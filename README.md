@@ -19,6 +19,7 @@ go run ./cmd/server
 - App 配置：`http://localhost:3000/v1/mobile/bootstrap?locale=zh-CN`
 - Admin 登录：`POST /v1/admin/auth/login` 创建 HttpOnly 会话；管理 API 默认拒绝未认证请求。`x-admin-key` 仅保留给受控自动化，不再进入 Web 构建。
 - MySQL：通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置；`MYSQL_CHARSET`、`MYSQL_TIMEZONE`、`MYSQL_PARSE_TIME` 控制字符集、日期时区和日期解析；测试使用 `<database>_test`
+- MySQL 连接行为：连接、读写、初始化超时与有限重试都通过 `MYSQL_*_SECONDS` / `MYSQL_INIT_MAX_ATTEMPTS` 配置。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。`MYSQL_AUTO_MIGRATE` 只控制基座表初始化，生产环境可在完成独立迁移后关闭。
 
 最低检查为 `gofmt`、`go vet ./...`、`go test -race ./...` 和 `go build ./cmd/server`。
 

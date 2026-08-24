@@ -6,12 +6,16 @@ Nginx.
 
 1. Edit `.env` and replace every `CHANGE_ME_MYSQL_*` value. Connection
    behavior is configurable with `MYSQL_CHARSET`, `MYSQL_TIMEZONE`, and
-   `MYSQL_PARSE_TIME`.
+   `MYSQL_PARSE_TIME`, plus the `MYSQL_*_TIMEOUT_SECONDS` and bounded retry
+   settings. The configured database must already exist; RN-Server never runs
+   `CREATE DATABASE` during application startup.
 2. Set `ADMIN_USERNAME` and a scrypt `ADMIN_PASSWORD_HASH`. The browser never receives `ADMIN_API_KEY`;
    that optional value is only for controlled automation.
 3. Set `ADMIN_COOKIE_SECURE=true` after the console is served over HTTPS.
-4. Run `./start.sh`.
-5. Check the deployment with `./status.sh`.
+4. Keep `MYSQL_AUTO_MIGRATE=true` only while the foundation tables need to be
+   initialized; after a controlled migration it may be set to `false`.
+5. Run `./start.sh`.
+6. Check the deployment with `./status.sh`.
 
 Endpoints after a successful start:
 

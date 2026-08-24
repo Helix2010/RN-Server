@@ -28,6 +28,13 @@ type Config struct {
 	MySQLCharset         string
 	MySQLTimezone        string
 	MySQLParseTime       bool
+	MySQLConnectTimeout  int
+	MySQLReadTimeout     int
+	MySQLWriteTimeout    int
+	MySQLInitTimeout     int
+	MySQLInitMaxAttempts int
+	MySQLInitRetryDelay  int
+	MySQLAutoMigrate     bool
 	OTAChannel           string
 	AndroidStoreURL      string
 	AndroidDirectURL     string
@@ -37,7 +44,7 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Environment:          value("NODE_ENV", "development"),
+		Environment:          value("APP_ENV", "development"),
 		Port:                 value("PORT", "3000"),
 		CORSOrigins:          split(value("CORS_ORIGINS", "*")),
 		AdminAPIKey:          os.Getenv("ADMIN_API_KEY"),
@@ -56,6 +63,13 @@ func Load() (Config, error) {
 		MySQLCharset:         value("MYSQL_CHARSET", "utf8mb4"),
 		MySQLTimezone:        value("MYSQL_TIMEZONE", "UTC"),
 		MySQLParseTime:       boolean("MYSQL_PARSE_TIME", true),
+		MySQLConnectTimeout:  integer("MYSQL_CONNECT_TIMEOUT_SECONDS", 15),
+		MySQLReadTimeout:     integer("MYSQL_READ_TIMEOUT_SECONDS", 30),
+		MySQLWriteTimeout:    integer("MYSQL_WRITE_TIMEOUT_SECONDS", 30),
+		MySQLInitTimeout:     integer("MYSQL_INIT_TIMEOUT_SECONDS", 30),
+		MySQLInitMaxAttempts: integer("MYSQL_INIT_MAX_ATTEMPTS", 3),
+		MySQLInitRetryDelay:  integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
+		MySQLAutoMigrate:     boolean("MYSQL_AUTO_MIGRATE", true),
 		OTAChannel:           value("OTA_CHANNEL", "production"),
 		AndroidStoreURL:      os.Getenv("ANDROID_STORE_URL"),
 		AndroidDirectURL:     os.Getenv("ANDROID_DIRECT_URL"),
@@ -73,7 +87,9 @@ func Load() (Config, error) {
 			return Config{}, errors.New("CORS_ORIGINS must be explicit in production")
 		}
 	}
-	if cfg.MySQLPort < 1 || cfg.MySQLPort > 65535 || cfg.MySQLConnectionLimit < 1 {
+	if cfg.MySQLPort < 1 || cfg.MySQLPort > 65535 || cfg.MySQLConnectionLimit < 1 ||
+		cfg.MySQLConnectTimeout < 1 || cfg.MySQLReadTimeout < 1 || cfg.MySQLWriteTimeout < 1 ||
+		cfg.MySQLInitTimeout < 1 || cfg.MySQLInitMaxAttempts < 1 || cfg.MySQLInitMaxAttempts > 10 || cfg.MySQLInitRetryDelay < 0 {
 		return Config{}, errors.New("invalid MySQL numeric configuration")
 	}
 	if strings.ContainsAny(cfg.MySQLDatabase+cfg.MySQLCharset, "`'\"; ") {
