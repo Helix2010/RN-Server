@@ -1,0 +1,1804 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/health/live": {
+      "get": {
+        "operationId": "HealthController_live",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "operationId": "HealthController_ready",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ready"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/v1/mobile/bootstrap": {
+      "get": {
+        "operationId": "BootstrapController_getBootstrap",
+        "parameters": [
+          {
+            "name": "locale",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "example": "zh-CN",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-app-version",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-build-number",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-platform",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-distribution-channel",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-runtime-version",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "if-none-match",
+            "required": true,
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Runtime-Version",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Distribution-Channel",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Platform",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Build-Number",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-App-Version",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BootstrapResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get typed mobile locale, theme, flags and update policy",
+        "tags": [
+          "mobile"
+        ]
+      }
+    },
+    "/v1/admin/auth/login": {
+      "post": {
+        "operationId": "AdminAuthController_login",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username",
+                  "password"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string",
+                    "maxLength": 120
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password",
+                    "maxLength": 1024
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Authenticated session"
+          },
+          "401": {
+            "description": "Invalid credentials"
+          },
+          "429": {
+            "description": "Too many attempts"
+          }
+        },
+        "summary": "Create an administrator browser session",
+        "tags": [
+          "admin-auth"
+        ]
+      }
+    },
+    "/v1/admin/auth/session": {
+      "get": {
+        "operationId": "AdminAuthController_session",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "summary": "Read the current administrator session",
+        "tags": [
+          "admin-auth"
+        ]
+      }
+    },
+    "/v1/admin/auth/logout": {
+      "post": {
+        "operationId": "AdminAuthController_logout",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "summary": "Revoke the current administrator session",
+        "tags": [
+          "admin-auth"
+        ]
+      }
+    },
+    "/v1/admin/overview": {
+      "get": {
+        "operationId": "AdminController_overview",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current releases and rollout summary"
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "summary": "Release operations dashboard summary",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/releases": {
+      "get": {
+        "operationId": "AdminController_list",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "platform",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": true,
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "operationId": "AdminController_create",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Release metadata and optional verified artifact",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "applicationId",
+                  "platform",
+                  "version",
+                  "buildNumber",
+                  "runtimeVersion",
+                  "channel"
+                ],
+                "properties": {
+                  "applicationId": {
+                    "type": "string"
+                  },
+                  "platform": {
+                    "enum": [
+                      "android",
+                      "ios"
+                    ]
+                  },
+                  "version": {
+                    "type": "string"
+                  },
+                  "buildNumber": {
+                    "type": "integer"
+                  },
+                  "runtimeVersion": {
+                    "type": "string"
+                  },
+                  "channel": {
+                    "enum": [
+                      "store",
+                      "direct",
+                      "mdm",
+                      "ota"
+                    ]
+                  },
+                  "releaseNotes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "artifact": {
+                    "type": "object",
+                    "nullable": true
+                  },
+                  "rollout": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/releases/{id}": {
+      "get": {
+        "operationId": "AdminController_detail",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/releases/{id}/{action}": {
+      "post": {
+        "operationId": "AdminController_action",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "action",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "High-risk action confirmation",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/audit-events": {
+      "get": {
+        "operationId": "AdminController_audits",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/admin/app-config": {
+      "get": {
+        "operationId": "AdminController_config",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Configuration, summary and MySQL revision metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "summary",
+                    "config",
+                    "metadata"
+                  ],
+                  "properties": {
+                    "summary": {
+                      "type": "object",
+                      "description": "Compact presentation summary of the active config"
+                    },
+                    "config": {
+                      "type": "object",
+                      "required": [
+                        "configVersion",
+                        "ttlSeconds",
+                        "localization",
+                        "theme",
+                        "features",
+                        "updatePolicy",
+                        "support"
+                      ],
+                      "properties": {
+                        "configVersion": {
+                          "type": "string"
+                        },
+                        "ttlSeconds": {
+                          "type": "integer",
+                          "minimum": 30,
+                          "maximum": 86400
+                        },
+                        "localization": {
+                          "type": "object",
+                          "required": [
+                            "fallbackLocale",
+                            "supportedLocales",
+                            "messagesVersion",
+                            "messages"
+                          ],
+                          "properties": {
+                            "fallbackLocale": {
+                              "enum": [
+                                "zh-CN",
+                                "en-US"
+                              ]
+                            },
+                            "supportedLocales": {
+                              "type": "array",
+                              "items": {
+                                "enum": [
+                                  "zh-CN",
+                                  "en-US"
+                                ]
+                              }
+                            },
+                            "messagesVersion": {
+                              "type": "string"
+                            },
+                            "messages": {
+                              "type": "object",
+                              "required": [
+                                "zh-CN",
+                                "en-US"
+                              ],
+                              "properties": {
+                                "zh-CN": {
+                                  "type": "object",
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  }
+                                },
+                                "en-US": {
+                                  "type": "object",
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "theme": {
+                          "type": "object",
+                          "required": [
+                            "defaultMode",
+                            "allowUserOverride",
+                            "paletteVersion",
+                            "light",
+                            "dark"
+                          ],
+                          "properties": {
+                            "defaultMode": {
+                              "type": "string",
+                              "enum": [
+                                "system"
+                              ]
+                            },
+                            "allowUserOverride": {
+                              "type": "boolean"
+                            },
+                            "paletteVersion": {
+                              "type": "string"
+                            },
+                            "light": {
+                              "type": "object",
+                              "required": [
+                                "primary",
+                                "onPrimary",
+                                "background",
+                                "surface",
+                                "surfaceVariant",
+                                "text",
+                                "textMuted",
+                                "border",
+                                "success",
+                                "warning",
+                                "danger",
+                                "info",
+                                "pricePositive",
+                                "priceNegative",
+                                "risk",
+                                "focus",
+                                "backdrop"
+                              ],
+                              "properties": {
+                                "primary": {
+                                  "type": "string"
+                                },
+                                "onPrimary": {
+                                  "type": "string"
+                                },
+                                "background": {
+                                  "type": "string"
+                                },
+                                "surface": {
+                                  "type": "string"
+                                },
+                                "surfaceVariant": {
+                                  "type": "string"
+                                },
+                                "text": {
+                                  "type": "string"
+                                },
+                                "textMuted": {
+                                  "type": "string"
+                                },
+                                "border": {
+                                  "type": "string"
+                                },
+                                "success": {
+                                  "type": "string"
+                                },
+                                "warning": {
+                                  "type": "string"
+                                },
+                                "danger": {
+                                  "type": "string"
+                                },
+                                "info": {
+                                  "type": "string"
+                                },
+                                "pricePositive": {
+                                  "type": "string"
+                                },
+                                "priceNegative": {
+                                  "type": "string"
+                                },
+                                "risk": {
+                                  "type": "string"
+                                },
+                                "focus": {
+                                  "type": "string"
+                                },
+                                "backdrop": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "dark": {
+                              "type": "object",
+                              "required": [
+                                "primary",
+                                "onPrimary",
+                                "background",
+                                "surface",
+                                "surfaceVariant",
+                                "text",
+                                "textMuted",
+                                "border",
+                                "success",
+                                "warning",
+                                "danger",
+                                "info",
+                                "pricePositive",
+                                "priceNegative",
+                                "risk",
+                                "focus",
+                                "backdrop"
+                              ],
+                              "properties": {
+                                "primary": {
+                                  "type": "string"
+                                },
+                                "onPrimary": {
+                                  "type": "string"
+                                },
+                                "background": {
+                                  "type": "string"
+                                },
+                                "surface": {
+                                  "type": "string"
+                                },
+                                "surfaceVariant": {
+                                  "type": "string"
+                                },
+                                "text": {
+                                  "type": "string"
+                                },
+                                "textMuted": {
+                                  "type": "string"
+                                },
+                                "border": {
+                                  "type": "string"
+                                },
+                                "success": {
+                                  "type": "string"
+                                },
+                                "warning": {
+                                  "type": "string"
+                                },
+                                "danger": {
+                                  "type": "string"
+                                },
+                                "info": {
+                                  "type": "string"
+                                },
+                                "pricePositive": {
+                                  "type": "string"
+                                },
+                                "priceNegative": {
+                                  "type": "string"
+                                },
+                                "risk": {
+                                  "type": "string"
+                                },
+                                "focus": {
+                                  "type": "string"
+                                },
+                                "backdrop": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "features": {
+                          "type": "object",
+                          "required": [
+                            "updateCenter",
+                            "otaEnabled",
+                            "directUpdateEnabled",
+                            "diagnosticsEnabled"
+                          ],
+                          "properties": {
+                            "updateCenter": {
+                              "type": "boolean"
+                            },
+                            "otaEnabled": {
+                              "type": "boolean"
+                            },
+                            "directUpdateEnabled": {
+                              "type": "boolean"
+                            },
+                            "diagnosticsEnabled": {
+                              "type": "boolean"
+                            }
+                          }
+                        },
+                        "updatePolicy": {
+                          "type": "object",
+                          "required": [
+                            "minSupportedVersion",
+                            "latestVersion",
+                            "otaChannel"
+                          ],
+                          "properties": {
+                            "minSupportedVersion": {
+                              "type": "string"
+                            },
+                            "latestVersion": {
+                              "type": "string"
+                            },
+                            "otaChannel": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "support": {
+                          "type": "object",
+                          "required": [
+                            "statusPageUrl"
+                          ],
+                          "properties": {
+                            "statusPageUrl": {
+                              "type": "string",
+                              "format": "uri"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "required": [
+                        "databaseVersion",
+                        "updatedBy",
+                        "updatedAt"
+                      ],
+                      "properties": {
+                        "databaseVersion": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "updatedBy": {
+                          "type": "string"
+                        },
+                        "updatedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "summary": "Get the complete active mobile configuration",
+        "tags": [
+          "admin"
+        ]
+      },
+      "patch": {
+        "operationId": "AdminController_updateConfig",
+        "parameters": [
+          {
+            "name": "X-Admin-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Admin-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason",
+                  "confirm",
+                  "expectedVersion",
+                  "config"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "config": {
+                    "type": "object",
+                    "required": [
+                      "configVersion",
+                      "ttlSeconds",
+                      "localization",
+                      "theme",
+                      "features",
+                      "updatePolicy",
+                      "support"
+                    ],
+                    "properties": {
+                      "configVersion": {
+                        "type": "string"
+                      },
+                      "ttlSeconds": {
+                        "type": "integer",
+                        "minimum": 30,
+                        "maximum": 86400
+                      },
+                      "localization": {
+                        "type": "object",
+                        "required": [
+                          "fallbackLocale",
+                          "supportedLocales",
+                          "messagesVersion",
+                          "messages"
+                        ],
+                        "properties": {
+                          "fallbackLocale": {
+                            "enum": [
+                              "zh-CN",
+                              "en-US"
+                            ]
+                          },
+                          "supportedLocales": {
+                            "type": "array",
+                            "items": {
+                              "enum": [
+                                "zh-CN",
+                                "en-US"
+                              ]
+                            }
+                          },
+                          "messagesVersion": {
+                            "type": "string"
+                          },
+                          "messages": {
+                            "type": "object",
+                            "required": [
+                              "zh-CN",
+                              "en-US"
+                            ],
+                            "properties": {
+                              "zh-CN": {
+                                "type": "object",
+                                "additionalProperties": {
+                                  "type": "string"
+                                }
+                              },
+                              "en-US": {
+                                "type": "object",
+                                "additionalProperties": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "theme": {
+                        "type": "object",
+                        "required": [
+                          "defaultMode",
+                          "allowUserOverride",
+                          "paletteVersion",
+                          "light",
+                          "dark"
+                        ],
+                        "properties": {
+                          "defaultMode": {
+                            "type": "string",
+                            "enum": [
+                              "system"
+                            ]
+                          },
+                          "allowUserOverride": {
+                            "type": "boolean"
+                          },
+                          "paletteVersion": {
+                            "type": "string"
+                          },
+                          "light": {
+                            "type": "object",
+                            "required": [
+                              "primary",
+                              "onPrimary",
+                              "background",
+                              "surface",
+                              "surfaceVariant",
+                              "text",
+                              "textMuted",
+                              "border",
+                              "success",
+                              "warning",
+                              "danger",
+                              "info",
+                              "pricePositive",
+                              "priceNegative",
+                              "risk",
+                              "focus",
+                              "backdrop"
+                            ],
+                            "properties": {
+                              "primary": {
+                                "type": "string"
+                              },
+                              "onPrimary": {
+                                "type": "string"
+                              },
+                              "background": {
+                                "type": "string"
+                              },
+                              "surface": {
+                                "type": "string"
+                              },
+                              "surfaceVariant": {
+                                "type": "string"
+                              },
+                              "text": {
+                                "type": "string"
+                              },
+                              "textMuted": {
+                                "type": "string"
+                              },
+                              "border": {
+                                "type": "string"
+                              },
+                              "success": {
+                                "type": "string"
+                              },
+                              "warning": {
+                                "type": "string"
+                              },
+                              "danger": {
+                                "type": "string"
+                              },
+                              "info": {
+                                "type": "string"
+                              },
+                              "pricePositive": {
+                                "type": "string"
+                              },
+                              "priceNegative": {
+                                "type": "string"
+                              },
+                              "risk": {
+                                "type": "string"
+                              },
+                              "focus": {
+                                "type": "string"
+                              },
+                              "backdrop": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "dark": {
+                            "type": "object",
+                            "required": [
+                              "primary",
+                              "onPrimary",
+                              "background",
+                              "surface",
+                              "surfaceVariant",
+                              "text",
+                              "textMuted",
+                              "border",
+                              "success",
+                              "warning",
+                              "danger",
+                              "info",
+                              "pricePositive",
+                              "priceNegative",
+                              "risk",
+                              "focus",
+                              "backdrop"
+                            ],
+                            "properties": {
+                              "primary": {
+                                "type": "string"
+                              },
+                              "onPrimary": {
+                                "type": "string"
+                              },
+                              "background": {
+                                "type": "string"
+                              },
+                              "surface": {
+                                "type": "string"
+                              },
+                              "surfaceVariant": {
+                                "type": "string"
+                              },
+                              "text": {
+                                "type": "string"
+                              },
+                              "textMuted": {
+                                "type": "string"
+                              },
+                              "border": {
+                                "type": "string"
+                              },
+                              "success": {
+                                "type": "string"
+                              },
+                              "warning": {
+                                "type": "string"
+                              },
+                              "danger": {
+                                "type": "string"
+                              },
+                              "info": {
+                                "type": "string"
+                              },
+                              "pricePositive": {
+                                "type": "string"
+                              },
+                              "priceNegative": {
+                                "type": "string"
+                              },
+                              "risk": {
+                                "type": "string"
+                              },
+                              "focus": {
+                                "type": "string"
+                              },
+                              "backdrop": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "features": {
+                        "type": "object",
+                        "required": [
+                          "updateCenter",
+                          "otaEnabled",
+                          "directUpdateEnabled",
+                          "diagnosticsEnabled"
+                        ],
+                        "properties": {
+                          "updateCenter": {
+                            "type": "boolean"
+                          },
+                          "otaEnabled": {
+                            "type": "boolean"
+                          },
+                          "directUpdateEnabled": {
+                            "type": "boolean"
+                          },
+                          "diagnosticsEnabled": {
+                            "type": "boolean"
+                          }
+                        }
+                      },
+                      "updatePolicy": {
+                        "type": "object",
+                        "required": [
+                          "minSupportedVersion",
+                          "latestVersion",
+                          "otaChannel"
+                        ],
+                        "properties": {
+                          "minSupportedVersion": {
+                            "type": "string"
+                          },
+                          "latestVersion": {
+                            "type": "string"
+                          },
+                          "otaChannel": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "support": {
+                        "type": "object",
+                        "required": [
+                          "statusPageUrl"
+                        ],
+                        "properties": {
+                          "statusPageUrl": {
+                            "type": "string",
+                            "format": "uri"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The active configuration after a transactional save",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status",
+                    "savedAt",
+                    "actorId",
+                    "requestId",
+                    "summary",
+                    "config",
+                    "metadata"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active"
+                      ]
+                    },
+                    "savedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "actorId": {
+                      "type": "string"
+                    },
+                    "requestId": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "object",
+                      "description": "Compact presentation summary of the active config"
+                    },
+                    "config": {
+                      "type": "object",
+                      "required": [
+                        "configVersion",
+                        "ttlSeconds",
+                        "localization",
+                        "theme",
+                        "features",
+                        "updatePolicy",
+                        "support"
+                      ],
+                      "properties": {
+                        "configVersion": {
+                          "type": "string"
+                        },
+                        "ttlSeconds": {
+                          "type": "integer",
+                          "minimum": 30,
+                          "maximum": 86400
+                        },
+                        "localization": {
+                          "type": "object",
+                          "required": [
+                            "fallbackLocale",
+                            "supportedLocales",
+                            "messagesVersion",
+                            "messages"
+                          ],
+                          "properties": {
+                            "fallbackLocale": {
+                              "enum": [
+                                "zh-CN",
+                                "en-US"
+                              ]
+                            },
+                            "supportedLocales": {
+                              "type": "array",
+                              "items": {
+                                "enum": [
+                                  "zh-CN",
+                                  "en-US"
+                                ]
+                              }
+                            },
+                            "messagesVersion": {
+                              "type": "string"
+                            },
+                            "messages": {
+                              "type": "object",
+                              "required": [
+                                "zh-CN",
+                                "en-US"
+                              ],
+                              "properties": {
+                                "zh-CN": {
+                                  "type": "object",
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  }
+                                },
+                                "en-US": {
+                                  "type": "object",
+                                  "additionalProperties": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "theme": {
+                          "type": "object",
+                          "required": [
+                            "defaultMode",
+                            "allowUserOverride",
+                            "paletteVersion",
+                            "light",
+                            "dark"
+                          ],
+                          "properties": {
+                            "defaultMode": {
+                              "type": "string",
+                              "enum": [
+                                "system"
+                              ]
+                            },
+                            "allowUserOverride": {
+                              "type": "boolean"
+                            },
+                            "paletteVersion": {
+                              "type": "string"
+                            },
+                            "light": {
+                              "type": "object",
+                              "required": [
+                                "primary",
+                                "onPrimary",
+                                "background",
+                                "surface",
+                                "surfaceVariant",
+                                "text",
+                                "textMuted",
+                                "border",
+                                "success",
+                                "warning",
+                                "danger",
+                                "info",
+                                "pricePositive",
+                                "priceNegative",
+                                "risk",
+                                "focus",
+                                "backdrop"
+                              ],
+                              "properties": {
+                                "primary": {
+                                  "type": "string"
+                                },
+                                "onPrimary": {
+                                  "type": "string"
+                                },
+                                "background": {
+                                  "type": "string"
+                                },
+                                "surface": {
+                                  "type": "string"
+                                },
+                                "surfaceVariant": {
+                                  "type": "string"
+                                },
+                                "text": {
+                                  "type": "string"
+                                },
+                                "textMuted": {
+                                  "type": "string"
+                                },
+                                "border": {
+                                  "type": "string"
+                                },
+                                "success": {
+                                  "type": "string"
+                                },
+                                "warning": {
+                                  "type": "string"
+                                },
+                                "danger": {
+                                  "type": "string"
+                                },
+                                "info": {
+                                  "type": "string"
+                                },
+                                "pricePositive": {
+                                  "type": "string"
+                                },
+                                "priceNegative": {
+                                  "type": "string"
+                                },
+                                "risk": {
+                                  "type": "string"
+                                },
+                                "focus": {
+                                  "type": "string"
+                                },
+                                "backdrop": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "dark": {
+                              "type": "object",
+                              "required": [
+                                "primary",
+                                "onPrimary",
+                                "background",
+                                "surface",
+                                "surfaceVariant",
+                                "text",
+                                "textMuted",
+                                "border",
+                                "success",
+                                "warning",
+                                "danger",
+                                "info",
+                                "pricePositive",
+                                "priceNegative",
+                                "risk",
+                                "focus",
+                                "backdrop"
+                              ],
+                              "properties": {
+                                "primary": {
+                                  "type": "string"
+                                },
+                                "onPrimary": {
+                                  "type": "string"
+                                },
+                                "background": {
+                                  "type": "string"
+                                },
+                                "surface": {
+                                  "type": "string"
+                                },
+                                "surfaceVariant": {
+                                  "type": "string"
+                                },
+                                "text": {
+                                  "type": "string"
+                                },
+                                "textMuted": {
+                                  "type": "string"
+                                },
+                                "border": {
+                                  "type": "string"
+                                },
+                                "success": {
+                                  "type": "string"
+                                },
+                                "warning": {
+                                  "type": "string"
+                                },
+                                "danger": {
+                                  "type": "string"
+                                },
+                                "info": {
+                                  "type": "string"
+                                },
+                                "pricePositive": {
+                                  "type": "string"
+                                },
+                                "priceNegative": {
+                                  "type": "string"
+                                },
+                                "risk": {
+                                  "type": "string"
+                                },
+                                "focus": {
+                                  "type": "string"
+                                },
+                                "backdrop": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "features": {
+                          "type": "object",
+                          "required": [
+                            "updateCenter",
+                            "otaEnabled",
+                            "directUpdateEnabled",
+                            "diagnosticsEnabled"
+                          ],
+                          "properties": {
+                            "updateCenter": {
+                              "type": "boolean"
+                            },
+                            "otaEnabled": {
+                              "type": "boolean"
+                            },
+                            "directUpdateEnabled": {
+                              "type": "boolean"
+                            },
+                            "diagnosticsEnabled": {
+                              "type": "boolean"
+                            }
+                          }
+                        },
+                        "updatePolicy": {
+                          "type": "object",
+                          "required": [
+                            "minSupportedVersion",
+                            "latestVersion",
+                            "otaChannel"
+                          ],
+                          "properties": {
+                            "minSupportedVersion": {
+                              "type": "string"
+                            },
+                            "latestVersion": {
+                              "type": "string"
+                            },
+                            "otaChannel": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "support": {
+                          "type": "object",
+                          "required": [
+                            "statusPageUrl"
+                          ],
+                          "properties": {
+                            "statusPageUrl": {
+                              "type": "string",
+                              "format": "uri"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "metadata": {
+                      "type": "object",
+                      "required": [
+                        "databaseVersion",
+                        "updatedBy",
+                        "updatedAt"
+                      ],
+                      "properties": {
+                        "databaseVersion": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "updatedBy": {
+                          "type": "string"
+                        },
+                        "updatedAt": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Config validation failed"
+          },
+          "409": {
+            "description": "Config revision is stale"
+          }
+        },
+        "security": [
+          {
+            "rn_admin_session": []
+          }
+        ],
+        "summary": "Validate and activate mobile configuration",
+        "tags": [
+          "admin"
+        ]
+      }
+    }
+  },
+  "info": {
+    "title": "RN Foundation API",
+    "description": "Mobile bootstrap, localization, theme and update policy",
+    "version": "1.0.0",
+    "contact": {}
+  },
+  "tags": [],
+  "servers": [],
+  "components": {
+    "securitySchemes": {
+      "cookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "rn_admin_session"
+      }
+    },
+    "schemas": {
+      "BootstrapResponseDto": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "type": "number",
+            "example": 1
+          },
+          "configVersion": {
+            "type": "string",
+            "example": "2026.08.21.1"
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ttlSeconds": {
+            "type": "number",
+            "example": 300
+          },
+          "requestId": {
+            "type": "string",
+            "example": "req-01"
+          },
+          "localization": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "theme": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "features": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "boolean"
+            }
+          },
+          "app": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "update": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "support": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "configVersion",
+          "generatedAt",
+          "ttlSeconds",
+          "requestId",
+          "localization",
+          "theme",
+          "features",
+          "app",
+          "update",
+          "support"
+        ]
+      }
+    }
+  }
+}
