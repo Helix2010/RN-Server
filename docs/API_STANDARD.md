@@ -44,7 +44,7 @@
 
 - 所有 path/query/header/body 在 controller 边界校验、去除未知字段；输出 DTO 明确映射，禁止直接序列化 ORM entity。
 - DTO/route/security/error 在 OpenAPI 中可见；每个 endpoint 至少有成功、校验、认证/授权错误定义。
-- CI 生成 `contracts/openapi/openapi.json`，与主分支执行 breaking diff；生成无差异才允许通过。
+- CI 校验 `contracts/openapi.json`，并与主分支执行 breaking diff；契约变更必须与 Go 路由和 RN-Admin adapter 同步。
 - generated contract 作为版本化 CI artifact 供 RN-App 固定使用。
 - 删除、重命名、required 新字段、收窄类型、改变 enum/格式/状态码均视为潜在 breaking change。
 

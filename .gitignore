@@ -1,8 +1,7 @@
-node_modules/
-dist/
 coverage/
 .env
 .env.*
 !.env.example
-*.tsbuildinfo
+rn-server
+bin/
 .DS_Store

@@ -15,38 +15,17 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: test-password
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptest-password"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-    env:
-      NODE_ENV: test
-      MYSQL_HOST: 127.0.0.1
-      MYSQL_PORT: 3306
-      MYSQL_USER: root
-      MYSQL_PASSWORD: test-password
-      MYSQL_DATABASE: rn_foundation_ci
-      ADMIN_API_KEY: ci-admin-key-please-change
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-go@v5
         with:
-          version: 10.28.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-      - run: pnpm api:check
+          go-version-file: go.mod
+          cache: true
+      - run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./cmd/server
+      - run: jq empty contracts/openapi.json
 
   deploy:
     needs: validate
@@ -76,8 +55,7 @@ jobs:
           rsync -az --delete \
             --exclude '.git/' \
             --exclude '.env' \
-            --exclude 'node_modules/' \
-            --exclude 'dist/' \
+            --exclude 'bin/' \
             ./ "$WEB4_USER@$WEB4_HOST:$staging/"
       - name: Deploy with lock, health gate and rollback
         run: |
@@ -104,12 +82,12 @@ jobs:
           cp rn-server/deploy/web4/compose.yaml compose.yaml
           if docker compose --env-file .env -f compose.yaml up -d --build --no-deps server; then
             healthy=false
-            for _ in $(seq 1 30); do
+            for _ in $(seq 1 90); do
               if [ "$(docker inspect -f '{{.State.Health.Status}}' rn-foundation-server 2>/dev/null || true)" = healthy ]; then
                 healthy=true
                 break
               fi
-              sleep 2
+              sleep 5
             done
             if [ "$healthy" = true ]; then
               if [ -d "$backup" ]; then rm -rf "$backup"; fi

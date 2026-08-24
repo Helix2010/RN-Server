@@ -39,14 +39,10 @@
 脚手架落地后最低执行：
 
 ```bash
-pnpm format:check
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm test:integration
-pnpm api:generate
-pnpm api:check
-pnpm check
+test -z "$(gofmt -l cmd internal)"
+go vet ./...
+go test -race ./...
+go build ./cmd/server
 ```
 
 数据迁移、队列、鉴权、版本发布还需运行对应集成/E2E 和回滚验证。交付必须列明实际验证、未验证项、API/数据兼容、发布与回滚，不得声称未运行的检查通过。

@@ -17,9 +17,9 @@
 
 | 领域 | 决策 |
 | --- | --- |
-| Runtime | 当前受支持的 Node.js LTS，版本固定 |
-| Framework | TypeScript strict + NestJS，HTTP adapter 首选 Fastify |
-| Database | MySQL 8.x + mysql2（Repository 隔离 SQL，后续迁移工具独立版本化） |
+| Runtime | 当前受支持的 Go 稳定版本，`go.mod` 固定最低版本 |
+| Framework | Go + Gin，标准 `net/http` 服务生命周期 |
+| Database | MySQL 8.x + `database/sql`/go-sql-driver（Repository 隔离 SQL） |
 | Cache/coordination | Redis，只用于有明确一致性语义的缓存、限流和锁 |
 | Background jobs | BullMQ/等价可靠队列 + transactional outbox |
 | API contract | OpenAPI 3.x 生成与版本化 artifact，breaking diff 门禁 |
@@ -33,15 +33,11 @@
 ## 3. 目录与模块边界
 
 ```text
-src/
-  app/                    # composition root、global pipeline
-  platform/
-    config/
-    database/
-    http/
-    observability/
-    security/
-    jobs/
+cmd/server/               # composition root
+internal/
+  config/
+  store/
+  api/
   modules/
     auth/
     app-config/
@@ -55,12 +51,10 @@ src/
       infrastructure/
       presentation/
       index.ts
-  generated/
 contracts/
   openapi/
 prisma/
   migrations/
-test/
 docs/
 ```
 

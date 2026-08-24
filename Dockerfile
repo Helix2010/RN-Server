@@ -1,24 +1,16 @@
-FROM node:22-alpine AS build
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/rn-server ./cmd/server
 
-RUN corepack enable && corepack prepare pnpm@10.28.1 --activate
+FROM alpine:3.22 AS runtime
+RUN apk add --no-cache ca-certificates tzdata && addgroup -S app && adduser -S -G app app
 WORKDIR /app
-
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
-
-COPY nest-cli.json tsconfig.json tsconfig.build.json ./
-COPY src ./src
-RUN pnpm build && pnpm prune --prod
-
-FROM node:22-alpine AS runtime
-
-ENV NODE_ENV=production
-WORKDIR /app
-
-COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-
-USER node
+COPY --from=build /out/rn-server ./rn-server
+COPY contracts ./contracts
+USER app
 EXPOSE 3000
-CMD ["node", "dist/main.js"]
+CMD ["./rn-server"]
