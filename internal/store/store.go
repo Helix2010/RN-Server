@@ -13,7 +13,7 @@ import (
 type Store struct{ DB *sql.DB }
 
 func Open(cfg config.Config) (*Store, error) {
-	bootstrap := mysql.Config{User: cfg.MySQLUser, Passwd: cfg.MySQLPassword, Net: "tcp", Addr: cfg.MySQLAddress(), Params: map[string]string{"charset": cfg.MySQLCharset}, Timeout: 15 * time.Second}
+	bootstrap := mysql.Config{User: cfg.MySQLUser, Passwd: cfg.MySQLPassword, Net: "tcp", Addr: cfg.MySQLAddress(), AllowNativePasswords: true, Params: map[string]string{"charset": cfg.MySQLCharset}, Timeout: 15 * time.Second}
 	db, err := sql.Open("mysql", bootstrap.FormatDSN())
 	if err != nil {
 		return nil, err
@@ -34,7 +34,7 @@ func Open(cfg config.Config) (*Store, error) {
 	if location == "local" {
 		loc = time.Local
 	}
-	dsn := mysql.Config{User: cfg.MySQLUser, Passwd: cfg.MySQLPassword, Net: "tcp", Addr: cfg.MySQLAddress(), DBName: cfg.MySQLDatabase, ParseTime: cfg.MySQLParseTime, Loc: loc, Params: map[string]string{"charset": cfg.MySQLCharset}, Timeout: 15 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
+	dsn := mysql.Config{User: cfg.MySQLUser, Passwd: cfg.MySQLPassword, Net: "tcp", Addr: cfg.MySQLAddress(), DBName: cfg.MySQLDatabase, ParseTime: cfg.MySQLParseTime, Loc: loc, AllowNativePasswords: true, Params: map[string]string{"charset": cfg.MySQLCharset}, Timeout: 15 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
 	db, err = sql.Open("mysql", dsn.FormatDSN())
 	if err != nil {
 		return nil, err
