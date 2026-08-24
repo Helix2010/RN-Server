@@ -12,8 +12,9 @@ Nginx.
 2. Set `ADMIN_USERNAME` and a scrypt `ADMIN_PASSWORD_HASH`. The browser never receives `ADMIN_API_KEY`;
    that optional value is only for controlled automation.
 3. Set `ADMIN_COOKIE_SECURE=true` after the console is served over HTTPS.
-4. Keep `MYSQL_AUTO_MIGRATE=true` only while the foundation tables need to be
-   initialized; after a controlled migration it may be set to `false`.
+4. Production defaults to `MYSQL_AUTO_MIGRATE=false`. Run schema changes as a
+   controlled deployment step; enable startup migration only for an isolated
+   initialization environment, then disable it again.
 5. Run `./start.sh`.
 6. Check the deployment with `./status.sh`.
 
