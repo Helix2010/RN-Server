@@ -72,7 +72,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	}
 	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}}
 	r := gin.New()
-	r.Use(gin.Recovery(), s.requestContext(), s.securityHeaders(), s.cors())
+	r.Use(gin.Recovery(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
 	r.GET("/health/live", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "live"}) })
 	r.GET("/health/ready", s.ready)
 	r.GET("/openapi.json", func(c *gin.Context) { c.File("contracts/openapi.json") })
@@ -93,6 +93,15 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	protected.GET("/app-config", s.getAppConfig)
 	protected.PATCH("/app-config", s.updateAppConfig)
 	return r
+}
+
+func (s *server) databaseTimeout() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.MySQLQueryTimeout)*time.Second)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
 }
 
 func (s *server) requestContext() gin.HandlerFunc {

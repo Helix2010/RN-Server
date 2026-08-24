@@ -13,6 +13,13 @@ import (
 
 type Store struct{ DB *sql.DB }
 
+type poolSettings struct {
+	maxOpen     int
+	maxIdle     int
+	maxLifetime time.Duration
+	maxIdleTime time.Duration
+}
+
 func Open(cfg config.Config) (*Store, error) {
 	driverCfg, err := driverConfig(cfg)
 	if err != nil {
@@ -22,9 +29,11 @@ func Open(cfg config.Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(cfg.MySQLConnectionLimit)
-	db.SetMaxIdleConns(cfg.MySQLConnectionLimit)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	settings := configuredPoolSettings(cfg)
+	db.SetMaxOpenConns(settings.maxOpen)
+	db.SetMaxIdleConns(settings.maxIdle)
+	db.SetConnMaxLifetime(settings.maxLifetime)
+	db.SetConnMaxIdleTime(settings.maxIdleTime)
 	if err := pingWithRetry(db, cfg); err != nil {
 		db.Close()
 		return nil, err
@@ -37,6 +46,15 @@ func Open(cfg config.Config) (*Store, error) {
 		}
 	}
 	return s, nil
+}
+
+func configuredPoolSettings(cfg config.Config) poolSettings {
+	return poolSettings{
+		maxOpen:     cfg.MySQLConnectionLimit,
+		maxIdle:     cfg.MySQLMaxIdleConnections,
+		maxLifetime: time.Duration(cfg.MySQLConnectionMaxLifetime) * time.Second,
+		maxIdleTime: time.Duration(cfg.MySQLConnectionMaxIdleTime) * time.Second,
+	}
 }
 
 func driverConfig(cfg config.Config) (mysql.Config, error) {

@@ -32,3 +32,17 @@ func TestDriverConfigUsesConfiguredConnectionOptions(t *testing.T) {
 		t.Fatalf("unexpected driver config: %#v", driverCfg)
 	}
 }
+
+func TestPoolSettingsUseConfiguredLimits(t *testing.T) {
+	cfg := config.Config{
+		MySQLConnectionLimit:       5,
+		MySQLMaxIdleConnections:    1,
+		MySQLConnectionMaxLifetime: 601,
+		MySQLConnectionMaxIdleTime: 61,
+	}
+
+	settings := configuredPoolSettings(cfg)
+	if settings.maxOpen != 5 || settings.maxIdle != 1 || settings.maxLifetime != 601*time.Second || settings.maxIdleTime != 61*time.Second {
+		t.Fatalf("unexpected pool settings: %#v", settings)
+	}
+}

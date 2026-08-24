@@ -9,72 +9,80 @@ import (
 )
 
 type Config struct {
-	Environment          string
-	Port                 string
-	CORSOrigins          []string
-	AdminAPIKey          string
-	AdminUsername        string
-	AdminPasswordHash    string
-	AdminSessionTTL      int
-	AdminCookieSecure    bool
-	AdminLoginMax        int
-	AdminLoginWindow     int
-	MySQLHost            string
-	MySQLPort            int
-	MySQLUser            string
-	MySQLPassword        string
-	MySQLDatabase        string
-	MySQLConnectionLimit int
-	MySQLCharset         string
-	MySQLTimezone        string
-	MySQLParseTime       bool
-	MySQLConnectTimeout  int
-	MySQLReadTimeout     int
-	MySQLWriteTimeout    int
-	MySQLInitTimeout     int
-	MySQLInitMaxAttempts int
-	MySQLInitRetryDelay  int
-	MySQLAutoMigrate     bool
-	OTAChannel           string
-	AndroidStoreURL      string
-	AndroidDirectURL     string
-	IOSStoreURL          string
-	IOSMDMURL            string
+	Environment                string
+	Port                       string
+	CORSOrigins                []string
+	AdminAPIKey                string
+	AdminUsername              string
+	AdminPasswordHash          string
+	AdminSessionTTL            int
+	AdminCookieSecure          bool
+	AdminLoginMax              int
+	AdminLoginWindow           int
+	MySQLHost                  string
+	MySQLPort                  int
+	MySQLUser                  string
+	MySQLPassword              string
+	MySQLDatabase              string
+	MySQLConnectionLimit       int
+	MySQLMaxIdleConnections    int
+	MySQLConnectionMaxLifetime int
+	MySQLConnectionMaxIdleTime int
+	MySQLQueryTimeout          int
+	MySQLCharset               string
+	MySQLTimezone              string
+	MySQLParseTime             bool
+	MySQLConnectTimeout        int
+	MySQLReadTimeout           int
+	MySQLWriteTimeout          int
+	MySQLInitTimeout           int
+	MySQLInitMaxAttempts       int
+	MySQLInitRetryDelay        int
+	MySQLAutoMigrate           bool
+	OTAChannel                 string
+	AndroidStoreURL            string
+	AndroidDirectURL           string
+	IOSStoreURL                string
+	IOSMDMURL                  string
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		Environment:          value("APP_ENV", "development"),
-		Port:                 value("PORT", "3000"),
-		CORSOrigins:          split(value("CORS_ORIGINS", "*")),
-		AdminAPIKey:          os.Getenv("ADMIN_API_KEY"),
-		AdminUsername:        os.Getenv("ADMIN_USERNAME"),
-		AdminPasswordHash:    os.Getenv("ADMIN_PASSWORD_HASH"),
-		AdminSessionTTL:      integer("ADMIN_SESSION_TTL_SECONDS", 28800),
-		AdminCookieSecure:    boolean("ADMIN_COOKIE_SECURE", false),
-		AdminLoginMax:        integer("ADMIN_LOGIN_MAX_ATTEMPTS", 5),
-		AdminLoginWindow:     integer("ADMIN_LOGIN_WINDOW_SECONDS", 900),
-		MySQLHost:            value("MYSQL_HOST", "127.0.0.1"),
-		MySQLPort:            integer("MYSQL_PORT", 3306),
-		MySQLUser:            value("MYSQL_USER", "root"),
-		MySQLPassword:        os.Getenv("MYSQL_PASSWORD"),
-		MySQLDatabase:        value("MYSQL_DATABASE", "rn_foundation"),
-		MySQLConnectionLimit: integer("MYSQL_CONNECTION_LIMIT", 10),
-		MySQLCharset:         value("MYSQL_CHARSET", "utf8mb4"),
-		MySQLTimezone:        value("MYSQL_TIMEZONE", "UTC"),
-		MySQLParseTime:       boolean("MYSQL_PARSE_TIME", true),
-		MySQLConnectTimeout:  integer("MYSQL_CONNECT_TIMEOUT_SECONDS", 15),
-		MySQLReadTimeout:     integer("MYSQL_READ_TIMEOUT_SECONDS", 30),
-		MySQLWriteTimeout:    integer("MYSQL_WRITE_TIMEOUT_SECONDS", 30),
-		MySQLInitTimeout:     integer("MYSQL_INIT_TIMEOUT_SECONDS", 30),
-		MySQLInitMaxAttempts: integer("MYSQL_INIT_MAX_ATTEMPTS", 3),
-		MySQLInitRetryDelay:  integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
-		MySQLAutoMigrate:     boolean("MYSQL_AUTO_MIGRATE", true),
-		OTAChannel:           value("OTA_CHANNEL", "production"),
-		AndroidStoreURL:      os.Getenv("ANDROID_STORE_URL"),
-		AndroidDirectURL:     os.Getenv("ANDROID_DIRECT_URL"),
-		IOSStoreURL:          os.Getenv("IOS_STORE_URL"),
-		IOSMDMURL:            os.Getenv("IOS_MDM_URL"),
+		Environment:                value("APP_ENV", "development"),
+		Port:                       value("PORT", "3000"),
+		CORSOrigins:                split(value("CORS_ORIGINS", "*")),
+		AdminAPIKey:                os.Getenv("ADMIN_API_KEY"),
+		AdminUsername:              os.Getenv("ADMIN_USERNAME"),
+		AdminPasswordHash:          os.Getenv("ADMIN_PASSWORD_HASH"),
+		AdminSessionTTL:            integer("ADMIN_SESSION_TTL_SECONDS", 28800),
+		AdminCookieSecure:          boolean("ADMIN_COOKIE_SECURE", false),
+		AdminLoginMax:              integer("ADMIN_LOGIN_MAX_ATTEMPTS", 5),
+		AdminLoginWindow:           integer("ADMIN_LOGIN_WINDOW_SECONDS", 900),
+		MySQLHost:                  value("MYSQL_HOST", "127.0.0.1"),
+		MySQLPort:                  integer("MYSQL_PORT", 3306),
+		MySQLUser:                  value("MYSQL_USER", "root"),
+		MySQLPassword:              os.Getenv("MYSQL_PASSWORD"),
+		MySQLDatabase:              value("MYSQL_DATABASE", "rn_foundation"),
+		MySQLConnectionLimit:       integer("MYSQL_CONNECTION_LIMIT", 10),
+		MySQLMaxIdleConnections:    integer("MYSQL_MAX_IDLE_CONNECTIONS", 2),
+		MySQLConnectionMaxLifetime: integer("MYSQL_CONNECTION_MAX_LIFETIME_SECONDS", 1800),
+		MySQLConnectionMaxIdleTime: integer("MYSQL_CONNECTION_MAX_IDLE_TIME_SECONDS", 300),
+		MySQLQueryTimeout:          integer("MYSQL_QUERY_TIMEOUT_SECONDS", 10),
+		MySQLCharset:               value("MYSQL_CHARSET", "utf8mb4"),
+		MySQLTimezone:              value("MYSQL_TIMEZONE", "UTC"),
+		MySQLParseTime:             boolean("MYSQL_PARSE_TIME", true),
+		MySQLConnectTimeout:        integer("MYSQL_CONNECT_TIMEOUT_SECONDS", 15),
+		MySQLReadTimeout:           integer("MYSQL_READ_TIMEOUT_SECONDS", 30),
+		MySQLWriteTimeout:          integer("MYSQL_WRITE_TIMEOUT_SECONDS", 30),
+		MySQLInitTimeout:           integer("MYSQL_INIT_TIMEOUT_SECONDS", 30),
+		MySQLInitMaxAttempts:       integer("MYSQL_INIT_MAX_ATTEMPTS", 3),
+		MySQLInitRetryDelay:        integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
+		MySQLAutoMigrate:           boolean("MYSQL_AUTO_MIGRATE", true),
+		OTAChannel:                 value("OTA_CHANNEL", "production"),
+		AndroidStoreURL:            os.Getenv("ANDROID_STORE_URL"),
+		AndroidDirectURL:           os.Getenv("ANDROID_DIRECT_URL"),
+		IOSStoreURL:                os.Getenv("IOS_STORE_URL"),
+		IOSMDMURL:                  os.Getenv("IOS_MDM_URL"),
 	}
 	if cfg.Environment == "test" && !strings.HasSuffix(cfg.MySQLDatabase, "_test") {
 		cfg.MySQLDatabase += "_test"
@@ -88,6 +96,8 @@ func Load() (Config, error) {
 		}
 	}
 	if cfg.MySQLPort < 1 || cfg.MySQLPort > 65535 || cfg.MySQLConnectionLimit < 1 ||
+		cfg.MySQLMaxIdleConnections < 0 || cfg.MySQLMaxIdleConnections > cfg.MySQLConnectionLimit ||
+		cfg.MySQLConnectionMaxLifetime < 1 || cfg.MySQLConnectionMaxIdleTime < 1 || cfg.MySQLQueryTimeout < 1 ||
 		cfg.MySQLConnectTimeout < 1 || cfg.MySQLReadTimeout < 1 || cfg.MySQLWriteTimeout < 1 ||
 		cfg.MySQLInitTimeout < 1 || cfg.MySQLInitMaxAttempts < 1 || cfg.MySQLInitMaxAttempts > 10 || cfg.MySQLInitRetryDelay < 0 {
 		return Config{}, errors.New("invalid MySQL numeric configuration")
