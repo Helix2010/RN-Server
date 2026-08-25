@@ -30,7 +30,6 @@ go run ./cmd/server
 - [总体架构](docs/ARCHITECTURE.md)
 - [API、数据与安全规范](docs/API_STANDARD.md)
 - [可观测、升级与运行规范](docs/OPERATIONS_AND_RELEASE.md)
-- [首个架构决策](docs/decisions/0001-modular-monolith.md)
 - [独立管理前端与插件模块决策](docs/decisions/0002-independent-admin-and-plugin-modules.md)
 - [MySQL 持久化决策](docs/decisions/0003-mysql-persistence.md)
 - [管理端浏览器会话门禁决策](docs/decisions/0004-admin-browser-session.md)

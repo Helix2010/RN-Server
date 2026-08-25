@@ -85,7 +85,7 @@ services:
       MYSQL_INIT_RETRY_DELAY_SECONDS: ${MYSQL_INIT_RETRY_DELAY_SECONDS:-5}
       MYSQL_AUTO_MIGRATE: ${MYSQL_AUTO_MIGRATE:-false}
     ports:
-      - "${SERVER_PORT:-3100}:3000"
+      - "127.0.0.1:${SERVER_PORT:-3100}:3000"
     healthcheck:
       test: ["CMD", "./rn-server", "healthcheck"]
       interval: 15s
@@ -113,7 +113,7 @@ services:
       server:
         condition: service_healthy
     ports:
-      - "${ADMIN_PORT:-3180}:80"
+      - "127.0.0.1:${ADMIN_PORT:-3180}:80"
     security_opt:
       - no-new-privileges:true
     logging:

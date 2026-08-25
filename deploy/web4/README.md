@@ -28,12 +28,20 @@ proxy. Unknown subdomains return 404 until an explicit upstream mapping is added
 Its ACME state is stored in the
 `rn-foundation-caddy-data` named volume and is not removed by source deployments.
 
-Endpoints after a successful start:
+Public endpoints after a successful start:
 
-- RN-Server: `http://15.235.225.217:3100`
-- RN-Admin: `http://15.235.225.217:3180`
 - HTTPS console: `https://console.anyfun.win`
 - HTTPS API: `https://api.anyfun.win`
+
+The raw service ports are loopback-only diagnostics on web4 and are not
+reachable from the public network:
+
+- RN-Server: `http://127.0.0.1:3100`
+- RN-Admin: `http://127.0.0.1:3180`
+
+External traffic must enter through the Caddy gateway on ports 80/443. This
+keeps session cookies, CORS and hostname routing on the configured HTTPS
+origins instead of exposing the application containers directly.
 
 `./stop.sh` removes only this Compose project's containers and network. MySQL
 data is external and is not deleted by the script.

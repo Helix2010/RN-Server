@@ -1,6 +1,6 @@
 # RN-Server 总体架构蓝图
 
-状态：Proposed
+状态：Active
 定位：移动应用平台基座 + 后续业务模块宿主。
 默认部署：单区域、高可用、无状态 API；根据真实容量演进。
 
@@ -21,7 +21,7 @@
 | Framework | Go + Gin，标准 `net/http` 服务生命周期 |
 | Database | MySQL 8.x + `database/sql`/go-sql-driver（Repository 隔离 SQL） |
 | Cache/coordination | Redis，只用于有明确一致性语义的缓存、限流和锁 |
-| Background jobs | BullMQ/等价可靠队列 + transactional outbox |
+| Background jobs | Go worker 进程 + 队列 adapter + transactional outbox |
 | API contract | OpenAPI 3.x 生成与版本化 artifact，breaking diff 门禁 |
 | Error | RFC 9457 `application/problem+json` 语义 |
 | Observability | OpenTelemetry traces/metrics/log correlation + error tracker |
@@ -33,29 +33,20 @@
 ## 3. 目录与模块边界
 
 ```text
-cmd/server/               # composition root
+cmd/server/               # composition root 和进程生命周期
 internal/
-  config/
-  store/
-  api/
-  modules/
-    auth/
-    app-config/
-    app-release/
-    feature-flags/
-    audit/
-    health/
+  api/                    # Gin transport、认证、校验和 DTO mapping
+  config/                 # 环境配置与安全校验
+  store/                  # database/sql、MySQL 查询与事务边界
+  modules/                # 复杂业务增长后按能力迁入此处
     <business-module>/
       domain/
       application/
       infrastructure/
       presentation/
-      index.ts
-contracts/
-  openapi/
-prisma/
-  migrations/
-docs/
+contracts/openapi.json    # 移动端与管理端公共契约
+deploy/web4/              # 隔离部署、Caddy 与 Compose
+docs/                     # 当前规范和仍有效的 ADR
 ```
 
 每个模块内部使用轻量的 domain/application/adapter 分层，但不要求每个 CRUD 都制造接口。只有外部依赖、复杂领域不变量或需要替换/测试的边界才抽象 port。
