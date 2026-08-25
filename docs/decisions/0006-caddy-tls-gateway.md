@@ -12,13 +12,17 @@ HTTP API，管理会话 Cookie 也必须启用 `Secure`。
 
 ## 决策
 
-RN 基座在自己的 Compose 项目中运行固定版本的 Caddy。网关仅占用当前空闲的
-80/443 端口，将 `/v1`、`/health`、`/docs` 和 `/openapi.json` 转发到 Go 服务，
-其余请求转发到 RN-Admin。Caddy 使用持久化命名卷保存 ACME 账户与证书，自动
-申请和续期公开信任证书；域名通过 `PUBLIC_CONSOLE_DOMAIN` 配置。
+RN 基座在自己的 Compose 项目中运行固定版本的 Caddy，并固定安装
+`caddy-dns/cloudflare` 插件。网关仅占用当前空闲的 80/443 端口，按明确的 host
+映射将 `api.anyfun.win` 转发到 Go 服务、将 `console.anyfun.win` 转发到
+RN-Admin，未知子域名返回 404。Caddy 通过最小权限 Cloudflare Token 完成 DNS-01
+验证，使用持久化命名卷保存 ACME 账户与泛域名证书并自动续期；基域名与路由
+分别通过 `PUBLIC_BASE_DOMAIN`、`PUBLIC_API_DOMAIN` 和
+`PUBLIC_CONSOLE_DOMAIN` 配置。
 
-生产管理页面和 API 使用同一 HTTPS origin。`PUBLIC_SERVER_URL` 与
-`CORS_ORIGINS` 指向该 origin，`ADMIN_COOKIE_SECURE=true`。RN-Server 和
+生产管理页面和 API 使用同一 site 下的两个 HTTPS origin。`PUBLIC_SERVER_URL`
+指向 API，`CORS_ORIGINS` 只允许管理端 origin，`ADMIN_COOKIE_SECURE=true`。
+Cloudflare Token 仅保存在生产 `.env`，不进入镜像、仓库或日志。RN-Server 和
 RN-Admin 的原有端口暂时保留用于兼容与回滚，后续确认没有旧客户端依赖后再收敛
 为 loopback 绑定。
 

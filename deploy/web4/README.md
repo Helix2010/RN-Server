@@ -11,8 +11,10 @@ Nginx.
    `CREATE DATABASE` during application startup.
 2. Set `ADMIN_USERNAME` and a scrypt `ADMIN_PASSWORD_HASH`. The browser never receives `ADMIN_API_KEY`;
    that optional value is only for controlled automation.
-3. Set `PUBLIC_CONSOLE_DOMAIN`, point `PUBLIC_SERVER_URL` and `CORS_ORIGINS` to its HTTPS origin,
-   and keep `ADMIN_COOKIE_SECURE=true`.
+3. Set `PUBLIC_BASE_DOMAIN` and `PUBLIC_CONSOLE_DOMAIN`, point `PUBLIC_SERVER_URL` and
+   `CORS_ORIGINS` to their HTTPS origins, set `PUBLIC_API_DOMAIN`, and keep
+   `ADMIN_COOKIE_SECURE=true`. Store a Cloudflare API token with
+   only Zone Read and DNS Edit access to the target zone in `CLOUDFLARE_API_TOKEN`.
 4. Production defaults to `MYSQL_AUTO_MIGRATE=false`. Run schema changes as a
    controlled deployment step; enable startup migration only for an isolated
    initialization environment, then disable it again.
@@ -20,15 +22,18 @@ Nginx.
 6. Check the deployment with `./status.sh`.
 
 The isolated `rn-foundation-gateway` Caddy container binds ports 80/443, routes
-the admin UI and Go API on one origin, and automatically obtains and renews a
-publicly trusted certificate. Its ACME state is stored in the
+the admin UI and Go API by hostname, and uses Cloudflare DNS-01 to automatically
+obtain and renew a `*.anyfun.win` certificate without disabling the Cloudflare
+proxy. Unknown subdomains return 404 until an explicit upstream mapping is added.
+Its ACME state is stored in the
 `rn-foundation-caddy-data` named volume and is not removed by source deployments.
 
 Endpoints after a successful start:
 
 - RN-Server: `http://15.235.225.217:3100`
 - RN-Admin: `http://15.235.225.217:3180`
-- HTTPS console and API: `https://console.anyfun.win`
+- HTTPS console: `https://console.anyfun.win`
+- HTTPS API: `https://api.anyfun.win`
 
 `./stop.sh` removes only this Compose project's containers and network. MySQL
 data is external and is not deleted by the script.

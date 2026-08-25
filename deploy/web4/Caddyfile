@@ -4,17 +4,32 @@
 	}
 }
 
-{$PUBLIC_CONSOLE_DOMAIN:console.anyfun.win} {
+*.{$PUBLIC_BASE_DOMAIN:anyfun.win} {
 	encode zstd gzip
 
-	@server path /v1/* /health/* /docs /openapi.json
-	handle @server {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	@api host {$PUBLIC_API_DOMAIN:api.anyfun.win}
+	handle @api {
 		reverse_proxy server:3000
 	}
 
-	handle {
+	@console_api {
+		host {$PUBLIC_CONSOLE_DOMAIN:console.anyfun.win}
+		path /v1/* /health/* /docs /openapi.json
+	}
+	handle @console_api {
+		reverse_proxy server:3000
+	}
+
+	@console host {$PUBLIC_CONSOLE_DOMAIN:console.anyfun.win}
+	handle @console {
 		reverse_proxy admin:80
 	}
+
+	respond "Unknown RN Foundation host" 404
 
 	header {
 		Referrer-Policy "no-referrer"

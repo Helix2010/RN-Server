@@ -3,11 +3,17 @@ name: rn-foundation
 services:
   gateway:
     container_name: rn-foundation-gateway
-    image: caddy:2.10.2-alpine
+    build:
+      context: ./rn-server/deploy/web4
+      dockerfile: Caddy.Dockerfile
+    image: rn-foundation-gateway:2.10.2-cloudflare
     init: true
     restart: unless-stopped
     environment:
+      PUBLIC_BASE_DOMAIN: ${PUBLIC_BASE_DOMAIN:-anyfun.win}
       PUBLIC_CONSOLE_DOMAIN: ${PUBLIC_CONSOLE_DOMAIN:-console.anyfun.win}
+      PUBLIC_API_DOMAIN: ${PUBLIC_API_DOMAIN:-api.anyfun.win}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
     depends_on:
       server:
         condition: service_healthy

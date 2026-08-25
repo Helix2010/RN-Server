@@ -117,7 +117,7 @@ jobs:
               sleep 5
             done
             if [ "$server_healthy" = true ] && \
-              docker compose --env-file .env -f compose.yaml up -d --no-deps gateway; then
+              docker compose --env-file .env -f compose.yaml up -d --build --no-deps gateway; then
               gateway_healthy=false
               for _ in $(seq 1 30); do
                 if [ "$(docker inspect -f '{{.State.Health.Status}}' rn-foundation-gateway 2>/dev/null || true)" = healthy ]; then
