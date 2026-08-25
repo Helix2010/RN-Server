@@ -1,0 +1,24 @@
+{
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+{$PUBLIC_CONSOLE_DOMAIN:console.anyfun.win} {
+	encode zstd gzip
+
+	@server path /v1/* /health/* /docs /openapi.json
+	handle @server {
+		reverse_proxy server:3000
+	}
+
+	handle {
+		reverse_proxy admin:80
+	}
+
+	header {
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+	}
+}

@@ -35,5 +35,6 @@ go run ./cmd/server
 - [MySQL 持久化决策](docs/decisions/0003-mysql-persistence.md)
 - [管理端浏览器会话门禁决策](docs/decisions/0004-admin-browser-session.md)
 - [Go 服务端运行时决策](docs/decisions/0005-go-server-runtime.md)
+- [Caddy HTTPS 网关决策](docs/decisions/0006-caddy-tls-gateway.md)
 
 所有参与者在改代码前必须先阅读 [AGENTS.md](AGENTS.md)。

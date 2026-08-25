@@ -99,20 +99,35 @@ jobs:
           flock -w 300 9
           backup="$DEPLOY_PATH/.rollback-rn-server-$(date +%s)"
           compose_backup="$DEPLOY_PATH/.rollback-compose-$(date +%s).yaml"
+          gateway_preexisting=false
+          if docker inspect rn-foundation-gateway >/dev/null 2>&1; then
+            gateway_preexisting=true
+          fi
           cp compose.yaml "$compose_backup"
           if [ -d rn-server ]; then mv rn-server "$backup"; fi
           mv "$STAGING" rn-server
           cp rn-server/deploy/web4/compose.yaml compose.yaml
           if docker compose --env-file .env -f compose.yaml up -d --build --no-deps server; then
-            healthy=false
+            server_healthy=false
             for _ in $(seq 1 90); do
               if [ "$(docker inspect -f '{{.State.Health.Status}}' rn-foundation-server 2>/dev/null || true)" = healthy ]; then
-                healthy=true
+                server_healthy=true
                 break
               fi
               sleep 5
             done
-            if [ "$healthy" = true ]; then
+            if [ "$server_healthy" = true ] && \
+              docker compose --env-file .env -f compose.yaml up -d --no-deps gateway; then
+              gateway_healthy=false
+              for _ in $(seq 1 30); do
+                if [ "$(docker inspect -f '{{.State.Health.Status}}' rn-foundation-gateway 2>/dev/null || true)" = healthy ]; then
+                  gateway_healthy=true
+                  break
+                fi
+                sleep 2
+              done
+            fi
+            if [ "${gateway_healthy:-false}" = true ]; then
               if [ -d "$backup" ]; then rm -rf "$backup"; fi
               rm -f "$compose_backup"
               cp rn-server/deploy/web4/start.sh rn-server/deploy/web4/stop.sh \
@@ -126,7 +141,12 @@ jobs:
           if [ -d "$backup" ]; then
             mv "$backup" rn-server
             mv "$compose_backup" compose.yaml
-            docker compose --env-file .env -f compose.yaml up -d --build --no-deps server
+            if [ "$gateway_preexisting" = true ]; then
+              docker compose --env-file .env -f compose.yaml up -d --build --no-deps server gateway
+            else
+              docker compose --env-file .env -f compose.yaml up -d --build --no-deps server
+              docker rm -f rn-foundation-gateway >/dev/null 2>&1 || true
+            fi
           fi
           rm -rf "$failed"
           exit 1

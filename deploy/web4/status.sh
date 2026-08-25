@@ -12,3 +12,8 @@ curl --fail --silent --show-error "http://127.0.0.1:${SERVER_PORT}/health/ready"
 printf '\n'
 curl --fail --silent --show-error "http://127.0.0.1:${ADMIN_PORT}/healthz"
 printf '\n'
+
+if [ -n "${PUBLIC_CONSOLE_DOMAIN:-}" ]; then
+  curl --fail --silent --show-error "https://${PUBLIC_CONSOLE_DOMAIN}/health/live"
+  printf '\n'
+fi
