@@ -35,7 +35,7 @@ jobs:
     env:
       DEPLOY_PATH: /home/ubuntu/fy/service
       WEB4_HOST: ${{ secrets.WEB4_HOST }}
-      WEB4_USER: ${{ secrets.WEB4_USER }}
+      WEB4_USER: ubuntu
     steps:
       - uses: actions/checkout@v4
       - name: Configure SSH
