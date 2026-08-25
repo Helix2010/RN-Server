@@ -107,7 +107,9 @@ jobs:
           if [ -d rn-server ]; then mv rn-server "$backup"; fi
           mv "$STAGING" rn-server
           cp rn-server/deploy/web4/compose.yaml compose.yaml
-          if docker compose --env-file .env -f compose.yaml up -d --build --no-deps server; then
+          if docker compose --env-file .env -f compose.yaml build server && \
+            docker compose --env-file .env -f compose.yaml run --rm --no-deps server ./rn-server migrate && \
+            docker compose --env-file .env -f compose.yaml up -d --no-deps server; then
             server_healthy=false
             for _ in $(seq 1 90); do
               if [ "$(docker inspect -f '{{.State.Health.Status}}' rn-foundation-server 2>/dev/null || true)" = healthy ]; then

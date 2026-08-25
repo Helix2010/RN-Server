@@ -35,6 +35,14 @@ func main() {
 		os.Exit(1)
 	}
 	defer database.Close()
+	if len(os.Args) == 2 && os.Args[1] == "migrate" {
+		if err := database.Migrate(cfg); err != nil {
+			slog.Error("database migration failed", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("database migrations complete")
+		return
+	}
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,

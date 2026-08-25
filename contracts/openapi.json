@@ -75,6 +75,26 @@
             }
           },
           {
+            "name": "tenant",
+            "required": false,
+            "in": "query",
+            "description": "Public tenant slug. Defaults to default for backward compatibility.",
+            "schema": {
+              "example": "default",
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Application-ID",
+            "required": false,
+            "in": "header",
+            "description": "Tenant-scoped application resource id.",
+            "schema": {
+              "example": "dex-mobile",
+              "type": "string"
+            }
+          },
+          {
             "name": "x-app-version",
             "required": true,
             "in": "header",
@@ -267,7 +287,156 @@
         ]
       }
     },
-    "/v1/admin/overview": {
+    "/v1/admin/tenants": {
+      "get": {
+        "operationId": "TenantAdmin_list",
+        "responses": { "200": { "description": "Platform-visible tenant list" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "tenant-admin" ]
+      },
+      "post": {
+        "operationId": "TenantAdmin_create",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "type": "object",
+            "required": [ "slug", "name", "reason", "confirm" ],
+            "properties": {
+              "slug": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$" },
+              "name": { "type": "string", "minLength": 2, "maxLength": 160 },
+              "reason": { "type": "string", "minLength": 3, "maxLength": 500 },
+              "confirm": { "type": "boolean", "enum": [ true ] }
+            }
+          } } }
+        },
+        "responses": { "201": { "description": "Tenant created" }, "409": { "description": "Tenant slug exists" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "tenant-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/applications": {
+      "parameters": [ { "$ref": "#/components/parameters/TenantId" } ],
+      "get": {
+        "operationId": "ApplicationAdmin_list",
+        "responses": { "200": { "description": "Tenant Android applications" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      },
+      "post": {
+        "operationId": "ApplicationAdmin_create",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApplicationWrite" } } } },
+        "responses": { "201": { "description": "Application identity created" }, "409": { "description": "Application or package exists" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/applications/{applicationId}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" },
+        { "name": "applicationId", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "put": {
+        "operationId": "ApplicationAdmin_update",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApplicationWrite" } } } },
+        "responses": { "200": { "description": "Application identity updated" }, "404": { "description": "Application not found" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/storage-config": {
+      "parameters": [ { "$ref": "#/components/parameters/TenantId" } ],
+      "get": {
+        "operationId": "StorageAdmin_get",
+        "responses": { "200": { "description": "Masked current storage config; never returns decrypted credentials" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      },
+      "put": {
+        "operationId": "StorageAdmin_putVersion",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageConfigWrite" } } } },
+        "responses": { "200": { "description": "Encrypted immutable storage config version" }, "409": { "description": "Expected version is stale" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/storage-config/test": {
+      "parameters": [ { "$ref": "#/components/parameters/TenantId" } ],
+      "post": {
+        "operationId": "StorageAdmin_test",
+        "responses": { "200": { "description": "Bucket access succeeded" }, "502": { "description": "Bucket access failed" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/artifacts": {
+      "parameters": [ { "$ref": "#/components/parameters/TenantId" } ],
+      "get": {
+        "operationId": "ArtifactAdmin_list",
+        "responses": { "200": { "description": "Tenant artifact list" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/artifacts/uploads": {
+      "parameters": [ { "$ref": "#/components/parameters/TenantId" } ],
+      "post": {
+        "operationId": "ArtifactAdmin_createUpload",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": {
+          "type": "object",
+          "required": [ "applicationId", "fileName", "contentType", "size" ],
+          "properties": {
+            "applicationId": { "type": "string" },
+            "fileName": { "type": "string", "pattern": "\\.apk$" },
+            "contentType": { "type": "string", "enum": [ "application/vnd.android.package-archive", "application/octet-stream" ] },
+            "size": { "type": "integer", "format": "int64", "minimum": 1 }
+          }
+        } } } },
+        "responses": { "201": { "description": "Artifact record and short-lived presigned PUT ticket" } },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/artifacts/{artifactId}/finalize": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" },
+        { "name": "artifactId", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "post": {
+        "operationId": "ArtifactAdmin_finalize",
+        "responses": {
+          "200": { "description": "Server-computed APK identity, hash and signature verification" },
+          "409": { "description": "Upload incomplete or state changed" },
+          "422": { "description": "APK rejected" }
+        },
+        "security": [ { "rn_admin_session": [] } ],
+        "tags": [ "artifact-admin" ]
+      }
+    },
+    "/v1/public/tenants/{tenantSlug}/apps/{applicationId}/android/direct/latest": {
+      "parameters": [
+        { "name": "tenantSlug", "in": "path", "required": true, "schema": { "type": "string" } },
+        { "name": "applicationId", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "PublicRelease_latestAndroidDirect",
+        "responses": { "200": { "description": "Current active direct APK metadata and download URL" }, "404": { "description": "No active release" } },
+        "tags": [ "public-release" ]
+      }
+    },
+    "/v1/public/artifacts/{artifactId}/download": {
+      "parameters": [
+        { "name": "artifactId", "in": "path", "required": true, "schema": { "type": "string" } }
+      ],
+      "get": {
+        "operationId": "PublicRelease_downloadArtifact",
+        "responses": { "307": { "description": "Redirect to CDN or short-lived S3 download URL" }, "404": { "description": "Artifact is not active" } },
+        "tags": [ "public-release" ]
+      }
+    },
+    "/v1/admin/tenants/{tenantId}/overview": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" }
+      ],
       "get": {
         "operationId": "AdminController_overview",
         "parameters": [
@@ -304,7 +473,10 @@
         ]
       }
     },
-    "/v1/admin/releases": {
+    "/v1/admin/tenants/{tenantId}/releases": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" }
+      ],
       "get": {
         "operationId": "AdminController_list",
         "parameters": [
@@ -377,7 +549,7 @@
         ],
         "requestBody": {
           "required": true,
-          "description": "Release metadata and optional verified artifact",
+          "description": "Release metadata. Android direct releases require a verified tenant artifact id.",
           "content": {
             "application/json": {
               "schema": {
@@ -423,8 +595,8 @@
                       "type": "string"
                     }
                   },
-                  "artifact": {
-                    "type": "object",
+                  "artifactId": {
+                    "type": "string",
                     "nullable": true
                   },
                   "rollout": {
@@ -450,7 +622,10 @@
         ]
       }
     },
-    "/v1/admin/releases/{id}": {
+    "/v1/admin/tenants/{tenantId}/releases/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" }
+      ],
       "get": {
         "operationId": "AdminController_detail",
         "parameters": [
@@ -494,7 +669,10 @@
         ]
       }
     },
-    "/v1/admin/releases/{id}/{action}": {
+    "/v1/admin/tenants/{tenantId}/releases/{id}/{action}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" }
+      ],
       "post": {
         "operationId": "AdminController_action",
         "parameters": [
@@ -573,7 +751,10 @@
         ]
       }
     },
-    "/v1/admin/audit-events": {
+    "/v1/admin/tenants/{tenantId}/audit-events": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" }
+      ],
       "get": {
         "operationId": "AdminController_audits",
         "parameters": [
@@ -609,7 +790,10 @@
         ]
       }
     },
-    "/v1/admin/app-config": {
+    "/v1/admin/tenants/{tenantId}/app-config": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TenantId" }
+      ],
       "get": {
         "operationId": "AdminController_config",
         "parameters": [
@@ -1720,21 +1904,66 @@
   },
   "info": {
     "title": "RN Foundation API",
-    "description": "Mobile bootstrap, localization, theme and update policy",
-    "version": "1.0.0",
+    "description": "Multi-tenant mobile bootstrap and verified APK release platform",
+    "version": "1.1.0",
     "contact": {}
   },
   "tags": [],
   "servers": [],
   "components": {
+    "parameters": {
+      "TenantId": {
+        "name": "tenantId",
+        "in": "path",
+        "required": true,
+        "description": "Platform administrator-selected tenant id.",
+        "schema": {
+          "type": "string",
+          "example": "tenant_default"
+        }
+      }
+    },
     "securitySchemes": {
-      "cookie": {
+      "rn_admin_session": {
         "type": "apiKey",
         "in": "cookie",
         "name": "rn_admin_session"
       }
     },
     "schemas": {
+      "ApplicationWrite": {
+        "type": "object",
+        "required": [ "name", "packageName", "expectedSignerSha256", "reason", "confirm" ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{1,119}$" },
+          "name": { "type": "string", "minLength": 2, "maxLength": 160 },
+          "packageName": { "type": "string", "example": "com.example.dex" },
+          "expectedSignerSha256": { "type": "string", "pattern": "^[a-fA-F0-9:]{64,95}$" },
+          "reason": { "type": "string", "minLength": 3, "maxLength": 500 },
+          "confirm": { "type": "boolean", "enum": [ true ] }
+        },
+        "additionalProperties": false
+      },
+      "StorageConfigWrite": {
+        "type": "object",
+        "required": [ "provider", "region", "bucket", "objectPrefix", "forcePathStyle", "expectedVersion", "reason", "confirm" ],
+        "properties": {
+          "provider": { "type": "string", "enum": [ "s3", "r2", "minio" ] },
+          "endpoint": { "type": "string", "format": "uri", "nullable": true },
+          "region": { "type": "string" },
+          "bucket": { "type": "string" },
+          "objectPrefix": { "type": "string" },
+          "forcePathStyle": { "type": "boolean" },
+          "publicBaseUrl": { "type": "string", "format": "uri", "nullable": true },
+          "accessKeyId": { "type": "string", "writeOnly": true },
+          "secretAccessKey": { "type": "string", "writeOnly": true },
+          "sessionToken": { "type": "string", "writeOnly": true },
+          "expectedVersion": { "type": "integer", "minimum": 0 },
+          "reason": { "type": "string", "minLength": 3, "maxLength": 500 },
+          "confirm": { "type": "boolean", "enum": [ true ] }
+        },
+        "additionalProperties": false
+      },
       "BootstrapResponseDto": {
         "type": "object",
         "properties": {

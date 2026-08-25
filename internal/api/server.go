@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/Helix2010/RN-Server/internal/objectstore"
+	"github.com/Helix2010/RN-Server/internal/secretbox"
 	"github.com/Helix2010/RN-Server/internal/store"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/scrypt"
@@ -29,6 +31,7 @@ type server struct {
 	db       *sql.DB
 	mu       sync.Mutex
 	attempts map[string]attempt
+	objects  objectstore.Factory
 }
 
 type attempt struct {
@@ -52,6 +55,7 @@ type release struct {
 	UpdatedAt      string         `json:"updatedAt"`
 	ActivatedAt    *string        `json:"activatedAt"`
 	LastAction     *string        `json:"lastAction"`
+	ArtifactID     *string        `json:"artifactId,omitempty"`
 }
 
 type auditEvent struct {
@@ -64,13 +68,14 @@ type auditEvent struct {
 	RequestID  string         `json:"requestId"`
 	CreatedAt  string         `json:"createdAt"`
 	Summary    map[string]any `json:"summary"`
+	TenantID   string         `json:"tenantId"`
 }
 
 func New(cfg config.Config, storage *store.Store) http.Handler {
 	if cfg.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}}
+	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}}
 	r := gin.New()
 	r.Use(gin.Recovery(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
 	r.GET("/health/live", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "live"}) })
@@ -78,25 +83,77 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/openapi.json", func(c *gin.Context) { c.File("contracts/openapi.json") })
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
+	r.GET("/v1/public/tenants/:tenantSlug/apps/:applicationId/android/direct/latest", s.publicLatestRelease)
+	r.GET("/v1/public/artifacts/:id/download", s.publicArtifactDownload)
 	admin := r.Group("/v1/admin")
 	admin.POST("/auth/login", s.login)
 	protected := admin.Group("")
 	protected.Use(s.authenticate())
 	protected.GET("/auth/session", s.session)
 	protected.POST("/auth/logout", s.logout)
-	protected.GET("/overview", s.overview)
-	protected.GET("/releases", s.listReleases)
-	protected.POST("/releases", s.createRelease)
-	protected.GET("/releases/:id", s.releaseDetail)
-	protected.POST("/releases/:id/:action", s.releaseAction)
-	protected.GET("/audit-events", s.listAudits)
-	protected.GET("/app-config", s.getAppConfig)
-	protected.PATCH("/app-config", s.updateAppConfig)
+	protected.GET("/tenants", s.listTenants)
+	protected.POST("/tenants", s.createTenant)
+	tenant := protected.Group("/tenants/:tenantId")
+	tenant.Use(s.tenantScope())
+	s.registerTenantRoutes(tenant)
+	legacy := protected.Group("")
+	legacy.Use(s.defaultTenantScope())
+	s.registerTenantRoutes(legacy)
 	return r
+}
+
+func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
+	group.GET("/overview", s.overview)
+	group.GET("/releases", s.listReleases)
+	group.POST("/releases", s.createRelease)
+	group.GET("/releases/:id", s.releaseDetail)
+	group.POST("/releases/:id/:action", s.releaseAction)
+	group.GET("/audit-events", s.listAudits)
+	group.GET("/app-config", s.getAppConfig)
+	group.PATCH("/app-config", s.updateAppConfig)
+	group.GET("/applications", s.listApplications)
+	group.POST("/applications", s.createApplication)
+	group.PUT("/applications/:applicationId", s.updateApplication)
+	group.GET("/storage-config", s.getStorageConfig)
+	group.PUT("/storage-config", s.putStorageConfig)
+	group.POST("/storage-config/test", s.testStorageConfig)
+	group.GET("/artifacts", s.listArtifacts)
+	group.POST("/artifacts/uploads", s.createArtifactUpload)
+	group.POST("/artifacts/:id/finalize", s.finalizeArtifact)
+}
+
+func (s *server) tenantScope() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := strings.TrimSpace(c.Param("tenantId"))
+		var status string
+		if id == "" || s.db.QueryRowContext(c.Request.Context(), `SELECT status FROM tenants WHERE id=?`, id).Scan(&status) != nil {
+			problem(c, 404, "TENANT_NOT_FOUND", "Tenant not found")
+			c.Abort()
+			return
+		}
+		if status != "active" {
+			problem(c, 409, "TENANT_DISABLED", "Tenant is disabled")
+			c.Abort()
+			return
+		}
+		c.Set("tenantId", id)
+		c.Next()
+	}
+}
+
+func (s *server) defaultTenantScope() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("tenantId", "tenant_default")
+		c.Next()
+	}
 }
 
 func (s *server) databaseTimeout() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/storage-config/test") || strings.HasSuffix(c.Request.URL.Path, "/download") {
+			c.Next()
+			return
+		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.MySQLQueryTimeout)*time.Second)
 		defer cancel()
 		c.Request = c.Request.WithContext(ctx)
@@ -270,7 +327,7 @@ func (s *server) failedLogin(ip string) {
 }
 
 func (s *server) listReleases(c *gin.Context) {
-	releases, err := s.queryReleases(c.Request.Context(), c.Query("platform"), c.Query("status"))
+	releases, err := s.queryReleases(c.Request.Context(), tenantID(c), c.Query("platform"), c.Query("status"))
 	if err != nil {
 		problem(c, 500, "RELEASE_QUERY_FAILED", "Unable to load releases")
 		return
@@ -278,9 +335,9 @@ func (s *server) listReleases(c *gin.Context) {
 	c.JSON(200, gin.H{"items": releases, "nextCursor": nil, "hasMore": false})
 }
 
-func (s *server) queryReleases(ctx context.Context, platform, status string) ([]release, error) {
-	query := `SELECT id,application_id,platform,version,build_number,runtime_version,channel,status,release_notes,artifact,rollout,activated_at,last_action,created_at,updated_at FROM app_releases WHERE (?='' OR platform=?) AND (?='' OR status=?) ORDER BY updated_at DESC`
-	rows, err := s.db.QueryContext(ctx, query, platform, platform, status, status)
+func (s *server) queryReleases(ctx context.Context, tenant, platform, status string) ([]release, error) {
+	query := `SELECT id,application_id,platform,version,build_number,runtime_version,channel,status,release_notes,artifact,rollout,activated_at,last_action,created_at,updated_at,artifact_id FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY updated_at DESC`
+	rows, err := s.db.QueryContext(ctx, query, tenant, platform, platform, status, status)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +361,8 @@ func scanRelease(row scanner) (release, error) {
 	var activated sql.NullTime
 	var action sql.NullString
 	var created, updated time.Time
-	err := row.Scan(&r.ID, &r.ApplicationID, &r.Platform, &r.Version, &r.BuildNumber, &r.RuntimeVersion, &r.Channel, &r.Status, &notes, &artifact, &rollout, &activated, &action, &created, &updated)
+	var artifactID sql.NullString
+	err := row.Scan(&r.ID, &r.ApplicationID, &r.Platform, &r.Version, &r.BuildNumber, &r.RuntimeVersion, &r.Channel, &r.Status, &notes, &artifact, &rollout, &activated, &action, &created, &updated, &artifactID)
 	if err != nil {
 		return r, err
 	}
@@ -322,6 +380,9 @@ func scanRelease(row scanner) (release, error) {
 	if action.Valid {
 		r.LastAction = &action.String
 	}
+	if artifactID.Valid {
+		r.ArtifactID = &artifactID.String
+	}
 	return r, nil
 }
 
@@ -335,6 +396,25 @@ func (s *server) createRelease(c *gin.Context) {
 		problem(c, 400, "INVALID_RELEASE", "Invalid release payload")
 		return
 	}
+	if err := s.requireApplication(c.Request.Context(), tenantID(c), input.ApplicationID); err != nil {
+		problem(c, 400, "APPLICATION_NOT_FOUND", "Application is not configured for this tenant")
+		return
+	}
+	if input.Channel == "direct" {
+		if input.Platform != "android" || input.ArtifactID == nil || *input.ArtifactID == "" {
+			problem(c, 400, "VERIFIED_ARTIFACT_REQUIRED", "Android direct releases require a verified APK artifact")
+			return
+		}
+		artifact, err := s.artifactForRelease(c.Request.Context(), tenantID(c), *input.ArtifactID, input.ApplicationID, input.Version, input.BuildNumber)
+		if err != nil {
+			problem(c, 409, "VERIFIED_ARTIFACT_REQUIRED", "Artifact is not verified or does not match the release identity")
+			return
+		}
+		input.Artifact = artifact
+	} else if input.ArtifactID != nil || input.Artifact != nil {
+		problem(c, 400, "INVALID_RELEASE_ARTIFACT", "Only Android direct releases accept APK artifacts")
+		return
+	}
 	now := time.Now().UTC()
 	input.ID = "rel_" + randomID(16)
 	input.CreatedAt = iso(now)
@@ -342,7 +422,7 @@ func (s *server) createRelease(c *gin.Context) {
 	action := "create"
 	input.LastAction = &action
 	if input.Artifact != nil {
-		input.Status = "uploaded"
+		input.Status = "verified"
 	} else {
 		input.Status = "draft"
 	}
@@ -362,7 +442,7 @@ func (s *server) createRelease(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases (id,application_id,platform,version,build_number,runtime_version,channel,status,release_notes,artifact,rollout,activated_at,last_action,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, input.ID, input.ApplicationID, input.Platform, input.Version, input.BuildNumber, input.RuntimeVersion, input.Channel, input.Status, notes, nullableJSON(input.Artifact, artifact), rollout, nil, action, now, now)
+	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases (id,tenant_id,application_id,platform,version,build_number,runtime_version,channel,status,release_notes,artifact,artifact_id,rollout,activated_at,last_action,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, input.ID, tenantID(c), input.ApplicationID, input.Platform, input.Version, input.BuildNumber, input.RuntimeVersion, input.Channel, input.Status, notes, nullableJSON(input.Artifact, artifact), input.ArtifactID, rollout, nil, action, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "Duplicate") {
 			problem(c, 409, "DUPLICATE_RELEASE", "A release with this build and channel already exists")
@@ -371,7 +451,7 @@ func (s *server) createRelease(c *gin.Context) {
 		}
 		return
 	}
-	event := newAudit(actor(c), "create", "release", input.ID, "Created release", requestID(c), map[string]any{"version": input.Version, "platform": input.Platform, "status": input.Status})
+	event := newAudit(tenantID(c), actor(c), "create", "release", input.ID, "Created release", requestID(c), map[string]any{"version": input.Version, "platform": input.Platform, "status": input.Status})
 	if err = insertAudit(c.Request.Context(), tx, event); err != nil || tx.Commit() != nil {
 		problem(c, 500, "RELEASE_CREATE_FAILED", "Unable to create release")
 		return
@@ -380,7 +460,7 @@ func (s *server) createRelease(c *gin.Context) {
 }
 
 func (s *server) releaseDetail(c *gin.Context) {
-	r, err := s.findRelease(c.Request.Context(), c.Param("id"))
+	r, err := s.findRelease(c.Request.Context(), tenantID(c), c.Param("id"))
 	if errors.Is(err, sql.ErrNoRows) {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Release not found")
 		return
@@ -389,15 +469,15 @@ func (s *server) releaseDetail(c *gin.Context) {
 		problem(c, 500, "RELEASE_QUERY_FAILED", "Unable to load release")
 		return
 	}
-	audits, _ := s.queryAudits(c.Request.Context(), r.ID)
+	audits, _ := s.queryAudits(c.Request.Context(), tenantID(c), r.ID)
 	c.JSON(200, gin.H{"release": r, "audits": audits})
 }
 
-func (s *server) findRelease(ctx context.Context, id string) (release, error) {
-	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,application_id,platform,version,build_number,runtime_version,channel,status,release_notes,artifact,rollout,activated_at,last_action,created_at,updated_at FROM app_releases WHERE id=?`, id))
+func (s *server) findRelease(ctx context.Context, tenant, id string) (release, error) {
+	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,application_id,platform,version,build_number,runtime_version,channel,status,release_notes,artifact,rollout,activated_at,last_action,created_at,updated_at,artifact_id FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id))
 }
 
-var transitions = map[string]map[string]string{"verify": {"uploaded": "verified"}, "stage": {"verified": "staged"}, "activate": {"staged": "active", "paused": "active"}, "pause": {"active": "paused"}, "rollback": {"active": "rolled_back", "paused": "rolled_back"}}
+var transitions = map[string]map[string]string{"stage": {"verified": "staged"}, "activate": {"staged": "active", "paused": "active"}, "pause": {"active": "paused"}, "rollback": {"active": "rolled_back", "paused": "rolled_back"}}
 
 func (s *server) releaseAction(c *gin.Context) {
 	var body struct {
@@ -408,7 +488,7 @@ func (s *server) releaseAction(c *gin.Context) {
 		problem(c, 400, "CONFIRMATION_REQUIRED", "reason and confirm=true are required")
 		return
 	}
-	r, err := s.findRelease(c.Request.Context(), c.Param("id"))
+	r, err := s.findRelease(c.Request.Context(), tenantID(c), c.Param("id"))
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Release not found")
 		return
@@ -422,6 +502,12 @@ func (s *server) releaseAction(c *gin.Context) {
 		problem(c, 400, "ROLLOUT_REQUIRED", "Configure a rollout percentage before activation")
 		return
 	}
+	if target == "active" && r.Channel == "direct" {
+		if r.ArtifactID == nil || s.artifactStillVerified(c.Request.Context(), tenantID(c), *r.ArtifactID) != nil {
+			problem(c, 409, "VERIFIED_ARTIFACT_REQUIRED", "The bound APK artifact is no longer publishable")
+			return
+		}
+	}
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -430,7 +516,7 @@ func (s *server) releaseAction(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	if target == "active" {
-		_, _ = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status='completed',last_action='completed',updated_at=? WHERE id<>? AND platform=? AND channel=? AND status='active'`, now, r.ID, r.Platform, r.Channel)
+		_, _ = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status='completed',last_action='completed',updated_at=? WHERE tenant_id=? AND id<>? AND application_id=? AND platform=? AND channel=? AND status='active'`, now, tenantID(c), r.ID, r.ApplicationID, r.Platform, r.Channel)
 	}
 	var activated any = nil
 	if target == "active" {
@@ -440,12 +526,12 @@ func (s *server) releaseAction(c *gin.Context) {
 			activated = parsed
 		}
 	}
-	_, err = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status=?,last_action=?,updated_at=?,activated_at=? WHERE id=?`, target, target, now, activated, r.ID)
+	_, err = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status=?,last_action=?,updated_at=?,activated_at=? WHERE tenant_id=? AND id=?`, target, target, now, activated, tenantID(c), r.ID)
 	if err != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
 	}
-	event := newAudit(actor(c), c.Param("action"), "release", r.ID, body.Reason, requestID(c), map[string]any{"version": r.Version, "platform": r.Platform, "status": target})
+	event := newAudit(tenantID(c), actor(c), c.Param("action"), "release", r.ID, body.Reason, requestID(c), map[string]any{"version": r.Version, "platform": r.Platform, "status": target})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
@@ -461,7 +547,7 @@ func (s *server) releaseAction(c *gin.Context) {
 }
 
 func (s *server) overview(c *gin.Context) {
-	items, err := s.queryReleases(c.Request.Context(), "", "")
+	items, err := s.queryReleases(c.Request.Context(), tenantID(c), "", "")
 	if err != nil {
 		problem(c, 500, "OVERVIEW_FAILED", "Unable to load overview")
 		return
@@ -487,15 +573,15 @@ func (s *server) overview(c *gin.Context) {
 }
 
 func (s *server) listAudits(c *gin.Context) {
-	items, err := s.queryAudits(c.Request.Context(), "")
+	items, err := s.queryAudits(c.Request.Context(), tenantID(c), "")
 	if err != nil {
 		problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to load audit events")
 		return
 	}
 	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
 }
-func (s *server) queryAudits(ctx context.Context, target string) ([]auditEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at FROM audit_events WHERE (?='' OR target_id=?) ORDER BY created_at DESC LIMIT 1000`, target, target)
+func (s *server) queryAudits(ctx context.Context, tenant, target string) ([]auditEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at FROM audit_events WHERE tenant_id=? AND (?='' OR target_id=?) ORDER BY created_at DESC LIMIT 1000`, tenant, target, target)
 	if err != nil {
 		return nil, err
 	}
@@ -509,6 +595,7 @@ func (s *server) queryAudits(ctx context.Context, target string) ([]auditEvent, 
 			return nil, err
 		}
 		_ = json.Unmarshal(summary, &a.Summary)
+		a.TenantID = tenant
 		a.CreatedAt = iso(created)
 		items = append(items, a)
 	}
@@ -516,23 +603,23 @@ func (s *server) queryAudits(ctx context.Context, target string) ([]auditEvent, 
 }
 
 func (s *server) getAppConfig(c *gin.Context) {
-	view, err := s.appConfigView(c.Request.Context())
+	view, err := s.appConfigView(c.Request.Context(), tenantID(c))
 	if err != nil {
 		problem(c, 500, "CONFIG_QUERY_FAILED", "Unable to load app config")
 		return
 	}
 	c.JSON(200, view)
 }
-func (s *server) appConfigView(ctx context.Context) (gin.H, error) {
+func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error) {
 	var raw []byte
 	var version int
 	var updatedBy string
 	var updated time.Time
-	err := s.db.QueryRowContext(ctx, `SELECT config_value,version,updated_by,updated_at FROM app_configs WHERE config_key='mobile-bootstrap'`).Scan(&raw, &version, &updatedBy, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT config_value,version,updated_by,updated_at FROM app_configs WHERE tenant_id=? AND config_key='mobile-bootstrap'`, tenant).Scan(&raw, &version, &updatedBy, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		raw = []byte(initialConfig)
 		now := time.Now().UTC()
-		_, err = s.db.ExecContext(ctx, `INSERT INTO app_configs(config_key,config_value,version,updated_by,updated_at) VALUES('mobile-bootstrap',?,1,'system-bootstrap',?)`, raw, now)
+		_, err = s.db.ExecContext(ctx, `INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,'mobile-bootstrap',?,1,'system-bootstrap',?)`, tenant, raw, now)
 		if err != nil {
 			return nil, err
 		}
@@ -567,7 +654,7 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE config_key='mobile-bootstrap' AND version=?`, raw, actor(c), now, body.ExpectedVersion)
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key='mobile-bootstrap' AND version=?`, raw, actor(c), now, tenantID(c), body.ExpectedVersion)
 	if err != nil {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
 		return
@@ -577,12 +664,12 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		problem(c, 409, "STALE_APP_CONFIG", "App config changed since it was loaded; refresh and retry")
 		return
 	}
-	event := newAudit(actor(c), "config_update", "app-config", "mobile-bootstrap", body.Reason, requestID(c), map[string]any{"status": "active", "databaseVersionBefore": body.ExpectedVersion, "databaseVersionAfter": body.ExpectedVersion + 1, "configVersion": body.Config["configVersion"]})
+	event := newAudit(tenantID(c), actor(c), "config_update", "app-config", "mobile-bootstrap", body.Reason, requestID(c), map[string]any{"status": "active", "databaseVersionBefore": body.ExpectedVersion, "databaseVersionAfter": body.ExpectedVersion + 1, "configVersion": body.Config["configVersion"]})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
 		return
 	}
-	view, _ := s.appConfigView(c.Request.Context())
+	view, _ := s.appConfigView(c.Request.Context(), tenantID(c))
 	view["status"] = "active"
 	view["savedAt"] = iso(now)
 	view["actorId"] = actor(c)
@@ -591,7 +678,12 @@ func (s *server) updateAppConfig(c *gin.Context) {
 }
 
 func (s *server) bootstrap(c *gin.Context) {
-	view, err := s.appConfigView(c.Request.Context())
+	tenant, err := s.resolveTenant(c.Request.Context(), c.Query("tenant"))
+	if err != nil {
+		problem(c, 404, "TENANT_NOT_FOUND", "Tenant not found")
+		return
+	}
+	view, err := s.appConfigView(c.Request.Context(), tenant.ID)
 	if err != nil {
 		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
 		return
@@ -614,6 +706,24 @@ func (s *server) bootstrap(c *gin.Context) {
 	latest := text(updatePolicy["latestVersion"], "1.1.0")
 	minimum := text(updatePolicy["minSupportedVersion"], "0.9.0")
 	actionURL := s.actionURL(platform, distribution)
+	var artifactID any
+	var artifactSHA any
+	var artifactSize any
+	releaseNotes := []string{"远程语言与主题配置", "统一升级决策"}
+	applicationID := strings.TrimSpace(c.GetHeader("x-application-id"))
+	if applicationID == "" {
+		applicationID = "dex-mobile"
+	}
+	if platform == "android" && distribution == "direct" {
+		if active, artifact, findErr := s.activeDirectRelease(c.Request.Context(), tenant.ID, applicationID); findErr == nil {
+			latest = active.Version
+			releaseNotes = active.ReleaseNotes
+			artifactID = artifact["id"]
+			artifactSHA = artifact["sha256"]
+			artifactSize = artifact["size"]
+			actionURL = absoluteURL(c, "/v1/public/artifacts/"+fmt.Sprint(artifact["id"])+"/download")
+		}
+	}
 	decision := "none"
 	if compareVersion(version, minimum) < 0 {
 		if actionURL != "" {
@@ -629,7 +739,7 @@ func (s *server) bootstrap(c *gin.Context) {
 	theme := object(cfg["theme"])
 	features := object(cfg["features"])
 	runtime := text(c.GetHeader("x-runtime-version"), "embedded")
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "messages": messages[locale]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": []string{"远程语言与主题配置", "统一升级决策"}, "ota": gin.H{"enabled": features["otaEnabled"], "channel": text(updatePolicy["otaChannel"], s.cfg.OTAChannel), "runtimeVersion": runtime}, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "artifactId": nil, "sha256": nil, "size": nil}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "messages": messages[locale]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": gin.H{"enabled": features["otaEnabled"], "channel": text(updatePolicy["otaChannel"], s.cfg.OTAChannel), "runtimeVersion": runtime}, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "artifactId": artifactID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func (s *server) actionURL(platform, distribution string) string {
@@ -650,11 +760,11 @@ func (s *server) actionURL(platform, distribution string) string {
 
 func insertAudit(ctx context.Context, tx *sql.Tx, a auditEvent) error {
 	summary, _ := json.Marshal(a.Summary)
-	_, err := tx.ExecContext(ctx, `INSERT INTO audit_events(id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, a.ID, a.ActorID, a.Action, a.TargetType, a.TargetID, a.Reason, a.RequestID, summary, time.Now().UTC())
+	_, err := tx.ExecContext(ctx, `INSERT INTO audit_events(id,tenant_id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, a.ID, a.TenantID, a.ActorID, a.Action, a.TargetType, a.TargetID, a.Reason, a.RequestID, summary, time.Now().UTC())
 	return err
 }
-func newAudit(actor, action, targetType, targetID, reason, requestID string, summary map[string]any) auditEvent {
-	return auditEvent{ID: "audit_" + randomID(16), ActorID: actor, Action: action, TargetType: targetType, TargetID: targetID, Reason: reason, RequestID: requestID, CreatedAt: iso(time.Now()), Summary: summary}
+func newAudit(tenant, actor, action, targetType, targetID, reason, requestID string, summary map[string]any) auditEvent {
+	return auditEvent{ID: "audit_" + randomID(16), TenantID: tenant, ActorID: actor, Action: action, TargetType: targetType, TargetID: targetID, Reason: reason, RequestID: requestID, CreatedAt: iso(time.Now()), Summary: summary}
 }
 func validConfig(v map[string]any) bool {
 	if v == nil {
@@ -687,7 +797,12 @@ func problem(c *gin.Context, status int, code, detail string) {
 }
 func requestID(c *gin.Context) string          { v, _ := c.Get("requestId"); return fmt.Sprint(v) }
 func actor(c *gin.Context) string              { v, _ := c.Get("actorId"); return fmt.Sprint(v) }
+func tenantID(c *gin.Context) string           { v, _ := c.Get("tenantId"); return fmt.Sprint(v) }
 func valueFrom(c *gin.Context, key string) any { v, _ := c.Get(key); return v }
+
+func (s *server) secretBox() (*secretbox.Box, error) {
+	return secretbox.New(s.cfg.StorageMasterKey)
+}
 func randomID(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

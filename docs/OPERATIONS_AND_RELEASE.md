@@ -121,3 +121,24 @@ bootstrap 根据以下输入求值：
 - 凭证/签名密钥疑似泄露。
 
 每份 runbook 包含影响确认、立即止损、诊断查询、恢复、数据核对、沟通和复盘责任。
+
+## 10. 多租户对象存储上线检查
+
+- 每个租户使用独立 bucket 或至少由服务端强制生成的 `tenants/<tenantId>/` 前缀；IAM policy 同时限制 bucket、prefix、Get/Put/List 权限，禁止 ListAllMyBuckets 和删除生产 Artifact。
+- bucket CORS 只允许 RN-Admin 的 HTTPS origin、`PUT`/`HEAD` 和 `content-type` header。AWS S3 示例：
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://console.anyfun.win"],
+    "AllowedMethods": ["PUT", "HEAD"],
+    "AllowedHeaders": ["content-type"],
+    "ExposeHeaders": ["etag"],
+    "MaxAgeSeconds": 900
+  }
+]
+```
+
+- `STORAGE_MASTER_KEY` 用 `openssl rand -base64 32` 生成并放入部署 secret；备份后再写入生产，不能放 MySQL。轮换前必须实现逐版本解密、重加密和核对，禁止直接替换环境值。
+- 先在管理端保存配置，再执行“测试连接”；随后用非生产签名 APK 验证直传、finalize、拒绝错误 signer、预发布、激活、公开 latest metadata、307 下载与覆盖安装。
+- 激活前确认 public CDN base URL 指向同一不可变 object key；未配置 CDN 时验证 presigned GET 的 TTL、限速和日志不会泄露 query signature。

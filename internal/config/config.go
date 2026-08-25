@@ -39,6 +39,11 @@ type Config struct {
 	MySQLInitMaxAttempts       int
 	MySQLInitRetryDelay        int
 	MySQLAutoMigrate           bool
+	StorageMasterKey           string
+	ArtifactMaxSizeBytes       int64
+	ArtifactUploadTTL          int
+	ArtifactDownloadTTL        int
+	ArtifactVerifyTimeout      int
 	OTAChannel                 string
 	AndroidStoreURL            string
 	AndroidDirectURL           string
@@ -78,6 +83,11 @@ func Load() (Config, error) {
 		MySQLInitMaxAttempts:       integer("MYSQL_INIT_MAX_ATTEMPTS", 3),
 		MySQLInitRetryDelay:        integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
 		MySQLAutoMigrate:           boolean("MYSQL_AUTO_MIGRATE", true),
+		StorageMasterKey:           strings.TrimSpace(os.Getenv("STORAGE_MASTER_KEY")),
+		ArtifactMaxSizeBytes:       int64(integer("ARTIFACT_MAX_SIZE_MB", 512)) * 1024 * 1024,
+		ArtifactUploadTTL:          integer("ARTIFACT_UPLOAD_TTL_SECONDS", 900),
+		ArtifactDownloadTTL:        integer("ARTIFACT_DOWNLOAD_TTL_SECONDS", 300),
+		ArtifactVerifyTimeout:      integer("ARTIFACT_VERIFY_TIMEOUT_SECONDS", 300),
 		OTAChannel:                 value("OTA_CHANNEL", "production"),
 		AndroidStoreURL:            os.Getenv("ANDROID_STORE_URL"),
 		AndroidDirectURL:           os.Getenv("ANDROID_DIRECT_URL"),
@@ -94,6 +104,9 @@ func Load() (Config, error) {
 		if len(cfg.CORSOrigins) == 1 && cfg.CORSOrigins[0] == "*" {
 			return Config{}, errors.New("CORS_ORIGINS must be explicit in production")
 		}
+		if cfg.StorageMasterKey == "" {
+			return Config{}, errors.New("STORAGE_MASTER_KEY is required in production")
+		}
 	}
 	if cfg.MySQLPort < 1 || cfg.MySQLPort > 65535 || cfg.MySQLConnectionLimit < 1 ||
 		cfg.MySQLMaxIdleConnections < 0 || cfg.MySQLMaxIdleConnections > cfg.MySQLConnectionLimit ||
@@ -107,6 +120,11 @@ func Load() (Config, error) {
 	}
 	if cfg.AdminSessionTTL < 300 || cfg.AdminLoginMax < 3 || cfg.AdminLoginWindow < 60 {
 		return Config{}, errors.New("invalid admin session or rate-limit configuration")
+	}
+	if cfg.ArtifactMaxSizeBytes < 1024*1024 || cfg.ArtifactMaxSizeBytes > 2*1024*1024*1024 ||
+		cfg.ArtifactUploadTTL < 60 || cfg.ArtifactUploadTTL > 3600 || cfg.ArtifactDownloadTTL < 30 || cfg.ArtifactDownloadTTL > 3600 ||
+		cfg.ArtifactVerifyTimeout < 30 || cfg.ArtifactVerifyTimeout > 1800 {
+		return Config{}, errors.New("invalid artifact storage configuration")
 	}
 	return cfg, nil
 }

@@ -15,11 +15,14 @@ Nginx.
    `CORS_ORIGINS` to their HTTPS origins, set `PUBLIC_API_DOMAIN`, and keep
    `ADMIN_COOKIE_SECURE=true`. Store a Cloudflare API token with
    only Zone Read and DNS Edit access to the target zone in `CLOUDFLARE_API_TOKEN`.
-4. Production defaults to `MYSQL_AUTO_MIGRATE=false`. Run schema changes as a
-   controlled deployment step; enable startup migration only for an isolated
-   initialization environment, then disable it again.
-5. Run `./start.sh`.
-6. Check the deployment with `./status.sh`.
+4. Production defaults to `MYSQL_AUTO_MIGRATE=false`. `start.sh` runs the
+   forward-only `migrate` command before starting containers; enable startup
+   migration only for an isolated initialization environment, then disable it again.
+5. Generate `STORAGE_MASTER_KEY` with `openssl rand -base64 32`. It encrypts tenant
+   S3 credentials in MySQL and must be backed up. Losing or directly replacing it
+   makes stored credentials unreadable.
+6. Run `./start.sh`.
+7. Check the deployment with `./status.sh`.
 
 The isolated `rn-foundation-gateway` Caddy container binds ports 80/443, routes
 the admin UI and Go API by hostname, and uses Cloudflare DNS-01 to automatically
