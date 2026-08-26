@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -41,6 +42,7 @@ type Config struct {
 	MySQLAutoMigrate           bool
 	StorageMasterKey           string
 	ArtifactMaxSizeBytes       int64
+	ArtifactUploadMode         string
 	ArtifactUploadTTL          int
 	ArtifactDownloadTTL        int
 	ArtifactVerifyTimeout      int
@@ -85,6 +87,7 @@ func Load() (Config, error) {
 		MySQLAutoMigrate:           boolean("MYSQL_AUTO_MIGRATE", true),
 		StorageMasterKey:           strings.TrimSpace(os.Getenv("STORAGE_MASTER_KEY")),
 		ArtifactMaxSizeBytes:       int64(integer("ARTIFACT_MAX_SIZE_MB", 512)) * 1024 * 1024,
+		ArtifactUploadMode:         value("ARTIFACT_UPLOAD_MODE", "direct"),
 		ArtifactUploadTTL:          integer("ARTIFACT_UPLOAD_TTL_SECONDS", 900),
 		ArtifactDownloadTTL:        integer("ARTIFACT_DOWNLOAD_TTL_SECONDS", 300),
 		ArtifactVerifyTimeout:      integer("ARTIFACT_VERIFY_TIMEOUT_SECONDS", 300),
@@ -121,12 +124,26 @@ func Load() (Config, error) {
 	if cfg.AdminSessionTTL < 300 || cfg.AdminLoginMax < 3 || cfg.AdminLoginWindow < 60 {
 		return Config{}, errors.New("invalid admin session or rate-limit configuration")
 	}
+	if cfg.StorageMasterKey != "" && !validMasterKey(cfg.StorageMasterKey) {
+		return Config{}, errors.New("STORAGE_MASTER_KEY must be a base64-encoded 32-byte key")
+	}
+	if cfg.ArtifactUploadMode != "direct" && cfg.ArtifactUploadMode != "proxy" {
+		return Config{}, errors.New("ARTIFACT_UPLOAD_MODE must be direct or proxy")
+	}
 	if cfg.ArtifactMaxSizeBytes < 1024*1024 || cfg.ArtifactMaxSizeBytes > 2*1024*1024*1024 ||
 		cfg.ArtifactUploadTTL < 60 || cfg.ArtifactUploadTTL > 3600 || cfg.ArtifactDownloadTTL < 30 || cfg.ArtifactDownloadTTL > 3600 ||
 		cfg.ArtifactVerifyTimeout < 30 || cfg.ArtifactVerifyTimeout > 1800 {
 		return Config{}, errors.New("invalid artifact storage configuration")
 	}
 	return cfg, nil
+}
+
+func validMasterKey(encoded string) bool {
+	key, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		key, err = base64.StdEncoding.DecodeString(encoded)
+	}
+	return err == nil && len(key) == 32
 }
 
 func (c Config) MySQLAddress() string { return fmt.Sprintf("%s:%d", c.MySQLHost, c.MySQLPort) }

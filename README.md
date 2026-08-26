@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-当前已进入可运行基座阶段，包含 `GET /v1/mobile/bootstrap`、多租户控制面和完整 Android Direct APK 发布链路。发布、审计、国际化、主题、Feature Flag、升级策略、S3 配置与 Artifact 元数据由 MySQL 持久化；APK 由浏览器直传 S3/R2/MinIO，服务端计算 hash、解析 manifest、验证签名后才能进入发布状态机。
+当前已进入可运行基座阶段，包含 `GET /v1/mobile/bootstrap`、基于请求域名的多租户上下文和统一安装包发布链路。发布记录、国际化、主题、Feature Flag、升级策略和租户对象存储配置均由 MySQL 持久化；管理端直传 S3/R2/MinIO，服务端计算 hash、解析 Android APK 身份后，统一写入 `app_releases` 并进入发布状态机。开发阶段已删除旧 Application、Artifact 和独立 Storage Config 模型。
 
 ## 本地运行
 
@@ -21,7 +21,7 @@ go run ./cmd/server
 - MySQL：通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置；`MYSQL_CHARSET`、`MYSQL_TIMEZONE`、`MYSQL_PARSE_TIME` 控制字符集、日期时区和日期解析；测试使用 `<database>_test`
 - MySQL 连接行为：最大/空闲连接数、连接生命周期、空闲回收、查询/读写/初始化超时与有限重试均由 `MYSQL_*` 配置。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。生产环境保持 `MYSQL_AUTO_MIGRATE=false`，迁移作为独立发布步骤执行。
 - 数据迁移：`go run ./cmd/server migrate` 执行带数据库锁和 ledger 的只向前迁移；历史数据自动归入 `default` 租户。
-- Artifact：`STORAGE_MASTER_KEY` 必须是 32 字节随机值的 Base64，用于 AES-256-GCM 加密租户对象存储凭证；`ARTIFACT_*` 控制 APK 大小、上传/下载 URL 有效期和校验超时。
+- Release storage：`STORAGE_MASTER_KEY` 必须是 32 字节随机值的 Base64，只用于加密数据库中的租户对象存储凭证；Endpoint、Region、Bucket、Prefix 与凭证通过管理端写入 `app_configs.release.storage`。`ARTIFACT_UPLOAD_MODE=direct` 使用浏览器预签名直传并要求 Bucket CORS，`proxy` 则由 RN-Server 流式中转到对象存储、不要求浏览器访问 Bucket；其余 `ARTIFACT_*` 控制安装包大小、上传/下载有效期和校验超时。
 
 最低检查为 `gofmt`、`go vet ./...`、`go test -race ./...` 和 `go build ./cmd/server`。
 
@@ -37,6 +37,6 @@ go run ./cmd/server
 - [管理端浏览器会话门禁决策](docs/decisions/0004-admin-browser-session.md)
 - [Go 服务端运行时决策](docs/decisions/0005-go-server-runtime.md)
 - [Caddy HTTPS 网关决策](docs/decisions/0006-caddy-tls-gateway.md)
-- [多租户 APK 与对象存储决策](docs/decisions/0007-multitenant-apk-artifact-storage.md)
+- [域名租户与 Release-Centric 简化决策](docs/decisions/0008-domain-release-centric-simplification.md)
 
 所有参与者在改代码前必须先阅读 [AGENTS.md](AGENTS.md)。

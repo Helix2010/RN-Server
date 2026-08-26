@@ -83,34 +83,22 @@ docs/                     # 当前规范和仍有效的 ADR
 
 ### 4.3 App Release
 
-核心模型：
+核心事实源只有一张 `app_releases`：
 
 ```text
-Application
-  id, bundleId/applicationId, platform
-
-Release
-  semanticVersion, buildNumber, runtimeVersion, status
-
-Artifact
-  releaseId, channel(store/direct/mdm/ota), objectKey/actionUrl,
-  size, sha256, codeSigningFingerprint, signature, minOs
-
-Rollout
-  artifactId, audience, percentage, startsAt, pausedAt, stopRules
-
-UpdatePolicy
-  app/platform/distribution, minSupported, latest, graceEndsAt,
-  recommendation, messageKey, activeRollout
+app_releases
+  tenant_id, platform(android/ios/harmony), version, build_number,
+  runtime_version, status, release_notes, object_key, file_name,
+  expected_size, file_size, sha256, file_metadata, published_at
 ```
 
 约束：
 
-- `app + platform + distribution + buildNumber` 唯一且发布后不可变。
-- artifact 上传后服务端计算 hash；客户端提供的 hash 不能成为事实源。
+- `tenant + platform + buildNumber` 唯一且发布后不可变。
+- 安装包上传后服务端计算 hash；客户端提供的 hash 不能成为事实源。
 - 当前激活需显式确认、reason 和 audit event；RBAC 与双人审批暂缓。提升 `minSupported` 仍是独立高风险动作。
-- rollout assignment 使用稳定匿名 installation bucket，确保同一设备结果稳定；安全紧急策略可覆盖。
-- OTA artifact 必须与 runtimeVersion 匹配并有 manifest 签名。
+- 当前开发阶段只做全量 active，不实现灰度 assignment。
+- OTA 资源必须与 runtimeVersion 匹配并有 manifest 签名。
 - direct APK 下载用短时 URL；MDM/store 只返回已批准的 action URL。
 
 ### 4.4 Feature Flags

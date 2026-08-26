@@ -37,14 +37,13 @@ metrics label 禁止 userId/requestId/完整 URL 等无限基数值。
 ## 3. Release 状态机
 
 ```text
-draft -> uploaded -> verified -> staged -> active -> paused -> completed
-                    \-> rejected                 \-> rolled_back
+uploaded -> verified -> active -> paused -> completed
+                    \-> rejected       \-> rolled_back
 ```
 
 - uploaded：对象存在但未可信；服务端流式计算 size/hash，提取 Android/iOS/OTA 元数据。
 - verified：签名、app identity、build/runtime、malware/策略检查通过。
-- staged：仅 staging/internal audience 可见，完成安装/启动/回滚测试。
-- active：生产 rollout 生效。
+- active：官网全量分发。
 - paused：不再分配新设备，已下载设备行为由客户端策略决定。
 - rolled_back：指向上一稳定 artifact/embedded bundle；记录原因和审计。
 
@@ -90,8 +89,7 @@ bootstrap 根据以下输入求值：
 
 ## 6. 灰度、暂停与回滚
 
-- rollout bucket 通过稳定 hash `(releaseSalt, installationId)` 计算，不使用每次请求随机数。
-- percentage 扩大是审计操作；减少比例不会从已采用设备卸载版本。
+- 当前开发阶段不实现灰度 bucket 和比例分配。
 - feature flag 可关闭业务功能，但不能修复原生 ABI 不兼容；两者责任分开。
 - OTA 回滚发布上一稳定 update 或让客户端回到 embedded；全量包通常不能主动降级，只能发布更高 build 的修复包。
 - 提升 minSupported 前先证明所有目标渠道可安装、覆盖率达标且客服/应急通道就绪。
@@ -123,6 +121,8 @@ bootstrap 根据以下输入求值：
 每份 runbook 包含影响确认、立即止损、诊断查询、恢复、数据核对、沟通和复盘责任。
 
 ## 10. 多租户对象存储上线检查
+
+- 上传模式由 `ARTIFACT_UPLOAD_MODE` 控制：`direct` 使用浏览器预签名 PUT，吞吐更高但 Bucket 必须允许管理端 Origin；`proxy` 由 RN-Server 将请求体流式写入对象存储，适用于暂时无法配置 CORS 的环境。代理模式不会把完整安装包读入内存，但会占用 API 带宽和一条长连接。
 
 - 每个租户使用独立 bucket 或至少由服务端强制生成的 `tenants/<tenantId>/` 前缀；IAM policy 同时限制 bucket、prefix、Get/Put/List 权限，禁止 ListAllMyBuckets 和删除生产 Artifact。
 - bucket CORS 只允许 RN-Admin 的 HTTPS origin、`PUT`/`HEAD` 和 `content-type` header。AWS S3 示例：

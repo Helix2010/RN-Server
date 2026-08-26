@@ -1,6 +1,7 @@
 package objectstore
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ type Config struct {
 
 type Client interface {
 	PresignPut(context.Context, string, string, int64, time.Duration) (string, map[string]string, error)
+	Put(context.Context, string, io.Reader, int64, string) error
 	PresignGet(context.Context, string, time.Duration, string) (string, error)
 	Head(context.Context, string) (int64, string, error)
 	Get(context.Context, string) (io.ReadCloser, error)
@@ -85,6 +87,20 @@ func (c *s3Client) PresignPut(ctx context.Context, key, contentType string, size
 	return output.URL, map[string]string{"content-type": contentType}, nil
 }
 
+func (c *s3Client) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(c.bucket),
+		Key:           aws.String(key),
+		Body:          body,
+		ContentLength: aws.Int64(size),
+		ContentType:   aws.String(contentType),
+	})
+	if err != nil {
+		return fmt.Errorf("put artifact: %w", err)
+	}
+	return nil
+}
+
 func (c *s3Client) PresignGet(ctx context.Context, key string, ttl time.Duration, downloadName string) (string, error) {
 	disposition := fmt.Sprintf(`attachment; filename="%s"`, strings.ReplaceAll(downloadName, `"`, ""))
 	output, err := c.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
@@ -115,9 +131,21 @@ func (c *s3Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 }
 
 func (c *s3Client) Test(ctx context.Context) error {
-	_, err := c.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(c.bucket), MaxKeys: aws.Int32(1)})
+	probeKey := ".rn-foundation-storage-check"
+	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(probeKey),
+		Body:   bytes.NewReader(nil),
+	})
 	if err != nil {
-		return fmt.Errorf("storage connection test failed: %w", err)
+		return fmt.Errorf("storage write test failed: %w", err)
+	}
+	_, err = c.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(probeKey),
+	})
+	if err != nil {
+		return fmt.Errorf("storage read test failed: %w", err)
 	}
 	return nil
 }

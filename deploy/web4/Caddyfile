@@ -11,16 +11,8 @@
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 	}
 
-	@api host {$PUBLIC_API_DOMAIN:api.anyfun.win}
+	@api path /v1/* /health/* /docs /openapi.json
 	handle @api {
-		reverse_proxy server:3000
-	}
-
-	@console_api {
-		host {$PUBLIC_CONSOLE_DOMAIN:console.anyfun.win}
-		path /v1/* /health/* /docs /openapi.json
-	}
-	handle @console_api {
 		reverse_proxy server:3000
 	}
 
