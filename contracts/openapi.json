@@ -15,7 +15,7 @@
     "/v1/admin/releases/{id}/upload": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "put": {"requestBody": {"required": true, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}, "responses": {"200": {"description": "Release package stored by RN-Server"}}}},
     "/v1/admin/releases/{id}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "get": {"responses": {"200": {"description": "Release detail"}}}},
     "/v1/admin/releases/{id}/finalize": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "post": {"responses": {"200": {"description": "Verified release"}}}},
-    "/v1/admin/releases/{id}/{action}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}, {"name": "action", "in": "path", "required": true, "schema": {"type": "string", "enum": ["publish", "pause", "rollback"]}}], "post": {"responses": {"201": {"description": "Transitioned release"}}}},
+    "/v1/admin/releases/{id}/{action}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}, {"name": "action", "in": "path", "required": true, "schema": {"type": "string", "enum": ["publish", "pause"]}}], "post": {"responses": {"201": {"description": "Transitioned release"}}}},
     "/v1/admin/app-config": {"get": {"responses": {"200": {"description": "App config"}}}, "patch": {"responses": {"200": {"description": "Saved app config"}}}},
     "/v1/admin/release-storage": {"get": {"responses": {"200": {"description": "Masked release storage config"}}}, "put": {"responses": {"200": {"description": "Saved release storage config"}}}},
     "/v1/admin/release-storage/test": {"post": {"responses": {"200": {"description": "Storage test result"}}}},

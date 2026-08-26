@@ -40,3 +40,9 @@ func TestSafeDownloadName(t *testing.T) {
 		t.Fatalf("safeDownloadName fallback = %q", got)
 	}
 }
+
+func TestReleaseTransitionsDoNotExposeRollback(t *testing.T) {
+	if _, exists := transitions["rollback"]; exists {
+		t.Fatal("full-package rollback must not be exposed without restoring a previous release")
+	}
+}

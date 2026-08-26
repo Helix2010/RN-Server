@@ -424,7 +424,7 @@ func (s *server) findRelease(ctx context.Context, tenant, id string) (release, e
 	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id))
 }
 
-var transitions = map[string]map[string]string{"publish": {"verified": "active", "paused": "active"}, "pause": {"active": "paused"}, "rollback": {"active": "rolled_back", "paused": "rolled_back"}}
+var transitions = map[string]map[string]string{"publish": {"verified": "active", "paused": "active"}, "pause": {"active": "paused"}}
 
 func (s *server) releaseAction(c *gin.Context) {
 	var body struct {

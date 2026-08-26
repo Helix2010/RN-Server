@@ -32,20 +32,20 @@ metrics label 禁止 userId/requestId/完整 URL 等无限基数值。
 - App crash-free/ANR（来自客户端平台）；
 - 发布后错误率相对上一稳定版本的变化。
 
-告警必须指向 runbook 和 owner，按用户影响而不是每个异常报警。发布系统的 stop rule 可因错误率、启动失败、crash-free 回归自动暂停 rollout，但自动回滚是否启用需通过演练。
+告警必须指向 runbook 和 owner，按用户影响而不是每个异常报警。发布系统的 stop rule 可因错误率、启动失败、crash-free 回归暂停发布。
 
 ## 3. Release 状态机
 
 ```text
 uploaded -> verified -> active -> paused -> completed
-                    \-> rejected       \-> rolled_back
+                    \-> rejected
 ```
 
 - uploaded：对象存在但未可信；服务端流式计算 size/hash，提取 Android/iOS/OTA 元数据。
 - verified：签名、app identity、build/runtime、malware/策略检查通过。
 - active：官网全量分发。
 - paused：不再分配新设备，已下载设备行为由客户端策略决定。
-- rolled_back：指向上一稳定 artifact/embedded bundle；记录原因和审计。
+- 全量安装包不提供“自动回滚”：需要停止当前版本时使用暂停；修复必须发布更高 build 的新安装包。
 
 已 active 的 artifact 永不原地替换。修复必须产生新 artifact/build/update id。
 
@@ -87,11 +87,11 @@ bootstrap 根据以下输入求值：
 - runtimeVersion 必须严格匹配；资源 URL 内容寻址并不可变。
 - 更新上传后跑静态检查、启动 smoke 和真机 staging；生产先 canary。
 
-## 6. 灰度、暂停与回滚
+## 6. 灰度与暂停
 
 - 当前开发阶段不实现灰度 bucket 和比例分配。
 - feature flag 可关闭业务功能，但不能修复原生 ABI 不兼容；两者责任分开。
-- OTA 回滚发布上一稳定 update 或让客户端回到 embedded；全量包通常不能主动降级，只能发布更高 build 的修复包。
+- OTA 可独立设计恢复上一稳定 update；当前全量安装包发布模块不提供回滚，必须发布更高 build 的修复包。
 - 提升 minSupported 前先证明所有目标渠道可安装、覆盖率达标且客服/应急通道就绪。
 
 ## 7. 备份与灾难恢复
@@ -104,7 +104,7 @@ bootstrap 根据以下输入求值：
 
 ## 8. 管理控制面
 
-发布管理端必须提供：draft preview、artifact verification、受众/比例、兼容矩阵、minSupported 风险提示、暂停/回滚、审计查询。当前阶段不加入 RBAC 与双人审批；高风险操作仍必须显式确认并填写 reason，不提供无上下文的“立即全量强更”按钮。
+发布管理端必须提供：draft preview、artifact verification、受众/比例、兼容矩阵、minSupported 风险提示、暂停、审计查询。当前阶段不加入 RBAC 与双人审批；高风险操作仍必须显式确认并填写 reason，不提供无上下文的“立即全量强更”按钮。
 
 ## 9. Runbook 最小集合
 
