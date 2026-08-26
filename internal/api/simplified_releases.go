@@ -176,15 +176,38 @@ func (s *server) uploadRelease(c *gin.Context) {
 	}
 	limited := http.MaxBytesReader(c.Writer, c.Request.Body, expected)
 	body := &countedReader{reader: io.LimitReader(limited, expected)}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
-	defer cancel()
-	if err := client.Put(ctx, key, body, expected, contentType); err != nil {
-		slog.Error("release package upload failed", "tenant", tenant, "releaseId", id, "objectKey", key, "expectedSize", expected, "error", err)
-		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", "Unable to store the release package")
+	temporary, err := os.CreateTemp("", "rn-upload-*")
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_UPLOAD_FAILED", "Unable to prepare the release package")
+		return
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := io.Copy(temporary, body); err != nil {
+		_ = temporary.Close()
+		problem(c, http.StatusBadRequest, "RELEASE_UPLOAD_FAILED", "Unable to read the release package")
 		return
 	}
 	if body.count != expected {
+		_ = temporary.Close()
 		problem(c, http.StatusUnprocessableEntity, "RELEASE_UPLOAD_SIZE_MISMATCH", "Uploaded file size does not match the release declaration")
+		return
+	}
+	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
+		_ = temporary.Close()
+		problem(c, http.StatusInternalServerError, "RELEASE_UPLOAD_FAILED", "Unable to prepare the release package")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
+	defer cancel()
+	if err := client.Put(ctx, key, temporary, expected, contentType); err != nil {
+		slog.Error("release package upload failed", "tenant", tenant, "releaseId", id, "objectKey", key, "expectedSize", expected, "error", err)
+		_ = temporary.Close()
+		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", "Unable to store the release package")
+		return
+	}
+	if err := temporary.Close(); err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_UPLOAD_FAILED", "Unable to finalize the release package")
 		return
 	}
 	storedSize, _, err := client.Head(ctx, key)
