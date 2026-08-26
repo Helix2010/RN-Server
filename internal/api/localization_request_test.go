@@ -35,3 +35,12 @@ func TestDecodeLanguageSettingsAcceptsSchemaVersion(t *testing.T) {
 		t.Fatalf("decoded request = %+v", body)
 	}
 }
+
+func TestNormalizeMessageKeyUsesCanonicalLowercase(t *testing.T) {
+	if got := normalizeMessageKey("  Action.CheckUpdate  "); got != "action.checkupdate" {
+		t.Fatalf("normalizeMessageKey() = %q", got)
+	}
+	if !messageKeyPattern.MatchString(normalizeMessageKey("Wallet.Connect_2")) {
+		t.Fatal("normalized message key should satisfy the storage format")
+	}
+}

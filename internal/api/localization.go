@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -28,7 +29,7 @@ const (
 )
 
 var languageCodePattern = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?$`)
-var messageKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`)
+var messageKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,254}$`)
 
 type languageOverride struct {
 	Label      *string `json:"label,omitempty"`
@@ -90,9 +91,10 @@ type languageDocumentValue struct {
 }
 
 type languageDocumentItem struct {
-	Key    string                           `json:"key"`
-	Meta   string                           `json:"meta"`
-	Values map[string]languageDocumentValue `json:"values"`
+	Key     string                           `json:"key"`
+	Meta    string                           `json:"meta"`
+	Enabled bool                             `json:"enabled"`
+	Values  map[string]languageDocumentValue `json:"values"`
 }
 
 func defaultStoredLanguagesConfig() storedLanguagesConfig {
@@ -116,6 +118,10 @@ func defaultStoredLanguagesConfig() storedLanguagesConfig {
 
 func validLanguageCode(code string) bool {
 	return languageCodePattern.MatchString(code) && !strings.Contains(code, "_")
+}
+
+func normalizeMessageKey(key string) string {
+	return strings.ToLower(strings.TrimSpace(key))
 }
 
 func applyLanguageOverride(base effectiveLanguage, value languageOverride, source string) effectiveLanguage {
@@ -284,28 +290,44 @@ func (s *server) getLocalization(c *gin.Context) {
 }
 
 func (s *server) queryLanguageDocuments(ctx context.Context, tenant string, settings effectiveLanguagesConfig) ([]languageDocumentItem, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT CAST(tenant_id AS CHAR),lang,`+"`key`"+`,content,meta FROM language_document WHERE tenant_id IN (0,?) AND type=? AND deleted=0 ORDER BY `+"`key`"+`,lang,tenant_id`, tenant, appLanguageType)
+	rows, err := s.db.QueryContext(ctx, `SELECT CAST(tenant_id AS CHAR),lang,`+"`key`"+`,content,meta,deleted FROM language_document WHERE tenant_id IN (0,?) AND type=? ORDER BY `+"`key`"+`,lang,tenant_id`, tenant, appLanguageType)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	type rawValue struct{ content, source, meta string }
-	byKey := map[string]map[string]rawValue{}
+	type rawValue struct {
+		content, source, meta string
+		deleted               bool
+	}
+	type rawPair struct {
+		global *rawValue
+		tenant *rawValue
+	}
+	byKey := map[string]map[string]rawPair{}
 	for rows.Next() {
 		var source, language, key, content, meta string
-		if err := rows.Scan(&source, &language, &key, &content, &meta); err != nil {
+		var deleted bool
+		if err := rows.Scan(&source, &language, &key, &content, &meta, &deleted); err != nil {
 			return nil, err
 		}
 		if !validLanguageCode(language) {
 			return nil, fmt.Errorf("invalid language code %q in language_document", language)
 		}
+		key = normalizeMessageKey(key)
+		if source == "0" && deleted {
+			continue
+		}
 		if byKey[key] == nil {
-			byKey[key] = map[string]rawValue{}
+			byKey[key] = map[string]rawPair{}
 		}
-		current, exists := byKey[key][language]
-		if !exists || source == tenant || current.source == "0" {
-			byKey[key][language] = rawValue{content: content, source: source, meta: meta}
+		pair := byKey[key][language]
+		value := rawValue{content: content, source: source, meta: meta, deleted: deleted}
+		if source == tenant {
+			pair.tenant = &value
+		} else {
+			pair.global = &value
 		}
+		byKey[key][language] = pair
 	}
 	keys := make([]string, 0, len(byKey))
 	for key := range byKey {
@@ -314,10 +336,24 @@ func (s *server) queryLanguageDocuments(ctx context.Context, tenant string, sett
 	sort.Strings(keys)
 	items := make([]languageDocumentItem, 0, len(keys))
 	for _, key := range keys {
-		item := languageDocumentItem{Key: key, Values: map[string]languageDocumentValue{}}
+		item := languageDocumentItem{Key: key, Enabled: true, Values: map[string]languageDocumentValue{}}
+		disabledLanguages := 0
 		for code := range settings.Languages {
-			value, ok := byKey[key][code]
-			if ok {
+			if value := byKey[key][code].tenant; value != nil && value.deleted {
+				disabledLanguages++
+			}
+		}
+		item.Enabled = disabledLanguages == 0
+		for code := range settings.Languages {
+			pair := byKey[key][code]
+			value := pair.tenant
+			if item.Enabled && value != nil && value.deleted {
+				value = pair.global
+			}
+			if value == nil {
+				value = pair.global
+			}
+			if value != nil {
 				item.Values[code] = languageDocumentValue{Content: value.content, Source: mapSource(value.source, tenant), Missing: false}
 				if item.Meta == "" {
 					item.Meta = value.meta
@@ -472,14 +508,18 @@ func intValue(value *int) int {
 	return *value
 }
 
+type languageDocumentInput struct {
+	Key     string             `json:"key"`
+	Meta    string             `json:"meta"`
+	Values  map[string]*string `json:"values"`
+	Enabled *bool              `json:"enabled,omitempty"`
+	Create  bool               `json:"create,omitempty"`
+}
+
 func (s *server) updateLocalizationDocuments(c *gin.Context) {
 	var body struct {
-		Documents []struct {
-			Key    string             `json:"key"`
-			Meta   string             `json:"meta"`
-			Values map[string]*string `json:"values"`
-		} `json:"documents"`
-		Reason string `json:"reason"`
+		Documents []languageDocumentInput `json:"documents"`
+		Reason    string                  `json:"reason"`
 	}
 	if decode(c, &body) != nil || len(strings.TrimSpace(body.Reason)) < 3 || len(body.Documents) == 0 {
 		problem(c, 400, "INVALID_LANGUAGE_DOCUMENTS", "documents and reason are required")
@@ -495,6 +535,15 @@ func (s *server) updateLocalizationDocuments(c *gin.Context) {
 		problem(c, 500, "LOCALIZATION_QUERY_FAILED", "Unable to load language settings")
 		return
 	}
+	effectiveDocuments, err := s.queryLanguageDocuments(c.Request.Context(), tenantID(c), settings)
+	if err != nil {
+		problem(c, 500, "LOCALIZATION_QUERY_FAILED", "Unable to load language documents")
+		return
+	}
+	existingDocuments := make(map[string]languageDocumentItem, len(effectiveDocuments))
+	for _, document := range effectiveDocuments {
+		existingDocuments[normalizeMessageKey(document.Key)] = document
+	}
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		problem(c, 500, "LANGUAGE_DOCUMENT_SAVE_FAILED", "Unable to save language documents")
@@ -503,11 +552,75 @@ func (s *server) updateLocalizationDocuments(c *gin.Context) {
 	defer tx.Rollback()
 	changed := 0
 	dirtyLanguages := map[string]bool{}
+	requestKeys := map[string]bool{}
 	for _, document := range body.Documents {
-		key := strings.TrimSpace(document.Key)
-		if !messageKeyPattern.MatchString(key) || len(document.Meta) > 255 {
+		key := normalizeMessageKey(document.Key)
+		if !messageKeyPattern.MatchString(key) || len(document.Meta) > 255 || requestKeys[key] {
 			problem(c, 422, "INVALID_LANGUAGE_DOCUMENTS", "Document key or metadata is invalid")
 			return
+		}
+		requestKeys[key] = true
+		existing, exists := existingDocuments[key]
+		if document.Create {
+			var exists int
+			err = tx.QueryRowContext(c.Request.Context(), `SELECT 1 FROM language_document WHERE tenant_id IN (0,?) AND type=? AND LOWER(`+"`key`"+`)=LOWER(?) LIMIT 1`, tenantID(c), appLanguageType, key).Scan(&exists)
+			if err == nil {
+				problem(c, http.StatusConflict, "LANGUAGE_DOCUMENT_KEY_EXISTS", "Document key already exists")
+				return
+			}
+			if err != sql.ErrNoRows {
+				problem(c, 500, "LANGUAGE_DOCUMENT_SAVE_FAILED", "Unable to verify document key")
+				return
+			}
+			fallbackValue := document.Values[settings.FallbackLanguage]
+			if fallbackValue == nil || strings.TrimSpace(*fallbackValue) == "" {
+				problem(c, 422, "INVALID_LANGUAGE_DOCUMENTS", "New document requires fallback language content")
+				return
+			}
+		} else if !exists {
+			problem(c, 422, "LANGUAGE_DOCUMENT_NOT_FOUND", "Document key does not exist")
+			return
+		}
+		if document.Enabled != nil && !*document.Enabled {
+			fallback := key
+			if value := document.Values[settings.FallbackLanguage]; value != nil && strings.TrimSpace(*value) != "" {
+				fallback = strings.TrimSpace(*value)
+			} else if value, ok := existing.Values[settings.FallbackLanguage]; ok && strings.TrimSpace(value.Content) != "" {
+				fallback = strings.TrimSpace(value.Content)
+			}
+			for code := range settings.Languages {
+				value := fallback
+				if input := document.Values[code]; input != nil && strings.TrimSpace(*input) != "" {
+					value = strings.TrimSpace(*input)
+				} else if current, ok := existing.Values[code]; ok && strings.TrimSpace(current.Content) != "" {
+					value = strings.TrimSpace(current.Content)
+				}
+				query := `INSERT INTO language_document(lang,` + "`key`" + `,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,?,?,1,?,?,?,1) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),edit=1,mtime=VALUES(mtime),deleted=1`
+				if document.Create {
+					query = `INSERT INTO language_document(lang,` + "`key`" + `,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,?,?,1,?,?,?,1)`
+				}
+				_, err = tx.ExecContext(c.Request.Context(), query, code, key, value, strings.TrimSpace(document.Meta), appLanguageType, tenantID(c), time.Now().UTC(), time.Now().UTC())
+				if err != nil {
+					if isDuplicateEntry(err) {
+						problem(c, http.StatusConflict, "LANGUAGE_DOCUMENT_KEY_EXISTS", "Document key already exists")
+					} else {
+						problem(c, 500, "LANGUAGE_DOCUMENT_SAVE_FAILED", "Unable to disable language document")
+					}
+					return
+				}
+				dirtyLanguages[code] = true
+				changed++
+			}
+			continue
+		}
+		if document.Enabled != nil && *document.Enabled && !document.Create {
+			if _, err = tx.ExecContext(c.Request.Context(), `UPDATE language_document SET deleted=0,mtime=? WHERE tenant_id=? AND `+"`key`"+`=? AND type=?`, time.Now().UTC(), tenantID(c), key, appLanguageType); err != nil {
+				problem(c, 500, "LANGUAGE_DOCUMENT_SAVE_FAILED", "Unable to enable language document")
+				return
+			}
+			for code := range settings.Languages {
+				dirtyLanguages[code] = true
+			}
 		}
 		for code, content := range document.Values {
 			if _, ok := settings.Languages[code]; !ok || !validLanguageCode(code) {
@@ -515,18 +628,26 @@ func (s *server) updateLocalizationDocuments(c *gin.Context) {
 				return
 			}
 			if content == nil {
-				_, err = tx.ExecContext(c.Request.Context(), `UPDATE language_document SET deleted=1,mtime=? WHERE tenant_id=? AND lang=? AND `+"`key`"+`=? AND type=?`, time.Now().UTC(), tenantID(c), code, key, appLanguageType)
+				_, err = tx.ExecContext(c.Request.Context(), `DELETE FROM language_document WHERE tenant_id=? AND lang=? AND `+"`key`"+`=? AND type=?`, tenantID(c), code, key, appLanguageType)
 			} else {
 				value := strings.TrimSpace(*content)
 				if value == "" || utf8.RuneCountInString(value) > 5000 {
 					problem(c, 422, "INVALID_LANGUAGE_DOCUMENTS", "Document content cannot be empty or exceed 5000 characters")
 					return
 				}
-				_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,?,?,1,?,?,?,0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),edit=1,mtime=VALUES(mtime),deleted=0`, code, key, value, strings.TrimSpace(document.Meta), appLanguageType, tenantID(c), time.Now().UTC(), time.Now().UTC())
+				query := `INSERT INTO language_document(lang,` + "`key`" + `,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,?,?,1,?,?,?,0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),edit=1,mtime=VALUES(mtime),deleted=0`
+				if document.Create {
+					query = `INSERT INTO language_document(lang,` + "`key`" + `,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,?,?,1,?,?,?,0)`
+				}
+				_, err = tx.ExecContext(c.Request.Context(), query, code, key, value, strings.TrimSpace(document.Meta), appLanguageType, tenantID(c), time.Now().UTC(), time.Now().UTC())
 			}
 			dirtyLanguages[code] = true
 			if err != nil {
-				problem(c, 500, "LANGUAGE_DOCUMENT_SAVE_FAILED", "Unable to save language documents")
+				if isDuplicateEntry(err) {
+					problem(c, http.StatusConflict, "LANGUAGE_DOCUMENT_KEY_EXISTS", "Document key already exists")
+				} else {
+					problem(c, 500, "LANGUAGE_DOCUMENT_SAVE_FAILED", "Unable to save language documents")
+				}
 				return
 			}
 			changed++
@@ -543,6 +664,11 @@ func (s *server) updateLocalizationDocuments(c *gin.Context) {
 	}
 	view, _ := s.localizationView(c.Request.Context(), tenantID(c))
 	c.JSON(http.StatusOK, view)
+}
+
+func isDuplicateEntry(err error) bool {
+	var mysqlError *mysql.MySQLError
+	return errors.As(err, &mysqlError) && mysqlError.Number == 1062
 }
 
 func (s *server) publishLocalization(c *gin.Context) {
@@ -751,19 +877,29 @@ func (s *server) saveLanguageConfigState(ctx context.Context, tenant string, cur
 }
 
 func (s *server) compiledMessages(ctx context.Context, tenant, language, fallback string) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT CAST(tenant_id AS CHAR),lang,`+"`key`"+`,content FROM language_document WHERE tenant_id IN (0,?) AND lang IN (?,?) AND type=? AND deleted=0 ORDER BY tenant_id ASC`, tenant, language, fallback, appLanguageType)
+	rows, err := s.db.QueryContext(ctx, `SELECT CAST(tenant_id AS CHAR),lang,`+"`key`"+`,content,deleted FROM language_document WHERE tenant_id IN (0,?) AND type=? AND (tenant_id=? OR (lang IN (?,?) AND deleted=0)) ORDER BY tenant_id ASC`, tenant, appLanguageType, tenant, language, fallback)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	targetGlobal, targetTenant, fallbackGlobal, fallbackTenant := map[string]string{}, map[string]string{}, map[string]string{}, map[string]string{}
 	keys := map[string]struct{}{}
+	disabledKeys := map[string]bool{}
 	for rows.Next() {
 		var source, code, key, content string
-		if err := rows.Scan(&source, &code, &key, &content); err != nil {
+		var deleted bool
+		if err := rows.Scan(&source, &code, &key, &content, &deleted); err != nil {
 			return nil, err
 		}
+		key = normalizeMessageKey(key)
 		keys[key] = struct{}{}
+		if source == tenant && deleted {
+			disabledKeys[key] = true
+			continue
+		}
+		if code != language && code != fallback {
+			continue
+		}
 		target := targetGlobal
 		if code == language && source == tenant {
 			target = targetTenant
@@ -776,13 +912,20 @@ func (s *server) compiledMessages(ctx context.Context, tenant, language, fallbac
 	}
 	result := map[string]string{}
 	for key := range keys {
-		if value := targetTenant[key]; value != "" {
+		if disabledKeys[key] {
+			continue
+		}
+		if targetTenant[key] != "" {
+			value := targetTenant[key]
 			result[key] = value
-		} else if value := targetGlobal[key]; value != "" {
+		} else if targetGlobal[key] != "" {
+			value := targetGlobal[key]
 			result[key] = value
-		} else if value := fallbackTenant[key]; value != "" {
+		} else if fallbackTenant[key] != "" {
+			value := fallbackTenant[key]
 			result[key] = value
-		} else if value := fallbackGlobal[key]; value != "" {
+		} else if fallbackGlobal[key] != "" {
+			value := fallbackGlobal[key]
 			result[key] = value
 		} else {
 			result[key] = key

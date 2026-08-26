@@ -19,6 +19,7 @@ type migration struct {
 var migrations = []migration{
 	{version: 5, name: "domain_release_final", apply: finalMigration},
 	{version: 6, name: "dynamic_localization", apply: localizationMigration},
+	{version: 7, name: "localization_document_status", apply: localizationDocumentStatusMigration},
 }
 
 func (s *Store) Migrate(cfg config.Config) error {
@@ -182,4 +183,19 @@ func localizationMigration(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return normalizeLanguageConfigRows(ctx, db)
+}
+
+func localizationDocumentStatusMigration(ctx context.Context, db *sql.DB) error {
+	statements := []string{
+		`DELETE bad FROM language_document bad JOIN language_document good ON bad.lang=good.lang AND bad.type=good.type AND bad.tenant_id=good.tenant_id AND LOWER(bad.` + "`key`" + `)=LOWER(good.` + "`key`" + `) AND bad.id>good.id`,
+		`UPDATE language_document SET ` + "`key`" + `=LOWER(` + "`key`" + `)`,
+		`ALTER TABLE language_document MODIFY ` + "`key`" + ` VARCHAR(255) NOT NULL COMMENT '小写文案Key，仅允许字母、数字、点、下划线和短横线'`,
+		`ALTER TABLE language_document MODIFY deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '文案启用状态：0启用，1停用；同一租户Key的各语言保持一致'`,
+	}
+	for i, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("localization document status migration statement %d: %w", i+1, err)
+		}
+	}
+	return nil
 }
