@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -15,7 +16,10 @@ type migration struct {
 	apply   func(context.Context, *sql.DB) error
 }
 
-var migrations = []migration{{version: 5, name: "domain_release_final", apply: finalMigration}}
+var migrations = []migration{
+	{version: 5, name: "domain_release_final", apply: finalMigration},
+	{version: 6, name: "dynamic_localization", apply: localizationMigration},
+}
 
 func (s *Store) Migrate(cfg config.Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.MySQLInitTimeout)*time.Second*4)
@@ -70,4 +74,112 @@ func finalMigration(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func normalizeLanguageConfigRows(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT tenant_id,config_value FROM app_configs WHERE config_key='languages'`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		tenantID int64
+		raw      []byte
+	}
+	items := []row{}
+	for rows.Next() {
+		var item row
+		if err := rows.Scan(&item.tenantID, &item.raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range items {
+		var value map[string]any
+		if err := json.Unmarshal(item.raw, &value); err != nil {
+			return err
+		}
+		if _, exists := value["languages"]; exists {
+			continue
+		}
+		languages := map[string]any{}
+		sortValue := 1
+		for _, code := range []string{"zh-CN", "en-US"} {
+			oldValue, exists := value[code].(map[string]any)
+			if !exists {
+				continue
+			}
+			label, _ := oldValue["label"].(string)
+			if label == "" {
+				label = code
+			}
+			enabled, ok := oldValue["enabled"].(bool)
+			if !ok {
+				enabled = true
+			}
+			languages[code] = map[string]any{"label": label, "nativeName": label, "enabled": enabled, "direction": "ltr", "sort": sortValue}
+			sortValue++
+		}
+		if len(languages) == 0 {
+			continue
+		}
+		normalized := map[string]any{"schemaVersion": 2, "fallbackLanguage": "zh-CN", "refreshIntervalSeconds": 21600, "languages": languages, "resources": map[string]any{}}
+		raw, _ := json.Marshal(normalized)
+		if _, err := db.ExecContext(ctx, `UPDATE app_configs SET config_value=?,version=version+1,updated_by='system-localization',updated_at=UTC_TIMESTAMP(3) WHERE tenant_id=? AND config_key='languages'`, raw, item.tenantID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func localizationMigration(ctx context.Context, db *sql.DB) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS language_document (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '多语言文案主键',
+			lang VARCHAR(35) NOT NULL COMMENT 'BCP 47 语言编码，例如 zh-CN',
+			` + "`key`" + ` VARCHAR(255) NOT NULL COMMENT '文案 Key',
+			content VARCHAR(5000) NOT NULL COMMENT '文案内容',
+			meta VARCHAR(255) NOT NULL DEFAULT '' COMMENT '文案元数据',
+			type INT NOT NULL DEFAULT 14 COMMENT '文案类型，14 表示 App 文案',
+			edit TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否允许编辑',
+			tenant_id BIGINT NOT NULL DEFAULT 0 COMMENT '租户ID，0表示全局文案',
+			ctime DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+			mtime DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+			deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '软删除标记',
+			PRIMARY KEY(id),
+			UNIQUE KEY uk_language_document(lang,` + "`key`" + `,type,tenant_id),
+			KEY ix_language_document_tenant(tenant_id,lang,type,deleted),
+			KEY ix_language_document_key(` + "`key`" + `,type,deleted)
+		) ENGINE=InnoDB COMMENT='全局与租户多语言文案'`,
+		`ALTER TABLE language_document MODIFY lang VARCHAR(35) NOT NULL COMMENT 'BCP 47 语言编码，例如 zh-CN'`,
+		`ALTER TABLE language_document MODIFY ` + "`key`" + ` VARCHAR(255) NOT NULL COMMENT '文案 Key'`,
+		`ALTER TABLE language_document MODIFY type INT NOT NULL DEFAULT 14 COMMENT '文案类型，14 表示 App 文案'`,
+		`ALTER TABLE language_document COMMENT='全局与租户多语言文案'`,
+		`DELETE bad FROM language_document bad JOIN language_document good ON good.lang='zh-CN' AND bad.lang='zh_CN' AND good.` + "`key`" + `=bad.` + "`key`" + ` AND good.type=bad.type AND good.tenant_id=bad.tenant_id WHERE bad.lang='zh_CN'`,
+		`DELETE bad FROM language_document bad JOIN language_document good ON good.lang='en-US' AND bad.lang='en_US' AND good.` + "`key`" + `=bad.` + "`key`" + ` AND good.type=bad.type AND good.tenant_id=bad.tenant_id WHERE bad.lang='en_US'`,
+		`UPDATE language_document SET lang='zh-CN' WHERE lang='zh_CN'`,
+		`UPDATE language_document SET lang='en-US' WHERE lang='en_US'`,
+		`UPDATE app_configs SET config_value=CAST(REPLACE(REPLACE(CAST(config_value AS CHAR),'zh_CN','zh-CN'),'en_US','en-US') AS JSON) WHERE config_key IN ('languages','mobile-bootstrap')`,
+		`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+		 SELECT 0,'languages',JSON_OBJECT('schemaVersion',2,'fallbackLanguage','zh-CN','refreshIntervalSeconds',21600,'languages',JSON_OBJECT(
+			'zh-CN',JSON_OBJECT('label','简体中文','nativeName','简体中文','enabled',true,'direction','ltr','sort',1,'publishStatus','published'),
+			'en-US',JSON_OBJECT('label','English','nativeName','English','enabled',true,'direction','ltr','sort',2,'publishStatus','published')
+		 )),1,'system-localization',UTC_TIMESTAMP(3)
+		 WHERE NOT EXISTS (SELECT 1 FROM app_configs WHERE tenant_id=0 AND config_key='languages')`,
+		`INSERT INTO language_document(lang,` + "`key`" + `,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES
+		 ('zh-CN','app.name','RN 应用基座','应用名称',14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0),
+		 ('zh-CN','home.title','远程配置中心','首页标题',14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0),
+		 ('en-US','app.name','RN App Foundation','Application name',14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0),
+		 ('en-US','home.title','Remote configuration center','Home title',14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0)
+		 ON DUPLICATE KEY UPDATE id=id`,
+	}
+	for i, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("localization migration statement %d: %w", i+1, err)
+		}
+	}
+	return normalizeLanguageConfigRows(ctx, db)
 }

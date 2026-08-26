@@ -1,10 +1,11 @@
 {
   "openapi": "3.0.3",
-  "info": {"title": "RN Server Foundation API", "version": "2026.08.25"},
+  "info": {"title": "RN Server Foundation API", "version": "2026.08.26"},
   "paths": {
     "/health/live": {"get": {"responses": {"200": {"description": "Live"}}}},
     "/health/ready": {"get": {"responses": {"200": {"description": "Ready"}, "503": {"description": "Unavailable"}}}},
     "/v1/mobile/bootstrap": {"get": {"parameters": [{"name": "locale", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "Bootstrap configuration"}}}},
+    "/v1/mobile/languages/{languageCode}/document": {"parameters": [{"name": "languageCode", "in": "path", "required": true, "schema": {"type": "string"}}], "get": {"responses": {"200": {"description": "Published localization JSON"}, "304": {"description": "Not modified"}}}},
     "/v1/admin/auth/login": {"post": {"requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LoginRequest"}}}}, "responses": {"200": {"description": "Authenticated"}}}},
     "/v1/admin/auth/session": {"get": {"responses": {"200": {"description": "Session"}}}},
     "/v1/admin/auth/logout": {"post": {"responses": {"200": {"description": "Logged out"}}}},
@@ -17,6 +18,10 @@
     "/v1/admin/releases/{id}/finalize": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "post": {"responses": {"200": {"description": "Verified release"}}}},
     "/v1/admin/releases/{id}/{action}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}, {"name": "action", "in": "path", "required": true, "schema": {"type": "string", "enum": ["publish", "pause"]}}], "post": {"responses": {"201": {"description": "Transitioned release"}}}},
     "/v1/admin/app-config": {"get": {"responses": {"200": {"description": "App config"}}}, "patch": {"responses": {"200": {"description": "Saved app config"}}}},
+    "/v1/admin/localization": {"get": {"responses": {"200": {"description": "Effective localization settings and documents"}}}},
+    "/v1/admin/localization/languages": {"put": {"responses": {"200": {"description": "Saved tenant language overrides"}}}},
+    "/v1/admin/localization/documents": {"put": {"responses": {"200": {"description": "Saved tenant language documents"}}}},
+    "/v1/admin/localization/publish": {"post": {"responses": {"200": {"description": "Published localization resources"}}}},
     "/v1/admin/release-storage": {"get": {"responses": {"200": {"description": "Masked release storage config"}}}, "put": {"responses": {"200": {"description": "Saved release storage config"}}}},
     "/v1/admin/release-storage/test": {"post": {"responses": {"200": {"description": "Storage test result"}}}},
     "/v1/admin/audit-events": {"get": {"responses": {"200": {"description": "Audit events"}}}},

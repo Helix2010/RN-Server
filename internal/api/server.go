@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,6 +98,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/openapi.json", func(c *gin.Context) { c.File("contracts/openapi.json") })
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
+	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/public/releases/latest", s.domainTenantScope(), s.publicLatestReleaseFromDomain)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
 	admin := r.Group("/v1/admin")
@@ -129,6 +131,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/audit-events", s.listAudits)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
+	group.GET("/localization", s.getLocalization)
+	group.PUT("/localization/languages", s.updateLocalizationLanguages)
+	group.PUT("/localization/documents", s.updateLocalizationDocuments)
+	group.POST("/localization/publish", s.publishLocalization)
 	group.GET("/release-storage", s.getReleaseStorage)
 	group.PUT("/release-storage", s.updateReleaseStorage)
 	group.POST("/release-storage/test", s.testReleaseStorage)
@@ -632,9 +638,10 @@ func (s *server) bootstrap(c *gin.Context) {
 		return
 	}
 	cfg := view["config"].(map[string]any)
-	locale := "zh-CN"
-	if strings.HasPrefix(strings.ToLower(c.Query("locale")), "en") {
-		locale = "en-US"
+	requestedLocale := strings.TrimSpace(c.Query("locale"))
+	locale := requestedLocale
+	if locale == "" {
+		locale = "zh-CN"
 	}
 	platform := strings.ToLower(c.GetHeader("x-platform"))
 	if !oneOf(platform, "android", "ios", "harmony") {
@@ -674,11 +681,46 @@ func (s *server) bootstrap(c *gin.Context) {
 		decision = "recommended"
 	}
 	localization := object(cfg["localization"])
+	locale = text(localization["fallbackLocale"], "zh-CN")
+	if requestedLocale != "" {
+		if !validLanguageCode(requestedLocale) {
+			problem(c, 400, "INVALID_LANGUAGE_CODE", "Language code must use canonical BCP 47 format")
+			return
+		}
+		locale = requestedLocale
+	}
+	if settings, _, _, settingsErr := s.effectiveLanguageSettings(c.Request.Context(), tenant.ID); settingsErr == nil {
+		if language, supported := settings.Languages[locale]; !supported || !language.Enabled {
+			locale = settings.FallbackLanguage
+		}
+		localization = map[string]any{"fallbackLocale": settings.FallbackLanguage, "supportedLocales": enabledLanguageCodes(settings), "messagesVersion": cfg["configVersion"], "refreshIntervalSeconds": settings.RefreshIntervalSeconds}
+		if compiled, compileErr := s.compiledMessages(c.Request.Context(), tenant.ID, locale, settings.FallbackLanguage); compileErr == nil {
+			localization["messages"] = map[string]any{locale: compiled}
+		} else {
+			localization["messages"] = map[string]any{locale: map[string]string{}}
+		}
+		if language, exists := settings.Languages[locale]; exists && language.Resource != nil {
+			localization["resource"] = language.Resource
+		} else {
+			localization["resource"] = nil
+		}
+	}
 	messages := object(localization["messages"])
 	theme := object(cfg["theme"])
 	features := object(cfg["features"])
 	runtime := text(c.GetHeader("x-runtime-version"), "embedded")
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "messages": messages[locale]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": gin.H{"enabled": features["otaEnabled"], "channel": text(updatePolicy["otaChannel"], s.cfg.OTAChannel), "runtimeVersion": runtime}, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": gin.H{"enabled": features["otaEnabled"], "channel": text(updatePolicy["otaChannel"], s.cfg.OTAChannel), "runtimeVersion": runtime}, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+}
+
+func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
+	codes := make([]string, 0, len(settings.Languages))
+	for code, item := range settings.Languages {
+		if item.Enabled {
+			codes = append(codes, code)
+		}
+	}
+	sort.Strings(codes)
+	return codes
 }
 
 func (s *server) actionURL(platform, distribution string) string {
