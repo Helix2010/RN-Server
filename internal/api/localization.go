@@ -339,6 +339,7 @@ func mapSource(source, tenant string) string {
 }
 
 type languageSettingsInput struct {
+	SchemaVersion          int    `json:"schemaVersion"`
 	FallbackLanguage       string `json:"fallbackLanguage"`
 	RefreshIntervalSeconds int    `json:"refreshIntervalSeconds"`
 	Languages              map[string]struct {
@@ -356,7 +357,7 @@ func (s *server) updateLocalizationLanguages(c *gin.Context) {
 		ExpectedVersion int                   `json:"expectedVersion"`
 		Reason          string                `json:"reason"`
 	}
-	if decode(c, &body) != nil || body.ExpectedVersion < 0 || len(strings.TrimSpace(body.Reason)) < 3 {
+	if decode(c, &body) != nil || body.Settings.SchemaVersion != 2 || body.ExpectedVersion < 0 || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, 400, "INVALID_LANGUAGE_SETTINGS", "settings, expectedVersion and reason are required")
 		return
 	}
