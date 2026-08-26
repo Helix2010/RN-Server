@@ -59,6 +59,11 @@ func (AWSFactory) New(cfg Config) (Client, error) {
 	// CRC32 streaming trailer that newer AWS SDK versions add to PutObject.
 	// Required SigV4 payload signing remains enabled.
 	awsCfg.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+	// Huawei OBS rejects the optional response checksum mode on presigned GET
+	// URLs (InsecureDownloadForbidden). Only validate checksums when an
+	// operation explicitly requires one, which keeps downloads compatible with
+	// S3-compatible providers while preserving required validation.
+	awsCfg.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	if cfg.Endpoint != "" {
 		parsed, err := url.Parse(cfg.Endpoint)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
