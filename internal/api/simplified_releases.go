@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
@@ -178,6 +179,7 @@ func (s *server) uploadRelease(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
 	if err := client.Put(ctx, key, body, expected, contentType); err != nil {
+		slog.Error("release package upload failed", "tenant", tenant, "releaseId", id, "objectKey", key, "expectedSize", expected, "error", err)
 		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", "Unable to store the release package")
 		return
 	}
@@ -187,6 +189,7 @@ func (s *server) uploadRelease(c *gin.Context) {
 	}
 	storedSize, _, err := client.Head(ctx, key)
 	if err != nil || storedSize != expected {
+		slog.Error("stored release package verification failed", "tenant", tenant, "releaseId", id, "objectKey", key, "expectedSize", expected, "storedSize", storedSize, "error", err)
 		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", "Stored release package size could not be verified")
 		return
 	}
