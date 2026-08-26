@@ -55,6 +55,10 @@ func (AWSFactory) New(cfg Config) (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load storage client configuration: %w", err)
 	}
+	// Some S3-compatible providers, including Huawei OBS, reject the optional
+	// CRC32 streaming trailer that newer AWS SDK versions add to PutObject.
+	// Required SigV4 payload signing remains enabled.
+	awsCfg.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	if cfg.Endpoint != "" {
 		parsed, err := url.Parse(cfg.Endpoint)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
