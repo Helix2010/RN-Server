@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -353,7 +354,9 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 
 func (s *server) publicReleaseDownload(c *gin.Context) {
 	var key, fileName string
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName)
+	var contentType sql.NullString
+	var fileSize sql.NullInt64
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName, &contentType, &fileSize)
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Published release not found")
 		return
@@ -363,10 +366,35 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	url, err := client.PresignGet(c.Request.Context(), key, time.Duration(s.cfg.ArtifactDownloadTTL)*time.Second, fileName)
+	body, err := client.Get(c.Request.Context(), key)
 	if err != nil {
-		problem(c, 502, "RELEASE_DOWNLOAD_FAILED", "Unable to create release download URL")
+		problem(c, 502, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
 		return
 	}
-	c.Redirect(http.StatusTemporaryRedirect, url)
+	defer body.Close()
+	if contentType.Valid && isSafeHeaderValue(contentType.String) {
+		c.Header("Content-Type", contentType.String)
+	} else {
+		c.Header("Content-Type", "application/octet-stream")
+	}
+	c.Header("Content-Disposition", `attachment; filename="`+safeDownloadName(fileName)+`"`)
+	if fileSize.Valid && fileSize.Int64 >= 0 {
+		c.Header("Content-Length", strconv.FormatInt(fileSize.Int64, 10))
+	}
+	if _, err := io.Copy(c.Writer, body); err != nil {
+		slog.Error("release download stream failed", "releaseId", c.Param("id"), "error", err)
+	}
+}
+
+func safeDownloadName(name string) string {
+	name = path.Base(strings.TrimSpace(name))
+	name = strings.NewReplacer(`"`, "", "\r", "", "\n", "").Replace(name)
+	if name == "" || name == "." || name == ".." {
+		return "application.apk"
+	}
+	return name
+}
+
+func isSafeHeaderValue(value string) bool {
+	return !strings.ContainsAny(value, "\r\n")
 }

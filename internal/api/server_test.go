@@ -28,3 +28,15 @@ func TestVersionComparison(t *testing.T) {
 		t.Fatal("semantic version behavior is invalid")
 	}
 }
+
+func TestSafeDownloadName(t *testing.T) {
+	if got := safeDownloadName(`../AnyFun.apk`); got != "AnyFun.apk" {
+		t.Fatalf("safeDownloadName stripped path = %q", got)
+	}
+	if got := safeDownloadName("bad\"name\r\n.apk"); got != "badname.apk" {
+		t.Fatalf("safeDownloadName removed unsafe header characters = %q", got)
+	}
+	if got := safeDownloadName("../"); got != "application.apk" {
+		t.Fatalf("safeDownloadName fallback = %q", got)
+	}
+}

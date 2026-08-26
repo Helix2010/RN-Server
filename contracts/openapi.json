@@ -21,7 +21,7 @@
     "/v1/admin/release-storage/test": {"post": {"responses": {"200": {"description": "Storage test result"}}}},
     "/v1/admin/audit-events": {"get": {"responses": {"200": {"description": "Audit events"}}}},
     "/v1/public/releases/latest": {"get": {"parameters": [{"name": "platform", "in": "query", "required": true, "schema": {"type": "string", "enum": ["android", "ios", "harmony"]}}], "responses": {"200": {"description": "Latest active release"}}}},
-    "/v1/public/releases/{id}/download": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "get": {"responses": {"307": {"description": "Presigned download redirect"}}}}
+    "/v1/public/releases/{id}/download": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "get": {"responses": {"200": {"description": "Release package stream"}, "404": {"description": "Published release not found"}, "502": {"description": "Release package unavailable"}, "503": {"description": "Release storage unavailable"}}}}
   },
   "components": {
     "parameters": {"ReleaseId": {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}},
