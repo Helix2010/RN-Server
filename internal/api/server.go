@@ -126,6 +126,7 @@ func (s *server) currentTenant(c *gin.Context) {
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/overview", s.overview)
 	group.GET("/releases", s.listReleases)
+	group.POST("/releases", s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)
 	group.POST("/releases/:id/:action", s.releaseAction)
 	group.GET("/audit-events", s.listAudits)
@@ -138,9 +139,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/release-storage", s.getReleaseStorage)
 	group.PUT("/release-storage", s.updateReleaseStorage)
 	group.POST("/release-storage/test", s.testReleaseStorage)
-	group.POST("/releases/uploads", s.createReleaseUpload)
-	group.PUT("/releases/:id/upload", s.uploadRelease)
-	group.POST("/releases/:id/finalize", s.finalizeReleaseUpload)
+	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
+	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
+	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
 }
 
 func (s *server) domainTenantScope() gin.HandlerFunc {

@@ -11,11 +11,10 @@
     "/v1/admin/auth/logout": {"post": {"responses": {"200": {"description": "Logged out"}}}},
     "/v1/admin/tenant": {"get": {"responses": {"200": {"description": "Current tenant"}}}},
     "/v1/admin/overview": {"get": {"responses": {"200": {"description": "Release overview"}}}},
-    "/v1/admin/releases": {"get": {"responses": {"200": {"description": "Release list"}}}},
-    "/v1/admin/releases/uploads": {"post": {"requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReleaseUploadRequest"}}}}, "responses": {"201": {"description": "Upload ticket"}}}},
-    "/v1/admin/releases/{id}/upload": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "put": {"requestBody": {"required": true, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}, "responses": {"200": {"description": "Release package stored by RN-Server"}}}},
+    "/v1/admin/releases": {"get": {"responses": {"200": {"description": "Release list"}}}, "post": {"responses": {"201": {"description": "Verified release created from uploaded artifact"}}}},
+    "/v1/admin/release-artifacts/uploads": {"post": {"responses": {"201": {"description": "Temporary artifact upload ticket"}}}},
+    "/v1/admin/release-artifacts/upload": {"put": {"responses": {"200": {"description": "Temporary artifact stored"}}}, "delete": {"responses": {"200": {"description": "Temporary artifact removed"}}}},
     "/v1/admin/releases/{id}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "get": {"responses": {"200": {"description": "Release detail"}}}},
-    "/v1/admin/releases/{id}/finalize": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}], "post": {"responses": {"200": {"description": "Verified release"}}}},
     "/v1/admin/releases/{id}/{action}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}, {"name": "action", "in": "path", "required": true, "schema": {"type": "string", "enum": ["publish", "pause"]}}], "post": {"responses": {"201": {"description": "Transitioned release"}}}},
     "/v1/admin/app-config": {"get": {"responses": {"200": {"description": "App config"}}}, "patch": {"responses": {"200": {"description": "Saved app config"}}}},
     "/v1/admin/localization": {"get": {"responses": {"200": {"description": "Effective localization settings and documents"}}}},
@@ -32,7 +31,6 @@
     "parameters": {"ReleaseId": {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}},
     "schemas": {
       "LoginRequest": {"type": "object", "required": ["username", "password"], "properties": {"username": {"type": "string"}, "password": {"type": "string", "format": "password"}}},
-      "ReleaseUploadRequest": {"type": "object", "required": ["platform", "version", "buildNumber", "runtimeVersion", "fileName", "contentType", "size"], "properties": {"platform": {"type": "string", "enum": ["android", "ios", "harmony"]}, "version": {"type": "string"}, "buildNumber": {"type": "integer", "minimum": 1}, "runtimeVersion": {"type": "string"}, "releaseNotes": {"type": "object"}, "fileName": {"type": "string"}, "contentType": {"type": "string"}, "size": {"type": "integer", "minimum": 1}}},
       "LocalizationDocumentsRequest": {"type": "object", "required": ["documents", "reason"], "properties": {"reason": {"type": "string", "minLength": 3}, "documents": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/LocalizationDocumentChange"}}}},
       "LocalizationDocumentChange": {"type": "object", "required": ["key", "meta", "values"], "properties": {"key": {"type": "string", "maxLength": 255, "pattern": "^[a-z0-9][a-z0-9._-]{0,254}$", "description": "Canonical lowercase localization key"}, "meta": {"type": "string", "maxLength": 255}, "create": {"type": "boolean"}, "enabled": {"type": "boolean", "description": "Maps to language_document.deleted for the whole key"}, "values": {"type": "object", "additionalProperties": {"type": "string", "nullable": true}}}}
     }

@@ -28,8 +28,8 @@ func TestNormalizeHostRejectsInvalidValues(t *testing.T) {
 }
 
 func TestSimplifiedObjectKeyScopesTenantAndRelease(t *testing.T) {
-	key := simplifiedObjectKey("releases", "100000001", "rel_abc", "../signed.apk")
-	if key != "releases/tenants/100000001/releases/rel_abc/application.apk" {
+	key := releaseArtifactObjectKey("releases", "100000001", "art_abc", "../signed.apk")
+	if key != "releases/tenants/100000001/release-uploads/art_abc/application.apk" {
 		t.Fatalf("unexpected object key: %s", key)
 	}
 }

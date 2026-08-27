@@ -31,6 +31,7 @@ type Client interface {
 	PresignGet(context.Context, string, time.Duration, string) (string, error)
 	Head(context.Context, string) (int64, string, error)
 	Get(context.Context, string) (io.ReadCloser, error)
+	Delete(context.Context, string) error
 	Test(context.Context) error
 }
 
@@ -137,6 +138,17 @@ func (c *s3Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("read artifact: %w", err)
 	}
 	return output.Body, nil
+}
+
+func (c *s3Client) Delete(ctx context.Context, key string) error {
+	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("delete artifact: %w", err)
+	}
+	return nil
 }
 
 func (c *s3Client) Test(ctx context.Context) error {
