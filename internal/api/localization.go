@@ -723,7 +723,7 @@ func (s *server) publishLocalization(c *gin.Context) {
 		}{1, tenantID(c), code, version, iso(time.Now().UTC()), messages}
 		raw, _ := json.Marshal(payload)
 		hash := sha256.Sum256(raw)
-		objectKey := strings.TrimLeft(path.Join(objectPrefix, "localization", tenantID(c), code, tenantID(c)+"_"+version+"_"+code+".json"), "/")
+		objectKey := languageResourceObjectKey(objectPrefix, tenantID(c), code, version)
 		if err := client.Put(c.Request.Context(), objectKey, bytes.NewReader(raw), int64(len(raw)), "application/json; charset=utf-8"); err != nil {
 			s.markLocalizationPublishFailure(c.Request.Context(), tenantID(c), current, code, err.Error())
 			problem(c, 502, "LOCALIZATION_UPLOAD_FAILED", "Unable to upload localization document")
@@ -743,6 +743,13 @@ func (s *server) publishLocalization(c *gin.Context) {
 	}
 	view, _ := s.localizationView(c.Request.Context(), tenantID(c))
 	c.JSON(http.StatusOK, gin.H{"version": version, "languages": selected, "localization": view})
+}
+
+func languageResourceObjectKey(objectPrefix, tenant, language, version string) string {
+	return strings.TrimLeft(
+		path.Join(objectPrefix, "localization", tenant, language, version+".json"),
+		"/",
+	)
 }
 
 func cloneResources(source map[string]languageResource) map[string]languageResource {
