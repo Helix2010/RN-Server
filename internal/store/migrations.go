@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/config"
@@ -21,6 +22,7 @@ var migrations = []migration{
 	{version: 6, name: "dynamic_localization", apply: localizationMigration},
 	{version: 7, name: "localization_document_status", apply: localizationDocumentStatusMigration},
 	{version: 8, name: "reset_rn_app_localization", apply: resetRNAppLocalizationMigration},
+	{version: 9, name: "normalize_rn_app_localization_keys", apply: normalizeRNAppLocalizationKeysMigration},
 }
 
 func resetRNAppLocalizationMigration(ctx context.Context, db *sql.DB) error {
@@ -211,11 +213,16 @@ func resetRNAppLocalizationMigration(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("seed language config: %w", err)
 	}
 	for _, item := range seed {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0)`, item.lang, item.key, item.content, item.meta); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0)`, item.lang, strings.ToLower(item.key), item.content, item.meta); err != nil {
 			return fmt.Errorf("seed language document %s/%s: %w", item.lang, item.key, err)
 		}
 	}
 	return tx.Commit()
+}
+
+func normalizeRNAppLocalizationKeysMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE language_document SET `+"`key`"+`=LOWER(`+"`key`"+`) WHERE type=14`)
+	return err
 }
 
 func (s *Store) Migrate(cfg config.Config) error {
