@@ -48,8 +48,8 @@ func main() {
 		Addr:              ":" + cfg.Port,
 		Handler:           api.New(cfg, database),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       time.Duration(cfg.HTTPReadTimeout) * time.Second,
+		WriteTimeout:      time.Duration(cfg.HTTPWriteTimeout) * time.Second,
 		IdleTimeout:       75 * time.Second,
 	}
 	go func() {

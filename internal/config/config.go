@@ -12,6 +12,8 @@ import (
 type Config struct {
 	Environment                string
 	Port                       string
+	HTTPReadTimeout            int
+	HTTPWriteTimeout           int
 	CORSOrigins                []string
 	AdminAPIKey                string
 	AdminUsername              string
@@ -57,6 +59,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		Environment:                value("APP_ENV", "development"),
 		Port:                       value("PORT", "3000"),
+		HTTPReadTimeout:            integer("HTTP_READ_TIMEOUT_SECONDS", 900),
+		HTTPWriteTimeout:           integer("HTTP_WRITE_TIMEOUT_SECONDS", 900),
 		CORSOrigins:                split(value("CORS_ORIGINS", "*")),
 		AdminAPIKey:                os.Getenv("ADMIN_API_KEY"),
 		AdminUsername:              os.Getenv("ADMIN_USERNAME"),
@@ -111,7 +115,8 @@ func Load() (Config, error) {
 			return Config{}, errors.New("STORAGE_MASTER_KEY is required in production")
 		}
 	}
-	if cfg.MySQLPort < 1 || cfg.MySQLPort > 65535 || cfg.MySQLConnectionLimit < 1 ||
+	if cfg.HTTPReadTimeout < 1 || cfg.HTTPWriteTimeout < 1 ||
+		cfg.MySQLPort < 1 || cfg.MySQLPort > 65535 || cfg.MySQLConnectionLimit < 1 ||
 		cfg.MySQLMaxIdleConnections < 0 || cfg.MySQLMaxIdleConnections > cfg.MySQLConnectionLimit ||
 		cfg.MySQLConnectionMaxLifetime < 1 || cfg.MySQLConnectionMaxIdleTime < 1 || cfg.MySQLQueryTimeout < 1 ||
 		cfg.MySQLConnectTimeout < 1 || cfg.MySQLReadTimeout < 1 || cfg.MySQLWriteTimeout < 1 ||
