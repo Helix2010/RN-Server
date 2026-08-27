@@ -19,6 +19,7 @@ go run ./cmd/server
 - App 配置：`http://localhost:3000/v1/mobile/bootstrap?locale=zh-CN`
 - 多语言管理：管理端使用 `/v1/admin/localization` 读取全局与租户合并结果，语言设置和文案分别保存为租户差异；发布后生成 `/v1/mobile/languages/{languageCode}/document` 资源。语言编码只接受标准 BCP 47（如 `zh-CN`、`en-US`），不接受下划线格式。
 - 多语言资源对象 Key：发布文件按 `localization/{tenantId}/{languageCode}/{version}.json` 存储，租户和语言已由目录表达，文件名只保留版本号。
+- RN-App 正式文案：迁移 8 会重置 `type=14` 为 AnyFun 基座实际使用的 zh-CN/en-US 文案，并清空旧语言资源引用；迁移后需由管理端重新发布语言包。
 - Admin 登录：`POST /v1/admin/auth/login` 创建 HttpOnly 会话；管理 API 默认拒绝未认证请求。`x-admin-key` 仅保留给受控自动化，不再进入 Web 构建。
 - MySQL：通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置；`MYSQL_CHARSET`、`MYSQL_TIMEZONE`、`MYSQL_PARSE_TIME` 控制字符集、日期时区和日期解析；测试使用 `<database>_test`
 - MySQL 连接行为：最大/空闲连接数、连接生命周期、空闲回收、查询/读写/初始化超时与有限重试均由 `MYSQL_*` 配置。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。生产环境保持 `MYSQL_AUTO_MIGRATE=false`，迁移作为独立发布步骤执行。
