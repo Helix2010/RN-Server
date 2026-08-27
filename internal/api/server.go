@@ -200,7 +200,7 @@ func (s *server) cors() gin.HandlerFunc {
 			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Vary", "Origin")
 			c.Header("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id")
+			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token")
 		}
 		if c.Request.Method == http.MethodOptions {
 			c.Status(http.StatusNoContent)
