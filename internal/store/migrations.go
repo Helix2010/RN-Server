@@ -25,6 +25,31 @@ var migrations = []migration{
 	{version: 9, name: "normalize_rn_app_localization_keys", apply: normalizeRNAppLocalizationKeysMigration},
 	{version: 10, name: "ota_releases", apply: otaReleasesMigration},
 	{version: 11, name: "ota_apply_strategy", apply: otaApplyStrategyMigration},
+	{version: 12, name: "upload_sessions", apply: uploadSessionsMigration},
+}
+
+func uploadSessionsMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS upload_sessions (
+		id VARCHAR(80) NOT NULL COMMENT '分段上传会话ID',
+		tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+		upload_type ENUM('apk','ota') NOT NULL COMMENT '上传类型',
+		object_key VARCHAR(512) NOT NULL COMMENT '临时对象Key',
+		upload_id VARCHAR(255) NOT NULL COMMENT '对象存储Multipart Upload ID',
+		file_name VARCHAR(255) NOT NULL COMMENT '文件名',
+		content_type VARCHAR(120) NOT NULL COMMENT '内容类型',
+		expected_size BIGINT UNSIGNED NOT NULL COMMENT '预期文件大小',
+		part_size INT UNSIGNED NOT NULL COMMENT '分片大小',
+		total_parts INT UNSIGNED NOT NULL COMMENT '分片总数',
+		uploaded_parts JSON NOT NULL COMMENT '已完成分片及ETag',
+		status ENUM('active','completed','aborted','expired') NOT NULL DEFAULT 'active' COMMENT '会话状态',
+		expires_at DATETIME(3) NOT NULL COMMENT '过期时间',
+		created_by VARCHAR(120) NOT NULL COMMENT '创建人',
+		created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+		updated_at DATETIME(3) NOT NULL COMMENT '更新时间',
+		PRIMARY KEY (id), UNIQUE KEY uq_upload_multipart (tenant_id, upload_id),
+		KEY ix_upload_cleanup (status, expires_at), KEY ix_upload_tenant (tenant_id, created_at)
+	) ENGINE=InnoDB COMMENT='租户分段上传会话'`)
+	return err
 }
 
 func otaApplyStrategyMigration(ctx context.Context, db *sql.DB) error {

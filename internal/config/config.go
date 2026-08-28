@@ -46,6 +46,7 @@ type Config struct {
 	ArtifactMaxSizeBytes       int64
 	ArtifactUploadMode         string
 	ArtifactUploadTTL          int
+	ArtifactMultipartTTL       int
 	ArtifactDownloadTTL        int
 	ArtifactVerifyTimeout      int
 	OTAChannel                 string
@@ -93,6 +94,7 @@ func Load() (Config, error) {
 		ArtifactMaxSizeBytes:       int64(integer("ARTIFACT_MAX_SIZE_MB", 512)) * 1024 * 1024,
 		ArtifactUploadMode:         value("ARTIFACT_UPLOAD_MODE", "direct"),
 		ArtifactUploadTTL:          integer("ARTIFACT_UPLOAD_TTL_SECONDS", 900),
+		ArtifactMultipartTTL:       integer("ARTIFACT_MULTIPART_TTL_SECONDS", 7200),
 		ArtifactDownloadTTL:        integer("ARTIFACT_DOWNLOAD_TTL_SECONDS", 300),
 		ArtifactVerifyTimeout:      integer("ARTIFACT_VERIFY_TIMEOUT_SECONDS", 300),
 		OTAChannel:                 value("OTA_CHANNEL", "production"),
@@ -136,7 +138,7 @@ func Load() (Config, error) {
 		return Config{}, errors.New("ARTIFACT_UPLOAD_MODE must be direct or proxy")
 	}
 	if cfg.ArtifactMaxSizeBytes < 1024*1024 || cfg.ArtifactMaxSizeBytes > 2*1024*1024*1024 ||
-		cfg.ArtifactUploadTTL < 60 || cfg.ArtifactUploadTTL > 3600 || cfg.ArtifactDownloadTTL < 30 || cfg.ArtifactDownloadTTL > 3600 ||
+		cfg.ArtifactUploadTTL < 60 || cfg.ArtifactUploadTTL > 3600 || cfg.ArtifactMultipartTTL < 300 || cfg.ArtifactMultipartTTL > 86400 || cfg.ArtifactDownloadTTL < 30 || cfg.ArtifactDownloadTTL > 3600 ||
 		cfg.ArtifactVerifyTimeout < 30 || cfg.ArtifactVerifyTimeout > 1800 {
 		return Config{}, errors.New("invalid artifact storage configuration")
 	}

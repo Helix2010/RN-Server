@@ -21,11 +21,12 @@ func TestLoadUsesConfigurableMySQLOptions(t *testing.T) {
 	t.Setenv("MYSQL_AUTO_MIGRATE", "false")
 	t.Setenv("HTTP_READ_TIMEOUT_SECONDS", "901")
 	t.Setenv("HTTP_WRITE_TIMEOUT_SECONDS", "902")
+	t.Setenv("ARTIFACT_MULTIPART_TTL_SECONDS", "1800")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HTTPReadTimeout != 901 || cfg.HTTPWriteTimeout != 902 || cfg.MySQLDatabase != "foundation_test" || cfg.MySQLCharset != "utf8mb4" || cfg.MySQLTimezone != "Z" || !cfg.MySQLParseTime ||
+	if cfg.HTTPReadTimeout != 901 || cfg.HTTPWriteTimeout != 902 || cfg.ArtifactMultipartTTL != 1800 || cfg.MySQLDatabase != "foundation_test" || cfg.MySQLCharset != "utf8mb4" || cfg.MySQLTimezone != "Z" || !cfg.MySQLParseTime ||
 		cfg.MySQLConnectTimeout != 23 || cfg.MySQLReadTimeout != 41 || cfg.MySQLWriteTimeout != 43 ||
 		cfg.MySQLMaxIdleConnections != 2 || cfg.MySQLConnectionMaxLifetime != 601 || cfg.MySQLConnectionMaxIdleTime != 61 || cfg.MySQLQueryTimeout != 11 ||
 		cfg.MySQLInitTimeout != 47 || cfg.MySQLInitMaxAttempts != 4 || cfg.MySQLInitRetryDelay != 7 || cfg.MySQLAutoMigrate {

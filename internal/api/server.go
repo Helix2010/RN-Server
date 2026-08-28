@@ -151,6 +151,13 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.DELETE("/ota/artifacts/upload", s.deleteOTAArtifact)
 	group.POST("/ota/releases", s.saveOTARelease)
 	group.POST("/ota/releases/:id/:action", s.otaAction)
+	group.POST("/upload-sessions", s.createUploadSession)
+	group.POST("/upload-sessions/cleanup-expired", s.cleanupExpiredUploadSessions)
+	group.GET("/upload-sessions/:id", s.getUploadSession)
+	group.PUT("/upload-sessions/:id/parts/:partNumber", s.uploadSessionPart)
+	group.POST("/upload-sessions/:id/parts/:partNumber/presign", s.presignUploadSessionPart)
+	group.POST("/upload-sessions/:id/complete", s.completeUploadSession)
+	group.DELETE("/upload-sessions/:id", s.cancelUploadSession)
 }
 
 func (s *server) domainTenantScope() gin.HandlerFunc {
@@ -169,7 +176,8 @@ func (s *server) domainTenantScope() gin.HandlerFunc {
 
 func (s *server) databaseTimeout() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if strings.HasSuffix(c.Request.URL.Path, "/upload") || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") {
+		multipartPartUpload := c.Request.Method == http.MethodPut && strings.Contains(c.Request.URL.Path, "/v1/admin/upload-sessions/") && strings.Contains(c.Request.URL.Path, "/parts/")
+		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") {
 			c.Next()
 			return
 		}
@@ -207,9 +215,10 @@ func (s *server) cors() gin.HandlerFunc {
 		if origin != "" && s.originAllowed(origin) {
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Access-Control-Expose-Headers", "ETag,X-Request-Id")
 			c.Header("Vary", "Origin")
 			c.Header("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-ota-artifact-token,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
+			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-ota-artifact-token,x-upload-session-token,x-part-sha256,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
 		}
 		if c.Request.Method == http.MethodOptions {
 			c.Status(http.StatusNoContent)

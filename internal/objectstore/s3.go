@@ -13,7 +13,14 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+type CompletedPart struct {
+	PartNumber int
+	ETag       string
+	Size       int64
+}
 
 type Config struct {
 	Endpoint        string
@@ -32,6 +39,12 @@ type Client interface {
 	Head(context.Context, string) (int64, string, error)
 	Get(context.Context, string) (io.ReadCloser, error)
 	Delete(context.Context, string) error
+	CreateMultipartUpload(context.Context, string, string) (string, error)
+	UploadPart(context.Context, string, string, int, io.Reader, int64) (string, error)
+	PresignUploadPart(context.Context, string, string, int, time.Duration) (string, map[string]string, error)
+	ListParts(context.Context, string, string) ([]CompletedPart, error)
+	CompleteMultipartUpload(context.Context, string, string, []CompletedPart) error
+	AbortMultipartUpload(context.Context, string, string) error
 	Test(context.Context) error
 }
 
@@ -147,6 +160,90 @@ func (c *s3Client) Delete(ctx context.Context, key string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("delete artifact: %w", err)
+	}
+	return nil
+}
+
+func (c *s3Client) CreateMultipartUpload(ctx context.Context, key, contentType string) (string, error) {
+	output, err := c.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), ContentType: aws.String(contentType),
+	})
+	if err != nil {
+		return "", fmt.Errorf("create multipart upload: %w", err)
+	}
+	if strings.TrimSpace(aws.ToString(output.UploadId)) == "" {
+		return "", fmt.Errorf("create multipart upload: storage returned an empty upload id")
+	}
+	return aws.ToString(output.UploadId), nil
+}
+
+func (c *s3Client) UploadPart(ctx context.Context, key, uploadID string, partNumber int, body io.Reader, size int64) (string, error) {
+	output, err := c.client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		PartNumber: aws.Int32(int32(partNumber)), Body: body, ContentLength: aws.Int64(size),
+	})
+	if err != nil {
+		return "", fmt.Errorf("upload multipart part: %w", err)
+	}
+	etag := strings.TrimSpace(aws.ToString(output.ETag))
+	if etag == "" {
+		return "", fmt.Errorf("upload multipart part: storage returned an empty ETag")
+	}
+	return etag, nil
+}
+
+func (c *s3Client) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int, ttl time.Duration) (string, map[string]string, error) {
+	output, err := c.presigner.PresignUploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)),
+	}, func(options *s3.PresignOptions) { options.Expires = ttl })
+	if err != nil {
+		return "", nil, fmt.Errorf("presign multipart part: %w", err)
+	}
+	return output.URL, map[string]string{}, nil
+}
+
+func (c *s3Client) ListParts(ctx context.Context, key, uploadID string) ([]CompletedPart, error) {
+	parts := make([]CompletedPart, 0)
+	var marker *string
+	for {
+		output, err := c.client.ListParts(ctx, &s3.ListPartsInput{
+			Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumberMarker: marker,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list multipart parts: %w", err)
+		}
+		for _, part := range output.Parts {
+			parts = append(parts, CompletedPart{PartNumber: int(aws.ToInt32(part.PartNumber)), ETag: aws.ToString(part.ETag), Size: aws.ToInt64(part.Size)})
+		}
+		if !aws.ToBool(output.IsTruncated) {
+			break
+		}
+		marker = output.NextPartNumberMarker
+	}
+	return parts, nil
+}
+
+func (c *s3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []CompletedPart) error {
+	completed := make([]types.CompletedPart, 0, len(parts))
+	for _, part := range parts {
+		completed = append(completed, types.CompletedPart{ETag: aws.String(part.ETag), PartNumber: aws.Int32(int32(part.PartNumber))})
+	}
+	_, err := c.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+	})
+	if err != nil {
+		return fmt.Errorf("complete multipart upload: %w", err)
+	}
+	return nil
+}
+
+func (c *s3Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	_, err := c.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+	})
+	if err != nil {
+		return fmt.Errorf("abort multipart upload: %w", err)
 	}
 	return nil
 }

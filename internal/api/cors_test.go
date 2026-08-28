@@ -31,3 +31,20 @@ func TestCorsAllowsReleaseArtifactTokenHeader(t *testing.T) {
 		t.Fatalf("Access-Control-Allow-Headers = %q, missing artifact token header", got)
 	}
 }
+
+func TestCorsAllowsMultipartSessionHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	s := &server{}
+	s.cfg.CORSOrigins = []string{"https://console.anyfun.win"}
+	r.Use(s.cors())
+	req := httptest.NewRequest(http.MethodOptions, "/v1/admin/upload-sessions/upl_1/parts/1", nil)
+	req.Header.Set("Origin", "https://console.anyfun.win")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPut)
+	req.Header.Set("Access-Control-Request-Headers", "content-length,x-upload-session-token")
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNoContent || !strings.Contains(resp.Header().Get("Access-Control-Allow-Headers"), "x-upload-session-token") {
+		t.Fatalf("multipart CORS preflight failed: status=%d headers=%q", resp.Code, resp.Header().Get("Access-Control-Allow-Headers"))
+	}
+}
