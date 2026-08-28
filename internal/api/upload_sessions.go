@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"path"
 	"sort"
@@ -265,12 +266,17 @@ func (s *server) completeUploadSession(c *gin.Context) {
 	}
 	storageParts, listErr := client.ListParts(c.Request.Context(), session.ObjectKey, tok.UploadID)
 	if listErr != nil {
-		problem(c, 502, "UPLOAD_PARTS_QUERY_FAILED", "Unable to verify uploaded parts")
-		return
-	}
-	session.Parts = make([]uploadPartState, 0, len(storageParts))
-	for _, part := range storageParts {
-		session.Parts = append(session.Parts, uploadPartState{PartNumber: part.PartNumber, ETag: part.ETag, Size: part.Size})
+		// Some S3-compatible providers (or tenant IAM policies) allow part
+		// uploads and completion but do not expose ListParts. The database
+		// ledger is already written after every successful part upload, so use
+		// it as the recovery source and let CompleteMultipartUpload remain the
+		// provider's authoritative validation.
+		slog.Warn("multipart parts listing unavailable; using persisted ledger", "tenant", tenantID(c), "sessionId", session.ID, "error", listErr)
+	} else {
+		session.Parts = make([]uploadPartState, 0, len(storageParts))
+		for _, part := range storageParts {
+			session.Parts = append(session.Parts, uploadPartState{PartNumber: part.PartNumber, ETag: part.ETag, Size: part.Size})
+		}
 	}
 	sort.Slice(body.Parts, func(i, j int) bool { return body.Parts[i].PartNumber < body.Parts[j].PartNumber })
 	for i, part := range body.Parts {
@@ -290,10 +296,18 @@ func (s *server) completeUploadSession(c *gin.Context) {
 		}
 		return out
 	}()); err != nil {
-		_ = client.AbortMultipartUpload(context.Background(), session.ObjectKey, tok.UploadID)
-		_, _ = s.db.ExecContext(context.Background(), `UPDATE upload_sessions SET status='aborted',updated_at=? WHERE tenant_id=? AND id=? AND status='active'`, time.Now().UTC(), tenantID(c), session.ID)
-		problem(c, 502, "UPLOAD_COMPLETE_FAILED", "Unable to complete multipart upload")
-		return
+		// A successful provider completion can still lose its HTTP response.
+		// Check the immutable object before deciding that completion failed.
+		if size, _, headErr := client.Head(c.Request.Context(), session.ObjectKey); headErr == nil && size == session.ExpectedSize {
+			slog.Warn("multipart complete response was lost; object is already complete", "tenant", tenantID(c), "sessionId", session.ID)
+		} else {
+			slog.Error("multipart complete failed", "tenant", tenantID(c), "sessionId", session.ID, "partCount", len(body.Parts), "objectSize", session.ExpectedSize, "error", err)
+			// Keep the session active so a transient/provider compatibility error
+			// can be retried without uploading all parts again. Expiry cleanup
+			// will abort abandoned sessions.
+			problem(c, 502, "UPLOAD_COMPLETE_FAILED", "Unable to complete multipart upload; the uploaded parts were kept for retry")
+			return
+		}
 	}
 	size, _, err := client.Head(c.Request.Context(), session.ObjectKey)
 	if err != nil || size != session.ExpectedSize {

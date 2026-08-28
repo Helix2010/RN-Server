@@ -1,8 +1,12 @@
 package api
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestUploadSessionPartsRequireExactETagAndSize(t *testing.T) {
@@ -25,5 +29,30 @@ func TestUploadSessionJSONIncludesUploadedParts(t *testing.T) {
 	}
 	if len(view["uploadedParts"].([]uploadPartState)) != 1 {
 		t.Fatal("uploadedParts should expose resumable progress")
+	}
+}
+
+func TestDatabaseTimeoutDoesNotCancelUploadSessionStorageOperations(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := &server{}
+	s.cfg.MySQLQueryTimeout = 1
+	tests := []struct {
+		method string
+		path   string
+	}{{http.MethodPut, "/v1/admin/upload-sessions/upl_1/parts/1"}}
+	for _, item := range tests {
+		t.Run(item.method+" "+item.path, func(t *testing.T) {
+			router := gin.New()
+			router.Use(s.databaseTimeout())
+			router.Handle(item.method, item.path, func(c *gin.Context) {
+				_, hasDeadline := c.Request.Context().Deadline()
+				c.JSON(http.StatusOK, gin.H{"hasDeadline": hasDeadline})
+			})
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(item.method, item.path, nil))
+			if response.Body.String() != "{\"hasDeadline\":false}" {
+				t.Fatalf("unexpected database timeout behavior: %s", response.Body.String())
+			}
+		})
 	}
 }
