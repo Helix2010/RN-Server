@@ -8,6 +8,20 @@ import (
 	"testing"
 )
 
+func TestOTASequenceLockNameFitsMySQLLimit(t *testing.T) {
+	runtime := "3f6df6c8584862471d6f2f045d60c9bdac129cd6-runtime-with-a-long-fingerprint"
+	name := otaSequenceLockName("100000001", "android", "production", runtime)
+	if len(name) > 64 {
+		t.Fatalf("lock name exceeds MySQL GET_LOCK limit: %d", len(name))
+	}
+	if name != otaSequenceLockName("100000001", "android", "production", runtime) {
+		t.Fatal("lock name must be deterministic")
+	}
+	if name == otaSequenceLockName("100000002", "android", "production", runtime) {
+		t.Fatal("lock name must include tenant scope")
+	}
+}
+
 func TestValidateOTAManifestPackageRequiresMatchingRuntimeAndHashes(t *testing.T) {
 	content := []byte("console.log('ok')")
 	digest := sha256.Sum256(content)

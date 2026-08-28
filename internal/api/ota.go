@@ -259,9 +259,8 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	// The upload object is a temporary staging artifact. Always remove it after
-	// finalize succeeds or fails; storage lifecycle rules remain the last-resort
-	// cleanup for interrupted requests.
+	// The upload object is temporary staging data. Remove it after finalize
+	// succeeds or fails; interrupted uploads are handled by storage lifecycle.
 	defer client.Delete(context.Background(), v.ObjectKey)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
@@ -366,9 +365,13 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		return
 	}
 	defer conn.Close()
-	lock := "rn_ota_" + tenantID(c) + "_" + basePlatform + "_" + body.Channel + "_" + baseRuntime
+	lock := otaSequenceLockName(tenantID(c), basePlatform, body.Channel, baseRuntime)
 	var locked int
-	if err = conn.QueryRowContext(c.Request.Context(), `SELECT GET_LOCK(?,5)`, lock).Scan(&locked); err != nil || locked != 1 {
+	if err = conn.QueryRowContext(c.Request.Context(), `SELECT GET_LOCK(?,5)`, lock).Scan(&locked); err != nil {
+		problem(c, 500, "OTA_SEQUENCE_LOCK_FAILED", "Unable to coordinate OTA revision allocation")
+		return
+	}
+	if locked != 1 {
 		problem(c, 409, "OTA_SEQUENCE_BUSY", "Another OTA is being created for this runtime")
 		return
 	}
@@ -406,6 +409,12 @@ func nullableSQLValue(v string) any {
 	}
 	return v
 }
+
+func otaSequenceLockName(tenant, platform, channel, runtime string) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{tenant, platform, channel, runtime}, "\x00")))
+	return "rn_ota_" + hex.EncodeToString(digest[:])[:56]
+}
+
 func readZipEntry(f *zip.File, limit int64) ([]byte, error) {
 	r, e := f.Open()
 	if e != nil {
@@ -720,9 +729,13 @@ func (s *server) otaAction(c *gin.Context) {
 		return
 	}
 	defer conn.Close()
-	lockName := "rn_ota_" + tenantID(c) + "_" + slotPlatform + "_" + slotChannel + "_" + slotRuntime
+	lockName := otaSequenceLockName(tenantID(c), slotPlatform, slotChannel, slotRuntime)
 	var locked int
-	if err := conn.QueryRowContext(c.Request.Context(), `SELECT GET_LOCK(?,5)`, lockName).Scan(&locked); err != nil || locked != 1 {
+	if err := conn.QueryRowContext(c.Request.Context(), `SELECT GET_LOCK(?,5)`, lockName).Scan(&locked); err != nil {
+		problem(c, 500, "OTA_SEQUENCE_LOCK_FAILED", "Unable to coordinate OTA action")
+		return
+	}
+	if locked != 1 {
 		problem(c, 409, "OTA_SEQUENCE_BUSY", "Another OTA action is in progress")
 		return
 	}
