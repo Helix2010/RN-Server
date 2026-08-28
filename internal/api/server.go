@@ -364,7 +364,7 @@ func (s *server) listReleases(c *gin.Context) {
 }
 
 func (s *server) queryReleases(ctx context.Context, tenant, platform, status string) ([]release, error) {
-	query := `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY updated_at DESC`
+	query := `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY build_number DESC, updated_at DESC, id DESC`
 	rows, err := s.db.QueryContext(ctx, query, tenant, platform, platform, status, status)
 	if err != nil {
 		return nil, err

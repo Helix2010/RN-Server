@@ -182,7 +182,7 @@ func (s *server) createOTAUploader(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(201, gin.H{"artifact": gin.H{"id": id, "token": tok, "fileName": body.FileName, "contentType": body.ContentType, "size": body.Size, "objectKey": key, "baseReleaseId": body.BaseReleaseID, "platform": platform, "runtimeVersion": runtime, "channel": body.Channel, "expiresAt": iso(time.Unix(expiresAt, 0).UTC())}, "upload": gin.H{"method": "PUT", "url": url, "headers": headers, "requiresCredentials": requires}})
+	c.JSON(201, gin.H{"artifact": gin.H{"id": id, "token": tok, "fileName": body.FileName, "contentType": body.ContentType, "size": body.Size, "objectKey": key, "baseReleaseId": body.BaseReleaseID, "platform": platform, "runtimeVersion": runtime, "channel": body.Channel, "expiresAt": iso(time.Unix(expiresAt, 0).UTC())}, "upload": gin.H{"method": "PUT", "url": url, "headers": headers, "expiresAt": iso(time.Unix(expiresAt, 0).UTC()), "requiresCredentials": requires}})
 }
 
 func (s *server) uploadOTAArtifact(c *gin.Context) {
