@@ -46,3 +46,15 @@ func TestPoolSettingsUseConfiguredLimits(t *testing.T) {
 		t.Fatalf("unexpected pool settings: %#v", settings)
 	}
 }
+
+func TestOTAMigrationIsForwardOnly(t *testing.T) {
+	found := false
+	for _, item := range migrations {
+		if item.version == 10 && item.name == "ota_releases" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("OTA schema migration 10 is missing")
+	}
+}

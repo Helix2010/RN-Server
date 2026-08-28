@@ -99,6 +99,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
+	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)
+	r.GET("/v1/ota/assets/:id/*path", s.domainTenantScope(), s.otaAsset)
 	r.GET("/v1/public/releases/latest", s.domainTenantScope(), s.publicLatestReleaseFromDomain)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
 	admin := r.Group("/v1/admin")
@@ -142,6 +144,13 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
+	group.GET("/ota/base-releases", s.listOTABaseReleases)
+	group.GET("/ota/releases", s.listOTAReleases)
+	group.POST("/ota/artifacts/uploads", s.createOTAUploader)
+	group.PUT("/ota/artifacts/upload", s.uploadOTAArtifact)
+	group.DELETE("/ota/artifacts/upload", s.deleteOTAArtifact)
+	group.POST("/ota/releases", s.saveOTARelease)
+	group.POST("/ota/releases/:id/:action", s.otaAction)
 }
 
 func (s *server) domainTenantScope() gin.HandlerFunc {
@@ -200,7 +209,7 @@ func (s *server) cors() gin.HandlerFunc {
 			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Vary", "Origin")
 			c.Header("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token")
+			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-ota-artifact-token,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
 		}
 		if c.Request.Method == http.MethodOptions {
 			c.Status(http.StatusNoContent)
@@ -710,7 +719,19 @@ func (s *server) bootstrap(c *gin.Context) {
 	theme := object(cfg["theme"])
 	features := object(cfg["features"])
 	runtime := text(c.GetHeader("x-runtime-version"), "embedded")
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": gin.H{"enabled": features["otaEnabled"], "channel": text(updatePolicy["otaChannel"], s.cfg.OTAChannel), "runtimeVersion": runtime}, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	otaChannel := text(updatePolicy["otaChannel"], s.cfg.OTAChannel)
+	ota := gin.H{"enabled": features["otaEnabled"], "channel": otaChannel, "runtimeVersion": runtime, "revision": nil, "updateId": nil, "baseReleaseId": nil, "releaseNotes": []string{}}
+	if runtime != "embedded" && truth(features["otaEnabled"]) {
+		var otaRevision int
+		var otaID, baseID string
+		var otaNotes []byte
+		if err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.revision,o.update_id,o.base_release_id,o.release_notes FROM ota_releases o WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' ORDER BY o.revision DESC LIMIT 1`, tenant.ID, platform, otaChannel, runtime).Scan(&otaRevision, &otaID, &baseID, &otaNotes); err == nil {
+			var notes map[string][]string
+			_ = json.Unmarshal(otaNotes, &notes)
+			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["releaseNotes"] = otaRevision, otaID, baseID, releaseNotesForLocale(notes, locale)
+		}
+	}
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
@@ -788,6 +809,16 @@ func randomID(n int) string {
 		panic(err)
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func randomUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 func sha256Hex(v string) string { sum := sha256.Sum256([]byte(v)); return hex.EncodeToString(sum[:]) }
 func constantEqual(a, b string) bool {

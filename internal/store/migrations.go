@@ -23,6 +23,36 @@ var migrations = []migration{
 	{version: 7, name: "localization_document_status", apply: localizationDocumentStatusMigration},
 	{version: 8, name: "reset_rn_app_localization", apply: resetRNAppLocalizationMigration},
 	{version: 9, name: "normalize_rn_app_localization_keys", apply: normalizeRNAppLocalizationKeysMigration},
+	{version: 10, name: "ota_releases", apply: otaReleasesMigration},
+}
+
+func otaReleasesMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS ota_releases (
+		id VARCHAR(80) NOT NULL COMMENT 'OTA发布记录ID',
+		tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+		base_release_id VARCHAR(80) NOT NULL COMMENT '基线APK发布ID',
+		platform ENUM('android','ios') NOT NULL COMMENT '客户端平台',
+		channel VARCHAR(40) NOT NULL COMMENT '发布通道',
+		runtime_version VARCHAR(160) NOT NULL COMMENT '兼容的原生Runtime',
+		revision INT UNSIGNED NOT NULL COMMENT '同租户平台通道Runtime下递增序号',
+		update_id VARCHAR(120) NOT NULL COMMENT 'Expo Update ID',
+		release_kind ENUM('update','rollback') NOT NULL DEFAULT 'update' COMMENT '正常更新或回到内置Bundle指令',
+		status ENUM('draft','verified','active','paused','superseded','rejected') NOT NULL COMMENT 'OTA状态',
+		manifest_key VARCHAR(512) NULL COMMENT '正常更新Manifest对象Key，回退指令为空',
+		manifest_sha256 CHAR(64) NULL COMMENT '正常更新Manifest SHA-256，回退指令为空',
+		release_notes JSON NOT NULL COMMENT '多语言发布说明',
+		source_commit_sha VARCHAR(80) NULL COMMENT '生成OTA的代码提交SHA',
+		rejection_reason VARCHAR(500) NULL COMMENT '校验拒绝原因',
+		created_by VARCHAR(120) NOT NULL COMMENT '创建人',
+		verified_at DATETIME(3) NULL COMMENT '校验时间',
+		published_at DATETIME(3) NULL COMMENT '发布时间',
+		created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+		updated_at DATETIME(3) NOT NULL COMMENT '更新时间',
+		PRIMARY KEY(id), UNIQUE KEY uq_ota_update_id(update_id),
+		UNIQUE KEY uq_ota_revision(tenant_id,platform,channel,runtime_version,revision),
+		KEY ix_ota_lookup(tenant_id,platform,channel,runtime_version,status,published_at)
+	) ENGINE=InnoDB COMMENT='租户OTA热更新发布记录'`)
+	return err
 }
 
 func resetRNAppLocalizationMigration(ctx context.Context, db *sql.DB) error {
