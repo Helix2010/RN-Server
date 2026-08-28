@@ -146,6 +146,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
 	group.GET("/ota/base-releases", s.listOTABaseReleases)
 	group.GET("/ota/releases", s.listOTAReleases)
+	group.GET("/ota/releases/:id", s.otaReleaseDetail)
 	group.POST("/ota/artifacts/uploads", s.createOTAUploader)
 	group.PUT("/ota/artifacts/upload", s.uploadOTAArtifact)
 	group.DELETE("/ota/artifacts/upload", s.deleteOTAArtifact)
