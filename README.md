@@ -24,6 +24,7 @@ go run ./cmd/server
 - MySQL：通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置；`MYSQL_CHARSET`、`MYSQL_TIMEZONE`、`MYSQL_PARSE_TIME` 控制字符集、日期时区和日期解析；测试使用 `<database>_test`
 - MySQL 连接行为：最大/空闲连接数、连接生命周期、空闲回收、查询/读写/初始化超时与有限重试均由 `MYSQL_*` 配置。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。生产环境保持 `MYSQL_AUTO_MIGRATE=false`，迁移作为独立发布步骤执行。
 - OTA（实验性）：迁移 10 增加租户级 `ota_releases`，基线 APK、Runtime、Channel、Manifest 和资产由 RN-Server/华为 OBS 管理；`/v1/ota/manifest` 实现 Expo Updates v1 基础协议。当前尚未接入 Manifest 签名密钥和客户端公钥验签，生产启用前必须完成签名链路与真机回退验证。
+- OTA Manifest 身份：上传 ZIP 中的客户端字段只作为构建提示。保存发布记录时，服务端会按当前请求域名和所选基线 APK 重写 `extra.expoClient`、API Base URL、应用版本、Build、Runtime、平台、分发渠道与 OTA Channel，避免跨租户或跨版本复用时继承构建机写死值。
 - 数据迁移：`go run ./cmd/server migrate` 执行带数据库锁和 ledger 的只向前迁移；历史数据自动归入 `default` 租户。
 - Release storage：`STORAGE_MASTER_KEY` 必须是 32 字节随机值的 Base64，只用于加密数据库中的租户对象存储凭证；Endpoint、Region、Bucket、Prefix 与凭证通过管理端写入 `app_configs.release.storage`。`ARTIFACT_UPLOAD_MODE=direct` 使用浏览器预签名直传并要求 Bucket CORS，`proxy` 则由 RN-Server 流式中转到对象存储、不要求浏览器访问 Bucket；其余 `ARTIFACT_*` 控制安装包大小、上传/下载有效期和校验超时。
 - Multipart 上传：`/v1/admin/upload-sessions` 为 APK/OTA 提供可恢复的 S3 Multipart 会话。当前 RN-Admin 走服务端 proxy 分片接口（不依赖 Bucket CORS）；另提供 presign 分片接口供后续直传接入。选择文件后创建会话，按 `partSize` 上传分片，完成后才返回临时 artifact token；临时会话存于 `upload_sessions`，不会写入 `app_releases` 或 OTA 发布记录。`ARTIFACT_MULTIPART_TTL_SECONDS` 控制会话有效期，过期会话通过 cleanup endpoint abort。

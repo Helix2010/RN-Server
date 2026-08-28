@@ -34,6 +34,16 @@ type otaUploadToken struct {
 	Size, ExpiresAt                                int64
 }
 
+type otaClientIdentity struct {
+	APIBaseURL    string
+	ApplicationID string
+	AppVersion    string
+	BuildNumber   int
+	Platform      string
+	Distribution  string
+	OTAChannel    string
+}
+
 func (s *server) encodeOTAUploadToken(v otaUploadToken) (string, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -245,8 +255,10 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 401, "INVALID_OTA_ARTIFACT_TOKEN", err.Error())
 		return
 	}
-	var basePlatform, baseRuntime, baseStatus string
-	if err = s.db.QueryRowContext(c.Request.Context(), `SELECT platform,runtime_version,status FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), body.BaseReleaseID).Scan(&basePlatform, &baseRuntime, &baseStatus); err != nil {
+	var basePlatform, baseRuntime, baseStatus, baseVersion string
+	var baseBuild int
+	var baseFileMetadata []byte
+	if err = s.db.QueryRowContext(c.Request.Context(), `SELECT platform,runtime_version,status,version,build_number,file_metadata FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), body.BaseReleaseID).Scan(&basePlatform, &baseRuntime, &baseStatus, &baseVersion, &baseBuild, &baseFileMetadata); err != nil {
 		problem(c, 404, "OTA_BASE_RELEASE_NOT_FOUND", "Base APK release not found")
 		return
 	}
@@ -348,6 +360,16 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	}
 	manifest["runtimeVersion"] = baseRuntime
 	manifest["platform"] = basePlatform
+	manifest["channel"] = body.Channel
+	rewriteOTAClientIdentity(manifest, otaClientIdentity{
+		APIBaseURL:    absoluteURL(c, ""),
+		ApplicationID: otaApplicationID(baseFileMetadata, manifest),
+		AppVersion:    baseVersion,
+		BuildNumber:   baseBuild,
+		Platform:      basePlatform,
+		Distribution:  otaDistribution(basePlatform, baseFileMetadata, manifest),
+		OTAChannel:    body.Channel,
+	})
 	manifest["metadata"] = mergeManifestMetadata(manifest["metadata"], body.Channel, body.ApplyStrategy)
 	manifest = rewriteManifestURLs(manifest, absoluteURL(c, "/v1/ota/assets/"+releaseID+"/"))
 	finalManifest, _ := json.Marshal(manifest)
@@ -550,6 +572,102 @@ func mergeManifestMetadata(v any, channel, applyStrategy string) map[string]any 
 		}
 	}
 	return m
+}
+
+func rewriteOTAClientIdentity(manifest map[string]any, identity otaClientIdentity) {
+	extra, _ := manifest["extra"].(map[string]any)
+	if extra == nil {
+		extra = map[string]any{}
+	}
+	expoClient, _ := extra["expoClient"].(map[string]any)
+	if expoClient == nil {
+		expoClient = map[string]any{}
+	}
+	expoClient["version"] = identity.AppVersion
+	android, _ := expoClient["android"].(map[string]any)
+	if identity.Platform == "android" {
+		if android == nil {
+			android = map[string]any{}
+		}
+		android["versionCode"] = identity.BuildNumber
+		expoClient["android"] = android
+	}
+	ios, _ := expoClient["ios"].(map[string]any)
+	if identity.Platform == "ios" {
+		if ios == nil {
+			ios = map[string]any{}
+		}
+		ios["buildNumber"] = fmt.Sprint(identity.BuildNumber)
+		expoClient["ios"] = ios
+	}
+	clientExtra, _ := expoClient["extra"].(map[string]any)
+	if clientExtra == nil {
+		clientExtra = map[string]any{}
+	}
+	clientExtra["apiBaseUrl"] = identity.APIBaseURL
+	clientExtra["distributionChannel"] = identity.Distribution
+	clientExtra["otaChannel"] = identity.OTAChannel
+	clientExtra["applicationId"] = identity.ApplicationID
+	clientExtra["appVersion"] = identity.AppVersion
+	clientExtra["buildNumber"] = fmt.Sprint(identity.BuildNumber)
+	expoClient["extra"] = clientExtra
+	updates, _ := expoClient["updates"].(map[string]any)
+	if updates == nil {
+		updates = map[string]any{}
+	}
+	updates["url"] = strings.TrimRight(identity.APIBaseURL, "/") + "/v1/ota/manifest"
+	expoClient["updates"] = updates
+	extra["expoClient"] = expoClient
+	extra["scopeKey"] = identity.APIBaseURL
+	extra["apiBaseUrl"] = identity.APIBaseURL
+	extra["distributionChannel"] = identity.Distribution
+	extra["otaChannel"] = identity.OTAChannel
+	extra["applicationId"] = identity.ApplicationID
+	extra["appVersion"] = identity.AppVersion
+	extra["buildNumber"] = identity.BuildNumber
+	manifest["extra"] = extra
+}
+
+func otaApplicationID(raw []byte, manifest map[string]any) string {
+	var metadata map[string]any
+	if json.Unmarshal(raw, &metadata) == nil {
+		if value, ok := metadata["packageName"].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if value := otaManifestExtraString(manifest, "applicationId"); value != "" {
+		return value
+	}
+	return "dex-mobile"
+}
+
+func otaDistribution(platform string, raw []byte, manifest map[string]any) string {
+	var metadata map[string]any
+	if json.Unmarshal(raw, &metadata) == nil {
+		if value, ok := metadata["distributionChannel"].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if value := otaManifestExtraString(manifest, "distributionChannel"); oneOf(value, "development", "staging", "store", "direct", "mdm") {
+		return value
+	}
+	if platform == "ios" {
+		return "mdm"
+	}
+	return "direct"
+}
+
+func otaManifestExtraString(manifest map[string]any, key string) string {
+	extra, _ := manifest["extra"].(map[string]any)
+	if value, ok := extra[key].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	expoClient, _ := extra["expoClient"].(map[string]any)
+	clientExtra, _ := expoClient["extra"].(map[string]any)
+	if value, ok := clientExtra[key].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 func rewriteManifestURLs(m map[string]any, base string) map[string]any {
 	if x, ok := m["launchAsset"].(map[string]any); ok {

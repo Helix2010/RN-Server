@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 )
 
@@ -19,6 +20,28 @@ func TestOTASequenceLockNameFitsMySQLLimit(t *testing.T) {
 	}
 	if name == otaSequenceLockName("100000002", "android", "production", runtime) {
 		t.Fatal("lock name must include tenant scope")
+	}
+}
+
+func TestRewriteOTAClientIdentityUsesBaseReleaseAndTenant(t *testing.T) {
+	manifest := map[string]any{
+		"extra": map[string]any{
+			"expoClient": map[string]any{
+				"version": "0.0.1",
+				"android": map[string]any{"versionCode": 1},
+				"extra":   map[string]any{"apiBaseUrl": "https://old.example"},
+			},
+		},
+	}
+	rewriteOTAClientIdentity(manifest, otaClientIdentity{APIBaseURL: "https://tenant.example", ApplicationID: "com.example.app", AppVersion: "2.3.4", BuildNumber: 42, Platform: "android", Distribution: "direct", OTAChannel: "production"})
+	extra := manifest["extra"].(map[string]any)
+	client := extra["expoClient"].(map[string]any)
+	clientExtra := client["extra"].(map[string]any)
+	if client["version"] != "2.3.4" || client["android"].(map[string]any)["versionCode"] != 42 || clientExtra["apiBaseUrl"] != "https://tenant.example" || extra["distributionChannel"] != "direct" {
+		t.Fatalf("manifest identity was not rewritten: %#v", manifest)
+	}
+	if _, err := json.Marshal(manifest); err != nil {
+		t.Fatalf("rewritten manifest must remain JSON serializable: %v", err)
 	}
 }
 
