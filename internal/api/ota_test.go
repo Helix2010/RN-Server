@@ -14,7 +14,8 @@ func TestValidateOTAManifestPackageRequiresMatchingRuntimeAndHashes(t *testing.T
 	manifest := map[string]any{
 		"id": "123e4567-e89b-12d3-a456-426614174000", "runtimeVersion": "fingerprint-a", "platform": "android",
 		"createdAt":   "2026-08-28T00:00:00Z",
-		"launchAsset": map[string]any{"path": "bundle.js", "key": "bundle", "contentType": "application/javascript", "hash": base64.RawURLEncoding.EncodeToString(digest[:])},
+		"extra":       map[string]any{"scopeKey": "anyfun"},
+		"launchAsset": map[string]any{"path": "bundle.js", "key": "bundle", "contentType": "application/javascript", "url": "https://example.test/bundle.js", "fileExtension": ".js", "hash": base64.RawURLEncoding.EncodeToString(digest[:])},
 		"assets":      []any{},
 	}
 	f := makeZipFile(t, "bundle.js", content)

@@ -720,15 +720,15 @@ func (s *server) bootstrap(c *gin.Context) {
 	features := object(cfg["features"])
 	runtime := text(c.GetHeader("x-runtime-version"), "embedded")
 	otaChannel := text(updatePolicy["otaChannel"], s.cfg.OTAChannel)
-	ota := gin.H{"enabled": features["otaEnabled"], "channel": otaChannel, "runtimeVersion": runtime, "revision": nil, "updateId": nil, "baseReleaseId": nil, "releaseNotes": []string{}}
+	ota := gin.H{"enabled": features["otaEnabled"], "channel": otaChannel, "runtimeVersion": runtime, "revision": nil, "updateId": nil, "baseReleaseId": nil, "applyStrategy": nil, "releaseNotes": []string{}}
 	if runtime != "embedded" && truth(features["otaEnabled"]) {
 		var otaRevision int
-		var otaID, baseID string
+		var otaID, baseID, applyStrategy string
 		var otaNotes []byte
-		if err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.revision,o.update_id,o.base_release_id,o.release_notes FROM ota_releases o WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' ORDER BY o.revision DESC LIMIT 1`, tenant.ID, platform, otaChannel, runtime).Scan(&otaRevision, &otaID, &baseID, &otaNotes); err == nil {
+		if err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.revision,o.update_id,o.base_release_id,o.apply_strategy,o.release_notes FROM ota_releases o WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' ORDER BY o.revision DESC LIMIT 1`, tenant.ID, platform, otaChannel, runtime).Scan(&otaRevision, &otaID, &baseID, &applyStrategy, &otaNotes); err == nil {
 			var notes map[string][]string
 			_ = json.Unmarshal(otaNotes, &notes)
-			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["releaseNotes"] = otaRevision, otaID, baseID, releaseNotesForLocale(notes, locale)
+			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
 	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})

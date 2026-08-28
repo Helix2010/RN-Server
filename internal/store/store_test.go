@@ -49,12 +49,19 @@ func TestPoolSettingsUseConfiguredLimits(t *testing.T) {
 
 func TestOTAMigrationIsForwardOnly(t *testing.T) {
 	found := false
+	foundApplyStrategy := false
 	for _, item := range migrations {
 		if item.version == 10 && item.name == "ota_releases" {
 			found = true
 		}
+		if item.version == 11 && item.name == "ota_apply_strategy" {
+			foundApplyStrategy = true
+		}
 	}
 	if !found {
 		t.Fatal("OTA schema migration 10 is missing")
+	}
+	if !foundApplyStrategy {
+		t.Fatal("OTA apply strategy migration 11 is missing")
 	}
 }

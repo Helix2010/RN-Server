@@ -27,6 +27,8 @@ import (
 
 const otaMaxPackageBytes int64 = 512 * 1024 * 1024
 
+var otaUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
+
 type otaUploadToken struct {
 	ID, TenantID, ObjectKey, FileName, ContentType string
 	Size, ExpiresAt                                int64
@@ -95,7 +97,7 @@ func (s *server) listOTABaseReleases(c *gin.Context) {
 
 func (s *server) listOTAReleases(c *gin.Context) {
 	platform, status := strings.ToLower(strings.TrimSpace(c.Query("platform"))), strings.ToLower(strings.TrimSpace(c.Query("status")))
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.status,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.updated_at DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.updated_at DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
 	if err != nil {
 		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 		return
@@ -103,17 +105,17 @@ func (s *server) listOTAReleases(c *gin.Context) {
 	defer rows.Close()
 	items := []gin.H{}
 	for rows.Next() {
-		var id, base, p, channel, runtime, updateID, kind, st, creator, notes, baseVersion string
+		var id, base, p, channel, runtime, updateID, kind, applyStrategy, st, creator, notes, baseVersion string
 		var sha, source, rejection sql.NullString
 		var revision, baseBuild int
 		var verified, published, created, updated sql.NullTime
-		if err := rows.Scan(&id, &base, &p, &channel, &runtime, &revision, &updateID, &kind, &st, &sha, &notes, &source, &rejection, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild); err != nil {
+		if err := rows.Scan(&id, &base, &p, &channel, &runtime, &revision, &updateID, &kind, &applyStrategy, &st, &sha, &notes, &source, &rejection, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild); err != nil {
 			problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 			return
 		}
 		var noteValue map[string]any
 		_ = json.Unmarshal([]byte(notes), &noteValue)
-		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "status": st, "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
+		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": st, "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
 	}
 	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
 }
@@ -218,11 +220,24 @@ func (s *server) deleteOTAArtifact(c *gin.Context) {
 
 func (s *server) saveOTARelease(c *gin.Context) {
 	var body struct {
-		ArtifactToken, BaseReleaseID, Channel, SourceCommitSHA string
-		ReleaseNotes                                           map[string]any `json:"releaseNotes"`
+		ArtifactToken, BaseReleaseID, Channel, SourceCommitSHA, ApplyStrategy string
+		ReleaseNotes                                                          map[string]any `json:"releaseNotes"`
 	}
-	if decode(c, &body) != nil || body.ArtifactToken == "" || body.BaseReleaseID == "" || strings.TrimSpace(body.Channel) == "" {
+	if decode(c, &body) != nil {
+		problem(c, 400, "INVALID_OTA_RELEASE", "Invalid OTA release payload")
+		return
+	}
+	body.ApplyStrategy = strings.TrimSpace(body.ApplyStrategy)
+	body.Channel = strings.TrimSpace(body.Channel)
+	if body.ApplyStrategy == "" {
+		body.ApplyStrategy = "next_launch"
+	}
+	if body.ArtifactToken == "" || body.BaseReleaseID == "" || body.Channel == "" {
 		problem(c, 400, "INVALID_OTA_RELEASE", "artifactToken, baseReleaseId and channel are required")
+		return
+	}
+	if body.ApplyStrategy != "next_launch" && body.ApplyStrategy != "immediate" {
+		problem(c, 422, "INVALID_OTA_APPLY_STRATEGY", "applyStrategy must be next_launch or immediate")
 		return
 	}
 	v, err := s.decodeOTAUploadToken(tenantID(c), body.ArtifactToken)
@@ -334,7 +349,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	}
 	manifest["runtimeVersion"] = baseRuntime
 	manifest["platform"] = basePlatform
-	manifest["metadata"] = mergeManifestMetadata(manifest["metadata"], body.Channel)
+	manifest["metadata"] = mergeManifestMetadata(manifest["metadata"], body.Channel, body.ApplyStrategy)
 	manifest = rewriteManifestURLs(manifest, absoluteURL(c, "/v1/ota/assets/"+releaseID+"/"))
 	finalManifest, _ := json.Marshal(manifest)
 	manifestKey := path.Join(baseKey, "manifest.json")
@@ -367,7 +382,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	var revision int
 	_ = tx.QueryRowContext(c.Request.Context(), `SELECT COALESCE(MAX(revision),0)+1 FROM ota_releases WHERE tenant_id=? AND platform=? AND channel=? AND runtime_version=?`, tenantID(c), basePlatform, body.Channel, baseRuntime).Scan(&revision)
 	now := time.Now().UTC()
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO ota_releases(id,tenant_id,base_release_id,platform,channel,runtime_version,revision,update_id,status,manifest_key,manifest_sha256,release_notes,source_commit_sha,created_by,verified_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, releaseID, tenantID(c), body.BaseReleaseID, basePlatform, body.Channel, baseRuntime, revision, updateID, "verified", manifestKey, hex.EncodeToString(hash[:]), notes, nullableSQLValue(body.SourceCommitSHA), actor(c), now, now, now)
+	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO ota_releases(id,tenant_id,base_release_id,platform,channel,runtime_version,revision,update_id,apply_strategy,status,manifest_key,manifest_sha256,release_notes,source_commit_sha,created_by,verified_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, releaseID, tenantID(c), body.BaseReleaseID, basePlatform, body.Channel, baseRuntime, revision, updateID, body.ApplyStrategy, "verified", manifestKey, hex.EncodeToString(hash[:]), notes, nullableSQLValue(body.SourceCommitSHA), actor(c), now, now, now)
 	if err != nil {
 		problem(c, 500, "OTA_CREATE_FAILED", "Unable to save OTA release")
 		return
@@ -382,7 +397,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		return
 	}
 	persisted = true
-	c.JSON(201, gin.H{"release": gin.H{"id": releaseID, "baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "channel": body.Channel, "runtimeVersion": baseRuntime, "revision": revision, "updateId": updateID, "status": "verified", "manifestSha256": hex.EncodeToString(hash[:]), "releaseNotes": body.ReleaseNotes, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now)}})
+	c.JSON(201, gin.H{"release": gin.H{"id": releaseID, "baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "channel": body.Channel, "runtimeVersion": baseRuntime, "revision": revision, "updateId": updateID, "applyStrategy": body.ApplyStrategy, "status": "verified", "manifestSha256": hex.EncodeToString(hash[:]), "releaseNotes": body.ReleaseNotes, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now)}})
 }
 
 func nullableSQLValue(v string) any {
@@ -425,6 +440,10 @@ func validateOTAManifestPackage(manifest map[string]any, files map[string]*zip.F
 	if err := verifyOTAManifestAsset("launchAsset", launch, files); err != nil {
 		return err
 	}
+	extra, ok := manifest["extra"].(map[string]any)
+	if !ok || strings.TrimSpace(fmt.Sprint(extra["scopeKey"])) == "" {
+		return errors.New("manifest extra.scopeKey is required")
+	}
 	assets, ok := manifest["assets"].([]any)
 	if !ok {
 		return errors.New("manifest assets must be an array")
@@ -457,10 +476,11 @@ func verifyOTAManifestAsset(label string, asset map[string]any, files map[string
 	if contentType, _ := asset["contentType"].(string); strings.TrimSpace(contentType) == "" {
 		return fmt.Errorf("manifest %s contentType is required", label)
 	}
-	if label != "launchAsset" {
-		if fileExtension, _ := asset["fileExtension"].(string); strings.TrimSpace(fileExtension) == "" {
-			return fmt.Errorf("manifest %s fileExtension is required", label)
-		}
+	if urlValue, _ := asset["url"].(string); strings.TrimSpace(urlValue) == "" {
+		return fmt.Errorf("manifest %s url is required", label)
+	}
+	if fileExtension, _ := asset["fileExtension"].(string); strings.TrimSpace(fileExtension) == "" {
+		return fmt.Errorf("manifest %s fileExtension is required", label)
 	}
 	expected, _ := asset["hash"].(string)
 	if expected == "" {
@@ -513,8 +533,8 @@ func contentTypeForPath(name string) string {
 		return "application/octet-stream"
 	}
 }
-func mergeManifestMetadata(v any, channel string) map[string]any {
-	m := map[string]any{"channel": channel}
+func mergeManifestMetadata(v any, channel, applyStrategy string) map[string]any {
+	m := map[string]any{"channel": channel, "applyStrategy": applyStrategy}
 	if x, ok := v.(map[string]any); ok {
 		for k, val := range x {
 			m[k] = val

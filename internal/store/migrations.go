@@ -24,6 +24,12 @@ var migrations = []migration{
 	{version: 8, name: "reset_rn_app_localization", apply: resetRNAppLocalizationMigration},
 	{version: 9, name: "normalize_rn_app_localization_keys", apply: normalizeRNAppLocalizationKeysMigration},
 	{version: 10, name: "ota_releases", apply: otaReleasesMigration},
+	{version: 11, name: "ota_apply_strategy", apply: otaApplyStrategyMigration},
+}
+
+func otaApplyStrategyMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `ALTER TABLE ota_releases ADD COLUMN apply_strategy ENUM('next_launch','immediate') NOT NULL DEFAULT 'next_launch' COMMENT '客户端应用时机：下次启动或下载后提示立即重启' AFTER release_kind`)
+	return err
 }
 
 func otaReleasesMigration(ctx context.Context, db *sql.DB) error {

@@ -15,7 +15,7 @@
     "/v1/admin/release-artifacts/uploads": {"post": {"responses": {"201": {"description": "Temporary artifact upload ticket"}}}},
     "/v1/admin/release-artifacts/upload": {"put": {"responses": {"200": {"description": "Temporary artifact stored"}}}, "delete": {"responses": {"200": {"description": "Temporary artifact removed"}}}},
     "/v1/admin/ota/base-releases": {"get": {"parameters": [{"name": "platform", "in": "query", "schema": {"type": "string", "enum": ["android", "ios"]}}], "responses": {"200": {"description": "Verified APK releases available as OTA bases"}}}},
-    "/v1/admin/ota/releases": {"get": {"responses": {"200": {"description": "Tenant OTA release list"}}}, "post": {"responses": {"201": {"description": "Verified OTA release created"}}}},
+    "/v1/admin/ota/releases": {"get": {"responses": {"200": {"description": "Tenant OTA release list"}}}, "post": {"requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OTAReleaseRequest"}}}}, "responses": {"201": {"description": "Verified OTA release created"}, "422": {"description": "Base release or apply strategy invalid"}}}},
     "/v1/admin/ota/artifacts/uploads": {"post": {"responses": {"201": {"description": "Temporary OTA upload ticket"}}}},
     "/v1/admin/ota/artifacts/upload": {"put": {"responses": {"200": {"description": "Temporary OTA package stored"}}}, "delete": {"responses": {"200": {"description": "Temporary OTA package removed"}}}},
     "/v1/admin/ota/releases/{id}/{action}": {"parameters": [{"$ref": "#/components/parameters/ReleaseId"}, {"name": "action", "in": "path", "required": true, "schema": {"type": "string", "enum": ["publish", "pause", "rollback"]}}], "post": {"responses": {"201": {"description": "OTA state transition or rollback directive"}}}},
@@ -39,6 +39,7 @@
     "schemas": {
       "LoginRequest": {"type": "object", "required": ["username", "password"], "properties": {"username": {"type": "string"}, "password": {"type": "string", "format": "password"}}},
       "LocalizationDocumentsRequest": {"type": "object", "required": ["documents", "reason"], "properties": {"reason": {"type": "string", "minLength": 3}, "documents": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/LocalizationDocumentChange"}}}},
+      "OTAReleaseRequest": {"type": "object", "required": ["artifactToken", "baseReleaseId", "channel"], "properties": {"artifactToken": {"type": "string"}, "baseReleaseId": {"type": "string"}, "channel": {"type": "string"}, "applyStrategy": {"type": "string", "enum": ["next_launch", "immediate"], "default": "next_launch"}, "sourceCommitSha": {"type": "string"}, "releaseNotes": {"type": "object", "additionalProperties": true}}},
       "LocalizationDocumentChange": {"type": "object", "required": ["key", "meta", "values"], "properties": {"key": {"type": "string", "maxLength": 255, "pattern": "^[a-z0-9][a-z0-9._-]{0,254}$", "description": "Canonical lowercase localization key"}, "meta": {"type": "string", "maxLength": 255}, "create": {"type": "boolean"}, "enabled": {"type": "boolean", "description": "Maps to language_document.deleted for the whole key"}, "values": {"type": "object", "additionalProperties": {"type": "string", "nullable": true}}}}
     }
   }
