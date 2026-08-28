@@ -130,6 +130,56 @@ func (s *server) listOTAReleases(c *gin.Context) {
 	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
 }
 
+func (s *server) otaReleaseDetail(c *gin.Context) {
+	var id, baseID, platform, channel, runtime, updateID, kind, applyStrategy, status, baseVersion, creator string
+	var revision, baseBuild int
+	var manifestKey, manifestSHA, source, reject sql.NullString
+	var notes []byte
+	var verified, published, created, updated sql.NullTime
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.manifest_key,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at,a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.id=?`, tenantID(c), c.Param("id")).Scan(&id, &baseID, &platform, &channel, &runtime, &revision, &updateID, &kind, &applyStrategy, &status, &manifestKey, &manifestSHA, &notes, &source, &reject, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild)
+	if errors.Is(err, sql.ErrNoRows) {
+		problem(c, http.StatusNotFound, "OTA_NOT_FOUND", "OTA release not found")
+		return
+	}
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "OTA_QUERY_FAILED", "Unable to load OTA release")
+		return
+	}
+	var releaseNotes map[string]any
+	_ = json.Unmarshal(notes, &releaseNotes)
+	baseMetadata := map[string]any{}
+	var rawBaseMetadata []byte
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT file_metadata FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), baseID).Scan(&rawBaseMetadata); err == nil {
+		_ = json.Unmarshal(rawBaseMetadata, &baseMetadata)
+	}
+	var manifest map[string]any
+	if manifestKey.Valid {
+		client, _, storageErr := s.storageClientForTenant(c.Request.Context(), tenantID(c))
+		if storageErr != nil {
+			problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
+			return
+		}
+		body, getErr := client.Get(c.Request.Context(), manifestKey.String)
+		if getErr != nil {
+			problem(c, http.StatusBadGateway, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
+			return
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(body, 8*1024*1024))
+		_ = body.Close()
+		if readErr != nil || (manifestSHA.Valid && hex.EncodeToString(hashBytes(raw)) != manifestSHA.String) || json.Unmarshal(raw, &manifest) != nil {
+			problem(c, http.StatusBadGateway, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
+			return
+		}
+	}
+	identity := otaManifestIdentity(manifest)
+	c.JSON(http.StatusOK, gin.H{
+		"release":      gin.H{"id": id, "baseReleaseId": baseID, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": platform, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": status, "manifestKey": nullableString(manifestKey.String), "manifestSha256": nullableString(manifestSHA.String), "releaseNotes": releaseNotes, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(reject.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)},
+		"identity":     identity,
+		"baseMetadata": baseMetadata,
+		"manifest":     manifest,
+	})
+}
+
 func nullableOTAFieldTime(v sql.NullTime) any {
 	if !v.Valid {
 		return nil
@@ -668,6 +718,47 @@ func otaManifestExtraString(manifest map[string]any, key string) string {
 		return strings.TrimSpace(value)
 	}
 	return ""
+}
+
+func otaManifestIdentity(manifest map[string]any) gin.H {
+	identity := gin.H{}
+	extra, _ := manifest["extra"].(map[string]any)
+	client, _ := extra["expoClient"].(map[string]any)
+	clientExtra, _ := client["extra"].(map[string]any)
+	put := func(key string, values ...map[string]any) {
+		for _, source := range values {
+			if value, ok := source[key]; ok {
+				identity[key] = value
+				return
+			}
+		}
+	}
+	put("apiBaseUrl", extra, clientExtra)
+	put("distributionChannel", extra, clientExtra)
+	put("otaChannel", extra, clientExtra)
+	put("applicationId", extra, clientExtra)
+	put("appVersion", extra, clientExtra)
+	put("buildNumber", extra, clientExtra)
+	if value, ok := client["version"]; ok {
+		identity["expoClientVersion"] = value
+	}
+	put("runtimeVersion", manifest)
+	put("platform", manifest)
+	put("channel", manifest)
+	if android, ok := client["android"].(map[string]any); ok {
+		if value, exists := android["versionCode"]; exists {
+			identity["expoClientAndroidVersionCode"] = value
+		}
+	}
+	if ios, ok := client["ios"].(map[string]any); ok {
+		if value, exists := ios["buildNumber"]; exists {
+			identity["expoClientIOSBuildNumber"] = value
+		}
+	}
+	if len(identity) == 0 {
+		return nil
+	}
+	return identity
 }
 func rewriteManifestURLs(m map[string]any, base string) map[string]any {
 	if x, ok := m["launchAsset"].(map[string]any); ok {

@@ -45,6 +45,30 @@ func TestRewriteOTAClientIdentityUsesBaseReleaseAndTenant(t *testing.T) {
 	}
 }
 
+func TestOTAManifestIdentityExtractsClientFields(t *testing.T) {
+	manifest := map[string]any{
+		"runtimeVersion": "runtime-a",
+		"platform":       "android",
+		"channel":        "production",
+		"extra": map[string]any{
+			"apiBaseUrl":          "https://tenant.example",
+			"distributionChannel": "direct",
+			"otaChannel":          "production",
+			"applicationId":       "com.example.app",
+			"appVersion":          "2.3.4",
+			"buildNumber":         42,
+			"expoClient": map[string]any{
+				"version": "2.3.4",
+				"android": map[string]any{"versionCode": 42},
+			},
+		},
+	}
+	identity := otaManifestIdentity(manifest)
+	if identity["apiBaseUrl"] != "https://tenant.example" || identity["expoClientVersion"] != "2.3.4" || identity["expoClientAndroidVersionCode"] != 42 {
+		t.Fatalf("manifest identity extraction failed: %#v", identity)
+	}
+}
+
 func TestValidateOTAManifestPackageRequiresMatchingRuntimeAndHashes(t *testing.T) {
 	content := []byte("console.log('ok')")
 	digest := sha256.Sum256(content)
