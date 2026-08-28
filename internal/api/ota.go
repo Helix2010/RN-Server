@@ -97,7 +97,7 @@ func (s *server) listOTABaseReleases(c *gin.Context) {
 
 func (s *server) listOTAReleases(c *gin.Context) {
 	platform, status := strings.ToLower(strings.TrimSpace(c.Query("platform"))), strings.ToLower(strings.TrimSpace(c.Query("status")))
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.updated_at DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.revision DESC, o.created_at DESC, o.id DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
 	if err != nil {
 		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 		return
