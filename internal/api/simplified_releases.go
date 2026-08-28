@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -129,24 +130,57 @@ func (s *server) uploadReleaseArtifact(c *gin.Context) {
 		problem(c, http.StatusLengthRequired, "RELEASE_UPLOAD_SIZE_MISMATCH", "Uploaded file size does not match the artifact declaration")
 		return
 	}
-	client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
+	storedSize, err := s.receiveAndStoreArtifact(c, value.ObjectKey, value.ContentType, value.Size)
 	if err != nil {
-		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
-		return
-	}
-	limited := http.MaxBytesReader(c.Writer, c.Request.Body, value.Size)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
-	defer cancel()
-	if err := client.Put(ctx, value.ObjectKey, limited, value.Size, value.ContentType); err != nil {
-		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", "Unable to store the release package")
-		return
-	}
-	storedSize, _, err := client.Head(ctx, value.ObjectKey)
-	if err != nil || storedSize != value.Size {
-		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", "Stored release package size could not be verified")
+		slog.Error("release artifact proxy upload failed", "tenant", tenantID(c), "artifactId", value.ID, "objectKey", value.ObjectKey, "expectedSize", value.Size, "error", err)
+		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"artifact": gin.H{"id": value.ID, "fileSize": storedSize, "objectKey": value.ObjectKey}})
+}
+
+func (s *server) receiveAndStoreArtifact(c *gin.Context, objectKey, contentType string, expectedSize int64) (int64, error) {
+	client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
+	if err != nil {
+		return 0, errors.New("release storage is not configured")
+	}
+	temporary, err := os.CreateTemp("", "rn-artifact-upload-*")
+	if err != nil {
+		return 0, fmt.Errorf("prepare temporary upload: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	limited := http.MaxBytesReader(c.Writer, c.Request.Body, expectedSize)
+	written, copyErr := io.Copy(temporary, limited)
+	if copyErr != nil {
+		_ = temporary.Close()
+		return 0, fmt.Errorf("receive upload body: %w", copyErr)
+	}
+	if written != expectedSize {
+		_ = temporary.Close()
+		return 0, fmt.Errorf("uploaded size mismatch: got %d, expected %d", written, expectedSize)
+	}
+	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
+		_ = temporary.Close()
+		return 0, fmt.Errorf("prepare stored upload: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
+	defer cancel()
+	if err := client.Put(ctx, objectKey, temporary, expectedSize, contentType); err != nil {
+		_ = temporary.Close()
+		return 0, fmt.Errorf("write object storage: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return 0, fmt.Errorf("close temporary upload: %w", err)
+	}
+	storedSize, _, err := client.Head(ctx, objectKey)
+	if err != nil {
+		return 0, fmt.Errorf("verify stored upload: %w", err)
+	}
+	if storedSize != expectedSize {
+		return 0, fmt.Errorf("stored size mismatch: got %d, expected %d", storedSize, expectedSize)
+	}
+	return storedSize, nil
 }
 
 func (s *server) deleteReleaseArtifact(c *gin.Context) {

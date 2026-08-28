@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -196,20 +197,10 @@ func (s *server) uploadOTAArtifact(c *gin.Context) {
 		problem(c, 411, "OTA_UPLOAD_SIZE_MISMATCH", "Uploaded file size does not match declaration")
 		return
 	}
-	client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
+	size, err := s.receiveAndStoreArtifact(c, v.ObjectKey, v.ContentType, v.Size)
 	if err != nil {
-		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
-		return
-	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
-	defer cancel()
-	if err := client.Put(ctx, v.ObjectKey, http.MaxBytesReader(c.Writer, c.Request.Body, v.Size), v.Size, v.ContentType); err != nil {
-		problem(c, 502, "OTA_UPLOAD_FAILED", "Unable to store OTA package")
-		return
-	}
-	size, _, err := client.Head(ctx, v.ObjectKey)
-	if err != nil || size != v.Size {
-		problem(c, 502, "OTA_UPLOAD_FAILED", "Stored OTA package could not be verified")
+		slog.Error("OTA artifact proxy upload failed", "tenant", tenantID(c), "artifactId", v.ID, "objectKey", v.ObjectKey, "expectedSize", v.Size, "error", err)
+		problem(c, 502, "OTA_UPLOAD_FAILED", err.Error())
 		return
 	}
 	c.JSON(200, gin.H{"artifact": gin.H{"id": v.ID, "fileSize": size, "objectKey": v.ObjectKey}})

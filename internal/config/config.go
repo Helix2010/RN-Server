@@ -59,8 +59,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		Environment:                value("APP_ENV", "development"),
 		Port:                       value("PORT", "3000"),
-		HTTPReadTimeout:            integer("HTTP_READ_TIMEOUT_SECONDS", 900),
-		HTTPWriteTimeout:           integer("HTTP_WRITE_TIMEOUT_SECONDS", 900),
+		HTTPReadTimeout:            integer("HTTP_READ_TIMEOUT_SECONDS", 3600),
+		HTTPWriteTimeout:           integer("HTTP_WRITE_TIMEOUT_SECONDS", 3600),
 		CORSOrigins:                split(value("CORS_ORIGINS", "*")),
 		AdminAPIKey:                os.Getenv("ADMIN_API_KEY"),
 		AdminUsername:              os.Getenv("ADMIN_USERNAME"),
