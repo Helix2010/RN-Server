@@ -1,11 +1,13 @@
 package apkinspect
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/avast/apkverifier"
 	"github.com/shogo82148/androidbinary/apk"
@@ -21,6 +23,7 @@ type Metadata struct {
 	SignerSHA256      string
 	SigningScheme     int
 	SignerCertificate string
+	RuntimeVersion    string
 }
 
 func Inspect(path string) (Metadata, error) {
@@ -65,6 +68,10 @@ func Inspect(path string) (Metadata, error) {
 	if certificateInfo == nil {
 		return Metadata{}, fmt.Errorf("verify APK signature: signer certificate missing")
 	}
+	runtimeVersion, err := runtimeVersionFromArchive(path)
+	if err != nil {
+		return Metadata{}, fmt.Errorf("read Expo runtime version: %w", err)
+	}
 	return Metadata{
 		PackageName:       parsed.PackageName(),
 		VersionName:       versionName,
@@ -75,5 +82,35 @@ func Inspect(path string) (Metadata, error) {
 		SignerSHA256:      certificateInfo.Sha256,
 		SigningScheme:     verification.SigningSchemeId,
 		SignerCertificate: certificateInfo.Subject,
+		RuntimeVersion:    runtimeVersion,
 	}, nil
+}
+
+func runtimeVersionFromArchive(path string) (string, error) {
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		return "", fmt.Errorf("open APK archive: %w", err)
+	}
+	defer archive.Close()
+	for _, entry := range archive.File {
+		name := entry.Name
+		if !strings.HasSuffix(strings.TrimSuffix(name, "/"), "/assets/fingerprint") && name != "assets/fingerprint" {
+			continue
+		}
+		reader, err := entry.Open()
+		if err != nil {
+			return "", fmt.Errorf("open fingerprint entry: %w", err)
+		}
+		value, readErr := io.ReadAll(io.LimitReader(reader, 256))
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil {
+			return "", fmt.Errorf("read fingerprint entry")
+		}
+		runtime := strings.TrimSpace(string(value))
+		if runtime == "" {
+			return "", fmt.Errorf("fingerprint entry is empty")
+		}
+		return runtime, nil
+	}
+	return "", nil
 }

@@ -164,12 +164,11 @@ func (s *server) deleteReleaseArtifact(c *gin.Context) {
 
 func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	var body struct {
-		ArtifactToken  string         `json:"artifactToken"`
-		Platform       string         `json:"platform"`
-		Version        string         `json:"version"`
-		BuildNumber    int            `json:"buildNumber"`
-		RuntimeVersion string         `json:"runtimeVersion"`
-		ReleaseNotes   map[string]any `json:"releaseNotes"`
+		ArtifactToken string         `json:"artifactToken"`
+		Platform      string         `json:"platform"`
+		Version       string         `json:"version"`
+		BuildNumber   int            `json:"buildNumber"`
+		ReleaseNotes  map[string]any `json:"releaseNotes"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "Invalid release payload")
@@ -177,8 +176,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	}
 	body.Platform = strings.ToLower(strings.TrimSpace(body.Platform))
 	body.Version = strings.TrimSpace(body.Version)
-	body.RuntimeVersion = strings.TrimSpace(body.RuntimeVersion)
-	if !validVersion(body.Version) || body.BuildNumber < 1 || body.RuntimeVersion == "" {
+	if !validVersion(body.Version) || body.BuildNumber < 1 {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "Platform, version and build number are invalid")
 		return
 	}
@@ -225,13 +223,15 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		return
 	}
 	metadata := map[string]any{"fileName": artifact.FileName, "size": size, "sha256": hex.EncodeToString(hash.Sum(nil))}
+	runtimeVersion := ""
 	if body.Platform == "android" {
 		apk, inspectErr := apkinspect.Inspect(temporaryPath)
 		if inspectErr != nil {
 			problem(c, http.StatusUnprocessableEntity, "RELEASE_VERIFY_FAILED", "Android package or signature verification failed")
 			return
 		}
-		metadata["packageName"], metadata["versionName"], metadata["versionCode"] = apk.PackageName, apk.VersionName, apk.VersionCode
+		runtimeVersion = apk.RuntimeVersion
+		metadata["packageName"], metadata["versionName"], metadata["versionCode"], metadata["runtimeVersion"] = apk.PackageName, apk.VersionName, apk.VersionCode, runtimeVersion
 		metadata["minSdk"], metadata["signerSha256"], metadata["signingScheme"] = apk.MinSDK, apk.SignerSHA256, apk.SigningScheme
 		if apk.VersionName != body.Version || apk.VersionCode != int64(body.BuildNumber) {
 			problem(c, http.StatusUnprocessableEntity, "RELEASE_IDENTITY_MISMATCH", "APK versionName/versionCode does not match the release version and build number")
@@ -272,7 +272,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	id := "rel_" + randomID(16)
 	notes, _ := json.Marshal(body.ReleaseNotes)
 	rawMetadata, _ := json.Marshal(metadata)
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, tenantID(c), body.Platform, body.Version, body.BuildNumber, body.RuntimeVersion, "verified", notes, artifact.ObjectKey, artifact.FileName, artifact.ContentType, artifact.Size, size, metadata["sha256"], rawMetadata, now, actor(c), now, now)
+	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, tenantID(c), body.Platform, body.Version, body.BuildNumber, runtimeVersion, "verified", notes, artifact.ObjectKey, artifact.FileName, artifact.ContentType, artifact.Size, size, metadata["sha256"], rawMetadata, now, actor(c), now, now)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release")
 		return
@@ -282,7 +282,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release audit")
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": body.RuntimeVersion, "status": "verified", "releaseNotes": body.ReleaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
+	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": body.ReleaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
 }
 
 func (s *server) activeSimplifiedRelease(ctx context.Context, tenant, platform string) (simplifiedActiveRelease, error) {

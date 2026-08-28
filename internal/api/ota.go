@@ -71,7 +71,7 @@ func otaTokenFromRequest(c *gin.Context) string {
 
 func (s *server) listOTABaseReleases(c *gin.Context) {
 	platform := strings.ToLower(strings.TrimSpace(c.Query("platform")))
-	query := `SELECT id,platform,version,build_number,runtime_version,status,created_at FROM app_releases WHERE tenant_id=? AND status IN ('verified','active') AND (?='' OR platform=?) ORDER BY build_number DESC LIMIT 100`
+	query := `SELECT id,platform,version,build_number,runtime_version,status,created_at FROM app_releases WHERE tenant_id=? AND status IN ('verified','active') AND runtime_version<>'' AND (?='' OR platform=?) ORDER BY build_number DESC LIMIT 100`
 	rows, err := s.db.QueryContext(c.Request.Context(), query, tenantID(c), platform, platform)
 	if err != nil {
 		problem(c, 500, "OTA_BASE_RELEASE_QUERY_FAILED", "Unable to load OTA base releases")
