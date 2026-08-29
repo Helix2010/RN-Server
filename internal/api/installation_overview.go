@@ -11,7 +11,7 @@ import (
 func (s *server) installationOverview(c *gin.Context) {
 	now := time.Now().UTC()
 	var total, active1d, active7d, active30d int
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*), COALESCE(SUM(last_active_at>=?),0), COALESCE(SUM(last_active_at>=?),0), COALESCE(SUM(last_active_at>=?),0) FROM app_installations WHERE tenant_id=?`, now.Add(-24*time.Hour), now.Add(-7*24*time.Hour), now.Add(-30*24*time.Hour), tenantID(c)).Scan(&total, &active1d, &active7d, &active30d); err != nil {
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*), COALESCE(SUM(status='active' AND last_active_at>=?),0), COALESCE(SUM(status='active' AND last_active_at>=?),0), COALESCE(SUM(status='active' AND last_active_at>=?),0) FROM app_installations WHERE tenant_id=?`, now.Add(-24*time.Hour), now.Add(-7*24*time.Hour), now.Add(-30*24*time.Hour), tenantID(c)).Scan(&total, &active1d, &active7d, &active30d); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation overview")
 		return
 	}

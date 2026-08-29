@@ -58,11 +58,6 @@
         "responses": { "201": { "description": "Installation registered" } }
       }
     },
-    "/v1/mobile/installations/refresh-credential": {
-      "post": {
-        "responses": { "200": { "description": "Installation credential rotated" } }
-      }
-    },
     "/v1/mobile/push-tokens": {
       "post": {
         "responses": {

@@ -100,7 +100,6 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
 	r.POST("/v1/mobile/installations/heartbeat", s.domainTenantScope(), s.installationHeartbeat)
 	r.POST("/v1/mobile/installations/register", s.domainTenantScope(), s.registerInstallation)
-	r.POST("/v1/mobile/installations/refresh-credential", s.domainTenantScope(), s.refreshInstallationCredential)
 	r.POST("/v1/mobile/push-tokens", s.domainTenantScope(), s.registerPushToken)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)

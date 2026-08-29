@@ -56,13 +56,43 @@ func (s *server) registerInstallation(c *gin.Context) {
 		problem(c, 422, "INVALID_INSTALLATION", "Platform is invalid")
 		return
 	}
-	var exists bool
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM app_installations WHERE tenant_id=? AND application_id=? AND installation_id=? AND credential_hash IS NOT NULL)`, tenantID(c), applicationID, body.InstallationID).Scan(&exists); err != nil {
+	var existingDeviceKey, existingStatus sql.NullString
+	var existingVersion int
+	existingErr := s.db.QueryRowContext(c.Request.Context(), `SELECT d.device_key_hash,i.status,i.credential_version FROM app_installations i LEFT JOIN device_clients d ON d.id=i.device_client_id WHERE i.tenant_id=? AND i.application_id=? AND i.installation_id=? LIMIT 1`, tenantID(c), applicationID, body.InstallationID).Scan(&existingDeviceKey, &existingStatus, &existingVersion)
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to check installation")
 		return
 	}
-	if exists {
-		problem(c, 409, "INSTALLATION_ALREADY_REGISTERED", "Installation is already registered")
+	if existingErr == nil {
+		if existingStatus.String == "revoked" {
+			problem(c, 403, "INSTALLATION_REVOKED", "Installation has been revoked")
+			return
+		}
+		if body.DeviceSourceHash == "" || !existingDeviceKey.Valid {
+			problem(c, 409, "INSTALLATION_RECOVERY_UNAVAILABLE", "Installation credential cannot be recovered on this device")
+			return
+		}
+		deviceKey, keyErr := s.deviceKeyHash(platform, body.DeviceSourceHash)
+		if keyErr != nil || subtle.ConstantTimeCompare([]byte(existingDeviceKey.String), []byte(deviceKey)) != 1 {
+			problem(c, 409, "INSTALLATION_IDENTITY_MISMATCH", "Installation identity does not match the registered device")
+			return
+		}
+		credential, hash, rotateErr := newInstallationCredential()
+		if rotateErr != nil {
+			problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to rotate installation credential")
+			return
+		}
+		now, expires := time.Now().UTC(), time.Now().UTC().Add(installationCredentialTTL)
+		result, updateErr := s.db.ExecContext(c.Request.Context(), `UPDATE app_installations SET credential_hash=?,credential_version=?,credential_expires_at=?,credential_last_used_at=?,credential_revoked_at=NULL,revoked_reason=NULL,status='active',updated_at=? WHERE tenant_id=? AND application_id=? AND installation_id=? AND status<>'revoked'`, hash, existingVersion+1, expires, now, now, tenantID(c), applicationID, body.InstallationID)
+		if updateErr != nil {
+			problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to rotate installation credential")
+			return
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			problem(c, 409, "INSTALLATION_CREDENTIAL_CONFLICT", "Installation changed; retry")
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"installationId": body.InstallationID, "installationCredential": credential, "credentialVersion": existingVersion + 1, "credentialExpiresAt": iso(expires), "heartbeatIntervalSeconds": 1800, "receivedAt": iso(now), "credentialRotated": true})
 		return
 	}
 	credential, hash, err := newInstallationCredential()
@@ -106,37 +136,6 @@ func (s *server) installationHeartbeat(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, response)
-}
-
-func (s *server) refreshInstallationCredential(c *gin.Context) {
-	var body struct {
-		InstallationID string `json:"installationId"`
-	}
-	if decode(c, &body) != nil {
-		problem(c, 400, "INVALID_INSTALLATION", "Invalid installation payload")
-		return
-	}
-	body.InstallationID = strings.TrimSpace(body.InstallationID)
-	record, valid := s.authenticateInstallation(c, body.InstallationID)
-	if !valid {
-		return
-	}
-	credential, hash, err := newInstallationCredential()
-	if err != nil {
-		problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to rotate installation credential")
-		return
-	}
-	now, expires := time.Now().UTC(), time.Now().UTC().Add(installationCredentialTTL)
-	result, err := s.db.ExecContext(c.Request.Context(), `UPDATE app_installations SET credential_hash=?,credential_version=?,credential_expires_at=?,credential_last_used_at=?,updated_at=? WHERE tenant_id=? AND application_id=? AND installation_id=? AND credential_version=? AND credential_revoked_at IS NULL`, hash, record.Version+1, expires, now, now, tenantID(c), record.ApplicationID, body.InstallationID, record.Version)
-	if err != nil {
-		problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to rotate installation credential")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, 409, "INSTALLATION_CREDENTIAL_CONFLICT", "Installation credential changed; retry")
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"installationId": body.InstallationID, "installationCredential": credential, "credentialVersion": record.Version + 1, "credentialExpiresAt": iso(expires)})
 }
 
 func (s *server) revokeInstallation(c *gin.Context) {
