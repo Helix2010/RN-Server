@@ -40,3 +40,25 @@ func TestHasTenantObjectPrefixNormalizesLeadingSlash(t *testing.T) {
 		t.Fatal("expected a different tenant object key to be rejected")
 	}
 }
+
+func TestResolveBrandingInheritsImagesAcrossThemes(t *testing.T) {
+	logo := map[string]any{"assetId": "tenant-logo", "fileUrl": "/v1/mobile/branding/assets/tenant-logo"}
+	config := cloneMap(defaultBrandingConfig)
+	launch := config["launch"].(map[string]any)
+	visuals := launch["defaultVisual"].(map[string]any)
+	visuals["light"].(map[string]any)["logo"] = logo
+
+	resolved := resolveBranding(config, "zh-CN", "zh-CN", map[string]string{
+		"launch.title":    "AnyFun",
+		"launch.subtitle": "正在同步",
+	})
+	resolvedVisuals := resolved["launch"].(map[string]any)["visuals"].(map[string]any)
+	dark := resolvedVisuals["dark"].(map[string]any)
+
+	if darkLogo := dark["logo"].(map[string]any); darkLogo["assetId"] != "tenant-logo" {
+		t.Fatalf("dark theme did not inherit tenant logo: %#v", resolvedVisuals)
+	}
+	if dark["backgroundColor"] != "#0B1220" {
+		t.Fatalf("dark theme background color must be preserved: %#v", dark)
+	}
+}

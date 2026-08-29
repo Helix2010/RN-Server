@@ -350,6 +350,7 @@ func resolveBranding(config map[string]any, locale, fallback string, messages ma
 		selectedOverride = object(localeOverrides[fallback])
 	}
 	visuals := mergeBranding(defaultVisual, selectedOverride)
+	inheritBrandingAssetsAcrossThemes(visuals)
 	messageConfig := object(launch["messages"])
 	titleKey, subtitleKey := text(messageConfig["titleKey"], "launch.title"), text(messageConfig["subtitleKey"], "launch.subtitle")
 	return map[string]any{
@@ -358,6 +359,23 @@ func resolveBranding(config map[string]any, locale, fallback string, messages ma
 		"launch":      map[string]any{"enabled": launch["enabled"], "minDisplayMs": launch["minDisplayMs"], "maxDisplayMs": launch["maxDisplayMs"], "animation": launch["animation"], "title": messages[titleKey], "subtitle": messages[subtitleKey], "visuals": visuals},
 		"cachePolicy": config["cachePolicy"],
 	}
+}
+
+func inheritBrandingAssetsAcrossThemes(visuals map[string]any) {
+	light := object(visuals["light"])
+	dark := object(visuals["dark"])
+	for _, key := range []string{"logo", "backgroundImage"} {
+		lightValue, lightExists := light[key]
+		darkValue, darkExists := dark[key]
+		if (!lightExists || lightValue == nil) && darkExists && darkValue != nil {
+			light[key] = darkValue
+		}
+		if (!darkExists || darkValue == nil) && lightExists && lightValue != nil {
+			dark[key] = lightValue
+		}
+	}
+	visuals["light"] = light
+	visuals["dark"] = dark
 }
 
 type brandingAssetToken struct {
