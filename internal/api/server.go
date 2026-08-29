@@ -99,6 +99,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
+	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
 	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)
 	r.GET("/v1/ota/assets/:id/*path", s.domainTenantScope(), s.otaAsset)
 	r.GET("/v1/public/releases/latest", s.domainTenantScope(), s.publicLatestReleaseFromDomain)
@@ -134,6 +135,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/audit-events", s.listAudits)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
+	group.GET("/branding", s.getBranding)
+	group.PATCH("/branding", s.updateBranding)
 	group.GET("/localization", s.getLocalization)
 	group.PUT("/localization/languages", s.updateLocalizationLanguages)
 	group.PUT("/localization/documents", s.updateLocalizationDocuments)
@@ -159,6 +162,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/upload-sessions/:id/parts/:partNumber/presign", s.presignUploadSessionPart)
 	group.POST("/upload-sessions/:id/complete", s.completeUploadSession)
 	group.DELETE("/upload-sessions/:id", s.cancelUploadSession)
+	group.POST("/branding/assets/uploads", s.createBrandingAssetUpload)
+	group.PUT("/branding/assets/upload", s.uploadBrandingAsset)
+	group.DELETE("/branding/assets/upload", s.deleteBrandingAsset)
 }
 
 func (s *server) domainTenantScope() gin.HandlerFunc {
@@ -219,7 +225,7 @@ func (s *server) cors() gin.HandlerFunc {
 			c.Header("Access-Control-Expose-Headers", "ETag,X-Request-Id")
 			c.Header("Vary", "Origin")
 			c.Header("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-ota-artifact-token,x-upload-session-token,x-part-sha256,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
+			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-ota-artifact-token,x-branding-asset-token,x-upload-session-token,x-part-sha256,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
 		}
 		if c.Request.Method == http.MethodOptions {
 			c.Status(http.StatusNoContent)
@@ -728,6 +734,15 @@ func (s *server) bootstrap(c *gin.Context) {
 	messages := object(localization["messages"])
 	theme := object(cfg["theme"])
 	features := object(cfg["features"])
+	brandingConfig, _, _, _, _, brandingErr := s.brandingRecord(c.Request.Context(), tenant.ID)
+	if brandingErr != nil {
+		brandingConfig = cloneMap(defaultBrandingConfig)
+	}
+	brandingMessages := map[string]string{}
+	if compiled, compileErr := s.compiledMessages(c.Request.Context(), tenant.ID, locale, text(localization["fallbackLocale"], "zh-CN")); compileErr == nil {
+		brandingMessages = compiled
+	}
+	branding := resolveBranding(brandingConfig, locale, text(localization["fallbackLocale"], "zh-CN"), brandingMessages)
 	runtime := text(c.GetHeader("x-runtime-version"), "embedded")
 	otaChannel := text(updatePolicy["otaChannel"], s.cfg.OTAChannel)
 	ota := gin.H{"enabled": features["otaEnabled"], "channel": otaChannel, "runtimeVersion": runtime, "revision": nil, "updateId": nil, "baseReleaseId": nil, "applyStrategy": nil, "releaseNotes": []string{}}
@@ -741,7 +756,7 @@ func (s *server) bootstrap(c *gin.Context) {
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

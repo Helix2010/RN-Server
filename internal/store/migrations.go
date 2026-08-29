@@ -26,6 +26,22 @@ var migrations = []migration{
 	{version: 10, name: "ota_releases", apply: otaReleasesMigration},
 	{version: 11, name: "ota_apply_strategy", apply: otaApplyStrategyMigration},
 	{version: 12, name: "upload_sessions", apply: uploadSessionsMigration},
+	{version: 13, name: "branding_launch_copy", apply: brandingLaunchCopyMigration},
+}
+
+func brandingLaunchCopyMigration(ctx context.Context, db *sql.DB) error {
+	items := []struct{ lang, key, content, meta string }{
+		{"zh-CN", "launch.title", "AnyFun", "启动页标题"},
+		{"zh-CN", "launch.subtitle", "正在同步应用配置", "启动页副标题"},
+		{"en-US", "launch.title", "AnyFun", "Launch title"},
+		{"en-US", "launch.subtitle", "Syncing app configuration", "Launch subtitle"},
+	}
+	for _, item := range items {
+		if _, err := db.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),deleted=0`, item.lang, item.key, item.content, item.meta); err != nil {
+			return fmt.Errorf("seed branding launch copy %s/%s: %w", item.lang, item.key, err)
+		}
+	}
+	return nil
 }
 
 func uploadSessionsMigration(ctx context.Context, db *sql.DB) error {
