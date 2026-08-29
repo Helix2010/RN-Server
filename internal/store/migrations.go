@@ -34,6 +34,96 @@ var migrations = []migration{
 	{version: 18, name: "installation_credentials", apply: installationCredentialsMigration},
 	{version: 19, name: "installation_branding_version", apply: installationBrandingVersionMigration},
 	{version: 20, name: "installation_revoked_status", apply: installationRevokedStatusMigration},
+	{version: 21, name: "device_schema_comments", apply: deviceSchemaCommentsMigration},
+}
+
+func deviceSchemaCommentsMigration(ctx context.Context, db *sql.DB) error {
+	statements := []string{
+		`ALTER TABLE device_clients
+			MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '平台内部设备归并ID',
+			MODIFY COLUMN platform ENUM('android','ios') NOT NULL COMMENT '设备平台',
+			MODIFY COLUMN device_key_hash CHAR(64) NOT NULL COMMENT '平台设备来源标识HMAC，不保存原始设备ID',
+			MODIFY COLUMN first_seen_at DATETIME(3) NOT NULL COMMENT '首次发现时间',
+			MODIFY COLUMN last_seen_at DATETIME(3) NOT NULL COMMENT '最近活跃时间',
+			MODIFY COLUMN created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+			MODIFY COLUMN updated_at DATETIME(3) NOT NULL COMMENT '更新时间'`,
+		`ALTER TABLE app_installations
+			MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '安装实例内部ID',
+			MODIFY COLUMN tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			MODIFY COLUMN device_client_id BIGINT UNSIGNED NULL COMMENT '平台设备归并ID，仅平台内部使用',
+			MODIFY COLUMN installation_id VARCHAR(80) NOT NULL COMMENT '当前租户App安装实例ID',
+			MODIFY COLUMN application_id VARCHAR(120) NOT NULL COMMENT '应用身份',
+			MODIFY COLUMN package_id VARCHAR(180) NOT NULL COMMENT 'Android包名或iOS Bundle ID',
+			MODIFY COLUMN platform ENUM('android','ios') NOT NULL COMMENT 'App平台',
+			MODIFY COLUMN distribution_channel VARCHAR(40) NOT NULL COMMENT '分发渠道',
+			MODIFY COLUMN app_version VARCHAR(40) NOT NULL COMMENT 'APK/IPA版本号',
+			MODIFY COLUMN build_number VARCHAR(40) NOT NULL COMMENT '构建号',
+			MODIFY COLUMN runtime_version VARCHAR(160) NOT NULL COMMENT '原生Runtime版本',
+			MODIFY COLUMN ota_channel VARCHAR(40) NOT NULL COMMENT 'OTA通道',
+			MODIFY COLUMN ota_revision INT UNSIGNED NULL COMMENT '当前OTA修订号',
+			MODIFY COLUMN localization_version VARCHAR(80) NULL COMMENT '当前语言包版本',
+			MODIFY COLUMN branding_version INT UNSIGNED NULL COMMENT '当前品牌配置版本',
+			MODIFY COLUMN locale VARCHAR(40) NULL COMMENT '当前语言',
+			MODIFY COLUMN theme VARCHAR(20) NULL COMMENT '当前主题',
+			MODIFY COLUMN os_version VARCHAR(40) NULL COMMENT '系统版本',
+			MODIFY COLUMN device_class VARCHAR(80) NULL COMMENT '设备类型，不含硬件唯一标识',
+			MODIFY COLUMN first_seen_at DATETIME(3) NOT NULL COMMENT '首次安装实例上报时间',
+			MODIFY COLUMN last_active_at DATETIME(3) NOT NULL COMMENT '最近活跃时间',
+			MODIFY COLUMN status ENUM('active','inactive','push_disabled','revoked') NOT NULL DEFAULT 'active' COMMENT '安装实例状态',
+			MODIFY COLUMN credential_hash CHAR(64) NULL COMMENT '安装凭证SHA-256哈希',
+			MODIFY COLUMN credential_version INT UNSIGNED NOT NULL DEFAULT 1 COMMENT '安装凭证版本',
+			MODIFY COLUMN credential_expires_at DATETIME(3) NULL COMMENT '安装凭证过期时间',
+			MODIFY COLUMN credential_last_used_at DATETIME(3) NULL COMMENT '凭证最近使用时间',
+			MODIFY COLUMN credential_revoked_at DATETIME(3) NULL COMMENT '凭证撤销时间',
+			MODIFY COLUMN revoked_reason VARCHAR(255) NULL COMMENT '凭证撤销原因',
+			MODIFY COLUMN created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+			MODIFY COLUMN updated_at DATETIME(3) NOT NULL COMMENT '更新时间'`,
+		`ALTER TABLE app_push_tokens
+			MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '推送Token内部ID',
+			MODIFY COLUMN tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			MODIFY COLUMN installation_id VARCHAR(80) NOT NULL COMMENT '安装实例ID',
+			MODIFY COLUMN platform ENUM('android','ios') NOT NULL COMMENT '推送平台',
+			MODIFY COLUMN provider ENUM('fcm','apns','hms') NOT NULL COMMENT '推送供应商',
+			MODIFY COLUMN token VARCHAR(512) NOT NULL COMMENT '供应商推送Token',
+			MODIFY COLUMN environment VARCHAR(20) NOT NULL DEFAULT 'production' COMMENT '推送环境',
+			MODIFY COLUMN permission_status VARCHAR(32) NOT NULL DEFAULT 'unknown' COMMENT '系统通知权限状态',
+			MODIFY COLUMN last_seen_at DATETIME(3) NOT NULL COMMENT 'Token最近上报时间',
+			MODIFY COLUMN invalid_at DATETIME(3) NULL COMMENT 'Token失效时间',
+			MODIFY COLUMN created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+			MODIFY COLUMN updated_at DATETIME(3) NOT NULL COMMENT '更新时间'`,
+		`ALTER TABLE app_push_outbox
+			MODIFY COLUMN id VARCHAR(80) NOT NULL COMMENT '推送事件ID',
+			MODIFY COLUMN tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			MODIFY COLUMN event_type VARCHAR(64) NOT NULL COMMENT '事件类型',
+			MODIFY COLUMN payload JSON NOT NULL COMMENT '推送事件轻量Payload',
+			MODIFY COLUMN status ENUM('pending','processing','sent','partial_failed','failed','cancelled') NOT NULL DEFAULT 'pending' COMMENT 'Outbox状态',
+			MODIFY COLUMN attempts INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '投递尝试次数',
+			MODIFY COLUMN last_error VARCHAR(500) NULL COMMENT '最近一次投递错误',
+			MODIFY COLUMN next_attempt_at DATETIME(3) NOT NULL COMMENT '下一次投递时间',
+			MODIFY COLUMN locked_at DATETIME(3) NULL COMMENT 'Worker锁定时间',
+			MODIFY COLUMN sent_at DATETIME(3) NULL COMMENT '事件完成时间',
+			MODIFY COLUMN created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+			MODIFY COLUMN updated_at DATETIME(3) NOT NULL COMMENT '更新时间'`,
+		`ALTER TABLE app_push_deliveries
+			MODIFY COLUMN event_id VARCHAR(80) NOT NULL COMMENT 'Outbox事件ID',
+			MODIFY COLUMN tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			MODIFY COLUMN installation_id VARCHAR(80) NOT NULL COMMENT '安装实例ID',
+			MODIFY COLUMN provider VARCHAR(16) NOT NULL COMMENT '推送供应商',
+			MODIFY COLUMN provider_message_id VARCHAR(255) NULL COMMENT '供应商消息ID',
+			MODIFY COLUMN status VARCHAR(32) NOT NULL COMMENT '投递状态',
+			MODIFY COLUMN failure_code VARCHAR(255) NULL COMMENT '失败原因',
+			MODIFY COLUMN sent_at DATETIME(3) NULL COMMENT '发送时间',
+			MODIFY COLUMN delivered_at DATETIME(3) NULL COMMENT '送达时间',
+			MODIFY COLUMN opened_at DATETIME(3) NULL COMMENT '打开时间',
+			MODIFY COLUMN created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+			MODIFY COLUMN updated_at DATETIME(3) NOT NULL COMMENT '更新时间'`,
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func installationRevokedStatusMigration(ctx context.Context, db *sql.DB) error {
