@@ -31,3 +31,12 @@ func TestValidateBrandingConfigRequiresSchemaAndMessageKeys(t *testing.T) {
 		t.Fatal("expected missing title key to be rejected")
 	}
 }
+
+func TestHasTenantObjectPrefixNormalizesLeadingSlash(t *testing.T) {
+	if !hasTenantObjectPrefix("/tenants/100000001/branding/logo.png", "100000001") {
+		t.Fatal("expected a normalized tenant object key to match")
+	}
+	if hasTenantObjectPrefix("tenants/100000002/branding/logo.png", "100000001") {
+		t.Fatal("expected a different tenant object key to be rejected")
+	}
+}

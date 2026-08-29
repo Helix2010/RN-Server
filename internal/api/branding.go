@@ -497,9 +497,9 @@ func (s *server) brandingAsset(c *gin.Context) {
 		return
 	}
 	resourceTenant := tenantID(c)
-	if strings.Contains(key, "/tenants/0/") {
+	if hasTenantObjectPrefix(key, "0") {
 		resourceTenant = "0"
-	} else if !strings.Contains(key, "/tenants/"+tenantID(c)+"/") {
+	} else if !hasTenantObjectPrefix(key, tenantID(c)) {
 		problem(c, 404, "BRANDING_ASSET_NOT_FOUND", "Branding asset not found")
 		return
 	}
@@ -524,6 +524,11 @@ func (s *server) brandingAsset(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "public, max-age=31536000, immutable")
 	_, _ = io.Copy(c.Writer, body)
+}
+
+func hasTenantObjectPrefix(key, tenant string) bool {
+	clean := strings.TrimLeft(strings.TrimSpace(key), "/")
+	return strings.HasPrefix(clean, "tenants/"+tenant+"/")
 }
 
 func findBrandingAsset(value any, id string) (map[string]any, bool) {
