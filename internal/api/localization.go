@@ -804,6 +804,9 @@ func (s *server) savePublishedResources(ctx context.Context, tenant string, curr
 	if err := insertAudit(ctx, tx, event); err != nil {
 		return err
 	}
+	if err := enqueuePushEvent(ctx, tx, tenant, "localization_updated", map[string]any{"resourceVersion": publishVersion, "languages": published}); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

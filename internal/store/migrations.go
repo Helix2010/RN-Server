@@ -27,6 +27,135 @@ var migrations = []migration{
 	{version: 11, name: "ota_apply_strategy", apply: otaApplyStrategyMigration},
 	{version: 12, name: "upload_sessions", apply: uploadSessionsMigration},
 	{version: 13, name: "branding_launch_copy", apply: brandingLaunchCopyMigration},
+	{version: 14, name: "app_installations_and_push", apply: appInstallationsAndPushMigration},
+	{version: 15, name: "app_product_shell_copy", apply: appProductShellCopyMigration},
+	{version: 16, name: "app_push_deliveries", apply: appPushDeliveriesMigration},
+	{version: 17, name: "app_push_outbox_error", apply: appPushOutboxErrorMigration},
+}
+
+func appPushOutboxErrorMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `ALTER TABLE app_push_outbox ADD COLUMN last_error VARCHAR(500) NULL COMMENT '最近一次投递错误' AFTER attempts`)
+	return err
+}
+
+func appPushDeliveriesMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS app_push_deliveries (
+		event_id VARCHAR(80) NOT NULL,
+		tenant_id BIGINT UNSIGNED NOT NULL,
+		installation_id VARCHAR(80) NOT NULL,
+		provider VARCHAR(16) NOT NULL,
+		provider_message_id VARCHAR(255) NULL,
+		status VARCHAR(32) NOT NULL,
+		failure_code VARCHAR(255) NULL,
+		sent_at DATETIME(3) NULL,
+		delivered_at DATETIME(3) NULL,
+		opened_at DATETIME(3) NULL,
+		created_at DATETIME(3) NOT NULL,
+		updated_at DATETIME(3) NOT NULL,
+		PRIMARY KEY(event_id, installation_id, provider),
+		KEY ix_push_delivery_tenant(tenant_id, created_at), KEY ix_push_delivery_status(status, created_at)
+	) ENGINE=InnoDB COMMENT='推送事件投递记录'`)
+	return err
+}
+
+func appProductShellCopyMigration(ctx context.Context, db *sql.DB) error {
+	items := []struct{ lang, key, content, meta string }{
+		{"zh-CN", "nav.home", "首页", "底部导航"}, {"zh-CN", "nav.assets", "资产", "底部导航"}, {"zh-CN", "nav.profile", "我的", "底部导航"},
+		{"zh-CN", "assets.eyebrow", "PORTFOLIO", "资产页眉题"},
+		{"zh-CN", "assets.title", "我的资产", "资产页标题"}, {"zh-CN", "assets.subtitle", "跨网络查看余额、估值和今日变化。", "资产页说明"}, {"zh-CN", "assets.total", "总资产", "资产摘要"}, {"zh-CN", "assets.today", "今日收益", "资产摘要"}, {"zh-CN", "assets.available", "可用资产", "资产摘要"}, {"zh-CN", "assets.networks", "已连接网络", "资产摘要"}, {"zh-CN", "assets.holdings", "资产明细", "资产列表"}, {"zh-CN", "assets.updated", "刚刚更新", "资产列表"},
+		{"zh-CN", "profile.eyebrow", "ACCOUNT", "个人中心眉题"}, {"zh-CN", "profile.title", "个人中心", "个人中心标题"}, {"zh-CN", "profile.subtitle", "管理账户偏好、安全状态和应用更新。", "个人中心说明"}, {"zh-CN", "profile.preferences", "偏好与应用", "个人中心分组"}, {"zh-CN", "profile.settingsHint", "语言、主题、版本与诊断设置", "个人中心入口"}, {"zh-CN", "profile.security", "设备与安全", "个人中心分组"}, {"zh-CN", "profile.network", "当前网络", "个人中心信息"}, {"zh-CN", "profile.manage", "管理应用设置", "个人中心操作"},
+		{"zh-CN", "settings.languageVersion", "语言包版本", "设置版本信息"}, {"zh-CN", "settings.enableNotifications", "开启更新通知", "通知权限"}, {"zh-CN", "settings.notificationsEnabled", "更新通知已开启", "通知权限"}, {"zh-CN", "settings.notificationsDenied", "通知权限未开启，可在系统设置中恢复。", "通知权限"},
+		{"zh-CN", "update.noticeTitle", "发现新版本", "升级提示"}, {"zh-CN", "update.noticeDescription", "新版本已准备好，可查看更新内容后选择升级。", "升级提示"}, {"zh-CN", "update.viewNow", "查看更新", "升级操作"},
+		{"en-US", "nav.home", "Home", "Bottom navigation"}, {"en-US", "nav.assets", "Assets", "Bottom navigation"}, {"en-US", "nav.profile", "Profile", "Bottom navigation"},
+		{"en-US", "assets.eyebrow", "PORTFOLIO", "Assets eyebrow"},
+		{"en-US", "assets.title", "My assets", "Assets title"}, {"en-US", "assets.subtitle", "Review balances, value and daily moves across networks.", "Assets description"}, {"en-US", "assets.total", "Total assets", "Assets summary"}, {"en-US", "assets.today", "Today's return", "Assets summary"}, {"en-US", "assets.available", "Available", "Assets summary"}, {"en-US", "assets.networks", "Networks", "Assets summary"}, {"en-US", "assets.holdings", "Holdings", "Assets list"}, {"en-US", "assets.updated", "Updated now", "Assets list"},
+		{"en-US", "profile.eyebrow", "ACCOUNT", "Profile eyebrow"}, {"en-US", "profile.title", "Profile", "Profile title"}, {"en-US", "profile.subtitle", "Manage preferences, security status and app updates.", "Profile description"}, {"en-US", "profile.preferences", "Preferences and app", "Profile group"}, {"en-US", "profile.settingsHint", "Language, theme, version and diagnostics", "Profile entry"}, {"en-US", "profile.security", "Device and security", "Profile group"}, {"en-US", "profile.network", "Current network", "Profile info"}, {"en-US", "profile.manage", "Manage app settings", "Profile action"},
+		{"en-US", "settings.languageVersion", "Language package version", "Settings version info"}, {"en-US", "settings.enableNotifications", "Enable update notifications", "Notification permission"}, {"en-US", "settings.notificationsEnabled", "Update notifications enabled", "Notification permission"}, {"en-US", "settings.notificationsDenied", "Notifications are disabled. You can enable them in system settings.", "Notification permission"},
+		{"en-US", "update.noticeTitle", "New version available", "Update prompt"}, {"en-US", "update.noticeDescription", "A new version is ready. Review the changes before updating.", "Update prompt"}, {"en-US", "update.viewNow", "View update", "Update action"},
+	}
+	for _, item := range items {
+		if _, err := db.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),deleted=0`, item.lang, item.key, item.content, item.meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func appInstallationsAndPushMigration(ctx context.Context, db *sql.DB) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS device_clients (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '平台内部设备归并ID',
+			platform ENUM('android','ios') NOT NULL COMMENT '平台',
+			device_key_hash CHAR(64) NOT NULL COMMENT '平台设备来源标识HMAC',
+			first_seen_at DATETIME(3) NOT NULL COMMENT '首次发现时间',
+			last_seen_at DATETIME(3) NOT NULL COMMENT '最近活跃时间',
+			created_at DATETIME(3) NOT NULL,
+			updated_at DATETIME(3) NOT NULL,
+			PRIMARY KEY(id), UNIQUE KEY uq_device_client(platform,device_key_hash)
+		) ENGINE=InnoDB COMMENT='平台内部设备归并记录'`,
+		`CREATE TABLE IF NOT EXISTS app_installations (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			device_client_id BIGINT UNSIGNED NULL COMMENT '平台设备归并ID',
+			installation_id VARCHAR(80) NOT NULL COMMENT '当前App安装实例ID',
+			application_id VARCHAR(120) NOT NULL COMMENT '应用身份',
+			package_id VARCHAR(180) NOT NULL COMMENT '包名或Bundle ID',
+			platform ENUM('android','ios') NOT NULL,
+			distribution_channel VARCHAR(40) NOT NULL,
+			app_version VARCHAR(40) NOT NULL,
+			build_number VARCHAR(40) NOT NULL,
+			runtime_version VARCHAR(160) NOT NULL,
+			ota_channel VARCHAR(40) NOT NULL,
+			ota_revision INT UNSIGNED NULL,
+			localization_version VARCHAR(80) NULL,
+			locale VARCHAR(40) NULL,
+			theme VARCHAR(20) NULL,
+			os_version VARCHAR(40) NULL,
+			device_class VARCHAR(80) NULL,
+			first_seen_at DATETIME(3) NOT NULL,
+			last_active_at DATETIME(3) NOT NULL,
+			status ENUM('active','inactive','push_disabled') NOT NULL DEFAULT 'active',
+			created_at DATETIME(3) NOT NULL,
+			updated_at DATETIME(3) NOT NULL,
+			PRIMARY KEY(id), UNIQUE KEY uq_installation(tenant_id,application_id,installation_id),
+			KEY ix_installation_active(tenant_id,last_active_at), KEY ix_installation_version(tenant_id,platform,app_version,build_number), KEY ix_installation_device(device_client_id)
+		) ENGINE=InnoDB COMMENT='租户App安装实例'`,
+		`CREATE TABLE IF NOT EXISTS app_push_tokens (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			tenant_id BIGINT UNSIGNED NOT NULL,
+			installation_id VARCHAR(80) NOT NULL,
+			platform ENUM('android','ios') NOT NULL,
+			provider ENUM('fcm','apns','hms') NOT NULL,
+			token VARCHAR(512) NOT NULL COMMENT '推送Token',
+			environment VARCHAR(20) NOT NULL DEFAULT 'production',
+			permission_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
+			last_seen_at DATETIME(3) NOT NULL,
+			invalid_at DATETIME(3) NULL,
+			created_at DATETIME(3) NOT NULL,
+			updated_at DATETIME(3) NOT NULL,
+			PRIMARY KEY(id), UNIQUE KEY uq_push_token(tenant_id,installation_id,provider,token), KEY ix_push_installation(tenant_id,installation_id)
+		) ENGINE=InnoDB COMMENT='租户App推送Token'`,
+		`CREATE TABLE IF NOT EXISTS app_push_outbox (
+			id VARCHAR(80) NOT NULL,
+			tenant_id BIGINT UNSIGNED NOT NULL,
+			event_type VARCHAR(64) NOT NULL,
+			payload JSON NOT NULL,
+			status ENUM('pending','processing','sent','partial_failed','failed','cancelled') NOT NULL DEFAULT 'pending',
+			attempts INT UNSIGNED NOT NULL DEFAULT 0,
+			next_attempt_at DATETIME(3) NOT NULL,
+			locked_at DATETIME(3) NULL,
+			sent_at DATETIME(3) NULL,
+			created_at DATETIME(3) NOT NULL,
+			updated_at DATETIME(3) NOT NULL,
+			PRIMARY KEY(id), KEY ix_push_outbox_pending(status,next_attempt_at), KEY ix_push_outbox_tenant(tenant_id,created_at)
+		) ENGINE=InnoDB COMMENT='租户推送事件Outbox'`,
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func brandingLaunchCopyMigration(ctx context.Context, db *sql.DB) error {

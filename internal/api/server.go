@@ -98,6 +98,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/openapi.json", func(c *gin.Context) { c.File("contracts/openapi.json") })
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
+	r.POST("/v1/mobile/installations/heartbeat", s.domainTenantScope(), s.installationHeartbeat)
+	r.POST("/v1/mobile/push-tokens", s.domainTenantScope(), s.registerPushToken)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
 	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)
@@ -128,6 +130,7 @@ func (s *server) currentTenant(c *gin.Context) {
 
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/overview", s.overview)
+	group.GET("/installations/overview", s.installationOverview)
 	group.GET("/releases", s.listReleases)
 	group.POST("/releases", s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)
@@ -501,7 +504,17 @@ func (s *server) releaseAction(c *gin.Context) {
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), c.Param("action"), "release", r.ID, body.Reason, requestID(c), map[string]any{"version": r.Version, "platform": r.Platform, "status": target})
-	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+	if insertAudit(c.Request.Context(), tx, event) != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	if target == "active" {
+		if err := enqueuePushEvent(c.Request.Context(), tx, tenantID(c), "app_update_available", map[string]any{"releaseId": r.ID, "platform": r.Platform, "version": r.Version, "buildNumber": r.BuildNumber}); err != nil {
+			problem(c, 500, "TRANSITION_FAILED", "Unable to enqueue update notification")
+			return
+		}
+	}
+	if tx.Commit() != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
 	}
@@ -640,7 +653,15 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "config_update", "app-config", "mobile-bootstrap", body.Reason, requestID(c), map[string]any{"status": "active", "databaseVersionBefore": body.ExpectedVersion, "databaseVersionAfter": newVersion, "configVersion": body.Config["configVersion"]})
-	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+	if insertAudit(c.Request.Context(), tx, event) != nil {
+		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config audit")
+		return
+	}
+	if err := enqueuePushEvent(c.Request.Context(), tx, tenantID(c), "bootstrap_updated", map[string]any{"configVersion": body.Config["configVersion"]}); err != nil {
+		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to enqueue config notification")
+		return
+	}
+	if tx.Commit() != nil {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
 		return
 	}

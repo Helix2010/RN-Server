@@ -1012,7 +1012,17 @@ func (s *server) otaAction(c *gin.Context) {
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "ota_"+action, "ota-release", id, body.Reason, requestID(c), map[string]any{"status": target})
-	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+	if insertAudit(c.Request.Context(), tx, event) != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to save OTA audit")
+		return
+	}
+	if target == "active" {
+		if err := enqueuePushEvent(c.Request.Context(), tx, tenantID(c), "ota_updated", map[string]any{"otaReleaseId": id, "platform": platform, "channel": channel, "runtimeVersion": runtime}); err != nil {
+			problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to enqueue OTA notification")
+			return
+		}
+	}
+	if tx.Commit() != nil {
 		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to save OTA audit")
 		return
 	}

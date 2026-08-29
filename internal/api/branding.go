@@ -225,7 +225,15 @@ func (s *server) updateBranding(c *gin.Context) {
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "branding_update", "app-config", brandingConfigKey, strings.TrimSpace(body.Reason), requestID(c), map[string]any{"version": newVersion})
-	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+	if insertAudit(c.Request.Context(), tx, event) != nil {
+		problem(c, 500, "BRANDING_SAVE_FAILED", "Unable to save branding audit")
+		return
+	}
+	if err := enqueuePushEvent(c.Request.Context(), tx, tenantID(c), "branding_updated", map[string]any{"brandingVersion": newVersion}); err != nil {
+		problem(c, 500, "BRANDING_SAVE_FAILED", "Unable to enqueue branding notification")
+		return
+	}
+	if tx.Commit() != nil {
 		problem(c, 500, "BRANDING_SAVE_FAILED", "Unable to save branding audit")
 		return
 	}

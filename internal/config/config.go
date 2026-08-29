@@ -43,6 +43,7 @@ type Config struct {
 	MySQLInitRetryDelay        int
 	MySQLAutoMigrate           bool
 	StorageMasterKey           string
+	DeviceIdentityKey          string
 	ArtifactMaxSizeBytes       int64
 	ArtifactUploadMode         string
 	ArtifactUploadTTL          int
@@ -54,6 +55,15 @@ type Config struct {
 	AndroidDirectURL           string
 	IOSStoreURL                string
 	IOSMDMURL                  string
+	PushDispatchEnabled        bool
+	PushPollInterval           int
+	FCMProjectID               string
+	FCMServiceAccountJSON      string
+	APNsTeamID                 string
+	APNsKeyID                  string
+	APNsPrivateKey             string
+	APNsBundleID               string
+	APNsEnvironment            string
 }
 
 func Load() (Config, error) {
@@ -91,6 +101,7 @@ func Load() (Config, error) {
 		MySQLInitRetryDelay:        integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
 		MySQLAutoMigrate:           boolean("MYSQL_AUTO_MIGRATE", true),
 		StorageMasterKey:           strings.TrimSpace(os.Getenv("STORAGE_MASTER_KEY")),
+		DeviceIdentityKey:          strings.TrimSpace(os.Getenv("DEVICE_IDENTITY_HMAC_KEY")),
 		ArtifactMaxSizeBytes:       int64(integer("ARTIFACT_MAX_SIZE_MB", 512)) * 1024 * 1024,
 		ArtifactUploadMode:         value("ARTIFACT_UPLOAD_MODE", "direct"),
 		ArtifactUploadTTL:          integer("ARTIFACT_UPLOAD_TTL_SECONDS", 900),
@@ -102,6 +113,15 @@ func Load() (Config, error) {
 		AndroidDirectURL:           os.Getenv("ANDROID_DIRECT_URL"),
 		IOSStoreURL:                os.Getenv("IOS_STORE_URL"),
 		IOSMDMURL:                  os.Getenv("IOS_MDM_URL"),
+		PushDispatchEnabled:        boolean("PUSH_DISPATCH_ENABLED", false),
+		PushPollInterval:           integer("PUSH_POLL_INTERVAL_SECONDS", 10),
+		FCMProjectID:               strings.TrimSpace(os.Getenv("FCM_PROJECT_ID")),
+		FCMServiceAccountJSON:      strings.TrimSpace(os.Getenv("FCM_SERVICE_ACCOUNT_JSON")),
+		APNsTeamID:                 strings.TrimSpace(os.Getenv("APNS_TEAM_ID")),
+		APNsKeyID:                  strings.TrimSpace(os.Getenv("APNS_KEY_ID")),
+		APNsPrivateKey:             strings.TrimSpace(os.Getenv("APNS_PRIVATE_KEY")),
+		APNsBundleID:               strings.TrimSpace(os.Getenv("APNS_BUNDLE_ID")),
+		APNsEnvironment:            value("APNS_ENVIRONMENT", "production"),
 	}
 	if cfg.Environment == "test" && !strings.HasSuffix(cfg.MySQLDatabase, "_test") {
 		cfg.MySQLDatabase += "_test"
@@ -134,8 +154,17 @@ func Load() (Config, error) {
 	if cfg.StorageMasterKey != "" && !validMasterKey(cfg.StorageMasterKey) {
 		return Config{}, errors.New("STORAGE_MASTER_KEY must be a base64-encoded 32-byte key")
 	}
+	if cfg.DeviceIdentityKey == "" {
+		cfg.DeviceIdentityKey = cfg.StorageMasterKey
+	}
 	if cfg.ArtifactUploadMode != "direct" && cfg.ArtifactUploadMode != "proxy" {
 		return Config{}, errors.New("ARTIFACT_UPLOAD_MODE must be direct or proxy")
+	}
+	if cfg.PushPollInterval < 1 || cfg.PushPollInterval > 300 {
+		return Config{}, errors.New("PUSH_POLL_INTERVAL_SECONDS must be between 1 and 300")
+	}
+	if cfg.APNsEnvironment != "production" && cfg.APNsEnvironment != "sandbox" {
+		return Config{}, errors.New("APNS_ENVIRONMENT must be production or sandbox")
 	}
 	if cfg.ArtifactMaxSizeBytes < 1024*1024 || cfg.ArtifactMaxSizeBytes > 2*1024*1024*1024 ||
 		cfg.ArtifactUploadTTL < 60 || cfg.ArtifactUploadTTL > 3600 || cfg.ArtifactMultipartTTL < 300 || cfg.ArtifactMultipartTTL > 86400 || cfg.ArtifactDownloadTTL < 30 || cfg.ArtifactDownloadTTL > 3600 ||

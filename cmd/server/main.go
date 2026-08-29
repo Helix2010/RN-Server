@@ -13,6 +13,7 @@ import (
 
 	"github.com/Helix2010/RN-Server/internal/api"
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/Helix2010/RN-Server/internal/push"
 	"github.com/Helix2010/RN-Server/internal/store"
 )
 
@@ -42,6 +43,16 @@ func main() {
 		}
 		slog.Info("database migrations complete")
 		return
+	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	if cfg.PushDispatchEnabled {
+		dispatcher, dispatchErr := push.New(workerCtx, database.DB, cfg)
+		if dispatchErr != nil {
+			slog.Error("push dispatcher initialization failed", "error", dispatchErr)
+			os.Exit(1)
+		}
+		go dispatcher.Run(workerCtx)
 	}
 
 	httpServer := &http.Server{
