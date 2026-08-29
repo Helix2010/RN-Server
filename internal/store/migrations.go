@@ -31,6 +31,30 @@ var migrations = []migration{
 	{version: 15, name: "app_product_shell_copy", apply: appProductShellCopyMigration},
 	{version: 16, name: "app_push_deliveries", apply: appPushDeliveriesMigration},
 	{version: 17, name: "app_push_outbox_error", apply: appPushOutboxErrorMigration},
+	{version: 18, name: "installation_credentials", apply: installationCredentialsMigration},
+	{version: 19, name: "installation_branding_version", apply: installationBrandingVersionMigration},
+	{version: 20, name: "installation_revoked_status", apply: installationRevokedStatusMigration},
+}
+
+func installationRevokedStatusMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `ALTER TABLE app_installations MODIFY COLUMN status ENUM('active','inactive','push_disabled','revoked') NOT NULL DEFAULT 'active' COMMENT '安装实例状态'`)
+	return err
+}
+
+func installationBrandingVersionMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `ALTER TABLE app_installations ADD COLUMN branding_version INT UNSIGNED NULL COMMENT '品牌配置版本' AFTER localization_version`)
+	return err
+}
+
+func installationCredentialsMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `ALTER TABLE app_installations
+		ADD COLUMN credential_hash CHAR(64) NULL COMMENT '安装凭证SHA-256哈希',
+		ADD COLUMN credential_version INT UNSIGNED NOT NULL DEFAULT 1 COMMENT '安装凭证版本',
+		ADD COLUMN credential_expires_at DATETIME(3) NULL COMMENT '安装凭证过期时间',
+		ADD COLUMN credential_last_used_at DATETIME(3) NULL COMMENT '最近使用时间',
+		ADD COLUMN credential_revoked_at DATETIME(3) NULL COMMENT '安装凭证撤销时间',
+		ADD COLUMN revoked_reason VARCHAR(255) NULL COMMENT '安装凭证撤销原因'`)
+	return err
 }
 
 func appPushOutboxErrorMigration(ctx context.Context, db *sql.DB) error {

@@ -32,7 +32,7 @@ type event struct {
 }
 
 type target struct {
-	InstallationID, Provider, Token, Environment string
+	InstallationID, PackageID, Provider, Token, Environment string
 }
 
 func New(ctx context.Context, db *sql.DB, cfg config.Config) (*Dispatcher, error) {
@@ -129,7 +129,7 @@ func (d *Dispatcher) dispatchNext(ctx context.Context) error {
 }
 
 func (d *Dispatcher) targets(ctx context.Context, tenant string) ([]target, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT installation_id,provider,token,environment FROM app_push_tokens WHERE tenant_id=? AND invalid_at IS NULL AND permission_status IN ('granted','authorized','provisional')`, tenant)
+	rows, err := d.db.QueryContext(ctx, `SELECT p.installation_id,i.package_id,p.provider,p.token,p.environment FROM app_push_tokens p JOIN app_installations i ON i.tenant_id=p.tenant_id AND i.installation_id=p.installation_id WHERE p.tenant_id=? AND p.invalid_at IS NULL AND i.status='active' AND p.permission_status IN ('granted','authorized','provisional')`, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +137,7 @@ func (d *Dispatcher) targets(ctx context.Context, tenant string) ([]target, erro
 	items := []target{}
 	for rows.Next() {
 		var item target
-		if rows.Scan(&item.InstallationID, &item.Provider, &item.Token, &item.Environment) == nil {
+		if rows.Scan(&item.InstallationID, &item.PackageID, &item.Provider, &item.Token, &item.Environment) == nil {
 			items = append(items, item)
 		}
 	}
@@ -155,7 +155,7 @@ func (d *Dispatcher) send(ctx context.Context, item event, recipient target) (st
 		return d.sendFCM(ctx, recipient.Token, data, visible)
 	}
 	if recipient.Provider == "apns" {
-		return d.sendAPNs(ctx, recipient.Token, data, visible)
+		return d.sendAPNs(ctx, recipient.Token, recipient.PackageID, data, visible)
 	}
 	return "", errors.New("push provider is not configured")
 }
@@ -186,8 +186,12 @@ func (d *Dispatcher) sendFCM(ctx context.Context, targetToken string, data map[s
 	return result.Name, nil
 }
 
-func (d *Dispatcher) sendAPNs(ctx context.Context, targetToken string, data map[string]string, visible bool) (string, error) {
-	if d.apns == nil || d.cfg.APNsBundleID == "" {
+func (d *Dispatcher) sendAPNs(ctx context.Context, targetToken, packageID string, data map[string]string, visible bool) (string, error) {
+	topic := packageID
+	if topic == "" {
+		topic = d.cfg.APNsBundleID
+	}
+	if d.apns == nil || topic == "" {
 		return "", errors.New("APNs is not configured")
 	}
 	aps := map[string]any{"content-available": 1}
@@ -200,7 +204,7 @@ func (d *Dispatcher) sendAPNs(ctx context.Context, targetToken string, data map[
 		payload[key] = value
 	}
 	raw, _ := json.Marshal(payload)
-	response, err := d.apns.PushWithContext(ctx, &apns2.Notification{DeviceToken: targetToken, Topic: d.cfg.APNsBundleID, Payload: raw})
+	response, err := d.apns.PushWithContext(ctx, &apns2.Notification{DeviceToken: targetToken, Topic: topic, Payload: raw})
 	if err != nil {
 		return "", err
 	}

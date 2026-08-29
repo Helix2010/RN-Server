@@ -99,6 +99,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
 	r.POST("/v1/mobile/installations/heartbeat", s.domainTenantScope(), s.installationHeartbeat)
+	r.POST("/v1/mobile/installations/register", s.domainTenantScope(), s.registerInstallation)
+	r.POST("/v1/mobile/installations/refresh-credential", s.domainTenantScope(), s.refreshInstallationCredential)
 	r.POST("/v1/mobile/push-tokens", s.domainTenantScope(), s.registerPushToken)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
@@ -131,6 +133,8 @@ func (s *server) currentTenant(c *gin.Context) {
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/overview", s.overview)
 	group.GET("/installations/overview", s.installationOverview)
+	group.GET("/installations", s.listInstallations)
+	group.POST("/installations/:id/revoke", s.revokeInstallation)
 	group.GET("/releases", s.listReleases)
 	group.POST("/releases", s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"net/http"
 	"time"
 
@@ -31,4 +32,30 @@ func (s *server) installationOverview(c *gin.Context) {
 		versions = append(versions, gin.H{"platform": platform, "version": version, "buildNumber": build, "count": count})
 	}
 	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions})
+}
+
+func (s *server) listInstallations(c *gin.Context) {
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT installation_id,application_id,package_id,platform,app_version,build_number,runtime_version,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,last_active_at,status FROM app_installations WHERE tenant_id=? ORDER BY last_active_at DESC LIMIT 500`, tenantID(c))
+	if err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installations")
+		return
+	}
+	defer rows.Close()
+	items := []gin.H{}
+	for rows.Next() {
+		var id, applicationID, packageID, platform, version, build, runtime, locale, theme, osVersion, deviceClass, status string
+		var otaRevision, brandingVersion sql.NullInt64
+		var localizationVersion sql.NullString
+		var active time.Time
+		if err := rows.Scan(&id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status); err != nil {
+			problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
+			return
+		}
+		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status})
+	}
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
 }

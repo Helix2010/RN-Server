@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -17,6 +19,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const installationCredentialTTL = 90 * 24 * time.Hour
+const installationCredentialRotateBefore = 14 * 24 * time.Hour
+
 var installationIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,80}$`)
 var deviceSourceHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -27,63 +32,140 @@ type installationHeartbeat struct {
 	OTAChannel          string `json:"otaChannel"`
 	OTARevision         *int   `json:"otaRevision"`
 	LocalizationVersion string `json:"localizationVersion"`
+	BrandingVersion     *int   `json:"brandingVersion"`
 	Locale              string `json:"locale"`
 	Theme               string `json:"theme"`
 	OSVersion           string `json:"osVersion"`
 	DeviceClass         string `json:"deviceClass"`
 }
 
-func (s *server) installationHeartbeat(c *gin.Context) {
-	var body installationHeartbeat
-	if decode(c, &body) != nil {
-		problem(c, http.StatusBadRequest, "INVALID_INSTALLATION", "Invalid installation heartbeat")
+type installationCredentialRecord struct {
+	Hash, ApplicationID, Platform, Status string
+	Version                               int
+	ExpiresAt                             time.Time
+	RevokedAt                             sql.NullTime
+}
+
+func (s *server) registerInstallation(c *gin.Context) {
+	body, ok := decodeInstallationBody(c)
+	if !ok {
 		return
 	}
-	body.InstallationID = strings.TrimSpace(body.InstallationID)
-	body.DeviceSourceHash = strings.ToLower(strings.TrimSpace(body.DeviceSourceHash))
-	body.PackageID = strings.TrimSpace(body.PackageID)
-	if !installationIDPattern.MatchString(body.InstallationID) || body.PackageID == "" || len(body.PackageID) > 180 || (body.DeviceSourceHash != "" && !deviceSourceHashPattern.MatchString(body.DeviceSourceHash)) {
-		problem(c, http.StatusUnprocessableEntity, "INVALID_INSTALLATION", "Installation identity is invalid")
-		return
-	}
-	platform := strings.ToLower(c.GetHeader("x-platform"))
+	platform, applicationID := strings.ToLower(c.GetHeader("x-platform")), text(c.GetHeader("x-application-id"), "unknown")
 	if !oneOf(platform, "android", "ios") {
-		problem(c, http.StatusUnprocessableEntity, "INVALID_INSTALLATION", "Platform is invalid")
+		problem(c, 422, "INVALID_INSTALLATION", "Platform is invalid")
+		return
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM app_installations WHERE tenant_id=? AND application_id=? AND installation_id=? AND credential_hash IS NOT NULL)`, tenantID(c), applicationID, body.InstallationID).Scan(&exists); err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to check installation")
+		return
+	}
+	if exists {
+		problem(c, 409, "INSTALLATION_ALREADY_REGISTERED", "Installation is already registered")
+		return
+	}
+	credential, hash, err := newInstallationCredential()
+	if err != nil {
+		problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to create installation credential")
+		return
+	}
+	now, expires := time.Now().UTC(), time.Now().UTC().Add(installationCredentialTTL)
+	if err := s.saveInstallation(c, body, hash, 1, expires, now); err != nil {
+		problem(c, 500, "INSTALLATION_SAVE_FAILED", "Unable to register installation")
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"installationId": body.InstallationID, "installationCredential": credential, "credentialVersion": 1, "credentialExpiresAt": iso(expires), "heartbeatIntervalSeconds": 1800, "receivedAt": iso(now)})
+}
+
+func (s *server) installationHeartbeat(c *gin.Context) {
+	body, ok := decodeInstallationBody(c)
+	if !ok {
+		return
+	}
+	record, valid := s.authenticateInstallation(c, body.InstallationID)
+	if !valid {
 		return
 	}
 	now := time.Now().UTC()
-	tx, err := s.db.BeginTx(c.Request.Context(), nil)
-	if err != nil {
+	if err := s.saveInstallation(c, body, record.Hash, record.Version, record.ExpiresAt, now); err != nil {
 		problem(c, 500, "INSTALLATION_SAVE_FAILED", "Unable to save installation heartbeat")
 		return
 	}
-	defer tx.Rollback()
-	var deviceClientID any
-	grouping := "disabled"
-	if body.DeviceSourceHash != "" && s.cfg.DeviceIdentityKey != "" {
-		deviceKey, hashErr := s.deviceKeyHash(platform, body.DeviceSourceHash)
-		if hashErr != nil {
-			problem(c, 503, "DEVICE_IDENTITY_UNAVAILABLE", "Device grouping is unavailable")
-			return
-		}
-		_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO device_clients(platform,device_key_hash,first_seen_at,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE last_seen_at=VALUES(last_seen_at),updated_at=VALUES(updated_at)`, platform, deviceKey, now, now, now, now)
-		if err == nil {
-			var id uint64
-			err = tx.QueryRowContext(c.Request.Context(), `SELECT id FROM device_clients WHERE platform=? AND device_key_hash=?`, platform, deviceKey).Scan(&id)
-			deviceClientID, grouping = id, "available"
+	response := gin.H{"installationId": body.InstallationID, "heartbeatIntervalSeconds": 1800, "receivedAt": iso(now), "credentialVersion": record.Version, "credentialExpiresAt": iso(record.ExpiresAt)}
+	if time.Until(record.ExpiresAt) <= installationCredentialRotateBefore {
+		credential, hash, rotateErr := newInstallationCredential()
+		if rotateErr == nil {
+			version, expires := record.Version+1, now.Add(installationCredentialTTL)
+			result, updateErr := s.db.ExecContext(c.Request.Context(), `UPDATE app_installations SET credential_hash=?,credential_version=?,credential_expires_at=?,credential_last_used_at=?,updated_at=? WHERE tenant_id=? AND application_id=? AND installation_id=? AND credential_version=? AND credential_revoked_at IS NULL`, hash, version, expires, now, now, tenantID(c), record.ApplicationID, body.InstallationID, record.Version)
+			if updateErr == nil {
+				if affected, _ := result.RowsAffected(); affected == 1 {
+					response["credentialRotated"], response["installationCredential"], response["credentialVersion"], response["credentialExpiresAt"] = true, credential, version, iso(expires)
+				}
+			}
 		}
 	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (s *server) refreshInstallationCredential(c *gin.Context) {
+	var body struct {
+		InstallationID string `json:"installationId"`
+	}
+	if decode(c, &body) != nil {
+		problem(c, 400, "INVALID_INSTALLATION", "Invalid installation payload")
+		return
+	}
+	body.InstallationID = strings.TrimSpace(body.InstallationID)
+	record, valid := s.authenticateInstallation(c, body.InstallationID)
+	if !valid {
+		return
+	}
+	credential, hash, err := newInstallationCredential()
 	if err != nil {
-		problem(c, 500, "INSTALLATION_SAVE_FAILED", "Unable to save device grouping")
+		problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to rotate installation credential")
 		return
 	}
-	applicationID := text(c.GetHeader("x-application-id"), "unknown")
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,localization_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),localization_version=VALUES(localization_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),status='active',updated_at=VALUES(updated_at)`, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LocalizationVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, now, now)
-	if err != nil || tx.Commit() != nil {
-		problem(c, 500, "INSTALLATION_SAVE_FAILED", "Unable to save installation heartbeat")
+	now, expires := time.Now().UTC(), time.Now().UTC().Add(installationCredentialTTL)
+	result, err := s.db.ExecContext(c.Request.Context(), `UPDATE app_installations SET credential_hash=?,credential_version=?,credential_expires_at=?,credential_last_used_at=?,updated_at=? WHERE tenant_id=? AND application_id=? AND installation_id=? AND credential_version=? AND credential_revoked_at IS NULL`, hash, record.Version+1, expires, now, now, tenantID(c), record.ApplicationID, body.InstallationID, record.Version)
+	if err != nil {
+		problem(c, 500, "INSTALLATION_CREDENTIAL_FAILED", "Unable to rotate installation credential")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"installationId": body.InstallationID, "deviceGrouping": grouping, "heartbeatIntervalSeconds": 1800, "receivedAt": iso(now)})
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, 409, "INSTALLATION_CREDENTIAL_CONFLICT", "Installation credential changed; retry")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"installationId": body.InstallationID, "installationCredential": credential, "credentialVersion": record.Version + 1, "credentialExpiresAt": iso(expires)})
+}
+
+func (s *server) revokeInstallation(c *gin.Context) {
+	var body struct {
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if decode(c, &body) != nil {
+		problem(c, 400, "INVALID_INSTALLATION", "Invalid installation payload")
+		return
+	}
+	installationID := strings.TrimSpace(c.Param("id"))
+	body.Reason = strings.TrimSpace(body.Reason)
+	if !installationIDPattern.MatchString(installationID) || !body.Confirm || len(body.Reason) < 3 {
+		problem(c, 422, "INVALID_INSTALLATION", "installationId, reason and confirm=true are required")
+		return
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(c.Request.Context(), `UPDATE app_installations SET status='revoked',credential_revoked_at=?,revoked_reason=?,updated_at=? WHERE tenant_id=? AND installation_id=? AND status<>'revoked'`, now, body.Reason, now, tenantID(c), installationID)
+	if err != nil {
+		problem(c, 500, "INSTALLATION_REVOKE_FAILED", "Unable to revoke installation")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, 404, "INSTALLATION_NOT_FOUND", "Installation not found")
+		return
+	}
+	_, _ = s.db.ExecContext(c.Request.Context(), `UPDATE app_push_tokens SET invalid_at=?,updated_at=? WHERE tenant_id=? AND installation_id=? AND invalid_at IS NULL`, now, now, tenantID(c), installationID)
+	c.JSON(http.StatusOK, gin.H{"revoked": true, "installationId": installationID, "revokedAt": iso(now)})
 }
 
 func (s *server) registerPushToken(c *gin.Context) {
@@ -103,10 +185,7 @@ func (s *server) registerPushToken(c *gin.Context) {
 		problem(c, 422, "INVALID_PUSH_TOKEN", "Push token is invalid")
 		return
 	}
-	var exists bool
-	_ = s.db.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM app_installations WHERE tenant_id=? AND installation_id=?)`, tenantID(c), body.InstallationID).Scan(&exists)
-	if !exists {
-		problem(c, 409, "INSTALLATION_REQUIRED", "Register the installation before the push token")
+	if _, valid := s.authenticateInstallation(c, body.InstallationID); !valid {
 		return
 	}
 	now := time.Now().UTC()
@@ -116,6 +195,80 @@ func (s *server) registerPushToken(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"registered": true, "provider": body.Provider, "updatedAt": iso(now)})
+}
+
+func decodeInstallationBody(c *gin.Context) (installationHeartbeat, bool) {
+	var body installationHeartbeat
+	if decode(c, &body) != nil {
+		problem(c, 400, "INVALID_INSTALLATION", "Invalid installation payload")
+		return body, false
+	}
+	body.InstallationID, body.DeviceSourceHash, body.PackageID = strings.TrimSpace(body.InstallationID), strings.ToLower(strings.TrimSpace(body.DeviceSourceHash)), strings.TrimSpace(body.PackageID)
+	if !installationIDPattern.MatchString(body.InstallationID) || body.PackageID == "" || len(body.PackageID) > 180 || (body.DeviceSourceHash != "" && !deviceSourceHashPattern.MatchString(body.DeviceSourceHash)) {
+		problem(c, 422, "INVALID_INSTALLATION", "Installation identity is invalid")
+		return body, false
+	}
+	return body, true
+}
+
+func (s *server) saveInstallation(c *gin.Context, body installationHeartbeat, credentialHash string, credentialVersion int, credentialExpires, now time.Time) error {
+	platform, applicationID := strings.ToLower(c.GetHeader("x-platform")), text(c.GetHeader("x-application-id"), "unknown")
+	tx, err := s.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var deviceClientID any
+	if body.DeviceSourceHash != "" && s.cfg.DeviceIdentityKey != "" {
+		deviceKey, hashErr := s.deviceKeyHash(platform, body.DeviceSourceHash)
+		if hashErr != nil {
+			return hashErr
+		}
+		if _, err = tx.ExecContext(c.Request.Context(), `INSERT INTO device_clients(platform,device_key_hash,first_seen_at,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE last_seen_at=VALUES(last_seen_at),updated_at=VALUES(updated_at)`, platform, deviceKey, now, now, now, now); err != nil {
+			return err
+		}
+		var id uint64
+		if err = tx.QueryRowContext(c.Request.Context(), `SELECT id FROM device_clients WHERE platform=? AND device_key_hash=?`, platform, deviceKey).Scan(&id); err != nil {
+			return err
+		}
+		deviceClientID = id
+	}
+	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *server) authenticateInstallation(c *gin.Context, installationID string) (installationCredentialRecord, bool) {
+	var record installationCredentialRecord
+	credential := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Installation "))
+	if credential == "" {
+		problem(c, 401, "INSTALLATION_CREDENTIAL_REQUIRED", "Installation credential is required")
+		return record, false
+	}
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT credential_hash,credential_version,credential_expires_at,credential_revoked_at,application_id,platform,status FROM app_installations WHERE tenant_id=? AND installation_id=? LIMIT 1`, tenantID(c), installationID).Scan(&record.Hash, &record.Version, &record.ExpiresAt, &record.RevokedAt, &record.ApplicationID, &record.Platform, &record.Status)
+	if err != nil || record.RevokedAt.Valid || record.Status == "revoked" || record.ExpiresAt.Before(time.Now().UTC()) || record.ApplicationID != text(c.GetHeader("x-application-id"), "unknown") || record.Platform != strings.ToLower(c.GetHeader("x-platform")) {
+		problem(c, 401, "INSTALLATION_CREDENTIAL_INVALID", "Installation credential is invalid, expired or revoked")
+		return record, false
+	}
+	actual := sha256.Sum256([]byte(credential))
+	expected, err := hex.DecodeString(record.Hash)
+	if err != nil || len(expected) != len(actual) || subtle.ConstantTimeCompare(expected, actual[:]) != 1 {
+		problem(c, 401, "INSTALLATION_CREDENTIAL_INVALID", "Installation credential is invalid, expired or revoked")
+		return record, false
+	}
+	return record, true
+}
+
+func newInstallationCredential() (string, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	credential := "icred_" + base64.RawURLEncoding.EncodeToString(raw)
+	hash := sha256.Sum256([]byte(credential))
+	return credential, hex.EncodeToString(hash[:]), nil
 }
 
 func (s *server) deviceKeyHash(platform, sourceHash string) (string, error) {

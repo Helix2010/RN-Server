@@ -45,13 +45,32 @@
       }
     },
     "/v1/mobile/installations/heartbeat": {
-      "post": { "responses": { "200": { "description": "Installation heartbeat accepted" } } }
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Installation heartbeat accepted"
+          }
+        }
+      }
+    },
+    "/v1/mobile/installations/register": {
+      "post": {
+        "responses": { "201": { "description": "Installation registered" } }
+      }
+    },
+    "/v1/mobile/installations/refresh-credential": {
+      "post": {
+        "responses": { "200": { "description": "Installation credential rotated" } }
+      }
     },
     "/v1/mobile/push-tokens": {
-      "post": { "responses": { "200": { "description": "Push token registered" } } }
-    },
-    "/v1/mobile/push-tokens": {
-      "post": { "responses": { "200": { "description": "Push token registered" } } }
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Push token registered"
+          }
+        }
+      }
     },
     "/v1/mobile/branding/assets/{id}": {
       "get": {
@@ -143,7 +162,23 @@
       }
     },
     "/v1/admin/installations/overview": {
-      "get": { "responses": { "200": { "description": "Tenant installation and active version overview" } } }
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Tenant installation and active version overview"
+          }
+        }
+      }
+    },
+    "/v1/admin/installations": {
+      "get": {
+        "responses": { "200": { "description": "Tenant installation list" } }
+      }
+    },
+    "/v1/admin/installations/{id}/revoke": {
+      "post": {
+        "responses": { "200": { "description": "Installation revoked" } }
+      }
     },
     "/v1/admin/releases": {
       "get": {
