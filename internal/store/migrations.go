@@ -35,6 +35,20 @@ var migrations = []migration{
 	{version: 19, name: "installation_branding_version", apply: installationBrandingVersionMigration},
 	{version: 20, name: "installation_revoked_status", apply: installationRevokedStatusMigration},
 	{version: 21, name: "device_schema_comments", apply: deviceSchemaCommentsMigration},
+	{version: 22, name: "push_notification_copy", apply: pushNotificationCopyMigration},
+}
+
+func pushNotificationCopyMigration(ctx context.Context, db *sql.DB) error {
+	items := []struct{ lang, key, content, meta string }{
+		{"zh-CN", "update.localizationTitle", "语言资源已更新", "推送标题"}, {"zh-CN", "update.localizationDescription", "新的语言包已准备好，将在下次刷新后生效。", "推送正文"}, {"zh-CN", "update.brandingTitle", "品牌配置已更新", "推送标题"}, {"zh-CN", "update.brandingDescription", "新的品牌资源已准备好，将在下次启动时生效。", "推送正文"}, {"zh-CN", "update.configTitle", "应用配置已更新", "推送标题"}, {"zh-CN", "update.configDescription", "应用配置已更新，正在后台同步。", "推送正文"},
+		{"en-US", "update.localizationTitle", "Language resources updated", "Push title"}, {"en-US", "update.localizationDescription", "New language resources are ready and will apply after the next refresh.", "Push body"}, {"en-US", "update.brandingTitle", "Branding updated", "Push title"}, {"en-US", "update.brandingDescription", "New branding resources are ready and will apply on the next launch.", "Push body"}, {"en-US", "update.configTitle", "App configuration updated", "Push title"}, {"en-US", "update.configDescription", "App configuration changed and is syncing in the background.", "Push body"},
+	}
+	for _, item := range items {
+		if _, err := db.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),deleted=0`, item.lang, item.key, item.content, item.meta); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func deviceSchemaCommentsMigration(ctx context.Context, db *sql.DB) error {

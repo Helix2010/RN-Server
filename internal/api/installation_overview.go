@@ -3,6 +3,7 @@ package api
 import (
 	"database/sql"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -56,6 +57,54 @@ func (s *server) listInstallations(c *gin.Context) {
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
 		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+}
+
+func (s *server) listPushOutbox(c *gin.Context) {
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.event_type,o.status,o.attempts,o.last_error,o.created_at,o.sent_at,COALESCE(SUM(d.status='sent'),0),COALESCE(SUM(d.status='failed'),0) FROM app_push_outbox o LEFT JOIN app_push_deliveries d ON d.event_id=o.id AND d.tenant_id=o.tenant_id WHERE o.tenant_id=? GROUP BY o.id ORDER BY o.created_at DESC LIMIT 200`, tenantID(c))
+	if err != nil {
+		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to load push events")
+		return
+	}
+	defer rows.Close()
+	items := []gin.H{}
+	for rows.Next() {
+		var id, eventType, status string
+		var attempts, sent, failed int
+		var lastError sql.NullString
+		var created, sentAt sql.NullTime
+		if err := rows.Scan(&id, &eventType, &status, &attempts, &lastError, &created, &sentAt, &sent, &failed); err != nil {
+			problem(c, 500, "PUSH_QUERY_FAILED", "Unable to read push events")
+			return
+		}
+		items = append(items, gin.H{"id": id, "eventType": eventType, "status": status, "attempts": attempts, "lastError": nullableSQLString(lastError), "createdAt": nullableOTAFieldTime(created), "sentAt": nullableOTAFieldTime(sentAt), "sent": sent, "failed": failed})
+	}
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to read push events")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+}
+
+func (s *server) listPushDeliveries(c *gin.Context) {
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT d.event_id,d.installation_id,d.provider,d.provider_message_id,d.status,d.failure_code,d.sent_at,d.delivered_at,d.created_at FROM app_push_deliveries d WHERE d.tenant_id=? AND (?='' OR d.status=?) ORDER BY d.created_at DESC LIMIT 500`, tenantID(c), status, status)
+	if err != nil {
+		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to load push deliveries")
+		return
+	}
+	defer rows.Close()
+	items := []gin.H{}
+	for rows.Next() {
+		var eventID, installationID, provider, status string
+		var messageID, failure sql.NullString
+		var sent, delivered, created sql.NullTime
+		if err := rows.Scan(&eventID, &installationID, &provider, &messageID, &status, &failure, &sent, &delivered, &created); err != nil {
+			problem(c, 500, "PUSH_QUERY_FAILED", "Unable to read push deliveries")
+			return
+		}
+		items = append(items, gin.H{"eventId": eventID, "installationId": installationID, "provider": provider, "providerMessageId": nullableSQLString(messageID), "status": status, "failureCode": nullableSQLString(failure), "sentAt": nullableOTAFieldTime(sent), "deliveredAt": nullableOTAFieldTime(delivered), "createdAt": nullableOTAFieldTime(created)})
 	}
 	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
 }

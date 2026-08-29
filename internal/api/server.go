@@ -134,6 +134,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/installations/overview", s.installationOverview)
 	group.GET("/installations", s.listInstallations)
 	group.POST("/installations/:id/revoke", s.revokeInstallation)
+	group.GET("/push/outbox", s.listPushOutbox)
+	group.GET("/push/deliveries", s.listPushDeliveries)
 	group.GET("/releases", s.listReleases)
 	group.POST("/releases", s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)

@@ -175,6 +175,12 @@
         "responses": { "200": { "description": "Installation revoked" } }
       }
     },
+    "/v1/admin/push/outbox": {
+      "get": { "responses": { "200": { "description": "Tenant push outbox events" } } }
+    },
+    "/v1/admin/push/deliveries": {
+      "get": { "responses": { "200": { "description": "Tenant push delivery details" } } }
+    },
     "/v1/admin/releases": {
       "get": {
         "responses": {

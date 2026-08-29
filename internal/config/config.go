@@ -57,6 +57,7 @@ type Config struct {
 	IOSMDMURL                  string
 	PushDispatchEnabled        bool
 	PushPollInterval           int
+	PushConcurrency            int
 	FCMProjectID               string
 	FCMServiceAccountJSON      string
 	APNsTeamID                 string
@@ -64,6 +65,9 @@ type Config struct {
 	APNsPrivateKey             string
 	APNsBundleID               string
 	APNsEnvironment            string
+	HMSAppID                   string
+	HMSClientID                string
+	HMSClientSecret            string
 }
 
 func Load() (Config, error) {
@@ -115,6 +119,7 @@ func Load() (Config, error) {
 		IOSMDMURL:                  os.Getenv("IOS_MDM_URL"),
 		PushDispatchEnabled:        boolean("PUSH_DISPATCH_ENABLED", false),
 		PushPollInterval:           integer("PUSH_POLL_INTERVAL_SECONDS", 10),
+		PushConcurrency:            integer("PUSH_CONCURRENCY", 8),
 		FCMProjectID:               strings.TrimSpace(os.Getenv("FCM_PROJECT_ID")),
 		FCMServiceAccountJSON:      strings.TrimSpace(os.Getenv("FCM_SERVICE_ACCOUNT_JSON")),
 		APNsTeamID:                 strings.TrimSpace(os.Getenv("APNS_TEAM_ID")),
@@ -122,6 +127,9 @@ func Load() (Config, error) {
 		APNsPrivateKey:             strings.TrimSpace(os.Getenv("APNS_PRIVATE_KEY")),
 		APNsBundleID:               strings.TrimSpace(os.Getenv("APNS_BUNDLE_ID")),
 		APNsEnvironment:            value("APNS_ENVIRONMENT", "production"),
+		HMSAppID:                   strings.TrimSpace(os.Getenv("HMS_APP_ID")),
+		HMSClientID:                strings.TrimSpace(os.Getenv("HMS_CLIENT_ID")),
+		HMSClientSecret:            strings.TrimSpace(os.Getenv("HMS_CLIENT_SECRET")),
 	}
 	if cfg.Environment == "test" && !strings.HasSuffix(cfg.MySQLDatabase, "_test") {
 		cfg.MySQLDatabase += "_test"
@@ -160,7 +168,7 @@ func Load() (Config, error) {
 	if cfg.ArtifactUploadMode != "direct" && cfg.ArtifactUploadMode != "proxy" {
 		return Config{}, errors.New("ARTIFACT_UPLOAD_MODE must be direct or proxy")
 	}
-	if cfg.PushPollInterval < 1 || cfg.PushPollInterval > 300 {
+	if cfg.PushPollInterval < 1 || cfg.PushPollInterval > 300 || cfg.PushConcurrency < 1 || cfg.PushConcurrency > 64 {
 		return Config{}, errors.New("PUSH_POLL_INTERVAL_SECONDS must be between 1 and 300")
 	}
 	if cfg.APNsEnvironment != "production" && cfg.APNsEnvironment != "sandbox" {
