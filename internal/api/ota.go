@@ -795,7 +795,7 @@ func (s *server) otaManifest(c *gin.Context) {
 		channel = s.cfg.OTAChannel
 	}
 	if platform == "" || runtime == "" {
-		c.Status(http.StatusNoContent)
+		writeExpoNoUpdate(c)
 		return
 	}
 	if protocol := strings.TrimSpace(c.GetHeader("expo-protocol-version")); protocol != "" && protocol != "1" {
@@ -807,7 +807,7 @@ func (s *server) otaManifest(c *gin.Context) {
 	var published sql.NullTime
 	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id,release_kind,manifest_key,manifest_sha256,published_at FROM ota_releases WHERE tenant_id=? AND platform=? AND channel=? AND runtime_version=? AND status='active' ORDER BY revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime).Scan(&id, &kind, &key, &sha, &published)
 	if errors.Is(err, sql.ErrNoRows) {
-		c.Status(http.StatusNoContent)
+		writeExpoNoUpdate(c)
 		return
 	}
 	if err != nil {
@@ -862,6 +862,15 @@ func (s *server) otaManifest(c *gin.Context) {
 	}
 	c.Data(200, "application/expo+json", raw)
 }
+
+func writeExpoNoUpdate(c *gin.Context) {
+	c.Header("Cache-Control", "no-cache")
+	c.Header("expo-protocol-version", "1")
+	c.Header("expo-sfv-version", "0")
+	c.Status(http.StatusNoContent)
+	c.Writer.WriteHeaderNow()
+}
+
 func hashBytes(v []byte) []byte { h := sha256.Sum256(v); return h[:] }
 
 func writeExpoMultipart(c *gin.Context, name string, payload []byte) {

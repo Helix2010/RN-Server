@@ -6,8 +6,33 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
+
+func TestWriteExpoNoUpdateIncludesProtocolHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writeExpoNoUpdate(context)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", recorder.Code)
+	}
+	if recorder.Header().Get("expo-protocol-version") != "1" {
+		t.Fatal("no-update response must declare Expo protocol version 1")
+	}
+	if recorder.Header().Get("expo-sfv-version") != "0" {
+		t.Fatal("no-update response must declare Expo SFV version 0")
+	}
+	if recorder.Header().Get("Cache-Control") != "no-cache" {
+		t.Fatal("no-update response must not be cached as a permanent result")
+	}
+}
 
 func TestOTASequenceLockNameFitsMySQLLimit(t *testing.T) {
 	runtime := "3f6df6c8584862471d6f2f045d60c9bdac129cd6-runtime-with-a-long-fingerprint"
