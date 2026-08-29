@@ -32,7 +32,7 @@ type event struct {
 }
 
 type target struct {
-	InstallationID, PackageID, Provider, Token, Environment string
+	InstallationID, PackageID, Provider, Token string
 }
 
 func New(ctx context.Context, db *sql.DB, cfg config.Config) (*Dispatcher, error) {
@@ -94,7 +94,7 @@ func (d *Dispatcher) dispatchNext(ctx context.Context) error {
 		return err
 	}
 	if json.Unmarshal(raw, &item.Payload) != nil {
-		return d.finish(ctx, item, 0, 1, "invalid payload")
+		return d.finish(ctx, item, 1)
 	}
 	result, err := d.db.ExecContext(ctx, `UPDATE app_push_outbox SET status='processing',locked_at=?,updated_at=? WHERE id=? AND status='pending'`, time.Now().UTC(), time.Now().UTC(), item.ID)
 	if err != nil {
@@ -120,16 +120,16 @@ func (d *Dispatcher) dispatchNext(ctx context.Context) error {
 		_, _ = d.db.ExecContext(ctx, `INSERT INTO app_push_deliveries(event_id,tenant_id,installation_id,provider,provider_message_id,status,failure_code,sent_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE provider_message_id=VALUES(provider_message_id),status=VALUES(status),failure_code=VALUES(failure_code),sent_at=VALUES(sent_at),updated_at=VALUES(updated_at)`, item.ID, item.TenantID, recipient.InstallationID, recipient.Provider, providerID, status, failureCode, time.Now().UTC(), time.Now().UTC(), time.Now().UTC())
 	}
 	if len(targets) == 0 {
-		return d.finish(ctx, item, 0, 0, "")
+		return d.finish(ctx, item, 0)
 	}
 	if successes == 0 {
 		return d.retry(ctx, item, "all provider deliveries failed")
 	}
-	return d.finish(ctx, item, successes, failures, "")
+	return d.finish(ctx, item, failures)
 }
 
 func (d *Dispatcher) targets(ctx context.Context, tenant string) ([]target, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT p.installation_id,i.package_id,p.provider,p.token,p.environment FROM app_push_tokens p JOIN app_installations i ON i.tenant_id=p.tenant_id AND i.installation_id=p.installation_id WHERE p.tenant_id=? AND p.invalid_at IS NULL AND i.status='active' AND p.permission_status IN ('granted','authorized','provisional')`, tenant)
+	rows, err := d.db.QueryContext(ctx, `SELECT p.installation_id,i.package_id,p.provider,p.token FROM app_push_tokens p JOIN app_installations i ON i.tenant_id=p.tenant_id AND i.installation_id=p.installation_id WHERE p.tenant_id=? AND p.invalid_at IS NULL AND i.status='active' AND p.permission_status IN ('granted','authorized','provisional')`, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +137,7 @@ func (d *Dispatcher) targets(ctx context.Context, tenant string) ([]target, erro
 	items := []target{}
 	for rows.Next() {
 		var item target
-		if rows.Scan(&item.InstallationID, &item.PackageID, &item.Provider, &item.Token, &item.Environment) == nil {
+		if rows.Scan(&item.InstallationID, &item.PackageID, &item.Provider, &item.Token) == nil {
 			items = append(items, item)
 		}
 	}
@@ -214,9 +214,7 @@ func (d *Dispatcher) sendAPNs(ctx context.Context, targetToken, packageID string
 	return response.ApnsID, nil
 }
 
-func (d *Dispatcher) finish(ctx context.Context, item event, successes, failures int, reason string) error {
-	_ = successes
-	_ = reason
+func (d *Dispatcher) finish(ctx context.Context, item event, failures int) error {
 	status := "sent"
 	if failures > 0 {
 		status = "partial_failed"
