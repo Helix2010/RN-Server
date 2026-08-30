@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -95,15 +94,21 @@ func TestOTAManifestIdentityExtractsClientFields(t *testing.T) {
 	}
 }
 
-func TestOTAClientBaselineHeadersRemainOptionalForLegacyClients(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/v1/ota/manifest", nil)
-	if got := strings.TrimSpace(request.Header.Get("x-app-version")); got != "" {
-		t.Fatalf("legacy request app version = %q", got)
+func TestOTAClientBaselineRequiresVersionAndBuild(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/v1/ota/manifest", nil)
+	if _, _, ok := otaClientBaseline(context); ok {
+		t.Fatal("OTA must fail closed when APK baseline headers are absent")
 	}
-	request.Header.Set("x-app-version", "1.1.8")
-	request.Header.Set("x-build-number", "12")
-	if request.Header.Get("x-app-version") != "1.1.8" || request.Header.Get("x-build-number") != "12" {
-		t.Fatal("OTA baseline headers must preserve APK identity")
+	context.Request.Header.Set("x-app-version", "1.1.8")
+	if _, _, ok := otaClientBaseline(context); ok {
+		t.Fatal("OTA must require both version and build")
+	}
+	context.Request.Header.Set("x-build-number", "12")
+	version, build, ok := otaClientBaseline(context)
+	if !ok || version != "1.1.8" || build != "12" {
+		t.Fatalf("unexpected baseline: version=%q build=%q ok=%v", version, build, ok)
 	}
 }
 

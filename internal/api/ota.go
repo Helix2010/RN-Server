@@ -798,8 +798,11 @@ func (s *server) otaManifest(c *gin.Context) {
 		writeExpoNoUpdate(c)
 		return
 	}
-	appVersion := strings.TrimSpace(c.GetHeader("x-app-version"))
-	buildNumber := strings.TrimSpace(c.GetHeader("x-build-number"))
+	appVersion, buildNumber, baselineOK := otaClientBaseline(c)
+	if !baselineOK {
+		writeExpoNoUpdate(c)
+		return
+	}
 	if protocol := strings.TrimSpace(c.GetHeader("expo-protocol-version")); protocol != "" && protocol != "1" {
 		problem(c, http.StatusBadRequest, "OTA_PROTOCOL_UNSUPPORTED", "Unsupported Expo Updates protocol version")
 		return
@@ -863,6 +866,12 @@ func (s *server) otaManifest(c *gin.Context) {
 		return
 	}
 	c.Data(200, "application/expo+json", raw)
+}
+
+func otaClientBaseline(c *gin.Context) (string, string, bool) {
+	appVersion := strings.TrimSpace(c.GetHeader("x-app-version"))
+	buildNumber := strings.TrimSpace(c.GetHeader("x-build-number"))
+	return appVersion, buildNumber, appVersion != "" && buildNumber != ""
 }
 
 func writeExpoNoUpdate(c *gin.Context) {
