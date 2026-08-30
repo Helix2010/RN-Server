@@ -76,6 +76,12 @@ type effectiveLanguagesConfig struct {
 	Languages              map[string]effectiveLanguage `json:"languages"`
 }
 
+type languageCatalogItem struct {
+	Code       string `json:"code"`
+	Label      string `json:"label"`
+	NativeName string `json:"nativeName"`
+}
+
 type languageConfigRecord struct {
 	TenantID  string
 	Value     storedLanguagesConfig
@@ -215,6 +221,27 @@ func mergeLanguages(global, tenant storedLanguagesConfig) (effectiveLanguagesCon
 		}
 	}
 	return result, nil
+}
+
+func languageCatalog(settings effectiveLanguagesConfig) ([]languageCatalogItem, error) {
+	catalog := make([]languageCatalogItem, 0, len(settings.Languages))
+	for code, language := range settings.Languages {
+		if !language.Enabled {
+			continue
+		}
+		if !validLanguageCode(code) || language.Label == "" || language.NativeName == "" {
+			return nil, fmt.Errorf("language %s is incomplete", code)
+		}
+		catalog = append(catalog, languageCatalogItem{Code: code, Label: language.Label, NativeName: language.NativeName})
+	}
+	sort.Slice(catalog, func(i, j int) bool {
+		left, right := settings.Languages[catalog[i].Code], settings.Languages[catalog[j].Code]
+		if left.Sort != right.Sort {
+			return left.Sort < right.Sort
+		}
+		return catalog[i].Code < catalog[j].Code
+	})
+	return catalog, nil
 }
 
 func (s *server) languageConfigRecords(ctx context.Context, tenant string) (languageConfigRecord, languageConfigRecord, error) {
