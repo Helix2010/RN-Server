@@ -798,6 +798,8 @@ func (s *server) otaManifest(c *gin.Context) {
 		writeExpoNoUpdate(c)
 		return
 	}
+	appVersion := strings.TrimSpace(c.GetHeader("x-app-version"))
+	buildNumber := strings.TrimSpace(c.GetHeader("x-build-number"))
 	if protocol := strings.TrimSpace(c.GetHeader("expo-protocol-version")); protocol != "" && protocol != "1" {
 		problem(c, http.StatusBadRequest, "OTA_PROTOCOL_UNSUPPORTED", "Unsupported Expo Updates protocol version")
 		return
@@ -805,7 +807,7 @@ func (s *server) otaManifest(c *gin.Context) {
 	var id, kind string
 	var key, sha sql.NullString
 	var published sql.NullTime
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id,release_kind,manifest_key,manifest_sha256,published_at FROM ota_releases WHERE tenant_id=? AND platform=? AND channel=? AND runtime_version=? AND status='active' ORDER BY revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime).Scan(&id, &kind, &key, &sha, &published)
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.release_kind,o.manifest_key,o.manifest_sha256,o.published_at FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' AND (?='' OR a.version=?) AND (?='' OR CAST(a.build_number AS CHAR)=?) ORDER BY o.revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime, appVersion, appVersion, buildNumber, buildNumber).Scan(&id, &kind, &key, &sha, &published)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeExpoNoUpdate(c)
 		return

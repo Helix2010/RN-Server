@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -91,6 +92,18 @@ func TestOTAManifestIdentityExtractsClientFields(t *testing.T) {
 	identity := otaManifestIdentity(manifest)
 	if identity["apiBaseUrl"] != "https://tenant.example" || identity["expoClientVersion"] != "2.3.4" || identity["expoClientAndroidVersionCode"] != 42 {
 		t.Fatalf("manifest identity extraction failed: %#v", identity)
+	}
+}
+
+func TestOTAClientBaselineHeadersRemainOptionalForLegacyClients(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/v1/ota/manifest", nil)
+	if got := strings.TrimSpace(request.Header.Get("x-app-version")); got != "" {
+		t.Fatalf("legacy request app version = %q", got)
+	}
+	request.Header.Set("x-app-version", "1.1.8")
+	request.Header.Set("x-build-number", "12")
+	if request.Header.Get("x-app-version") != "1.1.8" || request.Header.Get("x-build-number") != "12" {
+		t.Fatal("OTA baseline headers must preserve APK identity")
 	}
 }
 
