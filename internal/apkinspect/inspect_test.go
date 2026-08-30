@@ -56,6 +56,33 @@ func TestRuntimeVersionFromArchiveAllowsMissingFingerprint(t *testing.T) {
 	}
 }
 
+func TestRuntimeVersionFromArchiveReadsExplicitRuntimeVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "explicit-runtime.apk")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	entry, err := archive.Create("assets/app.config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte(`{"runtimeVersion":"1.1.9"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := runtimeVersionFromArchive(path)
+	if err != nil || got != "1.1.9" {
+		t.Fatalf("runtimeVersionFromArchive() = %q, %v", got, err)
+	}
+}
+
 func TestInspectAPKFromEnvironment(t *testing.T) {
 	path := os.Getenv("TEST_APK_PATH")
 	if path == "" {

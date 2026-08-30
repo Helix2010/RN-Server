@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -111,6 +112,26 @@ func runtimeVersionFromArchive(path string) (string, error) {
 			return "", fmt.Errorf("fingerprint entry is empty")
 		}
 		return runtime, nil
+	}
+	for _, entry := range archive.File {
+		if entry.Name != "assets/app.config" && entry.Name != "assets/app.manifest" {
+			continue
+		}
+		reader, err := entry.Open()
+		if err != nil {
+			return "", fmt.Errorf("open app config entry: %w", err)
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(reader, 1024*1024))
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil {
+			return "", fmt.Errorf("read app config entry")
+		}
+		var config struct {
+			RuntimeVersion string `json:"runtimeVersion"`
+		}
+		if json.Unmarshal(raw, &config) == nil && strings.TrimSpace(config.RuntimeVersion) != "" {
+			return strings.TrimSpace(config.RuntimeVersion), nil
+		}
 	}
 	return "", nil
 }
