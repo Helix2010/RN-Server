@@ -36,6 +36,12 @@ var migrations = []migration{
 	{version: 20, name: "installation_revoked_status", apply: installationRevokedStatusMigration},
 	{version: 21, name: "device_schema_comments", apply: deviceSchemaCommentsMigration},
 	{version: 22, name: "push_notification_copy", apply: pushNotificationCopyMigration},
+	{version: 23, name: "app_modules_config", apply: appModulesConfigMigration},
+}
+
+func appModulesConfigMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE app_configs SET config_value=JSON_SET(config_value,'$.modules',JSON_OBJECT('predict',true,'dex',true)),version=version+1,updated_by='system-modules',updated_at=UTC_TIMESTAMP(3) WHERE config_key='mobile-bootstrap' AND JSON_EXTRACT(config_value,'$.modules') IS NULL`)
+	return err
 }
 
 func pushNotificationCopyMigration(ctx context.Context, db *sql.DB) error {

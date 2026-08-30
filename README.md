@@ -17,6 +17,7 @@ go run ./cmd/server
 - 健康检查：`http://localhost:3000/health/live`
 - OpenAPI UI：`http://localhost:3000/docs`
 - App 配置：`http://localhost:3000/v1/mobile/bootstrap?locale=zh-CN`
+- 业务模块：`app_configs.mobile-bootstrap.modules` 管理 `predict` 与 `dex` 开关；Bootstrap 按租户域名下发，至少保留一个模块开启。历史配置由迁移 23 自动补齐为双模块。
 - 多语言管理：管理端使用 `/v1/admin/localization` 读取全局与租户合并结果，语言设置和文案分别保存为租户差异；发布后生成 `/v1/mobile/languages/{languageCode}/document` 资源。语言编码只接受标准 BCP 47（如 `zh-CN`、`en-US`），不接受下划线格式。
 - 多语言资源对象 Key：发布文件按 `localization/{tenantId}/{languageCode}/{version}.json` 存储，租户和语言已由目录表达，文件名只保留版本号。
 - RN-App 正式文案：迁移 8 会重置 `type=14` 为 AnyFun 基座实际使用的 zh-CN/en-US 文案，并清空旧语言资源引用；迁移后需由管理端重新发布语言包。

@@ -615,6 +615,7 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	if err = json.Unmarshal(raw, &value); err != nil {
 		return nil, err
 	}
+	value["modules"] = normalizeModules(object(value["modules"]))
 	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0"}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
@@ -690,6 +691,7 @@ func (s *server) bootstrap(c *gin.Context) {
 		return
 	}
 	cfg := view["config"].(map[string]any)
+	modules := normalizeModules(object(cfg["modules"]))
 	requestedLocale := strings.TrimSpace(c.Query("locale"))
 	locale := requestedLocale
 	if locale == "" {
@@ -782,7 +784,7 @@ func (s *server) bootstrap(c *gin.Context) {
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
@@ -826,7 +828,18 @@ func validConfig(v map[string]any) bool {
 	}
 	_, ok1 := v["configVersion"].(string)
 	ttl, ok2 := v["ttlSeconds"].(float64)
-	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && object(v["updatePolicy"]) != nil && object(v["support"]) != nil
+	modules := object(v["modules"])
+	if modules == nil {
+		modules = map[string]any{"predict": true, "dex": true}
+	}
+	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && (truth(modules["predict"]) || truth(modules["dex"])) && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && object(v["updatePolicy"]) != nil && object(v["support"]) != nil
+}
+
+func normalizeModules(value map[string]any) map[string]any {
+	if value == nil || (!truth(value["predict"]) && !truth(value["dex"])) {
+		return map[string]any{"predict": true, "dex": true}
+	}
+	return map[string]any{"predict": truth(value["predict"]), "dex": truth(value["dex"])}
 }
 func configSummary(v map[string]any) gin.H {
 	l := object(v["localization"])
