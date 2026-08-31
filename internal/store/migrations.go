@@ -37,6 +37,20 @@ var migrations = []migration{
 	{version: 21, name: "device_schema_comments", apply: deviceSchemaCommentsMigration},
 	{version: 22, name: "push_notification_copy", apply: pushNotificationCopyMigration},
 	{version: 23, name: "app_modules_config", apply: appModulesConfigMigration},
+	{version: 24, name: "version_info_copy", apply: versionInfoCopyMigration},
+}
+
+func versionInfoCopyMigration(ctx context.Context, db *sql.DB) error {
+	items := []struct{ lang, content, meta string }{
+		{"zh-CN", "版本信息", "版本信息入口"},
+		{"en-US", "Version information", "Version information entry"},
+	}
+	for _, item := range items {
+		if _, err := db.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,'update.versioninfo',?,?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE id=id`, item.lang, item.content, item.meta); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func appModulesConfigMigration(ctx context.Context, db *sql.DB) error {
