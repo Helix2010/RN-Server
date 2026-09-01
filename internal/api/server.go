@@ -620,6 +620,7 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 		return nil, err
 	}
 	value["modules"] = normalizeModules(object(value["modules"]))
+	value["wallet"] = normalizeWallet(object(value["wallet"]))
 	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0"}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
@@ -683,6 +684,32 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	c.JSON(200, view)
 }
 
+// normalizeWallet fills in the wallet section a client needs at startup. The
+// WalletConnect project id is a client identifier, not a secret, so it is
+// delivered per tenant instead of being baked into every build.
+func normalizeWallet(raw map[string]any) map[string]any {
+	wallet := map[string]any{"walletConnectProjectId": "", "chains": []any{"bsc", "eth", "base"}}
+	if raw == nil {
+		return wallet
+	}
+	if value, ok := raw["walletConnectProjectId"].(string); ok {
+		wallet["walletConnectProjectId"] = strings.TrimSpace(value)
+	}
+	if chains, ok := raw["chains"].([]any); ok && len(chains) > 0 {
+		allowed := map[string]bool{"bsc": true, "eth": true, "base": true}
+		filtered := []any{}
+		for _, item := range chains {
+			if name, ok := item.(string); ok && allowed[name] {
+				filtered = append(filtered, name)
+			}
+		}
+		if len(filtered) > 0 {
+			wallet["chains"] = filtered
+		}
+	}
+	return wallet
+}
+
 func (s *server) bootstrap(c *gin.Context) {
 	tenant, err := s.tenant.resolve(c.Request.Context(), c.Request.Host)
 	if err != nil {
@@ -696,6 +723,7 @@ func (s *server) bootstrap(c *gin.Context) {
 	}
 	cfg := view["config"].(map[string]any)
 	modules := normalizeModules(object(cfg["modules"]))
+	wallet := normalizeWallet(object(cfg["wallet"]))
 	requestedLocale := strings.TrimSpace(c.Query("locale"))
 	locale := requestedLocale
 	if locale == "" {
@@ -795,7 +823,7 @@ func (s *server) bootstrap(c *gin.Context) {
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

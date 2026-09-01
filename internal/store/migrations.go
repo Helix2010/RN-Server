@@ -39,6 +39,17 @@ var migrations = []migration{
 	{version: 23, name: "app_modules_config", apply: appModulesConfigMigration},
 	{version: 24, name: "version_info_copy", apply: versionInfoCopyMigration},
 	{version: 25, name: "wallet_identity", apply: walletIdentityMigration},
+	{version: 26, name: "wallet_bootstrap_section", apply: walletBootstrapSectionMigration},
+}
+
+// walletBootstrapSectionMigration 给已有的 bootstrap 配置补上 wallet 段，
+// 这样每个租户的 WalletConnect projectId 可以在管理端改，不必重新打包。
+func walletBootstrapSectionMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE app_configs
+		SET config_value=JSON_SET(config_value,'$.wallet',JSON_OBJECT('walletConnectProjectId','','chains',JSON_ARRAY('bsc','eth','base'))),
+		    version=version+1, updated_by='system-wallet', updated_at=UTC_TIMESTAMP(3)
+		WHERE config_key='mobile-bootstrap' AND JSON_EXTRACT(config_value,'$.wallet') IS NULL`)
+	return err
 }
 
 // walletIdentityMigration 建立"地址即账号"的身份模型：一次性 nonce、租户内的
