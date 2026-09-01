@@ -26,77 +26,30 @@
         }
       }
     },
-    "/v1/mobile/bootstrap": {
-      "get": {
-        "parameters": [
-          {
-            "name": "locale",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Bootstrap configuration"
-          }
-        }
-      }
-    },
-    "/v1/mobile/installations/heartbeat": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Installation heartbeat accepted"
-          }
-        }
-      }
-    },
-    "/v1/mobile/installations/register": {
-      "post": {
-        "responses": { "201": { "description": "Installation registered" } }
-      }
-    },
-    "/v1/mobile/push-tokens": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Push token registered"
-          }
-        }
-      }
-    },
-    "/v1/mobile/branding/assets/{id}": {
+    "/v1/admin/app-config": {
       "get": {
         "responses": {
           "200": {
-            "description": "Branding asset"
+            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints; metadata.walletCatalog lists the chains this platform supports)"
+          }
+        }
+      },
+      "patch": {
+        "responses": {
+          "200": {
+            "description": "Saved app config (a request without config.wallet keeps the stored wallet section)"
           },
-          "404": {
-            "description": "Branding asset not found"
+          "400": {
+            "description": "INVALID_APP_CONFIG or INVALID_WALLET_CONFIG"
           }
         }
       }
     },
-    "/v1/mobile/languages/{languageCode}/document": {
-      "parameters": [
-        {
-          "name": "languageCode",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
+    "/v1/admin/audit-events": {
       "get": {
         "responses": {
           "200": {
-            "description": "Published localization JSON"
-          },
-          "304": {
-            "description": "Not modified"
+            "description": "Audit events"
           }
         }
       }
@@ -120,15 +73,6 @@
         }
       }
     },
-    "/v1/admin/auth/session": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Session"
-          }
-        }
-      }
-    },
     "/v1/admin/auth/logout": {
       "post": {
         "responses": {
@@ -138,20 +82,64 @@
         }
       }
     },
-    "/v1/admin/tenant": {
+    "/v1/admin/auth/session": {
       "get": {
         "responses": {
           "200": {
-            "description": "Current tenant"
+            "description": "Session"
           }
         }
       }
     },
-    "/v1/admin/overview": {
+    "/v1/admin/branding": {
       "get": {
         "responses": {
           "200": {
-            "description": "Release overview"
+            "description": "Branding configuration"
+          }
+        }
+      },
+      "patch": {
+        "responses": {
+          "200": {
+            "description": "Saved branding configuration"
+          },
+          "409": {
+            "description": "Stale branding configuration"
+          }
+        }
+      }
+    },
+    "/v1/admin/branding/assets/upload": {
+      "put": {
+        "responses": {
+          "200": {
+            "description": "Temporary branding asset stored"
+          }
+        }
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "Temporary branding asset removed"
+          }
+        }
+      }
+    },
+    "/v1/admin/branding/assets/uploads": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Temporary branding asset upload ticket"
+          }
+        }
+      }
+    },
+    "/v1/admin/installations": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Tenant installation list"
           }
         }
       }
@@ -165,59 +153,88 @@
         }
       }
     },
-    "/v1/admin/installations": {
-      "get": {
-        "responses": { "200": { "description": "Tenant installation list" } }
-      }
-    },
     "/v1/admin/installations/{id}/revoke": {
       "post": {
-        "responses": { "200": { "description": "Installation revoked" } }
+        "responses": {
+          "200": {
+            "description": "Installation revoked"
+          }
+        }
       }
     },
-    "/v1/admin/push/outbox": {
-      "get": { "responses": { "200": { "description": "Tenant push outbox events" } } }
-    },
-    "/v1/admin/push/deliveries": {
-      "get": { "responses": { "200": { "description": "Tenant push delivery details" } } }
-    },
-    "/v1/admin/releases": {
+    "/v1/admin/localization": {
       "get": {
         "responses": {
           "200": {
-            "description": "Release list"
-          }
-        }
-      },
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Verified release created from uploaded artifact"
+            "description": "Effective localization settings and documents"
           }
         }
       }
     },
-    "/v1/admin/release-artifacts/uploads": {
-      "post": {
+    "/v1/admin/localization/documents": {
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalizationDocumentsRequest"
+              }
+            }
+          }
+        },
         "responses": {
-          "201": {
-            "description": "Temporary artifact upload ticket"
+          "200": {
+            "description": "Saved tenant language documents"
+          },
+          "409": {
+            "description": "Localization key already exists"
+          },
+          "422": {
+            "description": "Invalid localization document"
           }
         }
       }
     },
-    "/v1/admin/release-artifacts/upload": {
+    "/v1/admin/localization/languages": {
       "put": {
         "responses": {
           "200": {
-            "description": "Temporary artifact stored"
+            "description": "Saved tenant language overrides"
+          }
+        }
+      }
+    },
+    "/v1/admin/localization/publish": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Published localization resources"
+          }
+        }
+      }
+    },
+    "/v1/admin/ota/artifacts/upload": {
+      "put": {
+        "responses": {
+          "200": {
+            "description": "Temporary OTA package stored"
           }
         }
       },
       "delete": {
         "responses": {
           "200": {
-            "description": "Temporary artifact removed"
+            "description": "Temporary OTA package removed"
+          }
+        }
+      }
+    },
+    "/v1/admin/ota/artifacts/uploads": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Temporary OTA upload ticket"
           }
         }
       }
@@ -273,27 +290,11 @@
         }
       }
     },
-    "/v1/admin/ota/artifacts/uploads": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Temporary OTA upload ticket"
-          }
-        }
-      }
-    },
-    "/v1/admin/ota/artifacts/upload": {
-      "put": {
+    "/v1/admin/ota/releases/{id}": {
+      "get": {
         "responses": {
           "200": {
-            "description": "Temporary OTA package stored"
-          }
-        }
-      },
-      "delete": {
-        "responses": {
-          "200": {
-            "description": "Temporary OTA package removed"
+            "description": "OTA release detail with final Manifest identity"
           }
         }
       }
@@ -325,26 +326,95 @@
         }
       }
     },
-    "/v1/ota/manifest": {
+    "/v1/admin/overview": {
       "get": {
         "responses": {
           "200": {
-            "description": "Expo Updates manifest"
-          },
-          "204": {
-            "description": "No matching update"
+            "description": "Release overview"
           }
         }
       }
     },
-    "/v1/ota/assets/{id}/{path}": {
+    "/v1/admin/push/deliveries": {
       "get": {
         "responses": {
           "200": {
-            "description": "Immutable OTA asset"
-          },
-          "404": {
-            "description": "Asset not found"
+            "description": "Tenant push delivery details"
+          }
+        }
+      }
+    },
+    "/v1/admin/push/outbox": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Tenant push outbox events"
+          }
+        }
+      }
+    },
+    "/v1/admin/release-artifacts/upload": {
+      "put": {
+        "responses": {
+          "200": {
+            "description": "Temporary artifact stored"
+          }
+        }
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "Temporary artifact removed"
+          }
+        }
+      }
+    },
+    "/v1/admin/release-artifacts/uploads": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Temporary artifact upload ticket"
+          }
+        }
+      }
+    },
+    "/v1/admin/release-storage": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Masked release storage config"
+          }
+        }
+      },
+      "put": {
+        "responses": {
+          "200": {
+            "description": "Saved release storage config"
+          }
+        }
+      }
+    },
+    "/v1/admin/release-storage/test": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Storage test result"
+          }
+        }
+      }
+    },
+    "/v1/admin/releases": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Release list"
+          }
+        }
+      },
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Verified release created from uploaded artifact"
           }
         }
       }
@@ -389,195 +459,11 @@
         }
       }
     },
-    "/v1/admin/app-config": {
+    "/v1/admin/tenant": {
       "get": {
         "responses": {
           "200": {
-            "description": "App config"
-          }
-        }
-      },
-      "patch": {
-        "responses": {
-          "200": {
-            "description": "Saved app config"
-          }
-        }
-      }
-    },
-    "/v1/admin/branding": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Branding configuration"
-          }
-        }
-      },
-      "patch": {
-        "responses": {
-          "200": {
-            "description": "Saved branding configuration"
-          },
-          "409": {
-            "description": "Stale branding configuration"
-          }
-        }
-      }
-    },
-    "/v1/admin/branding/assets/uploads": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Temporary branding asset upload ticket"
-          }
-        }
-      }
-    },
-    "/v1/admin/branding/assets/upload": {
-      "put": {
-        "responses": {
-          "200": {
-            "description": "Temporary branding asset stored"
-          }
-        }
-      },
-      "delete": {
-        "responses": {
-          "200": {
-            "description": "Temporary branding asset removed"
-          }
-        }
-      }
-    },
-    "/v1/admin/localization": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Effective localization settings and documents"
-          }
-        }
-      }
-    },
-    "/v1/admin/localization/languages": {
-      "put": {
-        "responses": {
-          "200": {
-            "description": "Saved tenant language overrides"
-          }
-        }
-      }
-    },
-    "/v1/admin/localization/documents": {
-      "put": {
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LocalizationDocumentsRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Saved tenant language documents"
-          },
-          "409": {
-            "description": "Localization key already exists"
-          },
-          "422": {
-            "description": "Invalid localization document"
-          }
-        }
-      }
-    },
-    "/v1/admin/localization/publish": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Published localization resources"
-          }
-        }
-      }
-    },
-    "/v1/admin/release-storage": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Masked release storage config"
-          }
-        }
-      },
-      "put": {
-        "responses": {
-          "200": {
-            "description": "Saved release storage config"
-          }
-        }
-      }
-    },
-    "/v1/admin/release-storage/test": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Storage test result"
-          }
-        }
-      }
-    },
-    "/v1/admin/audit-events": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Audit events"
-          }
-        }
-      }
-    },
-    "/v1/public/releases/latest": {
-      "get": {
-        "parameters": [
-          {
-            "name": "platform",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "android",
-                "ios",
-                "harmony"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Latest active release"
-          }
-        }
-      }
-    },
-    "/v1/public/releases/{id}/download": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/ReleaseId"
-        }
-      ],
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Release package stream"
-          },
-          "404": {
-            "description": "Published release not found"
-          },
-          "502": {
-            "description": "Release package unavailable"
-          },
-          "503": {
-            "description": "Release storage unavailable"
+            "description": "Current tenant"
           }
         }
       }
@@ -601,6 +487,15 @@
                 "$ref": "#/components/schemas/UploadSessionRequest"
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/admin/upload-sessions/cleanup-expired": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Expired sessions aborted"
           }
         }
       }
@@ -637,6 +532,35 @@
             "$ref": "#/components/parameters/UploadSessionToken"
           }
         ]
+      }
+    },
+    "/v1/admin/upload-sessions/{id}/complete": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/UploadSessionId"
+        }
+      ],
+      "post": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UploadSessionToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadSessionCompleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Completed artifact token"
+          }
+        }
       }
     },
     "/v1/admin/upload-sessions/{id}/parts/{partNumber}": {
@@ -701,49 +625,195 @@
         }
       }
     },
-    "/v1/admin/upload-sessions/{id}/complete": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/UploadSessionId"
-        }
-      ],
+    "/v1/mobile/auth/logout": {
       "post": {
+        "summary": "Revoke the current wallet session",
+        "responses": {
+          "200": {
+            "description": "Signed out"
+          }
+        }
+      }
+    },
+    "/v1/mobile/auth/nonce": {
+      "post": {
+        "summary": "Issue a SIWE challenge for a wallet address",
+        "responses": {
+          "200": {
+            "description": "SIWE nonce and message"
+          }
+        }
+      }
+    },
+    "/v1/mobile/auth/session": {
+      "get": {
+        "summary": "Read the current wallet session",
+        "responses": {
+          "200": {
+            "description": "Wallet session"
+          },
+          "401": {
+            "description": "Session missing or revoked"
+          }
+        }
+      }
+    },
+    "/v1/mobile/auth/verify": {
+      "post": {
+        "summary": "Exchange a SIWE signature for a session token",
+        "responses": {
+          "200": {
+            "description": "Wallet session"
+          }
+        }
+      }
+    },
+    "/v1/mobile/bootstrap": {
+      "get": {
         "parameters": [
           {
-            "$ref": "#/components/parameters/UploadSessionToken"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UploadSessionCompleteRequest"
-              }
+            "name": "locale",
+            "in": "query",
+            "schema": {
+              "type": "string"
             }
           }
-        },
+        ],
         "responses": {
           "200": {
-            "description": "Completed artifact token"
+            "description": "Bootstrap configuration"
           }
         }
       }
     },
-    "/v1/admin/upload-sessions/cleanup-expired": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Expired sessions aborted"
-          }
-        }
-      }
-    },
-    "/v1/admin/ota/releases/{id}": {
+    "/v1/mobile/branding/assets/{id}": {
       "get": {
         "responses": {
           "200": {
-            "description": "OTA release detail with final Manifest identity"
+            "description": "Branding asset"
+          },
+          "404": {
+            "description": "Branding asset not found"
+          }
+        }
+      }
+    },
+    "/v1/mobile/installations/heartbeat": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Installation heartbeat accepted"
+          }
+        }
+      }
+    },
+    "/v1/mobile/installations/register": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Installation registered"
+          }
+        }
+      }
+    },
+    "/v1/mobile/languages/{languageCode}/document": {
+      "parameters": [
+        {
+          "name": "languageCode",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Published localization JSON"
+          },
+          "304": {
+            "description": "Not modified"
+          }
+        }
+      }
+    },
+    "/v1/mobile/push-tokens": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Push token registered"
+          }
+        }
+      }
+    },
+    "/v1/ota/assets/{id}/{path}": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Immutable OTA asset"
+          },
+          "404": {
+            "description": "Asset not found"
+          }
+        }
+      }
+    },
+    "/v1/ota/manifest": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Expo Updates manifest"
+          },
+          "204": {
+            "description": "No matching update"
+          }
+        }
+      }
+    },
+    "/v1/public/releases/latest": {
+      "get": {
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios",
+                "harmony"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Latest active release"
+          }
+        }
+      }
+    },
+    "/v1/public/releases/{id}/download": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ReleaseId"
+        }
+      ],
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Release package stream"
+          },
+          "404": {
+            "description": "Published release not found"
+          },
+          "502": {
+            "description": "Release package unavailable"
+          },
+          "503": {
+            "description": "Release storage unavailable"
           }
         }
       }

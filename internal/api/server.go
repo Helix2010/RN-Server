@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -621,7 +622,7 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	}
 	value["modules"] = normalizeModules(object(value["modules"]))
 	value["wallet"] = normalizeWallet(object(value["wallet"]))
-	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0"}}, nil
+	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0", "walletCatalog": walletCatalog()}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
 	var body struct {
@@ -634,7 +635,6 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		problem(c, 400, "INVALID_APP_CONFIG", "config, expectedVersion, reason and confirm=true are required")
 		return
 	}
-	raw, _ := json.Marshal(body.Config)
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -642,6 +642,23 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+	var stored []byte
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT config_value FROM app_configs WHERE config_key='mobile-bootstrap' AND tenant_id IN (?,0) ORDER BY (tenant_id=?) DESC LIMIT 1 FOR UPDATE`, tenantID(c), tenantID(c)).Scan(&stored); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
+		return
+	}
+	if incoming, present := body.Config["wallet"]; present && incoming != nil {
+		if err := validateWalletSection(incoming); err != nil {
+			problem(c, 400, "INVALID_WALLET_CONFIG", err.Error())
+			return
+		}
+	} else if carried := storedWalletSection(stored); carried != nil {
+		// 客户端不带 wallet 段时保留库里已有的：否则一次改颜色就会把租户的
+		// projectId 和链端点顺手清空。沿用的值不再校验——它已经在库里，
+		// 读路径会把不合法的部分归一化掉
+		body.Config["wallet"] = carried
+	}
+	raw, _ := json.Marshal(body.Config)
 	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key='mobile-bootstrap' AND version=?`, raw, actor(c), now, tenantID(c), body.ExpectedVersion)
 	if err != nil {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
@@ -694,13 +711,150 @@ func (s *server) updateAppConfig(c *gin.Context) {
 // secret in an rpcUrl.
 var supportedNetworks = []struct {
 	ID          string
+	Name        string
 	ChainID     int
 	RPCUrls     []any
 	ExplorerURL string
 }{
-	{"bsc", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com"},
-	{"eth", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io"},
-	{"base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org"},
+	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com"},
+	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io"},
+	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org"},
+}
+
+// walletCatalog tells the admin console which chains this platform can talk to
+// and what the platform defaults are. Without it the console would have to keep
+// its own copy of the chain list, which is exactly how the two lists drift.
+func walletCatalog() []any {
+	items := []any{}
+	for _, network := range supportedNetworks {
+		items = append(items, map[string]any{
+			"id":                 network.ID,
+			"name":               network.Name,
+			"chainId":            network.ChainID,
+			"defaultRpcUrls":     network.RPCUrls,
+			"defaultExplorerUrl": network.ExplorerURL,
+		})
+	}
+	return items
+}
+
+func supportedNetwork(id string) (int, bool) {
+	for _, network := range supportedNetworks {
+		if network.ID == id {
+			return network.ChainID, true
+		}
+	}
+	return 0, false
+}
+
+// walletProjectIDPattern matches a WalletConnect / Reown project id: a hex
+// client identifier, not a secret. Validated loosely on purpose — the point is
+// to catch a pasted URL or a copied-with-quotes value, not to guess the vendor's
+// future id format.
+var walletProjectIDPattern = regexp.MustCompile(`^[0-9a-zA-Z]{16,64}$`)
+
+// validateWalletSection rejects a wallet section the admin console should never
+// have sent. The bootstrap path is deliberately lenient (bad config falls back
+// to defaults so the app still starts), but on the write path silence is the
+// wrong answer: an operator who pastes an http:// endpoint must be told, not
+// have it quietly dropped and wonder why nothing changed.
+func validateWalletSection(raw any) error {
+	section, ok := raw.(map[string]any)
+	if !ok {
+		return errors.New("wallet 必须是一个对象")
+	}
+	for key := range section {
+		if !oneOf(key, "walletConnectProjectId", "chains", "networks") {
+			return fmt.Errorf("wallet.%s 不是可配置项", key)
+		}
+	}
+	if value, present := section["walletConnectProjectId"]; present {
+		projectID, ok := value.(string)
+		if !ok {
+			return errors.New("walletConnectProjectId 必须是字符串")
+		}
+		trimmed := strings.TrimSpace(projectID)
+		if trimmed != "" && !walletProjectIDPattern.MatchString(trimmed) {
+			return errors.New("walletConnectProjectId 格式不对：应为 cloud.reown.com 上的 Project ID（16-64 位字母数字），不要填入完整链接")
+		}
+	}
+	if value, present := section["chains"]; present {
+		chains, ok := value.([]any)
+		if !ok {
+			return errors.New("chains 必须是数组")
+		}
+		if len(chains) == 0 {
+			return errors.New("至少要启用一条链，否则 App 里的钱包无链可用")
+		}
+		for _, item := range chains {
+			id, ok := item.(string)
+			if !ok {
+				return errors.New("chains 只能包含链 id 字符串")
+			}
+			if _, supported := supportedNetwork(id); !supported {
+				return fmt.Errorf("不支持的链 %q：当前平台支持 bsc / eth / base", id)
+			}
+		}
+	}
+	if value, present := section["networks"]; present {
+		networks, ok := value.([]any)
+		if !ok {
+			return errors.New("networks 必须是数组")
+		}
+		for _, item := range networks {
+			network := object(item)
+			if network == nil {
+				return errors.New("networks 的每一项都必须是对象")
+			}
+			id, ok := network["id"].(string)
+			if !ok {
+				return errors.New("networks 的每一项都要有 id")
+			}
+			chainID, supported := supportedNetwork(id)
+			if !supported {
+				return fmt.Errorf("不支持的链 %q：当前平台支持 bsc / eth / base", id)
+			}
+			// chainId 由平台目录决定：填错会让签名打到另一条链上
+			if raw, present := network["chainId"]; present {
+				value, ok := raw.(float64)
+				if !ok || int(value) != chainID {
+					return fmt.Errorf("%s 的 chainId 固定为 %d，不可修改", id, chainID)
+				}
+			}
+			if raw, present := network["rpcUrls"]; present {
+				urls, ok := raw.([]any)
+				if !ok {
+					return fmt.Errorf("%s 的 rpcUrls 必须是数组", id)
+				}
+				for _, entry := range urls {
+					url, ok := entry.(string)
+					if !ok || !isHTTPSURL(url) {
+						return fmt.Errorf("%s 的 RPC 端点必须是 https:// 开头的完整地址：明文 RPC 会泄露用户查询的每个地址和余额", id)
+					}
+				}
+			}
+			if raw, present := network["explorerUrl"]; present {
+				url, ok := raw.(string)
+				if !ok || (strings.TrimSpace(url) != "" && !isHTTPSURL(url)) {
+					return fmt.Errorf("%s 的区块浏览器地址必须是 https:// 开头的完整地址", id)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// storedWalletSection reads the wallet section already in the database, so a
+// config that arrives without one carries it over instead of erasing it. Any
+// client that round-trips the config through a schema that does not know about
+// `wallet` would otherwise wipe the tenant's project id and endpoints as a side
+// effect of an unrelated edit.
+func storedWalletSection(stored []byte) any {
+	var current map[string]any
+	if len(stored) == 0 || json.Unmarshal(stored, &current) != nil {
+		return nil
+	}
+	return current["wallet"]
 }
 
 // normalizeWallet fills in the wallet section a client needs at startup:
@@ -977,7 +1131,13 @@ func configSummary(v map[string]any) gin.H {
 			enabled = append(enabled, k)
 		}
 	}
-	return gin.H{"configVersion": v["configVersion"], "localization": gin.H{"supportedLocales": l["supportedLocales"], "messagesVersion": l["messagesVersion"]}, "theme": gin.H{"paletteVersion": t["paletteVersion"], "modes": []string{"light", "dark"}}, "featureFlags": enabled, "updatePolicy": gin.H{"source": "mysql", "approvalRequired": false}}
+	wallet := object(v["wallet"])
+	projectID, _ := wallet["walletConnectProjectId"].(string)
+	chains, ok := wallet["chains"].([]any)
+	if !ok {
+		chains = []any{}
+	}
+	return gin.H{"configVersion": v["configVersion"], "localization": gin.H{"supportedLocales": l["supportedLocales"], "messagesVersion": l["messagesVersion"]}, "theme": gin.H{"paletteVersion": t["paletteVersion"], "modes": []string{"light", "dark"}}, "featureFlags": enabled, "updatePolicy": gin.H{"source": "mysql", "approvalRequired": false}, "wallet": gin.H{"chains": chains, "walletConnectConfigured": strings.TrimSpace(projectID) != ""}}
 }
 func decode(c *gin.Context, v any) error {
 	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
