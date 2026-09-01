@@ -684,30 +684,117 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	c.JSON(200, view)
 }
 
-// normalizeWallet fills in the wallet section a client needs at startup. The
-// WalletConnect project id is a client identifier, not a secret, so it is
-// delivered per tenant instead of being baked into every build.
+// supportedNetworks is the EVM chain catalog this platform can talk to. The
+// EIP-155 id and the default endpoints live here so a tenant only overrides
+// what it actually wants to change.
+//
+// RPC endpoints are delivered to every client, so they are public by
+// definition: use endpoints that are safe to expose (domain-restricted or
+// rate-limited keys), or proxy RPC through this server. Never put a bearer
+// secret in an rpcUrl.
+var supportedNetworks = []struct {
+	ID          string
+	ChainID     int
+	RPCUrls     []any
+	ExplorerURL string
+}{
+	{"bsc", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com"},
+	{"eth", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io"},
+	{"base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org"},
+}
+
+// normalizeWallet fills in the wallet section a client needs at startup:
+// the WalletConnect project id (a client identifier, not a secret) and the
+// per-chain endpoints. Both are tenant configuration rather than build
+// parameters, so changing them never requires a new app build.
 func normalizeWallet(raw map[string]any) map[string]any {
-	wallet := map[string]any{"walletConnectProjectId": "", "chains": []any{"bsc", "eth", "base"}}
-	if raw == nil {
-		return wallet
-	}
-	if value, ok := raw["walletConnectProjectId"].(string); ok {
-		wallet["walletConnectProjectId"] = strings.TrimSpace(value)
-	}
-	if chains, ok := raw["chains"].([]any); ok && len(chains) > 0 {
-		allowed := map[string]bool{"bsc": true, "eth": true, "base": true}
-		filtered := []any{}
-		for _, item := range chains {
-			if name, ok := item.(string); ok && allowed[name] {
-				filtered = append(filtered, name)
+	enabled := map[string]bool{}
+	overrides := map[string]map[string]any{}
+	projectID := ""
+	if raw != nil {
+		if value, ok := raw["walletConnectProjectId"].(string); ok {
+			projectID = strings.TrimSpace(value)
+		}
+		if chains, ok := raw["chains"].([]any); ok {
+			for _, item := range chains {
+				if name, ok := item.(string); ok {
+					enabled[name] = true
+				}
 			}
 		}
-		if len(filtered) > 0 {
-			wallet["chains"] = filtered
+		if networks, ok := raw["networks"].([]any); ok {
+			for _, item := range networks {
+				network := object(item)
+				if network == nil {
+					continue
+				}
+				if id, ok := network["id"].(string); ok {
+					overrides[id] = network
+					// networks 里出现即视为启用，省得两处都要配
+					if _, listed := raw["chains"]; !listed {
+						enabled[id] = true
+					}
+				}
+			}
 		}
 	}
-	return wallet
+	// 没有任何配置时启用全部支持的链
+	if len(enabled) == 0 {
+		for _, network := range supportedNetworks {
+			enabled[network.ID] = true
+		}
+	}
+
+	chains := []any{}
+	networks := []any{}
+	for _, network := range supportedNetworks {
+		if !enabled[network.ID] {
+			continue
+		}
+		entry := map[string]any{
+			"id":          network.ID,
+			"chainId":     network.ChainID,
+			"rpcUrls":     network.RPCUrls,
+			"explorerUrl": network.ExplorerURL,
+		}
+		if override := overrides[network.ID]; override != nil {
+			if urls := httpsList(override["rpcUrls"]); len(urls) > 0 {
+				entry["rpcUrls"] = urls
+			}
+			if explorer, ok := override["explorerUrl"].(string); ok && isHTTPSURL(explorer) {
+				entry["explorerUrl"] = strings.TrimRight(strings.TrimSpace(explorer), "/")
+			}
+		}
+		chains = append(chains, network.ID)
+		networks = append(networks, entry)
+	}
+	return map[string]any{
+		"walletConnectProjectId": projectID,
+		// chains 保留为启用链的 id 列表：老客户端只认它，别为了整洁把它删掉
+		"chains":   chains,
+		"networks": networks,
+	}
+}
+
+func isHTTPSURL(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return strings.HasPrefix(trimmed, "https://") && len(trimmed) > len("https://")
+}
+
+// httpsList keeps only https endpoints; a cleartext RPC would leak every
+// address and balance the app looks up.
+func httpsList(raw any) []any {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	urls := []any{}
+	for _, item := range items {
+		if value, ok := item.(string); ok && isHTTPSURL(value) {
+			urls = append(urls, strings.TrimSpace(value))
+		}
+	}
+	return urls
 }
 
 func (s *server) bootstrap(c *gin.Context) {
