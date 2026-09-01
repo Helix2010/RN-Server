@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -21,6 +22,11 @@ import (
 
 const installationCredentialTTL = 90 * 24 * time.Hour
 const installationCredentialRotateBefore = 14 * 24 * time.Hour
+
+// installationUpsertSQL is shared by register and heartbeat. Keep the column
+// list, the VALUES placeholders and the argument list in saveInstallation in
+// sync; TestInstallationUpsertPlaceholderCount guards the first two.
+const installationUpsertSQL = `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`
 
 var installationIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,80}$`)
 var deviceSourceHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -102,6 +108,7 @@ func (s *server) registerInstallation(c *gin.Context) {
 	}
 	now, expires := time.Now().UTC(), time.Now().UTC().Add(installationCredentialTTL)
 	if err := s.saveInstallation(c, body, hash, 1, expires, now); err != nil {
+		slog.Error("installation register failed", "error", err, "requestId", requestID(c), "tenant", tenantID(c))
 		problem(c, 500, "INSTALLATION_SAVE_FAILED", "Unable to register installation")
 		return
 	}
@@ -119,10 +126,11 @@ func (s *server) installationHeartbeat(c *gin.Context) {
 	}
 	now := time.Now().UTC()
 	if err := s.saveInstallation(c, body, record.Hash, record.Version, record.ExpiresAt, now); err != nil {
+		slog.Error("installation heartbeat failed", "error", err, "requestId", requestID(c), "tenant", tenantID(c))
 		problem(c, 500, "INSTALLATION_SAVE_FAILED", "Unable to save installation heartbeat")
 		return
 	}
-	response := gin.H{"installationId": body.InstallationID, "heartbeatIntervalSeconds": 1800, "receivedAt": iso(now), "credentialVersion": record.Version, "credentialExpiresAt": iso(record.ExpiresAt)}
+	response := gin.H{"installationId": body.InstallationID, "deviceGrouping": "available", "heartbeatIntervalSeconds": 1800, "receivedAt": iso(now), "credentialVersion": record.Version, "credentialExpiresAt": iso(record.ExpiresAt)}
 	if time.Until(record.ExpiresAt) <= installationCredentialRotateBefore {
 		credential, hash, rotateErr := newInstallationCredential()
 		if rotateErr == nil {
@@ -232,7 +240,7 @@ func (s *server) saveInstallation(c *gin.Context, body installationHeartbeat, cr
 		}
 		deviceClientID = id
 	}
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
+	_, err = tx.ExecContext(c.Request.Context(), installationUpsertSQL, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
 	if err != nil {
 		return err
 	}
