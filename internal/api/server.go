@@ -58,11 +58,13 @@ type release struct {
 	SHA256          *string             `json:"sha256"`
 	FileMetadata    map[string]any      `json:"fileMetadata"`
 	RejectionReason *string             `json:"rejectionReason"`
-	VerifiedAt      *string             `json:"verifiedAt"`
-	PublishedAt     *string             `json:"publishedAt"`
-	CreatedAt       string              `json:"createdAt"`
-	UpdatedAt       string              `json:"updatedAt"`
-	LastAction      *string             `json:"lastAction"`
+	// Mandatory 表示这一版上线后用户不可跳过
+	Mandatory   bool    `json:"mandatory"`
+	VerifiedAt  *string `json:"verifiedAt"`
+	PublishedAt *string `json:"publishedAt"`
+	CreatedAt   string  `json:"createdAt"`
+	UpdatedAt   string  `json:"updatedAt"`
+	LastAction  *string `json:"lastAction"`
 }
 
 type simplifiedActiveRelease struct {
@@ -386,7 +388,7 @@ func (s *server) listReleases(c *gin.Context) {
 }
 
 func (s *server) queryReleases(ctx context.Context, tenant, platform, status string) ([]release, error) {
-	query := `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY build_number DESC, updated_at DESC, id DESC`
+	query := `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY build_number DESC, updated_at DESC, id DESC`
 	rows, err := s.db.QueryContext(ctx, query, tenant, platform, platform, status, status)
 	if err != nil {
 		return nil, err
@@ -413,7 +415,7 @@ func scanRelease(row scanner) (release, error) {
 	var verifiedAt, publishedAt sql.NullTime
 	var action sql.NullString
 	var created, updated time.Time
-	err := row.Scan(&r.ID, &r.Platform, &r.Version, &r.BuildNumber, &r.RuntimeVersion, &r.Status, &notes, &fileName, &contentType, &expectedSize, &fileSize, &sha, &metadata, &rejection, &verifiedAt, &publishedAt, &action, &created, &updated)
+	err := row.Scan(&r.ID, &r.Platform, &r.Version, &r.BuildNumber, &r.RuntimeVersion, &r.Status, &notes, &fileName, &contentType, &expectedSize, &fileSize, &sha, &metadata, &rejection, &r.Mandatory, &verifiedAt, &publishedAt, &action, &created, &updated)
 	if err != nil {
 		return r, err
 	}
@@ -468,7 +470,7 @@ func (s *server) releaseDetail(c *gin.Context) {
 }
 
 func (s *server) findRelease(ctx context.Context, tenant, id string) (release, error) {
-	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id))
+	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id))
 }
 
 var transitions = map[string]map[string]string{"publish": {"verified": "active", "paused": "active"}, "pause": {"active": "paused"}}
