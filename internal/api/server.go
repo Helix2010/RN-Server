@@ -719,10 +719,14 @@ var supportedNetworks = []struct {
 	ChainID     int
 	RPCUrls     []any
 	ExplorerURL string
+	// Testnet 上的币没有价值。混进主网列表里，运营会误开给生产租户、用户会
+	// 把它当成真链，所以这个标记要一路传到管理端和 App 的界面上。
+	Testnet bool
 }{
-	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com"},
-	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io"},
-	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org"},
+	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com", false},
+	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io", false},
+	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org", false},
+	{"op-sepolia", "OP Sepolia", 11155420, []any{"https://sepolia.optimism.io"}, "https://sepolia-optimism.etherscan.io", true},
 }
 
 // walletCatalog tells the admin console which chains this platform can talk to
@@ -737,9 +741,20 @@ func walletCatalog() []any {
 			"chainId":            network.ChainID,
 			"defaultRpcUrls":     network.RPCUrls,
 			"defaultExplorerUrl": network.ExplorerURL,
+			"testnet":            network.Testnet,
 		})
 	}
 	return items
+}
+
+// supportedNetworkIDs 拼出报错里要展示的链清单。硬编码成 "bsc / eth / base"
+// 的话，每加一条链就会多一处对不上的文案。
+func supportedNetworkIDs() string {
+	ids := make([]string, 0, len(supportedNetworks))
+	for _, network := range supportedNetworks {
+		ids = append(ids, network.ID)
+	}
+	return strings.Join(ids, " / ")
 }
 
 func supportedNetwork(id string) (int, bool) {
@@ -796,7 +811,7 @@ func validateWalletSection(raw any) error {
 				return errors.New("chains 只能包含链 id 字符串")
 			}
 			if _, supported := supportedNetwork(id); !supported {
-				return fmt.Errorf("不支持的链 %q：当前平台支持 bsc / eth / base", id)
+				return fmt.Errorf("不支持的链 %q：当前平台支持 %s", id, supportedNetworkIDs())
 			}
 		}
 	}
@@ -816,7 +831,7 @@ func validateWalletSection(raw any) error {
 			}
 			chainID, supported := supportedNetwork(id)
 			if !supported {
-				return fmt.Errorf("不支持的链 %q：当前平台支持 bsc / eth / base", id)
+				return fmt.Errorf("不支持的链 %q：当前平台支持 %s", id, supportedNetworkIDs())
 			}
 			// chainId 由平台目录决定：填错会让签名打到另一条链上
 			if raw, present := network["chainId"]; present {
@@ -896,9 +911,13 @@ func normalizeWallet(raw map[string]any) map[string]any {
 			}
 		}
 	}
-	// 没有任何配置时启用全部支持的链
+	// 没有任何配置时启用全部**主网**。测试链必须由运营显式勾选——否则新增一条
+	// 测试链就会自动出现在所有还没配过钱包的租户里。
 	if len(enabled) == 0 {
 		for _, network := range supportedNetworks {
+			if network.Testnet {
+				continue
+			}
 			enabled[network.ID] = true
 		}
 	}
@@ -914,6 +933,7 @@ func normalizeWallet(raw map[string]any) map[string]any {
 			"chainId":     network.ChainID,
 			"rpcUrls":     network.RPCUrls,
 			"explorerUrl": network.ExplorerURL,
+			"testnet":     network.Testnet,
 		}
 		if override := overrides[network.ID]; override != nil {
 			if urls := httpsList(override["rpcUrls"]); len(urls) > 0 {
