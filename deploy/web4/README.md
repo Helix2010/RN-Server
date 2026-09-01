@@ -21,8 +21,19 @@ Nginx.
 5. Generate `STORAGE_MASTER_KEY` with `openssl rand -base64 32`. It encrypts tenant
    S3 credentials in MySQL and must be backed up. Losing or directly replacing it
    makes stored credentials unreadable.
-6. Run `./start.sh`.
-7. Check the deployment with `./status.sh`.
+6. Push credentials live only in this `.env` (the compose file passes them
+   through; nothing is read from files at runtime). Keep the originals in
+   `~/fy/secrets/<tenant>/` on this host as the archive and derive `.env` from
+   them:
+   - `FCM_PROJECT_ID=<firebase project id>`
+   - `FCM_SERVICE_ACCOUNT_JSON=$(base64 -w0 firebase-service-account.json)`
+   - `PUSH_DISPATCH_ENABLED=true` once the credentials are in place
+   - iOS later: `APNS_TEAM_ID`, `APNS_KEY_ID`, `APNS_PRIVATE_KEY` (base64 `.p8`),
+     `APNS_BUNDLE_ID`, `APNS_ENVIRONMENT`
+   Apply with `docker compose --env-file .env -f compose.yaml up -d --no-deps server`
+   and confirm the log has no `push dispatcher initialization failed`.
+7. Run `./start.sh`.
+8. Check the deployment with `./status.sh`.
 
 The isolated `rn-foundation-gateway` Caddy container binds ports 80/443, routes
 the admin UI and Go API by hostname, and uses Cloudflare DNS-01 to automatically
