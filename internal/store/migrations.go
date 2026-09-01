@@ -38,6 +38,63 @@ var migrations = []migration{
 	{version: 22, name: "push_notification_copy", apply: pushNotificationCopyMigration},
 	{version: 23, name: "app_modules_config", apply: appModulesConfigMigration},
 	{version: 24, name: "version_info_copy", apply: versionInfoCopyMigration},
+	{version: 25, name: "wallet_identity", apply: walletIdentityMigration},
+}
+
+// walletIdentityMigration 建立"地址即账号"的身份模型：一次性 nonce、租户内的
+// 钱包用户、以及签名换来的会话。服务端只保存地址与会话，永不接触私钥。
+func walletIdentityMigration(ctx context.Context, db *sql.DB) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS wallet_auth_nonce (
+			nonce CHAR(43) NOT NULL COMMENT 'SIWE一次性随机数',
+			tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			address_key VARCHAR(42) NOT NULL COMMENT '小写地址，绑定挑战与签名者',
+			domain VARCHAR(255) NOT NULL COMMENT '签发挑战的域名',
+			message TEXT NOT NULL COMMENT '服务端构造的完整SIWE消息',
+			issued_at DATETIME(3) NOT NULL COMMENT '签发时间',
+			expires_at DATETIME(3) NOT NULL COMMENT '挑战过期时间',
+			consumed_at DATETIME(3) NULL COMMENT '核销时间，非空即不可复用',
+			PRIMARY KEY(nonce),
+			KEY ix_wallet_nonce_gc(expires_at),
+			KEY ix_wallet_nonce_address(tenant_id,address_key)
+		) ENGINE=InnoDB COMMENT='SIWE登录挑战'`,
+		`CREATE TABLE IF NOT EXISTS wallet_user (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '钱包用户主键',
+			tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			address VARCHAR(42) NOT NULL COMMENT 'EIP-55校验和地址',
+			address_key VARCHAR(42) NOT NULL COMMENT '小写地址，租户内唯一',
+			first_seen_at DATETIME(3) NOT NULL COMMENT '首次登录即注册时间',
+			last_login_at DATETIME(3) NOT NULL COMMENT '最近登录时间',
+			login_count BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '登录次数',
+			status ENUM('active','blocked') NOT NULL DEFAULT 'active' COMMENT '账号状态',
+			created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+			updated_at DATETIME(3) NOT NULL COMMENT '更新时间',
+			PRIMARY KEY(id),
+			UNIQUE KEY uq_wallet_user(tenant_id,address_key),
+			KEY ix_wallet_user_active(tenant_id,last_login_at)
+		) ENGINE=InnoDB COMMENT='租户钱包用户，地址即账号'`,
+		`CREATE TABLE IF NOT EXISTS wallet_session (
+			id VARCHAR(80) NOT NULL COMMENT '会话ID',
+			tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+			user_id BIGINT UNSIGNED NOT NULL COMMENT '钱包用户ID',
+			token_hash CHAR(64) NOT NULL COMMENT '会话令牌SHA-256',
+			connector VARCHAR(32) NOT NULL COMMENT '登录使用的钱包连接器',
+			chains VARCHAR(160) NOT NULL COMMENT '会话声明的链，逗号分隔',
+			issued_at DATETIME(3) NOT NULL COMMENT '签发时间',
+			expires_at DATETIME(3) NOT NULL COMMENT '过期时间',
+			last_seen_at DATETIME(3) NOT NULL COMMENT '最近使用时间',
+			revoked_at DATETIME(3) NULL COMMENT '撤销时间',
+			PRIMARY KEY(id),
+			UNIQUE KEY uq_wallet_session_token(token_hash),
+			KEY ix_wallet_session_user(tenant_id,user_id,expires_at)
+		) ENGINE=InnoDB COMMENT='钱包会话'`,
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func versionInfoCopyMigration(ctx context.Context, db *sql.DB) error {
