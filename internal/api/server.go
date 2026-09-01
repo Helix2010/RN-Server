@@ -785,8 +785,13 @@ func validateWalletSection(raw any) error {
 		return errors.New("wallet 必须是一个对象")
 	}
 	for key := range section {
-		if !oneOf(key, "walletConnectProjectId", "chains", "networks") {
+		if !oneOf(key, "walletConnectProjectId", "chains", "networks", "onchainSends") {
 			return fmt.Errorf("wallet.%s 不是可配置项", key)
+		}
+	}
+	if value, present := section["onchainSends"]; present {
+		if _, ok := value.(bool); !ok {
+			return errors.New("onchainSends 必须是布尔值")
 		}
 	}
 	if value, present := section["walletConnectProjectId"]; present {
@@ -889,7 +894,14 @@ func normalizeWallet(raw map[string]any) map[string]any {
 	enabled := map[string]bool{}
 	overrides := map[string]map[string]any{}
 	projectID := ""
+	// onchainSends 是"转出是否真的上链"的租户级开关，默认关。
+	// 不能用"有没有 RPC 端点"当开关：没配过端点的租户也会拿到平台默认端点，
+	// 那样新版本一发布，所有租户的主网转出就同时变成真钱。
+	onchainSends := false
 	if raw != nil {
+		if value, ok := raw["onchainSends"].(bool); ok {
+			onchainSends = value
+		}
 		if value, ok := raw["walletConnectProjectId"].(string); ok {
 			projectID = strings.TrimSpace(value)
 		}
@@ -961,8 +973,9 @@ func normalizeWallet(raw map[string]any) map[string]any {
 	return map[string]any{
 		"walletConnectProjectId": projectID,
 		// chains 保留为启用链的 id 列表：老客户端只认它，别为了整洁把它删掉
-		"chains":   chains,
-		"networks": networks,
+		"chains":       chains,
+		"networks":     networks,
+		"onchainSends": onchainSends,
 	}
 }
 

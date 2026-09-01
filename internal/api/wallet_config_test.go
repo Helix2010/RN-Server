@@ -377,3 +377,23 @@ func TestValidConfigRequiresSemverInTheUpdatePolicy(t *testing.T) {
 		t.Fatal("an empty latest version must be rejected")
 	}
 }
+
+func TestNormalizeWalletKeepsOnchainSendsOffUnlessTheTenantOptedIn(t *testing.T) {
+	// 没配过端点的租户也会拿到平台默认端点，所以"有端点"不能当开关：
+	// 转出是否真的上链必须是一个显式的、默认关的布尔
+	if normalizeWallet(nil)["onchainSends"] != false {
+		t.Fatal("onchainSends must default to false")
+	}
+	if normalizeWallet(map[string]any{"onchainSends": true})["onchainSends"] != true {
+		t.Fatal("an explicit opt-in must be delivered")
+	}
+	if normalizeWallet(map[string]any{"onchainSends": "yes"})["onchainSends"] != false {
+		t.Fatal("a non-boolean must not switch real sends on")
+	}
+	if err := validateWalletSection(map[string]any{"onchainSends": "yes"}); err == nil {
+		t.Fatal("validation must reject a non-boolean onchainSends")
+	}
+	if err := validateWalletSection(map[string]any{"onchainSends": true}); err != nil {
+		t.Fatalf("a boolean onchainSends must validate, got %v", err)
+	}
+}
