@@ -320,7 +320,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release audit")
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": body.ReleaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
+	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": body.ReleaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "mandatory": body.Mandatory, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
 }
 
 func (s *server) activeSimplifiedRelease(ctx context.Context, tenant, platform string) (simplifiedActiveRelease, error) {

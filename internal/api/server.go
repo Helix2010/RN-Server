@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/Helix2010/RN-Server/internal/objectstore"
@@ -845,16 +847,19 @@ func validateWalletSection(raw any) error {
 				if !ok {
 					return fmt.Errorf("%s 的 rpcUrls 必须是数组", id)
 				}
+				if len(urls) > maxEndpointsPerChain {
+					return fmt.Errorf("%s 最多配置 %d 个 RPC 端点", id, maxEndpointsPerChain)
+				}
 				for _, entry := range urls {
-					url, ok := entry.(string)
-					if !ok || !isHTTPSURL(url) {
-						return fmt.Errorf("%s 的 RPC 端点必须是 https:// 开头的完整地址：明文 RPC 会泄露用户查询的每个地址和余额", id)
+					endpoint, ok := entry.(string)
+					if !ok || !isHTTPSURL(endpoint) {
+						return fmt.Errorf("%s 的 RPC 端点必须是 https:// 开头、不含账号密码和空格的完整地址：明文 RPC 会泄露用户查询的每个地址和余额，而 bootstrap 对所有客户端公开", id)
 					}
 				}
 			}
 			if raw, present := network["explorerUrl"]; present {
-				url, ok := raw.(string)
-				if !ok || (strings.TrimSpace(url) != "" && !isHTTPSURL(url)) {
+				explorer, ok := raw.(string)
+				if !ok || (strings.TrimSpace(explorer) != "" && !isHTTPSURL(explorer)) {
 					return fmt.Errorf("%s 的区块浏览器地址必须是 https:// 开头的完整地址", id)
 				}
 			}
@@ -911,8 +916,15 @@ func normalizeWallet(raw map[string]any) map[string]any {
 			}
 		}
 	}
-	// 没有任何配置时启用全部**主网**。测试链必须由运营显式勾选——否则新增一条
-	// 测试链就会自动出现在所有还没配过钱包的租户里。
+	// 只认目录里有的链：租户配置里残留的链 id（比如目录下线了一条链）不能让
+	// 下发结果变成空列表——App 侧要求至少一条链，空列表会让整份 bootstrap 解析失败
+	for id := range enabled {
+		if _, known := supportedNetwork(id); !known {
+			delete(enabled, id)
+		}
+	}
+	// 没有任何（有效）配置时启用全部**主网**。测试链必须由运营显式勾选——否则
+	// 新增一条测试链就会自动出现在所有还没配过钱包的租户里。
 	if len(enabled) == 0 {
 		for _, network := range supportedNetworks {
 			if network.Testnet {
@@ -954,22 +966,60 @@ func normalizeWallet(raw map[string]any) map[string]any {
 	}
 }
 
+// maxEndpointLength caps a single RPC / explorer URL; anything longer is not
+// a URL an operator typed, it is a mistake or an attack on the bootstrap size.
+const maxEndpointLength = 512
+
+// maxEndpointsPerChain caps the fallback list; a client tries them in order and
+// nobody benefits from a fiftieth fallback.
+const maxEndpointsPerChain = 8
+
+// isHTTPSURL is the single definition of "an endpoint we will deliver".
+//
+// A prefix check is not enough: the app validates with a real URL parser, so
+// anything this accepts that the parser rejects makes the whole bootstrap fail
+// to parse on every device of that tenant. Credentials in the URL are refused
+// outright — bootstrap is public to every client.
 func isHTTPSURL(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	return strings.HasPrefix(trimmed, "https://") && len(trimmed) > len("https://")
+	if trimmed == "" || len(trimmed) > maxEndpointLength {
+		return false
+	}
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.Hostname() != ""
 }
 
 // httpsList keeps only https endpoints; a cleartext RPC would leak every
-// address and balance the app looks up.
+// address and balance the app looks up. Duplicates collapse to one: the client
+// tries endpoints in order and a repeated entry is just a wasted retry.
 func httpsList(raw any) []any {
 	items, ok := raw.([]any)
 	if !ok {
 		return nil
 	}
 	urls := []any{}
+	seen := map[string]bool{}
 	for _, item := range items {
-		if value, ok := item.(string); ok && isHTTPSURL(value) {
-			urls = append(urls, strings.TrimSpace(value))
+		value, ok := item.(string)
+		if !ok || !isHTTPSURL(value) {
+			continue
+		}
+		trimmed := strings.TrimSpace(value)
+		if seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		urls = append(urls, trimmed)
+		if len(urls) >= maxEndpointsPerChain {
+			break
 		}
 	}
 	return urls
@@ -1065,6 +1115,10 @@ func (s *server) bootstrap(c *gin.Context) {
 				mandatoryVersion = active.Version
 			}
 		}
+	} else if active, findErr := s.activeSimplifiedRelease(c.Request.Context(), tenant.ID, platform); findErr == nil && active.Mandatory {
+		// 商店 / MDM 渠道拿不到直装包，但运营勾的"强制升级"仍然要生效：
+		// 否则管理端显示的强制徽章对 iOS 是假的
+		mandatoryVersion = active.Version
 	}
 	decision := resolveUpdateDecision(updateDecisionInput{
 		Current:          version,
@@ -1179,7 +1233,10 @@ func validConfig(v map[string]any) bool {
 	if modules == nil {
 		modules = map[string]any{"predict": true, "dex": true}
 	}
-	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && (truth(modules["predict"]) || truth(modules["dex"])) && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && object(v["updatePolicy"]) != nil && object(v["support"]) != nil
+	policy := object(v["updatePolicy"])
+	// 版本号不是 semver 时，compareVersion 会把非法值当成 "1.0.0"，强制升级静默失效
+	policyValid := policy != nil && validVersion(text(policy["minSupportedVersion"], "")) && validVersion(text(policy["latestVersion"], ""))
+	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && (truth(modules["predict"]) || truth(modules["dex"])) && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && policyValid && object(v["support"]) != nil
 }
 
 func normalizeModules(value map[string]any) map[string]any {

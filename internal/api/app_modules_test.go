@@ -9,8 +9,9 @@ func TestValidConfigRequiresAtLeastOneBusinessModule(t *testing.T) {
 		"localization":  map[string]any{},
 		"theme":         map[string]any{},
 		"features":      map[string]any{},
-		"updatePolicy":  map[string]any{},
-		"support":       map[string]any{},
+		// updatePolicy 的版本号现在必须是 semver（非法值会让强制升级静默失效）
+		"updatePolicy": map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": "1.1.0"},
+		"support":      map[string]any{},
 	}
 	base["modules"] = map[string]any{"predict": false, "dex": false}
 	if validConfig(base) {

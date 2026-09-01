@@ -298,3 +298,82 @@ func TestSupportedNetworkIDsListsEveryChain(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeWalletFallsBackWhenEveryEnabledChainIsUnknown(t *testing.T) {
+	// 目录下线了一条链，而某租户只勾了它：下发空列表会让 App 整份 bootstrap 解析失败
+	wallet := normalizeWallet(map[string]any{"chains": []any{"nope"}})
+	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base"}) {
+		t.Fatalf("chains = %v, want the mainnet defaults", wallet["chains"])
+	}
+}
+
+func TestIsHTTPSURLMatchesWhatTheAppWillAccept(t *testing.T) {
+	// 服务端放过而 App 的 URL 解析拒绝的值，会让该租户所有设备的 bootstrap 失效
+	// 大小写的 scheme 两端都接受（url.Parse 会归一化）；首尾空白会被 trim 掉
+	accept := []string{"https://rpc.example", "https://rpc.example/v1?key=abc", "https://rpc.example:8545/", "HTTPS://rpc.example", " https://rpc.example\n"}
+	reject := []string{
+		"https://not a url",
+		"https:///",
+		"https:",
+		"https://user:pass@rpc.example",
+		"https://rpc.\nexample",
+		"http://rpc.example",
+		"",
+		"https://" + strings.Repeat("a", maxEndpointLength),
+	}
+	for _, value := range accept {
+		if !isHTTPSURL(value) {
+			t.Errorf("should accept %q", value)
+		}
+	}
+	for _, value := range reject {
+		if isHTTPSURL(value) {
+			t.Errorf("should reject %q", value)
+		}
+	}
+}
+
+func TestHTTPSListDropsDuplicatesAndCredentials(t *testing.T) {
+	urls := httpsList([]any{
+		"https://a.example",
+		"https://a.example",
+		"https://user:pw@b.example",
+		" https://c.example ",
+	})
+	if !reflect.DeepEqual(urls, []any{"https://a.example", "https://c.example"}) {
+		t.Fatalf("urls = %v", urls)
+	}
+}
+
+func TestValidateWalletSectionCapsTheEndpointList(t *testing.T) {
+	many := []any{}
+	for i := 0; i < maxEndpointsPerChain+1; i++ {
+		many = append(many, "https://rpc.example/"+strings.Repeat("x", i+1))
+	}
+	err := validateWalletSection(map[string]any{
+		"networks": []any{map[string]any{"id": "bsc", "rpcUrls": many}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "最多配置") {
+		t.Fatalf("expected the endpoint cap to be enforced, got %v", err)
+	}
+}
+
+func TestValidConfigRequiresSemverInTheUpdatePolicy(t *testing.T) {
+	base := func(policy map[string]any) map[string]any {
+		return map[string]any{
+			"configVersion": "1", "ttlSeconds": float64(300),
+			"localization": map[string]any{}, "theme": map[string]any{}, "features": map[string]any{},
+			"updatePolicy": policy, "support": map[string]any{},
+		}
+	}
+	if !validConfig(base(map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": "1.2.0"})) {
+		t.Fatal("a semver policy should be valid")
+	}
+	// 非法版本号会让 compareVersion 当成 1.0.0，强制升级静默失效
+	if validConfig(base(map[string]any{"minSupportedVersion": "abc", "latestVersion": "1.2.0"})) {
+		t.Fatal("a garbage minimum version must be rejected")
+	}
+	if validConfig(base(map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": ""})) {
+		t.Fatal("an empty latest version must be rejected")
+	}
+}
