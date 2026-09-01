@@ -71,6 +71,8 @@ type simplifiedActiveRelease struct {
 	ReleaseNotes map[string][]string
 	SHA256       *string
 	FileSize     *int64
+	// Mandatory 表示这个版本不可跳过
+	Mandatory bool
 }
 
 type auditEvent struct {
@@ -951,6 +953,46 @@ func httpsList(raw any) []any {
 	return urls
 }
 
+type updateDecisionInput struct {
+	// Current 是客户端上报的版本（x-app-version）
+	Current string
+	// Minimum 来自租户配置 updatePolicy.minSupportedVersion
+	Minimum string
+	Latest  string
+	// Distribution 是分发渠道：store / direct / mdm / development
+	Distribution string
+	// ActionURL 空表示这个渠道拿不到安装入口
+	ActionURL string
+	// MandatoryVersion 是 active 发布声明"必须升级"时的版本号，空表示没声明
+	MandatoryVersion string
+}
+
+// resolveUpdateDecision 决定客户端看到 none / recommended / required。
+//
+// 强制升级有两个来源：租户配置里的最低支持版本，以及 active 发布记录自己的
+// mandatory 标记。后者等效于"把最低版本提到这一版"，但**只升不降**——把老版本
+// 标成强制再激活，不该让所有人被要求"升级"到更老的包。两者都仍然走 semver
+// 比较，而不是让某个布尔位直接决定结果（见 docs/RELIABILITY_AND_RELEASE.md）。
+func resolveUpdateDecision(in updateDecisionInput) string {
+	minimum := in.Minimum
+	if in.MandatoryVersion != "" && compareVersion(in.MandatoryVersion, minimum) > 0 {
+		minimum = in.MandatoryVersion
+	}
+	if compareVersion(in.Current, minimum) < 0 {
+		// 以前这里只要拿不到 actionURL 就一律降级成 recommended，结果是运营以为
+		// 强更生效了、装了正式包的用户却看到带"稍后再说"的软更。现在只对
+		// development 这种本来就没有安装入口的渠道降级，别把自己人锁在外面。
+		if in.ActionURL == "" && in.Distribution == "development" {
+			return "recommended"
+		}
+		return "required"
+	}
+	if compareVersion(in.Current, in.Latest) < 0 {
+		return "recommended"
+	}
+	return "none"
+}
+
 func (s *server) bootstrap(c *gin.Context) {
 	tenant, err := s.tenant.resolve(c.Request.Context(), c.Request.Host)
 	if err != nil {
@@ -986,6 +1028,8 @@ func (s *server) bootstrap(c *gin.Context) {
 	var releaseID any
 	var artifactSHA any
 	var artifactSize any
+	// active 发布声明"必须升级"时它的版本号；空表示没有强制要求
+	mandatoryVersion := ""
 	releaseNotes := []string{"远程语言与主题配置", "统一升级决策"}
 	if platform == "android" && distribution == "direct" {
 		if active, findErr := s.activeSimplifiedRelease(c.Request.Context(), tenant.ID, platform); findErr == nil {
@@ -995,18 +1039,19 @@ func (s *server) bootstrap(c *gin.Context) {
 			artifactSHA = active.SHA256
 			artifactSize = active.FileSize
 			actionURL = absoluteURL(c, "/v1/public/releases/"+active.ID+"/download")
+			if active.Mandatory {
+				mandatoryVersion = active.Version
+			}
 		}
 	}
-	decision := "none"
-	if compareVersion(version, minimum) < 0 {
-		if actionURL != "" {
-			decision = "required"
-		} else {
-			decision = "recommended"
-		}
-	} else if compareVersion(version, latest) < 0 {
-		decision = "recommended"
-	}
+	decision := resolveUpdateDecision(updateDecisionInput{
+		Current:          version,
+		Minimum:          minimum,
+		Latest:           latest,
+		Distribution:     distribution,
+		ActionURL:        actionURL,
+		MandatoryVersion: mandatoryVersion,
+	})
 	localization := object(cfg["localization"])
 	localeCatalog, _ := languageCatalog(effectiveLanguagesConfig{
 		Languages: map[string]effectiveLanguage{

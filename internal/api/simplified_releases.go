@@ -203,6 +203,10 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		Version       string         `json:"version"`
 		BuildNumber   int            `json:"buildNumber"`
 		ReleaseNotes  map[string]any `json:"releaseNotes"`
+		// 强制升级：用户在 App 里没有"稍后再说"，只能升。
+		// 按 docs/RELIABILITY_AND_RELEASE.md 只用于严重安全漏洞、协议不兼容、
+		// 法律合规阻断；为什么强制走审计 reason 留痕。
+		Mandatory bool `json:"mandatory"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "Invalid release payload")
@@ -306,12 +310,12 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	id := "rel_" + randomID(16)
 	notes, _ := json.Marshal(body.ReleaseNotes)
 	rawMetadata, _ := json.Marshal(metadata)
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, tenantID(c), body.Platform, body.Version, body.BuildNumber, runtimeVersion, "verified", notes, artifact.ObjectKey, artifact.FileName, artifact.ContentType, artifact.Size, size, metadata["sha256"], rawMetadata, now, actor(c), now, now)
+	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, tenantID(c), body.Platform, body.Version, body.BuildNumber, runtimeVersion, "verified", notes, artifact.ObjectKey, artifact.FileName, artifact.ContentType, artifact.Size, size, metadata["sha256"], rawMetadata, body.Mandatory, now, actor(c), now, now)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "release_create", "release", id, "Uploaded artifact verified and saved", requestID(c), map[string]any{"platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber})
+	event := newAudit(tenantID(c), actor(c), "release_create", "release", id, "Uploaded artifact verified and saved", requestID(c), map[string]any{"platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "mandatory": body.Mandatory})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release audit")
 		return
@@ -324,7 +328,7 @@ func (s *server) activeSimplifiedRelease(ctx context.Context, tenant, platform s
 	var notes []byte
 	var sha sql.NullString
 	var size sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id,version,release_notes,sha256,file_size FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`, tenant, platform).Scan(&item.ID, &item.Version, &notes, &sha, &size)
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,release_notes,sha256,file_size,mandatory FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`, tenant, platform).Scan(&item.ID, &item.Version, &notes, &sha, &size, &item.Mandatory)
 	if err != nil {
 		return item, err
 	}

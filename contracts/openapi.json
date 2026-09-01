@@ -414,7 +414,7 @@
       "post": {
         "responses": {
           "201": {
-            "description": "Verified release created from uploaded artifact"
+            "description": "Verified release created from uploaded artifact (mandatory=true makes the update unskippable once this release is active)"
           }
         }
       }
@@ -681,7 +681,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Bootstrap configuration"
+            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release"
           }
         }
       }

@@ -40,6 +40,28 @@ var migrations = []migration{
 	{version: 24, name: "version_info_copy", apply: versionInfoCopyMigration},
 	{version: 25, name: "wallet_identity", apply: walletIdentityMigration},
 	{version: 26, name: "wallet_bootstrap_section", apply: walletBootstrapSectionMigration},
+	{version: 27, name: "release_mandatory_flag", apply: releaseMandatoryFlagMigration},
+}
+
+// releaseMandatoryFlagMigration 让"这个版本必须升级"成为发布记录自己的属性。
+// 在此之前运营只能去改全局 updatePolicy.minSupportedVersion，跟具体发布毫无
+// 关联，两处不一致就会出现"包还没能装、最低版本却先提上去"。
+//
+// 只加一列：为什么要强制走既有的审计 reason，给用户看的说明是 release_notes，
+// 两者都已经有地方存了。
+func releaseMandatoryFlagMigration(ctx context.Context, db *sql.DB) error {
+	var exists int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema=DATABASE() AND table_name='app_releases' AND column_name='mandatory'`).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if exists > 0 {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, `ALTER TABLE app_releases
+		ADD COLUMN mandatory TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=用户不可跳过此次升级'`)
+	return err
 }
 
 // walletBootstrapSectionMigration 给已有的 bootstrap 配置补上 wallet 段，
