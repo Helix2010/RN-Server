@@ -30,7 +30,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints; metadata.walletCatalog lists the chains this platform supports)"
+            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints; metadata.walletCatalog lists the chains this platform supports, each marked testnet or not)"
           }
         }
       },

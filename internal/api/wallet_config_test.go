@@ -230,3 +230,71 @@ func TestConfigSummaryReportsWalletReadiness(t *testing.T) {
 		t.Fatal("blank project id should report not configured")
 	}
 }
+
+func TestNormalizeWalletLeavesTestnetsOutOfTheDefaults(t *testing.T) {
+	// 加一条测试链不该让所有还没配过钱包的租户突然多出一条测试网
+	wallet := normalizeWallet(nil)
+	for _, item := range wallet["chains"].([]any) {
+		if item == "op-sepolia" {
+			t.Fatal("测试链不能进默认启用列表")
+		}
+	}
+	if firstNetwork(wallet, "op-sepolia") != nil {
+		t.Fatal("测试链不能出现在默认下发的 networks 里")
+	}
+}
+
+func TestNormalizeWalletEnablesATestnetWhenAsked(t *testing.T) {
+	wallet := normalizeWallet(map[string]any{"chains": []any{"bsc", "op-sepolia"}})
+	network := firstNetwork(wallet, "op-sepolia")
+	if network == nil {
+		t.Fatal("显式勾选后测试链必须能启用")
+	}
+	if network["chainId"] != 11155420 {
+		t.Fatalf("op-sepolia chainId = %v", network["chainId"])
+	}
+	if network["testnet"] != true {
+		t.Fatalf("下发给 App 的 networks 要带 testnet 标记，got %v", network["testnet"])
+	}
+	// 主网不能被误标成测试网
+	if firstNetwork(wallet, "bsc")["testnet"] != false {
+		t.Fatal("bsc 不是测试网")
+	}
+}
+
+func TestWalletCatalogMarksTestnets(t *testing.T) {
+	// 管理端靠这个标记在界面上警示运营
+	for _, item := range walletCatalog() {
+		entry := item.(map[string]any)
+		if entry["id"] != "op-sepolia" {
+			continue
+		}
+		if entry["testnet"] != true {
+			t.Fatal("目录里的 op-sepolia 必须标为测试网")
+		}
+		if entry["chainId"] != 11155420 {
+			t.Fatalf("chainId = %v", entry["chainId"])
+		}
+		return
+	}
+	t.Fatal("目录里找不到 op-sepolia")
+}
+
+func TestValidateWalletSectionAcceptsTheTestnet(t *testing.T) {
+	if err := validateWalletSection(map[string]any{
+		"chains":   []any{"op-sepolia"},
+		"networks": []any{map[string]any{"id": "op-sepolia", "chainId": float64(11155420)}},
+	}); err != nil {
+		t.Fatalf("测试链应当是合法配置: %v", err)
+	}
+}
+
+func TestSupportedNetworkIDsListsEveryChain(t *testing.T) {
+	// 报错文案里的链清单必须跟着目录走，不能写死
+	ids := supportedNetworkIDs()
+	for _, want := range []string{"bsc", "eth", "base", "op-sepolia"} {
+		if !strings.Contains(ids, want) {
+			t.Fatalf("%q 不在报错清单里: %s", want, ids)
+		}
+	}
+}
