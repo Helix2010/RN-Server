@@ -831,7 +831,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Restrict to one chain id (bsc/eth/base/op-sepolia); omit for all chains"
+            "description": "Restrict to one chain id (bsc/eth/base/op-sepolia/monad); omit for all chains"
           }
         ],
         "responses": {

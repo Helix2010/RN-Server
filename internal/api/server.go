@@ -754,6 +754,8 @@ var supportedNetworks = []evmNetwork{
 	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io", false, "ETH", 18},
 	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org", false, "ETH", 18},
 	{"op-sepolia", "OP Sepolia", 11155420, []any{"https://sepolia.optimism.io"}, "https://sepolia-optimism.etherscan.io", true, "ETH", 18},
+	// 预测市场平台（pm-cup2026）的默认主网；2026-09-02 经 rpc.monad.xyz 实测 chainId 0x8f
+	{"monad", "Monad", 143, []any{"https://rpc.monad.xyz"}, "https://monadvision.com", false, "MON", 18},
 }
 
 // walletCatalog tells the admin console which chains this platform can talk to

@@ -20,7 +20,7 @@ import (
 // ---- 目录与配置视图 ----
 
 func TestWalletCatalogCarriesTheNativeCurrency(t *testing.T) {
-	want := map[string]string{"bsc": "BNB", "eth": "ETH", "base": "ETH", "op-sepolia": "ETH"}
+	want := map[string]string{"bsc": "BNB", "eth": "ETH", "base": "ETH", "op-sepolia": "ETH", "monad": "MON"}
 	seen := map[string]bool{}
 	for _, item := range walletCatalog() {
 		entry := item.(map[string]any)
@@ -31,7 +31,7 @@ func TestWalletCatalogCarriesTheNativeCurrency(t *testing.T) {
 			t.Errorf("%s native = %v/%v", id, entry["nativeSymbol"], entry["nativeDecimals"])
 		}
 	}
-	if len(seen) != 4 {
+	if len(seen) != 5 {
 		t.Fatalf("catalog = %v", seen)
 	}
 }

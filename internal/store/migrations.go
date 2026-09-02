@@ -45,6 +45,7 @@ var migrations = []migration{
 	{version: 29, name: "current_rn_app_localization_seed", apply: currentRNAppLocalizationSeedMigration},
 	{version: 30, name: "chain_token_logo_color_required", apply: chainTokenLogoColorMigration},
 	{version: 31, name: "chain_token_logo_color_no_default", apply: chainTokenLogoColorNoDefaultMigration},
+	{version: 32, name: "chain_token_seed_monad", apply: chainTokenSeedMonadMigration},
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
@@ -98,6 +99,7 @@ var ChainTokenSeed = []ChainTokenSeedRow{
 	{Chain: "eth", Address: "native", Symbol: "ETH", Name: "Ether", Decimals: 18, DisplayDecimals: 4, LogoColor: "#627EEA", SortWeight: 1000},
 	{Chain: "base", Address: "native", Symbol: "ETH", Name: "Ether", Decimals: 18, DisplayDecimals: 4, LogoColor: "#627EEA", SortWeight: 1000},
 	{Chain: "op-sepolia", Address: "native", Symbol: "ETH", Name: "Ether", Decimals: 18, DisplayDecimals: 4, LogoColor: "#627EEA", SortWeight: 1000},
+	{Chain: "monad", Address: "native", Symbol: "MON", Name: "Monad", Decimals: 18, DisplayDecimals: 4, LogoColor: "#836EF9", SortWeight: 1000},
 	{Chain: "bsc", Address: "0x55d398326f99059fF775485246999027B3197955", Symbol: "USDT", Name: "Tether USD", Decimals: 18, DisplayDecimals: 2, LogoColor: "#26A17B", SortWeight: 900},
 	{Chain: "bsc", Address: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", Symbol: "USDC", Name: "USD Coin", Decimals: 18, DisplayDecimals: 2, LogoColor: "#2775CA", SortWeight: 800},
 	{Chain: "eth", Address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Symbol: "USDT", Name: "Tether USD", Decimals: 6, DisplayDecimals: 2, LogoColor: "#26A17B", SortWeight: 900},
@@ -118,7 +120,7 @@ func chainTokenCatalogMigration(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS chain_token_catalog (
 		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '代币主键',
 		tenant_id BIGINT NOT NULL DEFAULT 0 COMMENT '租户ID，0表示平台全局代币',
-		chain VARCHAR(32) NOT NULL COMMENT '链 id，与平台链目录一致：bsc/eth/base/op-sepolia',
+		chain VARCHAR(32) NOT NULL COMMENT '链 id，与平台链目录一致：bsc/eth/base/op-sepolia/monad',
 		contract_address VARCHAR(42) NOT NULL COMMENT '合约地址，入库前已做 EIP-55 规范化；native 表示原生币',
 		symbol VARCHAR(32) NOT NULL COMMENT '代币符号。添加时由服务端从链上 symbol() 读取，不可编辑',
 		name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '代币全名。添加时从链上 name() 预填，可人工修订',
@@ -137,6 +139,12 @@ func chainTokenCatalogMigration(ctx context.Context, db *sql.DB) error {
 	) ENGINE=InnoDB COMMENT='全局与租户代币目录'`); err != nil {
 		return fmt.Errorf("create chain_token_catalog: %w", err)
 	}
+	return seedChainTokens(ctx, db)
+}
+
+// seedChainTokens 把平台预置代币写进目录；已存在的行原样保留（ON DUPLICATE KEY
+// UPDATE id=id），所以每次新增一条链都可以用一个只调用它的迁移把原生币补上。
+func seedChainTokens(ctx context.Context, db *sql.DB) error {
 	for _, row := range ChainTokenSeed {
 		if _, err := db.ExecContext(ctx, `INSERT INTO chain_token_catalog(tenant_id,chain,contract_address,symbol,name,decimals,display_decimals,logo_color,sort_weight,enabled,metadata_synced_at,ctime,mtime,deleted)
 			VALUES(0,?,?,?,?,?,?,?,?,1,NULL,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE id=id`,
@@ -145,6 +153,12 @@ func chainTokenCatalogMigration(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// chainTokenSeedMonadMigration 补上 monad 的原生币行。链目录（supportedNetworks）
+// 里每条启用的链都必须有启用的原生币条目，否则 bootstrap 对该链返回 503。
+func chainTokenSeedMonadMigration(ctx context.Context, db *sql.DB) error {
+	return seedChainTokens(ctx, db)
 }
 
 // releaseMandatoryFlagMigration 让"这个版本必须升级"成为发布记录自己的属性。

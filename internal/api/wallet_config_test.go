@@ -23,7 +23,7 @@ func TestNormalizeWalletDefaultsToEveryNetwork(t *testing.T) {
 	if wallet["walletConnectProjectId"] != "" {
 		t.Fatalf("project id should default to empty, got %v", wallet["walletConnectProjectId"])
 	}
-	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base"}) {
+	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base", "monad"}) {
 		t.Fatalf("chains = %v", wallet["chains"])
 	}
 	bsc := firstNetwork(wallet, "bsc")
@@ -115,7 +115,7 @@ func TestNormalizeWalletIgnoresGarbage(t *testing.T) {
 	})
 	// 写入时已校验过类型，这里只保证类型断言不会 panic；没有任何有效配置 = 未配置，
 	// 走声明式默认（全部主网）
-	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base"}) {
+	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base", "monad"}) {
 		t.Fatalf("chains = %v", wallet["chains"])
 	}
 }
