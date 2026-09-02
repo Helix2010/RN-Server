@@ -158,6 +158,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/audit-events", s.listAudits)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
+	group.POST("/predict/probe", s.probePredictService)
 	group.GET("/branding", s.getBranding)
 	group.PATCH("/branding", s.updateBranding)
 	group.GET("/tokens", s.listTokens)
@@ -647,6 +648,7 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	}
 	value["modules"] = normalizeModules(object(value["modules"]))
 	value["wallet"] = normalizeWallet(object(value["wallet"]))
+	value["services"] = normalizeServices(value["services"])
 	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0", "walletCatalog": walletCatalog()}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
@@ -682,6 +684,23 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		// projectId 和链端点顺手清空。沿用的值不再校验——它已经在库里，
 		// 读路径会把不合法的部分归一化掉
 		body.Config["wallet"] = carried
+	}
+	if incoming, present := body.Config["services"]; present && incoming != nil {
+		section, err := parseServicesSection(incoming)
+		if err != nil {
+			problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
+			return
+		}
+		body.Config["services"] = section
+	} else if carried := storedServicesSection(stored); carried != nil {
+		// 同 wallet：不带这一段就沿用库里的，改一次主题色不能把预测平台的关联清掉
+		body.Config["services"] = carried
+	}
+	// predict 模块开着就必须有完整合法的平台配置，链还得在租户启用的链里；
+	// 在这里拦下比让 bootstrap 503 早得多
+	if _, err := predictServiceFor(normalizeModules(object(body.Config["modules"])), object(body.Config["services"]), normalizeWallet(object(body.Config["wallet"]))); err != nil {
+		problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
+		return
 	}
 	raw, _ := json.Marshal(body.Config)
 	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key='mobile-bootstrap' AND version=?`, raw, actor(c), now, tenantID(c), body.ExpectedVersion)
@@ -1128,6 +1147,17 @@ func (s *server) bootstrap(c *gin.Context) {
 		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
 		return
 	}
+	// 预测模块开着就必须下发完整的平台关联；缺了或不合法是配置事故，不下发半段
+	predict, err := predictServiceFor(modules, normalizeServices(cfg["services"]), wallet)
+	if err != nil {
+		slog.Error("services.predict cannot be delivered", "tenant", tenant.ID, "error", err)
+		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
+		return
+	}
+	services := gin.H{}
+	if predict != nil {
+		services["predict"] = predict.asMap()
+	}
 	// 代币目录只在这里下发：管理端的配置视图不带 tokens，它不是通过配置 PATCH 写的
 	if err := s.attachWalletTokens(c.Request.Context(), tenant.ID, wallet); err != nil {
 		slog.Error("wallet tokens could not be loaded for bootstrap", "tenant", tenant.ID, "error", err)
@@ -1249,7 +1279,7 @@ func (s *server) bootstrap(c *gin.Context) {
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

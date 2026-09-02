@@ -30,17 +30,17 @@
       "get": {
         "responses": {
           "200": {
-            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints, never tokens: the token catalogue is managed under /v1/admin/tokens; metadata.walletCatalog lists the chains this platform supports, each marked testnet or not and carrying nativeSymbol/nativeDecimals)"
+            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints, never tokens: the token catalogue is managed under /v1/admin/tokens; metadata.walletCatalog lists the chains this platform supports, each marked testnet or not and carrying nativeSymbol/nativeDecimals); config.services.predict holds the tenant's link to the prediction-market platform (domain, scopeId, chain) and is delivered to the App only while modules.predict is enabled"
           }
         }
       },
       "patch": {
         "responses": {
           "200": {
-            "description": "Saved app config (a request without config.wallet keeps the stored wallet section)"
+            "description": "Saved app config (a request without config.wallet or config.services keeps the stored section)"
           },
           "400": {
-            "description": "INVALID_APP_CONFIG or INVALID_WALLET_CONFIG"
+            "description": "INVALID_APP_CONFIG, INVALID_WALLET_CONFIG or INVALID_SERVICES_CONFIG (the Predict module cannot be enabled without a valid services.predict whose chain is among the enabled chains)"
           }
         }
       }
@@ -681,7 +681,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path)"
+            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path); services.predict (domain, scopeId, chain) is present only while modules.predict is enabled and is 503 when enabled but not configured"
           },
           "503": {
             "description": "BOOTSTRAP_UNAVAILABLE: the tenant configuration, its token catalogue or its wallet section could not be produced completely (storage error, a corrupt catalogue row, an enabled chain without a native token, or a tenant whose configured chains are all unknown). The app keeps its last successful snapshot and shows the retry screen"
@@ -1006,6 +1006,50 @@
           },
           "502": {
             "description": "TOKEN_CHAIN_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/admin/predict/probe": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "domain",
+                  "scopeId",
+                  "chain"
+                ],
+                "properties": {
+                  "domain": {
+                    "type": "string",
+                    "description": "Bare hostname of the tenant on the prediction platform"
+                  },
+                  "scopeId": {
+                    "type": "string",
+                    "description": "0x + 64 hex, the platform tenant scope"
+                  },
+                  "chain": {
+                    "type": "string",
+                    "description": "Chain id from the platform chain catalog (e.g. op-sepolia)"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Probe result: ok, brand, chainId, chainName, scopeId and problems[] (scope or chain mismatch against gamma-api.{domain}/public-info)"
+          },
+          "400": {
+            "description": "INVALID_SERVICES_CONFIG"
+          },
+          "502": {
+            "description": "PREDICT_PROBE_FAILED: gamma-api.{domain} unreachable, non-200 or not JSON"
           }
         }
       }
