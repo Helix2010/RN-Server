@@ -391,7 +391,6 @@
     "predict.yesProbability": "Yes 概率",
     "profile.about": "关于",
     "profile.addressBook": "转账地址簿",
-    "profile.addressBook.count": "{n} 个地址",
     "profile.appLockOff": "应用锁未开",
     "profile.appLockOn": "应用锁已开",
     "profile.chains": "{n} 条链",

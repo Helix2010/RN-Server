@@ -391,7 +391,6 @@
     "predict.yesProbability": "Yes chance",
     "profile.about": "About",
     "profile.addressBook": "Address book",
-    "profile.addressBook.count": "{n} addresses",
     "profile.appLockOff": "App lock off",
     "profile.appLockOn": "App lock on",
     "profile.chains": "{n} chains",

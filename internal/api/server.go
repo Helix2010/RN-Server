@@ -1196,7 +1196,16 @@ func (s *server) bootstrap(c *gin.Context) {
 		}
 		locale = requestedLocale
 	}
-	if settings, _, _, settingsErr := s.effectiveLanguageSettings(c.Request.Context(), tenant.ID); settingsErr == nil {
+	// 语言设置解析不出来（存储的配置被改坏、刷新间隔越界、fallback 语言被停用）是
+	// 要人去修的配置事故。此前这里会静默跳过，下发一个缺刷新间隔、缺语言目录的
+	// localization 段；App 按"缺了就失败"的原则严格解析，那样只会在客户端炸得更远
+	settings, _, _, settingsErr := s.effectiveLanguageSettings(c.Request.Context(), tenant.ID)
+	if settingsErr != nil {
+		slog.Error("language settings could not be resolved for bootstrap", "tenant", tenant.ID, "error", settingsErr)
+		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
+		return
+	}
+	{
 		if language, supported := settings.Languages[locale]; !supported || !language.Enabled {
 			locale = settings.FallbackLanguage
 		}
