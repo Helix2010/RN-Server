@@ -436,4 +436,3 @@ func TestApplyTokenPatchRequiresALogoColor(t *testing.T) {
 		t.Fatalf("a patch that leaves the colour alone must pass: %v", err)
 	}
 }
-
