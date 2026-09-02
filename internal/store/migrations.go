@@ -43,6 +43,25 @@ var migrations = []migration{
 	{version: 27, name: "release_mandatory_flag", apply: releaseMandatoryFlagMigration},
 	{version: 28, name: "chain_token_catalog", apply: chainTokenCatalogMigration},
 	{version: 29, name: "current_rn_app_localization_seed", apply: currentRNAppLocalizationSeedMigration},
+	{version: 30, name: "chain_token_logo_color_required", apply: chainTokenLogoColorMigration},
+}
+
+// chainTokenLogoColorMigration 把没有头像底色的代币行补成所在链原生币的颜色。
+//
+// 从这次迁移起 logo_color 是必填项（服务端在写入时拒绝空值，App 的 bootstrap
+// 校验也不接受空串）；这里是一次性的数据修正，不是读路径上的兜底。
+func chainTokenLogoColorMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE chain_token_catalog SET logo_color = CASE chain
+		WHEN 'bsc' THEN '#F0B90B'
+		WHEN 'eth' THEN '#627EEA'
+		WHEN 'base' THEN '#627EEA'
+		WHEN 'op-sepolia' THEN '#627EEA'
+		ELSE '#627EEA' END
+		WHERE logo_color = ''`)
+	if err != nil {
+		return fmt.Errorf("chain token logo color migration: %w", err)
+	}
+	return nil
 }
 
 // ChainTokenSeedRow 是迁移 28 写入的一条平台代币（tenant_id=0）。

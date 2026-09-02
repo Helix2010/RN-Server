@@ -1386,7 +1386,8 @@
           "contractAddress",
           "displayDecimals",
           "reason",
-          "expectedVersion"
+          "expectedVersion",
+          "logoColor"
         ],
         "properties": {
           "chain": {

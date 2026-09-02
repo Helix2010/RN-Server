@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -959,15 +960,10 @@ func normalizeWallet(raw map[string]any) map[string]any {
 			}
 		}
 	}
-	// 只认目录里有的链：租户配置里残留的链 id（比如目录下线了一条链）不能让
-	// 下发结果变成空列表——App 侧要求至少一条链，空列表会让整份 bootstrap 解析失败
-	for id := range enabled {
-		if _, known := supportedNetwork(id); !known {
-			delete(enabled, id)
-		}
-	}
-	// 没有任何（有效）配置时启用全部**主网**。测试链必须由运营显式勾选——否则
-	// 新增一条测试链就会自动出现在所有还没配过钱包的租户里。
+	// 声明式默认：租户还没配过钱包段时启用全部**主网**——管理端钱包页显示的就是这个
+	// 结果。测试链必须由运营显式勾选，否则新增一条测试链就会自动出现在所有租户里。
+	// 租户配了链却没有一条在目录里（目录下线了一条链），下发的就是空列表：这是
+	// 需要迁移租户配置的事故，不在运行时替它换成别的链。
 	if len(enabled) == 0 {
 		for _, network := range supportedNetworks {
 			if network.Testnet {
@@ -1124,7 +1120,11 @@ func (s *server) bootstrap(c *gin.Context) {
 	modules := normalizeModules(object(cfg["modules"]))
 	wallet := normalizeWallet(object(cfg["wallet"]))
 	// 代币目录只在这里下发：管理端的配置视图不带 tokens，它不是通过配置 PATCH 写的
-	s.attachWalletTokens(c.Request.Context(), tenant.ID, wallet)
+	if err := s.attachWalletTokens(c.Request.Context(), tenant.ID, wallet); err != nil {
+		slog.Error("wallet tokens could not be loaded for bootstrap", "tenant", tenant.ID, "error", err)
+		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
+		return
+	}
 	requestedLocale := strings.TrimSpace(c.Query("locale"))
 	locale := requestedLocale
 	if locale == "" {

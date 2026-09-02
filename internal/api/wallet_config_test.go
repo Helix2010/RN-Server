@@ -113,7 +113,8 @@ func TestNormalizeWalletIgnoresGarbage(t *testing.T) {
 		"chains":   "not-a-list",
 		"networks": []any{"not-an-object", nil, map[string]any{"id": 42}},
 	})
-	// 配置坏掉时回退到全部支持的链，而不是返回空列表让 App 没链可用
+	// 写入时已校验过类型，这里只保证类型断言不会 panic；没有任何有效配置 = 未配置，
+	// 走声明式默认（全部主网）
 	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base"}) {
 		t.Fatalf("chains = %v", wallet["chains"])
 	}
@@ -299,11 +300,15 @@ func TestSupportedNetworkIDsListsEveryChain(t *testing.T) {
 	}
 }
 
-func TestNormalizeWalletFallsBackWhenEveryEnabledChainIsUnknown(t *testing.T) {
-	// 目录下线了一条链，而某租户只勾了它：下发空列表会让 App 整份 bootstrap 解析失败
+func TestNormalizeWalletDeliversNothingWhenEveryConfiguredChainIsUnknown(t *testing.T) {
+	// 目录下线了一条链，而某租户只勾了它：这是要迁移租户配置的事故，运行时不替它
+	// 换成别的链——下发空列表，App 如实呈现"没有链"
 	wallet := normalizeWallet(map[string]any{"chains": []any{"nope"}})
-	if !reflect.DeepEqual(wallet["chains"], []any{"bsc", "eth", "base"}) {
-		t.Fatalf("chains = %v, want the mainnet defaults", wallet["chains"])
+	if !reflect.DeepEqual(wallet["chains"], []any{}) {
+		t.Fatalf("chains = %v, want an empty list", wallet["chains"])
+	}
+	if !reflect.DeepEqual(wallet["networks"], []any{}) {
+		t.Fatalf("networks = %v, want an empty list", wallet["networks"])
 	}
 }
 

@@ -407,3 +407,33 @@ func TestResyncAndDeleteValidateTheirBodies(t *testing.T) {
 		t.Fatalf("unknown field on delete: status %d body %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestApplyTokenPatchRefusesDisablingTheNativeCoin(t *testing.T) {
+	// 启用一条链即启用它的原生币：App 的手续费与原生币余额都按目录里这一条显示
+	row := tokenRecord{Chain: "bsc", Address: nativeTokenAddress, Symbol: "BNB", Decimals: 18, DisplayDecimals: 4, LogoColor: "#F0B90B", Enabled: true}
+	off := false
+	if _, err := applyTokenPatch(row, tokenPatch{Enabled: &off}); err == nil {
+		t.Fatal("disabling the native coin must be refused")
+	}
+	on := true
+	if _, err := applyTokenPatch(row, tokenPatch{Enabled: &on}); err != nil {
+		t.Fatalf("enabling the native coin must stay allowed: %v", err)
+	}
+}
+
+func TestApplyTokenPatchRequiresALogoColor(t *testing.T) {
+	// 头像底色直接落到 App 的背景色上，没有"没有颜色"的展示形态：新建时必填，改动时不能清空
+	row := tokenRecord{Chain: "bsc", Address: "0x55d398326f99059fF775485246999027B3197955", Symbol: "USDT", Decimals: 18, DisplayDecimals: 2}
+	if _, err := applyTokenPatch(row, tokenPatch{}); err == nil {
+		t.Fatal("a token without a logo colour must be refused")
+	}
+	empty := ""
+	row.LogoColor = "#26A17B"
+	if _, err := applyTokenPatch(row, tokenPatch{LogoColor: &empty}); err == nil {
+		t.Fatal("clearing the logo colour must be refused")
+	}
+	if updated, err := applyTokenPatch(row, tokenPatch{}); err != nil || updated.LogoColor != "#26A17B" {
+		t.Fatalf("a patch that leaves the colour alone must pass: %v", err)
+	}
+}
+

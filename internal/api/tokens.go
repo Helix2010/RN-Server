@@ -177,16 +177,18 @@ func bootstrapTokens(merged []tokenRecord, chains []any) []any {
 	return items
 }
 
-// attachWalletTokens 把代币目录放进 bootstrap 的 wallet 段。读库失败时不带 tokens
-// 而不是让整份 bootstrap 失败：App 对缺失按空数组处理，和面对老服务端一样。
-func (s *server) attachWalletTokens(ctx context.Context, tenant string, wallet map[string]any) {
+// attachWalletTokens 把代币目录放进 bootstrap 的 wallet 段。
+//
+// 读库失败就是整份 bootstrap 失败（503）：App 会继续用上一次成功的快照。不能
+// 省略 tokens 让 App 按"没有代币"理解——那是把故障伪装成一份合法的空目录。
+func (s *server) attachWalletTokens(ctx context.Context, tenant string, wallet map[string]any) error {
 	rows, err := s.queryTokens(ctx, tenant, "")
 	if err != nil {
-		slog.Error("wallet tokens could not be loaded for bootstrap", "tenant", tenant, "error", err)
-		return
+		return err
 	}
 	chains, _ := wallet["chains"].([]any)
 	wallet["tokens"] = bootstrapTokens(mergeTokenRecords(rows), chains)
+	return nil
 }
 
 // ---- 数据访问 ----
@@ -412,8 +414,8 @@ func validateTokenName(raw string) (string, error) {
 
 func validateLogoColor(raw string) (string, error) {
 	color := strings.TrimSpace(raw)
-	if color != "" && !logoColorPattern.MatchString(color) {
-		return "", errors.New("logoColor 必须是 #RGB / #RRGGBB / #RRGGBBAA 形式的颜色")
+	if !logoColorPattern.MatchString(color) {
+		return "", errors.New("logoColor 是必填项，必须是 #RGB / #RRGGBB / #RRGGBBAA 形式的颜色")
 	}
 	return color, nil
 }
@@ -503,6 +505,11 @@ func applyTokenPatch(row tokenRecord, patch tokenPatch) (tokenRecord, error) {
 		row.SortWeight = *patch.SortWeight
 	}
 	if patch.Enabled != nil {
+		// 启用一条链即启用它的原生币：App 的手续费、原生币余额都按目录里这一条显示，
+		// 停用它等于让一条启用的链没有原生币——那不是一个合法状态
+		if !*patch.Enabled && row.Address == nativeTokenAddress {
+			return row, badTokenRequest("原生币不能停用：要停用它，请在钱包配置里关闭这条链")
+		}
 		row.Enabled = *patch.Enabled
 	}
 	if patch.DisplayDecimals != nil {
@@ -510,6 +517,10 @@ func applyTokenPatch(row tokenRecord, patch tokenPatch) (tokenRecord, error) {
 	}
 	if row.DisplayDecimals < 0 || row.DisplayDecimals > row.Decimals {
 		return row, badTokenRequest(fmt.Sprintf("displayDecimals 必须在 0～%d 之间（不能超过链上精度）", row.Decimals))
+	}
+	// 头像底色是必填项：App 直接把它落到背景色上，没有"没有颜色"的展示形态
+	if _, err := validateLogoColor(row.LogoColor); err != nil {
+		return row, badTokenRequest(err.Error())
 	}
 	return row, nil
 }
