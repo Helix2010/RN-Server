@@ -42,6 +42,7 @@ var migrations = []migration{
 	{version: 26, name: "wallet_bootstrap_section", apply: walletBootstrapSectionMigration},
 	{version: 27, name: "release_mandatory_flag", apply: releaseMandatoryFlagMigration},
 	{version: 28, name: "chain_token_catalog", apply: chainTokenCatalogMigration},
+	{version: 29, name: "current_rn_app_localization_seed", apply: currentRNAppLocalizationSeedMigration},
 }
 
 // ChainTokenSeedRow 是迁移 28 写入的一条平台代币（tenant_id=0）。
