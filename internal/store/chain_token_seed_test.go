@@ -1,6 +1,10 @@
 package store
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -106,4 +110,48 @@ func TestChainTokenCatalogMigrationIsRegistered(t *testing.T) {
 		}
 	}
 	t.Fatal("migration 28 is missing")
+}
+
+// 手抄的 appAllowlist 是给 CI 用的（CI 只检出本仓库）；本地开发时 RN-App 就在旁边，
+// 直接读它的 token-allowlist.ts 再比一遍——两份表各抄一遍，迟早有一份改了另一份没改。
+func TestChainTokenSeedMatchesTheAppAllowlistFile(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "RN-App", "src", "core", "wallet", "config", "token-allowlist.ts")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("RN-App checkout not found next to this repo: %v", err)
+	}
+	// 形如：  "0x55d3…": {\n symbol: "USDT",\n decimals: 18,
+	entry := regexp.MustCompile(`"(0x[0-9a-fA-F]{40})":\s*\{\s*symbol:\s*"([A-Za-z0-9]+)",\s*decimals:\s*(\d+)`)
+	found := map[string]struct {
+		symbol   string
+		decimals int
+	}{}
+	for _, m := range entry.FindAllStringSubmatch(string(source), -1) {
+		decimals, _ := strconv.Atoi(m[3])
+		found[strings.ToLower(m[1])] = struct {
+			symbol   string
+			decimals int
+		}{m[2], decimals}
+	}
+	if len(found) == 0 {
+		t.Fatalf("no allowlist entries parsed from %s", path)
+	}
+	seen := 0
+	for _, row := range ChainTokenSeed {
+		if row.Address == "native" {
+			continue
+		}
+		want, ok := found[strings.ToLower(row.Address)]
+		if !ok {
+			t.Errorf("seed %s/%s is not in the App allowlist file", row.Chain, row.Address)
+			continue
+		}
+		seen++
+		if want.symbol != row.Symbol || want.decimals != row.Decimals {
+			t.Errorf("seed %s/%s = %s/%d, App allowlist says %s/%d", row.Chain, row.Address, row.Symbol, row.Decimals, want.symbol, want.decimals)
+		}
+	}
+	if seen != len(found) {
+		t.Errorf("App allowlist has %d contracts but the seed covers %d", len(found), seen)
+	}
 }

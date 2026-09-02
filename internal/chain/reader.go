@@ -182,8 +182,10 @@ func (r *Reader) readFrom(ctx context.Context, endpoint string, chainID int, add
 		}
 		// revert 之类：老合约可以没有 name()，留空由运营在表单里补
 	} else if decoded, decodeErr := decodeText(nameData); decodeErr == nil {
-		if name, err = SanitizeText(decoded, MaxNameLength); err != nil {
-			return Metadata{}, fail(KindMetadataInvalid, "name(): %v", err)
+		// name 只是预填、可人工修订：带 emoji 或超长就留空让运营补，
+		// 不能因为它拒掉整个代币——symbol / decimals 才是必须干净的
+		if cleaned, sanitizeErr := SanitizeText(decoded, MaxNameLength); sanitizeErr == nil {
+			name = cleaned
 		}
 	}
 	return Metadata{Symbol: symbol, Name: name, Decimals: decimals}, nil
@@ -236,7 +238,9 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-func (e *rpcError) Error() string { return fmt.Sprintf("json-rpc error %d", e.Code) }
+func (e *rpcError) Error() string {
+	return fmt.Sprintf("json-rpc error %d: %s", e.Code, e.Message)
+}
 
 // call 发一次 JSON-RPC 请求。超时与响应体上限都在这里兜底，调用方不必各自记得。
 func (r *Reader) call(ctx context.Context, endpoint, method string, params []any) (json.RawMessage, error) {

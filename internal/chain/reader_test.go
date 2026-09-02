@@ -292,3 +292,19 @@ func mustHex(value string) []byte {
 	}
 	return decoded
 }
+
+func TestReadTokenToleratesAnUnsanitizableName(t *testing.T) {
+	// name 只是预填、可人工修订；带 emoji 的 name 不能让整个代币加不进来
+	node := usdcNode()
+	node.calls[selectorName] = abiString("Rocket 🚀 Token")
+	meta, err := readWith(t, node, 1)
+	if err != nil {
+		t.Fatalf("expected the token to be readable, got %v", err)
+	}
+	if meta.Symbol != "USDC" || meta.Decimals != 6 {
+		t.Fatalf("symbol/decimals must still come through, got %+v", meta)
+	}
+	if meta.Name != "" {
+		t.Fatalf("an unsanitizable name must be left empty for the operator, got %q", meta.Name)
+	}
+}

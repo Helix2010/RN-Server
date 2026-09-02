@@ -279,9 +279,25 @@ func insertToken(ctx context.Context, tx dbExecutor, tenant string, row tokenRec
 // updateToken 覆写一行的全部可写字段并取消软删除；symbol/decimals 只在 create
 // 复活与 resync 里变化，其余路径传入的就是原值。
 func updateToken(ctx context.Context, tx dbExecutor, tenant string, row tokenRecord) error {
-	_, err := tx.ExecContext(ctx, `UPDATE chain_token_catalog SET symbol=?,name=?,decimals=?,display_decimals=?,logo_color=?,sort_weight=?,enabled=?,metadata_synced_at=?,mtime=?,deleted=0 WHERE id=? AND tenant_id=?`,
+	result, err := tx.ExecContext(ctx, `UPDATE chain_token_catalog SET symbol=?,name=?,decimals=?,display_decimals=?,logo_color=?,sort_weight=?,enabled=?,metadata_synced_at=?,mtime=?,deleted=0 WHERE id=? AND tenant_id=?`,
 		row.Symbol, row.Name, row.Decimals, row.DisplayDecimals, row.LogoColor, row.SortWeight, row.Enabled, nullableSQLTime(row.MetadataSyncedAt), time.Now().UTC(), row.ID, tenant)
-	return err
+	if err != nil {
+		return err
+	}
+	return requireOneRow(result)
+}
+
+// requireOneRow 把"UPDATE 命中 0 行"当成冲突：行在读取之后被别人删了，
+// 静默返回 200 会让运营以为改成功了。按乐观锁冲突处理，管理端会刷新重来。
+func requireOneRow(result sql.Result) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errTokenVersionConflict
+	}
+	return nil
 }
 
 func nullableSQLTime(value time.Time) any {
@@ -845,6 +861,19 @@ func (s *server) resyncToken(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "TOKEN_NATIVE_NO_RESYNC", "原生币没有合约，符号与精度来自平台链目录")
 		return
 	}
+	// 平台全局行、以及覆盖它的租户行，symbol/decimals 都是平台事实：租户上下文不能
+	// 改写，也没必要先读链再给一个必然失败的确认框。这一步放在读链之前
+	if tenantID(c) != "0" {
+		global, _, err := findTokenPair(ctx, s.db, tenantID(c), row.Chain, row.Address)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "TOKEN_QUERY_FAILED", "Unable to load token")
+			return
+		}
+		if global != nil {
+			problem(c, http.StatusForbidden, "TOKEN_GLOBAL_READONLY", "平台全局代币（及其租户覆盖行）的链上元数据只能由平台重新读取")
+			return
+		}
+	}
 	current, err := tokenConfigVersion(ctx, s.db, tenantID(c))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "TOKEN_QUERY_FAILED", "Unable to load token")
@@ -867,7 +896,7 @@ func (s *server) resyncToken(c *gin.Context) {
 	}
 	if meta.Symbol == row.Symbol && meta.Decimals == row.Decimals {
 		// 与库中一致：只刷新"最近核对时间"，不算配置变更，不动版本也不写审计
-		if _, err := s.db.ExecContext(ctx, `UPDATE chain_token_catalog SET metadata_synced_at=? WHERE id=?`, time.Now().UTC(), row.ID); err != nil {
+		if _, err := s.db.ExecContext(ctx, `UPDATE chain_token_catalog SET metadata_synced_at=? WHERE id=? AND tenant_id=?`, time.Now().UTC(), row.ID, row.TenantID); err != nil {
 			writeTokenProblem(c, err)
 			return
 		}
@@ -878,11 +907,6 @@ func (s *server) resyncToken(c *gin.Context) {
 	if !body.Confirm {
 		// 精度变了意味着合约升级或地址被换，不该静默接受：把差异交给运营确认
 		c.JSON(http.StatusOK, gin.H{"changed": true, "current": gin.H{"symbol": row.Symbol, "decimals": row.Decimals}, "onchain": gin.H{"symbol": meta.Symbol, "decimals": meta.Decimals}})
-		return
-	}
-	if row.scope() == "global" && tenantID(c) != "0" {
-		// 覆盖行的 symbol/decimals 必须与全局行一致，所以租户不能自己改写全局事实
-		problem(c, http.StatusForbidden, "TOKEN_GLOBAL_READONLY", "平台全局代币的链上元数据只能由平台重新读取")
 		return
 	}
 	updated := row
@@ -942,7 +966,11 @@ func (s *server) deleteToken(c *gin.Context) {
 		return
 	}
 	version, ok := s.tokenTransaction(c, body.ExpectedVersion, "token_delete", body.Reason, func(ctx context.Context, tx *sql.Tx) (string, map[string]any, error) {
-		if _, err := tx.ExecContext(ctx, `UPDATE chain_token_catalog SET deleted=1,mtime=? WHERE id=? AND tenant_id=?`, time.Now().UTC(), row.ID, row.TenantID); err != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE chain_token_catalog SET deleted=1,mtime=? WHERE id=? AND tenant_id=?`, time.Now().UTC(), row.ID, row.TenantID)
+		if err != nil {
+			return "", nil, err
+		}
+		if err := requireOneRow(result); err != nil {
 			return "", nil, err
 		}
 		return strconv.FormatInt(row.ID, 10), tokenSummary(row), nil

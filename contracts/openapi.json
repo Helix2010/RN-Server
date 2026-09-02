@@ -884,7 +884,7 @@
             "description": "Read-only chain lookup, nothing is stored: {chain, contractAddress (EIP-55), symbol, name, decimals, allowlisted, exists: null | {id, scope}}. Uses only the platform default endpoint, checks eth_chainId, requires code at the address, 5s per call and 64KB per response"
           },
           "400": {
-            "description": "INVALID_TOKEN_REQUEST (chain, address, displayDecimals, reason or expectedVersion invalid), TOKEN_NOT_A_CONTRACT (no code at the address), TOKEN_CHAIN_MISMATCH (platform endpoint reports another chain) or TOKEN_METADATA_INVALID (symbol/decimals on chain are not acceptable)"
+            "description": "chain 不受支持、contractAddress 不是合法地址、地址上没有合约代码（TOKEN_NOT_A_CONTRACT）、端点链 ID 不符（TOKEN_CHAIN_MISMATCH）或链上元数据不合法（TOKEN_METADATA_INVALID）"
           },
           "502": {
             "description": "TOKEN_CHAIN_UNAVAILABLE: the platform endpoint timed out or failed"
@@ -954,6 +954,9 @@
           },
           "409": {
             "description": "CONFIG_VERSION_CONFLICT: expectedVersion does not match metadata.databaseVersion"
+          },
+          "400": {
+            "description": "id 不是正整数、请求体含未知字段、或 reason 少于 3 个字（INVALID_TOKEN_REQUEST）"
           }
         }
       }
@@ -1404,7 +1407,7 @@
           },
           "logoColor": {
             "type": "string",
-            "description": "#RGB, #RRGGBB or #RRGGBBAA; empty allowed"
+            "description": "#RGB, #RRGGBB or #RRGGBBAA; empty allowed；接受 #RGB / #RGBA / #RRGGBB / #RRGGBBAA。"
           },
           "sortWeight": {
             "type": "integer"
