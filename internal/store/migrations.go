@@ -41,6 +41,80 @@ var migrations = []migration{
 	{version: 25, name: "wallet_identity", apply: walletIdentityMigration},
 	{version: 26, name: "wallet_bootstrap_section", apply: walletBootstrapSectionMigration},
 	{version: 27, name: "release_mandatory_flag", apply: releaseMandatoryFlagMigration},
+	{version: 28, name: "chain_token_catalog", apply: chainTokenCatalogMigration},
+}
+
+// ChainTokenSeedRow 是迁移 28 写入的一条平台代币（tenant_id=0）。
+//
+// 导出它是为了让 api 包用同一份表判断 allowlisted，测试再拿它跟 App 客户端的
+// 白名单 src/core/wallet/config/token-allowlist.ts 逐条对照——两份表各抄一遍，
+// 迟早有一份改了另一份没改。
+type ChainTokenSeedRow struct {
+	Chain           string
+	Address         string // EIP-55 形式；"native" 表示原生币
+	Symbol          string
+	Name            string
+	Decimals        int
+	DisplayDecimals int
+	LogoColor       string
+	SortWeight      int
+}
+
+// ChainTokenSeed 是平台预置的代币：每条链的原生币，加上五个已在链上核验过的
+// 主流稳定币。同一个 USDT 在 BSC 上是 18 位、以太坊上是 6 位——这里的精度全部
+// 来自链上 decimals()，不是凭直觉填的。测试链只有原生币，不预置任何代币。
+var ChainTokenSeed = []ChainTokenSeedRow{
+	{Chain: "bsc", Address: "native", Symbol: "BNB", Name: "BNB", Decimals: 18, DisplayDecimals: 4, LogoColor: "#F0B90B", SortWeight: 1000},
+	{Chain: "eth", Address: "native", Symbol: "ETH", Name: "Ether", Decimals: 18, DisplayDecimals: 4, LogoColor: "#627EEA", SortWeight: 1000},
+	{Chain: "base", Address: "native", Symbol: "ETH", Name: "Ether", Decimals: 18, DisplayDecimals: 4, LogoColor: "#627EEA", SortWeight: 1000},
+	{Chain: "op-sepolia", Address: "native", Symbol: "ETH", Name: "Ether", Decimals: 18, DisplayDecimals: 4, LogoColor: "#627EEA", SortWeight: 1000},
+	{Chain: "bsc", Address: "0x55d398326f99059fF775485246999027B3197955", Symbol: "USDT", Name: "Tether USD", Decimals: 18, DisplayDecimals: 2, LogoColor: "#26A17B", SortWeight: 900},
+	{Chain: "bsc", Address: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", Symbol: "USDC", Name: "USD Coin", Decimals: 18, DisplayDecimals: 2, LogoColor: "#2775CA", SortWeight: 800},
+	{Chain: "eth", Address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Symbol: "USDT", Name: "Tether USD", Decimals: 6, DisplayDecimals: 2, LogoColor: "#26A17B", SortWeight: 900},
+	{Chain: "eth", Address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", Symbol: "USDC", Name: "USD Coin", Decimals: 6, DisplayDecimals: 2, LogoColor: "#2775CA", SortWeight: 800},
+	{Chain: "base", Address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", Symbol: "USDC", Name: "USD Coin", Decimals: 6, DisplayDecimals: 2, LogoColor: "#2775CA", SortWeight: 800},
+}
+
+// chainTokenCatalogMigration 建立"全局 + 租户覆盖"两层的代币目录并写入平台预置。
+//
+// 表里刻意没有 source 列（元数据只能来自链上，留一列只会诱导人开手填入口）和
+// verified 列（客户端只认自己那份白名单，服务端下发的 verified 一律不采纳——它恰恰
+// 是被攻破的服务端最想控制的字段）。metadata_synced_at 预置为 NULL：这些值是人在
+// 链上核验后写进代码的，服务端自己还没读过；第一次 resync 会把它填上。
+//
+// 建表用 IF NOT EXISTS，预置用 ON DUPLICATE KEY UPDATE id=id，重跑安全；运营改过的
+// 预置行不会被覆盖回去。
+func chainTokenCatalogMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS chain_token_catalog (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '代币主键',
+		tenant_id BIGINT NOT NULL DEFAULT 0 COMMENT '租户ID，0表示平台全局代币',
+		chain VARCHAR(32) NOT NULL COMMENT '链 id，与平台链目录一致：bsc/eth/base/op-sepolia',
+		contract_address VARCHAR(42) NOT NULL COMMENT '合约地址，入库前已做 EIP-55 规范化；native 表示原生币',
+		symbol VARCHAR(32) NOT NULL COMMENT '代币符号。添加时由服务端从链上 symbol() 读取，不可编辑',
+		name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '代币全名。添加时从链上 name() 预填，可人工修订',
+		decimals TINYINT UNSIGNED NOT NULL COMMENT '链上精度（协议事实）。添加时由服务端从链上 decimals() 读取，不可编辑；错一位金额差 10 倍',
+		display_decimals TINYINT UNSIGNED NOT NULL COMMENT '展示精度：界面显示与输入保留的小数位，向下截断；0 ≤ display_decimals ≤ decimals；只影响显示，绝不参与金额换算',
+		logo_color VARCHAR(16) NOT NULL DEFAULT '' COMMENT '列表占位色',
+		sort_weight INT NOT NULL DEFAULT 0 COMMENT '展示排序，越大越靠前',
+		enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否下发给 App；租户可用一条覆盖行停用全局币',
+		metadata_synced_at DATETIME(3) NULL COMMENT '最近一次从链上读取 symbol/decimals 的时间',
+		ctime DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+		mtime DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '修改时间',
+		deleted TINYINT(1) NOT NULL DEFAULT 0 COMMENT '软删除标记',
+		PRIMARY KEY(id),
+		UNIQUE KEY uk_chain_token(chain, contract_address, tenant_id),
+		KEY ix_chain_token_tenant(tenant_id, chain, enabled, deleted)
+	) ENGINE=InnoDB COMMENT='全局与租户代币目录'`); err != nil {
+		return fmt.Errorf("create chain_token_catalog: %w", err)
+	}
+	for _, row := range ChainTokenSeed {
+		if _, err := db.ExecContext(ctx, `INSERT INTO chain_token_catalog(tenant_id,chain,contract_address,symbol,name,decimals,display_decimals,logo_color,sort_weight,enabled,metadata_synced_at,ctime,mtime,deleted)
+			VALUES(0,?,?,?,?,?,?,?,?,1,NULL,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE id=id`,
+			row.Chain, row.Address, row.Symbol, row.Name, row.Decimals, row.DisplayDecimals, row.LogoColor, row.SortWeight); err != nil {
+			return fmt.Errorf("seed chain token %s/%s: %w", row.Chain, row.Symbol, err)
+		}
+	}
+	return nil
 }
 
 // releaseMandatoryFlagMigration 让"这个版本必须升级"成为发布记录自己的属性。

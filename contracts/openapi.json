@@ -30,7 +30,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints; metadata.walletCatalog lists the chains this platform supports, each marked testnet or not)"
+            "description": "App config (config.wallet holds the WalletConnect project id and per-chain endpoints, never tokens: the token catalogue is managed under /v1/admin/tokens; metadata.walletCatalog lists the chains this platform supports, each marked testnet or not and carrying nativeSymbol/nativeDecimals)"
           }
         }
       },
@@ -681,7 +681,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release"
+            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist) and an older server omits it, which the app treats as an empty array"
           }
         }
       }
@@ -814,6 +814,192 @@
           },
           "503": {
             "description": "Release storage unavailable"
+          }
+        }
+      }
+    },
+    "/v1/admin/tokens": {
+      "get": {
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Restrict to one chain id (bsc/eth/base/op-sepolia); omit for all chains"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Merged token catalogue for the tenant: {tokens: Token[], metadata: {databaseVersion}}. Global rows (tenant_id 0) and the tenant's own rows; when both exist for the same (chain, address) only the tenant row is returned. metadata.databaseVersion is the optimistic-lock version every write must echo as expectedVersion"
+          },
+          "400": {
+            "description": "INVALID_TOKEN_REQUEST: unsupported chain filter"
+          }
+        }
+      },
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created {token: Token, metadata: {databaseVersion}}. The server reads symbol/decimals from the chain again (the preview result is not trusted). When a global row already exists for (chain, contractAddress) a tenant override row is created instead: symbol/decimals are copied from the global row and the chain is not read"
+          },
+          "400": {
+            "description": "INVALID_TOKEN_REQUEST (chain, address, displayDecimals, reason or expectedVersion invalid), TOKEN_NOT_A_CONTRACT (no code at the address), TOKEN_CHAIN_MISMATCH (platform endpoint reports another chain) or TOKEN_METADATA_INVALID (symbol/decimals on chain are not acceptable)"
+          },
+          "502": {
+            "description": "TOKEN_CHAIN_UNAVAILABLE: the platform endpoint timed out or failed"
+          },
+          "409": {
+            "description": "TOKEN_EXISTS (the tenant already has this token) or CONFIG_VERSION_CONFLICT"
+          }
+        }
+      }
+    },
+    "/v1/admin/tokens/preview": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenPreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Read-only chain lookup, nothing is stored: {chain, contractAddress (EIP-55), symbol, name, decimals, allowlisted, exists: null | {id, scope}}. Uses only the platform default endpoint, checks eth_chainId, requires code at the address, 5s per call and 64KB per response"
+          },
+          "400": {
+            "description": "INVALID_TOKEN_REQUEST (chain, address, displayDecimals, reason or expectedVersion invalid), TOKEN_NOT_A_CONTRACT (no code at the address), TOKEN_CHAIN_MISMATCH (platform endpoint reports another chain) or TOKEN_METADATA_INVALID (symbol/decimals on chain are not acceptable)"
+          },
+          "502": {
+            "description": "TOKEN_CHAIN_UNAVAILABLE: the platform endpoint timed out or failed"
+          }
+        }
+      }
+    },
+    "/v1/admin/tokens/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": "Token id from GET /v1/admin/tokens (global or tenant row)"
+        }
+      ],
+      "patch": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenPatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated {token: Token, metadata: {databaseVersion}}. Only name, displayDecimals, logoColor, sortWeight and enabled are editable. Patching a global row from a tenant creates or updates the tenant's override row and returns it (scope=tenant)"
+          },
+          "400": {
+            "description": "TOKEN_FIELD_READONLY when symbol, decimals, chain, contractAddress (or another server-owned field) appears in the body; INVALID_TOKEN_REQUEST for other validation failures (e.g. displayDecimals > decimals)"
+          },
+          "404": {
+            "description": "TOKEN_NOT_FOUND"
+          },
+          "409": {
+            "description": "CONFIG_VERSION_CONFLICT: expectedVersion does not match metadata.databaseVersion"
+          }
+        }
+      },
+      "delete": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenDeleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Soft-deleted: {metadata: {databaseVersion}}. Deleting a tenant override row restores the global row"
+          },
+          "403": {
+            "description": "TOKEN_GLOBAL_READONLY: global rows cannot be deleted from a tenant; disable them with PATCH enabled=false instead"
+          },
+          "404": {
+            "description": "TOKEN_NOT_FOUND"
+          },
+          "409": {
+            "description": "CONFIG_VERSION_CONFLICT: expectedVersion does not match metadata.databaseVersion"
+          }
+        }
+      }
+    },
+    "/v1/admin/tokens/{id}/resync": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "description": "Token id from GET /v1/admin/tokens (global or tenant row)"
+        }
+      ],
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenResyncRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Re-reads symbol/decimals from the chain. Unchanged: {changed: false, token}. Changed and confirm is not true: {changed: true, current: {symbol, decimals}, onchain: {symbol, decimals}} and nothing is written. Changed and confirm=true: {changed: true, token, metadata: {databaseVersion}}"
+          },
+          "400": {
+            "description": "TOKEN_NATIVE_NO_RESYNC (native rows have no contract), TOKEN_CHAIN_MISMATCH, TOKEN_METADATA_INVALID, TOKEN_NOT_A_CONTRACT or INVALID_TOKEN_REQUEST"
+          },
+          "403": {
+            "description": "TOKEN_GLOBAL_READONLY: a tenant cannot rewrite the on-chain facts of a global row"
+          },
+          "404": {
+            "description": "TOKEN_NOT_FOUND"
+          },
+          "409": {
+            "description": "CONFIG_VERSION_CONFLICT: expectedVersion does not match metadata.databaseVersion"
+          },
+          "502": {
+            "description": "TOKEN_CHAIN_UNAVAILABLE"
           }
         }
       }
@@ -1048,6 +1234,268 @@
             "type": "object",
             "nullable": true,
             "additionalProperties": true
+          }
+        }
+      },
+      "Token": {
+        "type": "object",
+        "description": "Token as returned by the admin endpoints. address is 'native' or an EIP-55 checksummed contract address; symbol and decimals come from the chain and are read-only; allowlisted says whether the app's built-in allowlist will show it as verified",
+        "required": [
+          "id",
+          "scope",
+          "chain",
+          "address",
+          "symbol",
+          "name",
+          "decimals",
+          "displayDecimals",
+          "logoColor",
+          "sortWeight",
+          "enabled",
+          "allowlisted",
+          "metadataSyncedAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "global",
+              "tenant"
+            ]
+          },
+          "chain": {
+            "type": "string"
+          },
+          "address": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "decimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36
+          },
+          "displayDecimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36,
+            "description": "Display-only precision, 0 <= displayDecimals <= decimals; never used for amount conversion"
+          },
+          "logoColor": {
+            "type": "string"
+          },
+          "sortWeight": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "allowlisted": {
+            "type": "boolean"
+          },
+          "metadataSyncedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BootstrapWalletToken": {
+        "type": "object",
+        "description": "Token entry delivered in bootstrap wallet.tokens; deliberately without verified, id or scope",
+        "required": [
+          "chain",
+          "address",
+          "symbol",
+          "name",
+          "decimals",
+          "displayDecimals",
+          "logoColor"
+        ],
+        "properties": {
+          "chain": {
+            "type": "string"
+          },
+          "address": {
+            "type": "string",
+            "description": "'native' or an EIP-55 checksummed address"
+          },
+          "symbol": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "decimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36
+          },
+          "displayDecimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36
+          },
+          "logoColor": {
+            "type": "string"
+          }
+        }
+      },
+      "TokenPreviewRequest": {
+        "type": "object",
+        "required": [
+          "chain",
+          "contractAddress"
+        ],
+        "properties": {
+          "chain": {
+            "type": "string",
+            "description": "Chain id from metadata.walletCatalog"
+          },
+          "contractAddress": {
+            "type": "string",
+            "description": "0x-prefixed contract address; mixed case must be a valid EIP-55 checksum"
+          }
+        }
+      },
+      "TokenCreateRequest": {
+        "type": "object",
+        "required": [
+          "chain",
+          "contractAddress",
+          "displayDecimals",
+          "reason",
+          "expectedVersion"
+        ],
+        "properties": {
+          "chain": {
+            "type": "string"
+          },
+          "contractAddress": {
+            "type": "string"
+          },
+          "displayDecimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Defaults to the on-chain name (or the symbol when the contract has none)"
+          },
+          "logoColor": {
+            "type": "string",
+            "description": "#RGB, #RRGGBB or #RRGGBBAA; empty allowed"
+          },
+          "sortWeight": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "metadata.databaseVersion from the last GET; 0 before the tenant's first write"
+          }
+        }
+      },
+      "TokenPatchRequest": {
+        "type": "object",
+        "required": [
+          "reason",
+          "expectedVersion"
+        ],
+        "description": "symbol, decimals, chain and contractAddress are rejected with TOKEN_FIELD_READONLY",
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "displayDecimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36
+          },
+          "logoColor": {
+            "type": "string"
+          },
+          "sortWeight": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "TokenResyncRequest": {
+        "type": "object",
+        "required": [
+          "reason",
+          "expectedVersion"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "Must be true to write a changed symbol/decimals into the catalogue"
+          }
+        }
+      },
+      "TokenDeleteRequest": {
+        "type": "object",
+        "required": [
+          "reason",
+          "expectedVersion"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       }

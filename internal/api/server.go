@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Helix2010/RN-Server/internal/chain"
 	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/Helix2010/RN-Server/internal/objectstore"
 	"github.com/Helix2010/RN-Server/internal/secretbox"
@@ -38,6 +39,8 @@ type server struct {
 	objects  objectstore.Factory
 	tenant   *tenantResolver
 	secrets  *secretbox.Box
+	// tokens 只从平台默认端点读代币元数据；测试用假实现替换
+	tokens tokenMetadataReader
 }
 
 type attempt struct {
@@ -97,7 +100,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	box, _ := secretbox.New(cfg.StorageMasterKey)
-	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box}
+	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil)}
 	r := gin.New()
 	r.Use(gin.Recovery(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
 	r.GET("/health/live", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "live"}) })
@@ -156,6 +159,12 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PATCH("/app-config", s.updateAppConfig)
 	group.GET("/branding", s.getBranding)
 	group.PATCH("/branding", s.updateBranding)
+	group.GET("/tokens", s.listTokens)
+	group.POST("/tokens/preview", s.previewToken)
+	group.POST("/tokens", s.createToken)
+	group.PATCH("/tokens/:id", s.patchToken)
+	group.POST("/tokens/:id/resync", s.resyncToken)
+	group.DELETE("/tokens/:id", s.deleteToken)
 	group.GET("/localization", s.getLocalization)
 	group.PUT("/localization/languages", s.updateLocalizationLanguages)
 	group.PUT("/localization/documents", s.updateLocalizationDocuments)
@@ -203,7 +212,7 @@ func (s *server) domainTenantScope() gin.HandlerFunc {
 func (s *server) databaseTimeout() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		multipartPartUpload := c.Request.Method == http.MethodPut && strings.Contains(c.Request.URL.Path, "/v1/admin/upload-sessions/") && strings.Contains(c.Request.URL.Path, "/parts/")
-		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") {
+		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") || readsTokenChain(c.Request) {
 			c.Next()
 			return
 		}
@@ -212,6 +221,15 @@ func (s *server) databaseTimeout() gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+// readsTokenChain 识别要去链上读元数据的三个代币接口。它们跟 /release-storage/test
+// 一样要等外部系统：最多五次 RPC、每次 5 秒，套在数据库超时里会被误杀。
+func readsTokenChain(r *http.Request) bool {
+	path := r.URL.Path
+	return strings.HasSuffix(path, "/tokens/preview") ||
+		(r.Method == http.MethodPost && strings.HasSuffix(path, "/tokens")) ||
+		strings.HasSuffix(path, "/resync")
 }
 
 func (s *server) requestContext() gin.HandlerFunc {
@@ -715,7 +733,7 @@ func (s *server) updateAppConfig(c *gin.Context) {
 // definition: use endpoints that are safe to expose (domain-restricted or
 // rate-limited keys), or proxy RPC through this server. Never put a bearer
 // secret in an rpcUrl.
-var supportedNetworks = []struct {
+type evmNetwork struct {
 	ID          string
 	Name        string
 	ChainID     int
@@ -724,11 +742,17 @@ var supportedNetworks = []struct {
 	// Testnet 上的币没有价值。混进主网列表里，运营会误开给生产租户、用户会
 	// 把它当成真链，所以这个标记要一路传到管理端和 App 的界面上。
 	Testnet bool
-}{
-	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com", false},
-	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io", false},
-	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org", false},
-	{"op-sepolia", "OP Sepolia", 11155420, []any{"https://sepolia.optimism.io"}, "https://sepolia-optimism.etherscan.io", true},
+	// NativeSymbol / NativeDecimals 描述原生币。原生币没有合约、读不了链，
+	// 它的符号与精度只能来自这里；管理端也靠这两项显示原生币行。
+	NativeSymbol   string
+	NativeDecimals int
+}
+
+var supportedNetworks = []evmNetwork{
+	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com", false, "BNB", 18},
+	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io", false, "ETH", 18},
+	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org", false, "ETH", 18},
+	{"op-sepolia", "OP Sepolia", 11155420, []any{"https://sepolia.optimism.io"}, "https://sepolia-optimism.etherscan.io", true, "ETH", 18},
 }
 
 // walletCatalog tells the admin console which chains this platform can talk to
@@ -744,6 +768,8 @@ func walletCatalog() []any {
 			"defaultRpcUrls":     network.RPCUrls,
 			"defaultExplorerUrl": network.ExplorerURL,
 			"testnet":            network.Testnet,
+			"nativeSymbol":       network.NativeSymbol,
+			"nativeDecimals":     network.NativeDecimals,
 		})
 	}
 	return items
@@ -760,12 +786,17 @@ func supportedNetworkIDs() string {
 }
 
 func supportedNetwork(id string) (int, bool) {
+	network, ok := platformNetwork(id)
+	return network.ChainID, ok
+}
+
+func platformNetwork(id string) (evmNetwork, bool) {
 	for _, network := range supportedNetworks {
 		if network.ID == id {
-			return network.ChainID, true
+			return network, true
 		}
 	}
-	return 0, false
+	return evmNetwork{}, false
 }
 
 // walletProjectIDPattern matches a WalletConnect / Reown project id: a hex
@@ -1092,6 +1123,8 @@ func (s *server) bootstrap(c *gin.Context) {
 	cfg := view["config"].(map[string]any)
 	modules := normalizeModules(object(cfg["modules"]))
 	wallet := normalizeWallet(object(cfg["wallet"]))
+	// 代币目录只在这里下发：管理端的配置视图不带 tokens，它不是通过配置 PATCH 写的
+	s.attachWalletTokens(c.Request.Context(), tenant.ID, wallet)
 	requestedLocale := strings.TrimSpace(c.Query("locale"))
 	locale := requestedLocale
 	if locale == "" {
