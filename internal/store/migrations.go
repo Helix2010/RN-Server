@@ -44,6 +44,16 @@ var migrations = []migration{
 	{version: 28, name: "chain_token_catalog", apply: chainTokenCatalogMigration},
 	{version: 29, name: "current_rn_app_localization_seed", apply: currentRNAppLocalizationSeedMigration},
 	{version: 30, name: "chain_token_logo_color_required", apply: chainTokenLogoColorMigration},
+	{version: 31, name: "chain_token_logo_color_no_default", apply: chainTokenLogoColorNoDefaultMigration},
+}
+
+// chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
+// 表结构不该再邀请写入路径已经拒绝的值。
+func chainTokenLogoColorNoDefaultMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `ALTER TABLE chain_token_catalog MODIFY logo_color VARCHAR(16) NOT NULL COMMENT '头像底色，#RRGGBB，必填'`); err != nil {
+		return fmt.Errorf("chain token logo color no-default migration: %w", err)
+	}
+	return nil
 }
 
 // chainTokenLogoColorMigration 把没有头像底色的代币行补成所在链原生币的颜色。

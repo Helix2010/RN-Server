@@ -25,6 +25,13 @@ import (
 const brandingConfigKey = "branding"
 const brandingMaxAssetBytes int64 = 5 * 1024 * 1024
 
+// legacyLaunchMaxDisplayMs 只为已安装的旧客户端存在。App ≤ 1.2.6 的 bootstrap 校验要求
+// launch.maxDisplayMs 必填（300～5000），缺了整份 bootstrap 解析失败、设备停在旧缓存上；
+// 新版本 App 已不再读它（启动页没有"超时放行"）。等 update.minSupportedVersion 抬到不再
+// 要求这个字段的版本后，把这一行和 resolveBranding 里的输出一起删掉。它不是配置项：
+// 管理端不能改，租户配置里出现也不读。
+const legacyLaunchMaxDisplayMs = 1800
+
 var defaultBrandingConfig = map[string]any{
 	"schemaVersion": 1,
 	"version":       1,
@@ -32,7 +39,6 @@ var defaultBrandingConfig = map[string]any{
 	"launch": map[string]any{
 		"enabled":         true,
 		"minDisplayMs":    700,
-		"maxDisplayMs":    1800,
 		"messages":        map[string]any{"titleKey": "launch.title", "subtitleKey": "launch.subtitle"},
 		"animation":       map[string]any{"type": "fade_scale", "durationMs": 360},
 		"defaultVisual":   map[string]any{"light": map[string]any{"backgroundColor": "#F4F7FB"}, "dark": map[string]any{"backgroundColor": "#0B1220"}},
@@ -356,7 +362,7 @@ func resolveBranding(config map[string]any, locale, fallback string, messages ma
 	return map[string]any{
 		"schemaVersion": config["schemaVersion"], "version": config["version"], "enabled": config["enabled"],
 		"selectedLocale": locale, "fallbackLocale": fallback,
-		"launch":      map[string]any{"enabled": launch["enabled"], "minDisplayMs": launch["minDisplayMs"], "maxDisplayMs": launch["maxDisplayMs"], "animation": launch["animation"], "title": messages[titleKey], "subtitle": messages[subtitleKey], "visuals": visuals},
+		"launch":      map[string]any{"enabled": launch["enabled"], "minDisplayMs": launch["minDisplayMs"], "maxDisplayMs": legacyLaunchMaxDisplayMs, "animation": launch["animation"], "title": messages[titleKey], "subtitle": messages[subtitleKey], "visuals": visuals},
 		"cachePolicy": config["cachePolicy"],
 	}
 }

@@ -681,7 +681,10 @@
         ],
         "responses": {
           "200": {
-            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist) and an older server omits it, which the app treats as an empty array"
+            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path)"
+          },
+          "503": {
+            "description": "BOOTSTRAP_UNAVAILABLE: the tenant configuration, its token catalogue or its wallet section could not be produced completely (storage error, a corrupt catalogue row, an enabled chain without a native token, or a tenant whose configured chains are all unknown). The app keeps its last successful snapshot and shows the retry screen"
           }
         }
       }
@@ -1404,11 +1407,11 @@
           "name": {
             "type": "string",
             "maxLength": 128,
-            "description": "Defaults to the on-chain name (or the symbol when the contract has none)"
+            "description": "Defaults to the on-chain name; when the contract has no name() the symbol is used (declared default). Never empty: an update with an empty name is rejected"
           },
           "logoColor": {
             "type": "string",
-            "description": "#RGB, #RRGGBB or #RRGGBBAA; empty allowed；接受 #RGB / #RGBA / #RRGGBB / #RRGGBBAA。"
+            "description": "#RRGGBB only; required on create unless a platform-global row for the same (chain, address) supplies it, and never empty on update. 头像底色，只接受 #RRGGBB。"
           },
           "sortWeight": {
             "type": "integer"

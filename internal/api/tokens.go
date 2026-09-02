@@ -35,7 +35,8 @@ type tokenMetadataReader interface {
 	ReadToken(ctx context.Context, network chain.Network, address string) (chain.Metadata, error)
 }
 
-var logoColorPattern = regexp.MustCompile(`^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$`)
+// 头像底色只认 #RRGGBB：管理端取色器与 App 的背景色都只处理这一种写法，三端一致。
+var logoColorPattern = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 
 // allowlistedTokens 是 App 客户端白名单的服务端副本，键为 chain|小写地址。
 // 来源就是迁移预置的五个合约（store.ChainTokenSeed），测试保证它与 App 那份一致。
@@ -109,19 +110,47 @@ func tokenView(t tokenRecord) gin.H {
 // bootstrapTokenView 是下发给 App 的形态（契约第 2 节）：不带 id / scope / verified。
 // verified 只能由 App 自己的白名单授予——被攻破的服务端最想控制的就是这个字段。
 func bootstrapTokenView(t tokenRecord) gin.H {
-	display := t.DisplayDecimals
-	if display > t.Decimals {
-		display = t.Decimals
-	}
 	return gin.H{
 		"chain":           t.Chain,
 		"address":         t.Address,
 		"symbol":          t.Symbol,
 		"name":            t.Name,
 		"decimals":        t.Decimals,
-		"displayDecimals": display,
+		"displayDecimals": t.DisplayDecimals,
 		"logoColor":       t.LogoColor,
 	}
+}
+
+// validateDeliveredTokens 是下发前的完整性检查。写入路径已经拒绝这些状态，出现在库里
+// 就是事故：不在读路径上截断或补值，而是让整份 bootstrap 失败（503），App 继续用上次
+// 快照，日志里留下坏行。同时检查不变量"每条启用的链都有一条启用的原生币"——App 的手续费
+// 与原生币余额都按它显示。
+func validateDeliveredTokens(merged []tokenRecord, chains []any) error {
+	nativeSeen := map[string]bool{}
+	for _, row := range merged {
+		if !row.Enabled {
+			continue
+		}
+		if row.Symbol == "" {
+			return fmt.Errorf("token %d (%s %s) has an empty symbol", row.ID, row.Chain, row.Address)
+		}
+		if row.DisplayDecimals < 0 || row.DisplayDecimals > row.Decimals {
+			return fmt.Errorf("token %d (%s %s) has displayDecimals %d outside 0..%d", row.ID, row.Chain, row.Address, row.DisplayDecimals, row.Decimals)
+		}
+		if !logoColorPattern.MatchString(row.LogoColor) {
+			return fmt.Errorf("token %d (%s %s) has an invalid logoColor %q", row.ID, row.Chain, row.Address, row.LogoColor)
+		}
+		if row.Address == nativeTokenAddress {
+			nativeSeen[row.Chain] = true
+		}
+	}
+	for _, item := range chains {
+		id, ok := item.(string)
+		if ok && !nativeSeen[id] {
+			return fmt.Errorf("enabled chain %q has no enabled native token", id)
+		}
+	}
+	return nil
 }
 
 // mergeTokenRecords 把全局行与租户行合成一份视图：同 (chain, address) 只留租户行，
@@ -187,7 +216,11 @@ func (s *server) attachWalletTokens(ctx context.Context, tenant string, wallet m
 		return err
 	}
 	chains, _ := wallet["chains"].([]any)
-	wallet["tokens"] = bootstrapTokens(mergeTokenRecords(rows), chains)
+	merged := mergeTokenRecords(rows)
+	if err := validateDeliveredTokens(merged, chains); err != nil {
+		return err
+	}
+	wallet["tokens"] = bootstrapTokens(merged, chains)
 	return nil
 }
 
@@ -409,13 +442,16 @@ func validateTokenName(raw string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("name 只能包含可打印字符且不超过 %d 个字符", chain.MaxNameLength)
 	}
+	if name == "" {
+		return "", errors.New("name 是必填项")
+	}
 	return name, nil
 }
 
 func validateLogoColor(raw string) (string, error) {
 	color := strings.TrimSpace(raw)
 	if !logoColorPattern.MatchString(color) {
-		return "", errors.New("logoColor 是必填项，必须是 #RGB / #RRGGBB / #RRGGBBAA 形式的颜色")
+		return "", errors.New("logoColor 是必填项，必须是 #RRGGBB 形式的颜色")
 	}
 	return color, nil
 }
@@ -719,6 +755,7 @@ func (s *server) createToken(c *gin.Context) {
 			return
 		}
 		row.Symbol, row.Name, row.Decimals = meta.Symbol, meta.Name, meta.Decimals
+		// 声明默认（OpenAPI 与管理端提示都写明）：合约没有 name() 时名称用符号
 		if row.Name == "" {
 			row.Name = meta.Symbol
 		}
@@ -881,7 +918,7 @@ func (s *server) resyncToken(c *gin.Context) {
 			return
 		}
 		if global != nil {
-			problem(c, http.StatusForbidden, "TOKEN_GLOBAL_READONLY", "平台全局代币（及其租户覆盖行）的链上元数据只能由平台重新读取")
+			problem(c, http.StatusForbidden, "TOKEN_GLOBAL_METADATA_READONLY", "平台全局代币（及其租户覆盖行）的链上元数据由平台维护，租户不能重新读取")
 			return
 		}
 	}
@@ -970,6 +1007,11 @@ func (s *server) deleteToken(c *gin.Context) {
 	}
 	if !found {
 		problem(c, http.StatusNotFound, "TOKEN_NOT_FOUND", "代币不存在")
+		return
+	}
+	if row.Address == nativeTokenAddress && row.scope() == "global" {
+		// 原生币行删了就再也建不回来（create 只接受合约地址），而启用的链必须有它
+		problem(c, http.StatusBadRequest, "TOKEN_NATIVE_REQUIRED", "原生币不能删除：要停用它，请在钱包配置里关闭这条链")
 		return
 	}
 	if row.scope() == "global" && tenantID(c) != "0" {

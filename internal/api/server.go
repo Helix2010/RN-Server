@@ -807,10 +807,10 @@ func platformNetwork(id string) (evmNetwork, bool) {
 var walletProjectIDPattern = regexp.MustCompile(`^[0-9a-zA-Z]{16,64}$`)
 
 // validateWalletSection rejects a wallet section the admin console should never
-// have sent. The bootstrap path is deliberately lenient (bad config falls back
-// to defaults so the app still starts), but on the write path silence is the
-// wrong answer: an operator who pastes an http:// endpoint must be told, not
-// have it quietly dropped and wonder why nothing changed.
+// have sent. Everything the bootstrap path later reads is validated here, on the
+// write path: an operator who pastes an http:// endpoint must be told, not have
+// it quietly dropped and wonder why nothing changed. The read path never repairs
+// stored data — see normalizeWallet and the 503 in the bootstrap handler.
 func validateWalletSection(raw any) error {
 	section, ok := raw.(map[string]any)
 	if !ok {
@@ -1119,6 +1119,13 @@ func (s *server) bootstrap(c *gin.Context) {
 	cfg := view["config"].(map[string]any)
 	modules := normalizeModules(object(cfg["modules"]))
 	wallet := normalizeWallet(object(cfg["wallet"]))
+	// 租户配了链却没有一条还在平台目录里（目录下线了一条链）：这是要迁移租户配置的事故，
+	// 不下发一个"零条链"的钱包段让 App 悄悄变成空壳
+	if chains, _ := wallet["chains"].([]any); len(chains) == 0 {
+		slog.Error("wallet section resolves to no supported chain", "tenant", tenant.ID, "configured", object(cfg["wallet"])["chains"])
+		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
+		return
+	}
 	// 代币目录只在这里下发：管理端的配置视图不带 tokens，它不是通过配置 PATCH 写的
 	if err := s.attachWalletTokens(c.Request.Context(), tenant.ID, wallet); err != nil {
 		slog.Error("wallet tokens could not be loaded for bootstrap", "tenant", tenant.ID, "error", err)

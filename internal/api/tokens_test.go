@@ -74,7 +74,7 @@ func TestNormalizeWalletNeverCarriesTokens(t *testing.T) {
 // ---- 合并视图 ----
 
 func seedRecord(id int64, tenant, chainID, address, symbol string, decimals, sortWeight int, enabled bool) tokenRecord {
-	return tokenRecord{ID: id, TenantID: tenant, Chain: chainID, Address: address, Symbol: symbol, Name: symbol, Decimals: decimals, DisplayDecimals: 2, SortWeight: sortWeight, Enabled: enabled, UpdatedAt: time.Unix(0, 0)}
+	return tokenRecord{ID: id, TenantID: tenant, Chain: chainID, Address: address, Symbol: symbol, Name: symbol, Decimals: decimals, DisplayDecimals: 2, LogoColor: "#26A17B", SortWeight: sortWeight, Enabled: enabled, UpdatedAt: time.Unix(0, 0)}
 }
 
 const (
@@ -117,8 +117,6 @@ func TestBootstrapTokensFiltersAndShapes(t *testing.T) {
 		seedRecord(3, "0", "bsc", bscUSDC, "USDC", 18, 800, false),
 		seedRecord(4, "0", "eth", "native", "ETH", 18, 1000, true),
 	})
-	// 展示精度超过链上精度时截到链上精度，App 侧也有同样的断言
-	merged[0].DisplayDecimals = 40
 	items := bootstrapTokens(merged, []any{"bsc", 42})
 	if len(items) != 2 {
 		t.Fatalf("items = %v", items)
@@ -132,7 +130,8 @@ func TestBootstrapTokensFiltersAndShapes(t *testing.T) {
 	if !reflect.DeepEqual(keys, []string{"address", "chain", "decimals", "displayDecimals", "logoColor", "name", "symbol"}) {
 		t.Fatalf("bootstrap token keys = %v", keys)
 	}
-	if first["symbol"] != "BNB" || first["displayDecimals"] != 18 {
+	// 读路径原样下发，不再截断
+	if first["symbol"] != "BNB" || first["displayDecimals"] != 2 {
 		t.Fatalf("first = %v", first)
 	}
 	if items[1].(gin.H)["symbol"] != "USDT" {
@@ -434,5 +433,36 @@ func TestApplyTokenPatchRequiresALogoColor(t *testing.T) {
 	}
 	if updated, err := applyTokenPatch(row, tokenPatch{}); err != nil || updated.LogoColor != "#26A17B" {
 		t.Fatalf("a patch that leaves the colour alone must pass: %v", err)
+	}
+}
+
+func TestValidateDeliveredTokensRefusesCorruptRowsAndMissingNatives(t *testing.T) {
+	good := []tokenRecord{
+		seedRecord(1, "0", "bsc", "native", "BNB", 18, 1000, true),
+		seedRecord(2, "0", "bsc", bscUSDT, "USDT", 18, 900, true),
+	}
+	if err := validateDeliveredTokens(good, []any{"bsc"}); err != nil {
+		t.Fatalf("valid catalogue rejected: %v", err)
+	}
+	// 读路径不截断：展示精度越界就是事故，整份 bootstrap 失败
+	bad := append([]tokenRecord{}, good...)
+	bad[1].DisplayDecimals = 40
+	if err := validateDeliveredTokens(bad, []any{"bsc"}); err == nil {
+		t.Fatal("displayDecimals above decimals must be refused")
+	}
+	bad = append([]tokenRecord{}, good...)
+	bad[1].LogoColor = ""
+	if err := validateDeliveredTokens(bad, []any{"bsc"}); err == nil {
+		t.Fatal("an empty logoColor must be refused")
+	}
+	// 启用的链必须有启用的原生币
+	if err := validateDeliveredTokens(good, []any{"bsc", "eth"}); err == nil {
+		t.Fatal("an enabled chain without a native token must be refused")
+	}
+	// 停用的坏行不影响下发
+	disabled := append([]tokenRecord{}, good...)
+	disabled[1].Enabled, disabled[1].DisplayDecimals = false, 40
+	if err := validateDeliveredTokens(disabled, []any{"bsc"}); err != nil {
+		t.Fatalf("a disabled row must not block delivery: %v", err)
 	}
 }
