@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -33,10 +34,80 @@ type predictService struct {
 	Domain  string `json:"domain"`
 	ScopeID string `json:"scopeId"`
 	Chain   string `json:"chain"`
+	// 逐服务的地址覆盖（可选）。平台部署方不一定按 gamma-api.{domain} 这类子域规则摆服务
+	//（平台前端 user-dapp 也允许用 *_API_URL 逐个指定），这里没填的项 App 按域名规则派生。
+	Endpoints map[string]string `json:"endpoints,omitempty"`
 }
 
+// predictEndpointKeys 是可覆盖的六个服务；键名与 App 的 platformHosts 一致。
+var predictEndpointKeys = map[string]bool{"gamma": true, "clob": true, "clobWs": true, "data": true, "relayer": true, "faucet": true}
+
 func (p predictService) asMap() map[string]any {
-	return map[string]any{"domain": p.Domain, "scopeId": p.ScopeID, "chain": p.Chain}
+	out := map[string]any{"domain": p.Domain, "scopeId": p.ScopeID, "chain": p.Chain}
+	if len(p.Endpoints) > 0 {
+		endpoints := map[string]any{}
+		for key, value := range p.Endpoints {
+			endpoints[key] = value
+		}
+		out["endpoints"] = endpoints
+	}
+	return out
+}
+
+// gammaBase 是 gamma 服务的基址：覆盖优先，否则按规则派生。测试连接与 App 用同一条规则。
+func gammaBase(p predictService) string {
+	if value, ok := p.Endpoints["gamma"]; ok {
+		return value
+	}
+	return "https://gamma-api." + p.Domain
+}
+
+// parsePredictEndpoint 校验并归一化一个服务基址：https://（clobWs 用 wss://）+ 主机[:端口][/路径]，
+// 不带用户信息、查询串与 #；主机转小写，去掉末尾的 /。
+func parsePredictEndpoint(key, raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
+		return "", fmt.Errorf("services.predict.endpoints.%s must be an absolute URL such as https://host[:port][/path]", key)
+	}
+	want := "https"
+	if key == "clobWs" {
+		want = "wss"
+	}
+	if parsed.Scheme != want {
+		return "", fmt.Errorf("services.predict.endpoints.%s must use %s://", key, want)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return "", fmt.Errorf("services.predict.endpoints.%s must not carry credentials, a query string or a fragment", key)
+	}
+	host := strings.ToLower(parsed.Host)
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	return want + "://" + host + path, nil
+}
+
+// parsePredictEndpoints 校验 endpoints 段：只认识六个键，空串视为"不覆盖"。
+func parsePredictEndpoints(raw any) (map[string]string, error) {
+	section := object(raw)
+	if section == nil {
+		return nil, errors.New("services.predict.endpoints must be an object")
+	}
+	out := map[string]string{}
+	for key, value := range section {
+		if !predictEndpointKeys[key] {
+			return nil, fmt.Errorf("services.predict.endpoints.%s is not a known service (gamma, clob, clobWs, data, relayer, faucet)", key)
+		}
+		if strings.TrimSpace(text(value, "")) == "" {
+			continue
+		}
+		normalized, err := parsePredictEndpoint(key, text(value, ""))
+		if err != nil {
+			return nil, err
+		}
+		out[key] = normalized
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func predictNetwork(id string) *evmNetwork {
@@ -66,7 +137,15 @@ func parsePredictService(raw any) (predictService, error) {
 	if predictNetwork(chain) == nil {
 		return predictService{}, fmt.Errorf("services.predict.chain %q is not in the platform chain catalog", chain)
 	}
-	return predictService{Domain: domain, ScopeID: scopeID, Chain: chain}, nil
+	service := predictService{Domain: domain, ScopeID: scopeID, Chain: chain}
+	if raw, present := item["endpoints"]; present && raw != nil {
+		endpoints, err := parsePredictEndpoints(raw)
+		if err != nil {
+			return predictService{}, err
+		}
+		service.Endpoints = endpoints
+	}
+	return service, nil
 }
 
 // parseServicesSection 校验管理端写入的 services 段。只认识 predict；不认识的键拒绝，
@@ -149,9 +228,9 @@ func predictServiceFor(modules, services, wallet map[string]any) (*predictServic
 	return nil, fmt.Errorf("services.predict.chain %q is not among the tenant's enabled chains", predict.Chain)
 }
 
-// gammaPublicInfoURL 按平台规则派生 public-info 地址；测试替换它指向本地服务。
-var gammaPublicInfoURL = func(domain string) string {
-	return "https://gamma-api." + domain + "/public-info"
+// gammaPublicInfoURL 是 public-info 地址：gamma 基址（覆盖或派生）+ /public-info；测试替换它指向本地服务。
+var gammaPublicInfoURL = func(predict predictService) string {
+	return gammaBase(predict) + "/public-info"
 }
 
 var predictProbeHTTP = &http.Client{Timeout: 10 * time.Second}
@@ -161,22 +240,27 @@ var predictProbeHTTP = &http.Client{Timeout: 10 * time.Second}
 // 这两个字段决定用户凭证发往哪里。
 func (s *server) probePredictService(c *gin.Context) {
 	var body struct {
-		Domain  string `json:"domain"`
-		ScopeID string `json:"scopeId"`
-		Chain   string `json:"chain"`
+		Domain    string         `json:"domain"`
+		ScopeID   string         `json:"scopeId"`
+		Chain     string         `json:"chain"`
+		Endpoints map[string]any `json:"endpoints"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, 400, "INVALID_SERVICES_CONFIG", "domain, scopeId and chain are required")
 		return
 	}
-	predict, err := parsePredictService(map[string]any{"domain": body.Domain, "scopeId": body.ScopeID, "chain": body.Chain})
+	raw := map[string]any{"domain": body.Domain, "scopeId": body.ScopeID, "chain": body.Chain}
+	if len(body.Endpoints) > 0 {
+		raw["endpoints"] = body.Endpoints
+	}
+	predict, err := parsePredictService(raw)
 	if err != nil {
 		problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, gammaPublicInfoURL(predict.Domain), nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, gammaPublicInfoURL(predict), nil)
 	if err != nil {
 		problem(c, 400, "INVALID_SERVICES_CONFIG", "domain cannot be turned into a request")
 		return
@@ -185,12 +269,12 @@ func (s *server) probePredictService(c *gin.Context) {
 	request.Header.Set("Accept", "application/json")
 	response, err := predictProbeHTTP.Do(request)
 	if err != nil {
-		problem(c, 502, "PREDICT_PROBE_FAILED", "gamma-api."+predict.Domain+" is unreachable: "+err.Error())
+		problem(c, 502, "PREDICT_PROBE_FAILED", gammaBase(predict)+" is unreachable: "+err.Error())
 		return
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		problem(c, 502, "PREDICT_PROBE_FAILED", fmt.Sprintf("gamma-api.%s answered HTTP %d for /public-info", predict.Domain, response.StatusCode))
+		problem(c, 502, "PREDICT_PROBE_FAILED", fmt.Sprintf("%s answered HTTP %d for /public-info", gammaBase(predict), response.StatusCode))
 		return
 	}
 	var info struct {

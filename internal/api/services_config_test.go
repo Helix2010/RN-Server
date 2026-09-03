@@ -37,6 +37,62 @@ func TestParsePredictServiceNormalizesAndRejects(t *testing.T) {
 	}
 }
 
+func TestParsePredictServiceEndpoints(t *testing.T) {
+	raw := predictConfig("predict.prax1s.xyz", testScope, "op-sepolia")
+	raw["endpoints"] = map[string]any{
+		"clob":   " https://CLOB.Example.net:8443/api/ ",
+		"clobWs": "wss://ws.example.net",
+		"gamma":  "",
+	}
+	got, err := parsePredictService(raw)
+	if err != nil {
+		t.Fatalf("valid endpoints rejected: %v", err)
+	}
+	// 主机转小写、末尾 / 去掉、空串不算覆盖
+	if got.Endpoints["clob"] != "https://clob.example.net:8443/api" || got.Endpoints["clobWs"] != "wss://ws.example.net" || len(got.Endpoints) != 2 {
+		t.Fatalf("endpoints = %+v", got.Endpoints)
+	}
+	if gammaBase(got) != "https://gamma-api.predict.prax1s.xyz" {
+		t.Fatalf("gamma must be derived when not overridden, got %s", gammaBase(got))
+	}
+	got.Endpoints["gamma"] = "https://gamma.example.net"
+	if gammaBase(got) != "https://gamma.example.net" || gammaPublicInfoURL(got) != "https://gamma.example.net/public-info" {
+		t.Fatalf("gamma override must drive the probe, got %s", gammaPublicInfoURL(got))
+	}
+	if delivered := got.asMap()["endpoints"].(map[string]any); delivered["clob"] != "https://clob.example.net:8443/api" {
+		t.Fatalf("asMap must deliver endpoints, got %v", delivered)
+	}
+	if _, ok := parseOnly(predictConfig("predict.prax1s.xyz", testScope, "op-sepolia")).asMap()["endpoints"]; ok {
+		t.Fatal("asMap must omit endpoints when none are configured")
+	}
+	for name, endpoints := range map[string]map[string]any{
+		"http scheme":         {"gamma": "http://gamma.example.net"},
+		"https for the ws":    {"clobWs": "https://ws.example.net"},
+		"query string":        {"data": "https://data.example.net/?x=1"},
+		"fragment":            {"relayer": "https://relayer.example.net/#x"},
+		"credentials":         {"faucet": "https://user:pw@faucet.example.net"},
+		"unknown service":     {"gama": "https://gamma.example.net"},
+		"not an object":       nil,
+		"missing host":        {"clob": "https:///api"},
+		"bare host no scheme": {"clob": "clob.example.net"},
+	} {
+		raw := predictConfig("predict.prax1s.xyz", testScope, "op-sepolia")
+		if endpoints == nil {
+			raw["endpoints"] = "https://gamma.example.net"
+		} else {
+			raw["endpoints"] = endpoints
+		}
+		if _, err := parsePredictService(raw); err == nil {
+			t.Errorf("%s must be rejected", name)
+		}
+	}
+}
+
+func parseOnly(raw map[string]any) predictService {
+	service, _ := parsePredictService(raw)
+	return service
+}
+
 func TestParseServicesSectionRejectsUnknownService(t *testing.T) {
 	if _, err := parseServicesSection(map[string]any{"predikt": predictConfig("predict.prax1s.xyz", testScope, "op-sepolia")}); err == nil {
 		t.Fatal("a misspelled service key must not be stored silently")
@@ -88,7 +144,7 @@ func probeWith(t *testing.T, publicInfo any, status int, body map[string]any) (i
 	}))
 	defer upstream.Close()
 	previous := gammaPublicInfoURL
-	gammaPublicInfoURL = func(string) string { return upstream.URL + "/public-info" }
+	gammaPublicInfoURL = func(predictService) string { return upstream.URL + "/public-info" }
 	defer func() { gammaPublicInfoURL = previous }()
 
 	gin.SetMode(gin.TestMode)
