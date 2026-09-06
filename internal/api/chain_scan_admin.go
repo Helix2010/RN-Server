@@ -90,6 +90,7 @@ func scanConfigViewOf(cfg scan.ChainConfig) scanConfigView {
 
 type scanStateView struct {
 	ScannedToBlock uint64                `json:"scannedToBlock"`
+	ScannedToTime  *string               `json:"scannedToTime"`
 	ScannedToHash  string                `json:"scannedToHash"`
 	HeadBlock      uint64                `json:"headBlock"`
 	LagBlocks      uint64                `json:"lagBlocks"`
@@ -108,6 +109,10 @@ type scanStateView struct {
 func scanStateViewOf(state scan.ChainState) scanStateView {
 	view := scanStateView{ScannedToBlock: state.ScannedToBlock, ScannedToHash: state.ScannedToHash, HeadBlock: state.HeadBlock, State: string(state.State), LeaseOwner: state.LeaseOwner,
 		LastError: state.LastError, ErrorCount: state.ErrorCount, ReorgCount: state.ReorgCount, EndpointHealth: state.EndpointHealth, Jobs: state.Jobs, OpenAlerts: state.OpenAlerts, UpdatedAt: iso(state.UpdatedAt)}
+	if state.ScannedToTime != nil {
+		text := iso(*state.ScannedToTime)
+		view.ScannedToTime = &text
+	}
 	if state.HeadBlock > state.ScannedToBlock {
 		view.LagBlocks = state.HeadBlock - state.ScannedToBlock
 	}
@@ -659,11 +664,14 @@ func (s *server) tenantIndexStatus(c *gin.Context) {
 	chains, _ := wallet["chains"].([]any)
 	for _, raw := range chains {
 		chain, _ := raw.(string)
-		item := gin.H{"chain": chain, "indexed": onchain, "state": "unconfigured", "lagBlocks": 0, "headBlock": 0, "scannedToBlock": 0, "rows24h": 0, "updatedAt": nil}
+		item := gin.H{"chain": chain, "indexed": onchain, "state": "unconfigured", "lagBlocks": 0, "headBlock": 0, "scannedToBlock": 0, "scannedToTime": nil, "rows24h": 0, "updatedAt": nil}
 		if state, ok := states[chain]; ok && onchain {
 			item["state"] = string(state.State)
 			item["headBlock"] = state.HeadBlock
 			item["scannedToBlock"] = state.ScannedToBlock
+			if state.ScannedToTime != nil {
+				item["scannedToTime"] = iso(*state.ScannedToTime)
+			}
 			if state.HeadBlock > state.ScannedToBlock {
 				item["lagBlocks"] = state.HeadBlock - state.ScannedToBlock
 			}

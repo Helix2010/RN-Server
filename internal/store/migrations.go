@@ -975,6 +975,7 @@ func chainScanIndexerMigration(ctx context.Context, db *sql.DB) error {
 			chain VARCHAR(32) NOT NULL COMMENT '链 id，与平台链目录 supportedNetworks 及 app_configs 的 chain-scan.<chain> 一致',
 			scanned_to_block BIGINT UNSIGNED NOT NULL COMMENT '已完整索引到的区块号（含）；与记录同一事务推进，是追块的唯一断点',
 			scanned_to_hash CHAR(66) NOT NULL COMMENT 'scanned_to_block 的区块哈希；每轮核对，不一致即判定重组',
+			scanned_to_time DATETIME(3) NULL COMMENT 'scanned_to_block 的区块时间戳（UTC），来自链、随游标同一事务写；移动端"落后秒数"= now − 该值，是唯一来源；NULL 表示尚未推进过游标',
 			head_block BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '最近一次从端点观察到的链头区块号，用于计算落后',
 			state ENUM('idle','scanning','catching_up','stalled','paused','unconfigured') NOT NULL COMMENT '运行状态：idle 追平等待；scanning 正在扫本轮；catching_up 落后追块中；stalled 全部端点不可用；paused 手动暂停；unconfigured 配置行不存在或 enabled=false',
 			lease_owner VARCHAR(80) NOT NULL DEFAULT '' COMMENT '持有租约的索引器实例标识（主机名+进程 id）；空表示无人持有',

@@ -61,8 +61,9 @@ type Store interface {
 	ReleaseLease(ctx context.Context, chain, owner string) error
 	Watched(ctx context.Context, chain string, tenants []uint64) ([]Watched, error)
 	Tokens(ctx context.Context, chain string) ([]string, error)
-	// CommitSlice 同一事务写记录并推进游标（toBlock=0 表示只写记录不动游标）。
-	CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string) error
+	// CommitSlice 同一事务写记录并推进游标（toBlock=0 表示只写记录不动游标）；
+	// toTime 是 toBlock 的链上时间戳，移动端据它算"落后秒数"。
+	CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error
 	SaveBalances(ctx context.Context, chain string, updates map[WatchKey]BalanceSnapshot) error
 	MarkOrphaned(ctx context.Context, chain string, afterBlock uint64) error
 	InsertAudit(ctx context.Context, action, chain string, summary map[string]any) error
@@ -144,7 +145,7 @@ func (s *SQLStore) Tokens(ctx context.Context, chain string) ([]string, error) {
 
 const insertBatch = 200
 
-func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string) error {
+func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -175,7 +176,7 @@ func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, to
 		}
 	}
 	if toBlock > 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE chain_scan_state SET scanned_to_block=?,scanned_to_hash=?,updated_at=? WHERE chain=?`, toBlock, toHash, now, chain); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE chain_scan_state SET scanned_to_block=?,scanned_to_hash=?,scanned_to_time=?,updated_at=? WHERE chain=?`, toBlock, toHash, toTime.UTC(), now, chain); err != nil {
 			return err
 		}
 	}

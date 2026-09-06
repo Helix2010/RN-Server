@@ -89,6 +89,8 @@ type ChainState struct {
 	Chain          string
 	ScannedToBlock uint64
 	ScannedToHash  string
+	// ScannedToTime 游标区块的链上时间戳；nil = 尚未推进过游标。
+	ScannedToTime  *time.Time
 	HeadBlock      uint64
 	State          State
 	LeaseOwner     string

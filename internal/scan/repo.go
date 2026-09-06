@@ -95,10 +95,10 @@ var ErrVersionConflict = errors.New("chain scan config version conflict")
 // LoadState 读一条链的运行状态；不存在返回 sql.ErrNoRows。
 func LoadState(ctx context.Context, db Querier, chain string) (ChainState, error) {
 	var state ChainState
-	var leaseUntil sql.NullTime
+	var leaseUntil, scannedToTime sql.NullTime
 	var health, jobs, alerts []byte
-	err := db.QueryRowContext(ctx, `SELECT chain,scanned_to_block,scanned_to_hash,head_block,state,lease_owner,lease_until,last_error,error_count,reorg_count,endpoint_health,jobs,open_alerts,updated_at FROM chain_scan_state WHERE chain=?`, chain).Scan(
-		&state.Chain, &state.ScannedToBlock, &state.ScannedToHash, &state.HeadBlock, &state.State, &state.LeaseOwner, &leaseUntil,
+	err := db.QueryRowContext(ctx, `SELECT chain,scanned_to_block,scanned_to_hash,scanned_to_time,head_block,state,lease_owner,lease_until,last_error,error_count,reorg_count,endpoint_health,jobs,open_alerts,updated_at FROM chain_scan_state WHERE chain=?`, chain).Scan(
+		&state.Chain, &state.ScannedToBlock, &state.ScannedToHash, &scannedToTime, &state.HeadBlock, &state.State, &state.LeaseOwner, &leaseUntil,
 		&state.LastError, &state.ErrorCount, &state.ReorgCount, &health, &jobs, &alerts, &state.UpdatedAt)
 	if err != nil {
 		return ChainState{}, err
@@ -106,6 +106,10 @@ func LoadState(ctx context.Context, db Querier, chain string) (ChainState, error
 	if leaseUntil.Valid {
 		t := leaseUntil.Time
 		state.LeaseUntil = &t
+	}
+	if scannedToTime.Valid {
+		t := scannedToTime.Time.UTC()
+		state.ScannedToTime = &t
 	}
 	if err := decodeJSON(health, &state.EndpointHealth); err != nil {
 		return ChainState{}, fmt.Errorf("chain_scan_state.%s endpoint_health: %w", chain, err)

@@ -1452,6 +1452,61 @@
           }
         }
       }
+    },
+    "/v1/mobile/wallet/transfers": {
+      "get": {
+        "summary": "钱包会话地址的链上转账记录（平台扫链索引，只含 confirmed）与每链索引进度",
+        "description": "鉴权 Authorization: Wallet <token>。记录来自 wallet_transfer_index，是唯一正式来源；App 与本机转出账本按 (chain, txHash) 合并。index 覆盖租户启用的每条链：租户未开 onchainSends、平台未配置或已关闭该链时为 unconfigured。lagSeconds = now − 游标区块的链上时间。",
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "只取这条链；必须是平台链目录里的 id"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "上一页返回的 nextCursor；不传取第一页"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "记录页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletTransfersResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_TRANSFER_QUERY（chain 不在目录或 limit 越界）/ INVALID_TRANSFER_CURSOR（游标损坏）"
+          },
+          "401": {
+            "description": "WALLET_SESSION_REQUIRED / WALLET_SESSION_INVALID"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1946,6 +2001,191 @@
           "expectedVersion": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      },
+      "WalletTransferToken": {
+        "description": "记录对应代币的目录元数据（chain_token_catalog，租户覆盖行优先）；App 用它显示符号与精度",
+        "type": "object",
+        "required": [
+          "address",
+          "symbol",
+          "name",
+          "decimals",
+          "displayDecimals",
+          "logoColor"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "合约地址（EIP-55）；原生币为 native"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "decimals": {
+            "type": "integer"
+          },
+          "displayDecimals": {
+            "type": "integer"
+          },
+          "logoColor": {
+            "type": "string"
+          }
+        }
+      },
+      "WalletTransferItem": {
+        "type": "object",
+        "required": [
+          "chain",
+          "direction",
+          "asset",
+          "contractAddress",
+          "amountRaw",
+          "counterparty",
+          "txHash",
+          "logIndex",
+          "blockNumber",
+          "blockTime",
+          "attribution",
+          "token"
+        ],
+        "properties": {
+          "chain": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "in",
+              "out"
+            ],
+            "description": "in 入账（to = 本地址）；out 出账（from = 本地址）"
+          },
+          "asset": {
+            "type": "string",
+            "enum": [
+              "native",
+              "erc20"
+            ]
+          },
+          "contractAddress": {
+            "type": "string",
+            "description": "代币合约地址（EIP-55）；原生币为 native"
+          },
+          "amountRaw": {
+            "type": "string",
+            "description": "最小单位整数，十进制字符串"
+          },
+          "counterparty": {
+            "type": "string",
+            "description": "对手方地址（小写）；unattributed 为空"
+          },
+          "txHash": {
+            "type": "string",
+            "description": "交易哈希；unattributed 为空"
+          },
+          "logIndex": {
+            "type": "integer",
+            "description": "ERC-20 为日志序号；原生币为交易序号；unattributed 为 -1"
+          },
+          "blockNumber": {
+            "type": "integer"
+          },
+          "blockTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "区块时间戳（UTC）"
+          },
+          "attribution": {
+            "type": "string",
+            "enum": [
+              "tx",
+              "unattributed"
+            ],
+            "description": "tx 已定位到交易；unattributed 只有余额差额（balance 模式），来源待后台任务定位"
+          },
+          "token": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WalletTransferToken"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "目录里找不到该合约时为 null（币已从目录删除）"
+          }
+        }
+      },
+      "WalletTransferIndex": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "idle",
+              "scanning",
+              "catching_up",
+              "stalled",
+              "paused",
+              "unconfigured"
+            ]
+          },
+          "block": {
+            "type": "integer",
+            "description": "已索引到的区块（含）"
+          },
+          "headBlock": {
+            "type": "integer"
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "已索引到的区块的链上时间"
+          },
+          "lagSeconds": {
+            "type": "integer",
+            "description": "now − time；App 超过 600 秒才提示落后"
+          }
+        }
+      },
+      "WalletTransfersResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "nextCursor",
+          "index"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WalletTransferItem"
+            }
+          },
+          "nextCursor": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "index": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/WalletTransferIndex"
+            },
+            "description": "键是租户启用的链 id"
           }
         }
       }

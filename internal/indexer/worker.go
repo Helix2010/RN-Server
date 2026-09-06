@@ -226,10 +226,12 @@ func (w *Worker) Round(ctx context.Context) error {
 		if err != nil {
 			return w.fail(ctx, err)
 		}
-		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, to, tip.Hash); err != nil {
+		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, to, tip.Hash, tip.Time); err != nil {
 			return w.fail(ctx, err)
 		}
 		w.state.ScannedToBlock, w.state.ScannedToHash = to, tip.Hash
+		tipTime := tip.Time
+		w.state.ScannedToTime = &tipTime
 		if len(rows) > 0 {
 			w.log.Info("slice committed", "from", from, "to", to, "rows", len(rows), "endpoint", w.pool.Current())
 		}
@@ -305,11 +307,13 @@ func (w *Worker) checkReorg(ctx context.Context) error {
 	if err := w.store.MarkOrphaned(ctx, w.cfg.Chain, back); err != nil {
 		return err
 	}
-	if err := w.store.CommitSlice(ctx, w.cfg.Chain, nil, back, anchor.Hash); err != nil {
+	if err := w.store.CommitSlice(ctx, w.cfg.Chain, nil, back, anchor.Hash, anchor.Time); err != nil {
 		return err
 	}
 	w.log.Warn("reorg detected", "cursor", w.state.ScannedToBlock, "expected", w.state.ScannedToHash, "got", current.Hash, "rolledBackTo", back)
 	w.state.ScannedToBlock, w.state.ScannedToHash = back, anchor.Hash
+	anchorTime := anchor.Time
+	w.state.ScannedToTime = &anchorTime
 	w.state.ReorgCount++
 	w.raise(ctx, scan.AlertReorg, fmt.Sprintf("reorg at block %d, rolled back to %d", current.Number, back))
 	_ = w.store.InsertAudit(ctx, "chain_scan.reorg", w.cfg.Chain, map[string]any{"at": current.Number, "rolledBackTo": back})
@@ -650,7 +654,7 @@ func (w *Worker) balanceRound(ctx context.Context, confirmed uint64) error {
 		}
 	}
 	if len(rows) > 0 {
-		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, ""); err != nil {
+		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, "", time.Time{}); err != nil {
 			return err
 		}
 		w.log.Info("balance round committed", "rows", len(rows))

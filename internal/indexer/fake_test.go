@@ -331,7 +331,7 @@ func (m *memStore) Tokens(_ context.Context, _ string) ([]string, error) {
 	return append([]string(nil), m.tokens...), nil
 }
 
-func (m *memStore) CommitSlice(_ context.Context, chain string, rows []Row, toBlock uint64, toHash string) error {
+func (m *memStore) CommitSlice(_ context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, row := range rows {
@@ -348,6 +348,8 @@ func (m *memStore) CommitSlice(_ context.Context, chain string, rows []Row, toBl
 	if toBlock > 0 {
 		state := m.states[chain]
 		state.ScannedToBlock, state.ScannedToHash = toBlock, toHash
+		at := toTime
+		state.ScannedToTime = &at
 		m.states[chain] = state
 	}
 	return nil

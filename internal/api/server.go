@@ -116,6 +116,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.POST("/v1/mobile/auth/verify", s.domainTenantScope(), s.walletAuthVerify)
 	r.GET("/v1/mobile/auth/session", s.domainTenantScope(), s.walletAuthSession)
 	r.POST("/v1/mobile/auth/logout", s.domainTenantScope(), s.walletAuthLogout)
+	r.GET("/v1/mobile/wallet/transfers", s.domainTenantScope(), s.walletTransfers)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
 	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)

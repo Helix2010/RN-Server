@@ -25,6 +25,7 @@ wallet_transfer_index.contract_address           ──▶ chain_token_catalog.c
 ## 不变量
 
 - 游标只在写记录的同一事务里推进；`scanned_to_hash` 每轮核对，不符即回退 `confirmations` 块并把 `block_number >` 回退点的行标 `orphaned`。
+- `scanned_to_time` 与游标同一事务写，是游标区块的链上时间戳；移动端 `index[chain].lagSeconds = now − scanned_to_time`，"落后多久"只从它算，不用出块时间估算。
 - 唯一键 `uq_transfer(tenant_id, chain, tx_hash, log_index, address_key, direction, block_number)`：重扫不重复；`unattributed` 行 `tx_hash=''`、`log_index=-1`，同一区间只会有一条。
 - 监听集合不落表：`wallet_user(status='active')` × 租户 `mobile-bootstrap.wallet`（`onchainSends=true` 且 `chains` 含该链）。
 - 端点明文只在 `app_configs` 密文与 indexer 内存里；`endpoint_health.urlHash` 是 SHA-256。
