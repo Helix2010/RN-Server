@@ -375,7 +375,7 @@ func (s *server) login(c *gin.Context) {
 	}
 	http.SetCookie(c.Writer, &http.Cookie{Name: "rn_admin_session", Value: token, Path: "/v1/admin", MaxAge: s.cfg.AdminSessionTTL, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
 	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"authenticated": true, "actorId": s.cfg.AdminUsername, "expiresAt": iso(expires), "method": "session"})
+	c.JSON(200, gin.H{"authenticated": true, "platformAdmin": s.isPlatformAdmin(s.cfg.AdminUsername), "actorId": s.cfg.AdminUsername, "expiresAt": iso(expires), "method": "session"})
 }
 
 func (s *server) session(c *gin.Context) {
