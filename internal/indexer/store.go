@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -63,8 +64,9 @@ type Store interface {
 	Watched(ctx context.Context, chain string, tenants []uint64) ([]Watched, error)
 	Tokens(ctx context.Context, chain string) ([]string, error)
 	// CommitSlice 同一事务写记录并推进游标（toBlock=0 表示只写记录不动游标）；
-	// toTime 是 toBlock 的链上时间戳，移动端据它算"落后秒数"。
-	CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error
+	// toTime 是 toBlock 的链上时间戳，移动端据它算"落后秒数"。notify 为真时，首次写入的
+	// in 行给该地址会话所在的安装入队 wallet.transfer.received 推送（重扫任务不推）。
+	CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time, notify bool) error
 	SaveBalances(ctx context.Context, chain string, updates map[WatchKey]BalanceSnapshot) error
 	MarkOrphaned(ctx context.Context, chain string, afterBlock uint64) error
 	InsertAudit(ctx context.Context, action, chain string, summary map[string]any) error
@@ -76,7 +78,11 @@ type Store interface {
 }
 
 // SQLStore 是 MySQL 实现。
-type SQLStore struct{ DB *sql.DB }
+type SQLStore struct {
+	DB *sql.DB
+	// ChainName 链 id → 显示名（推送文案的 {chain}）；nil 时用 id。
+	ChainName func(chain string) string
+}
 
 func (s *SQLStore) LoadState(ctx context.Context, chain string) (scan.ChainState, error) {
 	return scan.LoadState(ctx, s.DB, chain)
@@ -151,15 +157,37 @@ func (s *SQLStore) Tokens(ctx context.Context, chain string) ([]string, error) {
 
 const insertBatch = 200
 
-func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error {
+func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time, notify bool) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
+	var fresh []Row
+	if notify {
+		// 写入前判断哪些入账是第一次见：ON DUPLICATE KEY UPDATE 之后就分不清了
+		for _, row := range rows {
+			if row.Direction != "in" {
+				continue
+			}
+			var one int
+			err := tx.QueryRowContext(ctx, `SELECT 1 FROM wallet_transfer_index WHERE tenant_id=? AND chain=? AND tx_hash=? AND log_index=? AND address_key=? AND direction='in' AND block_number=? LIMIT 1`,
+				row.TenantID, row.Chain, row.TxHash, row.LogIndex, row.AddressKey, row.BlockNumber).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				fresh = append(fresh, row)
+			} else if err != nil {
+				return err
+			}
+		}
+	}
 	if err := insertRows(ctx, tx, rows, now); err != nil {
 		return err
+	}
+	for _, row := range fresh {
+		if err := s.enqueueReceipt(ctx, tx, row, now); err != nil {
+			return err
+		}
 	}
 	if toBlock > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE chain_scan_state SET scanned_to_block=?,scanned_to_hash=?,scanned_to_time=?,updated_at=? WHERE chain=?`, toBlock, toHash, toTime.UTC(), now, chain); err != nil {
@@ -167,6 +195,50 @@ func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, to
 		}
 	}
 	return tx.Commit()
+}
+
+// enqueueReceipt 给收款地址当前有效会话所在的安装入队推送（设计 §4.10）。没有关联安装的
+// 会话（旧版本 App 登录的）收不到定向推送；代币不在目录时没有符号与精度可显示，不推。
+func (s *SQLStore) enqueueReceipt(ctx context.Context, tx *sql.Tx, row Row, now time.Time) error {
+	cursor, err := tx.QueryContext(ctx, `SELECT DISTINCT s.installation_id FROM wallet_session s JOIN wallet_user u ON u.id=s.user_id WHERE s.tenant_id=? AND u.address_key=? AND s.revoked_at IS NULL AND s.expires_at>? AND s.installation_id IS NOT NULL AND s.installation_id<>''`,
+		row.TenantID, row.AddressKey, now)
+	if err != nil {
+		return err
+	}
+	var installations []string
+	for cursor.Next() {
+		var id string
+		if err := cursor.Scan(&id); err != nil {
+			cursor.Close()
+			return err
+		}
+		installations = append(installations, id)
+	}
+	cursor.Close()
+	if len(installations) == 0 {
+		return nil
+	}
+	var symbol string
+	var decimals, display int
+	err = tx.QueryRowContext(ctx, `SELECT symbol,decimals,display_decimals FROM chain_token_catalog WHERE chain=? AND contract_address=? AND tenant_id IN (0,?) AND deleted=0 ORDER BY tenant_id DESC LIMIT 1`,
+		row.Chain, row.Contract, row.TenantID).Scan(&symbol, &decimals, &display)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	chainName := row.Chain
+	if s.ChainName != nil {
+		chainName = s.ChainName(row.Chain)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"chain": row.Chain, "chainName": chainName, "addressKey": row.AddressKey, "symbol": symbol, "decimals": decimals, "displayDecimals": display,
+		"amountRaw": row.AmountRaw, "txHash": row.TxHash, "attribution": row.Attribution, "targetInstallationIds": installations,
+	})
+	_, err = tx.ExecContext(ctx, `INSERT INTO app_push_outbox(id,tenant_id,event_type,payload,status,attempts,next_attempt_at,created_at,updated_at) VALUES(?,?,'wallet.transfer.received',?,'pending',0,?,?,?)`,
+		"push_"+randomID(16), row.TenantID, payload, now, now, now)
+	return err
 }
 
 // insertRows 批量写记录。撞唯一键时不是忽略而是刷新：重组后同一笔交易回到同一区块号

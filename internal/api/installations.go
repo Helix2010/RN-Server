@@ -248,24 +248,36 @@ func (s *server) saveInstallation(c *gin.Context, body installationHeartbeat, cr
 }
 
 func (s *server) authenticateInstallation(c *gin.Context, installationID string) (installationCredentialRecord, bool) {
+	record, code := s.verifyInstallationCredential(c, installationID)
+	switch code {
+	case "":
+		return record, true
+	case "INSTALLATION_CREDENTIAL_REQUIRED":
+		problem(c, 401, code, "Installation credential is required")
+	default:
+		problem(c, 401, code, "Installation credential is invalid, expired or revoked")
+	}
+	return record, false
+}
+
+// verifyInstallationCredential 校验 `Authorization: Installation <credential>`，返回失败码
+// （空表示通过）。不直接写响应，给"可选携带安装身份"的接口（钱包登录）复用。
+func (s *server) verifyInstallationCredential(c *gin.Context, installationID string) (installationCredentialRecord, string) {
 	var record installationCredentialRecord
 	credential := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Installation "))
-	if credential == "" {
-		problem(c, 401, "INSTALLATION_CREDENTIAL_REQUIRED", "Installation credential is required")
-		return record, false
+	if credential == "" || credential == strings.TrimSpace(c.GetHeader("Authorization")) {
+		return record, "INSTALLATION_CREDENTIAL_REQUIRED"
 	}
 	err := s.db.QueryRowContext(c.Request.Context(), `SELECT credential_hash,credential_version,credential_expires_at,credential_revoked_at,application_id,platform,status FROM app_installations WHERE tenant_id=? AND installation_id=? LIMIT 1`, tenantID(c), installationID).Scan(&record.Hash, &record.Version, &record.ExpiresAt, &record.RevokedAt, &record.ApplicationID, &record.Platform, &record.Status)
 	if err != nil || record.RevokedAt.Valid || record.Status == "revoked" || record.ExpiresAt.Before(time.Now().UTC()) || record.ApplicationID != text(c.GetHeader("x-application-id"), "unknown") || record.Platform != strings.ToLower(c.GetHeader("x-platform")) {
-		problem(c, 401, "INSTALLATION_CREDENTIAL_INVALID", "Installation credential is invalid, expired or revoked")
-		return record, false
+		return record, "INSTALLATION_CREDENTIAL_INVALID"
 	}
 	actual := sha256.Sum256([]byte(credential))
 	expected, err := hex.DecodeString(record.Hash)
 	if err != nil || len(expected) != len(actual) || subtle.ConstantTimeCompare(expected, actual[:]) != 1 {
-		problem(c, 401, "INSTALLATION_CREDENTIAL_INVALID", "Installation credential is invalid, expired or revoked")
-		return record, false
+		return record, "INSTALLATION_CREDENTIAL_INVALID"
 	}
-	return record, true
+	return record, ""
 }
 
 func newInstallationCredential() (string, string, error) {

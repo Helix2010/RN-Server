@@ -13,6 +13,7 @@ App 的钱包记录页只有本机发起的转出（RN-App `onchain-transfers.ts
 - **先复用再建表**（AGENTS.md「数据库表设计原则」）：配置复用 `app_configs`，历史（告警触发 / 恢复、重组、任务）复用 `audit_events`（actor `system-indexer`），监听集合派生自 `wallet_user` × 租户 `mobile-bootstrap.wallet`（`onchainSends=true` 且 `chains` 含该链，规则就是 `normalizeWallet`，indexer 不复制），只新增 `chain_scan_state`（每链一行：游标、状态、端点健康 JSON、任务 JSON、未恢复告警 JSON）与 `wallet_transfer_index`（唯一的数据表），加 `wallet_user.scan_state`、`wallet_session.installation_id` 两列。
 - **不遗漏**：记录与游标同一事务写入，唯一键幂等；任何中断从 `scanned_to_block+1` 追；每轮核对游标区块哈希，不符回退 `confirmations` 块并把区间行标 `orphaned`。
 - **后台任务与写入幂等**：`jobs` 只在 `scan.MutateJobs`（`SELECT … FOR UPDATE` 读改写）里动，`SaveState` 不再整份写回，管理端取消与 worker 进度互不覆盖；任务只在追平后执行、每轮 20 秒预算、只扫已确认区间。记录写入用 `INSERT … ON DUPLICATE KEY UPDATE`（刷新 `status='confirmed'`、区块哈希、时间、金额）而不是 `INSERT IGNORE`：重组后同一笔交易回到同一区块号时 orphaned 行能变回 confirmed，重扫也因此幂等。`attribute` 任务逐全区块定位原生币入账，按每条 `unattributed` 行自己的区间与地址扣减"新定位到的金额"，扣完即删。
+- **定向推送复用 outbox**：不加表、不加列——`app_push_outbox.payload.targetInstallationIds` 非空时 dispatcher 只投这些安装；安装来自 `wallet_session.installation_id`（登录时可选带安装凭证头，带了就必须有效，失效返回 401 让 App 丢弃凭证后重试）。入队在写记录的同一事务里，写入前先判断是否首次见到该 in 行，重扫 / 补归属不推；代币不在目录（没有符号与精度）不推。
 - **原生币两种声明式模式**：`blocks` 逐块读全部交易（精确、双向）；`balance` 用 Multicall3 `aggregate3(getEthBalance)` 读余额差，只有增加才对本轮区间扫块定位交易，扫不到的差额记 `attribution='unattributed'`（金额正确、来源待定），缺口超过 `nativeGapCap` 直接记差额并建 `attribute` 任务后台归属。
 - **端点策略**：按顺序取第一个健康端点、同一轮固定；连续 3 次失败进入冷却（30s × 2^n，上限 10 分钟）；`eth_chainId` 不符永久剔除；链头低于游标的落后节点跳过；每端点令牌桶限速；"跨度过大"不算失败，减半重试并计数。
 

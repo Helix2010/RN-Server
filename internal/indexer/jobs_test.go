@@ -67,9 +67,9 @@ func TestRescanJobRestoresRowsWithoutMovingTheCursor(t *testing.T) {
 	if !containsAudit(store.audits, "chain_scan.job_done") {
 		t.Fatalf("audits = %v", store.audits)
 	}
-	// 重扫是幂等的：同一笔不重复
-	if len(store.rows) != 2 {
-		t.Fatalf("rows after final round = %+v", store.rows)
+	// 重扫是幂等的：同一笔不重复，也不把补回来的记录当新入账推送
+	if len(store.rows) != 2 || len(store.receipts) != 2 {
+		t.Fatalf("rows after final round = %+v receipts = %d", store.rows, len(store.receipts))
 	}
 }
 

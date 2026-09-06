@@ -165,6 +165,17 @@ func (s *server) walletAuthVerify(c *gin.Context) {
 	}
 	address := siwe.ChecksumAddress(body.Address)
 	now := time.Now().UTC()
+	// 可选的安装身份（X-Installation-ID + Authorization: Installation <credential>）：
+	// 会话关联到这台安装，收款等用户级推送只发它。带了就必须有效——失效凭证不能悄悄当没带，
+	// 在核销 nonce 之前校验，App 丢掉失效凭证后可用同一挑战重试。
+	var installation any
+	if installationID := strings.TrimSpace(c.GetHeader("X-Installation-ID")); installationID != "" {
+		if _, code := s.verifyInstallationCredential(c, installationID); code != "" {
+			problem(c, 401, code, "Installation credential is invalid, expired or revoked")
+			return
+		}
+		installation = installationID
+	}
 
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -266,8 +277,8 @@ func (s *server) walletAuthVerify(c *gin.Context) {
 	}
 	sessionExpires := now.Add(walletSessionTTL)
 	if _, err := tx.ExecContext(c.Request.Context(),
-		`INSERT INTO wallet_session(id,tenant_id,user_id,token_hash,connector,chains,issued_at,expires_at,last_seen_at) VALUES(?,?,?,?,?,?,?,?,?)`,
-		"wses_"+randomID(16), tenantID(c), userID, tokenHash, connector, strings.Join(chains, ","), now, sessionExpires, now); err != nil {
+		`INSERT INTO wallet_session(id,tenant_id,user_id,token_hash,connector,chains,issued_at,expires_at,last_seen_at,installation_id) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		"wses_"+randomID(16), tenantID(c), userID, tokenHash, connector, strings.Join(chains, ","), now, sessionExpires, now, installation); err != nil {
 		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
 		return
 	}

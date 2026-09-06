@@ -47,6 +47,7 @@ var migrations = []migration{
 	{version: 31, name: "chain_token_logo_color_no_default", apply: chainTokenLogoColorNoDefaultMigration},
 	{version: 32, name: "chain_token_seed_monad", apply: chainTokenSeedMonadMigration},
 	{version: 33, name: "chain_scan_indexer", apply: chainScanIndexerMigration},
+	{version: 34, name: "wallet_received_push_copy", apply: walletReceivedPushCopyMigration},
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
@@ -271,6 +272,25 @@ func pushNotificationCopyMigration(ctx context.Context, db *sql.DB) error {
 	items := []struct{ lang, key, content, meta string }{
 		{"zh-CN", "update.localizationTitle", "语言资源已更新", "推送标题"}, {"zh-CN", "update.localizationDescription", "新的语言包已准备好，将在下次刷新后生效。", "推送正文"}, {"zh-CN", "update.brandingTitle", "品牌配置已更新", "推送标题"}, {"zh-CN", "update.brandingDescription", "新的品牌资源已准备好，将在下次启动时生效。", "推送正文"}, {"zh-CN", "update.configTitle", "应用配置已更新", "推送标题"}, {"zh-CN", "update.configDescription", "应用配置已更新，正在后台同步。", "推送正文"},
 		{"en-US", "update.localizationTitle", "Language resources updated", "Push title"}, {"en-US", "update.localizationDescription", "New language resources are ready and will apply after the next refresh.", "Push body"}, {"en-US", "update.brandingTitle", "Branding updated", "Push title"}, {"en-US", "update.brandingDescription", "New branding resources are ready and will apply on the next launch.", "Push body"}, {"en-US", "update.configTitle", "App configuration updated", "Push title"}, {"en-US", "update.configDescription", "App configuration changed and is syncing in the background.", "Push body"},
+	}
+	for _, item := range items {
+		if _, err := db.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),deleted=0`, item.lang, item.key, item.content, item.meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// walletReceivedPushCopyMigration 钱包收款推送文案（占位符 {amount} {symbol} {chain}），
+// 与其它推送文案一样放 language_document type=14、tenant 0，租户可覆盖。
+func walletReceivedPushCopyMigration(ctx context.Context, db *sql.DB) error {
+	items := []struct{ lang, key, content, meta string }{
+		{"zh-CN", "wallet.receivedTitle", "收到入账", "推送标题"},
+		{"zh-CN", "wallet.receivedBody", "{chain} 上收到 {amount} {symbol}。", "推送正文；占位符 {amount} {symbol} {chain}"},
+		{"zh-CN", "wallet.receivedUnattributedBody", "{chain} 上收到 {amount} {symbol}，来源待确认。", "推送正文（余额差额、交易待定位）；占位符 {amount} {symbol} {chain}"},
+		{"en-US", "wallet.receivedTitle", "Funds received", "Push title"},
+		{"en-US", "wallet.receivedBody", "Received {amount} {symbol} on {chain}.", "Push body; placeholders {amount} {symbol} {chain}"},
+		{"en-US", "wallet.receivedUnattributedBody", "Received {amount} {symbol} on {chain} (source pending).", "Push body for balance-diff receipts; placeholders {amount} {symbol} {chain}"},
 	}
 	for _, item := range items {
 		if _, err := db.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?, ?,14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE content=VALUES(content),meta=VALUES(meta),deleted=0`, item.lang, item.key, item.content, item.meta); err != nil {

@@ -256,6 +256,8 @@ type memStore struct {
 	balances map[WatchKey]BalanceSnapshot
 	audits   []string
 	leaseOwn string
+	// receipts 通知过的入账（首次写入且 notify=true 的 in 行）
+	receipts []Row
 }
 
 func newMemStore() *memStore {
@@ -370,6 +372,15 @@ func (m *memStore) ResolveUnattributed(_ context.Context, chain string, from, to
 	return nil
 }
 
+func (m *memStore) hasLocked(row Row) bool {
+	for _, existing := range m.rows {
+		if existing.TenantID == row.TenantID && existing.TxHash == row.TxHash && existing.LogIndex == row.LogIndex && existing.AddressKey == row.AddressKey && existing.Direction == row.Direction && existing.BlockNumber == row.BlockNumber {
+			return true
+		}
+	}
+	return false
+}
+
 // insertLocked 同 SQL 的 INSERT … ON DUPLICATE KEY UPDATE：撞唯一键就刷新那一行。
 func (m *memStore) insertLocked(rows []Row) {
 	for _, row := range rows {
@@ -426,9 +437,16 @@ func (m *memStore) Tokens(_ context.Context, _ string) ([]string, error) {
 	return append([]string(nil), m.tokens...), nil
 }
 
-func (m *memStore) CommitSlice(_ context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error {
+func (m *memStore) CommitSlice(_ context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time, notify bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if notify {
+		for _, row := range rows {
+			if row.Direction == "in" && !m.hasLocked(row) {
+				m.receipts = append(m.receipts, row)
+			}
+		}
+	}
 	m.insertLocked(rows)
 	if toBlock > 0 {
 		state := m.states[chain]

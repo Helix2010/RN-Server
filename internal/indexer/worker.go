@@ -235,7 +235,7 @@ func (w *Worker) Round(ctx context.Context) error {
 		if err != nil {
 			return w.fail(ctx, err)
 		}
-		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, to, tip.Hash, tip.Time); err != nil {
+		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, to, tip.Hash, tip.Time, true); err != nil {
 			return w.fail(ctx, err)
 		}
 		w.state.ScannedToBlock, w.state.ScannedToHash = to, tip.Hash
@@ -324,7 +324,7 @@ func (w *Worker) checkReorg(ctx context.Context) error {
 	if err := w.store.MarkOrphaned(ctx, w.cfg.Chain, back); err != nil {
 		return err
 	}
-	if err := w.store.CommitSlice(ctx, w.cfg.Chain, nil, back, anchor.Hash, anchor.Time); err != nil {
+	if err := w.store.CommitSlice(ctx, w.cfg.Chain, nil, back, anchor.Hash, anchor.Time, false); err != nil {
 		return err
 	}
 	w.log.Warn("reorg detected", "cursor", w.state.ScannedToBlock, "expected", w.state.ScannedToHash, "got", current.Hash, "rolledBackTo", back)
@@ -673,7 +673,7 @@ func (w *Worker) balanceRound(ctx context.Context, confirmed uint64) error {
 		}
 	}
 	if len(rows) > 0 {
-		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, "", time.Time{}); err != nil {
+		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, "", time.Time{}, true); err != nil {
 			return err
 		}
 		w.log.Info("balance round committed", "rows", len(rows))
@@ -802,7 +802,8 @@ func (w *Worker) rescanStep(ctx context.Context, from, limit uint64) (uint64, er
 		return 0, err
 	}
 	if len(rows) > 0 {
-		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, "", time.Time{}); err != nil {
+		// 重扫是补记录，不是新入账：不推送
+		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, "", time.Time{}, false); err != nil {
 			return 0, err
 		}
 	}

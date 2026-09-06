@@ -93,6 +93,10 @@ func TestRoundInitialisesCursorAtStartBlockAndIndexesTransfers(t *testing.T) {
 	if in != 1 || out != 2 || native != 1 {
 		t.Fatalf("rows in=%d out=%d native=%d (total %d)", in, out, native, len(store.rows))
 	}
+	// 两笔入账（USDC + 原生币）各通知一次；转出不通知
+	if len(store.receipts) != 2 || store.receipts[0].Direction != "in" || store.receipts[1].Direction != "in" {
+		t.Fatalf("receipts = %+v", store.receipts)
+	}
 	// 第二轮没有新块：游标不动，不重复写
 	if err := worker.Round(context.Background()); err != nil {
 		t.Fatalf("second round: %v", err)

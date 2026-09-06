@@ -138,7 +138,7 @@ func (d *Dispatcher) dispatchNext(ctx context.Context) error {
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return nil
 	}
-	targets, err := d.targets(ctx, item.TenantID)
+	targets, err := d.targets(ctx, item.TenantID, targetInstallations(item.Payload))
 	if err != nil {
 		return d.retry(ctx, item, err.Error())
 	}
@@ -194,8 +194,29 @@ func (d *Dispatcher) dispatchNext(ctx context.Context) error {
 	return d.finish(ctx, item, failures)
 }
 
-func (d *Dispatcher) targets(ctx context.Context, tenant string) ([]target, error) {
-	rows, err := d.db.QueryContext(ctx, `SELECT p.installation_id,i.package_id,p.provider,p.token,COALESCE(i.locale,'') FROM app_push_tokens p JOIN app_installations i ON i.tenant_id=p.tenant_id AND i.installation_id=p.installation_id WHERE p.tenant_id=? AND p.invalid_at IS NULL AND i.status='active' AND p.permission_status IN ('granted','authorized','provisional')`, tenant)
+// targetInstallations 载荷里的 targetInstallationIds：非空表示只发给这些安装（钱包收款等
+// 用户级事件），空表示租户全体（配置 / 发布类事件）。
+func targetInstallations(payload map[string]any) []string {
+	raw, _ := payload["targetInstallationIds"].([]any)
+	ids := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if id, ok := item.(string); ok && strings.TrimSpace(id) != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (d *Dispatcher) targets(ctx context.Context, tenant string, only []string) ([]target, error) {
+	query := `SELECT p.installation_id,i.package_id,p.provider,p.token,COALESCE(i.locale,'') FROM app_push_tokens p JOIN app_installations i ON i.tenant_id=p.tenant_id AND i.installation_id=p.installation_id WHERE p.tenant_id=? AND p.invalid_at IS NULL AND i.status='active' AND p.permission_status IN ('granted','authorized','provisional')`
+	args := []any{tenant}
+	if len(only) > 0 {
+		query += ` AND p.installation_id IN (?` + strings.Repeat(",?", len(only)-1) + `)`
+		for _, id := range only {
+			args = append(args, id)
+		}
+	}
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -213,9 +234,13 @@ func (d *Dispatcher) targets(ctx context.Context, tenant string) ([]target, erro
 func (d *Dispatcher) sendWithMessage(ctx context.Context, item event, recipient target, title, body string) (string, error) {
 	data := map[string]string{"eventId": item.ID, "type": item.Type, "requiresRefresh": "true"}
 	for key, value := range item.Payload {
+		if key == "targetInstallationIds" {
+			// 投递范围是服务端的事，不下发到设备
+			continue
+		}
 		data[key] = fmt.Sprint(value)
 	}
-	visible := item.Type == "app_update_available"
+	visible := item.Type == "app_update_available" || item.Type == eventTransferReceived
 	data["requiresUserAction"] = fmt.Sprint(visible)
 	if recipient.Provider == "fcm" {
 		return d.sendFCM(ctx, recipient.Token, data, title, body, visible)

@@ -664,8 +664,23 @@
         "responses": {
           "200": {
             "description": "Wallet session"
+          },
+          "401": {
+            "description": "WALLET_CHALLENGE_* / WALLET_SIGNATURE_INVALID / INSTALLATION_CREDENTIAL_INVALID"
           }
-        }
+        },
+        "description": "可选带安装身份：X-Installation-ID + Authorization: Installation <installationCredential>（安装注册时下发）。带了就必须有效，无效返回 401 INSTALLATION_CREDENTIAL_INVALID（在核销 nonce 之前校验，App 可丢掉失效凭证后用同一挑战重试）；通过则会话记录 installation_id，钱包收款等用户级推送只发这台安装。",
+        "parameters": [
+          {
+            "name": "X-Installation-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "安装实例 ID；与 Authorization: Installation <credential> 成对出现"
+          }
+        ]
       }
     },
     "/v1/mobile/bootstrap": {

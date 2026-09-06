@@ -825,6 +825,14 @@ func supportedNetwork(id string) (int, bool) {
 	return network.ChainID, ok
 }
 
+// NetworkName 链目录里的显示名（推送文案用）；不在目录返回 id 本身。
+func NetworkName(id string) string {
+	if network, ok := platformNetwork(id); ok {
+		return network.Name
+	}
+	return id
+}
+
 func platformNetwork(id string) (evmNetwork, bool) {
 	for _, network := range supportedNetworks {
 		if network.ID == id {

@@ -122,7 +122,7 @@ func runIndexer(cfg config.Config, database *store.Store) {
 	runner := &indexer.Runner{
 		DB:      database.DB,
 		Box:     box,
-		Store:   &indexer.SQLStore{DB: database.DB},
+		Store:   &indexer.SQLStore{DB: database.DB, ChainName: api.NetworkName},
 		Tenants: &api.TenantChainResolver{DB: database.DB},
 		Catalog: api.NetworkChainID, AlertWebhook: cfg.IndexerAlertWebhook,
 		Log: slog.Default(),
