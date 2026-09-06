@@ -779,15 +779,77 @@ type evmNetwork struct {
 	// 它的符号与精度只能来自这里；管理端也靠这两项显示原生币行。
 	NativeSymbol   string
 	NativeDecimals int
+	// MinBuild 认识这条链的最低 App 构建号；bootstrap 只把链下发给构建号 ≥ 门槛的安装
+	// （设计 §4.8：新链先出 App 构建再进目录，旧 App 看不到新链就不会解析失败）。
+	MinBuild minBuild
 }
 
+// minBuild Android / iOS 各自的构建号门槛；0 表示所有构建都认识这条链。
+type minBuild struct {
+	Android int
+	IOS     int
+}
+
+// forPlatform 取该平台的门槛；harmony 装的是 Android 包，按 Android 算。
+func (m minBuild) forPlatform(platform string) int {
+	if platform == "ios" {
+		return m.IOS
+	}
+	return m.Android
+}
+
+// buildNumberOf 请求头 x-build-number 的整数值；解析不出按 0（最老的构建）。
+func buildNumberOf(c *gin.Context) int {
+	number, err := strconv.Atoi(strings.TrimSpace(c.GetHeader("x-build-number")))
+	if err != nil || number < 0 {
+		return 0
+	}
+	return number
+}
+
+// filterWalletForBuild 去掉这个安装的构建号还不认识的链（chains / networks 同步删），
+// 返回被去掉的链 id。代币目录在这之后按 chains 附加，自然也不会带上。
+func filterWalletForBuild(wallet map[string]any, platform string, build int) []string {
+	keep := map[string]bool{}
+	for _, network := range supportedNetworks {
+		if network.MinBuild.forPlatform(platform) <= build {
+			keep[network.ID] = true
+		}
+	}
+	var hidden []string
+	chains := []any{}
+	for _, raw := range asList(wallet["chains"]) {
+		id, _ := raw.(string)
+		if keep[id] {
+			chains = append(chains, id)
+		} else {
+			hidden = append(hidden, id)
+		}
+	}
+	networks := []any{}
+	for _, raw := range asList(wallet["networks"]) {
+		if id, _ := object(raw)["id"].(string); keep[id] {
+			networks = append(networks, raw)
+		}
+	}
+	wallet["chains"], wallet["networks"] = chains, networks
+	return hidden
+}
+
+func asList(value any) []any {
+	items, _ := value.([]any)
+	return items
+}
+
+// 目前五条链所有已发布构建都认识（MinBuild 0）。以后加链：先出带该链的 App 构建，
+// 再在这里写上 Android / iOS 的构建号。
 var supportedNetworks = []evmNetwork{
-	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com", false, "BNB", 18},
-	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io", false, "ETH", 18},
-	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org", false, "ETH", 18},
-	{"op-sepolia", "OP Sepolia", 11155420, []any{"https://sepolia.optimism.io"}, "https://sepolia-optimism.etherscan.io", true, "ETH", 18},
+	{"bsc", "BNB Smart Chain", 56, []any{"https://bsc-dataseed.bnbchain.org"}, "https://bscscan.com", false, "BNB", 18, minBuild{}},
+	{"eth", "Ethereum", 1, []any{"https://ethereum-rpc.publicnode.com"}, "https://etherscan.io", false, "ETH", 18, minBuild{}},
+	{"base", "Base", 8453, []any{"https://mainnet.base.org"}, "https://basescan.org", false, "ETH", 18, minBuild{}},
+	{"op-sepolia", "OP Sepolia", 11155420, []any{"https://sepolia.optimism.io"}, "https://sepolia-optimism.etherscan.io", true, "ETH", 18, minBuild{}},
 	// 预测市场平台（pm-cup2026）的默认主网；2026-09-02 经 rpc.monad.xyz 实测 chainId 0x8f
-	{"monad", "Monad", 143, []any{"https://rpc.monad.xyz"}, "https://monadvision.com", false, "MON", 18},
+	{"monad", "Monad", 143, []any{"https://rpc.monad.xyz"}, "https://monadvision.com", false, "MON", 18, minBuild{}},
 }
 
 // walletCatalog tells the admin console which chains this platform can talk to
@@ -805,6 +867,7 @@ func walletCatalog() []any {
 			"testnet":            network.Testnet,
 			"nativeSymbol":       network.NativeSymbol,
 			"nativeDecimals":     network.NativeDecimals,
+			"minBuild":           map[string]any{"android": network.MinBuild.Android, "ios": network.MinBuild.IOS},
 		})
 	}
 	return items
@@ -1167,6 +1230,15 @@ func (s *server) bootstrap(c *gin.Context) {
 		slog.Error("wallet section resolves to no supported chain", "tenant", tenant.ID, "configured", object(cfg["wallet"])["chains"])
 		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
 		return
+	}
+	// 构建号门禁（设计 §4.8）：这个安装还不认识的链不下发。过滤后一条不剩说明构建太旧，
+	// 只能升级——不下发空钱包段让 App 悄悄变成空壳
+	if hidden := filterWalletForBuild(wallet, strings.ToLower(c.GetHeader("x-platform")), buildNumberOf(c)); len(hidden) > 0 {
+		slog.Info("chains hidden from an older app build", "tenant", tenant.ID, "platform", c.GetHeader("x-platform"), "build", c.GetHeader("x-build-number"), "hidden", hidden)
+		if chains, _ := wallet["chains"].([]any); len(chains) == 0 {
+			problem(c, 426, "APP_BUILD_TOO_OLD", "This app build does not support any chain enabled for the tenant; update the app")
+			return
+		}
 	}
 	// 预测模块开着就必须下发完整的平台关联；缺了或不合法是配置事故，不下发半段
 	predict, err := predictServiceFor(modules, normalizeServices(cfg["services"]), wallet)

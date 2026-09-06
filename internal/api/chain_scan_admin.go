@@ -161,6 +161,32 @@ func (s *server) scanStats(ctx context.Context, chain string, tenants []uint64) 
 	return stats, nil
 }
 
+// scanReadinessView 新链接入向导（设计 §4.8 / §4.12 第 7 条）：门槛、旧构建安装、目录、配置。
+type scanReadinessView struct {
+	MinBuild         map[string]int `json:"minBuild"`
+	LowBuildInstalls int            `json:"lowBuildInstalls"`
+	Tokens           int            `json:"tokens"`
+	HasConfig        bool           `json:"hasConfig"`
+	Enabled          bool           `json:"enabled"`
+}
+
+// lowBuildInstalls 最近 30 天活跃、构建号低于门槛（看不到这条链）的安装数；tenant 空表示全平台。
+func (s *server) lowBuildInstalls(ctx context.Context, threshold minBuild, tenant string) (int, error) {
+	if threshold.Android == 0 && threshold.IOS == 0 {
+		return 0, nil
+	}
+	since := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	query := `SELECT COUNT(*) FROM app_installations WHERE status='active' AND last_active_at>=? AND ((platform='android' AND CAST(build_number AS UNSIGNED)<?) OR (platform='ios' AND CAST(build_number AS UNSIGNED)<?))`
+	args := []any{since, threshold.Android, threshold.IOS}
+	if tenant != "" {
+		query += ` AND tenant_id=?`
+		args = append(args, tenant)
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
 // scanChains GET /v1/admin/platform/scan/chains：目录 × 配置 × 状态 × 统计。
 func (s *server) scanChains(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -198,6 +224,19 @@ func (s *server) scanChains(c *gin.Context) {
 			return
 		}
 		item["stats"] = stats
+		readiness := scanReadinessView{MinBuild: map[string]int{"android": network.MinBuild.Android, "ios": network.MinBuild.IOS}}
+		if cfg, ok := configs[network.ID]; ok {
+			readiness.HasConfig, readiness.Enabled = true, cfg.Enabled
+		}
+		if readiness.LowBuildInstalls, err = s.lowBuildInstalls(ctx, network.MinBuild, ""); err != nil {
+			problem(c, 500, "SCAN_QUERY_FAILED", "Unable to count installations")
+			return
+		}
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM chain_token_catalog WHERE chain=? AND tenant_id=0 AND deleted=0`, network.ID).Scan(&readiness.Tokens); err != nil {
+			problem(c, 500, "SCAN_QUERY_FAILED", "Unable to count catalog tokens")
+			return
+		}
+		item["readiness"] = readiness
 		items = append(items, item)
 	}
 	c.Header("Cache-Control", "no-store")
@@ -643,7 +682,16 @@ func (s *server) tenantIndexStatus(c *gin.Context) {
 	chains, _ := wallet["chains"].([]any)
 	for _, raw := range chains {
 		chain, _ := raw.(string)
-		item := gin.H{"chain": chain, "indexed": onchain, "state": "unconfigured", "lagBlocks": 0, "headBlock": 0, "scannedToBlock": 0, "scannedToTime": nil, "rows24h": 0, "updatedAt": nil}
+		item := gin.H{"chain": chain, "indexed": onchain, "state": "unconfigured", "lagBlocks": 0, "headBlock": 0, "scannedToBlock": 0, "scannedToTime": nil, "rows24h": 0, "updatedAt": nil, "lowBuildInstalls": 0, "minBuild": gin.H{"android": 0, "ios": 0}}
+		if network, ok := platformNetwork(chain); ok {
+			item["minBuild"] = gin.H{"android": network.MinBuild.Android, "ios": network.MinBuild.IOS}
+			count, err := s.lowBuildInstalls(ctx, network.MinBuild, tenantID(c))
+			if err != nil {
+				problem(c, 500, "SCAN_QUERY_FAILED", "Unable to count installations")
+				return
+			}
+			item["lowBuildInstalls"] = count
+		}
 		if state, ok := states[chain]; ok && onchain {
 			item["state"] = string(state.State)
 			item["headBlock"] = state.HeadBlock

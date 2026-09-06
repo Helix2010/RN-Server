@@ -701,7 +701,8 @@
           "503": {
             "description": "BOOTSTRAP_UNAVAILABLE: the tenant configuration, its token catalogue or its wallet section could not be produced completely (storage error, a corrupt catalogue row, an enabled chain without a native token, or a tenant whose configured chains are all unknown). The app keeps its last successful snapshot and shows the retry screen"
           }
-        }
+        },
+        "description": "链按构建号门禁（设计 wallet-receive-index §4.8）：目录里每条链有 minBuild{android,ios}，按 x-platform / x-build-number 只下发构建号 ≥ 门槛的链（chains / networks / tokens 同步过滤，harmony 按 android 算，解析不出的构建号按 0）；过滤后一条不剩返回 426 APP_BUILD_TOO_OLD。"
       }
     },
     "/v1/mobile/branding/assets/{id}": {
@@ -1074,7 +1075,7 @@
         "summary": "扫链管理：目录 × 配置 × 状态 × 统计一览",
         "responses": {
           "200": {
-            "description": "{items:[{chain,name,chainId,testnet,config|null（端点只给 urlMasked/urlHash/hasSecret）,configError,state|null（chain_scan_state 含 endpointHealth/jobs/openAlerts）,stats{rows24h,unattributedOpen,watched,tenants}}],allowPlainHttp,defaults}"
+            "description": "{items:[{chain,name,chainId,testnet,config|null（端点只给 urlMasked/urlHash/hasSecret）,configError,state|null（chain_scan_state 含 endpointHealth/jobs/openAlerts）,stats{rows24h,unattributedOpen,watched,tenants}}],allowPlainHttp,defaults}；每项另带 readiness{minBuild{android,ios},lowBuildInstalls(近 30 天活跃且低于门槛的安装数),tokens(平台目录条目数),hasConfig,enabled}（新链接入向导）"
           },
           "403": {
             "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"

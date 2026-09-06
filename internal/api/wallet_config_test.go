@@ -402,3 +402,30 @@ func TestNormalizeWalletKeepsOnchainSendsOffUnlessTheTenantOptedIn(t *testing.T)
 		t.Fatalf("a boolean onchainSends must validate, got %v", err)
 	}
 }
+
+func TestFilterWalletForBuildHidesChainsNewerThanTheBuild(t *testing.T) {
+	saved := supportedNetworks
+	supportedNetworks = append(append([]evmNetwork(nil), saved...), evmNetwork{ID: "newchain", Name: "New Chain", ChainID: 999, RPCUrls: []any{"https://rpc.new.example"},
+		ExplorerURL: "https://explorer.new.example", NativeSymbol: "NEW", NativeDecimals: 18, MinBuild: minBuild{Android: 120, IOS: 30}})
+	defer func() { supportedNetworks = saved }()
+	configured := map[string]any{"chains": []any{"bsc", "newchain"}}
+
+	wallet := normalizeWallet(configured)
+	if hidden := filterWalletForBuild(wallet, "android", 119); !reflect.DeepEqual(hidden, []string{"newchain"}) || !reflect.DeepEqual(wallet["chains"], []any{"bsc"}) || len(wallet["networks"].([]any)) != 1 {
+		t.Fatalf("android 119 must hide the new chain: hidden=%v wallet=%v", hidden, wallet)
+	}
+	wallet = normalizeWallet(configured)
+	if hidden := filterWalletForBuild(wallet, "ios", 30); len(hidden) != 0 || len(wallet["chains"].([]any)) != 2 {
+		t.Fatalf("ios 30 meets the threshold: hidden=%v chains=%v", hidden, wallet["chains"])
+	}
+	// harmony 装的是 Android 包；没带构建号按最老的构建
+	wallet = normalizeWallet(configured)
+	if hidden := filterWalletForBuild(wallet, "harmony", 0); !reflect.DeepEqual(hidden, []string{"newchain"}) {
+		t.Fatalf("harmony without build must hide the new chain: %v", hidden)
+	}
+	// 老链门槛为 0：任何构建都能拿到
+	wallet = normalizeWallet(map[string]any{"chains": []any{"bsc", "eth"}})
+	if hidden := filterWalletForBuild(wallet, "android", 0); len(hidden) != 0 {
+		t.Fatalf("legacy chains must never be hidden: %v", hidden)
+	}
+}
