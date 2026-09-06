@@ -46,6 +46,7 @@ var migrations = []migration{
 	{version: 30, name: "chain_token_logo_color_required", apply: chainTokenLogoColorMigration},
 	{version: 31, name: "chain_token_logo_color_no_default", apply: chainTokenLogoColorNoDefaultMigration},
 	{version: 32, name: "chain_token_seed_monad", apply: chainTokenSeedMonadMigration},
+	{version: 33, name: "chain_scan_indexer", apply: chainScanIndexerMigration},
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
@@ -960,6 +961,76 @@ func localizationDocumentStatusMigration(ctx context.Context, db *sql.DB) error 
 	for i, statement := range statements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("localization document status migration statement %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+// chainScanIndexerMigration 建扫链模块的表与列（设计 RN-App/docs/design/wallet-receive-index-2026-09-06.md §4.9）：
+// 每链一行的运行状态、扫链得到的转账记录，以及 wallet_user / wallet_session 的两个新列。
+// 扫链配置不建表，放 app_configs(tenant_id=0, config_key='chain-scan.<chain>')。
+func chainScanIndexerMigration(ctx context.Context, db *sql.DB) error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS chain_scan_state (
+			chain VARCHAR(32) NOT NULL COMMENT '链 id，与平台链目录 supportedNetworks 及 app_configs 的 chain-scan.<chain> 一致',
+			scanned_to_block BIGINT UNSIGNED NOT NULL COMMENT '已完整索引到的区块号（含）；与记录同一事务推进，是追块的唯一断点',
+			scanned_to_hash CHAR(66) NOT NULL COMMENT 'scanned_to_block 的区块哈希；每轮核对，不一致即判定重组',
+			head_block BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '最近一次从端点观察到的链头区块号，用于计算落后',
+			state ENUM('idle','scanning','catching_up','stalled','paused','unconfigured') NOT NULL COMMENT '运行状态：idle 追平等待；scanning 正在扫本轮；catching_up 落后追块中；stalled 全部端点不可用；paused 手动暂停；unconfigured 配置行不存在或 enabled=false',
+			lease_owner VARCHAR(80) NOT NULL DEFAULT '' COMMENT '持有租约的索引器实例标识（主机名+进程 id）；空表示无人持有',
+			lease_until DATETIME(3) NULL COMMENT '租约到期时间（UTC）；到期后其他实例可接管',
+			last_error VARCHAR(512) NOT NULL DEFAULT '' COMMENT '最近一次错误（已截断），成功一轮后清空',
+			error_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '连续失败轮数；成功后归零',
+			reorg_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '累计检测到的重组次数，用于告警与排查',
+			endpoint_health JSON NOT NULL COMMENT '端点健康度数组，按配置顺序：[{label,urlHash,health(healthy|cooling|mismatch|unknown),consecutiveFailures,coolingUntil,lastOkAt,lastError,latencyMs,headBlock,spanRejected}]；urlHash = url 的 SHA-256，不含明文；由 worker 每轮写、管理端读',
+			jobs JSON NOT NULL COMMENT '后台任务数组：[{id,kind(rescan|attribute),fromBlock,toBlock,progressBlock,state(pending|running|failed),createdBy,reason,lastError,createdAt}]；由持租约的 worker 串行执行；done/cancelled 后移出数组并写 audit_events',
+			open_alerts JSON NOT NULL COMMENT '未恢复的告警数组：[{kind(stalled|lagging|reorg|endpoint_mismatch|job_failed),message,raisedAt,webhookSentAt}]；恢复即移出并写 audit_events；管理端横幅与 webhook 读它',
+			updated_at DATETIME(3) NOT NULL COMMENT '最后更新时间（UTC）',
+			PRIMARY KEY(chain)
+		) ENGINE=InnoDB COMMENT='每条链的扫描游标、运行状态、端点健康、后台任务与未恢复告警；每链一行，由持租约的索引器写，管理端与移动端接口读'`,
+		`CREATE TABLE IF NOT EXISTS wallet_transfer_index (
+			id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '记录主键',
+			tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户 ID，来自 wallet_user',
+			chain VARCHAR(32) NOT NULL COMMENT '链 id',
+			address_key VARCHAR(42) NOT NULL COMMENT '被监听的钱包地址（小写），同 wallet_user.address_key',
+			direction ENUM('in','out') NOT NULL COMMENT '方向：in 入账（to = 本地址）；out 出账（from = 本地址）',
+			asset ENUM('native','erc20') NOT NULL COMMENT '资产类型：native 原生币；erc20 目录内代币',
+			contract_address VARCHAR(42) NOT NULL COMMENT '代币合约地址（EIP-55）；原生币为 native，与 chain_token_catalog 一致',
+			amount_raw DECIMAL(65,0) NOT NULL COMMENT '金额，最小单位整数；精度看代币目录 decimals，此处不换算',
+			counterparty VARCHAR(42) NOT NULL DEFAULT '' COMMENT '对手方地址（小写）：in 为 from，out 为 to；unattributed 为空',
+			tx_hash CHAR(66) NOT NULL DEFAULT '' COMMENT '交易哈希；unattributed 为空',
+			log_index INT NOT NULL DEFAULT -1 COMMENT 'ERC-20 为日志在区块内的序号；原生币为交易在区块内的序号；unattributed 为 -1',
+			block_number BIGINT UNSIGNED NOT NULL COMMENT '区块号；unattributed 为覆盖区间的末块',
+			block_hash CHAR(66) NOT NULL COMMENT '区块哈希，重组回滚时据此比对',
+			block_time DATETIME(3) NOT NULL COMMENT '区块时间戳（UTC），来自链，不用服务器时钟',
+			attribution ENUM('tx','unattributed') NOT NULL DEFAULT 'tx' COMMENT '归属：tx 已定位到交易；unattributed 只有余额差额、交易待后台任务定位（balance 模式）',
+			gap_from_block BIGINT UNSIGNED NULL COMMENT 'unattributed 覆盖区间的起始区块；tx 行为 NULL',
+			status ENUM('confirmed','orphaned') NOT NULL DEFAULT 'confirmed' COMMENT '有效性：confirmed 有效；orphaned 因重组作废，保留供排查，接口不返回',
+			created_at DATETIME(3) NOT NULL COMMENT '入库时间（UTC）',
+			PRIMARY KEY(id),
+			UNIQUE KEY uq_transfer(tenant_id, chain, tx_hash, log_index, address_key, direction, block_number),
+			KEY ix_transfer_address(tenant_id, address_key, chain, block_number DESC)
+		) ENGINE=InnoDB COMMENT='扫链得到的钱包转账记录，唯一正式来源；App 本机账本只补充未上链的进行中状态'`,
+	}
+	for i, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("chain scan indexer migration statement %d: %w", i+1, err)
+		}
+	}
+	columns := []struct{ table, column, ddl string }{
+		{"wallet_user", "scan_state", `ALTER TABLE wallet_user ADD COLUMN scan_state JSON NULL COMMENT 'balance 模式的每链原生币余额快照：{"<chain>":{"balanceRaw":"最小单位整数","block":比对时的区块号}}；NULL 表示尚未读取；只对 nativeMode=balance 的链写'`},
+		{"wallet_session", "installation_id", `ALTER TABLE wallet_session ADD COLUMN installation_id VARCHAR(80) NULL COMMENT '登录时的 App 安装实例 ID（app_installations.installation_id），定向推送用；旧会话为 NULL'`},
+	}
+	for _, item := range columns {
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, item.table, item.column).Scan(&count); err != nil {
+			return fmt.Errorf("chain scan indexer migration inspect %s.%s: %w", item.table, item.column, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, item.ddl); err != nil {
+			return fmt.Errorf("chain scan indexer migration add %s.%s: %w", item.table, item.column, err)
 		}
 	}
 	return nil

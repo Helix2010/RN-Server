@@ -128,6 +128,17 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	protected.Use(s.authenticate())
 	protected.GET("/auth/session", s.session)
 	protected.POST("/auth/logout", s.logout)
+	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放
+	platform := protected.Group("/platform")
+	platform.Use(s.requirePlatformAdmin())
+	platform.GET("/scan/chains", s.scanChains)
+	platform.PUT("/scan/chains/:chain", s.saveScanChain)
+	platform.POST("/scan/chains/:chain/probe", s.probeScanChain)
+	platform.POST("/scan/chains/:chain/pause", s.toggleScanChain(true))
+	platform.POST("/scan/chains/:chain/resume", s.toggleScanChain(false))
+	platform.POST("/scan/chains/:chain/jobs", s.createScanJob)
+	platform.POST("/scan/chains/:chain/jobs/:id/cancel", s.cancelScanJob)
+	platform.GET("/scan/transfers", s.scanTransfers)
 	current := protected.Group("")
 	current.Use(s.domainTenantScope())
 	current.GET("/tenant", s.currentTenant)
@@ -156,6 +167,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/releases/:id", s.releaseDetail)
 	group.POST("/releases/:id/:action", s.releaseAction)
 	group.GET("/audit-events", s.listAudits)
+	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
 	group.POST("/predict/probe", s.probePredictService)
@@ -368,7 +380,7 @@ func (s *server) login(c *gin.Context) {
 
 func (s *server) session(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"authenticated": true, "actorId": actor(c), "expiresAt": valueFrom(c, "expiresAt"), "method": valueFrom(c, "authMethod")})
+	c.JSON(200, gin.H{"authenticated": true, "actorId": actor(c), "expiresAt": valueFrom(c, "expiresAt"), "method": valueFrom(c, "authMethod"), "platformAdmin": s.isPlatformAdmin(actor(c))})
 }
 
 func (s *server) logout(c *gin.Context) {

@@ -86,7 +86,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session"
+            "description": "Session 含 platformAdmin：账号是否在 PLATFORM_ADMIN_USERNAMES 里"
           }
         }
       }
@@ -1050,6 +1050,405 @@
           },
           "502": {
             "description": "PREDICT_PROBE_FAILED: gamma-api.{domain} unreachable, non-200 or not JSON"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/scan/chains": {
+      "get": {
+        "summary": "扫链管理：目录 × 配置 × 状态 × 统计一览",
+        "responses": {
+          "200": {
+            "description": "{items:[{chain,name,chainId,testnet,config|null（端点只给 urlMasked/urlHash/hasSecret）,configError,state|null（chain_scan_state 含 endpointHealth/jobs/openAlerts）,stats{rows24h,unattributedOpen,watched,tenants}}],allowPlainHttp,defaults}"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/scan/chains/{chain}": {
+      "put": {
+        "summary": "保存一条链的扫链配置",
+        "responses": {
+          "200": {
+            "description": "{chain,config,savedAt,actorId,requestId}；启用时逐端点核对 eth_chainId；乐观锁 409 SCAN_CONFIG_VERSION_CONFLICT；校验失败 400 INVALID_SCAN_CONFIG"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "expectedVersion": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "config": {
+                    "type": "object",
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "paused": {
+                        "type": "boolean"
+                      },
+                      "endpoints": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "url": {
+                              "type": "string",
+                              "description": "明文 URL；留空时用 urlHash 沿用已存端点"
+                            },
+                            "urlHash": {
+                              "type": "string"
+                            },
+                            "label": {
+                              "type": "string"
+                            },
+                            "rps": {
+                              "type": "integer"
+                            },
+                            "maxLogSpan": {
+                              "type": "integer"
+                            }
+                          }
+                        }
+                      },
+                      "maxLogSpan": {
+                        "type": "integer"
+                      },
+                      "confirmations": {
+                        "type": "integer"
+                      },
+                      "pollSeconds": {
+                        "type": "integer"
+                      },
+                      "addrChunk": {
+                        "type": "integer"
+                      },
+                      "nativeMode": {
+                        "type": "string",
+                        "enum": [
+                          "blocks",
+                          "balance"
+                        ]
+                      },
+                      "nativeGapCap": {
+                        "type": "integer"
+                      },
+                      "startBlock": {
+                        "type": "integer"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "平台链目录 id"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/scan/chains/{chain}/probe": {
+      "post": {
+        "summary": "端点体检",
+        "responses": {
+          "200": {
+            "description": "{chain,results:[{label,ok,error,chainId,headBlock,latencyMs,blockTimeMs,multicall3,maxLogSpan,fullBlockMs,fullBlockTxs,spanTried,suggestedMode,suggestedSpan,suggestedConfirmations}],suggestion{maxLogSpan,nativeMode,confirmations}}"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "endpoints": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "url": {
+                          "type": "string",
+                          "description": "明文 URL；留空时用 urlHash 沿用已存端点"
+                        },
+                        "urlHash": {
+                          "type": "string"
+                        },
+                        "label": {
+                          "type": "string"
+                        },
+                        "rps": {
+                          "type": "integer"
+                        },
+                        "maxLogSpan": {
+                          "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "平台链目录 id"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/scan/chains/{chain}/pause": {
+      "post": {
+        "summary": "暂停扫链（游标保留）",
+        "responses": {
+          "200": {
+            "description": "{chain,config}"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "expectedVersion": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "平台链目录 id"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/scan/chains/{chain}/resume": {
+      "post": {
+        "summary": "恢复扫链",
+        "responses": {
+          "200": {
+            "description": "{chain,config}"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "expectedVersion": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "平台链目录 id"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/scan/chains/{chain}/jobs": {
+      "post": {
+        "summary": "建后台任务（写入 chain_scan_state.jobs）",
+        "responses": {
+          "200": {
+            "description": "{chain,job}；kind = rescan | attribute；409 SCAN_STATE_NOT_FOUND 表示索引器尚未初始化该链"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "rescan",
+                      "attribute"
+                    ]
+                  },
+                  "fromBlock": {
+                    "type": "integer"
+                  },
+                  "toBlock": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "平台链目录 id"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/scan/chains/{chain}/jobs/{id}/cancel": {
+      "post": {
+        "summary": "取消后台任务",
+        "responses": {
+          "200": {
+            "description": "{chain,cancelled}；404 SCAN_JOB_NOT_FOUND"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "平台链目录 id"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/scan/transfers": {
+      "get": {
+        "summary": "客服查询某地址的索引记录（含 orphaned / unattributed）",
+        "responses": {
+          "200": {
+            "description": "{items:[{tenantId,chain,addressKey,direction,asset,contractAddress,amountRaw,counterparty,txHash,logIndex,blockNumber,blockHash,blockTime,attribution,gapFromBlock,status,createdAt}]}"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          }
+        },
+        "parameters": [
+          {
+            "name": "chain",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "address",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/admin/wallet/index-status": {
+      "get": {
+        "summary": "租户视角的收款索引状态",
+        "responses": {
+          "200": {
+            "description": "{onchainSends,watched,chains:[{chain,indexed,state,lagBlocks,headBlock,scannedToBlock,rows24h,updatedAt}]}"
           }
         }
       }

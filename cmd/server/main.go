@@ -13,7 +13,9 @@ import (
 
 	"github.com/Helix2010/RN-Server/internal/api"
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/Helix2010/RN-Server/internal/indexer"
 	"github.com/Helix2010/RN-Server/internal/push"
+	"github.com/Helix2010/RN-Server/internal/secretbox"
 	"github.com/Helix2010/RN-Server/internal/store"
 )
 
@@ -42,6 +44,10 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("database migrations complete")
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "indexer" {
+		runIndexer(cfg, database)
 		return
 	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
@@ -96,4 +102,32 @@ func healthcheck() error {
 		return fmt.Errorf("unexpected readiness status: %d", response.StatusCode)
 	}
 	return nil
+}
+
+// runIndexer 是 `./rn-server indexer`：扫链进程。INDEXER_ENABLED=false 时空转等信号，
+// 容器不会因为进程退出而反复重启；开关翻到 true 要重启进程。
+func runIndexer(cfg config.Config, database *store.Store) {
+	shutdown, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if !cfg.IndexerEnabled {
+		slog.Info("indexer is disabled (INDEXER_ENABLED=false); idling until signal")
+		<-shutdown.Done()
+		return
+	}
+	box, err := secretbox.New(cfg.StorageMasterKey)
+	if err != nil {
+		slog.Error("indexer cannot decrypt scan endpoints", "error", err)
+		os.Exit(1)
+	}
+	runner := &indexer.Runner{
+		DB:      database.DB,
+		Box:     box,
+		Store:   &indexer.SQLStore{DB: database.DB},
+		Tenants: &api.TenantChainResolver{DB: database.DB},
+		Catalog: api.NetworkChainID,
+		Log:     slog.Default(),
+	}
+	slog.Info("indexer starting")
+	runner.Run(shutdown)
+	slog.Info("indexer stopped")
 }

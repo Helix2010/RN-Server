@@ -68,6 +68,14 @@ type Config struct {
 	HMSAppID                   string
 	HMSClientID                string
 	HMSClientSecret            string
+	// IndexerEnabled 是否运行扫链进程（`./rn-server indexer`）；false 时进程空转等待信号。
+	IndexerEnabled bool
+	// IndexerAllowPlainHTTP 私网部署允许 http:// 扫链端点。
+	IndexerAllowPlainHTTP bool
+	// IndexerAlertWebhook 告警 webhook（企业微信 / Slack 通用 JSON）；空表示不发。
+	IndexerAlertWebhook string
+	// PlatformAdminUsernames 能进"扫链管理"等平台级页面的管理员用户名；空表示平台路由一律 403。
+	PlatformAdminUsernames []string
 }
 
 func Load() (Config, error) {
@@ -130,6 +138,10 @@ func Load() (Config, error) {
 		HMSAppID:                   strings.TrimSpace(os.Getenv("HMS_APP_ID")),
 		HMSClientID:                strings.TrimSpace(os.Getenv("HMS_CLIENT_ID")),
 		HMSClientSecret:            strings.TrimSpace(os.Getenv("HMS_CLIENT_SECRET")),
+		IndexerEnabled:             boolean("INDEXER_ENABLED", false),
+		IndexerAllowPlainHTTP:      boolean("INDEXER_ALLOW_PLAIN_HTTP", false),
+		IndexerAlertWebhook:        strings.TrimSpace(os.Getenv("INDEXER_ALERT_WEBHOOK")),
+		PlatformAdminUsernames:     split(strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_USERNAMES"))),
 	}
 	if cfg.Environment == "test" && !strings.HasSuffix(cfg.MySQLDatabase, "_test") {
 		cfg.MySQLDatabase += "_test"

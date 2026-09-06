@@ -118,6 +118,11 @@ jobs:
               fi
               sleep 5
             done
+            if [ "$server_healthy" = true ]; then
+              # 扫链进程与 API 同镜像；INDEXER_ENABLED 未开时空转。起不来不回滚 API，但要在日志里看到。
+              docker compose --env-file .env -f compose.yaml up -d --no-deps indexer \
+                || echo "::warning::rn-foundation-indexer failed to start; check docker compose logs indexer"
+            fi
             if [ "$server_healthy" = true ] && \
               docker compose --env-file .env -f compose.yaml up -d --build --no-deps gateway; then
               gateway_healthy=false
