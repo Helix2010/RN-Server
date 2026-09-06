@@ -140,6 +140,8 @@ services:
         condition: service_healthy
     environment:
       APP_ENV: production
+      # 生产模式的配置校验要求显式 CORS_ORIGINS；索引器不提供 HTTP，但和 server 用同一份配置加载
+      CORS_ORIGINS: ${CORS_ORIGINS}
       INDEXER_ENABLED: ${INDEXER_ENABLED:-false}
       INDEXER_ALLOW_PLAIN_HTTP: ${INDEXER_ALLOW_PLAIN_HTTP:-false}
       INDEXER_ALERT_WEBHOOK: ${INDEXER_ALERT_WEBHOOK:-}
