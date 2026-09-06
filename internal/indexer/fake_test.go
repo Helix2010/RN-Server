@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -287,8 +288,102 @@ func (m *memStore) SaveState(_ context.Context, state scan.ChainState) error {
 	current := m.states[state.Chain]
 	state.ScannedToBlock, state.ScannedToHash = current.ScannedToBlock, current.ScannedToHash
 	state.LeaseOwner = current.LeaseOwner
+	// 同 SQL 版：jobs 只在 MutateJobs 里动
+	state.Jobs = current.Jobs
 	m.states[state.Chain] = state
 	return nil
+}
+
+func (m *memStore) MutateJobs(_ context.Context, chain string, mutate func([]scan.Job) ([]scan.Job, error)) ([]scan.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.states[chain]
+	if !ok {
+		return nil, scan.ErrStateNotFound
+	}
+	next, err := mutate(append([]scan.Job(nil), state.Jobs...))
+	if err != nil {
+		return nil, err
+	}
+	if next == nil {
+		next = []scan.Job{}
+	}
+	state.Jobs = next
+	m.states[chain] = state
+	return append([]scan.Job(nil), next...), nil
+}
+
+func (m *memStore) ResolveUnattributed(_ context.Context, chain string, from, to uint64, rows []Row) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	located := func(tenant uint64, address string, lo, hi uint64) *big.Int {
+		sum := new(big.Int)
+		for _, row := range m.rows {
+			if row.TenantID == tenant && row.Chain == chain && row.AddressKey == address && row.Direction == "in" && row.Asset == "native" && row.Attribution == "tx" && row.BlockNumber >= lo && row.BlockNumber <= hi {
+				amount, _ := new(big.Int).SetString(row.AmountRaw, 10)
+				sum.Add(sum, amount)
+			}
+		}
+		return sum
+	}
+	type target struct {
+		index  int
+		lo, hi uint64
+		before *big.Int
+	}
+	var targets []target
+	for index, row := range m.rows {
+		if row.Attribution != "unattributed" || row.Chain != chain || row.GapFromBlock == nil || *row.GapFromBlock > to || row.BlockNumber < from {
+			continue
+		}
+		lo, hi := *row.GapFromBlock, row.BlockNumber
+		if lo < from {
+			lo = from
+		}
+		if hi > to {
+			hi = to
+		}
+		targets = append(targets, target{index: index, lo: lo, hi: hi, before: located(row.TenantID, row.AddressKey, lo, hi)})
+	}
+	m.insertLocked(rows)
+	remove := map[int]bool{}
+	for _, item := range targets {
+		row := m.rows[item.index]
+		after := located(row.TenantID, row.AddressKey, item.lo, item.hi)
+		amount, _ := new(big.Int).SetString(row.AmountRaw, 10)
+		remaining := new(big.Int).Sub(amount, new(big.Int).Sub(after, item.before))
+		if remaining.Sign() <= 0 {
+			remove[item.index] = true
+			continue
+		}
+		m.rows[item.index].AmountRaw = remaining.String()
+	}
+	if len(remove) > 0 {
+		kept := m.rows[:0]
+		for index, row := range m.rows {
+			if !remove[index] {
+				kept = append(kept, row)
+			}
+		}
+		m.rows = kept
+	}
+	return nil
+}
+
+// insertLocked 同 SQL 的 INSERT … ON DUPLICATE KEY UPDATE：撞唯一键就刷新那一行。
+func (m *memStore) insertLocked(rows []Row) {
+	for _, row := range rows {
+		replaced := false
+		for index, existing := range m.rows {
+			if existing.TenantID == row.TenantID && existing.TxHash == row.TxHash && existing.LogIndex == row.LogIndex && existing.AddressKey == row.AddressKey && existing.Direction == row.Direction && existing.BlockNumber == row.BlockNumber {
+				m.rows[index] = row
+				replaced = true
+			}
+		}
+		if !replaced {
+			m.rows = append(m.rows, row)
+		}
+	}
 }
 
 func (m *memStore) AcquireLease(_ context.Context, chain, owner string, _ time.Time) (bool, error) {
@@ -334,17 +429,7 @@ func (m *memStore) Tokens(_ context.Context, _ string) ([]string, error) {
 func (m *memStore) CommitSlice(_ context.Context, chain string, rows []Row, toBlock uint64, toHash string, toTime time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, row := range rows {
-		duplicate := false
-		for _, existing := range m.rows {
-			if existing.TenantID == row.TenantID && existing.TxHash == row.TxHash && existing.LogIndex == row.LogIndex && existing.AddressKey == row.AddressKey && existing.Direction == row.Direction && existing.BlockNumber == row.BlockNumber {
-				duplicate = true
-			}
-		}
-		if !duplicate {
-			m.rows = append(m.rows, row)
-		}
-	}
+	m.insertLocked(rows)
 	if toBlock > 0 {
 		state := m.states[chain]
 		state.ScannedToBlock, state.ScannedToHash = toBlock, toHash

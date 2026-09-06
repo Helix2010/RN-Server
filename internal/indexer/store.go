@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strings"
 	"time"
 
@@ -67,6 +68,11 @@ type Store interface {
 	SaveBalances(ctx context.Context, chain string, updates map[WatchKey]BalanceSnapshot) error
 	MarkOrphaned(ctx context.Context, chain string, afterBlock uint64) error
 	InsertAudit(ctx context.Context, action, chain string, summary map[string]any) error
+	// MutateJobs 行锁下读改写 jobs（管理端取消与 worker 进度互不覆盖），返回改后的数组。
+	MutateJobs(ctx context.Context, chain string, mutate func([]scan.Job) ([]scan.Job, error)) ([]scan.Job, error)
+	// ResolveUnattributed 补归属：写入 [from,to] 内全区块扫到的原生币行，并把与该区间相交的
+	// unattributed 行按"新定位到的金额"扣减，扣完即删；同一事务。
+	ResolveUnattributed(ctx context.Context, chain string, from, to uint64, rows []Row) error
 }
 
 // SQLStore 是 MySQL 实现。
@@ -152,13 +158,27 @@ func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, to
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
+	if err := insertRows(ctx, tx, rows, now); err != nil {
+		return err
+	}
+	if toBlock > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE chain_scan_state SET scanned_to_block=?,scanned_to_hash=?,scanned_to_time=?,updated_at=? WHERE chain=?`, toBlock, toHash, toTime.UTC(), now, chain); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// insertRows 批量写记录。撞唯一键时不是忽略而是刷新：重组后同一笔交易回到同一区块号
+// （只有区块哈希变了）时，原来标 orphaned 的行要重新变回 confirmed，重扫任务也靠它幂等。
+func insertRows(ctx context.Context, tx *sql.Tx, rows []Row, now time.Time) error {
 	for start := 0; start < len(rows); start += insertBatch {
 		end := start + insertBatch
 		if end > len(rows) {
 			end = len(rows)
 		}
 		var b strings.Builder
-		b.WriteString(`INSERT IGNORE INTO wallet_transfer_index(tenant_id,chain,address_key,direction,asset,contract_address,amount_raw,counterparty,tx_hash,log_index,block_number,block_hash,block_time,attribution,gap_from_block,status,created_at) VALUES `)
+		b.WriteString(`INSERT INTO wallet_transfer_index(tenant_id,chain,address_key,direction,asset,contract_address,amount_raw,counterparty,tx_hash,log_index,block_number,block_hash,block_time,attribution,gap_from_block,status,created_at) VALUES `)
 		args := make([]any, 0, (end-start)*17)
 		for index, row := range rows[start:end] {
 			if index > 0 {
@@ -171,12 +191,101 @@ func (s *SQLStore) CommitSlice(ctx context.Context, chain string, rows []Row, to
 			}
 			args = append(args, row.TenantID, row.Chain, row.AddressKey, row.Direction, row.Asset, row.Contract, row.AmountRaw, row.Counterparty, row.TxHash, row.LogIndex, row.BlockNumber, row.BlockHash, row.BlockTime.UTC(), row.Attribution, gap, now)
 		}
+		b.WriteString(` ON DUPLICATE KEY UPDATE status='confirmed',block_hash=VALUES(block_hash),block_time=VALUES(block_time),amount_raw=VALUES(amount_raw),counterparty=VALUES(counterparty),contract_address=VALUES(contract_address),gap_from_block=VALUES(gap_from_block)`)
 		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
 			return err
 		}
 	}
-	if toBlock > 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE chain_scan_state SET scanned_to_block=?,scanned_to_hash=?,scanned_to_time=?,updated_at=? WHERE chain=?`, toBlock, toHash, toTime.UTC(), now, chain); err != nil {
+	return nil
+}
+
+func (s *SQLStore) MutateJobs(ctx context.Context, chain string, mutate func([]scan.Job) ([]scan.Job, error)) ([]scan.Job, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	next, err := scan.MutateJobs(ctx, tx, chain, mutate)
+	if err != nil {
+		return nil, err
+	}
+	return next, tx.Commit()
+}
+
+// ResolveUnattributed 见 Store 接口。扣减按每条 unattributed 行自己的区间与地址算：
+// 先记下区间内已有的 tx 入账合计，写入新行后再算一次，差值就是这次新定位到的金额。
+func (s *SQLStore) ResolveUnattributed(ctx context.Context, chain string, from, to uint64, rows []Row) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	type pending struct {
+		id        uint64
+		tenant    uint64
+		address   string
+		amount    *big.Int
+		lo, hi    uint64
+		beforeSum *big.Int
+	}
+	var targets []pending
+	cursor, err := tx.QueryContext(ctx, `SELECT id,tenant_id,address_key,CAST(amount_raw AS CHAR),gap_from_block,block_number FROM wallet_transfer_index WHERE chain=? AND attribution='unattributed' AND status='confirmed' AND gap_from_block<=? AND block_number>=? FOR UPDATE`, chain, to, from)
+	if err != nil {
+		return err
+	}
+	for cursor.Next() {
+		var item pending
+		var amount string
+		var gapFrom, block uint64
+		if err := cursor.Scan(&item.id, &item.tenant, &item.address, &amount, &gapFrom, &block); err != nil {
+			cursor.Close()
+			return err
+		}
+		item.amount, _ = new(big.Int).SetString(amount, 10)
+		item.lo, item.hi = gapFrom, block
+		if item.lo < from {
+			item.lo = from
+		}
+		if item.hi > to {
+			item.hi = to
+		}
+		targets = append(targets, item)
+	}
+	cursor.Close()
+	locatedSum := func(item pending) (*big.Int, error) {
+		var text string
+		if err := tx.QueryRowContext(ctx, `SELECT CAST(COALESCE(SUM(amount_raw),0) AS CHAR) FROM wallet_transfer_index WHERE tenant_id=? AND chain=? AND address_key=? AND direction='in' AND asset='native' AND attribution='tx' AND status='confirmed' AND block_number BETWEEN ? AND ?`, item.tenant, chain, item.address, item.lo, item.hi).Scan(&text); err != nil {
+			return nil, err
+		}
+		sum, ok := new(big.Int).SetString(text, 10)
+		if !ok {
+			return nil, fmt.Errorf("located sum %q is not an integer", text)
+		}
+		return sum, nil
+	}
+	for index := range targets {
+		sum, err := locatedSum(targets[index])
+		if err != nil {
+			return err
+		}
+		targets[index].beforeSum = sum
+	}
+	if err := insertRows(ctx, tx, rows, time.Now().UTC()); err != nil {
+		return err
+	}
+	for _, item := range targets {
+		after, err := locatedSum(item)
+		if err != nil {
+			return err
+		}
+		remaining := new(big.Int).Sub(item.amount, new(big.Int).Sub(after, item.beforeSum))
+		if remaining.Sign() <= 0 {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM wallet_transfer_index WHERE id=?`, item.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE wallet_transfer_index SET amount_raw=? WHERE id=?`, remaining.String(), item.id); err != nil {
 			return err
 		}
 	}

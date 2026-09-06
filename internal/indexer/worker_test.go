@@ -229,6 +229,8 @@ func TestBalanceModeDefersHugeGapsToAJob(t *testing.T) {
 		chain.mine(number)
 	}
 	chain.setBalance(alice, 60, 999)
+	// 这轮只看余额轮本身：后台任务另有预算，见 jobs_test.go
+	worker.jobBudget = 0
 	if err := worker.Round(context.Background()); err != nil {
 		t.Fatalf("second round: %v", err)
 	}

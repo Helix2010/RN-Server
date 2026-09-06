@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -552,7 +551,7 @@ func (s *server) cancelScanJob(c *gin.Context) {
 }
 
 var errScanJobNotFound = errors.New("job not found")
-var errScanStateNotFound = errors.New("chain has no scan state yet")
+var errScanStateNotFound = scan.ErrStateNotFound
 
 func (s *server) writeScanJobProblem(c *gin.Context, err error) {
 	switch {
@@ -572,28 +571,8 @@ func (s *server) mutateScanJobs(ctx context.Context, chain string, mutate func([
 		return err
 	}
 	defer tx.Rollback()
-	var raw []byte
-	if err := tx.QueryRowContext(ctx, `SELECT jobs FROM chain_scan_state WHERE chain=? FOR UPDATE`, chain).Scan(&raw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errScanStateNotFound
-		}
-		return err
-	}
-	var jobs []scan.Job
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &jobs); err != nil {
-			return fmt.Errorf("chain_scan_state.%s jobs: %w", chain, err)
-		}
-	}
-	next, err := mutate(jobs)
-	if err != nil {
-		return err
-	}
-	encoded, _ := json.Marshal(next)
-	if string(encoded) == "null" {
-		encoded = []byte("[]")
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE chain_scan_state SET jobs=?,updated_at=? WHERE chain=?`, encoded, time.Now().UTC(), chain); err != nil {
+	// 行锁读改写：worker 同时在写进度也不会互相覆盖
+	if _, err := scan.MutateJobs(ctx, tx, chain, mutate); err != nil {
 		return err
 	}
 	if err := insertAudit(ctx, tx, newAudit("0", who, action, "chain", chain, reason, request, summary)); err != nil {

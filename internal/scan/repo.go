@@ -92,6 +92,39 @@ func SaveConfig(ctx context.Context, tx Querier, cfg ChainConfig, expectedVersio
 // ErrVersionConflict 乐观锁冲突：别人改过了，管理端要重新读再改。
 var ErrVersionConflict = errors.New("chain scan config version conflict")
 
+// ErrStateNotFound 这条链还没有状态行（索引器没跑过）。
+var ErrStateNotFound = errors.New("chain has no scan state yet")
+
+// MutateJobs 在行锁下读改写 chain_scan_state.jobs：管理端建 / 取消任务与 worker 写进度
+// 都走它，谁也不会用旧数组覆盖对方的改动。db 通常是调用方的事务（好把审计写进同一事务）。
+// 返回改后的数组。
+func MutateJobs(ctx context.Context, db Querier, chain string, mutate func([]Job) ([]Job, error)) ([]Job, error) {
+	var raw []byte
+	if err := db.QueryRowContext(ctx, `SELECT jobs FROM chain_scan_state WHERE chain=? FOR UPDATE`, chain).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrStateNotFound
+		}
+		return nil, err
+	}
+	var jobs []Job
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &jobs); err != nil {
+			return nil, fmt.Errorf("chain_scan_state.%s jobs: %w", chain, err)
+		}
+	}
+	next, err := mutate(jobs)
+	if err != nil {
+		return nil, err
+	}
+	if next == nil {
+		next = []Job{}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE chain_scan_state SET jobs=?,updated_at=? WHERE chain=?`, mustJSON(next), time.Now().UTC(), chain); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
 // LoadState 读一条链的运行状态；不存在返回 sql.ErrNoRows。
 func LoadState(ctx context.Context, db Querier, chain string) (ChainState, error) {
 	var state ChainState
@@ -160,11 +193,12 @@ func InsertState(ctx context.Context, db Querier, chain string, block uint64, ha
 	return affected == 1, nil
 }
 
-// SaveState 写回运行状态里除游标外的字段（游标只在 CommitSlice 的事务里动）。
+// SaveState 写回运行状态里除游标与 jobs 外的字段（游标只在 CommitSlice 的事务里动，
+// jobs 只在 MutateJobs 的行锁里动：worker 的整份状态写回不能覆盖管理端刚做的取消）。
 func SaveState(ctx context.Context, db Querier, state ChainState) error {
-	health, jobs, alerts := mustJSON(state.EndpointHealth), mustJSON(state.Jobs), mustJSON(state.OpenAlerts)
-	_, err := db.ExecContext(ctx, `UPDATE chain_scan_state SET head_block=?,state=?,last_error=?,error_count=?,reorg_count=?,endpoint_health=?,jobs=?,open_alerts=?,updated_at=? WHERE chain=?`,
-		state.HeadBlock, string(state.State), truncate(state.LastError, 512), state.ErrorCount, state.ReorgCount, health, jobs, alerts, time.Now().UTC(), state.Chain)
+	health, alerts := mustJSON(state.EndpointHealth), mustJSON(state.OpenAlerts)
+	_, err := db.ExecContext(ctx, `UPDATE chain_scan_state SET head_block=?,state=?,last_error=?,error_count=?,reorg_count=?,endpoint_health=?,open_alerts=?,updated_at=? WHERE chain=?`,
+		state.HeadBlock, string(state.State), truncate(state.LastError, 512), state.ErrorCount, state.ReorgCount, health, alerts, time.Now().UTC(), state.Chain)
 	return err
 }
 

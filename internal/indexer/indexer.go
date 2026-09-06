@@ -33,6 +33,8 @@ type Runner struct {
 	Log     *slog.Logger
 	Client  *http.Client
 	Owner   string
+	// AlertWebhook 告警通知地址（INDEXER_ALERT_WEBHOOK）；空表示不发。
+	AlertWebhook string
 
 	mu      sync.Mutex
 	workers map[string]*running
@@ -118,6 +120,9 @@ func (r *Runner) reload(ctx context.Context) {
 func (r *Runner) start(ctx context.Context, cfg scan.ChainConfig, chainID int64) {
 	pool := NewPool(cfg.Chain, chainID, cfg.Endpoints, r.Client, nil)
 	worker := NewWorker(cfg, pool, r.Store, r.Tenants, r.Owner, nil, r.Log)
+	if r.AlertWebhook != "" {
+		worker.WithNotifier(WebhookNotifier(r.AlertWebhook, r.Client))
+	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	r.mu.Lock()

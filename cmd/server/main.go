@@ -124,8 +124,8 @@ func runIndexer(cfg config.Config, database *store.Store) {
 		Box:     box,
 		Store:   &indexer.SQLStore{DB: database.DB},
 		Tenants: &api.TenantChainResolver{DB: database.DB},
-		Catalog: api.NetworkChainID,
-		Log:     slog.Default(),
+		Catalog: api.NetworkChainID, AlertWebhook: cfg.IndexerAlertWebhook,
+		Log: slog.Default(),
 	}
 	slog.Info("indexer starting")
 	runner.Run(shutdown)

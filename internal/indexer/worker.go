@@ -95,6 +95,16 @@ type Worker struct {
 	headers   map[uint64]header
 	// stalledSince 全部端点不可用的起点，用于告警。
 	stalledSince time.Time
+	// notify 告警通知（webhook）；nil 表示不发。
+	notify Notifier
+	// jobBudget 每轮花在后台任务上的时间上限（测试可调小）。
+	jobBudget time.Duration
+}
+
+// WithNotifier 挂上告警通知。
+func (w *Worker) WithNotifier(notify Notifier) *Worker {
+	w.notify = notify
+	return w
 }
 
 // NewWorker 构造一条链的 worker；pool 已按配置建好。
@@ -105,7 +115,7 @@ func NewWorker(cfg scan.ChainConfig, pool *Pool, store Store, tenants TenantReso
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Worker{cfg: cfg, pool: pool, store: store, tenants: tenants, owner: owner, now: now, log: log.With("chain", cfg.Chain)}
+	return &Worker{cfg: cfg, pool: pool, store: store, tenants: tenants, owner: owner, now: now, log: log.With("chain", cfg.Chain), jobBudget: jobBudget}
 }
 
 // Run 循环到 ctx 取消：每轮 Round，然后按状态休眠。
@@ -196,8 +206,7 @@ func (w *Worker) Round(ctx context.Context) error {
 		return w.fail(ctx, err)
 	}
 	if confirmed <= w.state.ScannedToBlock {
-		w.state.State = scan.StateIdle
-		return w.finish(ctx)
+		return w.idle(ctx, confirmed)
 	}
 	if err := w.refreshCaches(ctx); err != nil {
 		return w.fail(ctx, err)
@@ -248,7 +257,15 @@ func (w *Worker) Round(ctx context.Context) error {
 			return w.fail(ctx, err)
 		}
 	}
+	return w.idle(ctx, confirmed)
+}
+
+// idle 追平之后：跑一段后台任务，再写状态。
+func (w *Worker) idle(ctx context.Context, confirmed uint64) error {
 	w.state.State = scan.StateIdle
+	if err := w.runJobs(ctx, confirmed); err != nil {
+		return w.fail(ctx, err)
+	}
 	return w.finish(ctx)
 }
 
@@ -650,7 +667,9 @@ func (w *Worker) balanceRound(ctx context.Context, confirmed uint64) error {
 				Attribution: "unattributed", GapFromBlock: &gapFrom, LogIndex: -1})
 		}
 		for _, item := range deferred {
-			w.enqueueAttribute(item.prev.Block+1, confirmed)
+			if err := w.enqueueAttribute(ctx, item.prev.Block+1, confirmed); err != nil {
+				return err
+			}
 		}
 	}
 	if len(rows) > 0 {
@@ -677,16 +696,189 @@ func (w *Worker) balanceRound(ctx context.Context, confirmed uint64) error {
 	return nil
 }
 
-// enqueueAttribute 给大缺口建一条归属任务（同区间已有任务则合并）。
-func (w *Worker) enqueueAttribute(from, to uint64) {
+// enqueueAttribute 给大缺口建一条归属任务（同区间已有未失败的任务则合并）。走行锁，
+// 不覆盖管理端同时做的取消。
+func (w *Worker) enqueueAttribute(ctx context.Context, from, to uint64) error {
+	next, err := w.store.MutateJobs(ctx, w.cfg.Chain, func(jobs []scan.Job) ([]scan.Job, error) {
+		for _, job := range jobs {
+			if job.Kind == scan.JobAttribute && job.State != scan.JobFailed && job.FromBlock <= from && job.ToBlock >= to {
+				return jobs, nil
+			}
+		}
+		return append(jobs, scan.Job{ID: "job_" + randomID(12), Kind: scan.JobAttribute, FromBlock: from, ToBlock: to, ProgressBlock: from - 1,
+			State: scan.JobPending, CreatedBy: "system", Reason: "native balance increased across a gap larger than nativeGapCap", CreatedAt: w.now()}), nil
+	})
+	if err != nil {
+		return err
+	}
+	w.state.Jobs = next
+	return nil
+}
+
+// ---- 后台任务（设计 §4.7 / §4.9）----
+
+// jobBudget 每轮最多花在后台任务上的时间：主扫描优先，长任务分多轮跑完。
+const jobBudget = 20 * time.Second
+
+// attributeChunk 补归属一步扫这么多个全区块，然后落一次进度。
+const attributeChunk = 50
+
+// runJobs 执行 jobs 里第一条 pending / running 任务的一段。只扫已确认的区间，剩下的
+// 等游标追上再继续。存储层错误返回给轮次；任务本身失败记在任务上并告警，主扫描不受影响。
+func (w *Worker) runJobs(ctx context.Context, confirmed uint64) error {
+	w.jobFailedAlert(ctx)
+	var current *scan.Job
 	for index := range w.state.Jobs {
-		job := &w.state.Jobs[index]
-		if job.Kind == scan.JobAttribute && job.State == scan.JobPending && job.FromBlock <= from && job.ToBlock >= to {
-			return
+		if state := w.state.Jobs[index].State; state == scan.JobPending || state == scan.JobRunning {
+			job := w.state.Jobs[index]
+			current = &job
+			break
 		}
 	}
-	w.state.Jobs = append(w.state.Jobs, scan.Job{ID: "job_" + randomID(12), Kind: scan.JobAttribute, FromBlock: from, ToBlock: to, ProgressBlock: from - 1,
-		State: scan.JobPending, CreatedBy: "system", Reason: "native balance increased across a gap larger than nativeGapCap", CreatedAt: w.now()})
+	if current == nil {
+		return nil
+	}
+	if err := w.refreshCaches(ctx); err != nil {
+		return err
+	}
+	deadline := w.now().Add(w.jobBudget)
+	from, limit := current.ProgressBlock+1, current.ToBlock
+	if limit > confirmed {
+		limit = confirmed
+	}
+	var runErr error
+	for from <= limit && w.now().Before(deadline) && ctx.Err() == nil {
+		var to uint64
+		switch current.Kind {
+		case scan.JobRescan:
+			to, runErr = w.rescanStep(ctx, from, limit)
+		case scan.JobAttribute:
+			to, runErr = w.attributeStep(ctx, from, limit)
+		default:
+			runErr = fmt.Errorf("unknown job kind %q", current.Kind)
+		}
+		if runErr != nil {
+			break
+		}
+		from = to + 1
+		alive, err := w.updateJob(ctx, current.ID, func(job *scan.Job) {
+			job.ProgressBlock, job.State, job.LastError = to, scan.JobRunning, ""
+		})
+		if err != nil {
+			return err
+		}
+		if !alive {
+			w.log.Info("job cancelled while running", "job", current.ID)
+			return nil
+		}
+	}
+	if runErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		w.log.Warn("job failed", "job", current.ID, "kind", current.Kind, "error", runErr)
+		if _, err := w.updateJob(ctx, current.ID, func(job *scan.Job) {
+			job.State, job.LastError = scan.JobFailed, truncate(runErr.Error(), 512)
+		}); err != nil {
+			return err
+		}
+		w.jobFailedAlert(ctx)
+		return nil
+	}
+	if from > current.ToBlock {
+		if err := w.removeJob(ctx, current.ID); err != nil {
+			return err
+		}
+		w.log.Info("job done", "job", current.ID, "kind", current.Kind, "from", current.FromBlock, "to", current.ToBlock)
+		_ = w.store.InsertAudit(ctx, "chain_scan.job_done", w.cfg.Chain, map[string]any{"id": current.ID, "kind": current.Kind, "fromBlock": current.FromBlock, "toBlock": current.ToBlock, "createdBy": current.CreatedBy, "reason": current.Reason})
+	}
+	return nil
+}
+
+// rescanStep 重扫一片：同主扫描的分片逻辑，只写记录不动游标；撞唯一键即刷新，幂等。
+func (w *Worker) rescanStep(ctx context.Context, from, limit uint64) (uint64, error) {
+	to, rows, _, err := w.scanSlice(ctx, from, limit, w.pool.SpanFor(w.cfg.MaxLogSpan))
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) > 0 {
+		if err := w.store.CommitSlice(ctx, w.cfg.Chain, rows, 0, "", time.Time{}); err != nil {
+			return 0, err
+		}
+	}
+	return to, nil
+}
+
+// attributeStep 补归属一段：逐个全区块找监听地址的原生币转账，写入并扣减 unattributed 行。
+func (w *Worker) attributeStep(ctx context.Context, from, limit uint64) (uint64, error) {
+	to := from + attributeChunk - 1
+	if to > limit {
+		to = limit
+	}
+	var rows []Row
+	for number := from; number <= to; number++ {
+		block, err := w.fullBlock(ctx, number)
+		if err != nil {
+			return 0, err
+		}
+		rows = append(rows, w.rowsFromBlock(block, nil)...)
+	}
+	if err := w.store.ResolveUnattributed(ctx, w.cfg.Chain, from, to, rows); err != nil {
+		return 0, err
+	}
+	return to, nil
+}
+
+// updateJob 行锁下改一条任务；任务已不在（被取消）返回 false。
+func (w *Worker) updateJob(ctx context.Context, id string, apply func(*scan.Job)) (bool, error) {
+	found := false
+	next, err := w.store.MutateJobs(ctx, w.cfg.Chain, func(jobs []scan.Job) ([]scan.Job, error) {
+		for index := range jobs {
+			if jobs[index].ID == id {
+				apply(&jobs[index])
+				found = true
+			}
+		}
+		return jobs, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	w.state.Jobs = next
+	return found, nil
+}
+
+// removeJob 任务完成后移出数组。
+func (w *Worker) removeJob(ctx context.Context, id string) error {
+	next, err := w.store.MutateJobs(ctx, w.cfg.Chain, func(jobs []scan.Job) ([]scan.Job, error) {
+		kept := jobs[:0]
+		for _, job := range jobs {
+			if job.ID != id {
+				kept = append(kept, job)
+			}
+		}
+		return kept, nil
+	})
+	if err != nil {
+		return err
+	}
+	w.state.Jobs = next
+	return nil
+}
+
+// jobFailedAlert 有失败任务就保持 job_failed 告警，都清掉了就恢复。
+func (w *Worker) jobFailedAlert(ctx context.Context) {
+	var failed []string
+	for _, job := range w.state.Jobs {
+		if job.State == scan.JobFailed {
+			failed = append(failed, fmt.Sprintf("%s(%s %d-%d): %s", job.ID, job.Kind, job.FromBlock, job.ToBlock, job.LastError))
+		}
+	}
+	if len(failed) == 0 {
+		w.resolve(ctx, scan.AlertJobFailed)
+		return
+	}
+	w.raise(ctx, scan.AlertJobFailed, strings.Join(failed, "; "))
 }
 
 // header 读区块头（本轮缓存）。
@@ -752,6 +944,7 @@ func hexBlock(number uint64) string { return fmt.Sprintf("0x%x", number) }
 func (w *Worker) finish(ctx context.Context) error {
 	w.state.ErrorCount = 0
 	w.state.LastError = ""
+	w.endpointMismatchAlert(ctx)
 	if w.state.HeadBlock > w.state.ScannedToBlock {
 		lag := w.state.HeadBlock - w.state.ScannedToBlock
 		if uint64(w.cfg.Confirmations) < lag && time.Duration(lag-uint64(w.cfg.Confirmations))*w.blockTime() >= lagAlertAfter {
@@ -790,14 +983,38 @@ func (w *Worker) save(ctx context.Context) error {
 	return w.store.SaveState(ctx, w.state)
 }
 
+// endpointMismatchAlert 有端点返回了别的链的 chainId 就告警（配置错了端点），恢复即解除。
+func (w *Worker) endpointMismatchAlert(ctx context.Context) {
+	var mismatched []string
+	for _, endpoint := range w.pool.Health() {
+		if endpoint.Health == scan.HealthMismatch {
+			mismatched = append(mismatched, endpoint.Label)
+		}
+	}
+	if len(mismatched) == 0 {
+		w.resolve(ctx, scan.AlertEndpointMismatch)
+		return
+	}
+	w.raise(ctx, scan.AlertEndpointMismatch, "endpoints answer for another chain: "+strings.Join(mismatched, ", "))
+}
+
 func (w *Worker) raise(ctx context.Context, kind scan.AlertKind, message string) {
 	if existing := w.state.Alert(kind); existing != nil {
 		existing.Message = truncate(message, 512)
 		return
 	}
-	w.state.OpenAlerts = append(w.state.OpenAlerts, scan.Alert{Kind: kind, Message: truncate(message, 512), RaisedAt: w.now()})
+	alert := scan.Alert{Kind: kind, Message: truncate(message, 512), RaisedAt: w.now()}
 	w.log.Warn("alert raised", "kind", kind, "message", message)
 	_ = w.store.InsertAudit(ctx, "chain_scan.alert_raised", w.cfg.Chain, map[string]any{"kind": kind, "message": message})
+	if w.notify != nil {
+		if err := w.notify(ctx, w.cfg.Chain, alert, false); err != nil {
+			w.log.Error("alert webhook failed", "kind", kind, "error", err)
+		} else {
+			sent := w.now()
+			alert.WebhookSentAt = &sent
+		}
+	}
+	w.state.OpenAlerts = append(w.state.OpenAlerts, alert)
 }
 
 func (w *Worker) resolve(ctx context.Context, kind scan.AlertKind) {
@@ -814,5 +1031,10 @@ func (w *Worker) resolve(ctx context.Context, kind scan.AlertKind) {
 	if resolved {
 		w.log.Info("alert resolved", "kind", kind)
 		_ = w.store.InsertAudit(ctx, "chain_scan.alert_resolved", w.cfg.Chain, map[string]any{"kind": kind})
+		if w.notify != nil {
+			if err := w.notify(ctx, w.cfg.Chain, scan.Alert{Kind: kind, RaisedAt: w.now()}, true); err != nil {
+				w.log.Error("alert webhook failed", "kind", kind, "error", err)
+			}
+		}
 	}
 }
