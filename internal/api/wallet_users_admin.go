@@ -313,10 +313,14 @@ func (s *server) listWalletUsers(c *gin.Context) {
 	}
 	pageArgs = append([]any{now}, pageArgs...)
 	pageArgs = append(pageArgs, filter.limit+1)
+	// 最近活跃设备摘要（设计 §4.7）：该账号最近登录过的安装实例及其版本与心跳时间
 	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT u.id,u.address,u.status,u.first_seen_at,u.last_login_at,u.login_count,
 		(SELECT COUNT(*) FROM wallet_user_installation r WHERE r.tenant_id=u.tenant_id AND r.user_id=u.id),
-		(SELECT COUNT(DISTINCT s.installation_id) FROM wallet_session s WHERE s.tenant_id=u.tenant_id AND s.user_id=u.id AND s.revoked_at IS NULL AND s.expires_at>? AND s.installation_id IS NOT NULL)
-		FROM wallet_user u WHERE `+pageWhere+` ORDER BY u.last_login_at DESC, u.id DESC LIMIT ?`, pageArgs...)
+		(SELECT COUNT(DISTINCT s.installation_id) FROM wallet_session s WHERE s.tenant_id=u.tenant_id AND s.user_id=u.id AND s.revoked_at IS NULL AND s.expires_at>? AND s.installation_id IS NOT NULL),
+		latest.installation_id,latest.platform,latest.app_version,latest.build_number,latest.last_active_at
+		FROM wallet_user u
+		LEFT JOIN LATERAL (SELECT i.installation_id,i.platform,i.app_version,i.build_number,i.last_active_at FROM wallet_user_installation r JOIN app_installations i ON i.tenant_id=r.tenant_id AND i.installation_id=r.installation_id WHERE r.tenant_id=u.tenant_id AND r.user_id=u.id ORDER BY r.last_login_at DESC LIMIT 1) latest ON TRUE
+		WHERE `+pageWhere+` ORDER BY u.last_login_at DESC, u.id DESC LIMIT ?`, pageArgs...)
 	if err != nil {
 		problem(c, 500, "WALLET_USER_QUERY_FAILED", "Unable to load wallet users")
 		return
@@ -329,7 +333,9 @@ func (s *server) listWalletUsers(c *gin.Context) {
 		var address, status string
 		var first, last time.Time
 		var loginCount, installations, activeInstallations int
-		if err := rows.Scan(&id, &address, &status, &first, &last, &loginCount, &installations, &activeInstallations); err != nil {
+		var latestID, latestPlatform, latestVersion, latestBuild sql.NullString
+		var latestActive sql.NullTime
+		if err := rows.Scan(&id, &address, &status, &first, &last, &loginCount, &installations, &activeInstallations, &latestID, &latestPlatform, &latestVersion, &latestBuild, &latestActive); err != nil {
 			problem(c, 500, "WALLET_USER_QUERY_FAILED", "Unable to read wallet users")
 			return
 		}
@@ -337,7 +343,11 @@ func (s *server) listWalletUsers(c *gin.Context) {
 			nextCursor = items[len(items)-1]["cursor"]
 			break
 		}
-		items = append(items, gin.H{"id": id, "address": address, "status": status, "firstSeenAt": iso(first), "lastLoginAt": iso(last), "loginCount": loginCount, "installationsCount": installations, "activeInstallationsCount": activeInstallations, "cursor": encodeInstallationCursor(last, id)})
+		var lastInstallation any
+		if latestID.Valid {
+			lastInstallation = gin.H{"installationId": latestID.String, "platform": latestPlatform.String, "appVersion": latestVersion.String, "buildNumber": latestBuild.String, "lastActiveAt": nullableOTAFieldTime(latestActive)}
+		}
+		items = append(items, gin.H{"id": id, "address": address, "status": status, "firstSeenAt": iso(first), "lastLoginAt": iso(last), "loginCount": loginCount, "installationsCount": installations, "activeInstallationsCount": activeInstallations, "lastInstallation": lastInstallation, "cursor": encodeInstallationCursor(last, id)})
 	}
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "WALLET_USER_QUERY_FAILED", "Unable to read wallet users")

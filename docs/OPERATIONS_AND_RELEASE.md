@@ -136,6 +136,27 @@ WHERE bad.application_id = bad.package_id
 
 推送 Token、钱包会话都只按 `installation_id` 关联，不受删除影响。
 
+### 签名密钥切换日（测试阶段用的是公开 debug 密钥，正式包换密钥时执行）
+
+设备归并靠 Android ID 的 HMAC，而 Android ID 按应用签名密钥区分：换密钥当天所有 Android 设备的归并 ID 都会变，`device_clients` 会出现一批新记录，旧记录不再有心跳。
+
+1. 切换前：导出一份"账号 × 安装实例"汇总（`wallet_user_installation` 与 `app_installations` 按 `installation_id` 关联），切换前的设备维度历史只能从这份数据和安装实例记录回看。
+2. 切换要求：所有租户的正式包共用同一把密钥，否则跨租户设备归并只能按地址聚合（设计 device-account-aggregation-2026-09-07 §4.4）。
+3. 现有用户必须卸载重装（签名不同无法覆盖安装），重装后是新的安装实例、新的归并 ID；登录后账号历史照常累积。
+4. 切换后核对：管理端"设备管理"里新安装实例的 `launch_source` 与运行 OTA 正常上报；账号详情里旧安装实例停留在切换前的最近活跃时间，属预期。
+5. 归并从切换日重新开始，不做旧新 ID 的映射（没有可靠依据）。
+
+### 数据库集成测试
+
+`internal/api/db_integration_test.go` 覆盖会话替代、封禁结束会话、心跳解析运行修订号、租户接口不泄露归并 ID、平台级跨租户查询与封禁。需要一个可清空的 MySQL 8：
+
+```bash
+docker run -d --name rn-test-mysql -e MYSQL_ROOT_PASSWORD=rn-test -e MYSQL_DATABASE=rn_test -p 127.0.0.1:33061:3306 mysql:8.0
+RN_TEST_MYSQL_HOST=127.0.0.1 RN_TEST_MYSQL_PORT=33061 RN_TEST_MYSQL_USER=root RN_TEST_MYSQL_PASSWORD=rn-test RN_TEST_MYSQL_DATABASE=rn_test go test ./internal/api/ -run TestDB -v
+```
+
+没有设置 `RN_TEST_MYSQL_HOST` 时这组测试跳过（CI 里显示 skip，不算通过）。
+
 ## 10. 多租户对象存储上线检查
 
 - 上传模式由 `ARTIFACT_UPLOAD_MODE` 控制：`direct` 使用浏览器预签名 PUT，吞吐更高但 Bucket 必须允许管理端 Origin；`proxy` 由 RN-Server 将请求体流式写入对象存储，适用于暂时无法配置 CORS 的环境。代理模式不会把完整安装包读入内存，但会占用 API 带宽和一条长连接。

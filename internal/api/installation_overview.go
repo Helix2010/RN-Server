@@ -31,8 +31,8 @@ func (s *server) installationOverview(c *gin.Context) {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation OTA distribution")
 		return
 	}
-	var signedIn, accounts1d, accounts7d, accounts30d int
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(DISTINCT installation_id) FROM wallet_session WHERE tenant_id=? AND installation_id IS NOT NULL AND revoked_at IS NULL AND expires_at>?`, tenantID(c), now).Scan(&signedIn); err != nil {
+	var signedIn, signedInAccounts, accounts1d, accounts7d, accounts30d int
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(DISTINCT installation_id),COUNT(DISTINCT user_id) FROM wallet_session WHERE tenant_id=? AND installation_id IS NOT NULL AND revoked_at IS NULL AND expires_at>?`, tenantID(c), now).Scan(&signedIn, &signedInAccounts); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to count signed-in installations")
 		return
 	}
@@ -41,7 +41,7 @@ func (s *server) installationOverview(c *gin.Context) {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to count active accounts")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions, "otaRevisions": otaRevisions, "launchSources": launchSources, "signedInInstallations": signedIn, "activeAccounts": gin.H{"oneDay": accounts1d, "sevenDays": accounts7d, "thirtyDays": accounts30d}})
+	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions, "otaRevisions": otaRevisions, "launchSources": launchSources, "signedInInstallations": signedIn, "signedInAccounts": signedInAccounts, "activeAccounts": gin.H{"oneDay": accounts1d, "sevenDays": accounts7d, "thirtyDays": accounts30d}})
 }
 
 func (s *server) installationVersionDistribution(c *gin.Context) ([]gin.H, error) {
