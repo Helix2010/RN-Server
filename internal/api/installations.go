@@ -179,6 +179,11 @@ func (s *server) revokeInstallation(c *gin.Context) {
 		return
 	}
 	_, _ = s.db.ExecContext(c.Request.Context(), `UPDATE app_push_tokens SET invalid_at=?,updated_at=? WHERE tenant_id=? AND installation_id=? AND invalid_at IS NULL`, now, now, tenantID(c), installationID)
+	// 撤销安装实例同时结束它上面的会话（设计 §4.2），App 下次校验会话得到 401 回到未登录态
+	if _, err := s.db.ExecContext(c.Request.Context(), endSessionsSQL+`tenant_id=? AND installation_id=?`, now, "admin", tenantID(c), installationID); err != nil {
+		problem(c, 500, "INSTALLATION_REVOKE_FAILED", "Installation revoked but its sessions could not be ended")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"revoked": true, "installationId": installationID, "revokedAt": iso(now)})
 }
 

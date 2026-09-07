@@ -165,16 +165,21 @@ func (s *server) walletAuthVerify(c *gin.Context) {
 	}
 	address := siwe.ChecksumAddress(body.Address)
 	now := time.Now().UTC()
-	// 可选的安装身份（X-Installation-ID + Authorization: Installation <credential>）：
-	// 会话关联到这台安装，收款等用户级推送只发它。带了就必须有效——失效凭证不能悄悄当没带，
-	// 在核销 nonce 之前校验，App 丢掉失效凭证后可用同一挑战重试。
-	var installation any
-	if installationID := strings.TrimSpace(c.GetHeader("X-Installation-ID")); installationID != "" {
-		if _, code := s.verifyInstallationCredential(c, installationID); code != "" {
-			problem(c, 401, code, "Installation credential is invalid, expired or revoked")
-			return
-		}
-		installation = installationID
+	// 安装身份（X-Installation-ID + Authorization: Installation <credential>）必须带且有效：
+	// 会话关联到这台安装，定向推送与"当前账号"都靠它（设计 §4.2，用户 2026-09-07 决定）。
+	// 在核销 nonce 之前校验，App 重新注册后可用同一挑战重试一次；失效凭证不能悄悄当没带。
+	installationID := strings.TrimSpace(c.GetHeader("X-Installation-ID"))
+	if installationID == "" {
+		problem(c, 401, "INSTALLATION_REQUIRED", "Sign-in must be linked to a registered installation")
+		return
+	}
+	if _, code := s.verifyInstallationCredential(c, installationID); code != "" {
+		problem(c, 401, code, "Installation credential is invalid, expired or revoked")
+		return
+	}
+	if code := s.platformWalletBlocked(c, address); code != "" {
+		problem(c, 403, code, "This wallet is not allowed to sign in")
+		return
 	}
 
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
@@ -276,9 +281,20 @@ func (s *server) walletAuthVerify(c *gin.Context) {
 		connector = "embedded"
 	}
 	sessionExpires := now.Add(walletSessionTTL)
+	sessionID := "wses_" + randomID(16)
 	if _, err := tx.ExecContext(c.Request.Context(),
 		`INSERT INTO wallet_session(id,tenant_id,user_id,token_hash,connector,chains,issued_at,expires_at,last_seen_at,installation_id) VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		"wses_"+randomID(16), tenantID(c), userID, tokenHash, connector, strings.Join(chains, ","), now, sessionExpires, now, installation); err != nil {
+		sessionID, tenantID(c), userID, tokenHash, connector, strings.Join(chains, ","), now, sessionExpires, now, installationID); err != nil {
+		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
+		return
+	}
+	// 一个安装实例同一时刻最多一条有效会话（设计 §3 不变量）：新登录替代同安装实例的旧会话，
+	// 不依赖 App 先登出；登录历史同事务写入汇总表
+	if _, err := tx.ExecContext(c.Request.Context(), supersedeSessionsSQL, now, tenantID(c), installationID, sessionID); err != nil {
+		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
+		return
+	}
+	if _, err := tx.ExecContext(c.Request.Context(), walletUserInstallationUpsertSQL, tenantID(c), userID, installationID, now, now, connector, now, now); err != nil {
 		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
 		return
 	}
@@ -317,7 +333,7 @@ func (s *server) walletAuthLogout(c *gin.Context) {
 	}
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE wallet_session SET revoked_at=? WHERE id=? AND revoked_at IS NULL`, now, record.ID); err != nil {
+		`UPDATE wallet_session SET revoked_at=?,ended_reason='logout' WHERE id=? AND revoked_at IS NULL`, now, record.ID); err != nil {
 		problem(c, 500, "WALLET_LOGOUT_FAILED", "Unable to sign out")
 		return
 	}
@@ -366,3 +382,12 @@ func requestDomain(c *gin.Context) string {
 	}
 	return strings.ToLower(strings.TrimSpace(host))
 }
+
+// supersedeSessionsSQL 把同安装实例上其他仍有效的会话标为被替代（参数：now, tenant, installation, 新会话 id）。
+const supersedeSessionsSQL = `UPDATE wallet_session SET revoked_at=?,ended_reason='superseded' WHERE tenant_id=? AND installation_id=? AND id<>? AND revoked_at IS NULL`
+
+// walletUserInstallationUpsertSQL 登录历史汇总（参数：tenant, user, installation, first, last, connector, created, updated）。
+const walletUserInstallationUpsertSQL = `INSERT INTO wallet_user_installation(tenant_id,user_id,installation_id,first_login_at,last_login_at,login_count,last_connector,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?,?) ON DUPLICATE KEY UPDATE last_login_at=VALUES(last_login_at),login_count=login_count+1,last_connector=VALUES(last_connector),updated_at=VALUES(updated_at)`
+
+// endSessionsSQL 结束一组会话（参数：now, reason, 后接调用方自己的 WHERE 条件）。
+const endSessionsSQL = `UPDATE wallet_session SET revoked_at=?,ended_reason=? WHERE revoked_at IS NULL AND `

@@ -31,7 +31,17 @@ func (s *server) installationOverview(c *gin.Context) {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation OTA distribution")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions, "otaRevisions": otaRevisions, "launchSources": launchSources})
+	var signedIn, accounts1d, accounts7d, accounts30d int
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(DISTINCT installation_id) FROM wallet_session WHERE tenant_id=? AND installation_id IS NOT NULL AND revoked_at IS NULL AND expires_at>?`, tenantID(c), now).Scan(&signedIn); err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to count signed-in installations")
+		return
+	}
+	// 活跃账号按会话最近使用时间算（每次会话校验都会刷新），不是登录时间
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(DISTINCT CASE WHEN last_seen_at>=? THEN user_id END),COUNT(DISTINCT CASE WHEN last_seen_at>=? THEN user_id END),COUNT(DISTINCT CASE WHEN last_seen_at>=? THEN user_id END) FROM wallet_session WHERE tenant_id=? AND last_seen_at>=?`, now.Add(-24*time.Hour), now.Add(-7*24*time.Hour), now.Add(-30*24*time.Hour), tenantID(c), now.Add(-30*24*time.Hour)).Scan(&accounts1d, &accounts7d, &accounts30d); err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to count active accounts")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions, "otaRevisions": otaRevisions, "launchSources": launchSources, "signedInInstallations": signedIn, "activeAccounts": gin.H{"oneDay": accounts1d, "sevenDays": accounts7d, "thirtyDays": accounts30d}})
 }
 
 func (s *server) installationVersionDistribution(c *gin.Context) ([]gin.H, error) {
@@ -218,38 +228,39 @@ func decodeInstallationCursor(raw string) (time.Time, uint64, error) {
 	return time.UnixMilli(millis).UTC(), id, nil
 }
 
+// where 生成针对别名 i（app_installations）的条件；列都带前缀，子查询里同名列不会串。
 func (f installationListFilter) where(tenant string) (string, []any) {
-	clauses := []string{"tenant_id=?"}
+	clauses := []string{"i.tenant_id=?"}
 	args := []any{tenant}
 	if f.query != "" {
-		clauses = append(clauses, "(installation_id LIKE ? OR package_id LIKE ?)")
+		clauses = append(clauses, "(i.installation_id LIKE ? OR i.package_id LIKE ?)")
 		args = append(args, f.query+"%", "%"+f.query+"%")
 	}
 	if f.platform != "" {
-		clauses = append(clauses, "platform=?")
+		clauses = append(clauses, "i.platform=?")
 		args = append(args, f.platform)
 	}
 	if f.appVersion != "" {
-		clauses = append(clauses, "app_version=?")
+		clauses = append(clauses, "i.app_version=?")
 		args = append(args, f.appVersion)
 	}
 	switch f.launchSource {
 	case "unreported":
-		clauses = append(clauses, "launch_source IS NULL")
+		clauses = append(clauses, "i.launch_source IS NULL")
 	case "embedded", "ota":
-		clauses = append(clauses, "launch_source=?")
+		clauses = append(clauses, "i.launch_source=?")
 		args = append(args, f.launchSource)
 	}
 	if f.otaRevision.Valid {
-		clauses = append(clauses, "running_ota_revision=?")
+		clauses = append(clauses, "i.running_ota_revision=?")
 		args = append(args, f.otaRevision.Int64)
 	}
 	if !f.activeSince.IsZero() {
-		clauses = append(clauses, "last_active_at>=?")
+		clauses = append(clauses, "i.last_active_at>=?")
 		args = append(args, f.activeSince)
 	}
 	if f.status != "" {
-		clauses = append(clauses, "status=?")
+		clauses = append(clauses, "i.status=?")
 		args = append(args, f.status)
 	}
 	return strings.Join(clauses, " AND "), args
@@ -264,17 +275,25 @@ func (s *server) listInstallations(c *gin.Context) {
 	}
 	where, args := filter.where(tenantID(c))
 	var total int
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*) FROM app_installations WHERE `+where, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*) FROM app_installations i WHERE `+where, args...).Scan(&total); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to count installations")
 		return
 	}
 	pageWhere, pageArgs := where, append([]any{}, args...)
 	if filter.hasCursor {
-		pageWhere += " AND (last_active_at<? OR (last_active_at=? AND id<?))"
+		pageWhere += " AND (i.last_active_at<? OR (i.last_active_at=? AND i.id<?))"
 		pageArgs = append(pageArgs, filter.cursorAt, filter.cursorAt, filter.cursorID)
 	}
 	pageArgs = append(pageArgs, filter.limit+1)
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT id,installation_id,application_id,package_id,platform,app_version,build_number,runtime_version,ota_revision,launch_source,running_update_id,running_ota_revision,client_session_state,localization_version,branding_version,locale,theme,os_version,device_class,last_active_at,status FROM app_installations WHERE `+pageWhere+` ORDER BY last_active_at DESC, id DESC LIMIT ?`, pageArgs...)
+	// 当前账号只从有效会话派生（设计 §4.3）：一个安装实例最多一条有效会话，子查询按安装实例索引命中
+	pageArgs = append([]any{now, now, now, now}, pageArgs...)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT i.id,i.installation_id,i.application_id,i.package_id,i.platform,i.app_version,i.build_number,i.runtime_version,i.ota_revision,i.launch_source,i.running_update_id,i.running_ota_revision,i.client_session_state,i.localization_version,i.branding_version,i.locale,i.theme,i.os_version,i.device_class,i.last_active_at,i.status,
+		(SELECT s.id FROM wallet_session s WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
+		(SELECT s.user_id FROM wallet_session s WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
+		(SELECT u.address FROM wallet_session s JOIN wallet_user u ON u.id=s.user_id WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
+		(SELECT s.last_seen_at FROM wallet_session s WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
+		(SELECT COUNT(*) FROM wallet_user_installation r WHERE r.tenant_id=i.tenant_id AND r.installation_id=i.installation_id)
+		FROM app_installations i WHERE `+pageWhere+` ORDER BY i.last_active_at DESC, i.id DESC LIMIT ?`, pageArgs...)
 	if err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installations")
 		return
@@ -285,10 +304,12 @@ func (s *server) listInstallations(c *gin.Context) {
 	for rows.Next() {
 		var rowID uint64
 		var id, applicationID, packageID, platform, version, build, runtime, locale, theme, osVersion, deviceClass, status string
-		var otaRevision, runningRevision, brandingVersion sql.NullInt64
-		var launchSource, runningUpdateID, sessionState, localizationVersion sql.NullString
+		var otaRevision, runningRevision, brandingVersion, currentUserID sql.NullInt64
+		var launchSource, runningUpdateID, sessionState, localizationVersion, currentSessionID, currentAddress sql.NullString
 		var active time.Time
-		if err := rows.Scan(&rowID, &id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &launchSource, &runningUpdateID, &runningRevision, &sessionState, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status); err != nil {
+		var currentLastSeen sql.NullTime
+		var accountsCount int
+		if err := rows.Scan(&rowID, &id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &launchSource, &runningUpdateID, &runningRevision, &sessionState, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status, &currentSessionID, &currentUserID, &currentAddress, &currentLastSeen, &accountsCount); err != nil {
 			problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
 			return
 		}
@@ -298,7 +319,11 @@ func (s *server) listInstallations(c *gin.Context) {
 			nextCursor = previous["cursor"]
 			break
 		}
-		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "availableOtaRevision": nullableInt64(otaRevision), "launchSource": nullableSQLString(launchSource), "runningUpdateId": nullableSQLString(runningUpdateID), "runningOtaRevision": nullableInt64(runningRevision), "clientSessionState": nullableSQLString(sessionState), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status, "cursor": encodeInstallationCursor(active, rowID)})
+		var current *currentSession
+		if currentSessionID.Valid {
+			current = &currentSession{ID: currentSessionID.String, UserID: uint64(currentUserID.Int64), Address: currentAddress.String, LastSeenAt: currentLastSeen.Time}
+		}
+		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "availableOtaRevision": nullableInt64(otaRevision), "launchSource": nullableSQLString(launchSource), "runningUpdateId": nullableSQLString(runningUpdateID), "runningOtaRevision": nullableInt64(runningRevision), "clientSessionState": nullableSQLString(sessionState), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status, "currentAccount": currentSessionJSON(current), "accountsCount": accountsCount, "activity": installationActivity(current, active, now), "sessionMismatch": nullableString(sessionMismatch(sessionState, current)), "cursor": encodeInstallationCursor(active, rowID)})
 	}
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")

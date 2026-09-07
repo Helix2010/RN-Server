@@ -49,6 +49,7 @@ var migrations = []migration{
 	{version: 33, name: "chain_scan_indexer", apply: chainScanIndexerMigration},
 	{version: 34, name: "wallet_received_push_copy", apply: walletReceivedPushCopyMigration},
 	{version: 35, name: "installation_runtime_report", apply: installationRuntimeReportMigration},
+	{version: 36, name: "wallet_user_installation", apply: walletUserInstallationMigration},
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
@@ -1082,6 +1083,76 @@ func installationRuntimeReportMigration(ctx context.Context, db *sql.DB) error {
 	}
 	if _, err := db.ExecContext(ctx, `ALTER TABLE app_installations MODIFY COLUMN ota_revision INT UNSIGNED NULL COMMENT 'bootstrap 下发的最新可用 OTA 修订号（服务端视角），不是运行中的版本；运行中的看 running_ota_revision'`); err != nil {
 		return fmt.Errorf("installation runtime report migration comment ota_revision: %w", err)
+	}
+	return nil
+}
+
+// walletUserInstallationMigration 建"账号 × 安装实例"登录历史汇总表并补会话结束原因（设计 RN-App/docs/design/device-account-aggregation-2026-09-07.md §4.2、§4.6）：
+// 当前账号仍从 wallet_session 派生（按安装实例的索引），汇总表只记历史；会话永久保留，不设清理任务，
+// 所以 ended_reason 只记主动结束的原因，过期在读取时按 expires_at 判断。
+func walletUserInstallationMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS wallet_user_installation (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+		tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID',
+		user_id BIGINT UNSIGNED NOT NULL COMMENT 'wallet_user.id',
+		installation_id VARCHAR(80) NOT NULL COMMENT 'app_installations.installation_id',
+		first_login_at DATETIME(3) NOT NULL COMMENT '该账号在该安装实例首次登录时间',
+		last_login_at DATETIME(3) NOT NULL COMMENT '该账号在该安装实例最近登录时间',
+		login_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '该账号在该安装实例的登录次数',
+		last_connector VARCHAR(32) NOT NULL COMMENT '最近一次登录使用的钱包连接器',
+		created_at DATETIME(3) NOT NULL COMMENT '创建时间',
+		updated_at DATETIME(3) NOT NULL COMMENT '更新时间',
+		PRIMARY KEY (id),
+		UNIQUE KEY uq_user_installation (tenant_id, user_id, installation_id),
+		KEY ix_installation_users (tenant_id, installation_id, last_login_at)
+	) ENGINE=InnoDB COMMENT='账号与安装实例的登录历史汇总，登录时与会话同事务写入；当前账号不看此表，看 wallet_session'`); err != nil {
+		return fmt.Errorf("wallet user installation migration create table: %w", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='wallet_session' AND COLUMN_NAME='ended_reason'`).Scan(&count); err != nil {
+		return fmt.Errorf("wallet user installation migration inspect ended_reason: %w", err)
+	}
+	if count == 0 {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE wallet_session ADD COLUMN ended_reason ENUM('logout','superseded','admin','blocked') NULL COMMENT '会话主动结束的原因：logout=用户登出，superseded=同安装实例新登录替代，admin=管理端撤销，blocked=封禁；NULL=未被主动结束（是否过期看 expires_at）' AFTER revoked_at`); err != nil {
+			return fmt.Errorf("wallet user installation migration add ended_reason: %w", err)
+		}
+	}
+	indexes := []struct{ table, index, ddl string }{
+		{"wallet_session", "ix_wallet_session_installation", `ALTER TABLE wallet_session ADD INDEX ix_wallet_session_installation (tenant_id, installation_id, revoked_at, expires_at) COMMENT '按安装实例取当前有效会话'`},
+		{"wallet_user", "ix_wallet_user_address", `ALTER TABLE wallet_user ADD INDEX ix_wallet_user_address (address_key) COMMENT '平台级按地址跨租户查找'`},
+	}
+	for _, item := range indexes {
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?`, item.table, item.index).Scan(&count); err != nil {
+			return fmt.Errorf("wallet user installation migration inspect %s: %w", item.index, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, item.ddl); err != nil {
+			return fmt.Errorf("wallet user installation migration add %s: %w", item.index, err)
+		}
+	}
+	// 平台级封禁表（设计 §4.5）：对所有租户生效，登录时先查它再查租户级 wallet_user.status
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS platform_wallet_block (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+		address_key VARCHAR(42) NOT NULL COMMENT '小写地址，跨租户唯一',
+		address VARCHAR(42) NOT NULL COMMENT 'EIP-55 校验和地址，展示用',
+		reason VARCHAR(255) NOT NULL COMMENT '封禁原因，管理端必填',
+		created_by VARCHAR(120) NOT NULL COMMENT '操作的平台管理员（x-admin-id）',
+		created_at DATETIME(3) NOT NULL COMMENT '封禁时间',
+		revoked_at DATETIME(3) NULL COMMENT '解除时间；NULL=生效中',
+		revoked_by VARCHAR(120) NULL COMMENT '解除封禁的平台管理员',
+		revoked_reason VARCHAR(255) NULL COMMENT '解除原因',
+		PRIMARY KEY (id),
+		KEY ix_platform_block_address (address_key, revoked_at)
+	) ENGINE=InnoDB COMMENT='平台级钱包封禁，对所有租户生效；租户级封禁在 wallet_user.status'`); err != nil {
+		return fmt.Errorf("wallet user installation migration create platform block table: %w", err)
+	}
+	// 从已有会话回填历史（只有 1.2.9 起带安装实例的会话有数据；上线时线上为 0 条，从此开始积累）
+	if _, err := db.ExecContext(ctx, `INSERT IGNORE INTO wallet_user_installation(tenant_id,user_id,installation_id,first_login_at,last_login_at,login_count,last_connector,created_at,updated_at)
+		SELECT tenant_id,user_id,installation_id,MIN(issued_at),MAX(issued_at),COUNT(*),SUBSTRING_INDEX(GROUP_CONCAT(connector ORDER BY issued_at DESC SEPARATOR ','),',',1),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)
+		FROM wallet_session WHERE installation_id IS NOT NULL GROUP BY tenant_id,user_id,installation_id`); err != nil {
+		return fmt.Errorf("wallet user installation migration backfill: %w", err)
 	}
 	return nil
 }

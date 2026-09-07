@@ -128,7 +128,7 @@ func TestParseInstallationListFilterRejectsInvalidValues(t *testing.T) {
 		t.Fatalf("valid query rejected: %s", invalid)
 	}
 	where, args := filter.where("100000001")
-	for _, fragment := range []string{"tenant_id=?", "platform=?", "launch_source IS NULL", "running_ota_revision=?", "last_active_at>=?", "installation_id LIKE ?"} {
+	for _, fragment := range []string{"i.tenant_id=?", "i.platform=?", "i.launch_source IS NULL", "i.running_ota_revision=?", "i.last_active_at>=?", "i.installation_id LIKE ?"} {
 		if !strings.Contains(where, fragment) {
 			t.Fatalf("where clause missing %s: %s", fragment, where)
 		}
