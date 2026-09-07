@@ -28,23 +28,28 @@ const installationCredentialRotateBefore = 14 * 24 * time.Hour
 // sync; TestInstallationUpsertPlaceholderCount guards the first two.
 const installationCredentialLookupSQL = `SELECT credential_hash,credential_version,credential_expires_at,credential_revoked_at,application_id,platform,status FROM app_installations WHERE tenant_id=? AND application_id=? AND platform=? AND installation_id=? LIMIT 1`
 
-const installationUpsertSQL = `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`
+const installationUpsertSQL = `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,launch_source,running_update_id,running_ota_revision,client_session_state,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),launch_source=VALUES(launch_source),running_update_id=VALUES(running_update_id),running_ota_revision=VALUES(running_ota_revision),client_session_state=VALUES(client_session_state),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`
 
 var installationIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,80}$`)
 var deviceSourceHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type installationHeartbeat struct {
-	InstallationID      string `json:"installationId"`
-	DeviceSourceHash    string `json:"deviceSourceHash"`
-	PackageID           string `json:"packageId"`
-	OTAChannel          string `json:"otaChannel"`
-	OTARevision         *int   `json:"otaRevision"`
-	LocalizationVersion string `json:"localizationVersion"`
-	BrandingVersion     *int   `json:"brandingVersion"`
-	Locale              string `json:"locale"`
-	Theme               string `json:"theme"`
-	OSVersion           string `json:"osVersion"`
-	DeviceClass         string `json:"deviceClass"`
+	InstallationID   string `json:"installationId"`
+	DeviceSourceHash string `json:"deviceSourceHash"`
+	PackageID        string `json:"packageId"`
+	OTAChannel       string `json:"otaChannel"`
+	OTARevision      *int   `json:"otaRevision"`
+	// 设备实际在跑什么（设计 §4.1）：launchSource 缺省表示旧版 App 未上报，服务端存 NULL
+	LaunchSource    *string `json:"launchSource"`
+	RunningUpdateID *string `json:"runningUpdateId"`
+	// 客户端登录态，只用于与 wallet_session 对账，不参与任何判定
+	SessionState        *string `json:"sessionState"`
+	LocalizationVersion string  `json:"localizationVersion"`
+	BrandingVersion     *int    `json:"brandingVersion"`
+	Locale              string  `json:"locale"`
+	Theme               string  `json:"theme"`
+	OSVersion           string  `json:"osVersion"`
+	DeviceClass         string  `json:"deviceClass"`
 }
 
 type installationCredentialRecord struct {
@@ -217,7 +222,51 @@ func decodeInstallationBody(c *gin.Context) (installationHeartbeat, bool) {
 		problem(c, 422, "INVALID_INSTALLATION", "Installation identity is invalid")
 		return body, false
 	}
+	if code, detail := normalizeRuntimeReport(&body); code != "" {
+		problem(c, 422, code, detail)
+		return body, false
+	}
 	return body, true
+}
+
+// normalizeRuntimeReport 校验心跳里"设备实际在跑什么"的字段并做规范化，返回失败码与说明（空表示通过）。
+// 内置包不能带 update id，OTA 包必须带合法 update id，两者不符都是客户端 bug，直接 422 让它暴露。
+func normalizeRuntimeReport(body *installationHeartbeat) (string, string) {
+	runningID := ""
+	if body.RunningUpdateID != nil {
+		runningID = strings.ToLower(strings.TrimSpace(*body.RunningUpdateID))
+	}
+	if body.LaunchSource == nil {
+		if runningID != "" {
+			return "OTA_RUNNING_UPDATE_INVALID", "runningUpdateId requires launchSource"
+		}
+		body.RunningUpdateID = nil
+	} else {
+		source := strings.ToLower(strings.TrimSpace(*body.LaunchSource))
+		switch source {
+		case "embedded":
+			if runningID != "" {
+				return "OTA_RUNNING_UPDATE_INVALID", "Embedded launches must not report a running update id"
+			}
+			body.RunningUpdateID = nil
+		case "ota":
+			if !uuidPattern.MatchString(runningID) {
+				return "OTA_RUNNING_UPDATE_INVALID", "OTA launches must report the running update id as a UUID"
+			}
+			body.RunningUpdateID = &runningID
+		default:
+			return "OTA_RUNNING_UPDATE_INVALID", "launchSource must be embedded or ota"
+		}
+		body.LaunchSource = &source
+	}
+	if body.SessionState != nil {
+		state := strings.ToLower(strings.TrimSpace(*body.SessionState))
+		if state != "signed_in" && state != "signed_out" {
+			return "INVALID_INSTALLATION", "sessionState must be signed_in or signed_out"
+		}
+		body.SessionState = &state
+	}
+	return "", ""
 }
 
 func (s *server) saveInstallation(c *gin.Context, body installationHeartbeat, credentialHash string, credentialVersion int, credentialExpires, now time.Time) error {
@@ -242,7 +291,21 @@ func (s *server) saveInstallation(c *gin.Context, body installationHeartbeat, cr
 		}
 		deviceClientID = id
 	}
-	_, err = tx.ExecContext(c.Request.Context(), installationUpsertSQL, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
+	// 运行中的修订号由 update id 在本租户的 OTA 发布记录里解析；关联不上（回退、已删除、别的租户）存 NULL，
+	// 管理端显示"未知更新"，不猜
+	var runningRevision any
+	if body.LaunchSource != nil && *body.LaunchSource == "ota" && body.RunningUpdateID != nil {
+		var revision int
+		switch lookupErr := tx.QueryRowContext(c.Request.Context(), `SELECT revision FROM ota_releases WHERE tenant_id=? AND update_id=? LIMIT 1`, tenantID(c), *body.RunningUpdateID).Scan(&revision); {
+		case lookupErr == nil:
+			runningRevision = revision
+		case errors.Is(lookupErr, sql.ErrNoRows):
+			runningRevision = nil
+		default:
+			return lookupErr
+		}
+	}
+	_, err = tx.ExecContext(c.Request.Context(), installationUpsertSQL, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LaunchSource, body.RunningUpdateID, runningRevision, body.SessionState, body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
 	if err != nil {
 		return err
 	}

@@ -2,7 +2,12 @@ package api
 
 import (
 	"database/sql"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,10 +21,23 @@ func (s *server) installationOverview(c *gin.Context) {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation overview")
 		return
 	}
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT platform,app_version,build_number,COUNT(*) FROM app_installations WHERE tenant_id=? GROUP BY platform,app_version,build_number ORDER BY platform,COUNT(*) DESC`, tenantID(c))
+	versions, err := s.installationVersionDistribution(c)
 	if err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation versions")
 		return
+	}
+	otaRevisions, launchSources, err := s.installationOTADistribution(c)
+	if err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation OTA distribution")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions, "otaRevisions": otaRevisions, "launchSources": launchSources})
+}
+
+func (s *server) installationVersionDistribution(c *gin.Context) ([]gin.H, error) {
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT platform,app_version,build_number,COUNT(*) FROM app_installations WHERE tenant_id=? GROUP BY platform,app_version,build_number ORDER BY platform,COUNT(*) DESC`, tenantID(c))
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	versions := []gin.H{}
@@ -27,38 +45,269 @@ func (s *server) installationOverview(c *gin.Context) {
 		var platform, version, build string
 		var count int
 		if err := rows.Scan(&platform, &version, &build, &count); err != nil {
-			problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installation versions")
-			return
+			return nil, err
 		}
 		versions = append(versions, gin.H{"platform": platform, "version": version, "buildNumber": build, "count": count})
 	}
-	c.JSON(http.StatusOK, gin.H{"generatedAt": iso(now), "total": total, "active": gin.H{"oneDay": active1d, "sevenDays": active7d, "thirtyDays": active30d}, "versions": versions})
+	return versions, rows.Err()
+}
+
+// installationOTADistribution 回答"这版 OTA 生效了多少设备、还有多少待生效"：
+// running 按心跳上报的运行中修订号统计（只算 launch_source=ota 的实例，关联不上的归入 revision=null），
+// available 按 bootstrap 下发的可用修订号统计；两者之差就是待生效。
+// launchSources 里 unreported 是旧版 App，没有上报启动来源，不能当成内置。
+func (s *server) installationOTADistribution(c *gin.Context) ([]gin.H, gin.H, error) {
+	type bucket struct {
+		revision  sql.NullInt64
+		running   int
+		available int
+	}
+	buckets := map[int64]*bucket{}
+	unknown := &bucket{}
+	get := func(revision sql.NullInt64) *bucket {
+		if !revision.Valid {
+			return unknown
+		}
+		if item, ok := buckets[revision.Int64]; ok {
+			return item
+		}
+		item := &bucket{revision: revision}
+		buckets[revision.Int64] = item
+		return item
+	}
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT running_ota_revision,COUNT(*) FROM app_installations WHERE tenant_id=? AND launch_source='ota' GROUP BY running_ota_revision`, tenantID(c))
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var revision sql.NullInt64
+		var count int
+		if err := rows.Scan(&revision, &count); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		get(revision).running = count
+	}
+	rows.Close()
+	rows, err = s.db.QueryContext(c.Request.Context(), `SELECT ota_revision,COUNT(*) FROM app_installations WHERE tenant_id=? AND ota_revision IS NOT NULL GROUP BY ota_revision`, tenantID(c))
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var revision sql.NullInt64
+		var count int
+		if err := rows.Scan(&revision, &count); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		get(revision).available = count
+	}
+	rows.Close()
+	keys := make([]int64, 0, len(buckets))
+	for key := range buckets {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] > keys[j] })
+	otaRevisions := make([]gin.H, 0, len(keys)+1)
+	for _, key := range keys {
+		item := buckets[key]
+		otaRevisions = append(otaRevisions, gin.H{"revision": key, "running": item.running, "available": item.available})
+	}
+	if unknown.running > 0 {
+		otaRevisions = append(otaRevisions, gin.H{"revision": nil, "running": unknown.running, "available": 0})
+	}
+	launchSources := gin.H{"embedded": 0, "ota": 0, "unreported": 0}
+	rows, err = s.db.QueryContext(c.Request.Context(), `SELECT COALESCE(launch_source,'unreported'),COUNT(*) FROM app_installations WHERE tenant_id=? GROUP BY COALESCE(launch_source,'unreported')`, tenantID(c))
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var source string
+		var count int
+		if err := rows.Scan(&source, &count); err != nil {
+			return nil, nil, err
+		}
+		launchSources[source] = count
+	}
+	return otaRevisions, launchSources, rows.Err()
+}
+
+const installationListMaxLimit = 200
+
+type installationListFilter struct {
+	query        string
+	platform     string
+	appVersion   string
+	launchSource string
+	otaRevision  sql.NullInt64
+	activeSince  time.Time
+	status       string
+	limit        int
+	cursorAt     time.Time
+	cursorID     uint64
+	hasCursor    bool
+}
+
+// parseInstallationListFilter 解析列表参数；不合法的值直接 422，不静默忽略。
+func parseInstallationListFilter(c *gin.Context, now time.Time) (installationListFilter, string) {
+	f := installationListFilter{query: strings.TrimSpace(c.Query("q")), platform: strings.ToLower(strings.TrimSpace(c.Query("platform"))), appVersion: strings.TrimSpace(c.Query("appVersion")), launchSource: strings.ToLower(strings.TrimSpace(c.Query("launchSource"))), status: strings.ToLower(strings.TrimSpace(c.Query("status"))), limit: 50}
+	if f.platform != "" && f.platform != "android" && f.platform != "ios" {
+		return f, "platform must be android or ios"
+	}
+	if f.launchSource != "" && f.launchSource != "embedded" && f.launchSource != "ota" && f.launchSource != "unreported" {
+		return f, "launchSource must be embedded, ota or unreported"
+	}
+	if raw := strings.TrimSpace(c.Query("runningOtaRevision")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 0 {
+			return f, "runningOtaRevision must be a non-negative integer"
+		}
+		f.otaRevision = sql.NullInt64{Int64: value, Valid: true}
+	}
+	switch strings.TrimSpace(c.Query("activeWithin")) {
+	case "":
+	case "1d":
+		f.activeSince = now.Add(-24 * time.Hour)
+	case "7d":
+		f.activeSince = now.Add(-7 * 24 * time.Hour)
+	case "30d":
+		f.activeSince = now.Add(-30 * 24 * time.Hour)
+	default:
+		return f, "activeWithin must be 1d, 7d or 30d"
+	}
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > installationListMaxLimit {
+			return f, "limit must be between 1 and 200"
+		}
+		f.limit = value
+	}
+	if raw := strings.TrimSpace(c.Query("cursor")); raw != "" {
+		at, id, err := decodeInstallationCursor(raw)
+		if err != nil {
+			return f, "cursor is invalid"
+		}
+		f.cursorAt, f.cursorID, f.hasCursor = at, id, true
+	}
+	return f, ""
+}
+
+// 游标按 (last_active_at DESC, id DESC) 定位：编码成 base64url("<毫秒时间戳>:<内部id>")。
+func encodeInstallationCursor(at time.Time, id uint64) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%d", at.UnixMilli(), id)))
+}
+
+func decodeInstallationCursor(raw string) (time.Time, uint64, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 {
+		return time.Time{}, 0, errors.New("cursor must have two parts")
+	}
+	millis, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	id, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	return time.UnixMilli(millis).UTC(), id, nil
+}
+
+func (f installationListFilter) where(tenant string) (string, []any) {
+	clauses := []string{"tenant_id=?"}
+	args := []any{tenant}
+	if f.query != "" {
+		clauses = append(clauses, "(installation_id LIKE ? OR package_id LIKE ?)")
+		args = append(args, f.query+"%", "%"+f.query+"%")
+	}
+	if f.platform != "" {
+		clauses = append(clauses, "platform=?")
+		args = append(args, f.platform)
+	}
+	if f.appVersion != "" {
+		clauses = append(clauses, "app_version=?")
+		args = append(args, f.appVersion)
+	}
+	switch f.launchSource {
+	case "unreported":
+		clauses = append(clauses, "launch_source IS NULL")
+	case "embedded", "ota":
+		clauses = append(clauses, "launch_source=?")
+		args = append(args, f.launchSource)
+	}
+	if f.otaRevision.Valid {
+		clauses = append(clauses, "running_ota_revision=?")
+		args = append(args, f.otaRevision.Int64)
+	}
+	if !f.activeSince.IsZero() {
+		clauses = append(clauses, "last_active_at>=?")
+		args = append(args, f.activeSince)
+	}
+	if f.status != "" {
+		clauses = append(clauses, "status=?")
+		args = append(args, f.status)
+	}
+	return strings.Join(clauses, " AND "), args
 }
 
 func (s *server) listInstallations(c *gin.Context) {
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT installation_id,application_id,package_id,platform,app_version,build_number,runtime_version,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,last_active_at,status FROM app_installations WHERE tenant_id=? ORDER BY last_active_at DESC LIMIT 500`, tenantID(c))
+	now := time.Now().UTC()
+	filter, invalid := parseInstallationListFilter(c, now)
+	if invalid != "" {
+		problem(c, 422, "INVALID_INSTALLATION_FILTER", invalid)
+		return
+	}
+	where, args := filter.where(tenantID(c))
+	var total int
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*) FROM app_installations WHERE `+where, args...).Scan(&total); err != nil {
+		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to count installations")
+		return
+	}
+	pageWhere, pageArgs := where, append([]any{}, args...)
+	if filter.hasCursor {
+		pageWhere += " AND (last_active_at<? OR (last_active_at=? AND id<?))"
+		pageArgs = append(pageArgs, filter.cursorAt, filter.cursorAt, filter.cursorID)
+	}
+	pageArgs = append(pageArgs, filter.limit+1)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT id,installation_id,application_id,package_id,platform,app_version,build_number,runtime_version,ota_revision,launch_source,running_update_id,running_ota_revision,client_session_state,localization_version,branding_version,locale,theme,os_version,device_class,last_active_at,status FROM app_installations WHERE `+pageWhere+` ORDER BY last_active_at DESC, id DESC LIMIT ?`, pageArgs...)
 	if err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to load installations")
 		return
 	}
 	defer rows.Close()
 	items := []gin.H{}
+	var nextCursor any
 	for rows.Next() {
+		var rowID uint64
 		var id, applicationID, packageID, platform, version, build, runtime, locale, theme, osVersion, deviceClass, status string
-		var otaRevision, brandingVersion sql.NullInt64
-		var localizationVersion sql.NullString
+		var otaRevision, runningRevision, brandingVersion sql.NullInt64
+		var launchSource, runningUpdateID, sessionState, localizationVersion sql.NullString
 		var active time.Time
-		if err := rows.Scan(&id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status); err != nil {
+		if err := rows.Scan(&rowID, &id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &launchSource, &runningUpdateID, &runningRevision, &sessionState, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status); err != nil {
 			problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
 			return
 		}
-		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status})
+		if len(items) == filter.limit {
+			// 多取的一行只用来判断还有下一页，游标指向本页最后一行
+			previous := items[len(items)-1]
+			nextCursor = previous["cursor"]
+			break
+		}
+		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "availableOtaRevision": nullableInt64(otaRevision), "launchSource": nullableSQLString(launchSource), "runningUpdateId": nullableSQLString(runningUpdateID), "runningOtaRevision": nullableInt64(runningRevision), "clientSessionState": nullableSQLString(sessionState), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status, "cursor": encodeInstallationCursor(active, rowID)})
 	}
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+	for _, item := range items {
+		delete(item, "cursor")
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": total, "nextCursor": nextCursor, "limit": filter.limit})
 }
 
 func (s *server) listPushOutbox(c *gin.Context) {

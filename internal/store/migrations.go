@@ -48,6 +48,7 @@ var migrations = []migration{
 	{version: 32, name: "chain_token_seed_monad", apply: chainTokenSeedMonadMigration},
 	{version: 33, name: "chain_scan_indexer", apply: chainScanIndexerMigration},
 	{version: 34, name: "wallet_received_push_copy", apply: walletReceivedPushCopyMigration},
+	{version: 35, name: "installation_runtime_report", apply: installationRuntimeReportMigration},
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
@@ -1053,6 +1054,34 @@ func chainScanIndexerMigration(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, item.ddl); err != nil {
 			return fmt.Errorf("chain scan indexer migration add %s.%s: %w", item.table, item.column, err)
 		}
+	}
+	return nil
+}
+
+// installationRuntimeReportMigration 给安装实例加"设备实际在跑什么"的列（设计 RN-App/docs/design/device-account-aggregation-2026-09-07.md §4.1、§4.6）：
+// 此前只有 bootstrap 下发的可用修订号 ota_revision，管理端把它当成运行版本展示是错的。
+// 旧版 App 不上报这些字段时存 NULL，管理端显示"未上报"，不把 NULL 当内置包。
+func installationRuntimeReportMigration(ctx context.Context, db *sql.DB) error {
+	columns := []struct{ column, ddl string }{
+		{"launch_source", `ALTER TABLE app_installations ADD COLUMN launch_source ENUM('embedded','ota') NULL COMMENT '心跳上报的启动来源：embedded=内置 bundle，ota=OTA bundle；NULL=旧版 App 未上报' AFTER ota_revision`},
+		{"running_update_id", `ALTER TABLE app_installations ADD COLUMN running_update_id CHAR(36) NULL COMMENT '正在运行的 expo-updates update id；launch_source=embedded 时为 NULL' AFTER launch_source`},
+		{"running_ota_revision", `ALTER TABLE app_installations ADD COLUMN running_ota_revision INT UNSIGNED NULL COMMENT '由 running_update_id 关联本租户 ota_releases.update_id 得到的修订号；关联不上为 NULL，管理端显示未知更新' AFTER running_update_id`},
+		{"client_session_state", `ALTER TABLE app_installations ADD COLUMN client_session_state ENUM('signed_in','signed_out') NULL COMMENT '心跳上报的客户端登录态，只用于与 wallet_session 对账，不参与任何判定；NULL=旧版 App 未上报' AFTER running_ota_revision`},
+	}
+	for _, item := range columns {
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='app_installations' AND COLUMN_NAME=?`, item.column).Scan(&count); err != nil {
+			return fmt.Errorf("installation runtime report migration inspect %s: %w", item.column, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, item.ddl); err != nil {
+			return fmt.Errorf("installation runtime report migration add %s: %w", item.column, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE app_installations MODIFY COLUMN ota_revision INT UNSIGNED NULL COMMENT 'bootstrap 下发的最新可用 OTA 修订号（服务端视角），不是运行中的版本；运行中的看 running_ota_revision'`); err != nil {
+		return fmt.Errorf("installation runtime report migration comment ota_revision: %w", err)
 	}
 	return nil
 }
