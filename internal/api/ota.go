@@ -413,7 +413,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	manifest["channel"] = body.Channel
 	rewriteOTAClientIdentity(manifest, otaClientIdentity{
 		APIBaseURL:    absoluteURL(c, ""),
-		ApplicationID: otaApplicationID(baseFileMetadata, manifest),
+		ApplicationID: otaManifestExtraString(manifest, "applicationId"),
 		AppVersion:    baseVersion,
 		BuildNumber:   baseBuild,
 		Platform:      basePlatform,
@@ -524,6 +524,11 @@ func validateOTAManifestPackage(manifest map[string]any, files map[string]*zip.F
 	extra, ok := manifest["extra"].(map[string]any)
 	if !ok || strings.TrimSpace(fmt.Sprint(extra["scopeKey"])) == "" {
 		return errors.New("manifest extra.scopeKey is required")
+	}
+	// 应用身份（App 的 X-Application-ID）来自租户配置，OTA 构建脚本会写进 extra；
+	// 缺了就拒绝上传，不能拿基线 APK 的包名顶替：包名是 package_id，不是应用身份
+	if otaManifestExtraString(manifest, "applicationId") == "" {
+		return errors.New("manifest extra.applicationId is required")
 	}
 	assets, ok := manifest["assets"].([]any)
 	if !ok {
@@ -676,19 +681,6 @@ func rewriteOTAClientIdentity(manifest map[string]any, identity otaClientIdentit
 	extra["appVersion"] = identity.AppVersion
 	extra["buildNumber"] = identity.BuildNumber
 	manifest["extra"] = extra
-}
-
-func otaApplicationID(raw []byte, manifest map[string]any) string {
-	var metadata map[string]any
-	if json.Unmarshal(raw, &metadata) == nil {
-		if value, ok := metadata["packageName"].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	if value := otaManifestExtraString(manifest, "applicationId"); value != "" {
-		return value
-	}
-	return "dex-mobile"
 }
 
 func otaDistribution(platform string, raw []byte, manifest map[string]any) string {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -118,7 +119,7 @@ func TestValidateOTAManifestPackageRequiresMatchingRuntimeAndHashes(t *testing.T
 	manifest := map[string]any{
 		"id": "123e4567-e89b-12d3-a456-426614174000", "runtimeVersion": "fingerprint-a", "platform": "android",
 		"createdAt":   "2026-08-28T00:00:00Z",
-		"extra":       map[string]any{"scopeKey": "anyfun"},
+		"extra":       map[string]any{"scopeKey": "anyfun", "applicationId": "dex-mobile"},
 		"launchAsset": map[string]any{"path": "bundle.js", "key": "bundle", "contentType": "application/javascript", "url": "https://example.test/bundle.js", "fileExtension": ".js", "hash": base64.RawURLEncoding.EncodeToString(digest[:])},
 		"assets":      []any{},
 	}
@@ -129,6 +130,32 @@ func TestValidateOTAManifestPackageRequiresMatchingRuntimeAndHashes(t *testing.T
 	manifest["runtimeVersion"] = "other"
 	if err := validateOTAManifestPackage(manifest, map[string]*zip.File{"bundle.js": f}, "android", "fingerprint-a", "production"); err == nil {
 		t.Fatal("expected runtime mismatch")
+	}
+}
+
+// 应用身份必须由 OTA 包自己带上（构建脚本从租户配置写入 extra.applicationId），
+// 服务端不能拿基线 APK 的包名顶替：装了 OTA 的设备会以另一个身份上报，
+// app_installations 里就会出现同一台设备的两条记录，凭证也对不上
+func TestValidateOTAManifestPackageRequiresApplicationID(t *testing.T) {
+	content := []byte("console.log('ok')")
+	digest := sha256.Sum256(content)
+	f := makeZipFile(t, "bundle.js", content)
+	manifest := func(extra map[string]any) map[string]any {
+		return map[string]any{
+			"id": "123e4567-e89b-12d3-a456-426614174000", "runtimeVersion": "fingerprint-a", "platform": "android",
+			"createdAt":   "2026-08-28T00:00:00Z",
+			"extra":       extra,
+			"launchAsset": map[string]any{"path": "bundle.js", "key": "bundle", "contentType": "application/javascript", "url": "https://example.test/bundle.js", "fileExtension": ".js", "hash": base64.RawURLEncoding.EncodeToString(digest[:])},
+			"assets":      []any{},
+		}
+	}
+	err := validateOTAManifestPackage(manifest(map[string]any{"scopeKey": "anyfun"}), map[string]*zip.File{"bundle.js": f}, "android", "fingerprint-a", "production")
+	if err == nil || !strings.Contains(err.Error(), "extra.applicationId") {
+		t.Fatalf("manifest without applicationId must be rejected, got %v", err)
+	}
+	nested := map[string]any{"scopeKey": "anyfun", "expoClient": map[string]any{"extra": map[string]any{"applicationId": "dex-mobile"}}}
+	if err := validateOTAManifestPackage(manifest(nested), map[string]*zip.File{"bundle.js": f}, "android", "fingerprint-a", "production"); err != nil {
+		t.Fatalf("applicationId nested under expoClient.extra must be accepted: %v", err)
 	}
 }
 

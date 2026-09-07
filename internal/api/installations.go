@@ -26,6 +26,8 @@ const installationCredentialRotateBefore = 14 * 24 * time.Hour
 // installationUpsertSQL is shared by register and heartbeat. Keep the column
 // list, the VALUES placeholders and the argument list in saveInstallation in
 // sync; TestInstallationUpsertPlaceholderCount guards the first two.
+const installationCredentialLookupSQL = `SELECT credential_hash,credential_version,credential_expires_at,credential_revoked_at,application_id,platform,status FROM app_installations WHERE tenant_id=? AND application_id=? AND platform=? AND installation_id=? LIMIT 1`
+
 const installationUpsertSQL = `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`
 
 var installationIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,80}$`)
@@ -268,8 +270,11 @@ func (s *server) verifyInstallationCredential(c *gin.Context, installationID str
 	if credential == "" || credential == strings.TrimSpace(c.GetHeader("Authorization")) {
 		return record, "INSTALLATION_CREDENTIAL_REQUIRED"
 	}
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT credential_hash,credential_version,credential_expires_at,credential_revoked_at,application_id,platform,status FROM app_installations WHERE tenant_id=? AND installation_id=? LIMIT 1`, tenantID(c), installationID).Scan(&record.Hash, &record.Version, &record.ExpiresAt, &record.RevokedAt, &record.ApplicationID, &record.Platform, &record.Status)
-	if err != nil || record.RevokedAt.Valid || record.Status == "revoked" || record.ExpiresAt.Before(time.Now().UTC()) || record.ApplicationID != text(c.GetHeader("x-application-id"), "unknown") || record.Platform != strings.ToLower(c.GetHeader("x-platform")) {
+	// 安装记录的键是 (tenant, application_id, installation_id)：查询必须带上请求头里的
+	// 应用身份和平台，否则同一 installation_id 下若有多条记录会随机取一条去比对，
+	// 凭证明明有效也判失效
+	err := s.db.QueryRowContext(c.Request.Context(), installationCredentialLookupSQL, tenantID(c), text(c.GetHeader("x-application-id"), "unknown"), strings.ToLower(c.GetHeader("x-platform")), installationID).Scan(&record.Hash, &record.Version, &record.ExpiresAt, &record.RevokedAt, &record.ApplicationID, &record.Platform, &record.Status)
+	if err != nil || record.RevokedAt.Valid || record.Status == "revoked" || record.ExpiresAt.Before(time.Now().UTC()) {
 		return record, "INSTALLATION_CREDENTIAL_INVALID"
 	}
 	actual := sha256.Sum256([]byte(credential))

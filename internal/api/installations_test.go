@@ -28,3 +28,18 @@ func TestInstallationUpsertPlaceholderCount(t *testing.T) {
 		t.Fatalf("app_installations upsert expects %d placeholders (all columns except the status literal), got %d", columnCount-1, got)
 	}
 }
+
+// 凭证查询必须按 (tenant, application_id, platform, installation_id) 定位：
+// 只按 installation_id 查再 LIMIT 1，同一台设备有多条记录时会取错行，
+// 有效凭证被判失效，App 反复重注册（线上曾把 credential_version 刷到 80）
+func TestInstallationCredentialLookupIsScopedToApplicationAndPlatform(t *testing.T) {
+	where := installationCredentialLookupSQL[strings.Index(installationCredentialLookupSQL, " WHERE "):]
+	for _, column := range []string{"tenant_id=?", "application_id=?", "platform=?", "installation_id=?"} {
+		if !strings.Contains(where, column) {
+			t.Fatalf("credential lookup must filter by %s: %s", column, where)
+		}
+	}
+	if got := strings.Count(where, "?"); got != 4 {
+		t.Fatalf("credential lookup expects 4 placeholders, got %d", got)
+	}
+}

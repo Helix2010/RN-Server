@@ -86,6 +86,7 @@ bootstrap 根据以下输入求值：
 - manifest 签名密钥与 native signing key 分离；私钥由 signing service 保管。
 - runtimeVersion 必须严格匹配；资源 URL 内容寻址并不可变。
 - 更新上传后跑静态检查、启动 smoke 和真机 staging；生产先 canary。
+- 应用身份（App 请求头 `X-Application-ID`，即租户配置的 `applicationId`）由 OTA 包自己带上（`extra.applicationId`），服务端只校验不改写；缺失即拒绝上传（`OTA_MANIFEST_INVALID`）。基线 APK 的包名是 `package_id`，不是应用身份，不能拿来顶替，否则装了 OTA 的设备会以另一个身份上报，`app_installations` 里出现同一台设备的两条记录，安装凭证也对不上。
 
 ## 6. 灰度与暂停
 
@@ -119,6 +120,21 @@ bootstrap 根据以下输入求值：
 - 凭证/签名密钥疑似泄露。
 
 每份 runbook 包含影响确认、立即止损、诊断查询、恢复、数据核对、沟通和复盘责任。
+
+### 安装记录去重（2026-09-07 OTA 应用身份修复后的一次性核对）
+
+修复前上传的 OTA 包把应用身份改写成了 APK 包名，装过 OTA 的设备在 `app_installations` 里各有两条记录：`application_id` 等于 `package_id` 的那条是错误身份。设备装上修复后的 OTA 包会重新以租户配置的身份上报，那之后再删错误行；还没重新上报的设备（`good.last_active_at` 更旧）先留着，隔天再跑一次：
+
+```sql
+DELETE bad FROM app_installations bad
+JOIN app_installations good
+  ON good.tenant_id = bad.tenant_id AND good.installation_id = bad.installation_id
+ AND good.application_id <> bad.application_id
+WHERE bad.application_id = bad.package_id
+  AND good.last_active_at >= bad.last_active_at;
+```
+
+推送 Token、钱包会话都只按 `installation_id` 关联，不受删除影响。
 
 ## 10. 多租户对象存储上线检查
 
