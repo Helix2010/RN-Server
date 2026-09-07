@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 )
@@ -48,6 +49,7 @@ func currentRNAppLocalizationSeedMigration(ctx context.Context, db *sql.DB) erro
 		return err
 	}
 	defer tx.Rollback()
+	inserted := 0
 	for _, locale := range []string{"zh-CN", "en-US"} {
 		seed, err := readRNAppLocaleSeed(locale)
 		if err != nil {
@@ -60,10 +62,20 @@ func currentRNAppLocalizationSeedMigration(ctx context.Context, db *sql.DB) erro
 		sort.Strings(keys)
 		for _, key := range keys {
 			content := seed.Messages[key]
-			if _, err := tx.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,'RN-App UI seed',14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE id=id`, locale, strings.ToLower(key), content); err != nil {
+			result, err := tx.ExecContext(ctx, `INSERT INTO language_document(lang,`+"`key`"+`,content,meta,type,edit,tenant_id,ctime,mtime,deleted) VALUES(?,?,?,'RN-App UI seed',14,1,0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3),0) ON DUPLICATE KEY UPDATE id=id`, locale, strings.ToLower(key), content)
+			if err != nil {
 				return fmt.Errorf("seed RN-App localization %s/%s: %w", locale, key, err)
+			}
+			if affected, _ := result.RowsAffected(); affected == 1 {
+				inserted++
 			}
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if inserted > 0 {
+		slog.Info("RN-App localization seed applied", "insertedKeys", inserted)
+	}
+	return nil
 }
