@@ -43,15 +43,23 @@ func TestParsePredictServiceEndpoints(t *testing.T) {
 		"clob":   " https://CLOB.Example.net:8443/api/ ",
 		"clobWs": "wss://ws.example.net",
 		"gamma":  "",
+		// 地区限制检查服务：与其它地址同样校验，没有派生默认
+		"geo": "https://Geo.Example.net/check/",
 	}
 	got, err := parsePredictService(raw)
 	if err != nil {
 		t.Fatalf("valid endpoints rejected: %v", err)
 	}
 	// 主机转小写、末尾 / 去掉、空串不算覆盖
-	if got.Endpoints["clob"] != "https://clob.example.net:8443/api" || got.Endpoints["clobWs"] != "wss://ws.example.net" || len(got.Endpoints) != 2 {
+	if got.Endpoints["clob"] != "https://clob.example.net:8443/api" || got.Endpoints["clobWs"] != "wss://ws.example.net" || got.Endpoints["geo"] != "https://geo.example.net/check" || len(got.Endpoints) != 3 {
 		t.Fatalf("endpoints = %+v", got.Endpoints)
 	}
+	// geo 只接受 https
+	raw["endpoints"] = map[string]any{"geo": "http://geo.example.net"}
+	if _, err := parsePredictService(raw); err == nil {
+		t.Fatalf("plain-http geo endpoint must be rejected")
+	}
+	raw["endpoints"] = map[string]any{}
 	if gammaBase(got) != "https://gamma-api.predict.prax1s.xyz" {
 		t.Fatalf("gamma must be derived when not overridden, got %s", gammaBase(got))
 	}

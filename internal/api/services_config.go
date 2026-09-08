@@ -39,8 +39,10 @@ type predictService struct {
 	Endpoints map[string]string `json:"endpoints,omitempty"`
 }
 
-// predictEndpointKeys 是可覆盖的六个服务；键名与 App 的 platformHosts 一致。
-var predictEndpointKeys = map[string]bool{"gamma": true, "clob": true, "clobWs": true, "data": true, "relayer": true, "faucet": true}
+// predictEndpointKeys 是可配置的服务地址；键名与 App 的 platformHosts 一致。
+// 前六个不填时 App 按域名派生；geo（地区限制检查，平台前端的 GEO_CHECK_URL）没有派生规则：
+// 不填就是不做地区限制，填了 App 进入预测市场时向 {geo}/geoblock 询问是否受限。
+var predictEndpointKeys = map[string]bool{"gamma": true, "clob": true, "clobWs": true, "data": true, "relayer": true, "faucet": true, "geo": true}
 
 func (p predictService) asMap() map[string]any {
 	out := map[string]any{"domain": p.Domain, "scopeId": p.ScopeID, "chain": p.Chain}
@@ -84,7 +86,7 @@ func parsePredictEndpoint(key, raw string) (string, error) {
 	return want + "://" + host + path, nil
 }
 
-// parsePredictEndpoints 校验 endpoints 段：只认识六个键，空串视为"不覆盖"。
+// parsePredictEndpoints 校验 endpoints 段：只认识七个键，空串视为"不覆盖"（geo 的空串 = 不做地区限制）。
 func parsePredictEndpoints(raw any) (map[string]string, error) {
 	section := object(raw)
 	if section == nil {
@@ -93,7 +95,7 @@ func parsePredictEndpoints(raw any) (map[string]string, error) {
 	out := map[string]string{}
 	for key, value := range section {
 		if !predictEndpointKeys[key] {
-			return nil, fmt.Errorf("services.predict.endpoints.%s is not a known service (gamma, clob, clobWs, data, relayer, faucet)", key)
+			return nil, fmt.Errorf("services.predict.endpoints.%s is not a known service (gamma, clob, clobWs, data, relayer, faucet, geo)", key)
 		}
 		if strings.TrimSpace(text(value, "")) == "" {
 			continue
