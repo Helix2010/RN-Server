@@ -951,6 +951,7 @@
     "update.brandingDescription": "New branding resources are ready and will apply on the next launch.",
     "update.brandingTitle": "Branding updated",
     "update.channel": "Distribution channel",
+    "update.checkFailed": "Couldn't reach the server. Tap to retry",
     "update.checking": "Checking…",
     "update.configDescription": "App configuration changed and is syncing in the background.",
     "update.configTitle": "App configuration updated",

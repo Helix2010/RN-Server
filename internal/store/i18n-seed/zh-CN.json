@@ -951,6 +951,7 @@
     "update.brandingDescription": "新的品牌资源已准备好，将在下次启动时生效。",
     "update.brandingTitle": "品牌配置已更新",
     "update.channel": "分发通道",
+    "update.checkFailed": "网络不稳定，检查失败，点击重试",
     "update.checking": "检查中…",
     "update.configDescription": "应用配置已更新，正在后台同步。",
     "update.configTitle": "应用配置已更新",
