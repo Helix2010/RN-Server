@@ -483,6 +483,7 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 		c.Header("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
 		c.Header("Accept-Ranges", "bytes")
 		c.Status(http.StatusRequestedRangeNotSatisfiable)
+		c.Writer.WriteHeaderNow()
 		return
 	}
 	var body io.ReadCloser
