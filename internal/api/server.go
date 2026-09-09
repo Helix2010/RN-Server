@@ -521,10 +521,19 @@ func (s *server) findRelease(ctx context.Context, tenant, id string) (release, e
 
 var transitions = map[string]map[string]string{"publish": {"verified": "active", "paused": "active"}, "pause": {"active": "paused"}}
 
+// releaseFlagEditable 判断一个全量版本的"升级类型"（mandatory）现在还能不能改：
+// 只有还会影响客户端升级决策的状态才允许——待发布、活跃、暂停。已被新版本取代
+// （completed）或被拒绝 / 回滚的版本改了也不会有任何效果，直接拒绝，免得运营以为生效了。
+func releaseFlagEditable(status string) bool {
+	return status == "verified" || status == "active" || status == "paused"
+}
+
 func (s *server) releaseAction(c *gin.Context) {
 	var body struct {
 		Reason  string `json:"reason"`
 		Confirm bool   `json:"confirm"`
+		// set-mandatory 专用：目标值；其它动作忽略
+		Mandatory *bool `json:"mandatory"`
 	}
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, 400, "CONFIRMATION_REQUIRED", "reason and confirm=true are required")
@@ -533,6 +542,10 @@ func (s *server) releaseAction(c *gin.Context) {
 	r, err := s.findRelease(c.Request.Context(), tenantID(c), c.Param("id"))
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Release not found")
+		return
+	}
+	if c.Param("action") == "set-mandatory" {
+		s.setReleaseMandatory(c, r, body.Mandatory, body.Reason)
 		return
 	}
 	target, ok := transitions[c.Param("action")][r.Status]
@@ -585,6 +598,46 @@ func (s *server) releaseAction(c *gin.Context) {
 		v := iso(now)
 		r.PublishedAt = &v
 	}
+	c.JSON(201, gin.H{"release": r})
+}
+
+// setReleaseMandatory 事后修改"强制升级"标记（管理端列表里的开关）。语义与登记时勾选完全一样：
+// 只是把最低版本抬到这一版，且只升不降（见 resolveUpdateDecision）。客户端在下一次拉 bootstrap
+// 时看到新决策，没有推送。
+func (s *server) setReleaseMandatory(c *gin.Context, r release, mandatory *bool, reason string) {
+	if mandatory == nil {
+		problem(c, 400, "INVALID_RELEASE_FLAG", "mandatory is required")
+		return
+	}
+	if !releaseFlagEditable(r.Status) {
+		problem(c, 409, "RELEASE_FLAG_LOCKED", fmt.Sprintf("Cannot change the upgrade type of a %s release", r.Status))
+		return
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET mandatory=?,last_action='set-mandatory',updated_at=? WHERE tenant_id=? AND id=? AND status=?`, *mandatory, now, tenantID(c), r.ID, r.Status)
+	if err != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, 409, "RELEASE_STATE_CHANGED", "Release changed; refresh and retry")
+		return
+	}
+	event := newAudit(tenantID(c), actor(c), "release_set_mandatory", "release", r.ID, reason, requestID(c), map[string]any{"version": r.Version, "platform": r.Platform, "status": r.Status, "mandatory": *mandatory, "previous": r.Mandatory})
+	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	r.Mandatory = *mandatory
+	r.UpdatedAt = iso(now)
+	last := "set-mandatory"
+	r.LastAction = &last
 	c.JSON(201, gin.H{"release": r})
 }
 

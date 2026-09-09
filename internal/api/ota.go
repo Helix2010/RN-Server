@@ -799,10 +799,10 @@ func (s *server) otaManifest(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "OTA_PROTOCOL_UNSUPPORTED", "Unsupported Expo Updates protocol version")
 		return
 	}
-	var id, kind string
+	var id, kind, strategy string
 	var key, sha sql.NullString
 	var published sql.NullTime
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.release_kind,o.manifest_key,o.manifest_sha256,o.published_at FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' AND (?='' OR a.version=?) AND (?='' OR CAST(a.build_number AS CHAR)=?) ORDER BY o.revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime, appVersion, appVersion, buildNumber, buildNumber).Scan(&id, &kind, &key, &sha, &published)
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.release_kind,o.apply_strategy,o.manifest_key,o.manifest_sha256,o.published_at FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' AND (?='' OR a.version=?) AND (?='' OR CAST(a.build_number AS CHAR)=?) ORDER BY o.revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime, appVersion, appVersion, buildNumber, buildNumber).Scan(&id, &kind, &strategy, &key, &sha, &published)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeExpoNoUpdate(c)
 		return
@@ -844,20 +844,92 @@ func (s *server) otaManifest(c *gin.Context) {
 		problem(c, 502, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
 		return
 	}
-	if strings.TrimSpace(c.GetHeader("if-none-match")) == `"`+sha.String+`"` {
-		c.Header("ETag", `"`+sha.String+`"`)
+	// 生效策略以数据库为准（管理端可事后改）：ETag 要把策略算进去，否则改完客户端拿到 304
+	etag := `"` + sha.String + "-" + strategy + `"`
+	if strings.TrimSpace(c.GetHeader("if-none-match")) == etag {
+		c.Header("ETag", etag)
 		c.Status(http.StatusNotModified)
+		return
+	}
+	if raw, err = applyManifestStrategy(raw, strategy); err != nil {
+		problem(c, 502, "OTA_MANIFEST_INVALID", "OTA manifest is not valid JSON")
 		return
 	}
 	c.Header("Cache-Control", "no-cache")
 	c.Header("expo-protocol-version", "1")
 	c.Header("expo-sfv-version", "0")
-	c.Header("ETag", `"`+sha.String+`"`)
+	c.Header("ETag", etag)
 	if strings.Contains(c.GetHeader("Accept"), "multipart/mixed") {
 		writeExpoMultipart(c, "manifest", raw)
 		return
 	}
 	c.Data(200, "application/expo+json", raw)
+}
+
+// otaFlagEditable：生效策略只对还会下发给客户端的记录有意义——待发布、活跃、暂停；
+// 已被新 revision 取代或被拒绝的记录改了没有效果，拒绝。
+func otaFlagEditable(status string) bool {
+	return status == "verified" || status == "active" || status == "paused"
+}
+
+// setOTAApplyStrategy 事后修改 OTA 的生效策略（管理端列表里的开关）。
+// manifest 文件里登记时写死的 metadata.applyStrategy 不改，下发时用数据库里的值覆盖
+// （applyManifestStrategy）；bootstrap 本来就读数据库，App 以 bootstrap 为准。
+func (s *server) setOTAApplyStrategy(c *gin.Context, id, strategy, reason string) {
+	if strategy != "next_launch" && strategy != "immediate" {
+		problem(c, 422, "INVALID_OTA_APPLY_STRATEGY", "applyStrategy must be next_launch or immediate")
+		return
+	}
+	var status, previous string
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT status,apply_strategy FROM ota_releases WHERE tenant_id=? AND id=?`, tenantID(c), id).Scan(&status, &previous); err != nil {
+		problem(c, 404, "OTA_NOT_FOUND", "OTA release not found")
+		return
+	}
+	if !otaFlagEditable(status) {
+		problem(c, 409, "OTA_FLAG_LOCKED", fmt.Sprintf("Cannot change the apply strategy of a %s OTA release", status))
+		return
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
+		return
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE ota_releases SET apply_strategy=?,updated_at=? WHERE tenant_id=? AND id=? AND status=?`, strategy, now, tenantID(c), id, status)
+	if err != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, 409, "OTA_STATE_CHANGED", "OTA release changed; refresh and retry")
+		return
+	}
+	event := newAudit(tenantID(c), actor(c), "ota_set_apply_strategy", "ota-release", id, reason, requestID(c), map[string]any{"status": status, "applyStrategy": strategy, "previous": previous})
+	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to save OTA audit")
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"id": id, "status": status, "applyStrategy": strategy})
+}
+
+// applyManifestStrategy 用数据库里当前的生效策略覆盖 manifest 文件里登记时写死的值。
+// 文件与 manifest_sha256 保持不动（完整性校验仍对原文件），返回的字节是下发给客户端的内容。
+func applyManifestStrategy(raw []byte, strategy string) ([]byte, error) {
+	var manifest map[string]any
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return nil, err
+	}
+	metadata, _ := manifest["metadata"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if current, _ := metadata["applyStrategy"].(string); current == strategy {
+		return raw, nil
+	}
+	metadata["applyStrategy"] = strategy
+	manifest["metadata"] = metadata
+	return json.Marshal(manifest)
 }
 
 func otaClientBaseline(c *gin.Context) (string, string, bool) {
@@ -929,12 +1001,18 @@ func (s *server) otaAction(c *gin.Context) {
 	var body struct {
 		Reason  string `json:"reason"`
 		Confirm bool   `json:"confirm"`
+		// set-apply-strategy 专用：目标策略；其它动作忽略
+		ApplyStrategy string `json:"applyStrategy"`
 	}
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, 400, "CONFIRMATION_REQUIRED", "reason and confirm=true are required")
 		return
 	}
 	id, action := c.Param("id"), c.Param("action")
+	if action == "set-apply-strategy" {
+		s.setOTAApplyStrategy(c, id, body.ApplyStrategy, body.Reason)
+		return
+	}
 	if action == "republish" {
 		problem(c, 422, "OTA_REPUBLISH_UNSUPPORTED", "Republish must create a new immutable update from source artifacts")
 		return

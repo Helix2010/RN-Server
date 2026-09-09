@@ -179,3 +179,42 @@ func makeZipFile(t *testing.T, name string, body []byte) *zip.File {
 	}
 	return reader.File[0]
 }
+
+func TestApplyManifestStrategyOverridesBakedMetadata(t *testing.T) {
+	raw := []byte(`{"id":"u1","metadata":{"channel":"production","applyStrategy":"next_launch","sourceCommitSha":"abc"},"extra":{"x":1}}`)
+	out, err := applyManifestStrategy(raw, "immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	metadata := m["metadata"].(map[string]any)
+	if metadata["applyStrategy"] != "immediate" || metadata["sourceCommitSha"] != "abc" || metadata["channel"] != "production" {
+		t.Fatalf("metadata not overridden in place: %v", metadata)
+	}
+	if m["extra"] == nil {
+		t.Fatal("other manifest fields must survive")
+	}
+	same, err := applyManifestStrategy(raw, "next_launch")
+	if err != nil || string(same) != string(raw) {
+		t.Fatal("unchanged strategy must return the stored bytes untouched")
+	}
+	if _, err := applyManifestStrategy([]byte("not json"), "immediate"); err == nil {
+		t.Fatal("invalid manifest must be reported, not served")
+	}
+}
+
+func TestFlagEditableOnlyWhileTheRecordStillReachesClients(t *testing.T) {
+	for _, status := range []string{"verified", "active", "paused"} {
+		if !releaseFlagEditable(status) || !otaFlagEditable(status) {
+			t.Fatalf("%s must allow editing", status)
+		}
+	}
+	for _, status := range []string{"completed", "rejected", "rolled_back", "uploaded", "superseded", "draft"} {
+		if releaseFlagEditable(status) || otaFlagEditable(status) {
+			t.Fatalf("%s must not allow editing", status)
+		}
+	}
+}
