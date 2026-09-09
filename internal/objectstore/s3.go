@@ -38,6 +38,8 @@ type Client interface {
 	PresignGet(context.Context, string, time.Duration, string) (string, error)
 	Head(context.Context, string) (int64, string, error)
 	Get(context.Context, string) (io.ReadCloser, error)
+	// GetRange 读对象的 [start, end] 闭区间字节（HTTP Range 语义），给安装包断点续传用
+	GetRange(context.Context, string, int64, int64) (io.ReadCloser, error)
 	Delete(context.Context, string) error
 	CreateMultipartUpload(context.Context, string, string) (string, error)
 	UploadPart(context.Context, string, string, int, io.Reader, int64) (string, error)
@@ -149,6 +151,18 @@ func (c *s3Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	output, err := c.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	if err != nil {
 		return nil, fmt.Errorf("read artifact: %w", err)
+	}
+	return output.Body, nil
+}
+
+func (c *s3Client) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	output, err := c.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read artifact range: %w", err)
 	}
 	return output.Body, nil
 }

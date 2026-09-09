@@ -399,11 +399,65 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 	c.JSON(200, gin.H{"tenantId": tenantID(c), "platform": platform, "version": version, "buildNumber": build, "status": status, "fileName": fileName, "size": nullableInt64(size), "sha256": nullableSQLString(sha), "downloadUrl": download, "releaseId": id, "releaseNotes": notes})
 }
 
+// byteRange 是解析后的单区间 Range（闭区间）。
+type byteRange struct{ start, end int64 }
+
+// parseByteRange 解析 `Range: bytes=start-end` / `bytes=start-` / `bytes=-suffix`（只认单区间）。
+// 返回 (r, ok, satisfiable)：没有 Range 头或格式不认识 → ok=false（按全量处理）；
+// 区间落在文件之外 → satisfiable=false（416）。
+func parseByteRange(header string, size int64) (byteRange, bool, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" || size <= 0 || !strings.HasPrefix(header, "bytes=") {
+		return byteRange{}, false, false
+	}
+	spec := strings.TrimPrefix(header, "bytes=")
+	if strings.Contains(spec, ",") {
+		return byteRange{}, false, false
+	}
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return byteRange{}, false, false
+	}
+	startText, endText := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	if startText == "" {
+		// bytes=-N：最后 N 字节
+		suffix, err := strconv.ParseInt(endText, 10, 64)
+		if err != nil || suffix <= 0 {
+			return byteRange{}, false, false
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return byteRange{start: size - suffix, end: size - 1}, true, true
+	}
+	start, err := strconv.ParseInt(startText, 10, 64)
+	if err != nil || start < 0 {
+		return byteRange{}, false, false
+	}
+	end := size - 1
+	if endText != "" {
+		end, err = strconv.ParseInt(endText, 10, 64)
+		if err != nil || end < start {
+			return byteRange{}, false, false
+		}
+		if end > size-1 {
+			end = size - 1
+		}
+	}
+	if start >= size {
+		return byteRange{}, true, false
+	}
+	return byteRange{start: start, end: end}, true, true
+}
+
+// publicReleaseDownload 下发已发布的安装包；支持单区间 Range（安装包断点续传）：
+// 总是带 Accept-Ranges / ETag；Range 合法给 206 + Content-Range，越界给 416，
+// If-Range 与 ETag 不一致时忽略 Range 回全量（文件换了就不能接着旧的下）。
 func (s *server) publicReleaseDownload(c *gin.Context) {
 	var key, fileName string
-	var contentType sql.NullString
+	var contentType, sha sql.NullString
 	var fileSize sql.NullInt64
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName, &contentType, &fileSize)
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size,sha256 FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName, &contentType, &fileSize, &sha)
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Published release not found")
 		return
@@ -413,7 +467,30 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	body, err := client.Get(c.Request.Context(), key)
+	etag := ""
+	if sha.Valid && sha.String != "" {
+		etag = `"` + sha.String + `"`
+	}
+	size := int64(-1)
+	if fileSize.Valid && fileSize.Int64 >= 0 {
+		size = fileSize.Int64
+	}
+	rng, hasRange, satisfiable := parseByteRange(c.GetHeader("Range"), size)
+	if ifRange := strings.TrimSpace(c.GetHeader("If-Range")); hasRange && ifRange != "" && ifRange != etag {
+		hasRange = false
+	}
+	if hasRange && !satisfiable {
+		c.Header("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
+		c.Header("Accept-Ranges", "bytes")
+		c.Status(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	var body io.ReadCloser
+	if hasRange {
+		body, err = client.GetRange(c.Request.Context(), key, rng.start, rng.end)
+	} else {
+		body, err = client.Get(c.Request.Context(), key)
+	}
 	if err != nil {
 		problem(c, 502, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
 		return
@@ -425,8 +502,16 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 		c.Header("Content-Type", "application/octet-stream")
 	}
 	c.Header("Content-Disposition", `attachment; filename="`+safeDownloadName(fileName)+`"`)
-	if fileSize.Valid && fileSize.Int64 >= 0 {
-		c.Header("Content-Length", strconv.FormatInt(fileSize.Int64, 10))
+	c.Header("Accept-Ranges", "bytes")
+	if etag != "" {
+		c.Header("ETag", etag)
+	}
+	if hasRange {
+		c.Header("Content-Range", "bytes "+strconv.FormatInt(rng.start, 10)+"-"+strconv.FormatInt(rng.end, 10)+"/"+strconv.FormatInt(size, 10))
+		c.Header("Content-Length", strconv.FormatInt(rng.end-rng.start+1, 10))
+		c.Status(http.StatusPartialContent)
+	} else if size >= 0 {
+		c.Header("Content-Length", strconv.FormatInt(size, 10))
 	}
 	if _, err := io.Copy(c.Writer, body); err != nil {
 		slog.Error("release download stream failed", "releaseId", c.Param("id"), "error", err)
