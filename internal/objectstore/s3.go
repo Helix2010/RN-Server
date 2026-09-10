@@ -22,6 +22,15 @@ type CompletedPart struct {
 	Size       int64
 }
 
+// ObjectInfo 是 HeadObject 的结构化结果。ETag 已去掉 S3 返回的双引号；分段上传的对象是
+// "<md5>-<分段数>"，同一对象再次 Head 得到相同值，可直接比对；CopyObject / 存储类变更 / 服务端
+// 重加密会改变 ETag，此时需要重新入库。
+type ObjectInfo struct {
+	Size        int64
+	ContentType string
+	ETag        string
+}
+
 type Config struct {
 	Endpoint        string
 	Region          string
@@ -36,7 +45,10 @@ type Client interface {
 	PresignPut(context.Context, string, string, int64, time.Duration) (string, map[string]string, error)
 	Put(context.Context, string, io.Reader, int64, string) error
 	PresignGet(context.Context, string, time.Duration, string) (string, error)
+	// Head 返回 (大小, Content-Type)；只需要大小或类型的调用方用它
 	Head(context.Context, string) (int64, string, error)
+	// Stat 返回结构化对象信息（含 ETag）：做完整性比对的调用方必须用它，避免把 Content-Type 误当 ETag
+	Stat(context.Context, string) (ObjectInfo, error)
 	Get(context.Context, string) (io.ReadCloser, error)
 	// GetRange 读对象的 [start, end] 闭区间字节（HTTP Range 语义），给安装包断点续传用
 	GetRange(context.Context, string, int64, int64) (io.ReadCloser, error)
@@ -140,11 +152,23 @@ func (c *s3Client) PresignGet(ctx context.Context, key string, ttl time.Duration
 }
 
 func (c *s3Client) Head(ctx context.Context, key string) (int64, string, error) {
+	info, err := c.Stat(ctx, key)
+	if err != nil {
+		return 0, "", err
+	}
+	return info.Size, info.ContentType, nil
+}
+
+func (c *s3Client) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 	output, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	if err != nil {
-		return 0, "", fmt.Errorf("head artifact: %w", err)
+		return ObjectInfo{}, fmt.Errorf("head artifact: %w", err)
 	}
-	return aws.ToInt64(output.ContentLength), aws.ToString(output.ContentType), nil
+	return ObjectInfo{
+		Size:        aws.ToInt64(output.ContentLength),
+		ContentType: aws.ToString(output.ContentType),
+		ETag:        strings.Trim(strings.TrimSpace(aws.ToString(output.ETag)), `"`),
+	}, nil
 }
 
 func (c *s3Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {

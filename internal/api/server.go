@@ -198,6 +198,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/release-storage", s.getReleaseStorage)
 	group.PUT("/release-storage", s.updateReleaseStorage)
 	group.POST("/release-storage/test", s.testReleaseStorage)
+	group.GET("/release-identity/android", s.getAndroidReleaseIdentity)
+	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
@@ -1352,7 +1354,7 @@ func (s *server) bootstrap(c *gin.Context) {
 			releaseID = active.ID
 			artifactSHA = active.SHA256
 			artifactSize = active.FileSize
-			actionURL = absoluteURL(c, "/v1/public/releases/"+active.ID+"/download")
+			actionURL = s.absoluteURL(c, "/v1/public/releases/"+active.ID+"/download")
 			if active.Mandatory {
 				mandatoryVersion = active.Version
 			}
@@ -1609,13 +1611,27 @@ func nullableString(v string) any {
 	}
 	return v
 }
-func absoluteURL(c *gin.Context, path string) string {
+
+// absoluteURL 拼给客户端用的绝对地址（下载、OTA 资源、上传入口）。
+// 生产环境一律 https：代理没设 x-forwarded-proto 时也不能把 http:// 地址烘进 manifest 或 bootstrap，
+// 只记一次 warning 提醒修代理配置。开发环境按请求实际协议。
+func (s *server) absoluteURL(c *gin.Context, path string) string {
+	forwarded := c.GetHeader("x-forwarded-proto")
 	scheme := "http"
-	if c.GetHeader("x-forwarded-proto") == "https" || c.Request.TLS != nil {
+	if forwarded == "https" || c.Request.TLS != nil {
+		scheme = "https"
+	}
+	if s.cfg.Environment == "production" && scheme != "https" {
+		missingForwardedProtoWarning.Do(func() {
+			slog.Warn("x-forwarded-proto is not https in production; forcing https in generated URLs, fix the proxy configuration", "host", c.Request.Host, "xForwardedProto", forwarded)
+		})
 		scheme = "https"
 	}
 	return scheme + "://" + c.Request.Host + path
 }
+
+var missingForwardedProtoWarning sync.Once
+
 func nullableInt64(v sql.NullInt64) any {
 	if !v.Valid {
 		return nil

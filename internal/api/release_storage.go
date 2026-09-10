@@ -82,7 +82,11 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 	body.ObjectPrefix = strings.Trim(strings.TrimSpace(body.ObjectPrefix), "/")
 	body.PublicBaseURL = strings.TrimRight(strings.TrimSpace(body.PublicBaseURL), "/")
 	body.AccessKeyID = strings.TrimSpace(body.AccessKeyID)
-	if err := validateReleaseStorageWrite(body); err != nil {
+	if err := validateReleaseStorageWrite(body, s.cfg.Environment == "production"); err != nil {
+		if errors.Is(err, errStorageEndpointInsecure) {
+			problem(c, http.StatusUnprocessableEntity, "STORAGE_ENDPOINT_INSECURE", err.Error())
+			return
+		}
 		problem(c, http.StatusBadRequest, "INVALID_STORAGE_CONFIG", err.Error())
 		return
 	}
@@ -197,6 +201,11 @@ func (s *server) releaseStorageRecord(ctx context.Context, tenant string) (relea
 }
 
 func (s *server) storageClient(record releaseStorageRecord) (objectstore.Client, error) {
+	if storageEndpointInsecure(record.Value, s.cfg.Environment == "production") {
+		// 生产环境不能用 http 存储地址：直传 presigned URL 会以明文下发。配置必须先改成 https
+		slog.Error("release storage endpoint is not https; refusing to use it in production", "tenant", record.SourceTenant, "endpoint", record.Value.Endpoint, "publicBaseUrl", record.Value.PublicBaseURL)
+		return nil, errStorageEndpointInsecure
+	}
 	accessKeyID, secretAccessKey, sessionToken, err := s.decryptReleaseStorage(record)
 	if err != nil {
 		return nil, err
@@ -274,7 +283,11 @@ func releaseStorageView(record releaseStorageRecord, tenant string) gin.H {
 	}
 }
 
-func validateReleaseStorageWrite(body releaseStorageWrite) error {
+// errStorageEndpointInsecure：生产环境的对象存储地址必须是 https。直传模式下上传入口就是存储的
+// presigned URL，`absoluteURL` 管不到它，所以协议要求落在配置本身上。
+var errStorageEndpointInsecure = errors.New("endpoint and publicBaseUrl must use https in production")
+
+func validateReleaseStorageWrite(body releaseStorageWrite, production bool) error {
 	if !oneOf(body.Provider, "s3", "r2", "minio") || body.Region == "" || body.Bucket == "" {
 		return errors.New("provider, region and bucket are required")
 	}
@@ -289,8 +302,28 @@ func validateReleaseStorageWrite(body releaseStorageWrite) error {
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			return errors.New("endpoint and publicBaseUrl must be absolute HTTP(S) URLs")
 		}
+		if production && parsed.Scheme != "https" {
+			return errStorageEndpointInsecure
+		}
 	}
 	return nil
+}
+
+// storageEndpointInsecure：已保存的配置在生产环境里含 http 地址（改规则前保存的，或直接改库）。
+func storageEndpointInsecure(value storedReleaseStorage, production bool) bool {
+	if !production {
+		return false
+	}
+	for _, raw := range []string{value.Endpoint, value.PublicBaseURL} {
+		if raw == "" {
+			continue
+		}
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme != "https" {
+			return true
+		}
+	}
+	return false
 }
 
 func encryptedHint(value string) any {

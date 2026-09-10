@@ -464,7 +464,7 @@ func (s *server) createBrandingAssetUpload(c *gin.Context) {
 		problem(c, 503, "BRANDING_TOKEN_UNAVAILABLE", "Branding upload signing is not configured")
 		return
 	}
-	uploadURL := absoluteURL(c, "/v1/admin/branding/assets/upload")
+	uploadURL := s.absoluteURL(c, "/v1/admin/branding/assets/upload")
 	headers := map[string]string{"content-type": body.ContentType, "x-branding-asset-token": token}
 	requiresCredentials := true
 	if s.cfg.ArtifactUploadMode == "direct" {

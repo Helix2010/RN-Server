@@ -70,6 +70,9 @@ bootstrap 根据以下输入求值：
 
 - CI 使用受控 signing service 签名，构建节点不持有可导出的长期私钥。
 - 上传后验证 applicationId、versionCode、signer certificate fingerprint、minSdk、SHA-256。
+- **签名者与包名按租户 pin（2026-09-10）**：每个租户在 `app_configs` 的 `release.android`（`GET/PUT /v1/admin/release-identity/android`，JSON `{"packageName":"com.anyfun.wallet","signerSha256":"<证书 SHA-256，64 位小写十六进制>","expectedVersion":0,"reason":"…","confirm":true}`）登记正式包身份。入库时 APK 的包名与签名者证书指纹必须与之相等（`RELEASE_PACKAGE_MISMATCH` / `RELEASE_SIGNER_MISMATCH`）；`APP_ENV=production` 下未登记即拒绝（`RELEASE_SIGNER_UNPINNED`）；React Native 模板公开 debug 密钥（`fac61745…1033b9c`）在任何环境都拒绝入库也不允许被 pin（`RELEASE_DEBUG_SIGNER`）。pin 只读租户自己那一行，不从平台级继承。每次拒绝写 `audit_events`（`release_rejected`）。 管理端入口：RN-Admin「发布基础设施 → Android 发布身份」页（查看、设置、乐观锁冲突提示；客户端把带冒号/大写的指纹规范化为 64 位小写十六进制，debug 指纹在客户端即被拒绝）。
+- APK 必须内嵌 Expo 配置 `extra.applicationId`（RN-App 构建脚本已保证），入库记入 `file_metadata.applicationId`，缺失拒绝（`RELEASE_APPLICATION_ID_MISSING`）；内嵌配置存在但不是合法 JSON 拒绝（`RELEASE_EMBEDDED_CONFIG_INVALID`）。所有入库拒绝（身份、applicationId、版本不符）都写 `audit_events`（`release_rejected`）。
+- **发布后对象校验**：入库时用 `objectstore.Stat` 记录对象存储 ETag（`file_metadata.objectEtag`，去引号；分段上传对象形如 `<md5>-<n>`，同一对象再次 Stat 值不变）；`GET /v1/public/releases/{id}/download` 每次先 `Stat` 对象，大小或 ETag 与入库值不符返回 502 `RELEASE_OBJECT_CHANGED`，error 日志与审计（`release_object_changed`，actor `system-release`）对同一 (租户, 发布, 维度) 每 10 分钟最多写一次，请求本身每次都拒绝。去重是**进程内**的：多副本部署时每个实例各写一次；审计写失败只记 error 日志，绝不会把拒绝变成放行（响应先于审计决定）。对象存储不可达返回 502 `RELEASE_DOWNLOAD_FAILED`，不放行；`file_metadata` 不是合法 JSON、或 `objectEtag` 键存在但为空 / 不是字串，返回 500 `RELEASE_METADATA_INVALID`（数据事故，用迁移修，不降级成只比大小）。入库时对象存储没有返回 ETag 则拒绝入库（502 `RELEASE_OBJECT_ETAG_MISSING`），从不持久化空 ETag。只有 2026-09-10 之前入库、`file_metadata` 里**没有** `objectEtag` 键的发布才按旧记录处理：只比大小并每条记一次 warning；要获得完整校验需重新入库。CopyObject、存储类变更或服务端重加密都会改变 ETag，做过这些操作的发布必须重新入库，否则会被当成被篡改而拒绝下发。
 - 二进制放对象存储/CDN，API 只签发短时下载 URL，不代理大文件。
 - 生产下载入口可要求已认证企业用户或一次性 enrollment token；公开分发时仍需防盗链、限速与合规审查。
 - 记录下载/安装结果时使用最小化匿名标识；不能假设“已下载 = 已安装”。
@@ -87,6 +90,10 @@ bootstrap 根据以下输入求值：
 - runtimeVersion 必须严格匹配；资源 URL 内容寻址并不可变。
 - 更新上传后跑静态检查、启动 smoke 和真机 staging；生产先 canary。
 - 应用身份（App 请求头 `X-Application-ID`，即租户配置的 `applicationId`）由 OTA 包自己带上（`extra.applicationId`），服务端只校验不改写；缺失即拒绝上传（`OTA_MANIFEST_INVALID`）。基线 APK 的包名是 `package_id`，不是应用身份，不能拿来顶替，否则装了 OTA 的设备会以另一个身份上报，`app_installations` 里出现同一台设备的两条记录，安装凭证也对不上。
+- **应用身份绑定基线（2026-09-10）**：Android 基线的 OTA，其 `extra.applicationId` 必须等于基线 APK 内嵌的 `extra.applicationId`（`OTA_APPLICATION_ID_MISMATCH`）。基线在 `file_metadata` 里没有该值时，服务端从对象存储重新解析 APK 并回填（系统写入，审计 `release_applicationid_backfilled`，actor `system-ota`，在 OTA 事务之外，OTA 随后失败也不撤回）。回填前先核对下载到的对象与入库记录的 `sha256` / `file_size` 一致：不一致返回 502 `OTA_BASE_RELEASE_CHANGED` 并记审计（`ota_base_release_changed`），绝不把替换件的身份写进数据库；记录里没有 sha256 / 大小、对象读不到或超过 `ARTIFACT_MAX_SIZE_MB` 返回 502 `OTA_BASE_RELEASE_UNREADABLE`（不截断解析）；解析出来为空的基线不能再挂 OTA（`OTA_BASE_APPLICATION_ID_UNKNOWN`）。服务端没有租户级 applicationId 配置，所以只绑基线 APK，不与租户配置比对。**已知缺口**：iOS 基线（IPA）服务端不解析，iOS OTA 不做该绑定，只记 warning。
+- **资源对象校验**：OTA 入库时用 `objectstore.Stat` 记录每个资源对象的大小与 ETag（`ota_releases.object_metadata`，迁移 37；不含 `manifest.json`，manifest 由 `manifest_sha256` 全文校验）；入库时任一资源对象没有 ETag 即拒绝（502 `OTA_OBJECT_ETAG_MISSING`）；`GET /v1/ota/assets/{id}/*` 下发前 `Stat` 比对，不符返回 502 `OTA_OBJECT_CHANGED` 并记审计（`ota_object_changed`，同一 (租户, OTA, 维度, 路径) 每 10 分钟最多一次，进程内去重）；对象表里的条目缺 ETag 视为损坏（500）；对象存储不可达返回 502 `OTA_ASSET_UNAVAILABLE`；对象表里没有这条路径返回 404（包里没有这个文件，不拿前缀下的其它对象顶上）；对象表损坏返回 500 `OTA_OBJECT_METADATA_INVALID`。迁移 37 之前的 OTA 记录为 NULL，只受 manifest 内容 hash（服务端）与资源 hash（expo-updates 客户端）保护。
+- 生成给客户端的绝对地址（下载、OTA 资源、上传入口）在 `APP_ENV=production` 下一律 `https://`；代理缺 `x-forwarded-proto` 只记一次 warning，不再烘出 `http://` 地址。
+- 对象存储配置在 `APP_ENV=production` 下必须使用 https 的 `endpoint` / `publicBaseUrl`：保存时拒绝 http（422 `STORAGE_ENDPOINT_INSECURE`），已存的 http 配置在使用时被拒并记 error（503 `STORAGE_UNAVAILABLE`）。原因：`direct` 上传模式的上传入口是对象存储的 presigned URL，不经 `absoluteURL`，协议只能由配置本身保证。
 
 ## 6. 灰度与暂停
 

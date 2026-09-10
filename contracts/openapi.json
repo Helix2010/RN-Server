@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.08.26"
+    "version": "2026.09.10"
   },
   "paths": {
     "/health/live": {
@@ -285,7 +285,16 @@
             "description": "Verified OTA release created"
           },
           "422": {
-            "description": "Base release or apply strategy invalid"
+            "description": "Base release or apply strategy invalid; OTA_APPLICATION_ID_MISMATCH (extra.applicationId differs from the base APK), OTA_BASE_APPLICATION_ID_UNKNOWN (base APK carries no embedded application id)"
+          },
+          "500": {
+            "description": "RELEASE_METADATA_INVALID (base release file_metadata is invalid)"
+          },
+          "502": {
+            "description": "OTA_BASE_RELEASE_UNREADABLE (base APK unreadable, oversized, or without stored sha256/size), OTA_BASE_RELEASE_CHANGED (stored base APK no longer matches its verified sha256/size), OTA_RESOURCE_SAVE_FAILED, OTA_OBJECT_ETAG_MISSING (object storage returned no ETag for a resource)"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
           }
         }
       }
@@ -390,6 +399,15 @@
         "responses": {
           "200": {
             "description": "Saved release storage config"
+          },
+          "400": {
+            "description": "INVALID_STORAGE_CONFIG"
+          },
+          "409": {
+            "description": "STALE_STORAGE_CONFIG"
+          },
+          "422": {
+            "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint)"
           }
         }
       }
@@ -415,6 +433,21 @@
         "responses": {
           "201": {
             "description": "Verified release created from uploaded artifact (mandatory=true makes the update unskippable once this release is active)"
+          },
+          "409": {
+            "description": "RELEASE_SEQUENCE_BUSY / RELEASE_VERSION_NOT_INCREASING"
+          },
+          "422": {
+            "description": "RELEASE_FILE_INVALID, RELEASE_VERIFY_FAILED, RELEASE_EMBEDDED_CONFIG_INVALID, RELEASE_DEBUG_SIGNER, RELEASE_SIGNER_UNPINNED (production without release.android pin), RELEASE_PACKAGE_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_APPLICATION_ID_MISSING, RELEASE_IDENTITY_MISMATCH; every rejection is audited as release_rejected"
+          },
+          "500": {
+            "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored release.android pin is invalid), RELEASE_CREATE_FAILED"
+          },
+          "502": {
+            "description": "RELEASE_READ_FAILED, RELEASE_OBJECT_ETAG_MISSING (object storage returned no ETag; the release cannot be pinned)"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE (release storage not configured, or an http endpoint in production)"
           }
         }
       }
@@ -773,7 +806,16 @@
             "description": "Immutable OTA asset"
           },
           "404": {
-            "description": "Asset not found"
+            "description": "Asset not found or not part of the verified OTA package"
+          },
+          "500": {
+            "description": "OTA_OBJECT_METADATA_INVALID: stored object metadata is not valid; OTA_OBJECT_METADATA_INVALID (object_metadata invalid, or a recorded entry without an ETag)"
+          },
+          "502": {
+            "description": "OTA_ASSET_UNAVAILABLE (storage unreadable) or OTA_OBJECT_CHANGED (object in storage no longer matches the verified package)"
+          },
+          "503": {
+            "description": "Release storage unavailable"
           }
         }
       }
@@ -829,10 +871,13 @@
             "description": "Published release not found"
           },
           "502": {
-            "description": "Release package unavailable"
+            "description": "RELEASE_DOWNLOAD_FAILED (storage unreadable) or RELEASE_OBJECT_CHANGED (object in storage no longer matches the verified artifact)"
           },
           "503": {
             "description": "Release storage unavailable"
+          },
+          "500": {
+            "description": "RELEASE_METADATA_INVALID: stored release metadata is not valid JSON; RELEASE_METADATA_INVALID (file_metadata invalid, or objectEtag present but empty)"
           }
         }
       }
@@ -1523,6 +1568,50 @@
           }
         }
       }
+    },
+    "/v1/admin/release-identity/android": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Tenant Android release identity pin: {configured, identity{packageName, signerSha256}|null, version, updatedBy, updatedAt}"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "Stored release.android configuration is invalid (RELEASE_IDENTITY_CONFIG_INVALID)"
+          }
+        }
+      },
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AndroidReleaseIdentityWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved release identity pin (same shape as GET)"
+          },
+          "400": {
+            "description": "INVALID_RELEASE_IDENTITY: packageName/signerSha256 malformed, debug key, missing reason or confirm"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version"
+          },
+          "500": {
+            "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2202,6 +2291,38 @@
               "$ref": "#/components/schemas/WalletTransferIndex"
             },
             "description": "键是租户启用的链 id"
+          }
+        }
+      },
+      "AndroidReleaseIdentityWrite": {
+        "type": "object",
+        "required": [
+          "packageName",
+          "signerSha256",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "packageName": {
+            "type": "string",
+            "description": "Android applicationId of the tenant production build"
+          },
+          "signerSha256": {
+            "type": "string",
+            "description": "SHA-256 of the production signing certificate, 64 hex chars (colons and upper case accepted, normalised)"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock: current stored version, 0 when unset"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
           }
         }
       }

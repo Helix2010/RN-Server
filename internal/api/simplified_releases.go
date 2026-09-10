@@ -102,7 +102,7 @@ func (s *server) createReleaseArtifactUpload(c *gin.Context) {
 		problem(c, http.StatusServiceUnavailable, "ARTIFACT_TOKEN_UNAVAILABLE", "Artifact upload signing is not configured")
 		return
 	}
-	uploadURL := absoluteURL(c, "/v1/admin/release-artifacts/upload")
+	uploadURL := s.absoluteURL(c, "/v1/admin/release-artifacts/upload")
 	headers := map[string]string{"content-type": body.ContentType, "x-release-artifact-token": token}
 	requiresCredentials := true
 	if s.cfg.ArtifactUploadMode == "direct" {
@@ -234,11 +234,17 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
-	size, _, err := client.Head(ctx, artifact.ObjectKey)
-	if err != nil || size != artifact.Size {
+	stored, err := client.Stat(ctx, artifact.ObjectKey)
+	if err != nil || stored.Size != artifact.Size {
 		problem(c, http.StatusUnprocessableEntity, "RELEASE_FILE_INVALID", "Uploaded file is missing or has an unexpected size")
 		return
 	}
+	if strings.TrimSpace(stored.ETag) == "" {
+		// 没有 ETag 就没有"对象被替换"的可检测性：不能带着空值入库，否则下载时只剩大小比对
+		problem(c, http.StatusBadGateway, "RELEASE_OBJECT_ETAG_MISSING", "Object storage returned no ETag for the uploaded artifact; the release cannot be pinned")
+		return
+	}
+	size := stored.Size
 	temporary, err := os.CreateTemp("", "rn-release-*")
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_VERIFY_FAILED", "Unable to prepare release verification")
@@ -260,19 +266,55 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		problem(c, http.StatusBadGateway, "RELEASE_READ_FAILED", "Unable to read the complete release")
 		return
 	}
-	metadata := map[string]any{"fileName": artifact.FileName, "size": size, "sha256": hex.EncodeToString(hash.Sum(nil))}
+	// objectEtag 是校验时对象存储给的 ETag（objectstore.Stat，已去引号）；公开下载前再 Stat 一次比对，
+	// 发布后对象被换掉即拒绝下发。CopyObject / 存储类变更会改 ETag，此时必须重新入库
+	metadata := map[string]any{"fileName": artifact.FileName, "size": size, "sha256": hex.EncodeToString(hash.Sum(nil)), "objectEtag": stored.ETag}
 	runtimeVersion := ""
 	if body.Platform == "android" {
 		apk, inspectErr := apkinspect.Inspect(temporaryPath)
+		// 解析阶段的拒绝还拿不到包名/签名者，审计只记代码与错误摘要；文档承诺每次入库拒绝都留痕
+		rejectBeforeInspect := func(code, detail string) {
+			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, detail, requestID(c), map[string]any{"code": code, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "error": inspectErr.Error()}))
+			problem(c, http.StatusUnprocessableEntity, code, detail)
+		}
+		if errors.Is(inspectErr, apkinspect.ErrEmbeddedConfigInvalid) {
+			// 有内嵌配置但不是合法 JSON：这是构建产物损坏，不能当成"没有 applicationId"报缺失
+			rejectBeforeInspect("RELEASE_EMBEDDED_CONFIG_INVALID", "APK embedded Expo config is not valid JSON")
+			return
+		}
 		if inspectErr != nil {
-			problem(c, http.StatusUnprocessableEntity, "RELEASE_VERIFY_FAILED", "Android package or signature verification failed")
+			rejectBeforeInspect("RELEASE_VERIFY_FAILED", "Android package or signature verification failed")
+			return
+		}
+		// 先看身份再看版本：公开 debug 密钥、未 pin、包名或签名者不符的包不该走到版本比对
+		pin, pinErr := s.androidReleaseIdentityRecord(ctx, tenantID(c))
+		if pinErr != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.android configuration is invalid")
+			return
+		}
+		var pinned *androidReleaseIdentity
+		if pin != nil {
+			pinned = &pin.Value
+		}
+		if code, detail := checkAndroidReleaseIdentity(apk, pinned, s.cfg.Environment == "production"); code != "" {
+			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, detail, requestID(c), map[string]any{"code": code, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "packageName": apk.PackageName, "signerSha256": normalizeFingerprint(apk.SignerSHA256)}))
+			problem(c, http.StatusUnprocessableEntity, code, detail)
+			return
+		}
+		rejectRelease := func(code, detail string) {
+			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, detail, requestID(c), map[string]any{"code": code, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "packageName": apk.PackageName, "signerSha256": normalizeFingerprint(apk.SignerSHA256)}))
+			problem(c, http.StatusUnprocessableEntity, code, detail)
+		}
+		if apk.ApplicationID == "" {
+			rejectRelease("RELEASE_APPLICATION_ID_MISSING", "APK does not embed extra.applicationId; OTA identity cannot be bound to it")
 			return
 		}
 		runtimeVersion = apk.RuntimeVersion
 		metadata["packageName"], metadata["versionName"], metadata["versionCode"], metadata["runtimeVersion"] = apk.PackageName, apk.VersionName, apk.VersionCode, runtimeVersion
-		metadata["minSdk"], metadata["signerSha256"], metadata["signingScheme"] = apk.MinSDK, apk.SignerSHA256, apk.SigningScheme
+		metadata["minSdk"], metadata["signerSha256"], metadata["signingScheme"] = apk.MinSDK, normalizeFingerprint(apk.SignerSHA256), apk.SigningScheme
+		metadata["applicationId"] = apk.ApplicationID
 		if apk.VersionName != body.Version || apk.VersionCode != int64(body.BuildNumber) {
-			problem(c, http.StatusUnprocessableEntity, "RELEASE_IDENTITY_MISMATCH", "APK versionName/versionCode does not match the release version and build number")
+			rejectRelease("RELEASE_IDENTITY_MISMATCH", "APK versionName/versionCode does not match the release version and build number")
 			return
 		}
 	}
@@ -392,7 +434,7 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Active release not found")
 		return
 	}
-	download := absoluteURL(c, "/v1/public/releases/"+id+"/download")
+	download := s.absoluteURL(c, "/v1/public/releases/"+id+"/download")
 	var notes map[string][]string
 	_ = json.Unmarshal(rawNotes, &notes)
 	c.Header("Cache-Control", "public, max-age=60")
@@ -457,7 +499,8 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	var key, fileName string
 	var contentType, sha sql.NullString
 	var fileSize sql.NullInt64
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size,sha256 FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName, &contentType, &fileSize, &sha)
+	var rawMetadata []byte
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size,sha256,file_metadata FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName, &contentType, &fileSize, &sha, &rawMetadata)
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Published release not found")
 		return
@@ -474,6 +517,29 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	size := int64(-1)
 	if fileSize.Valid && fileSize.Int64 >= 0 {
 		size = fileSize.Int64
+	}
+	// 下发前核对对象存储里的东西还是入库时校验过的那一个：大小与 ETag 都要一致。
+	// 校验只在上传时做过一次，之后对象存储被改写（凭证泄漏、误操作）不会有任何人发现，
+	// 而 debug 签名 + 客户端不校 sha256 的现状会让替换后的包被系统安装器当成合法升级
+	// 键不存在 = 改动前入库的旧记录（只比大小并提醒一次）；键存在但空 / 非字串 = 数据事故（500），不降级
+	storedEtag, hasEtag, metadataErr := storedMetadataField(rawMetadata, "objectEtag")
+	if metadataErr != nil {
+		slog.Error("release file_metadata is invalid", "releaseId", c.Param("id"), "tenant", tenantID(c), "error", metadataErr)
+		problem(c, 500, "RELEASE_METADATA_INVALID", "Stored release metadata is invalid")
+		return
+	}
+	if !hasEtag {
+		legacyObjectWarning(c.Param("id"), "release")
+	}
+	actual, mismatch, statErr := verifyStoredObject(c.Request.Context(), client, key, size, storedEtag)
+	if statErr != nil {
+		problem(c, 502, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
+		return
+	}
+	if mismatch != "" {
+		s.noteObjectChanged("release", tenantID(c), c.Param("id"), mismatch, requestID(c), actual, size, storedEtag, nil)
+		problem(c, 502, "RELEASE_OBJECT_CHANGED", "Release package in storage no longer matches the verified artifact")
+		return
 	}
 	rng, hasRange, satisfiable := parseByteRange(c.GetHeader("Range"), size)
 	if ifRange := strings.TrimSpace(c.GetHeader("If-Range")); hasRange && ifRange != "" && ifRange != etag {

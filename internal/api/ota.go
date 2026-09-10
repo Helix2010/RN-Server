@@ -20,14 +20,14 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Helix2010/RN-Server/internal/apkinspect"
 	"github.com/gin-gonic/gin"
 )
 
 const otaMaxPackageBytes int64 = 512 * 1024 * 1024
-
-var otaUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 
 type otaUploadToken struct {
 	ID, TenantID, ObjectKey, FileName, ContentType string
@@ -231,7 +231,7 @@ func (s *server) createOTAUploader(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	url := absoluteURL(c, "/v1/admin/ota/artifacts/upload")
+	url := s.absoluteURL(c, "/v1/admin/ota/artifacts/upload")
 	headers := map[string]string{"content-type": body.ContentType, "x-ota-artifact-token": tok}
 	requires := true
 	if s.cfg.ArtifactUploadMode == "direct" {
@@ -305,10 +305,12 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 401, "INVALID_OTA_ARTIFACT_TOKEN", err.Error())
 		return
 	}
-	var basePlatform, baseRuntime, baseStatus, baseVersion string
+	var basePlatform, baseRuntime, baseStatus, baseVersion, baseObjectKey string
 	var baseBuild int
 	var baseFileMetadata []byte
-	if err = s.db.QueryRowContext(c.Request.Context(), `SELECT platform,runtime_version,status,version,build_number,file_metadata FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), body.BaseReleaseID).Scan(&basePlatform, &baseRuntime, &baseStatus, &baseVersion, &baseBuild, &baseFileMetadata); err != nil {
+	var baseSHA sql.NullString
+	var baseSize sql.NullInt64
+	if err = s.db.QueryRowContext(c.Request.Context(), `SELECT platform,runtime_version,status,version,build_number,file_metadata,object_key,sha256,file_size FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), body.BaseReleaseID).Scan(&basePlatform, &baseRuntime, &baseStatus, &baseVersion, &baseBuild, &baseFileMetadata, &baseObjectKey, &baseSHA, &baseSize); err != nil {
 		problem(c, 404, "OTA_BASE_RELEASE_NOT_FOUND", "Base APK release not found")
 		return
 	}
@@ -326,6 +328,40 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	defer client.Delete(context.Background(), v.ObjectKey)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
+	// OTA 的应用身份必须等于基线 APK 内嵌的 extra.applicationId（只有 Android 基线经过 apkinspect，
+	// 有可信的内嵌值；iOS 基线服务端读不出来，暂不绑定并记 warning）。改动前入库的 Android 基线没有
+	// 记这个值，从对象存储重新解析一次并回填 file_metadata；解析不出来的基线不能再挂 OTA
+	baseApplicationID := ""
+	if bindsApplicationIDToBase(basePlatform) {
+		baseApplicationID, err = storedMetadataString(baseFileMetadata, "applicationId")
+		if err != nil {
+			problem(c, 500, "RELEASE_METADATA_INVALID", "Stored base release metadata is invalid")
+			return
+		}
+		if baseApplicationID == "" {
+			source := backfillSource{Tenant: tenantID(c), ReleaseID: body.BaseReleaseID, ObjectKey: baseObjectKey, SHA256: strings.ToLower(strings.TrimSpace(baseSHA.String)), Size: -1}
+			if baseSize.Valid {
+				source.Size = baseSize.Int64
+			}
+			baseApplicationID, err = s.backfillReleaseApplicationID(ctx, client, source, requestID(c))
+			if errors.Is(err, errBaseReleaseChanged) {
+				// 对象存储里的基线 APK 已不是入库时校验过的那个：不能拿它的身份写回数据库
+				problem(c, 502, "OTA_BASE_RELEASE_CHANGED", "Stored base APK no longer matches the verified release; re-create the base release before publishing OTA")
+				return
+			}
+			if err != nil {
+				slog.Error("unable to read the base APK for application id back-fill", "tenant", tenantID(c), "baseReleaseId", body.BaseReleaseID, "error", err)
+				problem(c, 502, "OTA_BASE_RELEASE_UNREADABLE", "Unable to read the base APK to determine its application id")
+				return
+			}
+		}
+		if baseApplicationID == "" {
+			problem(c, 422, "OTA_BASE_APPLICATION_ID_UNKNOWN", "Base release does not carry an embedded application id; re-upload the base package")
+			return
+		}
+	} else {
+		slog.Warn("OTA application id is not bound to the base release: platform has no server-readable embedded config", "tenant", tenantID(c), "baseReleaseId", body.BaseReleaseID, "platform", basePlatform)
+	}
 	zipBody, err := client.Get(ctx, v.ObjectKey)
 	if err != nil {
 		problem(c, 422, "OTA_PACKAGE_MISSING", "Uploaded OTA package is missing")
@@ -383,11 +419,20 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 422, "OTA_MANIFEST_INVALID", err.Error())
 		return
 	}
+	if bindsApplicationIDToBase(basePlatform) {
+		if err := otaApplicationIDMismatch(manifest, baseApplicationID); err != nil {
+			problem(c, 422, "OTA_APPLICATION_ID_MISMATCH", err.Error())
+			return
+		}
+	}
 	updateID := manifest["id"].(string)
 	releaseID := "ota_" + randomID(16)
 	_, prefix, _ := s.storageClientForTenant(c.Request.Context(), tenantID(c))
 	baseKey := strings.TrimLeft(path.Join(prefix, "tenants", tenantID(c), "ota", body.Channel, basePlatform, baseRuntime, releaseID), "/")
 	uploadedKeys := []string{}
+	// 每个已上传资源对象的大小与 ETag（objectstore.Stat），下发前比对（otaAsset）。
+	// manifest.json 不记：otaManifest 下发前按 manifest_sha256 校验全文，比 ETag 更强
+	objectMetadata := map[string]any{}
 	persisted := false
 	defer func() {
 		if !persisted {
@@ -407,12 +452,23 @@ func (s *server) saveOTARelease(c *gin.Context) {
 			return
 		}
 		uploadedKeys = append(uploadedKeys, path.Join(baseKey, clean))
+		storedObject, statErr := client.Stat(ctx, path.Join(baseKey, clean))
+		if statErr != nil {
+			problem(c, 502, "OTA_RESOURCE_SAVE_FAILED", "Unable to verify stored OTA resources")
+			return
+		}
+		if strings.TrimSpace(storedObject.ETag) == "" {
+			// 没有 ETag 就没有"对象被替换"的可检测性：不能带着空值入库，否则下发时只剩大小比对
+			problem(c, 502, "OTA_OBJECT_ETAG_MISSING", "Object storage returned no ETag for a stored OTA resource; the package cannot be pinned")
+			return
+		}
+		objectMetadata[clean] = map[string]any{"size": storedObject.Size, "etag": storedObject.ETag}
 	}
 	manifest["runtimeVersion"] = baseRuntime
 	manifest["platform"] = basePlatform
 	manifest["channel"] = body.Channel
 	rewriteOTAClientIdentity(manifest, otaClientIdentity{
-		APIBaseURL:    absoluteURL(c, ""),
+		APIBaseURL:    s.absoluteURL(c, ""),
 		ApplicationID: otaManifestExtraString(manifest, "applicationId"),
 		AppVersion:    baseVersion,
 		BuildNumber:   baseBuild,
@@ -421,7 +477,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		OTAChannel:    body.Channel,
 	})
 	manifest["metadata"] = mergeManifestMetadata(manifest["metadata"], body.Channel, body.ApplyStrategy)
-	manifest = rewriteManifestURLs(manifest, absoluteURL(c, "/v1/ota/assets/"+releaseID+"/"))
+	manifest = rewriteManifestURLs(manifest, s.absoluteURL(c, "/v1/ota/assets/"+releaseID+"/"))
 	finalManifest, _ := json.Marshal(manifest)
 	manifestKey := path.Join(baseKey, "manifest.json")
 	if err := client.Put(ctx, manifestKey, strings.NewReader(string(finalManifest)), int64(len(finalManifest)), "application/json"); err != nil {
@@ -429,6 +485,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		return
 	}
 	uploadedKeys = append(uploadedKeys, manifestKey)
+	rawObjectMetadata, _ := json.Marshal(objectMetadata)
 	hash := sha256.Sum256(finalManifest)
 	notes, _ := json.Marshal(body.ReleaseNotes)
 	conn, err := s.db.Conn(c.Request.Context())
@@ -457,7 +514,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	var revision int
 	_ = tx.QueryRowContext(c.Request.Context(), `SELECT COALESCE(MAX(revision),0)+1 FROM ota_releases WHERE tenant_id=? AND platform=? AND channel=? AND runtime_version=?`, tenantID(c), basePlatform, body.Channel, baseRuntime).Scan(&revision)
 	now := time.Now().UTC()
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO ota_releases(id,tenant_id,base_release_id,platform,channel,runtime_version,revision,update_id,apply_strategy,status,manifest_key,manifest_sha256,release_notes,source_commit_sha,created_by,verified_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, releaseID, tenantID(c), body.BaseReleaseID, basePlatform, body.Channel, baseRuntime, revision, updateID, body.ApplyStrategy, "verified", manifestKey, hex.EncodeToString(hash[:]), notes, nullableSQLValue(body.SourceCommitSHA), actor(c), now, now, now)
+	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO ota_releases(id,tenant_id,base_release_id,platform,channel,runtime_version,revision,update_id,apply_strategy,status,manifest_key,manifest_sha256,object_metadata,release_notes,source_commit_sha,created_by,verified_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, releaseID, tenantID(c), body.BaseReleaseID, basePlatform, body.Channel, baseRuntime, revision, updateID, body.ApplyStrategy, "verified", manifestKey, hex.EncodeToString(hash[:]), rawObjectMetadata, notes, nullableSQLValue(body.SourceCommitSHA), actor(c), now, now, now)
 	if err != nil {
 		problem(c, 500, "OTA_CREATE_FAILED", "Unable to save OTA release")
 		return
@@ -526,7 +583,8 @@ func validateOTAManifestPackage(manifest map[string]any, files map[string]*zip.F
 		return errors.New("manifest extra.scopeKey is required")
 	}
 	// 应用身份（App 的 X-Application-ID）来自租户配置，OTA 构建脚本会写进 extra；
-	// 缺了就拒绝上传，不能拿基线 APK 的包名顶替：包名是 package_id，不是应用身份
+	// 这里只要求存在，不能拿基线 APK 的包名顶替：包名是 package_id，不是应用身份。
+	// 它必须等于基线 APK 内嵌的 applicationId，这一步在 saveOTARelease 里做（otaApplicationIDMismatch）
 	if otaManifestExtraString(manifest, "applicationId") == "" {
 		return errors.New("manifest extra.applicationId is required")
 	}
@@ -545,6 +603,99 @@ func validateOTAManifestPackage(manifest map[string]any, files map[string]*zip.F
 	}
 	return nil
 }
+
+// bindsApplicationIDToBase：只有 Android 基线经过 apkinspect，服务端有可信的内嵌 extra.applicationId 可比；
+// iOS 基线（IPA）服务端不解析，暂不绑定（已在 OPERATIONS_AND_RELEASE.md §5 记为缺口）。
+func bindsApplicationIDToBase(basePlatform string) bool { return basePlatform == "android" }
+
+// otaApplicationIDMismatch 把 OTA 自带的应用身份绑到基线 APK：两者不同就是给另一个应用打的包，
+// 装上后设备会以另一个身份上报（app_installations 出现同一台设备两条记录，安装凭证对不上）。
+func otaApplicationIDMismatch(manifest map[string]any, baseApplicationID string) error {
+	if strings.TrimSpace(baseApplicationID) == "" {
+		return errors.New("base release application id is unknown")
+	}
+	if value := otaManifestExtraString(manifest, "applicationId"); value != baseApplicationID {
+		return fmt.Errorf("manifest extra.applicationId %q does not match the base APK application id %q", value, baseApplicationID)
+	}
+	return nil
+}
+
+// backfillSource 是回填时要核对的基线记录：对象 key，以及入库时校验过的 sha256 与大小。
+type backfillSource struct {
+	Tenant, ReleaseID, ObjectKey string
+	// 入库时的 sha256（小写 hex）；为空表示记录里没有，无法核对，回填拒绝
+	SHA256 string
+	// 入库时的字节数；-1 表示记录里没有
+	Size int64
+}
+
+// errBaseReleaseChanged：对象存储里的基线 APK 与入库记录不符，调用方回 502 OTA_BASE_RELEASE_CHANGED。
+var errBaseReleaseChanged = errors.New("stored base release no longer matches the verified artifact")
+
+// backfillReleaseApplicationID 从对象存储重新解析基线 APK，把 extra.applicationId 写回 file_metadata。
+// 只给改动前入库、file_metadata 里没有 applicationId 的基线用；之后的入库路径在校验时就记了。
+// 解析前先核对下载到的字节与入库 sha256 / 大小一致：对象存储里的 APK 可能已被换成同大小的另一个包，
+// 不能把替换件的身份写进数据库再放行匹配它的 OTA。
+// 这是 OTA 事务之外的一次系统写入（回填的是既有事实，OTA 随后失败也不需要撤回），写 audit_events 留痕。
+func (s *server) backfillReleaseApplicationID(ctx context.Context, client interface {
+	Get(context.Context, string) (io.ReadCloser, error)
+}, source backfillSource, requestID string) (string, error) {
+	if source.SHA256 == "" || source.Size < 0 {
+		return "", errors.New("base release has no stored sha256/size to verify the object against")
+	}
+	body, err := client.Get(ctx, source.ObjectKey)
+	if err != nil {
+		return "", fmt.Errorf("read base release object: %w", err)
+	}
+	defer body.Close()
+	temporary, err := os.CreateTemp("", "rn-base-*.apk")
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	digest := sha256.New()
+	written, err := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(body, s.cfg.ArtifactMaxSizeBytes+1))
+	if err != nil {
+		_ = temporary.Close()
+		return "", fmt.Errorf("copy base release object: %w", err)
+	}
+	if err = temporary.Close(); err != nil {
+		return "", err
+	}
+	if written > s.cfg.ArtifactMaxSizeBytes {
+		// 超过上限说明对象不是入库时那个 APK（入库时同一上限校验过）：不能截断后解析出一个错误身份
+		return "", fmt.Errorf("base release object exceeds ARTIFACT_MAX_SIZE_MB (%d bytes read)", written)
+	}
+	actualSHA := hex.EncodeToString(digest.Sum(nil))
+	if written != source.Size || actualSHA != source.SHA256 {
+		slog.Error("stored base release changed after verification", "tenant", source.Tenant, "releaseId", source.ReleaseID, "storedSize", source.Size, "objectSize", written, "storedSha256", source.SHA256, "objectSha256", actualSHA)
+		s.auditNow(newAudit(source.Tenant, "system-ota", "ota_base_release_changed", "release", source.ReleaseID, "Stored base APK no longer matches the verified release; application id back-fill refused", requestID, map[string]any{"storedSize": source.Size, "objectSize": written, "storedSha256": source.SHA256, "objectSha256": actualSHA}))
+		return "", errBaseReleaseChanged
+	}
+	apk, err := apkinspect.Inspect(temporaryPath)
+	if err != nil {
+		return "", fmt.Errorf("inspect base release: %w", err)
+	}
+	if apk.ApplicationID == "" {
+		return "", nil
+	}
+	if _, err = s.db.ExecContext(ctx, `UPDATE app_releases SET file_metadata=JSON_SET(COALESCE(file_metadata,JSON_OBJECT()),'$.applicationId',?),updated_at=? WHERE tenant_id=? AND id=?`, apk.ApplicationID, time.Now().UTC(), source.Tenant, source.ReleaseID); err != nil {
+		return "", fmt.Errorf("persist base release application id: %w", err)
+	}
+	s.auditNow(newAudit(source.Tenant, "system-ota", "release_applicationid_backfilled", "release", source.ReleaseID, "Embedded application id read from the stored base APK and recorded in file_metadata", requestID, map[string]any{"applicationId": apk.ApplicationID, "packageName": apk.PackageName}))
+	slog.Info("backfilled base release application id from the stored APK", "tenant", source.Tenant, "releaseId", source.ReleaseID, "applicationId", apk.ApplicationID)
+	return apk.ApplicationID, nil
+}
+
+// legacyObjectWarning 对改列前入库、没有对象 ETag 记录的发布，每条只提醒一次：重新入库才能获得完整校验
+func legacyObjectWarning(id, kind string) {
+	if _, loaded := legacyObjectWarned.LoadOrStore(kind+":"+id, struct{}{}); !loaded {
+		slog.Warn("release object has no stored ETag; only size is checked before download, re-create the release to pin the object", "kind", kind, "id", id)
+	}
+}
+
+var legacyObjectWarned sync.Map
 
 func verifyOTAManifestAsset(label string, asset map[string]any, files map[string]*zip.File) error {
 	filePath, _ := asset["path"].(string)
@@ -975,7 +1126,8 @@ func (s *server) otaAsset(c *gin.Context) {
 		return
 	}
 	var key sql.NullString
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT manifest_key FROM ota_releases WHERE tenant_id=? AND id=? AND status IN ('active','paused','superseded')`, tenantID(c), id).Scan(&key); err != nil || !key.Valid {
+	var rawObjectMetadata []byte
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT manifest_key,object_metadata FROM ota_releases WHERE tenant_id=? AND id=? AND status IN ('active','paused','superseded')`, tenantID(c), id).Scan(&key, &rawObjectMetadata); err != nil || !key.Valid {
 		problem(c, 404, "OTA_ASSET_NOT_FOUND", "OTA asset not found")
 		return
 	}
@@ -986,15 +1138,85 @@ func (s *server) otaAsset(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
+	// 资源对象在入库后被改写的话不下发。expo-updates 会按 manifest 里的 hash 校验资源，
+	// 这里是服务端自己的那一道。三种记录状态必须分开：迁移 37 之前的记录没有对象表，只能放行并提醒；
+	// 对象表损坏是数据事故（500）；对象表里没有这条路径就是包里没有这个文件（404），不能拿前缀下任意对象顶上
+	record, state, recordErr := otaObjectRecord(rawObjectMetadata, relPath)
+	switch state {
+	case otaObjectLegacy:
+		legacyObjectWarning(id, "ota")
+	case otaObjectInvalid:
+		slog.Error("ota_releases.object_metadata is not valid", "otaReleaseId", id, "tenant", tenantID(c), "error", recordErr)
+		problem(c, 500, "OTA_OBJECT_METADATA_INVALID", "Stored OTA object metadata is invalid")
+		return
+	case otaObjectUnlisted:
+		problem(c, 404, "OTA_ASSET_NOT_FOUND", "OTA asset not found")
+		return
+	case otaObjectRecorded:
+		actual, mismatch, statErr := verifyStoredObject(c.Request.Context(), client, assetKey, record.Size, record.ETag)
+		if statErr != nil {
+			problem(c, 502, "OTA_ASSET_UNAVAILABLE", "Unable to read OTA resource from storage")
+			return
+		}
+		if mismatch != "" {
+			s.noteObjectChanged("ota", tenantID(c), id, mismatch+":"+relPath, requestID(c), actual, record.Size, record.ETag, map[string]any{"path": relPath})
+			problem(c, 502, "OTA_OBJECT_CHANGED", "OTA resource in storage no longer matches the verified package")
+			return
+		}
+	}
 	body, err := client.Get(c.Request.Context(), assetKey)
 	if err != nil {
-		problem(c, 404, "OTA_ASSET_NOT_FOUND", "OTA asset not found")
+		problem(c, 502, "OTA_ASSET_UNAVAILABLE", "Unable to read OTA resource from storage")
 		return
 	}
 	defer body.Close()
 	c.Header("Cache-Control", "public, max-age=31536000, immutable")
 	c.Header("Content-Type", contentTypeForPath(relPath))
 	io.Copy(c.Writer, body)
+}
+
+// otaObjectState 是 ota_releases.object_metadata 对某条资源路径的四种判定。
+type otaObjectState int
+
+const (
+	// otaObjectLegacy：列为 NULL，迁移 37 之前入库，没有对象记录
+	otaObjectLegacy otaObjectState = iota
+	// otaObjectRecorded：有这条路径的大小与 ETag
+	otaObjectRecorded
+	// otaObjectUnlisted：对象表存在但没有这条路径——包里没有这个文件
+	otaObjectUnlisted
+	// otaObjectInvalid：列有内容但不是合法结构，数据事故
+	otaObjectInvalid
+)
+
+type otaObjectEntry struct {
+	Size int64
+	ETag string
+}
+
+// otaObjectRecord 读 ota_releases.object_metadata 里某个相对路径的入库大小与 ETag，并说明记录状态。
+func otaObjectRecord(raw []byte, relPath string) (otaObjectEntry, otaObjectState, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return otaObjectEntry{}, otaObjectLegacy, nil
+	}
+	var metadata map[string]map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return otaObjectEntry{}, otaObjectInvalid, fmt.Errorf("object_metadata is not valid JSON: %w", err)
+	}
+	item, exists := metadata[relPath]
+	if !exists {
+		return otaObjectEntry{}, otaObjectUnlisted, nil
+	}
+	size, isNumber := item["size"].(float64)
+	if !isNumber || size < 0 {
+		return otaObjectEntry{}, otaObjectInvalid, fmt.Errorf("object_metadata[%q].size is not a non-negative number", relPath)
+	}
+	etag, isString := item["etag"].(string)
+	if !isString || strings.TrimSpace(etag) == "" {
+		// 入库时空 ETag 已被拒绝（OTA_OBJECT_ETAG_MISSING）：这里出现空值只能是数据被改过，不能退化成只比大小
+		return otaObjectEntry{}, otaObjectInvalid, fmt.Errorf("object_metadata[%q].etag is missing or empty", relPath)
+	}
+	return otaObjectEntry{Size: int64(size), ETag: etag}, otaObjectRecorded, nil
 }
 
 func (s *server) otaAction(c *gin.Context) {

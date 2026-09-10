@@ -50,6 +50,7 @@ var migrations = []migration{
 	{version: 34, name: "wallet_received_push_copy", apply: walletReceivedPushCopyMigration},
 	{version: 35, name: "installation_runtime_report", apply: installationRuntimeReportMigration},
 	{version: 36, name: "wallet_user_installation", apply: walletUserInstallationMigration},
+	{version: 37, name: "ota_object_metadata", apply: otaObjectMetadataMigration},
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，
@@ -803,6 +804,22 @@ func resetRNAppLocalizationMigration(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// otaObjectMetadataMigration：OTA 资源对象的入库大小与 ETag，下载前 Head 比对，发现对象存储被改写即拒绝下发。
+// 已有记录为 NULL：它们只受 manifest 内容 hash（服务端）与资源 hash（expo-updates 客户端）保护。
+func otaObjectMetadataMigration(ctx context.Context, db *sql.DB) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='ota_releases' AND COLUMN_NAME='object_metadata'`).Scan(&count); err != nil {
+		return fmt.Errorf("ota object metadata migration inspect: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE ota_releases ADD COLUMN object_metadata JSON NULL COMMENT '入库时各资源对象的校验元数据：{"<包内相对路径>":{"size":字节数,"etag":"对象存储 ETag（objectstore.Stat，去引号；分段上传形如 md5-n）"}}，不含 manifest.json（manifest 由 manifest_sha256 全文校验）；下发前 Stat 比对；NULL=迁移 37 之前入库的记录，只受内容 hash 保护' AFTER manifest_sha256`); err != nil {
+		return fmt.Errorf("ota object metadata migration add column: %w", err)
+	}
+	return nil
 }
 
 func normalizeRNAppLocalizationKeysMigration(ctx context.Context, db *sql.DB) error {

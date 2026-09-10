@@ -135,7 +135,8 @@ func TestValidateOTAManifestPackageRequiresMatchingRuntimeAndHashes(t *testing.T
 
 // 应用身份必须由 OTA 包自己带上（构建脚本从租户配置写入 extra.applicationId），
 // 服务端不能拿基线 APK 的包名顶替：装了 OTA 的设备会以另一个身份上报，
-// app_installations 里就会出现同一台设备的两条记录，凭证也对不上
+// app_installations 里就会出现同一台设备的两条记录，凭证也对不上。
+// validateOTAManifestPackage 只要求字段存在；与基线 APK 内嵌值的比对见 otaApplicationIDMismatch
 func TestValidateOTAManifestPackageRequiresApplicationID(t *testing.T) {
 	content := []byte("console.log('ok')")
 	digest := sha256.Sum256(content)
@@ -216,5 +217,66 @@ func TestFlagEditableOnlyWhileTheRecordStillReachesClients(t *testing.T) {
 		if releaseFlagEditable(status) || otaFlagEditable(status) {
 			t.Fatalf("%s must not allow editing", status)
 		}
+	}
+}
+
+func TestOTAApplicationIDMustMatchBaseAPK(t *testing.T) {
+	manifest := map[string]any{"extra": map[string]any{"scopeKey": "anyfun", "applicationId": "dex-mobile"}}
+	if err := otaApplicationIDMismatch(manifest, "dex-mobile"); err != nil {
+		t.Fatalf("matching application id rejected: %v", err)
+	}
+	if err := otaApplicationIDMismatch(manifest, "other-app"); err == nil || !strings.Contains(err.Error(), "does not match the base APK") {
+		t.Fatalf("mismatching application id must be rejected, got %v", err)
+	}
+	if err := otaApplicationIDMismatch(manifest, ""); err == nil {
+		t.Fatal("unknown base application id must be rejected, never treated as a match")
+	}
+	nested := map[string]any{"extra": map[string]any{"scopeKey": "anyfun", "expoClient": map[string]any{"extra": map[string]any{"applicationId": "dex-mobile"}}}}
+	if err := otaApplicationIDMismatch(nested, "dex-mobile"); err != nil {
+		t.Fatalf("nested application id must be compared: %v", err)
+	}
+}
+
+func TestOTAObjectRecordDistinguishesLegacyUnlistedAndInvalid(t *testing.T) {
+	raw := []byte(`{"bundle.js":{"size":1234,"etag":"abc"}}`)
+	record, state, err := otaObjectRecord(raw, "bundle.js")
+	if err != nil || state != otaObjectRecorded || record.Size != 1234 || record.ETag != "abc" {
+		t.Fatalf("recorded path = %+v %v %v", record, state, err)
+	}
+	if _, state, err := otaObjectRecord(raw, "missing.js"); err != nil || state != otaObjectUnlisted {
+		t.Fatalf("unlisted path must be 404-able, got %v %v", state, err)
+	}
+	if _, state, err := otaObjectRecord(nil, "bundle.js"); err != nil || state != otaObjectLegacy {
+		t.Fatalf("NULL object_metadata must be legacy, got %v %v", state, err)
+	}
+	if _, state, err := otaObjectRecord([]byte(`{broken`), "bundle.js"); err == nil || state != otaObjectInvalid {
+		t.Fatalf("invalid JSON must be a data incident, got %v %v", state, err)
+	}
+	if _, state, err := otaObjectRecord([]byte(`{"bundle.js":{"etag":"abc"}}`), "bundle.js"); err == nil || state != otaObjectInvalid {
+		t.Fatalf("entry without a size must be invalid, got %v %v", state, err)
+	}
+}
+
+func TestBindsApplicationIDToBaseOnlyForAndroid(t *testing.T) {
+	if !bindsApplicationIDToBase("android") {
+		t.Fatal("Android bases carry a server-readable embedded application id and must be bound")
+	}
+	if bindsApplicationIDToBase("ios") {
+		t.Fatal("iOS bases have no server-readable embedded config; binding would reject every iOS OTA")
+	}
+}
+
+func TestOTAObjectRecordRejectsAnEmptyETag(t *testing.T) {
+	for name, raw := range map[string]string{
+		"empty":   `{"bundle.js":{"size":10,"etag":""}}`,
+		"missing": `{"bundle.js":{"size":10}}`,
+		"number":  `{"bundle.js":{"size":10,"etag":7}}`,
+	} {
+		if _, state, err := otaObjectRecord([]byte(raw), "bundle.js"); state != otaObjectInvalid || err == nil {
+			t.Fatalf("%s: state=%v err=%v; an ETag-less record must be a data incident, not a size-only check", name, state, err)
+		}
+	}
+	if entry, state, err := otaObjectRecord([]byte(`{"bundle.js":{"size":10,"etag":"abc-3"}}`), "bundle.js"); err != nil || state != otaObjectRecorded || entry.ETag != "abc-3" {
+		t.Fatalf("recorded = %+v %v %v", entry, state, err)
 	}
 }

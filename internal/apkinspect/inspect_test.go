@@ -2,13 +2,14 @@ package apkinspect
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestRuntimeVersionFromArchive(t *testing.T) {
+func TestReadEmbeddedConfigReadsRuntimeVersionFromFingerprint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime.apk")
 	file, err := os.Create(path)
 	if err != nil {
@@ -28,16 +29,16 @@ func TestRuntimeVersionFromArchive(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := runtimeVersionFromArchive(path)
+	got, err := readEmbeddedConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "89bf81ffce9ae67427199b4aad8579c7455b229b" {
-		t.Fatalf("runtimeVersionFromArchive() = %q", got)
+	if got.RuntimeVersion != "89bf81ffce9ae67427199b4aad8579c7455b229b" {
+		t.Fatalf("readEmbeddedConfig().RuntimeVersion = %q", got.RuntimeVersion)
 	}
 }
 
-func TestRuntimeVersionFromArchiveAllowsMissingFingerprint(t *testing.T) {
+func TestReadEmbeddedConfigAllowsMissingFingerprint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "without-runtime.apk")
 	file, err := os.Create(path)
 	if err != nil {
@@ -50,13 +51,13 @@ func TestRuntimeVersionFromArchiveAllowsMissingFingerprint(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := runtimeVersionFromArchive(path)
-	if err != nil || got != "" {
-		t.Fatalf("runtimeVersionFromArchive() = %q, %v", got, err)
+	got, err := readEmbeddedConfig(path)
+	if err != nil || got.RuntimeVersion != "" {
+		t.Fatalf("readEmbeddedConfig() = %+v, %v", got, err)
 	}
 }
 
-func TestRuntimeVersionFromArchiveReadsExplicitRuntimeVersion(t *testing.T) {
+func TestReadEmbeddedConfigReadsExplicitRuntimeVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "explicit-runtime.apk")
 	file, err := os.Create(path)
 	if err != nil {
@@ -77,9 +78,9 @@ func TestRuntimeVersionFromArchiveReadsExplicitRuntimeVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := runtimeVersionFromArchive(path)
-	if err != nil || got != "1.1.9" {
-		t.Fatalf("runtimeVersionFromArchive() = %q, %v", got, err)
+	got, err := readEmbeddedConfig(path)
+	if err != nil || got.RuntimeVersion != "1.1.9" {
+		t.Fatalf("readEmbeddedConfig() = %+v, %v", got, err)
 	}
 }
 
@@ -105,5 +106,63 @@ func TestRejectsNonAPK(t *testing.T) {
 	}
 	if _, err := Inspect(path); err == nil {
 		t.Fatal("expected malformed APK to be rejected")
+	}
+}
+
+func writeArchive(t *testing.T, name string, entries map[string]string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	for entryName, body := range entries {
+		entry, err := archive.Create(entryName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestReadEmbeddedConfigReadsApplicationIDAndRuntimeInOnePass(t *testing.T) {
+	path := writeArchive(t, "with-app-id.apk", map[string]string{
+		"assets/fingerprint": "89bf81ffce9ae67427199b4aad8579c7455b229b\n",
+		"assets/app.config":  `{"runtimeVersion":"1.2.11","extra":{"applicationId":"dex-mobile","apiBaseUrl":"https://api.example.test"}}`,
+	})
+	got, err := readEmbeddedConfig(path)
+	if err != nil || got.ApplicationID != "dex-mobile" || got.RuntimeVersion != "89bf81ffce9ae67427199b4aad8579c7455b229b" {
+		t.Fatalf("readEmbeddedConfig() = %+v, %v", got, err)
+	}
+}
+
+func TestReadEmbeddedConfigIsEmptyWithoutEmbeddedConfig(t *testing.T) {
+	path := writeArchive(t, "without-app-id.apk", map[string]string{"assets/fingerprint": "abc\n"})
+	got, err := readEmbeddedConfig(path)
+	if err != nil || got.ApplicationID != "" || got.RuntimeVersion != "abc" {
+		t.Fatalf("readEmbeddedConfig() = %+v, %v", got, err)
+	}
+	path = writeArchive(t, "config-without-app-id.apk", map[string]string{"assets/app.config": `{"runtimeVersion":"1.2.11","extra":{}}`})
+	got, err = readEmbeddedConfig(path)
+	if err != nil || got.ApplicationID != "" || got.RuntimeVersion != "1.2.11" {
+		t.Fatalf("readEmbeddedConfig() without extra.applicationId = %+v, %v", got, err)
+	}
+}
+
+func TestReadEmbeddedConfigRejectsCorruptConfigInsteadOfTreatingItAsMissing(t *testing.T) {
+	path := writeArchive(t, "corrupt-config.apk", map[string]string{"assets/app.config": `{"runtimeVersion":`})
+	_, err := readEmbeddedConfig(path)
+	if !errors.Is(err, ErrEmbeddedConfigInvalid) {
+		t.Fatalf("corrupt embedded config must surface ErrEmbeddedConfigInvalid, got %v", err)
 	}
 }
