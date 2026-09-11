@@ -161,6 +161,15 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	platform.GET("/wallet/blocks", s.listPlatformWalletBlocks)
 	platform.POST("/wallet/blocks", s.createPlatformWalletBlock)
 	platform.POST("/wallet/blocks/:id/revoke", s.revokePlatformWalletBlock)
+	// 打包机代理通道：与管理端**完全分开**的一条凭据，也不按域名解析租户——
+	// 任务里带着租户，代理本来就跨租户工作。一台构建机被拿下时，拿到的应该只是
+	// 构建队列，不是整个管理面。
+	agent := r.Group("/v1/build-agent")
+	agent.Use(s.buildAgentAuth())
+	agent.POST("/claim", s.claimBuildJob)
+	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
+	agent.POST("/jobs/:id/complete", s.completeBuildJob)
+	agent.POST("/jobs/:id/fail", s.failBuildJob)
 	current := protected.Group("")
 	current.Use(s.domainTenantScope())
 	current.GET("/tenant", s.currentTenant)
@@ -221,6 +230,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/ota/signing-key", s.getOTASigningKey)
 	group.PUT("/ota/signing-key", s.updateOTASigningKey)
 	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)
+	group.GET("/builds", s.listBuildJobs)
+	group.POST("/builds", s.createBuildJob)
+	group.GET("/builds/:id", s.buildJobDetail)
+	group.POST("/builds/:id/cancel", s.cancelBuildJob)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)

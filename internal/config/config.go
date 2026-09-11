@@ -16,6 +16,7 @@ type Config struct {
 	HTTPWriteTimeout           int
 	CORSOrigins                []string
 	AdminAPIKey                string
+	BuildAgentToken            string
 	AdminAPIActor              string
 	AdminUsername              string
 	AdminPasswordHash          string
@@ -115,6 +116,7 @@ func Load() (Config, error) {
 		MySQLInitRetryDelay:        integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
 		MySQLAutoMigrate:           boolean("MYSQL_AUTO_MIGRATE", true),
 		StorageMasterKey:           strings.TrimSpace(os.Getenv("STORAGE_MASTER_KEY")),
+		BuildAgentToken:            strings.TrimSpace(os.Getenv("BUILD_AGENT_TOKEN")),
 		DeviceIdentityKey:          strings.TrimSpace(os.Getenv("DEVICE_IDENTITY_HMAC_KEY")),
 		ArtifactMaxSizeBytes:       int64(integer("ARTIFACT_MAX_SIZE_MB", 512)) * 1024 * 1024,
 		ArtifactUploadMode:         value("ARTIFACT_UPLOAD_MODE", "direct"),

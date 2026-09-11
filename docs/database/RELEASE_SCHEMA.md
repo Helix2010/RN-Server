@@ -34,3 +34,20 @@
 | 含请求方已验明的 `installation_id` | 命中 | 与 active 一同参与 `ORDER BY build_number DESC`（OTA 按 `revision`），大的胜出 |
 
 写入只走状态机（`canary` / `set-canary-audience`）：名单不能为空，ID 必须在 `app_installations` 里存在，上限 200 条（超过这个规模改为关联表，查询形状不变）。离开灰度（`promote` / `cancel-canary`）时清空。
+
+## build_jobs（迁移 40）
+
+打包任务。管理端写入，打包机代理认领与回报。设计见 `docs/design/build-service-2026-09-11.md`。
+
+**表里没有命令字段，这是有意的。** 任务带的是参数（租户、提交、版本号），不是 shell。让服务端能在打包机上执行任意命令，等于 wallet 后端的任何一个 RCE 都拿到了那台握着 Android keystore 的机器的执行权，而 keystore 泄露在 direct 分发下没有补救办法：Android 用（包名 + 签名证书）认身份，对方能签一个同签名的 APK 在用户设备上原地覆盖安装、数据目录（含钱包）完整保留，补救只能换包名。
+
+### 为什么不复用 app_releases
+
+`app_releases` 描述的是一个**已经存在的产物**。构建任务可以失败、可以重试、可以在没有任何产物的情况下结束，塞进去会把"失败的构建"写成"坏掉的发布记录"。构建成功后产物仍然落 `app_releases`，任务行用 `release_id` 指过去。
+
+### 不变量
+
+- `ux_build_jobs_build_number (tenant_id, platform, build_number)`：同租户同平台的同一个 build 号不能排两次队。创建时还会把 `app_releases` 里已用的最大值算进去，要求严格递增——装到设备上的 APK 靠 versionCode 决定谁覆盖谁，重号意味着"哪个赢"取决于谁后装。
+- 状态只前进：`queued → claimed → running → succeeded|failed`，`canceled` 只能从 `queued|claimed` 进入。已经出了包的构建不能被取消，否则状态会骗人。
+- `log_tail` 最多 200 行、每行最多 2000 字节。日志由代理送来，不设上限的话一次失败就能把这一行撑到几十兆，而这张表是管理端列表要扫的。
+- 认领是**跨租户**的，取最早那条。解析不出租户的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。

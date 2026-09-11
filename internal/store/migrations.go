@@ -53,6 +53,7 @@ var migrations = []migration{
 	{version: 37, name: "ota_object_metadata", apply: otaObjectMetadataMigration},
 	{version: 38, name: "release_notes_line_arrays", apply: releaseNotesLineArraysMigration},
 	{version: 39, name: "release_canary", apply: releaseCanaryMigration},
+	{version: 40, name: "build_jobs", apply: buildJobsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1309,6 +1310,49 @@ func walletUserInstallationMigration(ctx context.Context, db *sql.DB) error {
 		SELECT tenant_id,user_id,installation_id,MIN(issued_at),MAX(issued_at),COUNT(*),SUBSTRING_INDEX(GROUP_CONCAT(connector ORDER BY issued_at DESC SEPARATOR ','),',',1),UTC_TIMESTAMP(3),UTC_TIMESTAMP(3)
 		FROM wallet_session WHERE installation_id IS NOT NULL GROUP BY tenant_id,user_id,installation_id`); err != nil {
 		return fmt.Errorf("wallet user installation migration backfill: %w", err)
+	}
+	return nil
+}
+
+// buildJobsMigration 建打包任务表（设计 docs/design/build-service-2026-09-11.md）。
+//
+// 为什么不复用 app_releases：那张表描述的是一个**已经存在的产物**，而构建任务可以
+// 失败、可以重试、可以在没有任何产物的情况下结束。塞进去会把"失败的构建"写成
+// "坏掉的发布记录"。
+//
+// 表里**没有命令字段**，这是有意的。任务只带参数（租户、提交、版本号），怎么构建由
+// 打包机自己决定。让服务端能下发命令，等于 wallet 后端的任何一个 RCE 都拿到了那台
+// 握着 Android keystore 的机器的执行权，而 keystore 泄露在 direct 分发下没有补救
+// 办法——只能换包名，让每个用户手动卸载重装。
+func buildJobsMigration(ctx context.Context, db *sql.DB) error {
+	// 注释里不能出现单引号：它会提前终止 SQL 字符串字面量
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS build_jobs (
+		id VARCHAR(80) NOT NULL COMMENT '主键，bld_ 前缀',
+		tenant_id BIGINT UNSIGNED NOT NULL COMMENT '所属租户；构建参数与产物都只属于这个租户',
+		platform ENUM('android','ios') NOT NULL COMMENT '目标平台',
+		git_ref VARCHAR(200) NOT NULL COMMENT '要构建的分支名或提交 sha；代理解析出确切提交后回写 commit_sha',
+		commit_sha VARCHAR(64) NULL COMMENT '代理实际检出的提交；NULL=还没认领或还没解析出来',
+		version VARCHAR(40) NOT NULL COMMENT '语义版本，写进产物；与 app_releases.version 同义',
+		build_number INT UNSIGNED NOT NULL COMMENT 'Android versionCode / iOS build；服务端保证同租户同平台严格递增',
+		status ENUM('queued','claimed','running','succeeded','failed','canceled') NOT NULL COMMENT '任务状态：queued=待认领，claimed=已认领未开工，running=构建中，succeeded=有产物，failed=有失败原因，canceled=人工取消',
+		claimed_by VARCHAR(120) NULL COMMENT '认领这个任务的打包机自报标识，只用于排查，不作为鉴权依据；NULL=还没被认领',
+		claimed_at DATETIME(3) NULL COMMENT '认领时间 UTC；NULL=还没被认领',
+		heartbeat_at DATETIME(3) NULL COMMENT '代理最近一次心跳 UTC；用于在列表里标出卡死的任务',
+		release_id VARCHAR(80) NULL COMMENT '构建成功后落到 app_releases 的那条记录；NULL=还没产物',
+		artifact_sha256 CHAR(64) NULL COMMENT '产物 sha256，由代理计算并回报；NULL=还没产物',
+		log_tail JSON NULL COMMENT '失败定位用的日志尾部，字符串数组，最多 200 行；完整日志在对象存储。NULL=还没有日志',
+		log_object_key VARCHAR(512) NULL COMMENT '完整日志在租户对象存储里的键；NULL=没有上传日志',
+		failure_reason VARCHAR(500) NULL COMMENT '失败原因一句话；NULL=没失败',
+		reason VARCHAR(500) NOT NULL COMMENT '发起这次构建的原因，管理端必填，同时写进 audit_events',
+		created_by VARCHAR(120) NOT NULL COMMENT '发起人',
+		created_at DATETIME(3) NOT NULL COMMENT '创建时间 UTC',
+		updated_at DATETIME(3) NOT NULL COMMENT '更新时间 UTC',
+		PRIMARY KEY (id),
+		KEY ix_build_jobs_queue (status, created_at),
+		KEY ix_build_jobs_tenant (tenant_id, platform, created_at),
+		UNIQUE KEY ux_build_jobs_build_number (tenant_id, platform, build_number)
+	) ENGINE=InnoDB COMMENT='打包任务：管理端写入，打包机代理认领与回报。只记参数与结果，不记命令——服务端不在打包机上执行任意命令'`); err != nil {
+		return fmt.Errorf("build jobs migration create table: %w", err)
 	}
 	return nil
 }

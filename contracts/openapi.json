@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.14"
+    "version": "2026.09.15"
   },
   "paths": {
     "/health/live": {
@@ -1817,6 +1817,215 @@
           }
         }
       }
+    },
+    "/v1/admin/builds": {
+      "get": {
+        "summary": "List build jobs for this tenant",
+        "description": "Newest first. Each item carries status, the resolved commit, the artifact sha256 and a bounded log tail.",
+        "responses": {
+          "200": {
+            "description": "Build jobs"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          }
+        }
+      },
+      "post": {
+        "summary": "Queue a build",
+        "description": "Queues a build for this tenant. The job carries parameters only (tenant, git ref, version, build number) and never a command: the server must not be able to execute anything on the machine that holds the Android signing keystore. buildNumber must be strictly greater than every build number already used by this tenant and platform, across both app_releases and build_jobs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildJobCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Queued build job"
+          },
+          "400": {
+            "description": "INVALID_BUILD_JOB: platform, git ref, semver version, positive build number, reason and confirm=true are required"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used"
+          }
+        }
+      }
+    },
+    "/v1/admin/builds/{id}": {
+      "get": {
+        "summary": "Build job detail",
+        "description": "Includes the bounded log tail for failure triage.",
+        "responses": {
+          "200": {
+            "description": "Build job"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "BUILD_JOB_NOT_FOUND"
+          }
+        }
+      }
+    },
+    "/v1/admin/builds/{id}/cancel": {
+      "post": {
+        "summary": "Cancel a queued or claimed build",
+        "description": "Only queued or claimed builds can be canceled. Canceling a running or finished build would make the status lie: the artifact may already exist and the process on the build machine does not stop.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildJobCancel"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Canceled build job"
+          },
+          "400": {
+            "description": "INVALID_BUILD_JOB"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_CANCELABLE"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/claim": {
+      "post": {
+        "summary": "Claim the next queued build",
+        "description": "Atomically claims the oldest queued job for the requested platforms (FOR UPDATE SKIP LOCKED, so two agents never get the same job) and returns its parameters together with the tenant slug and the tenant OTA code signing certificate. The private key is never returned. Shipping the certificate with the job is what keeps the certificate compiled into the app in sync with the key the server signs with. Returns 204 when the queue is empty. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildClaim"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Claimed build job with tenantSlug and otaCertificatePem"
+          },
+          "204": {
+            "description": "No queued build"
+          },
+          "400": {
+            "description": "INVALID_BUILD_CLAIM"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/heartbeat": {
+      "post": {
+        "summary": "Report build progress",
+        "description": "Moves the job to running and stores a bounded log tail (at most 200 lines, 2000 bytes each). Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildProgress"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "INVALID_BUILD_PROGRESS"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_RUNNING"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/complete": {
+      "post": {
+        "summary": "Report a successful build",
+        "description": "commitSha and artifactSha256 must be lowercase hex digests; the server records what was built, not how. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildResult"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "INVALID_BUILD_RESULT"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_RUNNING"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/fail": {
+      "post": {
+        "summary": "Report a failed build",
+        "description": "failureReason is required: a failure with no reason shows up in the admin UI as failed with nothing to act on. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildFailure"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "INVALID_BUILD_RESULT"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_RUNNING"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2648,6 +2857,144 @@
           },
           "confirm": {
             "type": "boolean"
+          }
+        }
+      },
+      "BuildJobCreate": {
+        "type": "object",
+        "required": [
+          "platform",
+          "gitRef",
+          "version",
+          "buildNumber",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "platform": {
+            "type": "string",
+            "enum": [
+              "android",
+              "ios"
+            ]
+          },
+          "gitRef": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Branch name or commit sha to build"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "buildNumber": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Android versionCode / iOS build; must strictly increase"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BuildJobCancel": {
+        "type": "object",
+        "required": [
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BuildClaim": {
+        "type": "object",
+        "required": [
+          "agent"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Self-reported build machine identity; recorded for triage only, never used for authorization"
+          },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ]
+            },
+            "description": "Platforms this agent can build; empty means both"
+          }
+        }
+      },
+      "BuildProgress": {
+        "type": "object",
+        "properties": {
+          "logTail": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BuildResult": {
+        "type": "object",
+        "required": [
+          "commitSha",
+          "artifactSha256"
+        ],
+        "properties": {
+          "commitSha": {
+            "type": "string",
+            "description": "The commit actually checked out, lowercase hex"
+          },
+          "artifactSha256": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          },
+          "releaseId": {
+            "type": "string",
+            "description": "app_releases row the artifact landed in, when the agent uploaded it"
+          },
+          "logTail": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "BuildFailure": {
+        "type": "object",
+        "required": [
+          "failureReason"
+        ],
+        "properties": {
+          "failureReason": {
+            "type": "string",
+            "maxLength": 500
+          },
+          "logTail": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       }
