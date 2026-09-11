@@ -376,16 +376,19 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 // 只剩 active（见 canary.go 的 canaryVisibleSQL）。
 func (s *server) visibleSimplifiedRelease(ctx context.Context, tenant, platform, installationID string) (simplifiedActiveRelease, error) {
 	var item simplifiedActiveRelease
-	var notes []byte
+	var notes, rawMetadata []byte
 	var sha sql.NullString
 	var size sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id,version,release_notes,sha256,file_size,mandatory,status FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenant, platform, installationID, installationID).Scan(&item.ID, &item.Version, &notes, &sha, &size, &item.Mandatory, &item.Status)
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,release_notes,sha256,file_size,mandatory,status,file_metadata FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenant, platform, installationID, installationID).Scan(&item.ID, &item.Version, &notes, &sha, &size, &item.Mandatory, &item.Status, &rawMetadata)
 	if err != nil {
 		return item, err
 	}
 	if err := json.Unmarshal(notes, &item.ReleaseNotes); err != nil {
 		return item, err
 	}
+	// 签名者读不出来（旧记录没这个键、或元数据坏了）就当"不知道"：这个字段只用于
+	// 决定要不要关掉应用内直装，拿不到时保持现状，不把正常升级也挡掉
+	item.SignerSHA256, _ = storedMetadataString(rawMetadata, "signerSha256")
 	if sha.Valid {
 		item.SHA256 = &sha.String
 	}
@@ -393,6 +396,39 @@ func (s *server) visibleSimplifiedRelease(ctx context.Context, tenant, platform,
 		item.FileSize = &size.Int64
 	}
 	return item, nil
+}
+
+// installedReleaseSigner 反查"设备现在装的那个 build"入库时记下的签名证书指纹。
+// 查不到（从没上传过这个 build、或旧记录没记指纹）返回空串，调用方按"不知道"处理。
+func (s *server) installedReleaseSigner(ctx context.Context, tenant, platform, version, buildNumber string) string {
+	if version == "" || buildNumber == "" {
+		return ""
+	}
+	var rawMetadata []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT file_metadata FROM app_releases WHERE tenant_id=? AND platform=? AND version=? AND build_number=? ORDER BY created_at DESC LIMIT 1`, tenant, platform, version, buildNumber).Scan(&rawMetadata); err != nil {
+		return ""
+	}
+	signer, _ := storedMetadataString(rawMetadata, "signerSha256")
+	return signer
+}
+
+// directInstallAllowed 决定这台设备该不该看到"应用内直接安装"。
+//
+// Android 不允许签名不同的 APK 覆盖安装。轮换签名密钥之后，老密钥签的装机下载
+// 新包能成功、装到系统安装器那一步必定被拒——用户看到的是一个点一次失败一次、
+// 没有任何解释的按钮，强制升级时更是死循环（安全评审 N1 的迁移窗口）。
+//
+// 两边指纹都知道且不相等时关掉直装：客户端会退回"去下载页"，运营也就有地方
+// 把"先备份助记词、卸载旧版、重新安装"讲清楚。任何一边不知道都保持现状——
+// 宁可多给一个可能失败的按钮，也不要把正常升级的设备一起挡住。
+func directInstallAllowed(featureEnabled bool, platform, installedSigner, targetSigner string) bool {
+	if !featureEnabled || platform != "android" {
+		return false
+	}
+	if installedSigner == "" || targetSigner == "" {
+		return true
+	}
+	return strings.EqualFold(installedSigner, targetSigner)
 }
 
 // activeMandatoryVersion 返回 active 记录声明的"必须升到这一版"，没有强制要求时空串。

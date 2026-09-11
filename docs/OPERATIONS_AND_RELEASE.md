@@ -77,12 +77,14 @@ bootstrap 根据以下输入求值：
 - **签名者与包名按租户 pin（2026-09-10）**：每个租户在 `app_configs` 的 `release.android`（`GET/PUT /v1/admin/release-identity/android`，JSON `{"packageName":"com.anyfun.wallet","signerSha256":"<证书 SHA-256，64 位小写十六进制>","expectedVersion":0,"reason":"…","confirm":true}`）登记正式包身份。入库时 APK 的包名与签名者证书指纹必须与之相等（`RELEASE_PACKAGE_MISMATCH` / `RELEASE_SIGNER_MISMATCH`）；`APP_ENV=production` 下未登记即拒绝（`RELEASE_SIGNER_UNPINNED`）；React Native 模板公开 debug 密钥（`fac61745…1033b9c`）在任何环境都拒绝入库也不允许被 pin（`RELEASE_DEBUG_SIGNER`）。pin 只读租户自己那一行，不从平台级继承。每次拒绝写 `audit_events`（`release_rejected`）。 管理端入口：RN-Admin「发布基础设施 → Android 发布身份」页（查看、设置、乐观锁冲突提示；客户端把带冒号/大写的指纹规范化为 64 位小写十六进制，debug 指纹在客户端即被拒绝）。
 - APK 必须内嵌 Expo 配置 `extra.applicationId`（RN-App 构建脚本已保证），入库记入 `file_metadata.applicationId`，缺失拒绝（`RELEASE_APPLICATION_ID_MISSING`）；内嵌配置存在但不是合法 JSON 拒绝（`RELEASE_EMBEDDED_CONFIG_INVALID`）。所有入库拒绝（身份、applicationId、版本不符）都写 `audit_events`（`release_rejected`）。
 - **发布后对象校验**：入库时用 `objectstore.Stat` 记录对象存储 ETag（`file_metadata.objectEtag`，去引号；分段上传对象形如 `<md5>-<n>`，同一对象再次 Stat 值不变）；`GET /v1/public/releases/{id}/download` 每次先 `Stat` 对象，大小或 ETag 与入库值不符返回 502 `RELEASE_OBJECT_CHANGED`，error 日志与审计（`release_object_changed`，actor `system-release`）对同一 (租户, 发布, 维度) 每 10 分钟最多写一次，请求本身每次都拒绝。去重是**进程内**的：多副本部署时每个实例各写一次；审计写失败只记 error 日志，绝不会把拒绝变成放行（响应先于审计决定）。对象存储不可达返回 502 `RELEASE_DOWNLOAD_FAILED`，不放行；`file_metadata` 不是合法 JSON、或 `objectEtag` 键存在但为空 / 不是字串，返回 500 `RELEASE_METADATA_INVALID`（数据事故，用迁移修，不降级成只比大小）。入库时对象存储没有返回 ETag 则拒绝入库（502 `RELEASE_OBJECT_ETAG_MISSING`），从不持久化空 ETag。只有 2026-09-10 之前入库、`file_metadata` 里**没有** `objectEtag` 键的发布才按旧记录处理：只比大小并每条记一次 warning；要获得完整校验需重新入库。CopyObject、存储类变更或服务端重加密都会改变 ETag，做过这些操作的发布必须重新入库，否则会被当成被篡改而拒绝下发。
+- **换签名密钥期间自动收掉应用内直装（2026-09-11，安全评审 N1 迁移窗口 / RN-App runbook §8.5）**：Android 不允许签名不同的 APK 覆盖安装。bootstrap 现在比对"设备现在装的那个 build"入库时记的 `file_metadata.signerSha256` 与"它该升到的那个包"的同一字段，两边都知道且不相等时 `features.directUpdateEnabled` 对这台设备返回 `false`，客户端退回打开下载页而不是在应用内下完再被系统安装器拒掉。任何一边取不到指纹（2026-09-10 之前入库的旧记录、或那个 build 从没上传过）都保持原行为，宁可多给一个可能失败的按钮也不挡住正常升级。**这只消除应用内的失败循环，不能让旧签名装机装上新包**——真正的出路仍是"备份助记词 → 卸载 → 重装"，那段话要写进 `releaseNotes`（强制更新弹层会渲染前 3 条）或旧 runtime 的迁移 OTA。
 - 二进制放对象存储/CDN，API 只签发短时下载 URL，不代理大文件。
 - 生产下载入口可要求已认证企业用户或一次性 enrollment token；公开分发时仍需防盗链、限速与合规审查。
 - 记录下载/安装结果时使用最小化匿名标识；不能假设“已下载 = 已安装”。
 
 ### iOS MDM/企业内部分发
 
+- **Apple Team ID 与 bundle id 按租户登记（2026-09-11）**：`app_configs` 的 `release.ios`（`GET/PUT /v1/admin/release-identity/ios`，JSON `{"appleTeamId":"ABCDE12345","bundleId":"com.anyfun.foundation","expectedVersion":0,"reason":"…","confirm":true}`，Team ID 大小写不敏感、入库规范化为大写）。目前唯一的消费方是通用链接归属声明：`GET /.well-known/apple-app-site-association` 按域名解析租户，从这条记录生成，未登记返回 404（`RELEASE_IDENTITY_NOT_CONFIGURED`），**从不猜一份授权发出去**。声明只覆盖 `/app/wc` 一条路径（WalletConnect 回跳），不是整域——整域声明会让任何一个 API 地址都试图拉起 App。该文件按 Apple 要求不带 `.json` 后缀、以 `application/json` 直出、不重定向。RN-Admin 暂无对应界面，目前用 `PUT` 接口登记。
 - artifact/manifest 必须与允许的 bundleId、team/certificate、profile、受众匹配。
 - certificate/profile 到期前告警；轮换必须先在真实受管设备验证覆盖升级。
 - MDM assignment 状态与 App 主动 check 状态分开记录；MDM 是安装控制面，App release service 是版本策略面。
@@ -136,6 +138,12 @@ bootstrap 根据以下输入求值：
 ## 8. 管理控制面
 
 发布管理端必须提供：draft preview、artifact verification、受众/比例、兼容矩阵、minSupported 风险提示、暂停、审计查询。当前阶段不加入 RBAC 与双人审批；高风险操作仍必须显式确认并填写 reason，不提供无上下文的“立即全量强更”按钮。
+
+**身份与会话（2026-09-11，安全评审 N17）**：
+
+- `x-admin-key` 自动化通道写进 `audit_events` 的 actor 由 `ADMIN_API_ACTOR`（默认 `api-key-automation`）决定，**不再取请求自报的 `x-admin-id`**——那是持钥者可任意填写的字段，审计链等于没有依据。请求仍可带该头，只会被忽略并记一条 warning 日志；因此这条通道现在也不再要求带 `x-admin-id`。要区分多个自动化调用方，就给它们各自的部署配不同的 `ADMIN_API_ACTOR`（`ADMIN_API_KEY` 目前仍是单值）。
+- `ADMIN_COOKIE_SECURE` 默认改为 `true`，管理会话 cookie 只走 TLS。本地用 http 调管理端时在 `.env` 里显式设 `false`。
+- 旁路本身的存废（是否保留 `x-admin-key`）、按租户 RBAC 与发布双人分离仍是未决项，见钱包安全评审 N17。
 
 ## 9. Runbook 最小集合
 

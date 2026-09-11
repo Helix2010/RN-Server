@@ -86,6 +86,9 @@ type simplifiedActiveRelease struct {
 	Mandatory bool
 	// Status 是 active 或 canary：拿到灰度版本时客户端要知道自己在灰度里
 	Status string
+	// SignerSHA256 是入库时记下的签名证书指纹（`file_metadata.signerSha256`）。
+	// 2026-09-10 之前入库的记录没有这个键，取到空串，调用方按"不知道"处理。
+	SignerSHA256 string
 }
 
 type auditEvent struct {
@@ -129,6 +132,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// Android App Links 的域名归属声明（安全评审 N13）。系统会匿名来拉它，
 	// 所以放在公开路由上，按 Host 解析租户。
 	r.GET("/.well-known/assetlinks.json", s.domainTenantScope(), s.wellKnownAssetLinks)
+	// Apple 要求这个文件没有 .json 后缀，且必须直出 application/json
+	r.GET("/.well-known/apple-app-site-association", s.domainTenantScope(), s.wellKnownAppleAppSiteAssociation)
 	r.GET("/v1/public/releases/latest", s.domainTenantScope(), s.publicLatestReleaseFromDomain)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
 	admin := r.Group("/v1/admin")
@@ -208,6 +213,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/release-storage/test", s.testReleaseStorage)
 	group.GET("/release-identity/android", s.getAndroidReleaseIdentity)
 	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)
+	group.GET("/release-identity/ios", s.getIOSReleaseIdentity)
+	group.PUT("/release-identity/ios", s.updateIOSReleaseIdentity)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
@@ -353,9 +360,14 @@ func (s *server) authenticate() gin.HandlerFunc {
 				return
 			}
 		}
-		key, actor := c.GetHeader("x-admin-key"), strings.TrimSpace(c.GetHeader("x-admin-id"))
-		if s.cfg.AdminAPIKey != "" && actor != "" && constantEqual(key, s.cfg.AdminAPIKey) {
-			c.Set("actorId", actor)
+		// x-admin-key 自动化通道：身份来自配置里绑定的 actor，不是请求自报的 x-admin-id。
+		// 自报身份任何持钥者都能随便写，写进 audit_events 的 actor 就成了攻击者可控的字段，
+		// 事后追责等于没有依据（安全评审 N17）。请求仍然可以带那个头，只是不再被采纳。
+		if key := c.GetHeader("x-admin-key"); s.cfg.AdminAPIKey != "" && constantEqual(key, s.cfg.AdminAPIKey) {
+			if claimed := strings.TrimSpace(c.GetHeader("x-admin-id")); claimed != "" && claimed != s.cfg.AdminAPIActor {
+				slog.Warn("ignoring self-declared admin identity on api-key request", "claimed", claimed, "actor", s.cfg.AdminAPIActor, "path", c.Request.URL.Path)
+			}
+			c.Set("actorId", s.cfg.AdminAPIActor)
 			c.Set("authMethod", "api-key")
 			c.Set("expiresAt", nil)
 			c.Next()
@@ -1462,6 +1474,7 @@ func (s *server) bootstrap(c *gin.Context) {
 		distribution = "development"
 	}
 	version := normalizeVersion(c.GetHeader("x-app-version"))
+	buildNumber := text(c.GetHeader("x-build-number"), "0")
 	updatePolicy := object(cfg["updatePolicy"])
 	latest := text(updatePolicy["latestVersion"], "1.1.0")
 	minimum := text(updatePolicy["minSupportedVersion"], "0.9.0")
@@ -1474,6 +1487,8 @@ func (s *server) bootstrap(c *gin.Context) {
 	// bootstrap 本身——它是启动门禁，配置必须照发，只是不给灰度（设计 §8.1）
 	audience := s.canaryAudienceID(c, tenant.ID)
 	canaryRelease := false
+	// 目标包与已装包的签名者：用来决定应用内直装会不会被系统安装器拒掉
+	targetSigner, installedSigner := "", ""
 	if platform == "android" && distribution == "direct" {
 		if visible, findErr := s.visibleSimplifiedRelease(c.Request.Context(), tenant.ID, platform, audience); findErr == nil {
 			latest = visible.Version
@@ -1483,8 +1498,13 @@ func (s *server) bootstrap(c *gin.Context) {
 			artifactSize = visible.FileSize
 			actionURL = s.absoluteURL(c, "/v1/public/releases/"+visible.ID+"/download")
 			canaryRelease = visible.Status == "canary"
+			targetSigner = visible.SignerSHA256
+			if targetSigner != "" {
+				installedSigner = s.installedReleaseSigner(c.Request.Context(), tenant.ID, platform, version, buildNumber)
+			}
 		}
 	}
+
 	// 商店 / MDM 渠道拿不到直装包，但运营勾的"强制升级"仍然要生效：
 	// 否则管理端显示的强制徽章对 iOS 是假的。强制版本只认 active 记录
 	mandatoryVersion := s.activeMandatoryVersion(c.Request.Context(), tenant.ID, platform)
@@ -1553,6 +1573,8 @@ func (s *server) bootstrap(c *gin.Context) {
 	messages := object(localization["messages"])
 	theme := object(cfg["theme"])
 	features := object(cfg["features"])
+	// 换签名密钥之后，老密钥签的装机装不上新包：把直装按钮收掉，让客户端退回下载页
+	directUpdateEnabled := directInstallAllowed(truth(features["directUpdateEnabled"]), platform, installedSigner, targetSigner)
 	brandingConfig, _, _, _, _, brandingErr := s.brandingRecord(c.Request.Context(), tenant.ID)
 	if brandingErr != nil {
 		brandingConfig = cloneMap(defaultBrandingConfig)
@@ -1577,7 +1599,7 @@ func (s *server) bootstrap(c *gin.Context) {
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": directUpdateEnabled, "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

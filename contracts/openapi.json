@@ -747,7 +747,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path); services.predict (domain, scopeId, chain) is present only while modules.predict is enabled and is 503 when enabled but not configured. Optional installation authentication: a request carrying X-Installation-ID plus Authorization: Installation <credential> is matched against canary releases, so the device may receive update.full/update.ota for a canary build instead of the active one; an absent, expired or revoked credential is treated as anonymous and only ever sees active (bootstrap itself never fails on a credential problem). update.canary.enrolled says whether the offered full release is a canary build; update.canary.otaToken is a 24h opaque token that the app must store with Updates.setExtraParamAsync(\"canary-token\", token) so the native manifest request can be matched to a canary OTA revision (the key must stay lowercase: expo-structured-headers rejects uppercase dictionary keys). otaToken is null when the installation could not be authenticated, and the app then clears the stored param. update.minSupportedVersion and the mandatory flag always come from the active release, never from a canary one"
+            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path); services.predict (domain, scopeId, chain) is present only while modules.predict is enabled and is 503 when enabled but not configured. Optional installation authentication: a request carrying X-Installation-ID plus Authorization: Installation <credential> is matched against canary releases, so the device may receive update.full/update.ota for a canary build instead of the active one; an absent, expired or revoked credential is treated as anonymous and only ever sees active (bootstrap itself never fails on a credential problem). update.canary.enrolled says whether the offered full release is a canary build; update.canary.otaToken is a 24h opaque token that the app must store with Updates.setExtraParamAsync(\"canary-token\", token) so the native manifest request can be matched to a canary OTA revision (the key must stay lowercase: expo-structured-headers rejects uppercase dictionary keys). otaToken is null when the installation could not be authenticated, and the app then clears the stored param. update.minSupportedVersion and the mandatory flag always come from the active release, never from a canary one features.directUpdateEnabled is additionally false when the requesting build and the release it would install were signed with different certificates (the platform installer would reject the in-app install after the download), so the client falls back to opening the download URL instead of looping a failing install."
           },
           "503": {
             "description": "BOOTSTRAP_UNAVAILABLE: the tenant configuration, its token catalogue or its wallet section could not be produced completely (storage error, a corrupt catalogue row, an enabled chain without a native token, or a tenant whose configured chains are all unknown). The app keeps its last successful snapshot and shows the retry screen"
@@ -860,6 +860,23 @@
           },
           "404": {
             "description": "RELEASE_IDENTITY_NOT_CONFIGURED"
+          }
+        }
+      }
+    },
+    "/.well-known/apple-app-site-association": {
+      "get": {
+        "summary": "iOS Universal Links domain ownership for this tenant",
+        "description": "Generated from the tenant's registered release.ios identity (Apple Team ID + bundle id). Claims only the /app/wc path, never the whole host. 404 when the tenant has not registered one; the file is never guessed. Served as application/json with no .json extension, as Apple requires.",
+        "responses": {
+          "200": {
+            "description": "apple-app-site-association document"
+          },
+          "404": {
+            "description": "RELEASE_IDENTITY_NOT_CONFIGURED"
+          },
+          "500": {
+            "description": "RELEASE_IDENTITY_CONFIG_INVALID"
           }
         }
       }
@@ -1644,6 +1661,50 @@
           }
         }
       }
+    },
+    "/v1/admin/release-identity/ios": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Tenant iOS release identity pin: {configured, identity{appleTeamId, bundleId}|null, version, updatedBy, updatedAt}"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "Stored release.ios configuration is invalid (RELEASE_IDENTITY_CONFIG_INVALID)"
+          }
+        }
+      },
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IOSReleaseIdentityWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved release identity pin (same shape as GET)"
+          },
+          "400": {
+            "description": "INVALID_RELEASE_IDENTITY: appleTeamId/bundleId malformed, missing reason or confirm"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version"
+          },
+          "500": {
+            "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2351,6 +2412,38 @@
           "signerSha256": {
             "type": "string",
             "description": "SHA-256 of the production signing certificate, 64 hex chars (colons and upper case accepted, normalised)"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock: current stored version, 0 when unset"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "IOSReleaseIdentityWrite": {
+        "type": "object",
+        "required": [
+          "appleTeamId",
+          "bundleId",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "appleTeamId": {
+            "type": "string",
+            "description": "Apple Developer Team ID, 10 alphanumeric characters (lower case accepted, normalised to upper case)"
+          },
+          "bundleId": {
+            "type": "string",
+            "description": "iOS bundle identifier of the tenant production build"
           },
           "expectedVersion": {
             "type": "integer",

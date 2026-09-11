@@ -50,3 +50,28 @@ func TestProductionRequiresLoginAndExplicitOrigin(t *testing.T) {
 		t.Fatal("expected production validation error")
 	}
 }
+
+// 管理会话 cookie 默认只走 TLS，x-admin-key 通道的审计身份默认由配置绑定：
+// 两个默认值都是安全评审 N17 的门禁项，改回不安全的默认必须先改测试。
+func TestLoadAdminSecurityDefaults(t *testing.T) {
+	t.Setenv("APP_ENV", "test")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AdminCookieSecure {
+		t.Fatal("ADMIN_COOKIE_SECURE must default to true")
+	}
+	if cfg.AdminAPIActor != "api-key-automation" {
+		t.Fatalf("unexpected default api-key actor: %q", cfg.AdminAPIActor)
+	}
+	t.Setenv("ADMIN_COOKIE_SECURE", "false")
+	t.Setenv("ADMIN_API_ACTOR", "release-bot")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminCookieSecure || cfg.AdminAPIActor != "release-bot" {
+		t.Fatalf("environment must still win: %#v", cfg)
+	}
+}

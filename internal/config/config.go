@@ -16,6 +16,7 @@ type Config struct {
 	HTTPWriteTimeout           int
 	CORSOrigins                []string
 	AdminAPIKey                string
+	AdminAPIActor              string
 	AdminUsername              string
 	AdminPasswordHash          string
 	AdminSessionTTL            int
@@ -86,10 +87,11 @@ func Load() (Config, error) {
 		HTTPWriteTimeout:           integer("HTTP_WRITE_TIMEOUT_SECONDS", 3600),
 		CORSOrigins:                split(value("CORS_ORIGINS", "*")),
 		AdminAPIKey:                os.Getenv("ADMIN_API_KEY"),
+		AdminAPIActor:              value("ADMIN_API_ACTOR", "api-key-automation"),
 		AdminUsername:              os.Getenv("ADMIN_USERNAME"),
 		AdminPasswordHash:          os.Getenv("ADMIN_PASSWORD_HASH"),
 		AdminSessionTTL:            integer("ADMIN_SESSION_TTL_SECONDS", 28800),
-		AdminCookieSecure:          boolean("ADMIN_COOKIE_SECURE", false),
+		AdminCookieSecure:          boolean("ADMIN_COOKIE_SECURE", true),
 		AdminLoginMax:              integer("ADMIN_LOGIN_MAX_ATTEMPTS", 5),
 		AdminLoginWindow:           integer("ADMIN_LOGIN_WINDOW_SECONDS", 900),
 		MySQLHost:                  value("MYSQL_HOST", "127.0.0.1"),
