@@ -164,6 +164,11 @@ func TestOTASigningViewNeverLeaksThePrivateKey(t *testing.T) {
 	if view["keyId"] != "main" || view["certificateSha256"] == nil {
 		t.Fatalf("the view should carry the public facts: %v", view)
 	}
+	// 证书过期后 OTA 救不了自己，只能发原生新版。"还有多久过期"必须看得见，
+	// 不能靠谁记得当初填了几年。
+	if view["certificateNotAfter"] == nil || view["certificateNotBefore"] == nil {
+		t.Fatalf("the view must expose the certificate validity window: %v", view)
+	}
 	if otaSigningView(nil)["configured"] != false {
 		t.Fatal("an unconfigured tenant must report configured=false")
 	}
@@ -236,4 +241,111 @@ func quote(v string) string {
 		panic(err)
 	}
 	return string(encoded)
+}
+
+// 这条用例照着 CertificateChain.kt 的判据逐条对：
+// `keyUsage != null && keyUsage[0] && extendedKeyUsage.contains("1.3.6.1.5.5.7.3.3")`，
+// 并且 constructCertificate 会 checkValidity()。少任何一项都在**运行时**被拒，
+// 症状是所有设备静默停在内置 bundle——本地拦不住的话，只能在用户手机上发现。
+func TestGeneratedCertificateIsOneExpoUpdatesWouldAccept(t *testing.T) {
+	now := time.Now()
+	keyPEM, certPEM, err := generateOTASigningMaterial("AnyFun OTA", 2048, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		t.Fatal("certificate is not PEM encoded")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if certificate.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		t.Fatal("keyUsage[0] (digitalSignature) is what the client checks first")
+	}
+	var codeSigning bool
+	for _, usage := range certificate.ExtKeyUsage {
+		if usage == x509.ExtKeyUsageCodeSigning {
+			codeSigning = true
+		}
+	}
+	if !codeSigning {
+		t.Fatal("extendedKeyUsage must contain code signing (1.3.6.1.5.5.7.3.3)")
+	}
+	if certificate.IsCA {
+		t.Fatal("the leaf certificate must not be a CA")
+	}
+	// 客户端用**设备时钟**做 checkValidity()。刚签发就"还没生效"是一种只在部分
+	// 设备上出现、而且完全静默的故障，所以 NotBefore 必须已经过去。
+	if !certificate.NotBefore.Before(now) {
+		t.Fatalf("NotBefore %s is not in the past", certificate.NotBefore)
+	}
+	if certificate.NotAfter.Before(now.AddDate(9, 0, 0)) {
+		t.Fatalf("NotAfter %s is shorter than the requested 10 years", certificate.NotAfter)
+	}
+
+	// 生成出来的这一对必须真的能签、能验，而且服务端自己的配对校验要认它
+	key, err := parseRSAPrivateKeyPEM(keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := certificateMatchesKey(certPEM, key); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"id":"generated"}`)
+	header, err := signOTABody(key, "main", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(signatureField.FindStringSubmatch(header)[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	public, ok := certificate.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		t.Fatal("the certificate does not carry an RSA public key")
+	}
+	if err := rsa.VerifyPKCS1v15(public, crypto.SHA256, digest[:], raw); err != nil {
+		t.Fatalf("the client's algorithm cannot verify what we generated: %v", err)
+	}
+}
+
+func TestGenerateOTASigningMaterialRefusesUnusableParameters(t *testing.T) {
+	now := time.Now()
+	for name, run := range map[string]func() error{
+		"too few bits":  func() error { _, _, err := generateOTASigningMaterial("x", 1024, now, 10); return err },
+		"absurd bits":   func() error { _, _, err := generateOTASigningMaterial("x", 32768, now, 10); return err },
+		"zero years":    func() error { _, _, err := generateOTASigningMaterial("x", 2048, now, 0); return err },
+		"forever":       func() error { _, _, err := generateOTASigningMaterial("x", 2048, now, 200); return err },
+		"no commonName": func() error { _, _, err := generateOTASigningMaterial("  ", 2048, now, 10); return err },
+	} {
+		if run() == nil {
+			t.Fatalf("%s should have been refused", name)
+		}
+	}
+}
+
+func TestGenerateOTASigningKeyRejectsInvalidBodiesBeforeTouchingTheDatabase(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	// db 为 nil：任何走到数据库的路径都会 panic
+	s := &server{cfg: config.Config{Environment: "production"}}
+	for name, payload := range map[string]string{
+		"not confirmed":   `{"expectedVersion":0,"reason":"generate signing key","confirm":false}`,
+		"short reason":    `{"expectedVersion":0,"reason":"x","confirm":true}`,
+		"negative expect": `{"expectedVersion":-1,"reason":"generate signing key","confirm":true}`,
+		"weak key":        `{"expectedVersion":0,"reason":"generate signing key","confirm":true,"keySize":1024}`,
+		"endless cert":    `{"expectedVersion":0,"reason":"generate signing key","confirm":true,"years":200}`,
+		"not json":        `{`,
+	} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest("POST", "/v1/admin/ota/signing-key/generate", strings.NewReader(payload))
+		c.Request.Header.Set("Content-Type", "application/json")
+		s.generateOTASigningKey(c)
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "INVALID_OTA_SIGNING_KEY") {
+			t.Fatalf("%s: status %d body %s", name, recorder.Code, recorder.Body.String())
+		}
+	}
 }

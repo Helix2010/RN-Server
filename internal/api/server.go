@@ -220,6 +220,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/release-identity/ios", s.updateIOSReleaseIdentity)
 	group.GET("/ota/signing-key", s.getOTASigningKey)
 	group.PUT("/ota/signing-key", s.updateOTASigningKey)
+	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)

@@ -3,15 +3,18 @@ package api
 import (
 	"context"
 	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -227,6 +230,21 @@ type otaSigningWrite struct {
 	Confirm         bool   `json:"confirm"`
 }
 
+// certificateFacts 把证书里对运维有用的公开事实读出来。有效期尤其重要：证书过期
+// 之后 OTA 救不了自己（要验签的客户端会拒绝每一次更新），只能发原生新版，所以
+// "还有多久过期"必须是界面上看得见的东西，而不是靠谁记得当初填了几年。
+func certificateFacts(certificatePEM string) (subject string, notBefore, notAfter time.Time) {
+	block, _ := pem.Decode([]byte(strings.TrimSpace(certificatePEM)))
+	if block == nil {
+		return "", time.Time{}, time.Time{}
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", time.Time{}, time.Time{}
+	}
+	return certificate.Subject.CommonName, certificate.NotBefore.UTC(), certificate.NotAfter.UTC()
+}
+
 // certificateFingerprint 给运维一个能和 App 里那份证书对照的值。
 func certificateFingerprint(certificatePEM string) (string, bool) {
 	block, _ := pem.Decode([]byte(strings.TrimSpace(certificatePEM)))
@@ -241,17 +259,21 @@ func certificateFingerprint(certificatePEM string) (string, bool) {
 // 就只有服务端解得开，管理端要换就整把换，不提供"读出来看看"。
 func otaSigningView(record *otaSigningRecord) map[string]any {
 	if record == nil {
-		return map[string]any{"configured": false, "keyId": nil, "certificatePem": nil, "certificateSha256": nil, "version": 0, "updatedBy": nil, "updatedAt": nil}
+		return map[string]any{"configured": false, "keyId": nil, "certificatePem": nil, "certificateSha256": nil, "certificateSubject": nil, "certificateNotBefore": nil, "certificateNotAfter": nil, "version": 0, "updatedBy": nil, "updatedAt": nil}
 	}
 	fingerprint, _ := certificateFingerprint(record.Value.Certificate)
+	subject, notBefore, notAfter := certificateFacts(record.Value.Certificate)
 	return map[string]any{
-		"configured":        true,
-		"keyId":             record.Value.KeyID,
-		"certificatePem":    nullableString(record.Value.Certificate),
-		"certificateSha256": nullableString(fingerprint),
-		"version":           record.Version,
-		"updatedBy":         record.UpdatedBy,
-		"updatedAt":         iso(record.UpdatedAt),
+		"configured":           true,
+		"keyId":                record.Value.KeyID,
+		"certificatePem":       nullableString(record.Value.Certificate),
+		"certificateSha256":    nullableString(fingerprint),
+		"certificateSubject":   nullableString(subject),
+		"certificateNotBefore": nullableTime(notBefore),
+		"certificateNotAfter":  nullableTime(notAfter),
+		"version":              record.Version,
+		"updatedBy":            record.UpdatedBy,
+		"updatedAt":            iso(record.UpdatedAt),
 	}
 }
 
@@ -288,14 +310,21 @@ func (s *server) updateOTASigningKey(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_OTA_SIGNING_KEY", "privateKeyPem, certificatePem, expectedVersion, reason and confirm=true are required")
 		return
 	}
+	s.storeOTASigningKey(c, body.KeyID, body.PrivateKeyPEM, body.CertificatePEM, body.ExpectedVersion, body.Reason, "ota_signing_key_update")
+}
+
+// storeOTASigningKey 是「贴进来」与「服务端生成」共用的落库路径。两条入口写的是
+// 同一条记录、同一套校验、同一条审计，差别只在私钥从哪来——分成两份实现的话，
+// 迟早有一边漏掉配对校验或乐观锁。
+func (s *server) storeOTASigningKey(c *gin.Context, rawKeyID, privateKeyPEM, certificatePEM string, expectedVersion int, reason, action string) {
 	// 先校验请求本身，再看服务端有没有能力存。顺序反过来的话，一个明显不合法的
 	// 私钥会收到 500「服务端问题」，调用方照着这个提示永远查不到自己贴错了东西。
-	key, err := parseRSAPrivateKeyPEM(body.PrivateKeyPEM)
+	key, err := parseRSAPrivateKeyPEM(privateKeyPEM)
 	if err != nil {
 		problem(c, http.StatusBadRequest, "INVALID_OTA_SIGNING_KEY", err.Error())
 		return
 	}
-	if err := certificateMatchesKey(body.CertificatePEM, key); err != nil {
+	if err := certificateMatchesKey(certificatePEM, key); err != nil {
 		problem(c, http.StatusBadRequest, "INVALID_OTA_SIGNING_KEY", err.Error())
 		return
 	}
@@ -303,11 +332,11 @@ func (s *server) updateOTASigningKey(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "OTA_SIGNING_SAVE_FAILED", "Storage master key is unavailable")
 		return
 	}
-	keyID := strings.TrimSpace(body.KeyID)
+	keyID := strings.TrimSpace(rawKeyID)
 	if keyID == "" {
 		keyID = otaSigningDefaultKeyID
 	}
-	encrypted, err := s.secrets.Encrypt(strings.TrimSpace(body.PrivateKeyPEM), otaSigningAAD(tenantID(c)))
+	encrypted, err := s.secrets.Encrypt(strings.TrimSpace(privateKeyPEM), otaSigningAAD(tenantID(c)))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "OTA_SIGNING_SAVE_FAILED", "Unable to protect the signing key")
 		return
@@ -315,7 +344,7 @@ func (s *server) updateOTASigningKey(c *gin.Context) {
 	value := otaSigningKey{
 		KeyID:       keyID,
 		PrivateKey:  base64.StdEncoding.EncodeToString(encrypted),
-		Certificate: strings.TrimSpace(body.CertificatePEM),
+		Certificate: strings.TrimSpace(certificatePEM),
 	}
 	current, err := s.otaSigningRecord(c.Request.Context(), tenantID(c))
 	if err != nil {
@@ -326,7 +355,7 @@ func (s *server) updateOTASigningKey(c *gin.Context) {
 	if current != nil {
 		currentVersion = current.Version
 	}
-	if currentVersion != body.ExpectedVersion {
+	if currentVersion != expectedVersion {
 		problem(c, http.StatusConflict, "STALE_OTA_SIGNING_KEY", "Signing key changed; refresh and retry")
 		return
 	}
@@ -356,10 +385,118 @@ func (s *server) updateOTASigningKey(c *gin.Context) {
 	}
 	fingerprint, _ := certificateFingerprint(value.Certificate)
 	// 审计里记指纹与 keyid，绝不记私钥
-	event := newAudit(tenantID(c), actor(c), "ota_signing_key_update", "app-config", otaSigningConfigKey, body.Reason, requestID(c), map[string]any{"keyId": keyID, "certificateSha256": fingerprint, "databaseVersion": newVersion})
+	event := newAudit(tenantID(c), actor(c), action, "app-config", otaSigningConfigKey, reason, requestID(c), map[string]any{"keyId": keyID, "certificateSha256": fingerprint, "databaseVersion": newVersion})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "OTA_SIGNING_SAVE_FAILED", "Unable to save the signing key")
 		return
 	}
 	c.JSON(http.StatusOK, otaSigningView(&otaSigningRecord{Value: value, Version: newVersion, UpdatedBy: actor(c), UpdatedAt: now}))
+}
+
+// ---- 服务端生成密钥对 ----
+//
+// 为什么允许服务端生成：签每一份 manifest 时，服务端本来就必须把明文私钥解出来。
+// 让它在这里诞生，暴露面没有变大，却省掉了运维机上的明文文件、跨机器搬运、以及
+// 靠人记得 shred 的纪律——那条链路上的每一环都真实地出过错。
+//
+// 代价是没有离线备份：丢了这把密钥就只能发原生新版换证书。但主动轮换的代价本来
+// 也正好是"发一个原生新版"，所以这里没有新增损失。Android keystore 不适用这条
+// 推论：服务端运行时根本不用它，而它丢了没有任何补救。
+
+// otaSigningKeyMaxBits 挡住"生成一把 32768 位密钥"这种把 CPU 焊死几分钟的请求。
+const otaSigningKeyMaxBits = 8192
+
+// otaSigningMaxYears：证书过期后 OTA 救不了自己，只能发原生新版，所以有效期要长；
+// 但长到没有尽头就等于永远不会被换掉。
+const otaSigningMaxYears = 30
+
+type otaSigningGenerate struct {
+	KeyID           string `json:"keyId"`
+	CommonName      string `json:"commonName"`
+	KeySize         int    `json:"keySize"`
+	Years           int    `json:"years"`
+	ExpectedVersion int    `json:"expectedVersion"`
+	Reason          string `json:"reason"`
+	Confirm         bool   `json:"confirm"`
+}
+
+// generateOTASigningMaterial 生成 expo-updates 真的会接受的那种叶证书。
+//
+// CertificateChain.kt 的判据是 `keyUsage[0] && extendedKeyUsage.contains(CODE_SIGNING_OID)`
+// ——digitalSignature 与 code signing 两个扩展缺一不可，且它 `checkValidity()`，
+// 所以 NotBefore 必须已经过去。少任何一项都在**运行时**被拒，症状是所有设备静默
+// 停在内置 bundle，最难查的那种；因此这里写死，不做成可配置项。
+func generateOTASigningMaterial(commonName string, bits int, now time.Time, years int) (string, string, error) {
+	if bits < otaSigningMinBits || bits > otaSigningKeyMaxBits {
+		return "", "", fmt.Errorf("keySize must be between %d and %d", otaSigningMinBits, otaSigningKeyMaxBits)
+	}
+	if years < 1 || years > otaSigningMaxYears {
+		return "", "", fmt.Errorf("years must be between 1 and %d", otaSigningMaxYears)
+	}
+	if strings.TrimSpace(commonName) == "" {
+		return "", "", errors.New("commonName is required")
+	}
+	key, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return "", "", fmt.Errorf("unable to generate an RSA key: %w", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return "", "", fmt.Errorf("unable to draw a serial number: %w", err)
+	}
+	publicKeyDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return "", "", err
+	}
+	subjectKeyID := sha256.Sum256(publicKeyDER)
+	template := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: strings.TrimSpace(commonName)},
+		// 往前挪 5 分钟：客户端 checkValidity() 用的是设备时钟，刚签发就被判"还没生效"
+		// 是一种只在部分设备上出现、而且完全静默的故障。
+		NotBefore:             now.Add(-5 * time.Minute).UTC(),
+		NotAfter:              now.AddDate(years, 0, 0).UTC(),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		SubjectKeyId:          subjectKeyID[:20],
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return "", "", fmt.Errorf("unable to create the certificate: %w", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return "", "", err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return string(keyPEM), string(certPEM), nil
+}
+
+// generateOTASigningKey 生成并直接落库。私钥**不出现在响应里**，和贴进来的那条路
+// 一样：装进去之后只能整把换，读不回来。响应里给证书，那是要编进原生包的公开材料。
+func (s *server) generateOTASigningKey(c *gin.Context) {
+	var body otaSigningGenerate
+	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
+		problem(c, http.StatusBadRequest, "INVALID_OTA_SIGNING_KEY", "expectedVersion, reason and confirm=true are required")
+		return
+	}
+	if body.KeySize == 0 {
+		body.KeySize = 4096
+	}
+	if body.Years == 0 {
+		body.Years = 10
+	}
+	commonName := strings.TrimSpace(body.CommonName)
+	if commonName == "" {
+		commonName = tenantID(c) + " OTA"
+	}
+	privateKeyPEM, certificatePEM, err := generateOTASigningMaterial(commonName, body.KeySize, time.Now(), body.Years)
+	if err != nil {
+		problem(c, http.StatusBadRequest, "INVALID_OTA_SIGNING_KEY", err.Error())
+		return
+	}
+	s.storeOTASigningKey(c, body.KeyID, privateKeyPEM, certificatePEM, body.ExpectedVersion, body.Reason, "ota_signing_key_generate")
 }

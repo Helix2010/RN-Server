@@ -110,7 +110,7 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
 
 - **代码签名（2026-09-11，安全评审 N19）**：OTA 此前只有完整性没有真实性——manifest 的 sha256 存在我们自己的数据库里，能改数据库或能顶替这条响应的人，可以让客户端拿到一份它认为"完整"的恶意 bundle，而 OTA 能改的是整个 JS 层，包括钱包签名前的确认界面。
 
-  现在每租户一把 RSA 私钥（`app_configs` 的 `ota.signing`，用 storage master key 认证加密后落库，**任何接口都不返回私钥**），经 `GET/PUT /v1/admin/ota/signing-key` 维护。下发时对**改写完成后的最终响应体**签名（对入库原文签名会把 `applyManifestStrategy` 那段改写留在签名覆盖范围之外），`rollBackToEmbedded` 指令同样签——它本身就是一条"把所有人退回内置版本"的指令。
+  现在每租户一把 RSA 私钥（`app_configs` 的 `ota.signing`，用 storage master key 认证加密后落库，**任何接口都不返回私钥**），经 `GET/PUT /v1/admin/ota/signing-key` 维护，`POST /v1/admin/ota/signing-key/generate` 直接在服务端生成密钥对（签每一份 manifest 时服务端本来就要把明文私钥解出来，让它在这里诞生不扩大暴露面，却省掉运维机上的明文文件与一次跨机器搬运；代价是没有离线备份，而丢了它的代价本来就等于主动轮换它的代价：发一个原生新版。**Android keystore 不适用这条推论**——服务端运行时根本不用它，它丢了没有任何补救）。下发时对**改写完成后的最终响应体**签名（对入库原文签名会把 `applyManifestStrategy` 那段改写留在签名覆盖范围之外），`rollBackToEmbedded` 指令同样签——它本身就是一条"把所有人退回内置版本"的指令。
 
   协议事实（读 expo-updates 57.0.22 源码确认）：`expo-signature` 是 RFC 8941 字典 `sig="<base64>", keyid="…", alg="rsa-v1_5-sha256"`，签的是 body 原始字节，`SHA256withRSA`；**plain 响应里它是 HTTP 响应头，multipart 里它是 part 的头**（manifest 与 directive 各签各的）。写错位置的表现是"签了但客户端说没签名"。
 

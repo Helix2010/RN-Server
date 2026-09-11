@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.13"
+    "version": "2026.09.14"
   },
   "paths": {
     "/health/live": {
@@ -1740,7 +1740,7 @@
     "/v1/admin/ota/signing-key": {
       "get": {
         "summary": "Tenant OTA code signing key (public facts only)",
-        "description": "Returns {configured, keyId, certificatePem, certificateSha256, version, updatedBy, updatedAt}. The private key is never returned by any endpoint: it is stored encrypted with the storage master key and can only be replaced, not read back.",
+        "description": "Returns {configured, keyId, certificatePem, certificateSha256, certificateSubject, certificateNotBefore, certificateNotAfter, version, updatedBy, updatedAt}. The private key is never returned by any endpoint: it is stored encrypted with the storage master key and can only be replaced, not read back. The validity window is exposed because an expired certificate cannot be replaced over the air; only a native release can.",
         "responses": {
           "200": {
             "description": "Signing key status"
@@ -1772,6 +1772,39 @@
           },
           "400": {
             "description": "INVALID_OTA_SIGNING_KEY: key is not RSA/too small/malformed, certificate does not match the key, missing reason or confirm"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_OTA_SIGNING_KEY: expectedVersion does not match the stored version"
+          },
+          "500": {
+            "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/admin/ota/signing-key/generate": {
+      "post": {
+        "summary": "Generate the tenant OTA code signing key on the server",
+        "description": "Generates an RSA key pair and a self-signed code signing certificate, then stores them like PUT does. The private key is never returned: the server must already hold it in the clear to sign every manifest, so generating it here adds no exposure, but it removes the plaintext file, the cross-machine transfer and the shred discipline that the manual ceremony depends on. The certificate carries X509v3 Key Usage: Digital Signature and Extended Key Usage: Code Signing, which is exactly what expo-updates' CertificateChain checks; NotBefore is backdated five minutes because the client validates against the device clock. There is no offline backup: losing this key costs a native release, which is also what rotating it costs.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OTASigningKeyGenerate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved signing key status (same shape as GET); the private key is not included"
+          },
+          "400": {
+            "description": "INVALID_OTA_SIGNING_KEY: keySize out of range, years out of range, missing reason or confirm"
           },
           "401": {
             "description": "Admin authentication required"
@@ -2559,6 +2592,50 @@
           "certificatePem": {
             "type": "string",
             "description": "The code signing certificate the app compiles in. Must match privateKeyPem."
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock: current stored version, 0 when unset"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OTASigningKeyGenerate": {
+        "type": "object",
+        "required": [
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "keyId": {
+            "type": "string",
+            "description": "expo-signature keyid; defaults to \"main\""
+          },
+          "commonName": {
+            "type": "string",
+            "description": "Certificate CN; defaults to \"<tenant> OTA\""
+          },
+          "keySize": {
+            "type": "integer",
+            "minimum": 2048,
+            "maximum": 8192,
+            "default": 4096,
+            "description": "RSA bits"
+          },
+          "years": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 10,
+            "description": "Certificate lifetime. An expired certificate cannot be replaced over the air; only a native release can."
           },
           "expectedVersion": {
             "type": "integer",
