@@ -55,6 +55,7 @@ var migrations = []migration{
 	{version: 39, name: "release_canary", apply: releaseCanaryMigration},
 	{version: 40, name: "build_jobs", apply: buildJobsMigration},
 	{version: 41, name: "build_jobs_retryable", apply: buildJobsRetryableMigration},
+	{version: 42, name: "build_jobs_release_notes", apply: buildJobsReleaseNotesMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1385,6 +1386,19 @@ func buildJobsRetryableMigration(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX ux_build_jobs_live_build_number ON build_jobs (tenant_id, platform, live_build_number)`); err != nil {
 			return fmt.Errorf("build jobs retryable migration create index: %w", err)
 		}
+	}
+	return nil
+}
+
+// buildJobsReleaseNotesMigration 让打包任务带上发布说明。
+//
+// 发布记录一旦建好就没有改说明的接口，而产物是代理建的记录——结果 2026-09-11 的
+// 1.3.9 是带着空说明发出去的，用户看到一个没有任何说明的更新。说明必须在排队时
+// 就跟着任务走。
+func buildJobsReleaseNotesMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "build_jobs", "release_notes",
+		`ALTER TABLE build_jobs ADD COLUMN release_notes JSON NULL COMMENT '发布说明：语言码到字符串数组，随产物一起落进 app_releases。NULL=排队时没填' AFTER reason`); err != nil {
+		return fmt.Errorf("build jobs release notes migration: %w", err)
 	}
 	return nil
 }

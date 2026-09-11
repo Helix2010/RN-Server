@@ -404,3 +404,34 @@ func TestDBBuildJobLifecycleRefusesOutOfOrderTransitions(t *testing.T) {
 		t.Fatalf("a succeeded job was canceled: %d", cancelRecorder.Code)
 	}
 }
+
+// 发布记录由代理创建，而记录建好之后没有改说明的接口——2026-09-11 的 1.3.9 就是
+// 带着空说明发给用户的。说明必须在排队时跟着任务走，而且用与人工发布同一套校验。
+func TestBuildJobCarriesReleaseNotesAndValidatesThemLikeAManualRelease(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := &server{cfg: config.Config{Environment: "production"}}
+	for name, payload := range map[string]string{
+		"notes are not arrays": `{"platform":"android","gitRef":"main","version":"1.3.10","buildNumber":39,"reason":"ship","confirm":true,"releaseNotes":{"zh-CN":"一行"}}`,
+		"empty language key":   `{"platform":"android","gitRef":"main","version":"1.3.10","buildNumber":39,"reason":"ship","confirm":true,"releaseNotes":{"  ":["x"]}}`,
+		"line is not a string": `{"platform":"android","gitRef":"main","version":"1.3.10","buildNumber":39,"reason":"ship","confirm":true,"releaseNotes":{"zh-CN":[1]}}`,
+	} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest("POST", "/v1/admin/builds", strings.NewReader(payload))
+		c.Request.Header.Set("Content-Type", "application/json")
+		s.createBuildJob(c)
+		// db 为 nil：能走到数据库就会 panic，所以这里必须在校验阶段就被拒
+		if recorder.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("%s: status %d body %s", name, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	// 空说明读回来是空对象而不是 null：前端按对象渲染，null 会多一处判空
+	if notes := buildJobReleaseNotes(buildJob{}); notes == nil || len(notes) != 0 {
+		t.Fatalf("an empty release note column became %v", notes)
+	}
+	stored := buildJob{ReleaseNotes: []byte(`{"zh-CN":["修了两个崩溃"]}`)}
+	if got := buildJobReleaseNotes(stored)["zh-CN"]; len(got) != 1 || got[0] != "修了两个崩溃" {
+		t.Fatalf("stored notes did not round trip: %v", got)
+	}
+}

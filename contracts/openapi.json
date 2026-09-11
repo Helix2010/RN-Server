@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.19"
+    "version": "2026.09.20"
   },
   "paths": {
     "/health/live": {
@@ -2157,7 +2157,7 @@
     "/v1/build-agent/jobs/{id}/release": {
       "post": {
         "summary": "Turn the uploaded artifact into a release record",
-        "description": "Platform, version and build number are taken from the build job row, never from the request body: those three define the artifact's identity and the job row already passed the monotonic build-number check. Runs the same APK identity inspection, ETag pinning and signer fingerprint gate as a manual upload. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "description": "Platform, version, build number and release notes are all taken from the build job row, never from the request body: those define the artifact's identity and what users will read, and the job row already passed validation. Runs the same APK identity inspection, ETag pinning and signer fingerprint gate as a manual upload. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2170,9 +2170,6 @@
                 "properties": {
                   "artifactToken": {
                     "type": "string"
-                  },
-                  "releaseNotes": {
-                    "type": "object"
                   }
                 }
               }
@@ -3069,6 +3066,16 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "releaseNotes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "Release notes by language code, one array entry per line. Carried on the job because the release record is created by the build agent and there is no endpoint to edit notes afterwards."
           }
         }
       },

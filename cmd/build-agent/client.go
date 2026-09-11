@@ -186,6 +186,8 @@ func (c *client) uploadArtifact(ctx context.Context, jobID, path string) (string
 			ID string `json:"id"`
 		} `json:"release"`
 	}
+	// 只送 token：平台、版本、build 号和发布说明都取任务行上的值，代理没有理由
+	// 知道该写什么
 	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
 		"artifactToken": ticket.Artifact.Token,
 	}, &release); err != nil {

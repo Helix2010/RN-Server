@@ -63,18 +63,19 @@ type buildJob struct {
 	LogTail        []byte
 	FailureReason  sql.NullString
 	Reason         string
+	ReleaseNotes   []byte
 	CreatedBy      string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
 
-const buildJobColumns = `id,tenant_id,platform,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,created_by,created_at,updated_at`
+const buildJobColumns = `id,tenant_id,platform,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at`
 
 func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 	var j buildJob
 	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.GitRef, &j.CommitSHA, &j.Version, &j.BuildNumber,
 		&j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.HeartbeatAt, &j.ReleaseID, &j.ArtifactSHA256, &j.LogTail,
-		&j.FailureReason, &j.Reason, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt)
+		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt)
 	return j, err
 }
 
@@ -99,6 +100,7 @@ func buildJobView(j buildJob) map[string]any {
 		"logTail":        tail,
 		"failureReason":  nullableString(j.FailureReason.String),
 		"reason":         j.Reason,
+		"releaseNotes":   buildJobReleaseNotes(j),
 		"createdBy":      j.CreatedBy,
 		"createdAt":      iso(j.CreatedAt),
 		"updatedAt":      iso(j.UpdatedAt),
@@ -153,8 +155,21 @@ type buildJobCreate struct {
 	GitRef      string `json:"gitRef"`
 	Version     string `json:"version"`
 	BuildNumber int    `json:"buildNumber"`
-	Reason      string `json:"reason"`
-	Confirm     bool   `json:"confirm"`
+	// ReleaseNotes 跟着任务走：发布记录由代理创建，而记录建好之后没有改说明的
+	// 接口——2026-09-11 的 1.3.9 就是带着空说明发出去的。
+	ReleaseNotes map[string]any `json:"releaseNotes"`
+	Reason       string         `json:"reason"`
+	Confirm      bool           `json:"confirm"`
+}
+
+// buildJobReleaseNotes 读出任务上的发布说明；没填就是空对象，不是 null——
+// 前端按对象渲染，null 会多一处判空。
+func buildJobReleaseNotes(j buildJob) map[string][]string {
+	notes := map[string][]string{}
+	if len(j.ReleaseNotes) > 0 {
+		_ = json.Unmarshal(j.ReleaseNotes, &notes)
+	}
+	return notes
 }
 
 func (s *server) createBuildJob(c *gin.Context) {
@@ -172,6 +187,14 @@ func (s *server) createBuildJob(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_JOB", "platform must be android or ios, version must be semver, buildNumber must be positive, reason and confirm=true are required")
 		return
 	}
+	// 与人工发布用同一套校验：两边写进 app_releases 的形状必须一样
+	notes, notesCode, notesDetail := normalizeReleaseNotes(body.ReleaseNotes)
+	if notesCode != "" {
+		problem(c, http.StatusUnprocessableEntity, notesCode, notesDetail)
+		return
+	}
+	encodedNotes, _ := json.Marshal(notes)
+
 	floor, err := s.nextBuildNumberFloor(c, tenantID(c), platform)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to inspect existing build numbers")
@@ -193,9 +216,9 @@ func (s *server) createBuildJob(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(c.Request.Context(),
-		`INSERT INTO build_jobs(id,tenant_id,platform,git_ref,version,build_number,status,log_tail,reason,created_by,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,'queued',JSON_ARRAY(),?,?,?,?)`,
-		id, tenantID(c), platform, gitRef, version, body.BuildNumber, reason, actor(c), now, now); err != nil {
+		`INSERT INTO build_jobs(id,tenant_id,platform,git_ref,version,build_number,status,log_tail,reason,release_notes,created_by,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,'queued',JSON_ARRAY(),?,?,?,?,?)`,
+		id, tenantID(c), platform, gitRef, version, body.BuildNumber, reason, encodedNotes, actor(c), now, now); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to queue the build")
 		return
 	}
@@ -207,8 +230,8 @@ func (s *server) createBuildJob(c *gin.Context) {
 	}
 	c.JSON(http.StatusCreated, buildJobView(buildJob{
 		ID: id, TenantID: tenantID(c), Platform: platform, GitRef: gitRef, Version: version,
-		BuildNumber: body.BuildNumber, Status: "queued", Reason: reason, CreatedBy: actor(c),
-		CreatedAt: now, UpdatedAt: now,
+		BuildNumber: body.BuildNumber, Status: "queued", Reason: reason, ReleaseNotes: encodedNotes,
+		CreatedBy: actor(c), CreatedAt: now, UpdatedAt: now,
 	}))
 }
 
@@ -607,16 +630,17 @@ func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
 		return
 	}
 	var body struct {
-		ArtifactToken string         `json:"artifactToken"`
-		ReleaseNotes  map[string]any `json:"releaseNotes"`
+		ArtifactToken string `json:"artifactToken"`
 	}
 	if decode(c, &body) != nil || strings.TrimSpace(body.ArtifactToken) == "" {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "artifactToken is required")
 		return
 	}
-	notes := body.ReleaseNotes
-	if notes == nil {
-		notes = map[string]any{}
+	// 说明和平台、版本、build 号一样取任务行上的值：它在排队时就过了校验，
+	// 而代理没有理由知道该写什么说明
+	notes := map[string]any{}
+	for language, lines := range buildJobReleaseNotes(job) {
+		notes[language] = lines
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"artifactToken": body.ArtifactToken,
