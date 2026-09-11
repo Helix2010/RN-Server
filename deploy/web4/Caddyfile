@@ -11,7 +11,10 @@
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 	}
 
-	@api path /v1/* /health/* /docs /openapi.json
+	# assetlinks.json 必须挂在域名根下的固定位置，Android 安装时来拉它校验
+	# App Link 归属（安全评审 N13）；只放行这一个文件，不放行整个 /.well-known/*，
+	# 免得挡到 ACME 挑战之类由 Caddy 自己处理的路径。
+	@api path /v1/* /health/* /docs /openapi.json /.well-known/assetlinks.json
 	handle @api {
 		reverse_proxy server:3000
 	}
