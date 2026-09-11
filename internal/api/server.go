@@ -121,6 +121,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
 	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)
 	r.GET("/v1/ota/assets/:id/*path", s.domainTenantScope(), s.otaAsset)
+	// Android App Links 的域名归属声明（安全评审 N13）。系统会匿名来拉它，
+	// 所以放在公开路由上，按 Host 解析租户。
+	r.GET("/.well-known/assetlinks.json", s.domainTenantScope(), s.wellKnownAssetLinks)
 	r.GET("/v1/public/releases/latest", s.domainTenantScope(), s.publicLatestReleaseFromDomain)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
 	admin := r.Group("/v1/admin")

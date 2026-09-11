@@ -249,3 +249,38 @@ func TestBackfillRefusesABaseReleaseThatNoLongerMatchesItsRecord(t *testing.T) {
 		t.Fatalf("matching object must proceed to inspection, got %v", err)
 	}
 }
+
+func TestColonFingerprintMatchesWhatGoogleExpects(t *testing.T) {
+	digest := "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694"
+	got, ok := colonFingerprint(digest)
+	if !ok {
+		t.Fatalf("expected a valid fingerprint")
+	}
+	// 大写、冒号分隔、32 段：Google 只认这一种形状
+	if !strings.HasPrefix(got, "1A:5D:9F:B4:") || !strings.HasSuffix(got, ":E6:94") {
+		t.Fatalf("unexpected shape: %s", got)
+	}
+	if strings.Count(got, ":") != 31 {
+		t.Fatalf("expected 32 octets, got %s", got)
+	}
+	// 入库形式已经带冒号时同样可解析
+	again, ok := colonFingerprint(got)
+	if !ok || again != got {
+		t.Fatalf("round trip failed: %s -> %s (%v)", got, again, ok)
+	}
+}
+
+func TestColonFingerprintRefusesAnythingThatIsNotASha256(t *testing.T) {
+	for name, raw := range map[string]string{
+		"empty":     "",
+		"short":     "1a5d9fb4",
+		"non hex":   strings.Repeat("z", 64),
+		"too long":  strings.Repeat("a", 66),
+		"sha1 size": strings.Repeat("a", 40),
+	} {
+		if _, ok := colonFingerprint(raw); ok {
+			// 猜一个指纹等于把域名授权给一个我们并不确认的应用
+			t.Fatalf("%s should not produce a fingerprint", name)
+		}
+	}
+}

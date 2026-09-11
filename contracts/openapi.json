@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.10"
+    "version": "2026.09.11"
   },
   "paths": {
     "/health/live": {
@@ -828,6 +828,20 @@
           },
           "204": {
             "description": "No matching update"
+          }
+        }
+      }
+    },
+    "/.well-known/assetlinks.json": {
+      "get": {
+        "summary": "Android App Links domain ownership for this tenant",
+        "description": "Generated from the tenant's registered release.android identity (package name + signing certificate SHA-256). 404 when the tenant has not registered one; the file is never guessed.",
+        "responses": {
+          "200": {
+            "description": "Digital Asset Links statement list"
+          },
+          "404": {
+            "description": "RELEASE_IDENTITY_NOT_CONFIGURED"
           }
         }
       }

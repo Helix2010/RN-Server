@@ -329,3 +329,62 @@ func (s *server) noteObjectChanged(kind, tenant, id, mismatch, requestID string,
 	}
 	s.auditNow(newAudit(tenant, actorID, action, targetType, id, reason, requestID, summary))
 }
+
+// wellKnownAssetLinks 按租户域名提供 Android App Links 的归属声明
+// （`/.well-known/assetlinks.json`，安全评审 N13）。
+//
+// 自定义 scheme（`anyfun://`）谁都能在自己的 manifest 里声明，装了恶意应用的
+// 机器上，外部钱包批准后的回跳可能被它接走。App Link 把链接绑在租户自己的
+// 域名上：系统安装应用时来拉这个文件，只有文件里列出的包名 + 签名指纹才允许
+// 接管该域名的链接，抢注不了。
+//
+// 内容直接由已登记的发布身份（`release.android` 的 packageName + signerSha256）
+// 生成，不引入第二份真相源 —— 指纹改了、包名改了，这个文件自动跟着变。
+// 没有登记 pin 的租户返回 404：宁可让系统判定"未声明"，也不能发一份猜出来的
+// 授权，那等于把域名交给一个我们并不确认的应用。
+func (s *server) wellKnownAssetLinks(c *gin.Context) {
+	record, err := s.androidReleaseIdentityRecord(c.Request.Context(), tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.android configuration is invalid")
+		return
+	}
+	if record == nil {
+		problem(c, http.StatusNotFound, "RELEASE_IDENTITY_NOT_CONFIGURED", "This tenant has not registered an Android release identity")
+		return
+	}
+	fingerprint, ok := colonFingerprint(record.Value.SignerSHA256)
+	if !ok {
+		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Registered signer fingerprint is not a SHA-256 digest")
+		return
+	}
+	// Google 只接受这一种形状；缓存一小时，指纹轮换后不至于长期发旧文件
+	c.Header("Cache-Control", "public, max-age=3600")
+	c.JSON(http.StatusOK, []gin.H{{
+		"relation": []string{"delegate_permission/common.handle_all_urls"},
+		"target": gin.H{
+			"namespace":                "android_app",
+			"package_name":             record.Value.PackageName,
+			"sha256_cert_fingerprints": []string{fingerprint},
+		},
+	}})
+}
+
+// colonFingerprint 把入库的 64 位小写十六进制指纹转成 Google 要求的
+// `AA:BB:…` 大写冒号分隔形式。长度或字符不对就返回 false，不猜。
+func colonFingerprint(raw string) (string, bool) {
+	normalized := normalizeFingerprint(raw)
+	if len(normalized) != 64 {
+		return "", false
+	}
+	parts := make([]string, 0, 32)
+	for i := 0; i < len(normalized); i += 2 {
+		pair := normalized[i : i+2]
+		for _, ch := range pair {
+			if !strings.ContainsRune("0123456789abcdef", ch) {
+				return "", false
+			}
+		}
+		parts = append(parts, strings.ToUpper(pair))
+	}
+	return strings.Join(parts, ":"), true
+}
