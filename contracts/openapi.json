@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.15"
+    "version": "2026.09.16"
   },
   "paths": {
     "/health/live": {
@@ -2995,6 +2995,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "commitSha": {
+            "type": "string",
+            "description": "The commit the agent had checked out, when it got that far; a failed build still needs to say which revision it tried"
           }
         }
       }

@@ -1,0 +1,30 @@
+# 打包机代理。**这台机器不跑任何对外服务**，也不和 wallet 后端同机——它持有
+# Android keystore，而整套设计的安全论证（服务端不下发密钥、不执行命令）在两者
+# 同机的那一刻就作废了。
+#
+#   install -m 0755 build-agent /opt/rn-build-agent/build-agent
+#   install -m 0600 -o root -g root rn-build-agent.env /etc/rn-build-agent.env
+#   systemctl enable --now rn-build-agent
+[Unit]
+Description=RN build agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=builder
+Group=builder
+EnvironmentFile=/etc/rn-build-agent.env
+ExecStart=/opt/rn-build-agent/build-agent
+Restart=always
+RestartSec=10
+# 代理只出不进，不需要任何监听端口
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+# 只对工作区、构建缓存与仓库镜像可写。keystore 目录给读权限即可
+ReadWritePaths=/var/lib/rn-build-agent /home/builder/.gradle /home/builder/.pnpm-store
+
+[Install]
+WantedBy=multi-user.target

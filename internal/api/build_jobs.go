@@ -475,11 +475,14 @@ func (s *server) completeBuildJob(c *gin.Context) {
 func (s *server) failBuildJob(c *gin.Context) {
 	var body struct {
 		FailureReason string   `json:"failureReason"`
+		CommitSHA     string   `json:"commitSha"`
 		LogTail       []string `json:"logTail"`
 	}
 	reason := ""
+	commit := ""
 	if decode(c, &body) == nil {
 		reason = strings.TrimSpace(body.FailureReason)
+		commit = strings.ToLower(strings.TrimSpace(body.CommitSHA))
 	}
 	if reason == "" {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "failureReason is required")
@@ -488,10 +491,15 @@ func (s *server) failBuildJob(c *gin.Context) {
 	if len(reason) > 500 {
 		reason = reason[:500]
 	}
+	// 失败的构建也要记下它到底检出了哪个提交——没有这一条，排查只能靠猜分支当时
+	// 指向哪里。解析提交之前就失败的任务没有这个值，那时保留 NULL。
+	if !isHex(commit, 40, 64) {
+		commit = ""
+	}
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='failed',failure_reason=?,log_tail=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
-		reason, clampLogTail(body.LogTail), now, now, c.Param("id"))
+		`UPDATE build_jobs SET status='failed',failure_reason=?,commit_sha=COALESCE(?,commit_sha),log_tail=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
+		reason, sqlNullableString(commit), clampLogTail(body.LogTail), now, now, c.Param("id"))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build failure")
 		return

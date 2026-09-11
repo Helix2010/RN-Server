@@ -104,3 +104,87 @@ CREATE TABLE build_jobs (
 
 - iOS 的构建机与签名身份（`release.ios` 已经有存储位置，构建链路还没有）。
 - 卡死任务的回收策略：先只在列表里标出 `heartbeat_at` 超时，不自动重排——自动重排会在代理其实还活着的时候产生两个同号的包。
+
+---
+
+# 阶段 2b：打包机代理（独立程序，独立机器）
+
+## 它必须是一个单独的程序，而且必须部署在另一台机器上
+
+"单独部署"在这里不是工程洁癖，是这套设计成立的前提。
+
+- **它持有 Android keystore。** 阶段 2a 全部的安全论证——服务端不下发密钥、不执行命令——在代理和 wallet 后端同机运行的那一刻全部作废：后端的一个 RCE 直接读到磁盘上的 keystore。分开部署才是那条论证的物理基础。
+- **工具链完全不同。** JDK、Android SDK、Gradle、Node/pnpm，十几个 GB。服务端镜像是 alpine 加一个静态二进制，不该为了打包长成这样。
+- **负载形状不同。** 一次 Android release 构建是约三分钟的满 CPU。跑在 API 进程里，接口延迟就跟着构建波动。
+- **生命周期不同。** 重启 API 不该打断一个正在跑的构建；升级代理不该碰 API。
+
+所以：`cmd/build-agent`，与 server 同仓库、同 go.mod（共用请求体定义，契约不会飘），编译成一个静态二进制，**不进容器**——它要用宿主机上的 Android SDK、keystore 和 pnpm 缓存。用 systemd 常驻。
+
+## 只出不进
+
+代理**轮询**服务端，服务端从不连代理。
+
+这台机器因此可以完全不开放任何入站端口，蹲在 NAT 后面也能工作。反过来做（服务端推任务给代理）就要在那台握着签名密钥的机器上开一个监听端口，并给它一套鉴权——而那个端口的每一个 bug 都直接通向 keystore。
+
+轮询的代价是一点延迟：空闲时每 10 秒问一次，认领到任务后立刻再问一次（队列里可能还有）。
+
+## 配置（全部来自构建机本地，不来自服务端）
+
+| 变量 | 含义 |
+| --- | --- |
+| `BUILD_AGENT_SERVER` | 服务端地址，例如 `https://api.anyfun.win` |
+| `BUILD_AGENT_TOKEN` | 与管理端分开的那条凭据 |
+| `BUILD_AGENT_NAME` | 自报标识，只用于排查，不作为鉴权依据 |
+| `BUILD_AGENT_REPO` | RN-App 仓库地址或本地裸库路径 |
+| `BUILD_AGENT_WORKSPACE` | 工作区根目录，每个任务一个临时 worktree |
+| `BUILD_AGENT_PLATFORMS` | 这台机器能构建的平台，默认 android |
+| `BUILD_AGENT_TIMEOUT_MINUTES` | 单次构建上限，默认 45 |
+| `ANDROID_RELEASE_KEYSTORE_PATH` 等 | 现成的那套。**代理只是把它们传给构建脚本，自己不读内容** |
+
+服务端下发的只有：租户 slug、git ref、version、buildNumber、OTA 证书 PEM。
+
+## 一个任务的一生
+
+1. `claim` 拿到任务。拿不到（204）就睡一轮。
+2. `git fetch` 后 `git worktree add <workspace>/<jobId> <gitRef>`，记下解析出的确切提交。**每个任务一个全新 worktree**：共用检出会让另一个人未提交的改动混进产物——这件事 2026-09-10 真的发生过，当时的绕法就是手工开 worktree。
+3. 把任务里的 `version` 与 `buildNumber` 写进 worktree 里的 `tenants/<slug>/tenant.json`，然后**校验这个文件只有这两个字段变了**。改到第三个字段就是服务端在试图改产物身份，当场判失败。
+4. 把 OTA 证书 PEM 写进 worktree，设 `EXPO_UPDATES_CODE_SIGNING_CERTIFICATE` 指向它。
+5. `pnpm install --frozen-lockfile` 然后 `pnpm android:release <slug>`。现成的产物身份门禁（权限清单、applicationId、签名指纹、Gradle 依赖校验）照跑，代理不复制其中任何一条。
+6. **复核产物里内嵌的证书指纹等于任务里那张。** 这一条是新增的，它把"包里的证书"与"服务端当前的签名密钥"焊死。
+7. 算 sha256，走现成的发布产物上传接口，把 `commitSha` / `artifactSha256` / `releaseId` 回报给 `complete`。
+8. 无论成败，删掉 worktree。
+
+心跳每 30 秒一次，带最近的日志尾部。超时就杀掉进程树并 `fail`。
+
+## 日志里不能出现的东西
+
+keystore 口令、`BUILD_AGENT_TOKEN`、任何 `*_PASSWORD` / `*_SECRET` / `*_TOKEN` 环境变量的值。日志尾部是要进数据库、进管理端界面的，Gradle 在失败时很乐意把整个命令行打出来。代理在上报前逐行过一遍脱敏。
+
+## 并发
+
+默认 1。Gradle 在同一个 `GRADLE_USER_HOME` 下并发构建不安全，而 buildNumber 的唯一性已经由服务端保证，并发在这里买不到什么。需要更快就多加一台机器——它们各自轮询，`SKIP LOCKED` 保证不会拿到同一条。
+
+## 部署
+
+```
+/opt/rn-build-agent/build-agent          # 静态二进制，scp 上去
+/etc/rn-build-agent.env                  # 0600，root 所有
+/etc/systemd/system/rn-build-agent.service
+```
+
+服务单元以专用用户运行，`ProtectSystem=strict`，只对工作区与 keystore 目录可写。**这台机器不跑任何对外服务**。
+
+## 未决
+
+- 完整日志上传到对象存储（现在只有尾部进库）。
+- iOS：需要 macOS 构建机与签名身份，另排。
+
+## 升级顺序：先服务端，后代理
+
+服务端的请求体解码用 `DisallowUnknownFields`。代理比服务端新时，它多送的一个字段会让整条请求 400——2026-09-11 的冒烟测试里就撞上了一次：代理开始上报 `commitSha`，而旧服务端不认识这个字段，结果失败上报全部被拒，任务永远停在 `claimed`。
+
+所以升级顺序是**先服务端后代理**，不能反。这条严格性本身是对的（它让"多塞一个 command 字段"这种事必然失败），代价就是这个顺序约束。
+
+## 部署文件
+
+`deploy/build-agent/` 下有 systemd 单元与环境变量样例。要点：专用用户、`ProtectSystem=strict`、只对工作区和构建缓存可写、不监听任何端口。
