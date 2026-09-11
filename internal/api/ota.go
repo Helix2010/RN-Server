@@ -300,6 +300,11 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 422, "INVALID_OTA_APPLY_STRATEGY", "applyStrategy must be next_launch or immediate")
 		return
 	}
+	releaseNotes, notesProblem := normalizeReleaseNotes(body.ReleaseNotes)
+	if notesProblem != "" {
+		problem(c, 422, "INVALID_RELEASE_NOTES", notesProblem)
+		return
+	}
 	v, err := s.decodeOTAUploadToken(tenantID(c), body.ArtifactToken)
 	if err != nil {
 		problem(c, 401, "INVALID_OTA_ARTIFACT_TOKEN", err.Error())
@@ -487,7 +492,11 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	uploadedKeys = append(uploadedKeys, manifestKey)
 	rawObjectMetadata, _ := json.Marshal(objectMetadata)
 	hash := sha256.Sum256(finalManifest)
-	notes, _ := json.Marshal(body.ReleaseNotes)
+	notes, err := json.Marshal(releaseNotes)
+	if err != nil {
+		problem(c, 500, "OTA_CREATE_FAILED", "Unable to encode release notes")
+		return
+	}
 	conn, err := s.db.Conn(c.Request.Context())
 	if err != nil {
 		problem(c, 500, "OTA_CREATE_FAILED", "Unable to create OTA release")
@@ -529,7 +538,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		return
 	}
 	persisted = true
-	c.JSON(201, gin.H{"release": gin.H{"id": releaseID, "baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "channel": body.Channel, "runtimeVersion": baseRuntime, "revision": revision, "updateId": updateID, "applyStrategy": body.ApplyStrategy, "status": "verified", "manifestSha256": hex.EncodeToString(hash[:]), "releaseNotes": body.ReleaseNotes, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now)}})
+	c.JSON(201, gin.H{"release": gin.H{"id": releaseID, "baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "channel": body.Channel, "runtimeVersion": baseRuntime, "revision": revision, "updateId": updateID, "applyStrategy": body.ApplyStrategy, "status": "verified", "manifestSha256": hex.EncodeToString(hash[:]), "releaseNotes": releaseNotes, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now)}})
 }
 
 func nullableSQLValue(v string) any {

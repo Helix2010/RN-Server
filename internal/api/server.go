@@ -1594,6 +1594,42 @@ func text(v any, fallback string) string {
 	return fallback
 }
 
+// normalizeReleaseNotes 把写入侧收到的发布说明收敛成唯一的正式形状：语言 -> 行数组。
+// 读取侧（bootstrap 下发、管理端列表）都按这个形状解析，所以写入时就必须挡住别的形状——
+// 曾经有人用管理接口直接写进字符串，管理端整份列表因此校验失败。
+// 允许缺省（nil / 空对象）；给了就必须是数组，每一项非空字符串，语言码非空。
+func normalizeReleaseNotes(raw map[string]any) (map[string][]string, string) {
+	if len(raw) == 0 {
+		return map[string][]string{}, ""
+	}
+	notes := make(map[string][]string, len(raw))
+	for language, value := range raw {
+		if strings.TrimSpace(language) == "" {
+			return nil, "releaseNotes keys must be non-empty language codes"
+		}
+		items, ok := value.([]any)
+		if !ok {
+			return nil, "releaseNotes values must be arrays of strings, one entry per line"
+		}
+		lines := make([]string, 0, len(items))
+		for _, item := range items {
+			line, ok := item.(string)
+			if !ok {
+				return nil, "releaseNotes values must be arrays of strings, one entry per line"
+			}
+			if strings.TrimSpace(line) == "" {
+				return nil, "releaseNotes lines must not be blank"
+			}
+			lines = append(lines, line)
+		}
+		if len(lines) == 0 {
+			return nil, "releaseNotes languages must carry at least one line"
+		}
+		notes[language] = lines
+	}
+	return notes, ""
+}
+
 func releaseNotesForLocale(notes map[string][]string, locale string) []string {
 	if selected := notes[locale]; len(selected) > 0 {
 		return selected

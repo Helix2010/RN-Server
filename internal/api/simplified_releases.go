@@ -218,6 +218,11 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "Platform, version and build number are invalid")
 		return
 	}
+	releaseNotes, notesProblem := normalizeReleaseNotes(body.ReleaseNotes)
+	if notesProblem != "" {
+		problem(c, http.StatusUnprocessableEntity, "INVALID_RELEASE_NOTES", notesProblem)
+		return
+	}
 	if enabled, err := s.platformEnabled(c.Request.Context(), tenantID(c), body.Platform); err != nil || !enabled {
 		problem(c, http.StatusUnprocessableEntity, "PLATFORM_DISABLED", "The requested platform is not enabled for this tenant")
 		return
@@ -350,7 +355,11 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	}
 	now := time.Now().UTC()
 	id := "rel_" + randomID(16)
-	notes, _ := json.Marshal(body.ReleaseNotes)
+	notes, err := json.Marshal(releaseNotes)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to encode release notes")
+		return
+	}
 	rawMetadata, _ := json.Marshal(metadata)
 	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, tenantID(c), body.Platform, body.Version, body.BuildNumber, runtimeVersion, "verified", notes, artifact.ObjectKey, artifact.FileName, artifact.ContentType, artifact.Size, size, metadata["sha256"], rawMetadata, body.Mandatory, now, actor(c), now, now)
 	if err != nil {
@@ -362,7 +371,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release audit")
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": body.ReleaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "mandatory": body.Mandatory, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
+	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": releaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "mandatory": body.Mandatory, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
 }
 
 func (s *server) activeSimplifiedRelease(ctx context.Context, tenant, platform string) (simplifiedActiveRelease, error) {
