@@ -68,6 +68,22 @@ bootstrap 根据以下输入求值：
 
 决策响应须签名或包含由可信 TLS endpoint 获取的签名 manifest，带 issuedAt/expiresAt/policyVersion，防止离线缓存永久强更。
 
+### 4.1 公开的三个下载入口
+
+| 地址 | 返回 | 用途 |
+| --- | --- | --- |
+| `GET /v1/public/releases/latest?platform=android` | JSON（version、buildNumber、sha256、size、downloadUrl…） | 官网 / 脚本查当前版本 |
+| `GET /v1/public/releases/latest/download?platform=android` | **302** 跳到下面那条 | **贴二维码、官网按钮、群公告用这条**：地址固定，发版不用换 |
+| `GET /v1/public/releases/{id}/download` | APK 字节流（支持 Range） | 真实下载地址，带发布 ID，每发一版就变 |
+
+三条共用同一套可见性判定，灰度也在内：匿名与名单外的调用方永远只会拿到 / 被跳到
+active 版本；带有效安装凭证且在名单里的设备才会拿到它自己的灰度包（设计
+`RN-App/docs/design/canary-release-allowlist-2026-09-11.md`）。
+
+固定入口的跳转带 `Cache-Control: no-store`——它的意义就是"随时点都是最新的"，
+被 CDN 或浏览器缓存住就失去意义。`platform` 缺省顺序是 query → `x-platform` 头 →
+`android`（浏览器扫码打开时这两个都不会带）。
+
 ## 5. 非商店 artifact 安全
 
 ### Android direct APK
