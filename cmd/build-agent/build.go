@@ -99,6 +99,14 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	if job.Platform != "android" {
 		return result, fmt.Errorf("this agent only builds android, got %q", job.Platform)
 	}
+	if job.TenantDirectory == "" {
+		return result, fmt.Errorf("the job does not say which tenants/ directory to build; set repoDirectory in this tenant's build configuration")
+	}
+	// 目录名会被拼进路径。服务端已经校验过，代理再挡一次——两端分属不同的信任域，
+	// 各自把住自己那一侧是这类路径拼接的常规做法。
+	if strings.ContainsAny(job.TenantDirectory, `/\`) || strings.Contains(job.TenantDirectory, "..") {
+		return result, fmt.Errorf("refusing a tenant directory that escapes tenants/: %q", job.TenantDirectory)
+	}
 	worktree := filepath.Join(cfg.Workspace, job.ID)
 	env := os.Environ()
 
@@ -117,11 +125,11 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	buf.add("commit " + result.CommitSHA)
 
 	// 只许改 version 与 androidVersionCode；改到第三个字段就是在改产物身份
-	tenantFile := filepath.Join(worktree, "tenants", job.TenantSlug, "tenant.json")
+	tenantFile := filepath.Join(worktree, "tenants", job.TenantDirectory, "tenant.json")
 	if err := applyBuildVersion(tenantFile, job.Version, job.BuildNumber); err != nil {
 		return result, err
 	}
-	buf.add(fmt.Sprintf("tenant %s pinned to %s (%d)", job.TenantSlug, job.Version, job.BuildNumber))
+	buf.add(fmt.Sprintf("tenant %s pinned to %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
 
 	// 证书随任务下发，代理不去猜该编哪一张
 	if strings.TrimSpace(job.OTACertificatePEM) == "" {
@@ -134,7 +142,7 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	env = append(env,
 		"EXPO_UPDATES_CODE_SIGNING_CERTIFICATE=./ota-certificate.pem",
 		"EXPO_REQUIRE_OTA_SIGNING=1",
-		"EXPO_PUBLIC_TENANT="+job.TenantSlug,
+		"EXPO_PUBLIC_TENANT="+job.TenantDirectory,
 	)
 
 	if err := run(ctx, buf, worktree, env, "pnpm", "install", "--frozen-lockfile"); err != nil {
@@ -142,12 +150,12 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	}
 	// 现成的产物身份门禁在这条命令里面：权限清单、applicationId、签名指纹、
 	// Gradle 依赖校验。代理不复制其中任何一条，也不绕过它们。
-	if err := run(ctx, buf, worktree, env, "pnpm", "android:release", job.TenantSlug); err != nil {
+	if err := run(ctx, buf, worktree, env, "pnpm", "android:release", job.TenantDirectory); err != nil {
 		return result, err
 	}
 
 	artifact := filepath.Join(worktree, "artifacts",
-		fmt.Sprintf("%s-%s-build%d-release.apk", job.TenantSlug, job.Version, job.BuildNumber))
+		fmt.Sprintf("%s-%s-build%d-release.apk", job.TenantDirectory, job.Version, job.BuildNumber))
 	if _, err := os.Stat(artifact); err != nil {
 		return result, fmt.Errorf("the build reported success but %s is not there: %w", filepath.Base(artifact), err)
 	}

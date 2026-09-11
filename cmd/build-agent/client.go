@@ -11,8 +11,11 @@ import (
 )
 
 type claimedJob struct {
-	ID                   string `json:"id"`
-	TenantSlug           string `json:"tenantSlug"`
+	ID         string `json:"id"`
+	TenantSlug string `json:"tenantSlug"`
+	// TenantDirectory 是仓库里 tenants/ 下的目录名。它与 TenantSlug 是两套命名，
+	// 代理只用这一个去拼路径。
+	TenantDirectory      string `json:"tenantDirectory"`
 	Platform             string `json:"platform"`
 	GitRef               string `json:"gitRef"`
 	Version              string `json:"version"`

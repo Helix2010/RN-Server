@@ -185,3 +185,27 @@ func TestLoadConfigRefusesAnIncompleteOrUnsafeSetup(t *testing.T) {
 		t.Fatalf("a loopback development server was rejected: %v", err)
 	}
 }
+
+// 仓库里的租户目录名与服务端的租户 slug 是两套命名：2026-09-11 部署时线上 slug
+// 是 Predict.Kim，而仓库里的目录叫 anyfun。代理只认 tenantDirectory，而且必须挡住
+// 任何能跳出 tenants/ 的写法——它会被直接拼进路径。
+func TestTenantDirectoryMustStayInsideTenants(t *testing.T) {
+	for name, value := range map[string]string{
+		"empty":         "",
+		"parent":        "..",
+		"nested parent": "a/../../etc",
+		"absolute":      "/etc/passwd",
+		"slash":         "a/b",
+		"backslash":     `a\b`,
+	} {
+		if value != "" && !strings.ContainsAny(value, `/\`) && !strings.Contains(value, "..") {
+			t.Fatalf("%s should be caught by the guard", name)
+		}
+	}
+	// 正常的目录名要放过
+	for _, value := range []string{"anyfun", "tenant-2", "a.b_c"} {
+		if strings.ContainsAny(value, `/\`) || strings.Contains(value, "..") {
+			t.Fatalf("%q was treated as unsafe", value)
+		}
+	}
+}

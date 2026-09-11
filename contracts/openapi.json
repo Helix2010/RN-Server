@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.16"
+    "version": "2026.09.17"
   },
   "paths": {
     "/health/live": {
@@ -1907,6 +1907,48 @@
         }
       }
     },
+    "/v1/admin/build-config": {
+      "get": {
+        "summary": "Tenant build configuration",
+        "description": "Returns {repoDirectory, defaultGitRef, tenantSlug, version}. repoDirectory is the directory under tenants/ in the app repository, which is a different namespace from this platform's tenant slug: production runs slug Predict.Kim against repository directory anyfun. Falls back to the slug when unset.",
+        "responses": {
+          "200": {
+            "description": "Build configuration"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set the tenant build configuration",
+        "description": "repoDirectory must be a plain directory name; it is joined into a path by the build agent, so anything that could escape tenants/ is refused on both sides.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildConfigWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved"
+          },
+          "400": {
+            "description": "INVALID_BUILD_CONFIG"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_BUILD_CONFIG"
+          }
+        }
+      }
+    },
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
@@ -2999,6 +3041,37 @@
           "commitSha": {
             "type": "string",
             "description": "The commit the agent had checked out, when it got that far; a failed build still needs to say which revision it tried"
+          }
+        }
+      },
+      "BuildConfigWrite": {
+        "type": "object",
+        "required": [
+          "repoDirectory",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "repoDirectory": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "defaultGitRef": {
+            "type": "string",
+            "maxLength": 200,
+            "default": "main"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
           }
         }
       }

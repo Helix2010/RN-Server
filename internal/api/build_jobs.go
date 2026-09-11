@@ -401,8 +401,16 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	// 证书随任务一起下发：代理不该去猜哪张证书该编进包里。这样"包里的证书"与
 	// "服务端当前签名用的密钥"由同一条记录保证一致——今天这个一致性靠人拷文件，
 	// 而不一致的症状是所有设备静默停在内置 bundle。私钥当然不下发。
+	// 仓库里的租户目录名与本平台 slug 是两套命名，必须显式配置：线上 slug 是
+	// Predict.Kim，而仓库里的目录叫 anyfun，拿 slug 去找文件必然找不到。
+	buildCfg, _, err := s.buildConfigFor(c.Request.Context(), job.TenantID, slug)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_INVALID", "Stored build.android configuration is invalid")
+		return
+	}
 	view := buildJobView(job)
 	view["tenantSlug"] = slug
+	view["tenantDirectory"] = buildCfg.RepoDirectory
 	record, err := s.otaSigningRecord(c.Request.Context(), job.TenantID)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "OTA_SIGNING_CONFIG_INVALID", "Stored ota.signing configuration is invalid")
