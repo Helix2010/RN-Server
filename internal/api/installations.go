@@ -420,3 +420,12 @@ func encodeDeviceIntegrity(report *deviceIntegrityReport) any {
 	}
 	return raw
 }
+
+// rawJSONOrNil 把一列 JSON 原样透出去；空列就是 null。不解析再重编：那会把
+// "探针没跑"和"探针说 false"在往返里悄悄抹平。
+func rawJSONOrNil(raw []byte) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	return json.RawMessage(raw)
+}

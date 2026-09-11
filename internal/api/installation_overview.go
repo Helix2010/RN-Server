@@ -287,7 +287,7 @@ func (s *server) listInstallations(c *gin.Context) {
 	pageArgs = append(pageArgs, filter.limit+1)
 	// 当前账号只从有效会话派生（设计 §4.3）：一个安装实例最多一条有效会话，子查询按安装实例索引命中
 	pageArgs = append([]any{now, now, now, now}, pageArgs...)
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT i.id,i.installation_id,i.application_id,i.package_id,i.platform,i.app_version,i.build_number,i.runtime_version,i.ota_revision,i.launch_source,i.running_update_id,i.running_ota_revision,i.client_session_state,i.localization_version,i.branding_version,i.locale,i.theme,i.os_version,i.device_class,i.last_active_at,i.status,
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT i.id,i.installation_id,i.application_id,i.package_id,i.platform,i.app_version,i.build_number,i.runtime_version,i.ota_revision,i.launch_source,i.running_update_id,i.running_ota_revision,i.client_session_state,i.device_integrity,i.localization_version,i.branding_version,i.locale,i.theme,i.os_version,i.device_class,i.last_active_at,i.status,
 		(SELECT s.id FROM wallet_session s WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
 		(SELECT s.user_id FROM wallet_session s WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
 		(SELECT u.address FROM wallet_session s JOIN wallet_user u ON u.id=s.user_id WHERE s.tenant_id=i.tenant_id AND s.installation_id=i.installation_id AND s.revoked_at IS NULL AND s.expires_at>? ORDER BY s.issued_at DESC LIMIT 1),
@@ -306,10 +306,11 @@ func (s *server) listInstallations(c *gin.Context) {
 		var id, applicationID, packageID, platform, version, build, runtime, locale, theme, osVersion, deviceClass, status string
 		var otaRevision, runningRevision, brandingVersion, currentUserID sql.NullInt64
 		var launchSource, runningUpdateID, sessionState, localizationVersion, currentSessionID, currentAddress sql.NullString
+		var deviceIntegrity []byte
 		var active time.Time
 		var currentLastSeen sql.NullTime
 		var accountsCount int
-		if err := rows.Scan(&rowID, &id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &launchSource, &runningUpdateID, &runningRevision, &sessionState, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status, &currentSessionID, &currentUserID, &currentAddress, &currentLastSeen, &accountsCount); err != nil {
+		if err := rows.Scan(&rowID, &id, &applicationID, &packageID, &platform, &version, &build, &runtime, &otaRevision, &launchSource, &runningUpdateID, &runningRevision, &sessionState, &deviceIntegrity, &localizationVersion, &brandingVersion, &locale, &theme, &osVersion, &deviceClass, &active, &status, &currentSessionID, &currentUserID, &currentAddress, &currentLastSeen, &accountsCount); err != nil {
 			problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
 			return
 		}
@@ -323,7 +324,7 @@ func (s *server) listInstallations(c *gin.Context) {
 		if currentSessionID.Valid {
 			current = &currentSession{ID: currentSessionID.String, UserID: uint64(currentUserID.Int64), Address: currentAddress.String, LastSeenAt: currentLastSeen.Time}
 		}
-		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "availableOtaRevision": nullableInt64(otaRevision), "launchSource": nullableSQLString(launchSource), "runningUpdateId": nullableSQLString(runningUpdateID), "runningOtaRevision": nullableInt64(runningRevision), "clientSessionState": nullableSQLString(sessionState), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status, "currentAccount": currentSessionJSON(current), "accountsCount": accountsCount, "activity": installationActivity(current, active, now), "sessionMismatch": nullableString(sessionMismatch(sessionState, current)), "cursor": encodeInstallationCursor(active, rowID)})
+		items = append(items, gin.H{"installationId": id, "applicationId": applicationID, "packageId": packageID, "platform": platform, "appVersion": version, "buildNumber": build, "runtimeVersion": runtime, "otaRevision": nullableInt64(otaRevision), "availableOtaRevision": nullableInt64(otaRevision), "launchSource": nullableSQLString(launchSource), "runningUpdateId": nullableSQLString(runningUpdateID), "runningOtaRevision": nullableInt64(runningRevision), "clientSessionState": nullableSQLString(sessionState), "deviceIntegrity": rawJSONOrNil(deviceIntegrity), "localizationVersion": nullableSQLString(localizationVersion), "brandingVersion": nullableInt64(brandingVersion), "locale": locale, "theme": theme, "osVersion": osVersion, "deviceClass": deviceClass, "lastActiveAt": iso(active), "status": status, "currentAccount": currentSessionJSON(current), "accountsCount": accountsCount, "activity": installationActivity(current, active, now), "sessionMismatch": nullableString(sessionMismatch(sessionState, current)), "cursor": encodeInstallationCursor(active, rowID)})
 	}
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "INSTALLATION_QUERY_FAILED", "Unable to read installations")
