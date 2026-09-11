@@ -131,7 +131,9 @@ func (s *server) nextBuildNumberFloor(c *gin.Context, tenant, platform string) (
 		return 0, err
 	}
 	if err := s.db.QueryRowContext(c.Request.Context(),
-		`SELECT MAX(build_number) FROM build_jobs WHERE tenant_id=? AND platform=? AND status<>'canceled'`, tenant, platform).Scan(&fromJobs); err != nil {
+		// 失败与取消的任务不占号：失败的构建没有产物，那个号根本没被用掉，
+		// 而"改一行再用同一个版本号重来"是最常见的那条路径
+		`SELECT MAX(build_number) FROM build_jobs WHERE tenant_id=? AND platform=? AND status NOT IN ('canceled','failed')`, tenant, platform).Scan(&fromJobs); err != nil {
 		return 0, err
 	}
 	floor := 0

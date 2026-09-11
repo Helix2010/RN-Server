@@ -253,6 +253,51 @@ func TestDBBuildJobQueueEnforcesMonotonicBuildNumbers(t *testing.T) {
 	}
 }
 
+// 构建失败 → 改一行 → 用同一个版本号重来，是最常见的那条路径。第一版把唯一键
+// 直接建在 build_number 上，把它堵死了：失败的构建没有产物，那个号根本没被用掉。
+func TestDBBuildJobNumberIsFreeAgainAfterAFailure(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development", BuildAgentToken: "token"}}
+	tenant := testTenant(4)
+	seedBuildTenant(t, s, tenant)
+
+	queue := func(buildNumber int) *httptest.ResponseRecorder {
+		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
+			"platform": "android", "gitRef": "main", "version": "3.0.0",
+			"buildNumber": buildNumber, "reason": "retry after failure", "confirm": true,
+		})
+		s.createBuildJob(c)
+		return recorder
+	}
+	if code := queue(300).Code; code != http.StatusCreated {
+		t.Fatalf("first attempt: %d", code)
+	}
+	claimCtx, claimRecorder := testContext(t, tenant, "POST", "/v1/build-agent/claim", map[string]any{"agent": "builder"})
+	s.claimBuildJob(claimCtx)
+	if claimRecorder.Code != http.StatusOK {
+		t.Fatalf("claim: %d %s", claimRecorder.Code, claimRecorder.Body.String())
+	}
+	id := decodeBody(t, claimRecorder)["id"].(string)
+
+	failCtx, failRecorder := testContext(t, tenant, "POST", "/v1/build-agent/jobs/"+id+"/fail", map[string]any{
+		"failureReason": "gradle blew up",
+	})
+	failCtx.Params = gin.Params{{Key: "id", Value: id}}
+	s.failBuildJob(failCtx)
+	failCtx.Writer.WriteHeaderNow()
+	if failRecorder.Code != http.StatusNoContent {
+		t.Fatalf("fail: %d %s", failRecorder.Code, failRecorder.Body.String())
+	}
+
+	if recorder := queue(300); recorder.Code != http.StatusCreated {
+		t.Fatalf("the same build number was refused after a failure: %d %s", recorder.Code, recorder.Body.String())
+	}
+	// 但同时排两个还是不行：唯一索引只放过 failed/canceled
+	if recorder := queue(300); recorder.Code != http.StatusConflict {
+		t.Fatalf("two live jobs got the same build number: %d", recorder.Code)
+	}
+}
+
 func TestDBBuildJobClaimHandsEachJobToExactlyOneAgent(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db, cfg: config.Config{Environment: "development", BuildAgentToken: "token"}}

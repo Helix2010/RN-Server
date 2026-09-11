@@ -54,6 +54,7 @@ var migrations = []migration{
 	{version: 38, name: "release_notes_line_arrays", apply: releaseNotesLineArraysMigration},
 	{version: 39, name: "release_canary", apply: releaseCanaryMigration},
 	{version: 40, name: "build_jobs", apply: buildJobsMigration},
+	{version: 41, name: "build_jobs_retryable", apply: buildJobsRetryableMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1353,6 +1354,37 @@ func buildJobsMigration(ctx context.Context, db *sql.DB) error {
 		UNIQUE KEY ux_build_jobs_build_number (tenant_id, platform, build_number)
 	) ENGINE=InnoDB COMMENT='打包任务：管理端写入，打包机代理认领与回报。只记参数与结果，不记命令——服务端不在打包机上执行任意命令'`); err != nil {
 		return fmt.Errorf("build jobs migration create table: %w", err)
+	}
+	return nil
+}
+
+// buildJobsRetryableMigration 让失败的构建可以用同一个版本号重来。
+//
+// 迁移 40 把唯一键直接建在 (tenant, platform, build_number) 上，结果是最常见的那条
+// 路径走不通：构建失败 → 改一行代码 → 用同一个版本号重新构建，第二次会被唯一键
+// 顶回来。而失败的构建本来就没有产物，那个号根本没被用掉。
+//
+// 改成只约束"还活着的"任务：生成列在 failed / canceled 时取 NULL，MySQL 的唯一索引
+// 不比较 NULL，于是同一个号可以重试任意多次，但同时排两个仍然不行。
+func buildJobsRetryableMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "build_jobs", "live_build_number",
+		`ALTER TABLE build_jobs ADD COLUMN live_build_number INT UNSIGNED
+		 GENERATED ALWAYS AS (CASE WHEN status IN ('queued','claimed','running','succeeded') THEN build_number ELSE NULL END) STORED
+		 COMMENT '还活着的任务的 build 号：failed/canceled 时为 NULL。唯一索引建在它上面，失败的构建因此可以用同一个号重来'`); err != nil {
+		return fmt.Errorf("build jobs retryable migration add column: %w", err)
+	}
+	// 老索引可能不存在（全新库按新定义建表），删不掉不算错
+	if _, err := db.ExecContext(ctx, `ALTER TABLE build_jobs DROP INDEX ux_build_jobs_build_number`); err != nil && !strings.Contains(err.Error(), "check that column/key exists") {
+		return fmt.Errorf("build jobs retryable migration drop old index: %w", err)
+	}
+	var exists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='build_jobs' AND INDEX_NAME='ux_build_jobs_live_build_number'`).Scan(&exists); err != nil {
+		return fmt.Errorf("build jobs retryable migration inspect index: %w", err)
+	}
+	if exists == 0 {
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX ux_build_jobs_live_build_number ON build_jobs (tenant_id, platform, live_build_number)`); err != nil {
+			return fmt.Errorf("build jobs retryable migration create index: %w", err)
+		}
 	}
 	return nil
 }

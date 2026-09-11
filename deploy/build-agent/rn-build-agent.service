@@ -23,8 +23,13 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
-# 只对工作区、构建缓存与仓库镜像可写。keystore 目录给读权限即可
-ReadWritePaths=/var/lib/rn-build-agent /home/builder/.gradle /home/builder/.pnpm-store
+# ProtectHome=true 之后 /home 整个不可见，所以把 HOME 和两个构建缓存都挪进
+# 工作区目录树——这样"可写的地方"正好只有这一处，也不必为缓存开洞
+Environment=HOME=/var/lib/rn-build-agent/home
+Environment=GRADLE_USER_HOME=/var/lib/rn-build-agent/gradle
+Environment=PNPM_HOME=/var/lib/rn-build-agent/pnpm
+Environment=npm_config_store_dir=/var/lib/rn-build-agent/pnpm-store
+ReadWritePaths=/var/lib/rn-build-agent
 
 [Install]
 WantedBy=multi-user.target

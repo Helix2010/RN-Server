@@ -47,7 +47,7 @@
 
 ### 不变量
 
-- `ux_build_jobs_build_number (tenant_id, platform, build_number)`：同租户同平台的同一个 build 号不能排两次队。创建时还会把 `app_releases` 里已用的最大值算进去，要求严格递增——装到设备上的 APK 靠 versionCode 决定谁覆盖谁，重号意味着"哪个赢"取决于谁后装。
+- `ux_build_jobs_live_build_number (tenant_id, platform, live_build_number)`（迁移 41）：同租户同平台**同时**只能有一个用着这个 build 号的活任务。`live_build_number` 是生成列，`failed` / `canceled` 时取 NULL，而 MySQL 的唯一索引不比较 NULL——所以「构建失败 → 改一行 → 用同一个号重来」这条最常见的路径走得通。迁移 40 把唯一键直接建在 `build_number` 上，把它堵死了：失败的构建没有产物，那个号根本没被用掉。创建时还会把 `app_releases` 里已用的最大值算进去，要求严格递增——装到设备上的 APK 靠 versionCode 决定谁覆盖谁，重号意味着"哪个赢"取决于谁后装。
 - 状态只前进：`queued → claimed → running → succeeded|failed`，`canceled` 只能从 `queued|claimed` 进入。已经出了包的构建不能被取消，否则状态会骗人。
 - `log_tail` 最多 200 行、每行最多 2000 字节。日志由代理送来，不设上限的话一次失败就能把这一行撑到几十兆，而这张表是管理端列表要扫的。
 - 认领是**跨租户**的，取最早那条。解析不出租户的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。
