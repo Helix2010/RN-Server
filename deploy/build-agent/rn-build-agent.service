@@ -2,9 +2,14 @@
 # Android keystore，而整套设计的安全论证（服务端不下发密钥、不执行命令）在两者
 # 同机的那一刻就作废了。
 #
-#   install -m 0755 build-agent /opt/rn-build-agent/build-agent
-#   install -m 0600 -o root -g root rn-build-agent.env /etc/rn-build-agent.env
-#   systemctl enable --now rn-build-agent
+# 目录约定（FHS）：
+#   /opt/rn-build-agent/build-agent   程序本体
+#   /etc/rn-build-agent.env           配置，0600 root
+#   /var/lib/rn-build-agent/          状态：仓库镜像、工作区、部署密钥；同时是 builder 的 HOME
+#   /var/cache/rn-build-agent/        可重建的缓存：Gradle 与 pnpm 的 store
+#
+# 状态与缓存分开不是形式：缓存整个删掉只会让下一次构建慢一点，而 /var/lib 下的
+# 东西删了要重新配密钥、重新拉仓库。备份和清理策略完全不同。
 [Unit]
 Description=RN build agent
 After=network-online.target
@@ -23,13 +28,11 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
-# ProtectHome=true 之后 /home 整个不可见，所以把 HOME 和两个构建缓存都挪进
-# 工作区目录树——这样"可写的地方"正好只有这一处，也不必为缓存开洞
-Environment=HOME=/var/lib/rn-build-agent/home
-Environment=GRADLE_USER_HOME=/var/lib/rn-build-agent/gradle
-Environment=PNPM_HOME=/var/lib/rn-build-agent/pnpm
-Environment=npm_config_store_dir=/var/lib/rn-build-agent/pnpm-store
-ReadWritePaths=/var/lib/rn-build-agent
+# ProtectHome=true 之后 /home 整个不可见。builder 的家目录就设在 /var/lib 下的
+# 状态目录，OpenSSH 按 passwd 里的 home 找 ~/.ssh（不看 $HOME），两者必须一致。
+Environment=GRADLE_USER_HOME=/var/cache/rn-build-agent/gradle
+Environment=npm_config_store_dir=/var/cache/rn-build-agent/pnpm-store
+ReadWritePaths=/var/lib/rn-build-agent /var/cache/rn-build-agent
 
 [Install]
 WantedBy=multi-user.target

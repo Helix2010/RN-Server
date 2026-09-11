@@ -21,6 +21,9 @@ type config struct {
 	Platforms []string
 	Timeout   time.Duration
 	PollEvery time.Duration
+	// KeystorePassphrase 开服务端下发的那个盒子。它只存在于这台机器上——
+	// 服务端没有它，所以服务端打不开签名密钥。
+	KeystorePassphrase string
 }
 
 func envOr(key, fallback string) string {
@@ -33,12 +36,13 @@ func envOr(key, fallback string) string {
 func loadConfig() (config, error) {
 	host, _ := os.Hostname()
 	cfg := config{
-		Server:    strings.TrimRight(envOr("BUILD_AGENT_SERVER", ""), "/"),
-		Token:     envOr("BUILD_AGENT_TOKEN", ""),
-		Name:      envOr("BUILD_AGENT_NAME", host),
-		Repo:      envOr("BUILD_AGENT_REPO", ""),
-		Workspace: envOr("BUILD_AGENT_WORKSPACE", ""),
-		PollEvery: 10 * time.Second,
+		Server:             strings.TrimRight(envOr("BUILD_AGENT_SERVER", ""), "/"),
+		Token:              envOr("BUILD_AGENT_TOKEN", ""),
+		Name:               envOr("BUILD_AGENT_NAME", host),
+		Repo:               envOr("BUILD_AGENT_REPO", ""),
+		Workspace:          envOr("BUILD_AGENT_WORKSPACE", ""),
+		PollEvery:          10 * time.Second,
+		KeystorePassphrase: envOr("BUILD_KEYSTORE_PASSPHRASE", ""),
 	}
 	for _, p := range strings.Split(envOr("BUILD_AGENT_PLATFORMS", "android"), ",") {
 		if p = strings.ToLower(strings.TrimSpace(p)); p == "android" || p == "ios" {

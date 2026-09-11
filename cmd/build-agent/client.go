@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
 
 type claimedJob struct {
@@ -22,6 +24,12 @@ type claimedJob struct {
 	BuildNumber          int    `json:"buildNumber"`
 	OTACertificatePEM    string `json:"otaCertificatePem"`
 	OTACertificateSHA256 string `json:"otaCertificateSha256"`
+	// SealedKeystore 是运维用自己的口令封的盒子，服务端只是转交，打不开它。
+	SealedKeystore *buildkeystore.Sealed `json:"sealedKeystore"`
+	KeyAlias       string                `json:"keyAlias"`
+	// GoogleServicesJSON 不是机密（它原样编进每个 APK），但按租户不同，所以也随
+	// 任务下发——这样新加一台打包机仍然只需要一个封装口令。
+	GoogleServicesJSON string `json:"googleServicesJson"`
 }
 
 type client struct {

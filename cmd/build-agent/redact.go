@@ -36,6 +36,16 @@ type redactor struct{ values []string }
 
 func newRedactor() *redactor { return &redactor{values: secretValues(os.Environ())} }
 
+// add 登记一个运行时才知道的机密。keystore 口令是从盒子里开出来的，不在进程
+// 环境里——不登记它，Gradle 一旦把命令行打出来，口令就直接进了数据库和管理端界面。
+func (r *redactor) add(value string) {
+	if len(value) < 6 {
+		return
+	}
+	r.values = append(r.values, value)
+	sort.Slice(r.values, func(i, j int) bool { return len(r.values[i]) > len(r.values[j]) })
+}
+
 func (r *redactor) line(text string) string {
 	for _, value := range r.values {
 		text = strings.ReplaceAll(text, value, redacted)

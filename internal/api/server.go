@@ -236,6 +236,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/builds/:id/cancel", s.cancelBuildJob)
 	group.GET("/build-config", s.getBuildConfig)
 	group.PUT("/build-config", s.saveBuildConfig)
+	group.GET("/build-keystore", s.getBuildKeystore)
+	group.PUT("/build-keystore", s.saveBuildKeystore)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)

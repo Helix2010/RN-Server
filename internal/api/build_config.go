@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -31,6 +32,10 @@ type buildConfig struct {
 	RepoDirectory string `json:"repoDirectory"`
 	// DefaultGitRef 只是管理端新建构建时的默认值，不参与任何校验。
 	DefaultGitRef string `json:"defaultGitRef"`
+	// GoogleServicesJSON 是 google-services.json 的 base64。它**不是机密**——
+	// 同一份内容会原样编进每一个 APK——但它按租户不同，所以放在这里而不是放到
+	// 每台打包机上。这样"新加一台打包机"仍然只需要一个封装口令。
+	GoogleServicesJSON string `json:"googleServicesJson"`
 }
 
 func (s *server) buildConfigFor(ctx context.Context, tenant, fallbackSlug string) (buildConfig, int, error) {
@@ -71,18 +76,21 @@ func (s *server) getBuildConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"repoDirectory": cfg.RepoDirectory,
 		"defaultGitRef": cfg.DefaultGitRef,
-		"tenantSlug":    slug,
-		"version":       version,
+		// 只报有没有配、多大，不把整段 base64 塞进每一次列表请求
+		"googleServicesConfigured": cfg.GoogleServicesJSON != "",
+		"tenantSlug":               slug,
+		"version":                  version,
 	})
 }
 
 func (s *server) saveBuildConfig(c *gin.Context) {
 	var body struct {
-		RepoDirectory   string `json:"repoDirectory"`
-		DefaultGitRef   string `json:"defaultGitRef"`
-		ExpectedVersion int    `json:"expectedVersion"`
-		Reason          string `json:"reason"`
-		Confirm         bool   `json:"confirm"`
+		RepoDirectory      string `json:"repoDirectory"`
+		DefaultGitRef      string `json:"defaultGitRef"`
+		GoogleServicesJSON string `json:"googleServicesJson"`
+		ExpectedVersion    int    `json:"expectedVersion"`
+		Reason             string `json:"reason"`
+		Confirm            bool   `json:"confirm"`
 	}
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "repoDirectory, expectedVersion, reason and confirm=true are required")
@@ -102,7 +110,19 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "defaultGitRef is too long")
 		return
 	}
-	value, _ := json.Marshal(buildConfig{RepoDirectory: directory, DefaultGitRef: gitRef})
+	googleServices := strings.TrimSpace(body.GoogleServicesJSON)
+	if googleServices != "" {
+		decoded, err := base64.StdEncoding.DecodeString(googleServices)
+		if err != nil || !json.Valid(decoded) {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "googleServicesJson must be base64-encoded JSON")
+			return
+		}
+		if len(decoded) > 256*1024 {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "googleServicesJson is too large")
+			return
+		}
+	}
+	value, _ := json.Marshal(buildConfig{RepoDirectory: directory, DefaultGitRef: gitRef, GoogleServicesJSON: googleServices})
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -138,12 +158,12 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "build_config_update", "app-config", buildConfigKey, strings.TrimSpace(body.Reason), requestID(c),
-		map[string]any{"repoDirectory": directory, "defaultGitRef": gitRef, "databaseVersion": newVersion})
+		map[string]any{"repoDirectory": directory, "defaultGitRef": gitRef, "googleServicesConfigured": googleServices != "", "databaseVersion": newVersion})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_SAVE_FAILED", "Unable to save the build configuration")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"repoDirectory": directory, "defaultGitRef": gitRef, "version": newVersion})
+	c.JSON(http.StatusOK, gin.H{"repoDirectory": directory, "defaultGitRef": gitRef, "googleServicesConfigured": googleServices != "", "version": newVersion})
 }
 
 func (s *server) tenantSlug(ctx context.Context, tenant string) (string, error) {

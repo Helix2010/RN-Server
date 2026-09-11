@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.17"
+    "version": "2026.09.18"
   },
   "paths": {
     "/health/live": {
@@ -1949,6 +1949,51 @@
         }
       }
     },
+    "/v1/admin/build-keystore": {
+      "get": {
+        "summary": "Android signing keystore status (metadata only)",
+        "description": "Returns {configured, keyAlias, keystoreSha256, version, updatedBy, updatedAt}. The sealed bundle itself is never returned to admin readers; only the build-agent channel receives it. The server cannot open the bundle in any case: it is sealed with an operator passphrase the server does not have, and the server only wraps it with the storage master key on top.",
+        "responses": {
+          "200": {
+            "description": "Keystore status"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          }
+        }
+      },
+      "put": {
+        "summary": "Upload the sealed Android signing keystore",
+        "description": "Accepts a bundle produced by `build-keystore seal` on the operator's machine. The server validates the envelope shape and the KDF parameters, wraps it with the storage master key and stores it per tenant. It deliberately cannot decrypt the inner bundle: the Android signing key is never used by the server at runtime, and a leak of it cannot be remediated for direct distribution, so the server must not hold the ability to read it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildKeystoreWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved"
+          },
+          "400": {
+            "description": "INVALID_BUILD_KEYSTORE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_BUILD_KEYSTORE"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_SAVE_FAILED"
+          }
+        }
+      }
+    },
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
@@ -3061,6 +3106,92 @@
             "type": "string",
             "maxLength": 200,
             "default": "main"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SealedKeystore": {
+        "type": "object",
+        "required": [
+          "v",
+          "kdf",
+          "n",
+          "r",
+          "p",
+          "salt",
+          "nonce",
+          "ciphertext"
+        ],
+        "description": "scrypt + AES-256-GCM envelope produced on the operator's machine. The server checks the shape and refuses weakened KDF parameters, but never holds the passphrase.",
+        "properties": {
+          "v": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "kdf": {
+            "type": "string",
+            "enum": [
+              "scrypt"
+            ]
+          },
+          "n": {
+            "type": "integer",
+            "minimum": 65536
+          },
+          "r": {
+            "type": "integer",
+            "minimum": 8
+          },
+          "p": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "salt": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "ciphertext": {
+            "type": "string"
+          }
+        }
+      },
+      "BuildKeystoreWrite": {
+        "type": "object",
+        "required": [
+          "sealed",
+          "keyAlias",
+          "keystoreSha256",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "sealed": {
+            "$ref": "#/components/schemas/SealedKeystore"
+          },
+          "keyAlias": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "keystoreSha256": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "sha256 of the keystore file, so operators can tell which key a tenant is set to sign with"
           },
           "expectedVersion": {
             "type": "integer",

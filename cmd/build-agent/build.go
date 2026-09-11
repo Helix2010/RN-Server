@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
 
 // logBuffer 只留尾部若干行。完整日志留在构建机上，上报的是够定位失败的那一段。
@@ -145,6 +149,32 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 		"EXPO_PUBLIC_TENANT="+job.TenantDirectory,
 	)
 
+	if strings.TrimSpace(job.GoogleServicesJSON) != "" {
+		decoded, err := base64.StdEncoding.DecodeString(job.GoogleServicesJSON)
+		if err != nil {
+			return result, fmt.Errorf("googleServicesJson is not base64: %w", err)
+		}
+		googleServices := filepath.Join(worktree, "google-services.json")
+		if err := os.WriteFile(googleServices, decoded, 0o644); err != nil {
+			return result, err
+		}
+		env = append(env, "GOOGLE_SERVICES_JSON="+googleServices)
+		buf.add("google-services.json written from the tenant build configuration")
+	}
+
+	// 签名密钥：服务端转交盒子，口令只在这台机器上。开出来写进任务工作区，
+	// 0600，构建完随 worktree 一起删。
+	keystorePath, keystoreEnv, secrets, err := unsealKeystore(cfg, job, worktree)
+	if err != nil {
+		return result, err
+	}
+	// 口令是运行时才知道的，必须登记进脱敏器；Gradle 失败时很乐意把命令行打出来
+	for _, secret := range secrets {
+		buf.red.add(secret)
+	}
+	buf.add("keystore unsealed to " + filepath.Base(keystorePath))
+	env = append(env, keystoreEnv...)
+
 	if err := run(ctx, buf, worktree, env, "pnpm", "install", "--frozen-lockfile"); err != nil {
 		return result, err
 	}
@@ -173,4 +203,40 @@ func removeWorktree(cfg config, job claimedJob, buf *logBuffer) {
 	defer cancel()
 	_ = run(ctx, buf, cfg.Workspace, os.Environ(), "git", "-C", cfg.Repo, "worktree", "remove", "--force", worktree)
 	_ = os.RemoveAll(worktree)
+}
+
+// unsealKeystore 把服务端转交的盒子用本机口令打开，落成一个只有构建期间存在的
+// keystore 文件，并返回构建脚本要的那几个环境变量。
+//
+// 服务端从头到尾没有这个口令，所以它转交的东西对它自己也是不可读的——这正是把
+// 签名密钥放进数据库还能成立的原因。
+func unsealKeystore(cfg config, job claimedJob, worktree string) (string, []string, []string, error) {
+	if job.SealedKeystore == nil {
+		return "", nil, nil, fmt.Errorf("tenant %s has no signing keystore configured; upload one with build-keystore seal before building", job.TenantSlug)
+	}
+	if strings.TrimSpace(cfg.KeystorePassphrase) == "" {
+		return "", nil, nil, errors.New("BUILD_KEYSTORE_PASSPHRASE is not set on this build machine, so the sealed keystore cannot be opened")
+	}
+	bundle, err := buildkeystore.Open(*job.SealedKeystore, cfg.KeystorePassphrase)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("cannot open the sealed keystore: %w", err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(bundle.KeystoreBase64)
+	if err != nil || len(raw) == 0 {
+		return "", nil, nil, errors.New("the sealed keystore does not contain a keystore")
+	}
+	path := filepath.Join(worktree, ".build-keystore.jks")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return "", nil, nil, err
+	}
+	alias := bundle.KeyAlias
+	if strings.TrimSpace(job.KeyAlias) != "" {
+		alias = job.KeyAlias
+	}
+	return path, []string{
+		"ANDROID_RELEASE_KEYSTORE_PATH=" + path,
+		"ANDROID_RELEASE_KEYSTORE_PASSWORD=" + bundle.StorePassword,
+		"ANDROID_RELEASE_KEY_ALIAS=" + alias,
+		"ANDROID_RELEASE_KEY_PASSWORD=" + bundle.KeyPassword,
+	}, []string{bundle.StorePassword, bundle.KeyPassword}, nil
 }

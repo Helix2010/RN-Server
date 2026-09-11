@@ -411,6 +411,21 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	view := buildJobView(job)
 	view["tenantSlug"] = slug
 	view["tenantDirectory"] = buildCfg.RepoDirectory
+	view["googleServicesJson"] = nullableString(buildCfg.GoogleServicesJSON)
+	// 签名密钥以**服务端打不开的盒子**下发。打包机本地持有封装口令，自己开。
+	// 没配就留 null，代理会当场失败并说清楚缺什么。
+	sealedKeystore, keyAlias, err := s.sealedBuildKeystoreFor(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
+		return
+	}
+	if len(sealedKeystore) == 0 {
+		view["sealedKeystore"] = nil
+		view["keyAlias"] = nil
+	} else {
+		view["sealedKeystore"] = sealedKeystore
+		view["keyAlias"] = nullableString(keyAlias)
+	}
 	record, err := s.otaSigningRecord(c.Request.Context(), job.TenantID)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "OTA_SIGNING_CONFIG_INVALID", "Stored ota.signing configuration is invalid")

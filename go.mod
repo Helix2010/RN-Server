@@ -1,6 +1,6 @@
 module github.com/Helix2010/RN-Server
 
-go 1.24.0
+go 1.26.0
 
 require (
 	github.com/avast/apkverifier v0.0.0-20260710162049-d0e1a791cd5a
@@ -16,6 +16,7 @@ require (
 	golang.org/x/crypto v0.41.0
 	golang.org/x/mod v0.27.0
 	golang.org/x/oauth2 v0.30.0
+	golang.org/x/term v0.46.0
 )
 
 require (
@@ -59,7 +60,7 @@ require (
 	github.com/ugorji/go/codec v1.2.12 // indirect
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/net v0.42.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

@@ -209,3 +209,26 @@ func TestTenantDirectoryMustStayInsideTenants(t *testing.T) {
 		}
 	}
 }
+
+// keystore 口令是**运行时**从盒子里开出来的，不在进程环境里。不把它登记进脱敏器，
+// Gradle 一旦把命令行打出来，口令就直接进了数据库和管理端界面。
+func TestRuntimeSecretsAreRedactedAfterRegistration(t *testing.T) {
+	red := newRedactor()
+	buf := newLogBuffer(red)
+	buf.add("gradle -Pstore=unsealed-store-password")
+	// 登记之前是原样留着的——这正是不登记会发生的事
+	if !strings.Contains(strings.Join(buf.snapshot(), "\n"), "unsealed-store-password") {
+		t.Fatal("the fixture is wrong: the secret should be visible before registration")
+	}
+	red.add("unsealed-store-password")
+	buf.add("gradle -Pstore=unsealed-store-password")
+	last := buf.snapshot()
+	if strings.Contains(last[len(last)-1], "unsealed-store-password") {
+		t.Fatalf("a registered runtime secret still leaked: %s", last[len(last)-1])
+	}
+	// 太短的不参与替换：三五个字母到处都是，替换它等于毁掉日志
+	red.add("abc")
+	if red.line("abc def") != "abc def" {
+		t.Fatal("a very short runtime secret was used for substring replacement")
+	}
+}
