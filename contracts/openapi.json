@@ -1722,7 +1722,7 @@
           },
           "releaseNotes": {
             "type": "object",
-            "description": "Release notes keyed by language code; each value is one line per array entry. Any other shape is rejected with 422 INVALID_RELEASE_NOTES.",
+            "description": "Release notes keyed by language code; each value is one line per array entry. Language codes and lines are stored trimmed. Any other shape, a blank-after-trim line, an empty array, or two keys that collide once trimmed is rejected with 422 INVALID_RELEASE_NOTES. POST /v1/admin/releases validates the same field the same way.",
             "additionalProperties": {
               "type": "array",
               "minItems": 1,

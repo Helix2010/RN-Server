@@ -280,3 +280,49 @@ func TestOTAObjectRecordRejectsAnEmptyETag(t *testing.T) {
 		t.Fatalf("recorded = %+v %v %v", entry, state, err)
 	}
 }
+
+// 真正出问题的是"写入路径没有调用校验"，所以除了校验函数本身，
+// 还要从请求这一层确认两个保存接口都会拒绝错误的形状。
+func TestSaveOTAReleaseRejectsStringReleaseNotes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/admin/ota/releases", strings.NewReader(
+		`{"artifactToken":"t","baseReleaseId":"rel_1","channel":"production","applyStrategy":"immediate","releaseNotes":{"zh-CN":"写成了字符串"}}`,
+	))
+
+	(&server{}).saveOTARelease(context)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d body %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("problem body must be JSON: %v", err)
+	}
+	if body["code"] != "INVALID_RELEASE_NOTES" {
+		t.Fatalf("expected INVALID_RELEASE_NOTES, got %v", body["code"])
+	}
+}
+
+func TestCreateReleaseFromArtifactRejectsStringReleaseNotes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/admin/releases", strings.NewReader(
+		`{"artifactToken":"t","platform":"android","version":"1.3.1","buildNumber":27,"releaseNotes":{"zh-CN":"写成了字符串"},"mandatory":false}`,
+	))
+
+	(&server{}).createReleaseFromArtifact(context)
+
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d body %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("problem body must be JSON: %v", err)
+	}
+	if body["code"] != "INVALID_RELEASE_NOTES" {
+		t.Fatalf("expected INVALID_RELEASE_NOTES, got %v", body["code"])
+	}
+}

@@ -51,6 +51,100 @@ var migrations = []migration{
 	{version: 35, name: "installation_runtime_report", apply: installationRuntimeReportMigration},
 	{version: 36, name: "wallet_user_installation", apply: walletUserInstallationMigration},
 	{version: 37, name: "ota_object_metadata", apply: otaObjectMetadataMigration},
+	{version: 38, name: "release_notes_line_arrays", apply: releaseNotesLineArraysMigration},
+}
+
+// releaseNotesLineArraysMigration 修复 release_notes 里被写成字符串的发布说明。
+// 正式形状是"语言 -> 行数组"：管理端按这个形状做 Zod 严格校验（一条不符就整份列表
+// 打不开），bootstrap 也按 map[string][]string 解析（解析失败会让整段升级信息连同
+// mandatory 标记一起消失）。写入侧现在会拒绝别的形状，历史数据在这里一次性改正，
+// 不在读路径上容忍。字符串按单行数组处理，认不出的值（数字、对象、null）丢掉。
+func releaseNotesLineArraysMigration(ctx context.Context, db *sql.DB) error {
+	for _, table := range []string{"app_releases", "ota_releases"} {
+		if err := repairReleaseNotesTable(ctx, db, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func repairReleaseNotesTable(ctx context.Context, db *sql.DB, table string) error {
+	rows, err := db.QueryContext(ctx, "SELECT id, release_notes FROM "+table)
+	if err != nil {
+		return err
+	}
+	repairs := map[string][]byte{}
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		if len(raw) == 0 {
+			continue
+		}
+		var canonical map[string][]string
+		if json.Unmarshal(raw, &canonical) == nil {
+			continue
+		}
+		var loose map[string]any
+		if err := json.Unmarshal(raw, &loose); err != nil {
+			// 连 JSON 都不是：留给人工处理，不猜内容
+			rows.Close()
+			return fmt.Errorf("%s %s: release_notes is not a JSON object", table, id)
+		}
+		fixed, err := json.Marshal(releaseNotesFromLooseShape(loose))
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		repairs[id] = fixed
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for id, fixed := range repairs {
+		if _, err := db.ExecContext(ctx, "UPDATE "+table+" SET release_notes=? WHERE id=?", fixed, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// releaseNotesFromLooseShape 把历史上存进去的松散形状收敛成"语言 -> 行数组"：
+// 字符串当成一行，数组里只留非空字符串，其它值没有可靠含义、直接丢。
+func releaseNotesFromLooseShape(loose map[string]any) map[string][]string {
+	notes := map[string][]string{}
+	for language, value := range loose {
+		code := strings.TrimSpace(language)
+		if code == "" {
+			continue
+		}
+		var lines []string
+		switch typed := value.(type) {
+		case string:
+			if trimmed := strings.TrimSpace(typed); trimmed != "" {
+				lines = []string{trimmed}
+			}
+		case []any:
+			for _, item := range typed {
+				line, ok := item.(string)
+				if !ok {
+					continue
+				}
+				if trimmed := strings.TrimSpace(line); trimmed != "" {
+					lines = append(lines, trimmed)
+				}
+			}
+		}
+		if len(lines) > 0 {
+			notes[code] = lines
+		}
+	}
+	return notes
 }
 
 // chainTokenLogoColorNoDefaultMigration 去掉 logo_color 的空串默认值：字段已是必填，

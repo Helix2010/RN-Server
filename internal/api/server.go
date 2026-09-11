@@ -1594,40 +1594,43 @@ func text(v any, fallback string) string {
 	return fallback
 }
 
-// normalizeReleaseNotes 把写入侧收到的发布说明收敛成唯一的正式形状：语言 -> 行数组。
-// 读取侧（bootstrap 下发、管理端列表）都按这个形状解析，所以写入时就必须挡住别的形状——
-// 曾经有人用管理接口直接写进字符串，管理端整份列表因此校验失败。
-// 允许缺省（nil / 空对象）；给了就必须是数组，每一项非空字符串，语言码非空。
-func normalizeReleaseNotes(raw map[string]any) (map[string][]string, string) {
-	if len(raw) == 0 {
-		return map[string][]string{}, ""
-	}
+// normalizeReleaseNotes 把写入侧收到的发布说明收敛成唯一的正式形状：语言 -> 行数组，
+// 语言码与每一行都去掉首尾空白后存库。读取侧（bootstrap 下发、管理端列表）都按这个形状
+// 解析，所以写入时就必须挡住别的形状——曾经有人用管理接口直接写进字符串，管理端整份
+// 列表因此校验失败。允许缺省（nil / 空对象）；给了就必须是数组，每一项是非空字符串。
+// 返回 (problem code, detail)，两个写入路径共用同一个错误码，不各自抄一份字面量。
+func normalizeReleaseNotes(raw map[string]any) (map[string][]string, string, string) {
 	notes := make(map[string][]string, len(raw))
 	for language, value := range raw {
-		if strings.TrimSpace(language) == "" {
-			return nil, "releaseNotes keys must be non-empty language codes"
+		code := strings.TrimSpace(language)
+		if code == "" {
+			return nil, "INVALID_RELEASE_NOTES", "releaseNotes keys must be non-empty language codes"
+		}
+		if _, duplicate := notes[code]; duplicate {
+			return nil, "INVALID_RELEASE_NOTES", "releaseNotes keys must be distinct once trimmed"
 		}
 		items, ok := value.([]any)
 		if !ok {
-			return nil, "releaseNotes values must be arrays of strings, one entry per line"
+			return nil, "INVALID_RELEASE_NOTES", "releaseNotes values must be arrays of strings, one entry per line"
 		}
 		lines := make([]string, 0, len(items))
 		for _, item := range items {
 			line, ok := item.(string)
 			if !ok {
-				return nil, "releaseNotes values must be arrays of strings, one entry per line"
+				return nil, "INVALID_RELEASE_NOTES", "releaseNotes values must be arrays of strings, one entry per line"
 			}
-			if strings.TrimSpace(line) == "" {
-				return nil, "releaseNotes lines must not be blank"
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				return nil, "INVALID_RELEASE_NOTES", "releaseNotes lines must not be blank"
 			}
-			lines = append(lines, line)
+			lines = append(lines, trimmed)
 		}
 		if len(lines) == 0 {
-			return nil, "releaseNotes languages must carry at least one line"
+			return nil, "INVALID_RELEASE_NOTES", "releaseNotes languages must carry at least one line"
 		}
-		notes[language] = lines
+		notes[code] = lines
 	}
-	return notes, ""
+	return notes, "", ""
 }
 
 func releaseNotesForLocale(notes map[string][]string, locale string) []string {
@@ -1637,12 +1640,19 @@ func releaseNotesForLocale(notes map[string][]string, locale string) []string {
 	if fallback := notes["zh-CN"]; len(fallback) > 0 {
 		return fallback
 	}
-	for _, value := range notes {
-		if len(value) > 0 {
-			return value
+	// 既没有请求的语言也没有 zh-CN：按语言码排序取第一个，
+	// 否则 map 迭代顺序会让同一份数据在不同请求里返回不同语言
+	languages := make([]string, 0, len(notes))
+	for language := range notes {
+		if len(notes[language]) > 0 {
+			languages = append(languages, language)
 		}
 	}
-	return []string{}
+	if len(languages) == 0 {
+		return []string{}
+	}
+	sort.Strings(languages)
+	return notes[languages[0]]
 }
 func nullableString(v string) any {
 	if v == "" {

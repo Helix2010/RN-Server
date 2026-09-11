@@ -123,8 +123,13 @@ func (s *server) listOTAReleases(c *gin.Context) {
 			problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 			return
 		}
-		var noteValue map[string]any
-		_ = json.Unmarshal([]byte(notes), &noteValue)
+		// 按公开契约的形状解析：语言 -> 行数组。写入侧已拒绝别的形状，库里再出现
+		// 就是数据事故，整份列表直接失败，不把不符合契约的响应交给管理端
+		var noteValue map[string][]string
+		if err := json.Unmarshal([]byte(notes), &noteValue); err != nil {
+			problem(c, 500, "OTA_RELEASE_NOTES_CORRUPT", "Stored release notes do not match the published shape")
+			return
+		}
 		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": st, "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
 	}
 	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
@@ -145,8 +150,11 @@ func (s *server) otaReleaseDetail(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "OTA_QUERY_FAILED", "Unable to load OTA release")
 		return
 	}
-	var releaseNotes map[string]any
-	_ = json.Unmarshal(notes, &releaseNotes)
+	var releaseNotes map[string][]string
+	if err := json.Unmarshal(notes, &releaseNotes); err != nil {
+		problem(c, 500, "OTA_RELEASE_NOTES_CORRUPT", "Stored release notes do not match the published shape")
+		return
+	}
 	baseMetadata := map[string]any{}
 	var rawBaseMetadata []byte
 	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT file_metadata FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), baseID).Scan(&rawBaseMetadata); err == nil {
@@ -300,9 +308,9 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 422, "INVALID_OTA_APPLY_STRATEGY", "applyStrategy must be next_launch or immediate")
 		return
 	}
-	releaseNotes, notesProblem := normalizeReleaseNotes(body.ReleaseNotes)
-	if notesProblem != "" {
-		problem(c, 422, "INVALID_RELEASE_NOTES", notesProblem)
+	releaseNotes, notesCode, notesDetail := normalizeReleaseNotes(body.ReleaseNotes)
+	if notesCode != "" {
+		problem(c, 422, notesCode, notesDetail)
 		return
 	}
 	v, err := s.decodeOTAUploadToken(tenantID(c), body.ArtifactToken)
@@ -492,11 +500,8 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	uploadedKeys = append(uploadedKeys, manifestKey)
 	rawObjectMetadata, _ := json.Marshal(objectMetadata)
 	hash := sha256.Sum256(finalManifest)
-	notes, err := json.Marshal(releaseNotes)
-	if err != nil {
-		problem(c, 500, "OTA_CREATE_FAILED", "Unable to encode release notes")
-		return
-	}
+	// map[string][]string 一定能序列化，没有需要处理的错误分支
+	notes, _ := json.Marshal(releaseNotes)
 	conn, err := s.db.Conn(c.Request.Context())
 	if err != nil {
 		problem(c, 500, "OTA_CREATE_FAILED", "Unable to create OTA release")
