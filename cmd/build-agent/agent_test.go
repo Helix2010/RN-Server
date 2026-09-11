@@ -232,3 +232,52 @@ func TestRuntimeSecretsAreRedactedAfterRegistration(t *testing.T) {
 		t.Fatal("a very short runtime secret was used for substring replacement")
 	}
 }
+
+// needle 必须落在 PEM 的**一整行**里：每 64 个字符换一次行，跨行取会因为换行符
+// 而在包里永远找不到——那会让这道检查变成一条恒假的断言，比没有更坏。
+func TestCertificateNeedleComesFromASingleLine(t *testing.T) {
+	pem := "-----BEGIN CERTIFICATE-----\n" +
+		strings.Repeat("A", 64) + "\n" +
+		strings.Repeat("B", 64) + "\n" +
+		strings.Repeat("C", 64) + "\n" +
+		"-----END CERTIFICATE-----\n"
+	needle := certificateNeedle(pem)
+	if len(needle) != 48 {
+		t.Fatalf("needle is %d characters", len(needle))
+	}
+	if strings.Contains(needle, "\n") || strings.Contains(needle, "-----") {
+		t.Fatalf("needle crosses a line or includes the armour: %q", needle)
+	}
+	if !strings.Contains(pem, needle) {
+		t.Fatal("the needle cannot be found in the certificate it came from")
+	}
+	// 太短、空的、只有头尾的都不能硬凑出一个 needle——那会让检查恒真或恒假
+	for name, input := range map[string]string{
+		"empty":      "",
+		"armour":     "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+		"one line":   "-----BEGIN CERTIFICATE-----\n" + strings.Repeat("A", 64) + "\n-----END CERTIFICATE-----\n",
+		"short line": "-----BEGIN CERTIFICATE-----\nAA\nBB\nCC\n-----END CERTIFICATE-----\n",
+	} {
+		if certificateNeedle(input) != "" {
+			t.Fatalf("%s produced a needle anyway", name)
+		}
+	}
+}
+
+// AndroidManifest.xml 的字符串池是 UTF-16LE。只按 UTF-8 找，这道检查就成了恒假
+// 的断言——2026-09-11 第一版正是如此，一个内容完全正确的包被判成"没编进证书"。
+func TestUTF16LEMatchesHowAndroidStoresManifestStrings(t *testing.T) {
+	got := utf16LE("AB")
+	want := []byte{'A', 0, 'B', 0}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+	if len(utf16LE("")) != 0 {
+		t.Fatal("an empty string produced bytes")
+	}
+}

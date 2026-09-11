@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -153,12 +155,21 @@ func (c *client) uploadArtifact(ctx context.Context, jobID, path string) (string
 		return "", err
 	}
 	request.ContentLength = info.Size()
+	// GetBody 让传输层在需要重试时能把请求体从头再读一遍。没有它，一次 h2 流错误
+	// 就直接失败在 "cannot retry ... after Request.Body was written"——2026-09-11
+	// 第一次真实回传就是这么挂的，包已经构建出来了却传不上去。
+	request.GetBody = func() (io.ReadCloser, error) { return os.Open(path) }
 	for key, value := range ticket.Upload.Headers {
 		request.Header.Set(key, value)
 	}
 	request.Header.Set("x-build-agent-token", c.cfg.Token)
-	// 传一个几十上百兆的包，30 秒的默认超时肯定不够
-	uploader := &http.Client{Timeout: 30 * time.Minute}
+	// 传一个几十上百兆的包，30 秒的默认超时肯定不够。
+	// 强制 HTTP/1.1：几十兆的 PUT 经过反代链路时 h2 的流错误比 1.1 常见得多，
+	// 而这条路径没有任何需要多路复用的理由。
+	uploader := &http.Client{
+		Timeout:   30 * time.Minute,
+		Transport: &http.Transport{ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}},
+	}
 	response, err := uploader.Do(request)
 	if err != nil {
 		return "", err
@@ -168,13 +179,20 @@ func (c *client) uploadArtifact(ctx context.Context, jobID, path string) (string
 	if response.StatusCode >= 400 {
 		return "", fmt.Errorf("artifact upload returned %d: %s", response.StatusCode, truncate(string(payload), 300))
 	}
+	// 服务端把发布记录包在 "release" 里；第一版按 {"id":...} 解，结果任务上的
+	// releaseId 一直是空——产物其实已经入库了，只是任务行上看不见它
 	var release struct {
-		ID string `json:"id"`
+		Release struct {
+			ID string `json:"id"`
+		} `json:"release"`
 	}
 	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
 		"artifactToken": ticket.Artifact.Token,
 	}, &release); err != nil {
 		return "", err
 	}
-	return release.ID, nil
+	if release.Release.ID == "" {
+		return "", errors.New("the server created a release but did not say which one")
+	}
+	return release.Release.ID, nil
 }

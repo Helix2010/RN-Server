@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -190,6 +192,10 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 		return result, fmt.Errorf("the build reported success but %s is not there: %w", filepath.Base(artifact), err)
 	}
 	result.ArtifactPath = artifact
+	if err := verifyEmbeddedCertificate(artifact, job.OTACertificatePEM); err != nil {
+		return result, err
+	}
+	buf.add("embedded OTA certificate matches " + job.OTACertificateSHA256)
 	if result.SHA256, err = fileSHA256(artifact); err != nil {
 		return result, err
 	}
@@ -241,4 +247,77 @@ func unsealKeystore(cfg config, job claimedJob, worktree string) (string, []stri
 		"ANDROID_RELEASE_KEY_ALIAS=" + alias,
 		"ANDROID_RELEASE_KEY_PASSWORD=" + bundle.KeyPassword,
 	}, []string{bundle.StorePassword, bundle.KeyPassword}, nil
+}
+
+// verifyEmbeddedCertificate 确认产物里真的编进了这个租户当前那张 OTA 证书。
+//
+// 这是"包里的证书"与"服务端当前签名用的密钥"之间最后一道扣子。扣错了的表现是
+// 所有设备静默停在内置 bundle——设备上完全看不出来，只有服务端日志里有一条
+// warning，而那时包已经发出去了。
+//
+// 做法是在 APK 里找证书 base64 正文的一段。expo-updates 运行时读的是
+// AndroidManifest 的 expo.modules.updates.CODE_SIGNING_CERTIFICATE，而那个值可能
+// 是字面量也可能是资源引用——与其解析两种形态，不如直接确认这串内容确实在包里。
+func verifyEmbeddedCertificate(apkPath, certificatePEM string) error {
+	needle := certificateNeedle(certificatePEM)
+	if needle == "" {
+		return errors.New("the job certificate is too short to check against the package")
+	}
+	archive, err := zip.OpenReader(apkPath)
+	if err != nil {
+		return fmt.Errorf("cannot read the built package: %w", err)
+	}
+	defer archive.Close()
+	for _, entry := range archive.File {
+		if entry.UncompressedSize64 > 64<<20 {
+			continue
+		}
+		reader, err := entry.Open()
+		if err != nil {
+			continue
+		}
+		content, err := io.ReadAll(io.LimitReader(reader, 64<<20))
+		reader.Close()
+		if err != nil {
+			continue
+		}
+		// AndroidManifest.xml 的字符串池是 UTF-16LE，只按 UTF-8 找会一条都找不到
+		// ——那样这道检查就成了恒假的断言，比没有更坏。2026-09-11 第一版就是这样，
+		// 一个内容完全正确的包被判成"没编进证书"。
+		if bytes.Contains(content, []byte(needle)) || bytes.Contains(content, utf16LE(needle)) {
+			return nil
+		}
+	}
+	return errors.New("the built package does not contain this tenant's OTA signing certificate: every device would silently refuse updates and stay on the embedded bundle")
+}
+
+// certificateNeedle 取证书 base64 正文中间一整行里的一段。整行取是因为 PEM 每 64
+// 个字符换一次行，跨行取会因为换行符而找不到。
+func certificateNeedle(certificatePEM string) string {
+	lines := []string{}
+	for _, line := range strings.Split(certificatePEM, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "-----") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	if len(lines) < 3 {
+		return ""
+	}
+	middle := lines[len(lines)/2]
+	if len(middle) < 48 {
+		return ""
+	}
+	return middle[:48]
+}
+
+// utf16LE 把 ASCII 串转成 Android 字符串池用的那种编码。证书正文是 base64，
+// 全部落在 ASCII 范围内，所以每个字节后面补一个 0 就够了。
+func utf16LE(text string) []byte {
+	out := make([]byte, 0, len(text)*2)
+	for i := 0; i < len(text); i++ {
+		out = append(out, text[i], 0)
+	}
+	return out
 }
