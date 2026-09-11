@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.18"
+    "version": "2026.09.19"
   },
   "paths": {
     "/health/live": {
@@ -2110,6 +2110,90 @@
           },
           "409": {
             "description": "BUILD_JOB_NOT_RUNNING"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/artifact-uploads": {
+      "post": {
+        "summary": "Create an artifact upload ticket for a running build",
+        "description": "Same ticket the admin upload flow issues, scoped to the job's tenant. The upload URL points at the build-agent channel because the agent holds no admin credential. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "responses": {
+          "201": {
+            "description": "Upload ticket"
+          },
+          "400": {
+            "description": "INVALID_ARTIFACT_UPLOAD"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_RUNNING"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/artifact": {
+      "put": {
+        "summary": "Upload the built artifact bytes",
+        "description": "Proxy-mode upload of the APK; direct mode uploads straight to object storage with the presigned URL from the ticket. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "responses": {
+          "200": {
+            "description": "Stored"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_RUNNING"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/release": {
+      "post": {
+        "summary": "Turn the uploaded artifact into a release record",
+        "description": "Platform, version and build number are taken from the build job row, never from the request body: those three define the artifact's identity and the job row already passed the monotonic build-number check. Runs the same APK identity inspection, ETag pinning and signer fingerprint gate as a manual upload. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "artifactToken"
+                ],
+                "properties": {
+                  "artifactToken": {
+                    "type": "string"
+                  },
+                  "releaseNotes": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Release created"
+          },
+          "400": {
+            "description": "INVALID_RELEASE"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_RUNNING"
+          },
+          "422": {
+            "description": "RELEASE_FILE_INVALID, RELEASE_IDENTITY_MISMATCH"
           }
         }
       }

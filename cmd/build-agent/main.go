@@ -13,9 +13,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -93,6 +95,19 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 	}()
 
 	result, buildErr := buildJob(buildCtx, cfg, job, buf)
+
+	// 产物必须在删掉 worktree **之前**传走。第一版把删除放在前面，于是构建成功
+	// 之后包就没了，只剩一个 sha256——"成功"却拿不到任何可分发的东西。
+	releaseID := ""
+	if buildErr == nil {
+		buf.add("uploading " + filepath.Base(result.ArtifactPath))
+		releaseID, buildErr = api.uploadArtifact(buildCtx, job.ID, result.ArtifactPath)
+		if buildErr != nil {
+			buildErr = fmt.Errorf("the package was built but could not be uploaded: %w", buildErr)
+		} else {
+			buf.add("release " + releaseID)
+		}
+	}
 	close(beats)
 	removeWorktree(cfg, job, buf)
 
@@ -112,10 +127,10 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 		})
 		return true
 	}
-	slog.Info("build succeeded", "job", job.ID, "commit", result.CommitSHA, "sha256", result.SHA256)
+	slog.Info("build succeeded", "job", job.ID, "commit", result.CommitSHA, "sha256", result.SHA256, "release", releaseID)
 	// releaseId 留空：产物上传接入在阶段 2b 的下一步，现在先把构建结果与指纹落回去
 	report(reportCtx, job.ID, "result", func(ctx context.Context) error {
-		return api.complete(ctx, job.ID, result.CommitSHA, result.SHA256, "", buf.snapshot())
+		return api.complete(ctx, job.ID, result.CommitSHA, result.SHA256, releaseID, buf.snapshot())
 	})
 	return true
 }

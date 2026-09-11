@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/buildkeystore"
@@ -113,4 +115,66 @@ func truncate(text string, max int) string {
 		return text
 	}
 	return text[:max] + "…"
+}
+
+type uploadTicket struct {
+	Artifact struct {
+		Token string `json:"token"`
+	} `json:"artifact"`
+	Upload struct {
+		Method  string            `json:"method"`
+		URL     string            `json:"url"`
+		Headers map[string]string `json:"headers"`
+	} `json:"upload"`
+}
+
+// uploadArtifact 把产物传回服务端，返回它落成的发布记录 id。
+//
+// 走的是与人工上传**完全相同**的入库路径——APK 身份解析、ETag 固定、签名指纹
+// 比对都在服务端那一侧，代理不复制其中任何一条。
+func (c *client) uploadArtifact(ctx context.Context, jobID, path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	var ticket uploadTicket
+	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/artifact-uploads", map[string]any{
+		"fileName": filepath.Base(path), "contentType": "application/vnd.android.package-archive", "size": info.Size(),
+	}, &ticket); err != nil {
+		return "", err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, ticket.Upload.URL, file)
+	if err != nil {
+		return "", err
+	}
+	request.ContentLength = info.Size()
+	for key, value := range ticket.Upload.Headers {
+		request.Header.Set(key, value)
+	}
+	request.Header.Set("x-build-agent-token", c.cfg.Token)
+	// 传一个几十上百兆的包，30 秒的默认超时肯定不够
+	uploader := &http.Client{Timeout: 30 * time.Minute}
+	response, err := uploader.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode >= 400 {
+		return "", fmt.Errorf("artifact upload returned %d: %s", response.StatusCode, truncate(string(payload), 300))
+	}
+	var release struct {
+		ID string `json:"id"`
+	}
+	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
+		"artifactToken": ticket.Artifact.Token,
+	}, &release); err != nil {
+		return "", err
+	}
+	return release.ID, nil
 }

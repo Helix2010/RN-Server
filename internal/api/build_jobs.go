@@ -1,10 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -553,4 +555,78 @@ func sqlNullableString(v string) any {
 		return nil
 	}
 	return v
+}
+
+// ---- 产物回传 ----
+//
+// 代理不自己拼一条入库路径，而是**复用人工上传的那条**：APK 身份解析、ETag 固定、
+// 签名指纹比对、权限清单核对，一条都不少。复制一份出来迟早会漏掉其中一条，而漏掉
+// 的那条正是门禁存在的理由。
+//
+// 做法是把任务的租户放进上下文，然后交给现成的处理函数。代理通道的身份是固定的
+// `build-agent`，不采用它自报的机器名——自报身份任何持钥者都能随便写，写进审计
+// 就成了攻击者可控的字段（与 x-admin-id 同一条教训）。哪台机器干的，看任务行的
+// claimed_by。
+
+const buildAgentActor = "build-agent"
+
+// buildAgentJobScope 校验任务还在进行中，并把它的租户装进上下文。
+func (s *server) buildAgentJobScope(next gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		job, err := s.loadBuildJob(c, "", c.Param("id"))
+		if err != nil {
+			return
+		}
+		if job.Status != "claimed" && job.Status != "running" {
+			problem(c, http.StatusConflict, "BUILD_JOB_NOT_RUNNING", "This build is not claimed or running")
+			return
+		}
+		c.Set("tenantId", job.TenantID)
+		c.Set("actorId", buildAgentActor)
+		c.Set("buildAgent", true)
+		c.Set("buildJob", job)
+		next(c)
+	}
+}
+
+// buildAgentUploadsArtifact 告诉产物上传票据：回传地址要给代理通道的那一条，
+// 不是管理端那条——代理没有管理端凭据。
+func buildAgentUploadsArtifact(c *gin.Context) bool {
+	_, ok := c.Get("buildAgent")
+	return ok
+}
+
+// buildAgentReleaseFromArtifact 让代理用任务参数落一条发布记录。平台、版本、
+// build 号一律取**任务行上的值**，不采信请求体——那三个字段决定产物身份，而任务
+// 行上的那份是管理端排队时就定下、并且过了递增校验的。
+func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
+	item, _ := c.Get("buildJob")
+	job, ok := item.(buildJob)
+	if !ok {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read the build job")
+		return
+	}
+	var body struct {
+		ArtifactToken string         `json:"artifactToken"`
+		ReleaseNotes  map[string]any `json:"releaseNotes"`
+	}
+	if decode(c, &body) != nil || strings.TrimSpace(body.ArtifactToken) == "" {
+		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "artifactToken is required")
+		return
+	}
+	notes := body.ReleaseNotes
+	if notes == nil {
+		notes = map[string]any{}
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"artifactToken": body.ArtifactToken,
+		"platform":      job.Platform,
+		"version":       job.Version,
+		"buildNumber":   job.BuildNumber,
+		"releaseNotes":  notes,
+		"mandatory":     false,
+	})
+	c.Request.Body = io.NopCloser(bytes.NewReader(payload))
+	c.Request.ContentLength = int64(len(payload))
+	s.createReleaseFromArtifact(c)
 }

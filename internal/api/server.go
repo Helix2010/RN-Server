@@ -170,6 +170,10 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
 	agent.POST("/jobs/:id/complete", s.completeBuildJob)
 	agent.POST("/jobs/:id/fail", s.failBuildJob)
+	// 产物回传：三条都先用任务把租户定下来，再交给与人工上传完全相同的处理函数
+	agent.POST("/jobs/:id/artifact-uploads", s.buildAgentJobScope(s.createReleaseArtifactUpload))
+	agent.PUT("/jobs/:id/artifact", s.buildAgentJobScope(s.uploadReleaseArtifact))
+	agent.POST("/jobs/:id/release", s.buildAgentJobScope(s.buildAgentReleaseFromArtifact))
 	current := protected.Group("")
 	current.Use(s.domainTenantScope())
 	current.GET("/tenant", s.currentTenant)
