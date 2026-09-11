@@ -28,7 +28,7 @@ const installationCredentialRotateBefore = 14 * 24 * time.Hour
 // sync; TestInstallationUpsertPlaceholderCount guards the first two.
 const installationCredentialLookupSQL = `SELECT credential_hash,credential_version,credential_expires_at,credential_revoked_at,application_id,platform,status FROM app_installations WHERE tenant_id=? AND application_id=? AND platform=? AND installation_id=? LIMIT 1`
 
-const installationUpsertSQL = `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,launch_source,running_update_id,running_ota_revision,client_session_state,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),launch_source=VALUES(launch_source),running_update_id=VALUES(running_update_id),running_ota_revision=VALUES(running_ota_revision),client_session_state=VALUES(client_session_state),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`
+const installationUpsertSQL = `INSERT INTO app_installations(tenant_id,device_client_id,installation_id,application_id,package_id,platform,distribution_channel,app_version,build_number,runtime_version,ota_channel,ota_revision,launch_source,running_update_id,running_ota_revision,client_session_state,device_integrity,localization_version,branding_version,locale,theme,os_version,device_class,first_seen_at,last_active_at,status,credential_hash,credential_version,credential_expires_at,credential_last_used_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?) ON DUPLICATE KEY UPDATE device_client_id=VALUES(device_client_id),package_id=VALUES(package_id),platform=VALUES(platform),distribution_channel=VALUES(distribution_channel),app_version=VALUES(app_version),build_number=VALUES(build_number),runtime_version=VALUES(runtime_version),ota_channel=VALUES(ota_channel),ota_revision=VALUES(ota_revision),launch_source=VALUES(launch_source),running_update_id=VALUES(running_update_id),running_ota_revision=VALUES(running_ota_revision),client_session_state=VALUES(client_session_state),device_integrity=VALUES(device_integrity),localization_version=VALUES(localization_version),branding_version=VALUES(branding_version),locale=VALUES(locale),theme=VALUES(theme),os_version=VALUES(os_version),device_class=VALUES(device_class),last_active_at=VALUES(last_active_at),credential_hash=COALESCE(credential_hash,VALUES(credential_hash)),credential_version=IF(credential_hash IS NULL,VALUES(credential_version),credential_version),credential_expires_at=COALESCE(credential_expires_at,VALUES(credential_expires_at)),credential_last_used_at=VALUES(credential_last_used_at),status=IF(credential_revoked_at IS NULL,'active',status),updated_at=VALUES(updated_at)`
 
 var installationIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{16,80}$`)
 var deviceSourceHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -43,13 +43,17 @@ type installationHeartbeat struct {
 	LaunchSource    *string `json:"launchSource"`
 	RunningUpdateID *string `json:"runningUpdateId"`
 	// 客户端登录态，只用于与 wallet_session 对账，不参与任何判定
-	SessionState        *string `json:"sessionState"`
-	LocalizationVersion string  `json:"localizationVersion"`
-	BrandingVersion     *int    `json:"brandingVersion"`
-	Locale              string  `json:"locale"`
-	Theme               string  `json:"theme"`
-	OSVersion           string  `json:"osVersion"`
-	DeviceClass         string  `json:"deviceClass"`
+	SessionState *string `json:"sessionState"`
+	// 设备完整性信号（安全评审 N31）。**自报**，不是安全控制：被攻破的客户端
+	// 当然可以说自己没 root。它回答的是"我们的用户里有多少跑在 root 过的设备上"，
+	// 此前这个问题完全没有答案。每一项都可以缺省，探不出来就是 null。
+	DeviceIntegrity     *deviceIntegrityReport `json:"deviceIntegrity"`
+	LocalizationVersion string                 `json:"localizationVersion"`
+	BrandingVersion     *int                   `json:"brandingVersion"`
+	Locale              string                 `json:"locale"`
+	Theme               string                 `json:"theme"`
+	OSVersion           string                 `json:"osVersion"`
+	DeviceClass         string                 `json:"deviceClass"`
 }
 
 type installationCredentialRecord struct {
@@ -310,7 +314,7 @@ func (s *server) saveInstallation(c *gin.Context, body installationHeartbeat, cr
 			return lookupErr
 		}
 	}
-	_, err = tx.ExecContext(c.Request.Context(), installationUpsertSQL, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LaunchSource, body.RunningUpdateID, runningRevision, body.SessionState, body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
+	_, err = tx.ExecContext(c.Request.Context(), installationUpsertSQL, tenantID(c), deviceClientID, body.InstallationID, applicationID, body.PackageID, platform, text(c.GetHeader("x-distribution-channel"), "development"), text(c.GetHeader("x-app-version"), "0"), text(c.GetHeader("x-build-number"), "0"), text(c.GetHeader("x-runtime-version"), "embedded"), body.OTAChannel, body.OTARevision, body.LaunchSource, body.RunningUpdateID, runningRevision, body.SessionState, encodeDeviceIntegrity(body.DeviceIntegrity), body.LocalizationVersion, body.BrandingVersion, body.Locale, body.Theme, body.OSVersion, body.DeviceClass, now, now, credentialHash, credentialVersion, credentialExpires, now, now, now)
 	if err != nil {
 		return err
 	}
@@ -388,4 +392,31 @@ func enqueuePushEvent(ctx context.Context, tx *sql.Tx, tenant, eventType string,
 	now := time.Now().UTC()
 	_, err := tx.ExecContext(ctx, `INSERT INTO app_push_outbox(id,tenant_id,event_type,payload,status,attempts,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,'pending',0,?,?,?)`, "push_"+randomID(16), tenant, eventType, raw, now, now, now)
 	return err
+}
+
+// deviceIntegrityReport 是客户端自报的设备完整性信号（安全评审 N31）。
+//
+// 三态：true / false / 缺省。探针失败与"没有"必须分开——expo-device 的 root 检测
+// 明确标着 experimental，把探不出来算成"干净"会让统计出来的数直接是假的。
+type deviceIntegrityReport struct {
+	Rooted     *bool `json:"rooted"`
+	Emulator   *bool `json:"emulator"`
+	SideLoaded *bool `json:"sideLoaded"`
+	DevBundle  *bool `json:"devBundle"`
+}
+
+// encodeDeviceIntegrity 把信号存成 JSON；没上报就是 NULL，而不是一个全 false 的
+// 对象——那会把"旧版 App 没上报"读成"这台设备干净"。
+func encodeDeviceIntegrity(report *deviceIntegrityReport) any {
+	if report == nil {
+		return nil
+	}
+	if report.Rooted == nil && report.Emulator == nil && report.SideLoaded == nil && report.DevBundle == nil {
+		return nil
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		return nil
+	}
+	return raw
 }

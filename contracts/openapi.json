@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.20"
+    "version": "2026.09.21"
   },
   "paths": {
     "/health/live": {
@@ -774,7 +774,8 @@
           "200": {
             "description": "Installation heartbeat accepted"
           }
-        }
+        },
+        "description": " The optional deviceIntegrity object carries self-reported signals (rooted, emulator, sideLoaded, devBundle). It is not a security control: a compromised client can lie, so it is stored for fleet visibility only and never allows or denies anything. Each field is true, false or absent; absent means the probe failed, which is deliberately kept apart from false so the counts are not silently wrong."
       }
     },
     "/v1/mobile/installations/register": {
@@ -783,7 +784,8 @@
           "201": {
             "description": "Installation registered"
           }
-        }
+        },
+        "description": " The optional deviceIntegrity object carries self-reported signals (rooted, emulator, sideLoaded, devBundle). It is not a security control: a compromised client can lie, so it is stored for fleet visibility only and never allows or denies anything. Each field is true, false or absent; absent means the probe failed, which is deliberately kept apart from false so the counts are not silently wrong."
       }
     },
     "/v1/mobile/languages/{languageCode}/document": {

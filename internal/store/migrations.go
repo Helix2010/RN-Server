@@ -56,6 +56,7 @@ var migrations = []migration{
 	{version: 40, name: "build_jobs", apply: buildJobsMigration},
 	{version: 41, name: "build_jobs_retryable", apply: buildJobsRetryableMigration},
 	{version: 42, name: "build_jobs_release_notes", apply: buildJobsReleaseNotesMigration},
+	{version: 43, name: "installation_device_integrity", apply: installationDeviceIntegrityMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1399,6 +1400,22 @@ func buildJobsReleaseNotesMigration(ctx context.Context, db *sql.DB) error {
 	if err := addColumnIfMissing(ctx, db, "build_jobs", "release_notes",
 		`ALTER TABLE build_jobs ADD COLUMN release_notes JSON NULL COMMENT '发布说明：语言码到字符串数组，随产物一起落进 app_releases。NULL=排队时没填' AFTER reason`); err != nil {
 		return fmt.Errorf("build jobs release notes migration: %w", err)
+	}
+	return nil
+}
+
+// installationDeviceIntegrityMigration 存设备完整性信号（安全评审 N31）。
+//
+// 这是**自报**的信号，不是安全控制：被攻破的客户端当然可以说自己没 root。它的用处
+// 是舰队视角——"我们的用户里有多少跑在 root 过的设备上"这个问题此前完全没有答案。
+// 所以它只入库、只在管理端看，不参与任何放行判定。
+//
+// 每一项都可以是 NULL：探针本身可能失败，而 expo-device 的 root 检测明确标着
+// experimental。把"探不出来"和"没有"混成同一个值，统计出来的数就是假的。
+func installationDeviceIntegrityMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "app_installations", "device_integrity",
+		`ALTER TABLE app_installations ADD COLUMN device_integrity JSON NULL COMMENT '客户端自报的设备完整性信号：rooted/emulator/sideLoaded/devBundle，每项 true/false/null（null=探针失败或旧版未上报）。只作舰队统计，不参与任何放行判定——被攻破的客户端可以谎报' AFTER client_session_state`); err != nil {
+		return fmt.Errorf("installation device integrity migration: %w", err)
 	}
 	return nil
 }
