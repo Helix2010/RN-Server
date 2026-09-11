@@ -98,7 +98,7 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 
 	// 上报用一个不受构建超时影响的 context：构建因为超时被杀掉时，正是最需要
 	// 把失败原因送回去的时候。
-	reportCtx, reportCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	reportCtx, reportCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 	defer reportCancel()
 	if buildErr != nil {
 		reason := red.line(buildErr.Error())
@@ -107,15 +107,43 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 		}
 		slog.Error("build failed", "job", job.ID, "reason", reason)
 		// 带上已经解析出来的提交：失败的构建同样需要能查"它到底构建了哪一版"
-		if err := api.fail(reportCtx, job.ID, reason, result.CommitSHA, buf.snapshot()); err != nil {
-			slog.Error("cannot report the failure", "job", job.ID, "error", err)
-		}
+		report(reportCtx, job.ID, "failure", func(ctx context.Context) error {
+			return api.fail(ctx, job.ID, reason, result.CommitSHA, buf.snapshot())
+		})
 		return true
 	}
 	slog.Info("build succeeded", "job", job.ID, "commit", result.CommitSHA, "sha256", result.SHA256)
 	// releaseId 留空：产物上传接入在阶段 2b 的下一步，现在先把构建结果与指纹落回去
-	if err := api.complete(reportCtx, job.ID, result.CommitSHA, result.SHA256, "", buf.snapshot()); err != nil {
-		slog.Error("cannot report the result", "job", job.ID, "error", err)
-	}
+	report(reportCtx, job.ID, "result", func(ctx context.Context) error {
+		return api.complete(ctx, job.ID, result.CommitSHA, result.SHA256, "", buf.snapshot())
+	})
 	return true
+}
+
+// report 反复重试最后那一次上报。
+//
+// 这一步失败的代价和别处不一样：任务会永远停在 claimed，管理端上看不出发生了
+// 什么，那个 build 号也一直被占着。2026-09-11 部署时撞上过一次——上报正好落在
+// 服务端重启的几秒里拿到 521，任务从此卡住。
+//
+// 构建已经做完了，多等一会儿不浪费任何东西，所以退避重试到分钟级。
+func report(ctx context.Context, jobID, what string, send func(context.Context) error) {
+	delay := 2 * time.Second
+	for attempt := 1; attempt <= 8; attempt++ {
+		if err := send(ctx); err == nil {
+			return
+		} else {
+			slog.Warn("cannot report the "+what+", will retry", "job", jobID, "attempt", attempt, "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			slog.Error("gave up reporting the "+what, "job", jobID)
+			return
+		case <-time.After(delay):
+		}
+		if delay < 60*time.Second {
+			delay *= 2
+		}
+	}
+	slog.Error("gave up reporting the "+what+" after repeated failures", "job", jobID)
 }

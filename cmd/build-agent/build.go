@@ -235,7 +235,9 @@ func unsealKeystore(cfg config, job claimedJob, worktree string) (string, []stri
 	}
 	return path, []string{
 		"ANDROID_RELEASE_KEYSTORE_PATH=" + path,
-		"ANDROID_RELEASE_KEYSTORE_PASSWORD=" + bundle.StorePassword,
+		// 变量名以 plugins/with-release-signing.js 的 RELEASE_SIGNING_ENV 为准，
+		// 不是 keytool 的叫法：写错的表现是构建到最后一步才说"缺环境变量"
+		"ANDROID_RELEASE_STORE_PASSWORD=" + bundle.StorePassword,
 		"ANDROID_RELEASE_KEY_ALIAS=" + alias,
 		"ANDROID_RELEASE_KEY_PASSWORD=" + bundle.KeyPassword,
 	}, []string{bundle.StorePassword, bundle.KeyPassword}, nil

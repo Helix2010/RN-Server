@@ -33,8 +33,11 @@ sudo mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-to
 yes | sudo /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
 sudo /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --install \
   "platform-tools" "platforms;android-36" "build-tools;36.0.0" "build-tools;35.0.0" \
-  "ndk;27.1.12297006" "cmake;3.22.1"
+  "ndk;27.0.12077973" "ndk;27.1.12297006" "cmake;3.22.1"
 sudo chmod -R a+rX /opt/android-sdk
+# SDK 目录对构建用户只读是有意的，所以 NDK 版本必须**预装齐**：Gradle 想自己装
+# 一个缺失的 NDK 时会失败在"SDK directory is not writable"，而不是去装。
+# 版本号以 expo-updates / react-native 当前要求的为准，装漏了构建到一半才会知道。
 
 # 3. 用户与目录。家目录就是状态目录：OpenSSH 按 passwd 里的 home 找 ~/.ssh，
 #    不看 $HOME，所以两者必须一致

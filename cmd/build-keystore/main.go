@@ -19,11 +19,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"bufio"
 	"os"
 	"strings"
-	"syscall"
-
-	"golang.org/x/term"
 
 	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
@@ -108,17 +106,22 @@ keystore SHA256: %s
 `, *keystorePath, *alias, hex.EncodeToString(digest[:]), *out, *out, *out)
 }
 
-// secret 优先取环境变量；没有就从终端读，不回显。
+// secret 优先取环境变量；没有就从标准输入读一行。
+//
+// 不引第三方的"无回显读取"：那条依赖会把整个模块的 Go 版本要求往上顶，而生产
+// 镜像固定在一个较老的 Go 上——2026-09-11 就因为这个让服务端镜像构建直接失败。
+// 交互式使用时自己关回显即可：
+//
+//	read -rs -p "passphrase: " BUILD_KEYSTORE_PASSPHRASE && export BUILD_KEYSTORE_PASSPHRASE
 func secret(envKey, prompt string) string {
 	if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
 		return v
 	}
-	fmt.Fprintf(os.Stderr, "%s: ", prompt)
-	raw, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Fprintln(os.Stderr)
-	if err != nil {
+	fmt.Fprintf(os.Stderr, "%s（从标准输入读；想不回显就先 read -rs 存进 %s）: ", prompt, envKey)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
 		fmt.Fprintf(os.Stderr, "错误: 读不到输入: %v\n", err)
 		os.Exit(1)
 	}
-	return strings.TrimSpace(string(raw))
+	return strings.TrimSpace(line)
 }
