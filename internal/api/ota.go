@@ -1057,10 +1057,12 @@ func (s *server) otaManifest(c *gin.Context) {
 	c.Data(200, "application/expo+json", raw)
 }
 
-// otaFlagEditable：生效策略只对还会下发给客户端的记录有意义——待发布、活跃、暂停；
-// 已被新 revision 取代或被拒绝的记录改了没有效果，拒绝。
+// otaFlagEditable：生效策略只对还会下发给客户端的记录有意义——待发布、活跃、灰度、暂停；
+// 已被新 revision 取代或被拒绝的记录改了没有效果，拒绝。灰度修订确实会下发给名单里的
+// 设备，所以它的生效策略必须可改；全量包那边的 mandatory 恰好相反（设计 §3.5 禁止
+// 灰度版本设强制升级），两个开关的可编辑状态不一样，不要合并。
 func otaFlagEditable(status string) bool {
-	return status == "verified" || status == "active" || status == "paused"
+	return status == "verified" || status == "active" || status == "canary" || status == "paused"
 }
 
 // setOTAApplyStrategy 事后修改 OTA 的生效策略（管理端列表里的开关）。
