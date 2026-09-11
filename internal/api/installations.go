@@ -333,6 +333,13 @@ func (s *server) authenticateInstallation(c *gin.Context, installationID string)
 // verifyInstallationCredential 校验 `Authorization: Installation <credential>`，返回失败码
 // （空表示通过）。不直接写响应，给"可选携带安装身份"的接口（钱包登录）复用。
 func (s *server) verifyInstallationCredential(c *gin.Context, installationID string) (installationCredentialRecord, string) {
+	return s.verifyInstallationCredentialFor(c, tenantID(c), installationID)
+}
+
+// verifyInstallationCredentialFor 是同一套校验，但租户由调用方给出：bootstrap 不挂
+// domainTenantScope（它自己按 Host 解析租户并对解析失败给 TENANT_NOT_FOUND），
+// 上下文里没有 tenantId。
+func (s *server) verifyInstallationCredentialFor(c *gin.Context, tenant, installationID string) (installationCredentialRecord, string) {
 	var record installationCredentialRecord
 	credential := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Installation "))
 	if credential == "" || credential == strings.TrimSpace(c.GetHeader("Authorization")) {
@@ -341,7 +348,7 @@ func (s *server) verifyInstallationCredential(c *gin.Context, installationID str
 	// 安装记录的键是 (tenant, application_id, installation_id)：查询必须带上请求头里的
 	// 应用身份和平台，否则同一 installation_id 下若有多条记录会随机取一条去比对，
 	// 凭证明明有效也判失效
-	err := s.db.QueryRowContext(c.Request.Context(), installationCredentialLookupSQL, tenantID(c), text(c.GetHeader("x-application-id"), "unknown"), strings.ToLower(c.GetHeader("x-platform")), installationID).Scan(&record.Hash, &record.Version, &record.ExpiresAt, &record.RevokedAt, &record.ApplicationID, &record.Platform, &record.Status)
+	err := s.db.QueryRowContext(c.Request.Context(), installationCredentialLookupSQL, tenant, text(c.GetHeader("x-application-id"), "unknown"), strings.ToLower(c.GetHeader("x-platform")), installationID).Scan(&record.Hash, &record.Version, &record.ExpiresAt, &record.RevokedAt, &record.ApplicationID, &record.Platform, &record.Status)
 	if err != nil || record.RevokedAt.Valid || record.Status == "revoked" || record.ExpiresAt.Before(time.Now().UTC()) {
 		return record, "INSTALLATION_CREDENTIAL_INVALID"
 	}

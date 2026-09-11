@@ -107,7 +107,7 @@ func (s *server) listOTABaseReleases(c *gin.Context) {
 
 func (s *server) listOTAReleases(c *gin.Context) {
 	platform, status := strings.ToLower(strings.TrimSpace(c.Query("platform"))), strings.ToLower(strings.TrimSpace(c.Query("status")))
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.revision DESC, o.created_at DESC, o.id DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.canary_installations,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.revision DESC, o.created_at DESC, o.id DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
 	if err != nil {
 		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 		return
@@ -117,9 +117,10 @@ func (s *server) listOTAReleases(c *gin.Context) {
 	for rows.Next() {
 		var id, base, p, channel, runtime, updateID, kind, applyStrategy, st, creator, notes, baseVersion string
 		var sha, source, rejection sql.NullString
+		var audience []byte
 		var revision, baseBuild int
 		var verified, published, created, updated sql.NullTime
-		if err := rows.Scan(&id, &base, &p, &channel, &runtime, &revision, &updateID, &kind, &applyStrategy, &st, &sha, &notes, &source, &rejection, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild); err != nil {
+		if err := rows.Scan(&id, &base, &p, &channel, &runtime, &revision, &updateID, &kind, &applyStrategy, &st, &audience, &sha, &notes, &source, &rejection, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild); err != nil {
 			problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 			return
 		}
@@ -130,7 +131,7 @@ func (s *server) listOTAReleases(c *gin.Context) {
 			problem(c, 500, "OTA_RELEASE_NOTES_CORRUPT", "Stored release notes do not match the published shape")
 			return
 		}
-		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": st, "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
+		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": st, "canaryInstallations": canaryAudienceForStatus(st, audience), "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
 	}
 	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
 }
@@ -139,9 +140,9 @@ func (s *server) otaReleaseDetail(c *gin.Context) {
 	var id, baseID, platform, channel, runtime, updateID, kind, applyStrategy, status, baseVersion, creator string
 	var revision, baseBuild int
 	var manifestKey, manifestSHA, source, reject sql.NullString
-	var notes []byte
+	var notes, audience []byte
 	var verified, published, created, updated sql.NullTime
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.manifest_key,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at,a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.id=?`, tenantID(c), c.Param("id")).Scan(&id, &baseID, &platform, &channel, &runtime, &revision, &updateID, &kind, &applyStrategy, &status, &manifestKey, &manifestSHA, &notes, &source, &reject, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild)
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.canary_installations,o.manifest_key,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at,a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.id=?`, tenantID(c), c.Param("id")).Scan(&id, &baseID, &platform, &channel, &runtime, &revision, &updateID, &kind, &applyStrategy, &status, &audience, &manifestKey, &manifestSHA, &notes, &source, &reject, &creator, &verified, &published, &created, &updated, &baseVersion, &baseBuild)
 	if errors.Is(err, sql.ErrNoRows) {
 		problem(c, http.StatusNotFound, "OTA_NOT_FOUND", "OTA release not found")
 		return
@@ -181,7 +182,7 @@ func (s *server) otaReleaseDetail(c *gin.Context) {
 	}
 	identity := otaManifestIdentity(manifest)
 	c.JSON(http.StatusOK, gin.H{
-		"release":      gin.H{"id": id, "baseReleaseId": baseID, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": platform, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": status, "manifestKey": nullableString(manifestKey.String), "manifestSha256": nullableString(manifestSHA.String), "releaseNotes": releaseNotes, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(reject.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)},
+		"release":      gin.H{"id": id, "baseReleaseId": baseID, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": platform, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": status, "canaryInstallations": canaryAudienceForStatus(status, audience), "manifestKey": nullableString(manifestKey.String), "manifestSha256": nullableString(manifestSHA.String), "releaseNotes": releaseNotes, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(reject.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)},
 		"identity":     identity,
 		"baseMetadata": baseMetadata,
 		"manifest":     manifest,
@@ -544,6 +545,27 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	}
 	persisted = true
 	c.JSON(201, gin.H{"release": gin.H{"id": releaseID, "baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "channel": body.Channel, "runtimeVersion": baseRuntime, "revision": revision, "updateId": updateID, "applyStrategy": body.ApplyStrategy, "status": "verified", "manifestSha256": hex.EncodeToString(hash[:]), "releaseNotes": releaseNotes, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now)}})
+}
+
+// commitOTACanaryAudience 在已经持有 slot 锁与事务的前提下改灰度名单，不动状态。
+func (s *server) commitOTACanaryAudience(c *gin.Context, tx *sql.Tx, id, status string, audience []string, reason string) {
+	now := time.Now().UTC()
+	audienceValue, _ := json.Marshal(audience)
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE ota_releases SET canary_installations=?,updated_at=? WHERE tenant_id=? AND id=? AND status='canary'`, audienceValue, now, tenantID(c), id)
+	if err != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, 409, "OTA_STATE_CHANGED", "OTA release changed; refresh and retry")
+		return
+	}
+	event := newAudit(tenantID(c), actor(c), "ota_set_canary_audience", "ota-release", id, reason, requestID(c), map[string]any{"status": status, "canaryAudience": canaryAudienceDigest(audience)})
+	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to save OTA audit")
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"id": id, "status": status, "canaryInstallations": audience})
 }
 
 func nullableSQLValue(v string) any {
@@ -967,7 +989,11 @@ func (s *server) otaManifest(c *gin.Context) {
 	var id, kind, strategy string
 	var key, sha sql.NullString
 	var published sql.NullTime
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.release_kind,o.apply_strategy,o.manifest_key,o.manifest_sha256,o.published_at FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' AND (?='' OR a.version=?) AND (?='' OR CAST(a.build_number AS CHAR)=?) ORDER BY o.revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime, appVersion, appVersion, buildNumber, buildNumber).Scan(&id, &kind, &strategy, &key, &sha, &published)
+	// 灰度：这条请求带不了 Authorization，身份来自 bootstrap 下发、原生侧
+	// 通过 Expo-Extra-Params 捎回来的短时令牌。令牌过期 / 伪造 / 不带一律空串，
+	// 设备静默回到 active 修订（canary.go）
+	audience := s.canaryAudienceFromExtraParams(c, tenantID(c))
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.id,o.release_kind,o.apply_strategy,o.manifest_key,o.manifest_sha256,o.published_at FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND `+canaryVisibleOTASQL+` AND (?='' OR a.version=?) AND (?='' OR CAST(a.build_number AS CHAR)=?) ORDER BY o.revision DESC LIMIT 1`, tenantID(c), platform, channel, runtime, audience, audience, appVersion, appVersion, buildNumber, buildNumber).Scan(&id, &kind, &strategy, &key, &sha, &published)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeExpoNoUpdate(c)
 		return
@@ -1141,7 +1167,11 @@ func (s *server) otaAsset(c *gin.Context) {
 	}
 	var key sql.NullString
 	var rawObjectMetadata []byte
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT manifest_key,object_metadata FROM ota_releases WHERE tenant_id=? AND id=? AND status IN ('active','paused','superseded')`, tenantID(c), id).Scan(&key, &rawObjectMetadata); err != nil || !key.Valid {
+	// canary 与 paused / superseded 同档：资源请求由原生下载器发出，不带
+	// Expo-Extra-Params（只有 manifest 请求带），所以这里没有身份可验。
+	// 把关的是 manifest——资源路径只能从已经通过灰度校验的 manifest 里拿到，
+	// 而且必须逐条对得上 object_metadata 才下发
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT manifest_key,object_metadata FROM ota_releases WHERE tenant_id=? AND id=? AND status IN ('active','canary','paused','superseded')`, tenantID(c), id).Scan(&key, &rawObjectMetadata); err != nil || !key.Valid {
 		problem(c, 404, "OTA_ASSET_NOT_FOUND", "OTA asset not found")
 		return
 	}
@@ -1239,6 +1269,8 @@ func (s *server) otaAction(c *gin.Context) {
 		Confirm bool   `json:"confirm"`
 		// set-apply-strategy 专用：目标策略；其它动作忽略
 		ApplyStrategy string `json:"applyStrategy"`
+		// canary / set-canary-audience 专用：灰度名单（installation_id）
+		Installations []string `json:"installations"`
 	}
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, 400, "CONFIRMATION_REQUIRED", "reason and confirm=true are required")
@@ -1257,6 +1289,19 @@ func (s *server) otaAction(c *gin.Context) {
 	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT platform,channel,runtime_version FROM ota_releases WHERE tenant_id=? AND id=?`, tenantID(c), id).Scan(&slotPlatform, &slotChannel, &slotRuntime); err != nil {
 		problem(c, 404, "OTA_NOT_FOUND", "OTA release not found")
 		return
+	}
+	// 灰度名单在进事务前校验：查安装表要走库，不占着 slot 锁做
+	var audience []string
+	if action == "canary" || action == "set-canary-audience" {
+		var code, detail string
+		if audience, code, detail = normalizeCanaryAudience(body.Installations); code != "" {
+			problem(c, 422, code, detail)
+			return
+		}
+		if code, detail := s.rejectUnknownCanaryInstallations(c, slotPlatform, audience); code != "" {
+			problem(c, 422, code, detail)
+			return
+		}
 	}
 	conn, err := s.db.Conn(c.Request.Context())
 	if err != nil {
@@ -1293,6 +1338,24 @@ func (s *server) otaAction(c *gin.Context) {
 	if action == "pause" && status == "active" {
 		target = "paused"
 	}
+	// 灰度与 active 平行：转灰度不收尾任何 active 修订，收尾语句也只扫 status='active'
+	if action == "canary" && status == "verified" {
+		target = "canary"
+	}
+	if action == "promote" && status == "canary" {
+		target = "active"
+	}
+	if action == "cancel-canary" && status == "canary" {
+		target = "rejected"
+	}
+	if action == "set-canary-audience" {
+		if status != "canary" {
+			problem(c, 409, "INVALID_OTA_TRANSITION", "Invalid OTA state transition")
+			return
+		}
+		s.commitOTACanaryAudience(c, tx, id, status, audience, body.Reason)
+		return
+	}
 	if action == "rollback" {
 		// Rollback is represented by a new immutable directive so clients that
 		// have already cached a previous update can return to their embedded JS.
@@ -1328,7 +1391,13 @@ func (s *server) otaAction(c *gin.Context) {
 	if target == "active" {
 		_, _ = tx.ExecContext(c.Request.Context(), `UPDATE ota_releases SET status='superseded',updated_at=? WHERE tenant_id=? AND platform=? AND channel=? AND runtime_version=? AND status='active'`, now, tenantID(c), platform, channel, runtime)
 	}
-	result, err := tx.ExecContext(c.Request.Context(), `UPDATE ota_releases SET status=?,published_at=CASE WHEN ?='active' THEN ? ELSE published_at END,updated_at=? WHERE tenant_id=? AND id=? AND status=?`, target, target, now, now, tenantID(c), id, status)
+	// 名单只在灰度状态下有意义：离开灰度就清空，免得一条 superseded 记录上留着
+	// 看起来还在生效的范围
+	audienceValue, _ := json.Marshal(audience)
+	if target != "canary" {
+		audienceValue = nil
+	}
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE ota_releases SET status=?,canary_installations=?,published_at=CASE WHEN ?='active' THEN ? ELSE published_at END,updated_at=? WHERE tenant_id=? AND id=? AND status=?`, target, audienceValue, target, now, now, tenantID(c), id, status)
 	if err != nil {
 		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
 		return
@@ -1337,7 +1406,11 @@ func (s *server) otaAction(c *gin.Context) {
 		problem(c, 409, "OTA_STATE_CHANGED", "OTA release changed; refresh and retry")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "ota_"+action, "ota-release", id, body.Reason, requestID(c), map[string]any{"status": target})
+	summary := map[string]any{"status": target}
+	if target == "canary" {
+		summary["canaryAudience"] = canaryAudienceDigest(audience)
+	}
+	event := newAudit(tenantID(c), actor(c), "ota_"+action, "ota-release", id, body.Reason, requestID(c), summary)
 	if insertAudit(c.Request.Context(), tx, event) != nil {
 		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to save OTA audit")
 		return

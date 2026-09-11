@@ -37,13 +37,17 @@ metrics label 禁止 userId/requestId/完整 URL 等无限基数值。
 ## 3. Release 状态机
 
 ```text
-uploaded -> verified -> active -> paused -> completed
+uploaded -> verified -> active  -> paused -> completed
+                    |          \-> completed（被更新的 active 收尾）
+                    \-> canary -> active（promote）
+                    |         \-> rejected（cancel-canary）
                     \-> rejected
 ```
 
 - uploaded：对象存在但未可信；服务端流式计算 size/hash，提取 Android/iOS/OTA 元数据。
 - verified：签名、app identity、build/runtime、malware/策略检查通过。
 - active：官网全量分发。
+- canary：只对 `canary_installations` 名单里的安装可见，与 active 平行。`publish` 的收尾语句只扫 `status='active'`，两条主干互不干涉。
 - paused：不再分配新设备，已下载设备行为由客户端策略决定。
 - 全量安装包不提供“自动回滚”：需要停止当前版本时使用暂停；修复必须发布更高 build 的新安装包。
 
@@ -96,6 +100,25 @@ bootstrap 根据以下输入求值：
 - 对象存储配置在 `APP_ENV=production` 下必须使用 https 的 `endpoint` / `publicBaseUrl`：保存时拒绝 http（422 `STORAGE_ENDPOINT_INSECURE`），已存的 http 配置在使用时被拒并记 error（503 `STORAGE_UNAVAILABLE`）。原因：`direct` 上传模式的上传入口是对象存储的 presigned URL，不经 `absoluteURL`，协议只能由配置本身保证。
 
 ## 6. 灰度与暂停
+
+**按设备名单的灰度（2026-09-11 起可用）**。设计与安全论证见 `RN-App/docs/design/canary-release-allowlist-2026-09-11.md`。
+
+操作步骤（全量包与 OTA 同一套）：
+
+1. 让目标设备先跑一次带身份上报的版本——灰度靠服务端签发的安装凭证识别身份，更早的客户端认不出，只会拿到正式版。
+2. 管理端「发布记录」→ 待发布行 →「灰度发布」，从「安装与设备」勾选或粘贴安装 ID。名单不能为空，ID 必须已经上报过（拼错会当场被拒）。
+3. 名单内设备下一次拉 bootstrap 就能看到；**OTA 要多等一次启动**——灰度令牌由 expo-updates 的 extra params 持久化，本次启动的 manifest 请求已经发出去了。
+4. 验证通过 →「转为正式发布」（`promote`，同一条记录转正，不重新上传）；有问题 →「取消灰度」。
+5. 取消后，已经装上灰度版的设备会停在高于 active 的版本上，直到出现更高的 active。不要指望客户端降级。
+
+约束：
+
+- 强制升级（mandatory）与灰度互斥，两个方向都拒。强制版本只由 active 记录决定——一台设备拿到灰度包不会让它身上的强制升级要求消失。
+- 允许多条灰度并存（面向不同名单），设备按 `build_number`（OTA 按 `revision`）取最大的一条。
+- 发布一个 build 不低于某条灰度的 active 之后，那条灰度对谁都不再可见。管理端会提示，但**不会自动改它的状态**——需要运营去点「取消灰度」。
+- 名单规模上限 200 台；超过这个量级要把 JSON 列拆成关联表。
+- 进入灰度、改名单、取消、转正四个动作都进审计，正文记设备数与名单哈希（完整名单在发布记录上随时可查）。
+- 匿名请求与老客户端永远只看得到 active：`/v1/public/releases/latest` 不带凭证时看不到灰度，猜到发布 ID 直接下载也是 404。
 
 - 当前开发阶段不实现灰度 bucket 和比例分配。
 - feature flag 可关闭业务功能，但不能修复原生 ABI 不兼容；两者责任分开。

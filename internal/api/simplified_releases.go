@@ -371,12 +371,15 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": releaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "mandatory": body.Mandatory, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
 }
 
-func (s *server) activeSimplifiedRelease(ctx context.Context, tenant, platform string) (simplifiedActiveRelease, error) {
+// visibleSimplifiedRelease 取这台设备现在该拿的那一个全量版本：active，或者
+// 它在名单里的灰度版本（build 更大者胜）。installationID 为空 = 认不出身份，
+// 只剩 active（见 canary.go 的 canaryVisibleSQL）。
+func (s *server) visibleSimplifiedRelease(ctx context.Context, tenant, platform, installationID string) (simplifiedActiveRelease, error) {
 	var item simplifiedActiveRelease
 	var notes []byte
 	var sha sql.NullString
 	var size sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT id,version,release_notes,sha256,file_size,mandatory FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`, tenant, platform).Scan(&item.ID, &item.Version, &notes, &sha, &size, &item.Mandatory)
+	err := s.db.QueryRowContext(ctx, `SELECT id,version,release_notes,sha256,file_size,mandatory,status FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenant, platform, installationID, installationID).Scan(&item.ID, &item.Version, &notes, &sha, &size, &item.Mandatory, &item.Status)
 	if err != nil {
 		return item, err
 	}
@@ -390,6 +393,19 @@ func (s *server) activeSimplifiedRelease(ctx context.Context, tenant, platform s
 		item.FileSize = &size.Int64
 	}
 	return item, nil
+}
+
+// activeMandatoryVersion 返回 active 记录声明的"必须升到这一版"，没有强制要求时空串。
+// 强制升级只由 active 决定：灰度版本不得设 mandatory（设计 §3.5），而且一台设备
+// 拿到灰度版本不能把 active 上的强制要求弄丢——否则给某台机器发个灰度包就等于
+// 单独给它解除了强制升级。
+func (s *server) activeMandatoryVersion(ctx context.Context, tenant, platform string) string {
+	var version string
+	var mandatory bool
+	if err := s.db.QueryRowContext(ctx, `SELECT version,mandatory FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`, tenant, platform).Scan(&version, &mandatory); err != nil || !mandatory {
+		return ""
+	}
+	return version
 }
 
 func (s *server) platformEnabled(ctx context.Context, tenant, platform string) (bool, error) {
@@ -435,7 +451,9 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 	var build int
 	var size sql.NullInt64
 	var sha sql.NullString
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id,version,build_number,file_name,object_key,file_size,sha256,status,release_notes FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`, tenantID(c), platform).Scan(&id, &version, &build, &fileName, &key, &size, &sha, &status, &rawNotes)
+	// 匿名请求只看得到 active；带上有效安装凭证的设备还能看到发给它的灰度版本
+	audience := s.canaryAudienceID(c, tenantID(c))
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id,version,build_number,file_name,object_key,file_size,sha256,status,release_notes FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenantID(c), platform, audience, audience).Scan(&id, &version, &build, &fileName, &key, &size, &sha, &status, &rawNotes)
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Active release not found")
 		return
@@ -506,7 +524,9 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	var contentType, sha sql.NullString
 	var fileSize sql.NullInt64
 	var rawMetadata []byte
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size,sha256,file_metadata FROM app_releases WHERE tenant_id=? AND id=? AND status='active'`, tenantID(c), c.Param("id")).Scan(&key, &fileName, &contentType, &fileSize, &sha, &rawMetadata)
+	// 灰度设备要能真的下载到它在 bootstrap 里看到的那一个；名单外的人拿到 ID 直接下也是 404
+	audience := s.canaryAudienceID(c, tenantID(c))
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size,sha256,file_metadata FROM app_releases WHERE tenant_id=? AND id=? AND `+canaryVisibleSQL, tenantID(c), c.Param("id"), audience, audience).Scan(&key, &fileName, &contentType, &fileSize, &sha, &rawMetadata)
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Published release not found")
 		return

@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.11"
+    "version": "2026.09.12"
   },
   "paths": {
     "/health/live": {
@@ -322,15 +322,21 @@
             "enum": [
               "publish",
               "pause",
-              "rollback"
+              "rollback",
+              "set-apply-strategy",
+              "canary",
+              "promote",
+              "cancel-canary",
+              "set-canary-audience"
             ]
-          }
+          },
+          "description": "canary / set-canary-audience take {reason, confirm, installations[]} with the same audience rules as the full-release actions. A canary OTA revision never supersedes the active revision; promote does."
         }
       ],
       "post": {
         "responses": {
           "201": {
-            "description": "OTA state transition or rollback directive"
+            "description": "OTA state transition, canary audience change or rollback directive"
           }
         }
       }
@@ -425,7 +431,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Release list"
+            "description": "Release list; each release carries canaryInstallations (installation ID array) only while status is canary"
           }
         }
       },
@@ -479,15 +485,27 @@
             "type": "string",
             "enum": [
               "publish",
-              "pause"
+              "pause",
+              "set-mandatory",
+              "canary",
+              "promote",
+              "cancel-canary",
+              "set-canary-audience"
             ]
-          }
+          },
+          "description": "canary / set-canary-audience take a body {reason, confirm, installations[]}: the audience is a non-empty list of known installation IDs for this platform (CANARY_AUDIENCE_REQUIRED / CANARY_INSTALLATION_UNKNOWN / CANARY_AUDIENCE_TOO_LARGE, limit 200). A mandatory release cannot enter canary (CANARY_MANDATORY_FORBIDDEN) and a canary release cannot be made mandatory (RELEASE_FLAG_LOCKED). canary never completes other active releases; promote does, exactly like publish. Leaving canary (promote / cancel-canary) clears the audience."
         }
       ],
       "post": {
         "responses": {
           "201": {
-            "description": "Transitioned release"
+            "description": "Transitioned release; canaryInstallations is present only while status is canary"
+          },
+          "409": {
+            "description": "INVALID_TRANSITION, VERIFIED_ARTIFACT_REQUIRED, CANARY_MANDATORY_FORBIDDEN, RELEASE_FLAG_LOCKED or RELEASE_STATE_CHANGED"
+          },
+          "422": {
+            "description": "CANARY_AUDIENCE_REQUIRED, CANARY_AUDIENCE_INVALID, CANARY_AUDIENCE_TOO_LARGE, CANARY_INSTALLATION_UNKNOWN or CANARY_AUDIENCE_LOOKUP_FAILED"
           }
         }
       }
@@ -729,7 +747,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path); services.predict (domain, scopeId, chain) is present only while modules.predict is enabled and is 503 when enabled but not configured"
+            "description": "Bootstrap config; update.decision is none|recommended|required, where required comes from updatePolicy.minSupportedVersion or from a mandatory active release. wallet.tokens lists the token catalogue for the app (BootstrapWalletToken[]): only enabled tokens on the tenant's enabled chains, tenant rows override global rows with the same (chain, address), sorted by sortWeight DESC then symbol ASC; it never carries verified/id/scope (the app grants verified from its own allowlist). wallet.tokens is required by the app schema; every enabled chain carries an enabled native entry, and every delivered row is validated before delivery (a corrupt row makes the whole bootstrap fail with 503 rather than being repaired on the read path); services.predict (domain, scopeId, chain) is present only while modules.predict is enabled and is 503 when enabled but not configured. Optional installation authentication: a request carrying X-Installation-ID plus Authorization: Installation <credential> is matched against canary releases, so the device may receive update.full/update.ota for a canary build instead of the active one; an absent, expired or revoked credential is treated as anonymous and only ever sees active (bootstrap itself never fails on a credential problem). update.canary.enrolled says whether the offered full release is a canary build; update.canary.otaToken is a 24h opaque token that the app must store with Updates.setExtraParamAsync(\"canary-token\", token) so the native manifest request can be matched to a canary OTA revision (the key must stay lowercase: expo-structured-headers rejects uppercase dictionary keys). otaToken is null when the installation could not be authenticated, and the app then clears the stored param. update.minSupportedVersion and the mandatory flag always come from the active release, never from a canary one"
           },
           "503": {
             "description": "BOOTSTRAP_UNAVAILABLE: the tenant configuration, its token catalogue or its wallet section could not be produced completely (storage error, a corrupt catalogue row, an enabled chain without a native token, or a tenant whose configured chains are all unknown). The app keeps its last successful snapshot and shows the retry screen"
@@ -824,7 +842,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Expo Updates manifest"
+            "description": "Expo Updates manifest. Expo-Extra-Params may carry canary-token=\"<token>\" (RFC 8941 dictionary, issued by bootstrap); a valid token lets the device match a canary revision, anything else falls back to the active revision without an error"
           },
           "204": {
             "description": "No matching update"
@@ -865,7 +883,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Latest active release"
+            "description": "Latest active release Anonymous requests only ever see the active release; a request with a valid installation credential may see a canary release targeted at it (status is then canary)"
           }
         }
       }
@@ -882,7 +900,7 @@
             "description": "Release package stream"
           },
           "404": {
-            "description": "Published release not found"
+            "description": "Published release not found; a canary release is 404 for every device outside its audience, so knowing the release id is not enough"
           },
           "502": {
             "description": "RELEASE_DOWNLOAD_FAILED (storage unreadable) or RELEASE_OBJECT_CHANGED (object in storage no longer matches the verified artifact)"

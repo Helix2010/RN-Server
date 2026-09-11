@@ -71,6 +71,9 @@ type release struct {
 	CreatedAt   string  `json:"createdAt"`
 	UpdatedAt   string  `json:"updatedAt"`
 	LastAction  *string `json:"lastAction"`
+	// CanaryInstallations 是灰度名单；只有 status='canary' 的记录会带上它，
+	// 其它状态下这一列即使有残留值也不该被当成"生效中的范围"
+	CanaryInstallations []string `json:"canaryInstallations,omitempty"`
 }
 
 type simplifiedActiveRelease struct {
@@ -81,6 +84,8 @@ type simplifiedActiveRelease struct {
 	FileSize     *int64
 	// Mandatory 表示这个版本不可跳过
 	Mandatory bool
+	// Status 是 active 或 canary：拿到灰度版本时客户端要知道自己在灰度里
+	Status string
 }
 
 type auditEvent struct {
@@ -439,7 +444,7 @@ func (s *server) listReleases(c *gin.Context) {
 }
 
 func (s *server) queryReleases(ctx context.Context, tenant, platform, status string) ([]release, error) {
-	query := `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY build_number DESC, updated_at DESC, id DESC`
+	query := `SELECT id,platform,version,build_number,runtime_version,status,canary_installations,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY build_number DESC, updated_at DESC, id DESC`
 	rows, err := s.db.QueryContext(ctx, query, tenant, platform, platform, status, status)
 	if err != nil {
 		return nil, err
@@ -460,15 +465,18 @@ type scanner interface{ Scan(...any) error }
 
 func scanRelease(row scanner) (release, error) {
 	var r release
-	var notes, metadata []byte
+	var notes, metadata, audience []byte
 	var fileName, contentType, sha, rejection sql.NullString
 	var expectedSize, fileSize sql.NullInt64
 	var verifiedAt, publishedAt sql.NullTime
 	var action sql.NullString
 	var created, updated time.Time
-	err := row.Scan(&r.ID, &r.Platform, &r.Version, &r.BuildNumber, &r.RuntimeVersion, &r.Status, &notes, &fileName, &contentType, &expectedSize, &fileSize, &sha, &metadata, &rejection, &r.Mandatory, &verifiedAt, &publishedAt, &action, &created, &updated)
+	err := row.Scan(&r.ID, &r.Platform, &r.Version, &r.BuildNumber, &r.RuntimeVersion, &r.Status, &audience, &notes, &fileName, &contentType, &expectedSize, &fileSize, &sha, &metadata, &rejection, &r.Mandatory, &verifiedAt, &publishedAt, &action, &created, &updated)
 	if err != nil {
 		return r, err
+	}
+	if r.Status == "canary" {
+		r.CanaryInstallations = canaryAudienceOf(audience)
 	}
 	_ = json.Unmarshal(notes, &r.ReleaseNotes)
 	_ = json.Unmarshal(metadata, &r.FileMetadata)
@@ -521,10 +529,25 @@ func (s *server) releaseDetail(c *gin.Context) {
 }
 
 func (s *server) findRelease(ctx context.Context, tenant, id string) (release, error) {
-	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,platform,version,build_number,runtime_version,status,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id))
+	return scanRelease(s.db.QueryRowContext(ctx, `SELECT id,platform,version,build_number,runtime_version,status,canary_installations,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id))
 }
 
-var transitions = map[string]map[string]string{"publish": {"verified": "active", "paused": "active"}, "pause": {"active": "paused"}}
+// transitions 是全量发布的状态机。灰度（canary）与 active 平行，两条主干互不干涉：
+//
+//	verified --publish--> active      verified --canary-------> canary
+//	active   --pause----> paused      canary   --promote------> active
+//	paused   --publish--> active      canary   --cancel-canary-> rejected
+//
+// publish / promote 都收尾同平台其它 active 行（那句 UPDATE 只扫 status='active'，
+// 天然不会碰到灰度行）；转灰度不收尾任何东西。promote 与 publish 分开是为了审计能
+// 看出"灰度转正"和"直接全量"的区别，不是状态机上的区别。
+var transitions = map[string]map[string]string{
+	"publish":       {"verified": "active", "paused": "active"},
+	"pause":         {"active": "paused"},
+	"canary":        {"verified": "canary"},
+	"promote":       {"canary": "active"},
+	"cancel-canary": {"canary": "rejected"},
+}
 
 // releaseFlagEditable 判断一个全量版本的"升级类型"（mandatory）现在还能不能改：
 // 只有还会影响客户端升级决策的状态才允许——待发布、活跃、暂停。已被新版本取代
@@ -539,6 +562,8 @@ func (s *server) releaseAction(c *gin.Context) {
 		Confirm bool   `json:"confirm"`
 		// set-mandatory 专用：目标值；其它动作忽略
 		Mandatory *bool `json:"mandatory"`
+		// canary / set-canary-audience 专用：灰度名单（installation_id）
+		Installations []string `json:"installations"`
 	}
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, 400, "CONFIRMATION_REQUIRED", "reason and confirm=true are required")
@@ -553,16 +578,39 @@ func (s *server) releaseAction(c *gin.Context) {
 		s.setReleaseMandatory(c, r, body.Mandatory, body.Reason)
 		return
 	}
+	if c.Param("action") == "set-canary-audience" {
+		s.setReleaseCanaryAudience(c, r, body.Installations, body.Reason)
+		return
+	}
 	target, ok := transitions[c.Param("action")][r.Status]
 	if !ok {
 		problem(c, 409, "INVALID_TRANSITION", fmt.Sprintf("Cannot apply %s to %s", c.Param("action"), r.Status))
 		return
 	}
-	if target == "active" {
+	if target == "active" || target == "canary" {
 		var verified bool
 		_ = s.db.QueryRowContext(c.Request.Context(), `SELECT object_key IS NOT NULL AND sha256 IS NOT NULL AND verified_at IS NOT NULL FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), r.ID).Scan(&verified)
 		if !verified {
 			problem(c, 409, "VERIFIED_ARTIFACT_REQUIRED", "The bound APK artifact is no longer publishable")
+			return
+		}
+	}
+	// 转灰度要一并写名单：空名单的灰度行对谁都不可见，允许它存在只会让运营以为发出去了
+	audience := []string(nil)
+	if target == "canary" {
+		if r.Mandatory {
+			// 强制升级影响的是全量用户的决策口径；只发给几台测试机的版本设它没有意义，
+			// 而且 resolveUpdateDecision 会把它抬成所有人的最低版本
+			problem(c, 409, "CANARY_MANDATORY_FORBIDDEN", "A mandatory release cannot be moved to canary; clear the mandatory flag first")
+			return
+		}
+		var code, detail string
+		if audience, code, detail = normalizeCanaryAudience(body.Installations); code != "" {
+			problem(c, 422, code, detail)
+			return
+		}
+		if code, detail := s.rejectUnknownCanaryInstallations(c, r.Platform, audience); code != "" {
+			problem(c, 422, code, detail)
 			return
 		}
 	}
@@ -576,12 +624,25 @@ func (s *server) releaseAction(c *gin.Context) {
 	if target == "active" {
 		_, _ = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status='completed',last_action='completed',updated_at=? WHERE tenant_id=? AND id<>? AND platform=? AND status='active'`, now, tenantID(c), r.ID, r.Platform)
 	}
-	_, err = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status=?,last_action=?,updated_at=?,published_at=CASE WHEN ?='active' THEN ? ELSE published_at END WHERE tenant_id=? AND id=?`, target, target, now, target, now, tenantID(c), r.ID)
+	// 名单只在灰度状态下有意义：转灰度写入，离开灰度（转正 / 取消）清空，
+	// 免得一条 completed 记录上留着看起来还在生效的范围
+	audienceValue, _ := json.Marshal(audience)
+	if target != "canary" {
+		audienceValue = nil
+	}
+	_, err = tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET status=?,canary_installations=?,last_action=?,updated_at=?,published_at=CASE WHEN ?='active' THEN ? ELSE published_at END WHERE tenant_id=? AND id=?`, target, audienceValue, c.Param("action"), now, target, now, tenantID(c), r.ID)
 	if err != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), c.Param("action"), "release", r.ID, body.Reason, requestID(c), map[string]any{"version": r.Version, "platform": r.Platform, "status": target})
+	summary := map[string]any{"version": r.Version, "platform": r.Platform, "status": target}
+	if target == "canary" {
+		summary["canaryAudience"] = canaryAudienceDigest(audience)
+	}
+	if r.Status == "canary" {
+		summary["previousCanaryAudience"] = canaryAudienceDigest(r.CanaryInstallations)
+	}
+	event := newAudit(tenantID(c), actor(c), c.Param("action"), "release", r.ID, body.Reason, requestID(c), summary)
 	if insertAudit(c.Request.Context(), tx, event) != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
@@ -598,7 +659,9 @@ func (s *server) releaseAction(c *gin.Context) {
 	}
 	r.Status = target
 	r.UpdatedAt = iso(now)
-	r.LastAction = &target
+	lastAction := c.Param("action")
+	r.LastAction = &lastAction
+	r.CanaryInstallations = audience
 	if target == "active" {
 		v := iso(now)
 		r.PublishedAt = &v
@@ -646,13 +709,72 @@ func (s *server) setReleaseMandatory(c *gin.Context, r release, mandatory *bool,
 	c.JSON(201, gin.H{"release": r})
 }
 
+// rejectUnknownCanaryInstallations 把"这个租户下不存在的安装 ID"变成入口处的拒绝。
+// 名单里拼错一个字符不会报错，只会让那台设备永远匹配不上——运营看到的现象是
+// "发了但没收到"，查起来很贵。返回空串表示全部认识。
+func (s *server) rejectUnknownCanaryInstallations(c *gin.Context, platform string, audience []string) (string, string) {
+	unknown, err := s.unknownCanaryInstallations(c.Request.Context(), tenantID(c), platform, audience)
+	if err != nil {
+		return "CANARY_AUDIENCE_LOOKUP_FAILED", "Unable to verify the canary audience"
+	}
+	if len(unknown) > 0 {
+		return "CANARY_INSTALLATION_UNKNOWN", "Unknown installations for this platform: " + strings.Join(unknown, ", ")
+	}
+	return "", ""
+}
+
+// setReleaseCanaryAudience 改一条已经在灰度里的记录的名单，不动状态。
+// 与转灰度同样的校验：名单不能为空，ID 必须存在。
+func (s *server) setReleaseCanaryAudience(c *gin.Context, r release, installations []string, reason string) {
+	if r.Status != "canary" {
+		problem(c, 409, "INVALID_TRANSITION", fmt.Sprintf("Cannot change the canary audience of a %s release", r.Status))
+		return
+	}
+	audience, code, detail := normalizeCanaryAudience(installations)
+	if code != "" {
+		problem(c, 422, code, detail)
+		return
+	}
+	if code, detail := s.rejectUnknownCanaryInstallations(c, r.Platform, audience); code != "" {
+		problem(c, 422, code, detail)
+		return
+	}
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	defer tx.Rollback()
+	audienceValue, _ := json.Marshal(audience)
+	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_releases SET canary_installations=?,last_action='set-canary-audience',updated_at=? WHERE tenant_id=? AND id=? AND status='canary'`, audienceValue, now, tenantID(c), r.ID)
+	if err != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, 409, "RELEASE_STATE_CHANGED", "Release changed; refresh and retry")
+		return
+	}
+	event := newAudit(tenantID(c), actor(c), "release_set_canary_audience", "release", r.ID, reason, requestID(c), map[string]any{"version": r.Version, "platform": r.Platform, "status": r.Status, "canaryAudience": canaryAudienceDigest(audience), "previousCanaryAudience": canaryAudienceDigest(r.CanaryInstallations)})
+	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	}
+	r.UpdatedAt = iso(now)
+	last := "set-canary-audience"
+	r.LastAction = &last
+	r.CanaryInstallations = audience
+	c.JSON(201, gin.H{"release": r})
+}
+
 func (s *server) overview(c *gin.Context) {
 	items, err := s.queryReleases(c.Request.Context(), tenantID(c), "", "")
 	if err != nil {
 		problem(c, 500, "OVERVIEW_FAILED", "Unable to load overview")
 		return
 	}
-	counts := map[string]int{"uploaded": 0, "verified": 0, "active": 0, "paused": 0, "completed": 0, "rejected": 0, "rolled_back": 0}
+	counts := map[string]int{"uploaded": 0, "verified": 0, "active": 0, "canary": 0, "paused": 0, "completed": 0, "rejected": 0, "rolled_back": 0}
 	current := map[string]any{"android": nil, "ios": nil, "harmony": nil}
 	for _, r := range items {
 		counts[r.Status]++
@@ -1347,25 +1469,37 @@ func (s *server) bootstrap(c *gin.Context) {
 	var releaseID any
 	var artifactSHA any
 	var artifactSize any
-	// active 发布声明"必须升级"时它的版本号；空表示没有强制要求
-	mandatoryVersion := ""
 	releaseNotes := []string{"远程语言与主题配置", "统一升级决策"}
+	// 可选鉴权：带上有效安装凭证的设备才有身份参与灰度匹配。校验失败不影响
+	// bootstrap 本身——它是启动门禁，配置必须照发，只是不给灰度（设计 §8.1）
+	audience := s.canaryAudienceID(c, tenant.ID)
+	canaryRelease := false
 	if platform == "android" && distribution == "direct" {
-		if active, findErr := s.activeSimplifiedRelease(c.Request.Context(), tenant.ID, platform); findErr == nil {
-			latest = active.Version
-			releaseNotes = releaseNotesForLocale(active.ReleaseNotes, locale)
-			releaseID = active.ID
-			artifactSHA = active.SHA256
-			artifactSize = active.FileSize
-			actionURL = s.absoluteURL(c, "/v1/public/releases/"+active.ID+"/download")
-			if active.Mandatory {
-				mandatoryVersion = active.Version
-			}
+		if visible, findErr := s.visibleSimplifiedRelease(c.Request.Context(), tenant.ID, platform, audience); findErr == nil {
+			latest = visible.Version
+			releaseNotes = releaseNotesForLocale(visible.ReleaseNotes, locale)
+			releaseID = visible.ID
+			artifactSHA = visible.SHA256
+			artifactSize = visible.FileSize
+			actionURL = s.absoluteURL(c, "/v1/public/releases/"+visible.ID+"/download")
+			canaryRelease = visible.Status == "canary"
 		}
-	} else if active, findErr := s.activeSimplifiedRelease(c.Request.Context(), tenant.ID, platform); findErr == nil && active.Mandatory {
-		// 商店 / MDM 渠道拿不到直装包，但运营勾的"强制升级"仍然要生效：
-		// 否则管理端显示的强制徽章对 iOS 是假的
-		mandatoryVersion = active.Version
+	}
+	// 商店 / MDM 渠道拿不到直装包，但运营勾的"强制升级"仍然要生效：
+	// 否则管理端显示的强制徽章对 iOS 是假的。强制版本只认 active 记录
+	mandatoryVersion := s.activeMandatoryVersion(c.Request.Context(), tenant.ID, platform)
+	// OTA 的 manifest 请求由原生侧在 JS 起来之前发出，带不了 Authorization。
+	// 这里给已验明身份的安装下发一个 24 小时的灰度令牌，客户端存进 expo-updates 的
+	// extra params，下次启动那一次原生请求就会捎上它。身份没验过就不发，
+	// 客户端据此清掉旧令牌。注意：不管当前有没有灰度包都要发——extra params 要到
+	// 下次启动才生效，等看见灰度包再发就永远慢一拍
+	var canaryOTAToken any
+	if audience != "" {
+		if token, tokenErr := s.encodeCanaryToken(tenant.ID, audience, time.Now().UTC()); tokenErr == nil {
+			canaryOTAToken = token
+		} else {
+			slog.Error("canary token could not be issued", "tenant", tenant.ID, "error", tokenErr)
+		}
 	}
 	decision := resolveUpdateDecision(updateDecisionInput{
 		Current:          version,
@@ -1435,13 +1569,15 @@ func (s *server) bootstrap(c *gin.Context) {
 		var otaRevision int
 		var otaID, baseID, applyStrategy string
 		var otaNotes []byte
-		if err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.revision,o.update_id,o.base_release_id,o.apply_strategy,o.release_notes FROM ota_releases o WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND o.status='active' ORDER BY o.revision DESC LIMIT 1`, tenant.ID, platform, otaChannel, runtime).Scan(&otaRevision, &otaID, &baseID, &applyStrategy, &otaNotes); err == nil {
+		// 与 manifest 同一套可见性：否则灰度设备在"升级中心"里看到的修订号
+		// 和它真正会下到的那一个对不上
+		if err := s.db.QueryRowContext(c.Request.Context(), `SELECT o.revision,o.update_id,o.base_release_id,o.apply_strategy,o.release_notes FROM ota_releases o WHERE o.tenant_id=? AND o.platform=? AND o.channel=? AND o.runtime_version=? AND `+canaryVisibleOTASQL+` ORDER BY o.revision DESC LIMIT 1`, tenant.ID, platform, otaChannel, runtime, audience, audience).Scan(&otaRevision, &otaID, &baseID, &applyStrategy, &otaNotes); err == nil {
 			var notes map[string][]string
 			_ = json.Unmarshal(otaNotes, &notes)
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": platform == "android" && truth(features["directUpdateEnabled"]), "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": text(c.GetHeader("x-build-number"), "0"), "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

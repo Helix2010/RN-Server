@@ -52,6 +52,45 @@ var migrations = []migration{
 	{version: 36, name: "wallet_user_installation", apply: walletUserInstallationMigration},
 	{version: 37, name: "ota_object_metadata", apply: otaObjectMetadataMigration},
 	{version: 38, name: "release_notes_line_arrays", apply: releaseNotesLineArraysMigration},
+	{version: 39, name: "release_canary", apply: releaseCanaryMigration},
+}
+
+// releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
+// 白名单。灰度行只对名单里的安装可见，不参与"发布时收尾同平台其它 active"那条语句，
+// 所以 status='active' 仍然只有一条、仍然是"所有人该拿的那一个"。
+//
+// 两处都必须先于任何写入 'canary' 的代码上线：ENUM 里没有这个值时，严格模式直接报错，
+// 非严格模式会静默截断成空串——后者会把一条发布记录写坏。
+// 列可空、ENUM 只加值，旧代码读到这两处都不受影响，因此回滚时不要删。
+func releaseCanaryMigration(ctx context.Context, db *sql.DB) error {
+	// 注释里不能出现单引号：它会提前终止 SQL 字符串字面量（集成测试在这上面挡了一次）
+	const audienceComment = `灰度设备白名单：installation_id 字符串数组，仅 canary 状态下有意义；NULL 或空数组=该灰度行对所有设备不可见（fail-closed）。规模超过约 200 台时改为关联表`
+	if _, err := db.ExecContext(ctx, `ALTER TABLE app_releases MODIFY COLUMN status ENUM('uploaded','verified','active','canary','paused','completed','rejected','rolled_back') NOT NULL COMMENT '发布状态'`); err != nil {
+		return fmt.Errorf("release canary migration app_releases status: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "app_releases", "canary_installations", `ALTER TABLE app_releases ADD COLUMN canary_installations JSON NULL COMMENT '`+audienceComment+`' AFTER status`); err != nil {
+		return fmt.Errorf("release canary migration app_releases audience: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE ota_releases MODIFY COLUMN status ENUM('draft','verified','active','canary','paused','superseded','rejected') NOT NULL COMMENT 'OTA状态'`); err != nil {
+		return fmt.Errorf("release canary migration ota_releases status: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "ota_releases", "canary_installations", `ALTER TABLE ota_releases ADD COLUMN canary_installations JSON NULL COMMENT '`+audienceComment+`' AFTER status`); err != nil {
+		return fmt.Errorf("release canary migration ota_releases audience: %w", err)
+	}
+	return nil
+}
+
+// addColumnIfMissing 让加列的迁移可以重复执行：MySQL 没有 ADD COLUMN IF NOT EXISTS。
+func addColumnIfMissing(ctx context.Context, db *sql.DB, table, column, statement string) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, table, column).Scan(&count); err != nil {
+		return fmt.Errorf("inspect: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, statement)
+	return err
 }
 
 // releaseNotesLineArraysMigration 修复 release_notes 里被写成字符串的发布说明。

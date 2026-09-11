@@ -21,3 +21,16 @@
 | 有该路径且 `size` 为非负数、`etag` 为非空字串 | 正常记录 | `Stat` 比对大小与 ETag，不符 502 `OTA_OBJECT_CHANGED` |
 | 列有内容但不是合法 JSON，或条目缺 `size` / `etag` | 数据事故 | 500 `OTA_OBJECT_METADATA_INVALID` |
 | 列合法但没有该路径 | 包里没有这个文件 | 404 |
+
+## app_releases.canary_installations / ota_releases.canary_installations（JSON，迁移 39）
+
+灰度设备白名单，`installation_id` 字符串数组：`["inst_…", "inst_…"]`。设计见 `RN-App/docs/design/canary-release-allowlist-2026-09-11.md`。
+
+| 状态 | 判定 | 读路径行为 |
+| --- | --- | --- |
+| `status <> 'canary'` | 这一列只在灰度状态下有意义 | 忽略；管理端接口也不返回它 |
+| NULL 或 `[]` | 没有名单 | `JSON_CONTAINS` 不成立，该灰度行**对所有设备不可见** |
+| 不是字符串数组（手工写成 `{}` / `"x"`） | 数据事故 | `JSON_CONTAINS` 不成立，只会少发不会多发；管理端读到时当空名单 |
+| 含请求方已验明的 `installation_id` | 命中 | 与 active 一同参与 `ORDER BY build_number DESC`（OTA 按 `revision`），大的胜出 |
+
+写入只走状态机（`canary` / `set-canary-audience`）：名单不能为空，ID 必须在 `app_installations` 里存在，上限 200 条（超过这个规模改为关联表，查询形状不变）。离开灰度（`promote` / `cancel-canary`）时清空。
