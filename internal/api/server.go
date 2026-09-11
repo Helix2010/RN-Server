@@ -135,6 +135,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// Apple 要求这个文件没有 .json 后缀，且必须直出 application/json
 	r.GET("/.well-known/apple-app-site-association", s.domainTenantScope(), s.wellKnownAppleAppSiteAssociation)
 	r.GET("/v1/public/releases/latest", s.domainTenantScope(), s.publicLatestReleaseFromDomain)
+	// 固定下载入口：二维码、官网链接、群公告贴一次就不用再换。发布 ID 每发一版都变，
+	// 这条路由内部按同一套可见性挑出"现在该给你的那一版"再 302 过去。
+	r.GET("/v1/public/releases/latest/download", s.domainTenantScope(), s.publicLatestReleaseDownload)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
 	admin := r.Group("/v1/admin")
 	admin.POST("/auth/login", s.login)

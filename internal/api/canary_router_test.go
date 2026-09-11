@@ -184,6 +184,32 @@ func TestDBCanaryOverTheRealRouter(t *testing.T) {
 		}
 	})
 
+	// 固定下载入口：地址不变，跳到的目标随发布走；灰度设备跳到自己的那一版
+	t.Run("固定下载入口：302 到当前该给这台设备的那一版", func(t *testing.T) {
+		anonymous := call("/v1/public/releases/latest/download?platform=android", "", "", nil)
+		if anonymous.Code != http.StatusFound {
+			t.Fatalf("want 302, got %d %s", anonymous.Code, anonymous.Body.String())
+		}
+		location := anonymous.Header().Get("Location")
+		if !strings.HasSuffix(location, "/download") || strings.Contains(location, "latest") {
+			t.Fatalf("must redirect to the versioned download url, got %q", location)
+		}
+		if strings.Contains(location, canaryID) {
+			t.Fatalf("an anonymous request must never be sent to the canary build: %q", location)
+		}
+		// 这个跳转不能被缓存，否则"随时点都是最新"就不成立
+		if cache := anonymous.Header().Get("Cache-Control"); cache != "no-store" {
+			t.Fatalf("want Cache-Control no-store, got %q", cache)
+		}
+		allowlisted := call("/v1/public/releases/latest/download?platform=android", insider, insiderCredential, nil)
+		if allowlisted.Code != http.StatusFound {
+			t.Fatalf("want 302 for an allowlisted device, got %d", allowlisted.Code)
+		}
+		if !strings.Contains(allowlisted.Header().Get("Location"), canaryID) {
+			t.Fatalf("an allowlisted device must be redirected to the canary build, got %q", allowlisted.Header().Get("Location"))
+		}
+	})
+
 	t.Run("公开下载：名单外拿着发布 ID 也只拿到 404", func(t *testing.T) {
 		outside := call("/v1/public/releases/"+canaryID+"/download", outsider, outsiderCredential, nil)
 		if outside.Code != http.StatusNotFound {

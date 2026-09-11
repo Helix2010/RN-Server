@@ -501,6 +501,39 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 	c.JSON(200, gin.H{"tenantId": tenantID(c), "platform": platform, "version": version, "buildNumber": build, "status": status, "fileName": fileName, "size": nullableInt64(size), "sha256": nullableSQLString(sha), "downloadUrl": download, "releaseId": id, "releaseNotes": notes})
 }
 
+// publicLatestReleaseDownload 是"永远给最新包"的固定下载地址。
+//
+// 为什么要单独一条：真正的下载地址里带着发布 ID，每发一版就变一次，贴在官网、
+// 二维码或群里的链接每次发版都得换。这条地址不变，内部按与 /latest 完全一致的
+// 可见性挑出这台设备现在该拿的那一版（含灰度：名单内设备拿到的是灰度包），
+// 再 302 到带发布 ID 的真实地址——下载本身仍走原来那条路径，Range、ETag、
+// 对象一致性校验一个都不少。
+//
+// 不缓存这个跳转：它的意义就是"随时点都是最新的"，被缓存住就失去了意义。
+func (s *server) publicLatestReleaseDownload(c *gin.Context) {
+	platform := strings.ToLower(strings.TrimSpace(c.Query("platform")))
+	if platform == "" {
+		platform = strings.ToLower(strings.TrimSpace(c.GetHeader("x-platform")))
+	}
+	if platform == "" {
+		// 浏览器扫码打开时不会带这些，默认给 Android：iOS 目前没有直装分发链路
+		platform = "android"
+	}
+	if enabled, err := s.platformEnabled(c.Request.Context(), tenantID(c), platform); err != nil || !enabled {
+		problem(c, 400, "INVALID_PLATFORM", "A supported platform is required")
+		return
+	}
+	audience := s.canaryAudienceID(c, tenantID(c))
+	var id string
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenantID(c), platform, audience, audience).Scan(&id)
+	if err != nil {
+		problem(c, 404, "RELEASE_NOT_FOUND", "Active release not found")
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Redirect(http.StatusFound, s.absoluteURL(c, "/v1/public/releases/"+id+"/download"))
+}
+
 // byteRange 是解析后的单区间 Range（闭区间）。
 type byteRange struct{ start, end int64 }
 

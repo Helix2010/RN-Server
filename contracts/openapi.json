@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.12"
+    "version": "2026.09.13"
   },
   "paths": {
     "/health/live": {
@@ -901,6 +901,36 @@
         "responses": {
           "200": {
             "description": "Latest active release Anonymous requests only ever see the active release; a request with a valid installation credential may see a canary release targeted at it (status is then canary)"
+          }
+        }
+      }
+    },
+    "/v1/public/releases/latest/download": {
+      "get": {
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios",
+                "harmony"
+              ]
+            },
+            "description": "Defaults to the x-platform header, then android"
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Stable entry point that always serves the newest build: redirects to /v1/public/releases/{id}/download for the release this caller should get right now. The release id changes with every publish, this address does not, so a QR code or a link on a page only has to be set once. Visibility matches /v1/public/releases/latest exactly, canary included: an anonymous caller is only ever redirected to the active release, while a device that presents a valid installation credential and is in a canary audience is redirected to its canary build. Never cached (Cache-Control: no-store)"
+          },
+          "400": {
+            "description": "INVALID_PLATFORM"
+          },
+          "404": {
+            "description": "RELEASE_NOT_FOUND: no release is visible to this caller for that platform"
           }
         }
       }
