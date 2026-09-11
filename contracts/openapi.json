@@ -847,7 +847,8 @@
           "204": {
             "description": "No matching update"
           }
-        }
+        },
+        "description": " When the tenant has an ota.signing key installed, the response carries an RFC 8941 `expo-signature` dictionary over the FINAL response bytes: an HTTP response header for plain responses, and a part header on each part for multipart/mixed (manifest and directive are signed separately). The ETag includes the signing keyid so installing or rotating a key is not hidden behind a 304."
       }
     },
     "/.well-known/assetlinks.json": {
@@ -1735,6 +1736,54 @@
           }
         }
       }
+    },
+    "/v1/admin/ota/signing-key": {
+      "get": {
+        "summary": "Tenant OTA code signing key (public facts only)",
+        "description": "Returns {configured, keyId, certificatePem, certificateSha256, version, updatedBy, updatedAt}. The private key is never returned by any endpoint: it is stored encrypted with the storage master key and can only be replaced, not read back.",
+        "responses": {
+          "200": {
+            "description": "Signing key status"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "OTA_SIGNING_CONFIG_INVALID"
+          }
+        }
+      },
+      "put": {
+        "summary": "Install or rotate the tenant OTA code signing key",
+        "description": "Stores an RSA private key (PKCS#1 or PKCS#8 PEM, >= 2048 bits) encrypted at rest, together with the certificate the app compiles in. The certificate must match the private key: a mismatch would make every device silently reject updates and stay on the embedded bundle, so it is refused at write time. Signatures are emitted as the RFC 8941 `expo-signature` dictionary (sig/keyid/alg=rsa-v1_5-sha256) over the final response bytes.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OTASigningKeyWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved signing key status (same shape as GET)"
+          },
+          "400": {
+            "description": "INVALID_OTA_SIGNING_KEY: key is not RSA/too small/malformed, certificate does not match the key, missing reason or confirm"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_OTA_SIGNING_KEY: expectedVersion does not match the stored version"
+          },
+          "500": {
+            "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2474,6 +2523,42 @@
           "bundleId": {
             "type": "string",
             "description": "iOS bundle identifier of the tenant production build"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock: current stored version, 0 when unset"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "OTASigningKeyWrite": {
+        "type": "object",
+        "required": [
+          "privateKeyPem",
+          "certificatePem",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "keyId": {
+            "type": "string",
+            "description": "expo-signature keyid; defaults to \"main\" (expo-updates' CODE_SIGNING_METADATA_DEFAULT_KEY_ID)"
+          },
+          "privateKeyPem": {
+            "type": "string",
+            "description": "RSA private key, PKCS#1 or PKCS#8 PEM, at least 2048 bits. Stored encrypted; never returned."
+          },
+          "certificatePem": {
+            "type": "string",
+            "description": "The code signing certificate the app compiles in. Must match privateKeyPem."
           },
           "expectedVersion": {
             "type": "integer",

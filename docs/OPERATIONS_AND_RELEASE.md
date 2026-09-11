@@ -108,6 +108,15 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
 
 ### OTA
 
+- **代码签名（2026-09-11，安全评审 N19）**：OTA 此前只有完整性没有真实性——manifest 的 sha256 存在我们自己的数据库里，能改数据库或能顶替这条响应的人，可以让客户端拿到一份它认为"完整"的恶意 bundle，而 OTA 能改的是整个 JS 层，包括钱包签名前的确认界面。
+
+  现在每租户一把 RSA 私钥（`app_configs` 的 `ota.signing`，用 storage master key 认证加密后落库，**任何接口都不返回私钥**），经 `GET/PUT /v1/admin/ota/signing-key` 维护。下发时对**改写完成后的最终响应体**签名（对入库原文签名会把 `applyManifestStrategy` 那段改写留在签名覆盖范围之外），`rollBackToEmbedded` 指令同样签——它本身就是一条"把所有人退回内置版本"的指令。
+
+  协议事实（读 expo-updates 57.0.22 源码确认）：`expo-signature` 是 RFC 8941 字典 `sig="<base64>", keyid="…", alg="rsa-v1_5-sha256"`，签的是 body 原始字节，`SHA256withRSA`；**plain 响应里它是 HTTP 响应头，multipart 里它是 part 的头**（manifest 与 directive 各签各的）。写错位置的表现是"签了但客户端说没签名"。
+
+  几处必须知道的行为：ETag 把 keyid 算进去（否则装/换密钥时 manifest 字节没变，带 `if-none-match` 的客户端一直拿 304、永远收不到签名）；写入时校验证书与私钥是一对（不匹配的话服务端签得出来而客户端一定验不过，症状是所有设备静默停在内置 bundle）；租户没配密钥时照常下发未签名响应，要验签的客户端自己拒绝并回落内置 bundle，同时服务端按 (租户, 运行时) 去重记一条 warning——这个故障在设备上完全静默，只能从服务端看见。
+
+  **上线顺序**：先装服务端密钥，再发带 `codeSigningCertificate` 的原生包。反过来的话，新包的所有设备都收不到 OTA。App 侧的 `EXPO_REQUIRE_OTA_SIGNING` 开关（RN-App runbook §3.2.1）用来保证带证书这件事不被忘记。
 - manifest 签名密钥与 native signing key 分离；私钥由 signing service 保管。
 - runtimeVersion 必须严格匹配；资源 URL 内容寻址并不可变。
 - 更新上传后跑静态检查、启动 smoke 和真机 staging；生产先 canary。

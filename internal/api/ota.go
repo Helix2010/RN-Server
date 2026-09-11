@@ -1002,13 +1002,35 @@ func (s *server) otaManifest(c *gin.Context) {
 		problem(c, 500, "OTA_MANIFEST_QUERY_FAILED", "Unable to load OTA manifest")
 		return
 	}
+	// 签名器在分支之前取：directive 和 manifest 都要签。rollBackToEmbedded 尤其
+	// 不能漏——它本身就是一条"把所有人退回内置版本"的指令，未签名的它等于给任何
+	// 能顶替这条响应的人一个远程降级开关（安全评审 N19）。
+	signer, signerErr := s.otaSignerFor(c.Request.Context(), tenantID(c))
+	if signerErr != nil {
+		slog.Error("ota signing key is configured but unusable", "tenant", tenantID(c), "error", signerErr)
+		problem(c, http.StatusInternalServerError, "OTA_SIGNING_KEY_INVALID", "The configured OTA signing key cannot be used")
+		return
+	}
+	// 客户端要验签而我们没有密钥：它会拒绝这次更新并停在内置 bundle。这个故障
+	// 在设备上完全静默，只能从服务端看见，所以一定要留下痕迹。按 (租户, 运行时)
+	// 去重，避免公开端点被反复请求时刷屏。
+	if signer == nil && clientExpectsOTASignature(c.GetHeader("expo-expect-signature")) &&
+		objectChanges.shouldNotify("ota-unsigned:"+tenantID(c)+":"+runtime, time.Now()) {
+		slog.Warn("client asked for a signed OTA manifest but this tenant has no signing key",
+			"tenant", tenantID(c), "runtimeVersion", runtime, "platform", platform)
+	}
 	if kind == "rollback" {
 		commitTime := time.Now().UTC()
 		if published.Valid {
 			commitTime = published.Time.UTC()
 		}
 		payload, _ := json.Marshal(gin.H{"type": "rollBackToEmbedded", "parameters": gin.H{"commitTime": iso(commitTime)}})
-		writeExpoMultipart(c, "directive", payload)
+		signature, err := signer.sign(payload)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "OTA_SIGNING_FAILED", "Unable to sign the OTA directive")
+			return
+		}
+		writeExpoMultipart(c, "directive", payload, signature)
 		return
 	}
 	if !key.Valid || !sha.Valid {
@@ -1035,8 +1057,14 @@ func (s *server) otaManifest(c *gin.Context) {
 		problem(c, 502, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
 		return
 	}
-	// 生效策略以数据库为准（管理端可事后改）：ETag 要把策略算进去，否则改完客户端拿到 304
-	etag := `"` + sha.String + "-" + strategy + `"`
+	// 生效策略以数据库为准（管理端可事后改）：ETag 要把策略算进去，否则改完客户端拿到 304。
+	// 签名的 keyid 同理——装上或换掉签名密钥时 manifest 字节并没有变，不把它算进 ETag
+	// 的话，带 if-none-match 的客户端会一直拿 304，永远收不到那个签名。
+	signerKeyID := ""
+	if signer != nil {
+		signerKeyID = signer.keyID
+	}
+	etag := `"` + sha.String + "-" + strategy + "-" + signerKeyID + `"`
 	if strings.TrimSpace(c.GetHeader("if-none-match")) == etag {
 		c.Header("ETag", etag)
 		c.Status(http.StatusNotModified)
@@ -1046,13 +1074,24 @@ func (s *server) otaManifest(c *gin.Context) {
 		problem(c, 502, "OTA_MANIFEST_INVALID", "OTA manifest is not valid JSON")
 		return
 	}
+	// 签的是**改写完成后**的字节。对入库原文签名等于把 applyManifestStrategy 那段
+	// 改写留在签名覆盖范围之外（安全评审 §13 阶段 0b-2）。
+	signature, err := signer.sign(raw)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "OTA_SIGNING_FAILED", "Unable to sign the OTA manifest")
+		return
+	}
 	c.Header("Cache-Control", "no-cache")
 	c.Header("expo-protocol-version", "1")
 	c.Header("expo-sfv-version", "0")
 	c.Header("ETag", etag)
 	if strings.Contains(c.GetHeader("Accept"), "multipart/mixed") {
-		writeExpoMultipart(c, "manifest", raw)
+		writeExpoMultipart(c, "manifest", raw, signature)
 		return
+	}
+	// plain 响应里签名是 HTTP 响应头（FileDownloader.kt:478）
+	if signature != "" {
+		c.Header("expo-signature", signature)
 	}
 	c.Data(200, "application/expo+json", raw)
 }
@@ -1141,12 +1180,18 @@ func writeExpoNoUpdate(c *gin.Context) {
 
 func hashBytes(v []byte) []byte { h := sha256.Sum256(v); return h[:] }
 
-func writeExpoMultipart(c *gin.Context, name string, payload []byte) {
+// writeExpoMultipart 写 multipart 响应。`signature` 非空时作为**part 的头**带上——
+// multipart 下 expo-updates 是从 part 头里读 expo-signature 的，不是从 HTTP 响应头
+// （FileDownloader.kt:556,570）。写错位置的表现是"签了但客户端说没签名"。
+func writeExpoMultipart(c *gin.Context, name string, payload []byte, signature string) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	header := textproto.MIMEHeader{}
 	header.Set("Content-Disposition", `form-data; name="`+name+`"`)
 	header.Set("Content-Type", "application/json")
+	if signature != "" {
+		header.Set("expo-signature", signature)
+	}
 	part, err := writer.CreatePart(header)
 	if err != nil {
 		problem(c, 500, "OTA_PROTOCOL_WRITE_FAILED", "Unable to encode OTA response")
