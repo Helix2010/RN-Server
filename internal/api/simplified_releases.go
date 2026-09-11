@@ -528,6 +528,7 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	audience := s.canaryAudienceID(c, tenantID(c))
 	err := s.db.QueryRowContext(c.Request.Context(), `SELECT object_key,file_name,content_type,file_size,sha256,file_metadata FROM app_releases WHERE tenant_id=? AND id=? AND `+canaryVisibleSQL, tenantID(c), c.Param("id"), audience, audience).Scan(&key, &fileName, &contentType, &fileSize, &sha, &rawMetadata)
 	if err != nil {
+		s.noteCanaryDownloadRefused(c, c.Param("id"), audience)
 		problem(c, 404, "RELEASE_NOT_FOUND", "Published release not found")
 		return
 	}
@@ -609,6 +610,32 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	if _, err := io.Copy(c.Writer, body); err != nil {
 		slog.Error("release download stream failed", "releaseId", c.Param("id"), "error", err)
 	}
+}
+
+// noteCanaryDownloadRefused 把"灰度包被拒下载"从一个静默 404 变成能查的事件。
+//
+// 客户端这边只会看到"下载失败"，而失败的原因可能是：没带凭证、带了但四元组
+// 里少了平台 / 应用身份（不走 apiClient 的传输很容易漏）、凭证过期被吊销、
+// 或者这台机器真的不在名单里。2026-09-11 联调时就是因为分不清这几种，
+// 白查了很久。只在请求方自报了安装 ID 时多查一次状态，正常 404 不受影响。
+func (s *server) noteCanaryDownloadRefused(c *gin.Context, releaseID, audience string) {
+	claimed := strings.TrimSpace(c.GetHeader("x-installation-id"))
+	if claimed == "" {
+		return
+	}
+	var status string
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT status FROM app_releases WHERE tenant_id=? AND id=?`, tenantID(c), releaseID).Scan(&status); err != nil || status != "canary" {
+		return
+	}
+	reason := "installation is not in the canary audience"
+	if audience == "" {
+		_, code := s.verifyInstallationCredentialFor(c, tenantID(c), claimed)
+		reason = "installation identity was not accepted: " + code
+	}
+	slog.Warn("canary release download refused",
+		"tenant", tenantID(c), "releaseId", releaseID, "installationId", claimed,
+		"applicationId", c.GetHeader("x-application-id"), "platform", c.GetHeader("x-platform"),
+		"reason", reason, "requestId", requestID(c))
 }
 
 func safeDownloadName(name string) string {

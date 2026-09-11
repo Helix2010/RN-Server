@@ -196,6 +196,32 @@ func TestDBCanaryOverTheRealRouter(t *testing.T) {
 		}
 	})
 
+	// 联调时踩过：客户端只带凭证、漏了平台与应用身份，服务端按四元组查不到行，
+	// 凭证有效也判成匿名，灰度包一直 404 而客户端只看得到"下载失败"
+	t.Run("下载：只带凭证、漏掉平台与应用身份，仍然是匿名", func(t *testing.T) {
+		partial := httptest.NewRequest(http.MethodGet, "/v1/public/releases/"+canaryID+"/download", nil)
+		partial.Host = domain
+		partial.Header.Set("x-installation-id", insider)
+		partial.Header.Set("Authorization", "Installation "+insiderCredential)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, partial)
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("without the application/platform headers the credential cannot be located, want 404, got %d", recorder.Code)
+		}
+		// 补齐两个头就能过可见性这一关
+		full := httptest.NewRequest(http.MethodGet, "/v1/public/releases/"+canaryID+"/download", nil)
+		full.Host = domain
+		full.Header.Set("x-platform", "android")
+		full.Header.Set("x-application-id", "dex-mobile")
+		full.Header.Set("x-installation-id", insider)
+		full.Header.Set("Authorization", "Installation "+insiderCredential)
+		recorder = httptest.NewRecorder()
+		router.ServeHTTP(recorder, full)
+		if recorder.Code == http.StatusNotFound {
+			t.Fatalf("with the full identity header set the download must get past the visibility check: %s", recorder.Body.String())
+		}
+	})
+
 	t.Run("OTA manifest：灰度令牌走 Expo-Extra-Params，认不出就回 active", func(t *testing.T) {
 		base := "rel_router_ota_base_" + uniqueSuffix()
 		insertCanaryTestRelease(t, db, tenant, base, "6.2.0", 82, "active", nil, false)
