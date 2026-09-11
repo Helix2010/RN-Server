@@ -263,6 +263,35 @@ func TestDBCanaryTransitionRules(t *testing.T) {
 		}
 	})
 
+	t.Run("改名单：不动状态，名单落库并进审计", func(t *testing.T) {
+		other := "inst_canary_rules_2_" + uniqueSuffix()
+		canaryInstallation(t, s, tenant, other)
+		id := "rel_audience_" + uniqueSuffix()
+		insertCanaryTestRelease(t, db, tenant, id, "2.7.0", 47, "canary", []string{installation}, false)
+		if recorder := runReleaseAction(t, s, tenant, id, "set-canary-audience", map[string]any{"reason": "换一批测试机", "confirm": true, "installations": []string{other}}); recorder.Code != http.StatusCreated {
+			t.Fatalf("set-canary-audience failed: %d %s", recorder.Code, recorder.Body.String())
+		}
+		var status string
+		var audience []byte
+		if err := db.QueryRow(`SELECT status,canary_installations FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id).Scan(&status, &audience); err != nil || status != "canary" {
+			t.Fatalf("status must stay canary, got %q (%v)", status, err)
+		}
+		if got := canaryAudienceOf(audience); len(got) != 1 || got[0] != other {
+			t.Fatalf("audience not replaced: %v", got)
+		}
+		var audits int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=? AND target_id=? AND action='release_set_canary_audience'`, tenant, id).Scan(&audits); err != nil || audits != 1 {
+			t.Fatalf("audience change must be audited, got %d (%v)", audits, err)
+		}
+		// 非灰度记录不能改名单
+		other2 := "rel_audience_active_" + uniqueSuffix()
+		insertCanaryTestRelease(t, db, tenant, other2, "2.8.0", 48, "active", nil, false)
+		recorder := runReleaseAction(t, s, tenant, other2, "set-canary-audience", map[string]any{"reason": "试试看", "confirm": true, "installations": []string{other}})
+		if recorder.Code != 409 || !strings.Contains(recorder.Body.String(), "INVALID_TRANSITION") {
+			t.Fatalf("want INVALID_TRANSITION, got %d %s", recorder.Code, recorder.Body.String())
+		}
+	})
+
 	t.Run("取消灰度", func(t *testing.T) {
 		id := "rel_cancel_" + uniqueSuffix()
 		insertCanaryTestRelease(t, db, tenant, id, "2.6.0", 46, "canary", []string{installation}, false)
