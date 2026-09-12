@@ -53,6 +53,36 @@ uploaded -> verified -> active  -> paused -> completed
 
 已 active 的 artifact 永不原地替换。修复必须产生新 artifact/build/update id。
 
+### 3.1 历史版本清理（删除，不是状态迁移）
+
+状态机里没有"删除"：一个版本只会一路走到 completed，升级决策要看得见历史。但产物不
+会跟着退场——一个安卓包约 37MB，几十个版本累计就是几个 G 的对象存储，而任何时刻真正
+会被下发的只有 active 那一个。清理因此是**独立的破坏性动作**，两个接口，都要
+`reason` + `confirm: true`，都写审计（`release_purge` / `ota_release_purge`）：
+
+```text
+DELETE /v1/admin/ota/releases/{id}
+DELETE /v1/admin/releases/{id}
+```
+
+两条硬约束由服务端强制，不靠操作纪律：
+
+| 拒绝 | 条件 | 怎么解 |
+| --- | --- | --- |
+| `OTA_RELEASE_IN_USE` | 这条 OTA 是 active / canary，且它的运行时版本正是当前 active 全量包的运行时版本 | 先发新版或回滚，再清 |
+| `RELEASE_IN_USE` | 全量包处于 active / canary | 先暂停或发布替代版本 |
+| `RELEASE_HAS_OTA` | 还有 OTA 记录以它为基线 | 先清掉那些 OTA |
+
+更老运行时线上的 active OTA **可以**删：那条线上的设备收到的是全量升级，不是 OTA。
+
+顺序永远是先 OTA 后基线包。OTA 的包身份（`applicationId`、签名证书指纹）是从基线 APK
+读出来的，基线先消失，剩下的 OTA 行就永远校验不过去。
+
+对象删除**先列后删**：2026-09-10 之前入库的 OTA 没有 `object_metadata`，只按数据库枚
+举会把同目录的 bundle 和图片永久留在桶里，所以按 manifest 所在前缀 List 一遍再删。
+数据库先提交、对象后删除：反过来一旦入库失败，留下的是一行指向空对象的记录，下发时
+才炸；这个方向最坏只是桶里多几个孤儿对象，审计 summary 里记了前缀，可以再扫。
+
 ## 4. 更新决策 API
 
 bootstrap 根据以下输入求值：
