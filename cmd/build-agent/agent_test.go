@@ -8,35 +8,37 @@ import (
 	"testing"
 )
 
-func writeTenant(t *testing.T, fields map[string]any) string {
+func baseTenant() map[string]any {
+	return map[string]any{
+		"slug":                   "anyfun",
+		"appName":                "AnyFun",
+		"androidPackage":         "com.anyfun.foundation",
+		"apiBaseUrl":             "https://api.anyfun.win",
+		"bootstrapSignerAddress": "0x9269Ca361b9F0427ac883e89cD5B5fe113BBAD17",
+		"signerSha256":           "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694",
+		"version":                "1.3.7",
+		"androidVersionCode":     float64(33),
+	}
+}
+
+func tenantJSON(t *testing.T, fields map[string]any) []byte {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "tenant.json")
-	raw, err := json.MarshalIndent(fields, "", "  ")
+	raw, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, append(raw, '\n'), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	return raw
 }
 
-func baseTenant() map[string]any {
-	return map[string]any{
-		"slug":               "anyfun",
-		"appName":            "AnyFun",
-		"androidPackage":     "com.anyfun.foundation",
-		"apiBaseUrl":         "https://api.anyfun.win",
-		"version":            "1.3.7",
-		"androidVersionCode": float64(33),
-	}
-}
-
-func TestApplyBuildVersionTouchesOnlyTheTwoVersionFields(t *testing.T) {
-	path := writeTenant(t, baseTenant())
-	if err := applyBuildVersion(path, "1.3.8", 34); err != nil {
+func TestWriteTenantFileLandsTheManifestUnderTheTenantDirectory(t *testing.T) {
+	worktree := t.TempDir()
+	path, err := writeTenantFile(worktree, "anyfun", tenantJSON(t, baseTenant()))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// 目录仓库里不存在，代理要自己建出来——文件已经不再随代码提交
+	if want := filepath.Join(worktree, "tenants", "anyfun", "tenant.json"); path != want {
+		t.Fatalf("written to %s, want %s", path, want)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -46,50 +48,53 @@ func TestApplyBuildVersionTouchesOnlyTheTwoVersionFields(t *testing.T) {
 	if err := json.Unmarshal(raw, &after); err != nil {
 		t.Fatal(err)
 	}
-	if after["version"] != "1.3.8" || after["androidVersionCode"] != float64(34) {
-		t.Fatalf("version was not applied: %v", after)
-	}
-	// 身份字段一个都不能动
-	for _, key := range []string{"slug", "appName", "androidPackage", "apiBaseUrl"} {
-		if after[key] != baseTenant()[key] {
-			t.Fatalf("%s changed to %v", key, after[key])
+	for key, want := range baseTenant() {
+		if after[key] != want {
+			t.Fatalf("%s is %v, want %v", key, after[key], want)
 		}
 	}
 }
 
-// 这条用例守的是整套设计的那条线：数据库能提供构建参数，不能提供构建身份。
-// 服务端一旦能改到 applicationId，一次注入就能产出一个身份不同、却用我们的密钥
-// 签名的 APK——而 Android 用（包名 + 签名证书）认身份，那个包能在用户设备上原地
-// 覆盖安装，数据目录连钱包一起留着。
-func TestApplyBuildVersionRefusesToChangeIdentity(t *testing.T) {
+// 这几条守的是"身份文件搬到服务端之后，代理这一侧还剩下什么把关"。挡不住服务端
+// 故意下发一个别的包名（那件事归 acknowledgeIdentityChange 和排队时的漂移检查），
+// 挡的是会产出一个装上去才发现起不来的包的那些输入。
+func TestWriteTenantFileRefusesAManifestThatWouldBreakTheApp(t *testing.T) {
 	for name, mutate := range map[string]func(map[string]any){
-		"package renamed": func(m map[string]any) { m["androidPackage"] = "com.evil.app" },
-		"api redirected":  func(m map[string]any) { m["apiBaseUrl"] = "https://evil.example" },
-		"field dropped":   func(m map[string]any) { delete(m, "slug") },
-		"field added":     func(m map[string]any) { m["extra"] = "x" },
+		"包名不是反向域名":     func(m map[string]any) { m["androidPackage"] = "notapackage" },
+		"配置地址不是 https": func(m map[string]any) { m["apiBaseUrl"] = "http://api.anyfun.win" },
+		"缺签名地址":        func(m map[string]any) { delete(m, "bootstrapSignerAddress") },
+		"签名地址格式不对":     func(m map[string]any) { m["bootstrapSignerAddress"] = "0xzz" },
+		"缺自校验指纹":       func(m map[string]any) { delete(m, "signerSha256") },
+		"版本号不是正整数":     func(m map[string]any) { m["androidVersionCode"] = float64(0) },
+		"应用名为空":        func(m map[string]any) { m["appName"] = "   " },
 	} {
-		before := baseTenant()
-		after := baseTenant()
-		mutate(after)
-		after["version"] = "1.3.8"
-		after["androidVersionCode"] = float64(34)
-		if err := assertOnlyVersionChanged(before, after); err == nil {
-			t.Fatalf("%s was allowed", name)
+		fields := baseTenant()
+		mutate(fields)
+		if _, err := writeTenantFile(t.TempDir(), "anyfun", tenantJSON(t, fields)); err == nil {
+			t.Fatalf("%s 被放过了", name)
 		}
 	}
 }
 
-func TestApplyBuildVersionRejectsAFileItCannotUnderstand(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "tenant.json")
-	if err := os.WriteFile(path, []byte("not json"), 0o644); err != nil {
-		t.Fatal(err)
+// RN 模板那把 debug key 的私钥在每台装了 RN 的机器上。拿它当自校验基准等于把
+// 校验关掉，还留下一行"已经校验过了"的假象。
+func TestWriteTenantFileRefusesThePublicDebugSigner(t *testing.T) {
+	fields := baseTenant()
+	fields["signerSha256"] = reactNativeDebugSigner
+	_, err := writeTenantFile(t.TempDir(), "anyfun", tenantJSON(t, fields))
+	if err == nil || !strings.Contains(err.Error(), "debug key") {
+		t.Fatalf("公共 debug 签名指纹被接受了: %v", err)
 	}
-	if err := applyBuildVersion(path, "1.0.0", 1); err == nil {
-		t.Fatal("a tenant file that is not JSON was accepted")
+}
+
+func TestWriteTenantFileRejectsInputItCannotUnderstand(t *testing.T) {
+	if _, err := writeTenantFile(t.TempDir(), "anyfun", []byte("not json")); err == nil {
+		t.Fatal("不是 JSON 的身份文件被接受了")
 	}
-	if err := applyBuildVersion(filepath.Join(dir, "missing.json"), "1.0.0", 1); err == nil {
-		t.Fatal("a missing tenant file was accepted")
+	// 任务里没带身份文件，说明服务端根本没能合成出来——这时候硬打出来的包装上去
+	// 也起不来，要在这里就说清楚
+	if _, err := writeTenantFile(t.TempDir(), "anyfun", nil); err == nil {
+		t.Fatal("空的身份文件被接受了")
 	}
 }
 

@@ -2,11 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -160,6 +162,26 @@ type buildJobCreate struct {
 	ReleaseNotes map[string]any `json:"releaseNotes"`
 	Reason       string         `json:"reason"`
 	Confirm      bool           `json:"confirm"`
+	// AcknowledgeIdentityChange：这次构建会改变包名或签名指纹时必须显式带上。
+	AcknowledgeIdentityChange bool `json:"acknowledgeIdentityChange"`
+}
+
+// activeReleaseIdentity 取该平台正在分发那一版的包名与签名指纹，用来和这次要打的
+// 包比对。没有 active 版本（新租户）就返回空，比对自然跳过。
+func (s *server) activeReleaseIdentity(ctx context.Context, tenant, platform string) (string, string, error) {
+	var raw []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT object_metadata FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`,
+		tenant, platform).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	pkg, _ := storedMetadataString(raw, "packageName")
+	signer, _ := storedMetadataString(raw, "signerSha256")
+	return pkg, signer, nil
 }
 
 // buildJobReleaseNotes 读出任务上的发布说明；没填就是空对象，不是 null——
@@ -179,10 +201,12 @@ func (s *server) createBuildJob(c *gin.Context) {
 		return
 	}
 	platform := strings.ToLower(strings.TrimSpace(body.Platform))
-	gitRef := strings.TrimSpace(body.GitRef)
+	// 分支固定 main，请求里带什么都不看。能选分支就等于能从任意分支出一个用生产
+	// 签名密钥签的包，而那个包和正式版在设备上无法区分。
+	gitRef := buildGitRef
 	version := strings.TrimSpace(body.Version)
 	reason := strings.TrimSpace(body.Reason)
-	if !body.Confirm || (platform != "android" && platform != "ios") || gitRef == "" || len(gitRef) > 200 ||
+	if !body.Confirm || (platform != "android" && platform != "ios") ||
 		!semverPattern.MatchString(version) || body.BuildNumber < 1 || len(reason) < 3 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_JOB", "platform must be android or ios, version must be semver, buildNumber must be positive, reason and confirm=true are required")
 		return
@@ -207,6 +231,41 @@ func (s *server) createBuildJob(c *gin.Context) {
 			fmt.Sprintf("buildNumber must be greater than %d, the highest already used for %s", floor, platform))
 		return
 	}
+	// 身份在排队这一刻就要能合成出来。留到代理认领才发现，运维已经等了一轮队列，
+	// 而缺的往往是"签名密钥没配"这种在控制台点两下就好的事
+	slug, err := s.tenantSlug(c.Request.Context(), tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to resolve this tenant")
+		return
+	}
+	buildCfg, _, err := s.buildConfigFor(c.Request.Context(), tenantID(c), slug)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_INVALID", "Stored build.android configuration is invalid")
+		return
+	}
+	manifest, err := s.tenantManifestFor(c.Request.Context(), tenantID(c), buildCfg, version, body.BuildNumber)
+	if err != nil {
+		var missing *missingIdentity
+		if errors.As(err, &missing) {
+			problem(c, http.StatusConflict, "APP_IDENTITY_INCOMPLETE", missing.Error())
+			return
+		}
+		problem(c, http.StatusInternalServerError, "APP_IDENTITY_INVALID", "Unable to compose the tenant app identity")
+		return
+	}
+	// 和正在分发的那一版比一遍。包名或签名指纹变了，装着旧版的设备升不上去——
+	// 那是另一个 App，不是新版本，得有人明确说"我知道"
+	activePackage, activeSigner, err := s.activeReleaseIdentity(c.Request.Context(), tenantID(c), platform)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to inspect the active release")
+		return
+	}
+	if drift := tenantIdentityDrift(manifest, activePackage, activeSigner); len(drift) > 0 && !body.AcknowledgeIdentityChange {
+		problem(c, http.StatusConflict, "APP_IDENTITY_DRIFT",
+			"This build would change "+strings.Join(drift, "；")+"，装着当前版本的设备升不上去。确认要这么做就带 acknowledgeIdentityChange=true 重发。")
+		return
+	}
+
 	now := time.Now().UTC()
 	id := "bld_" + randomID(16)
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
@@ -437,6 +496,21 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	view["tenantSlug"] = slug
 	view["tenantDirectory"] = buildCfg.RepoDirectory
 	view["googleServicesJson"] = nullableString(buildCfg.GoogleServicesJSON)
+	// tenant.json 由服务端合成随任务下发，仓库里不再有这个文件。合成不出来就让
+	// 这条任务当场失败：缺的是签名密钥或发布身份这类东西，硬打出来的包装上去也
+	// 起不来，而那时候报的是"配置连接失败"，看不出根因（见 tenant_manifest.go）
+	manifest, err := s.tenantManifestFor(c.Request.Context(), job.TenantID, buildCfg, job.Version, job.BuildNumber)
+	if err != nil {
+		var missing *missingIdentity
+		if errors.As(err, &missing) {
+			s.markBuildJobFailed(c.Request.Context(), job.ID, missing.Error())
+			problem(c, http.StatusConflict, "APP_IDENTITY_INCOMPLETE", missing.Error())
+			return
+		}
+		problem(c, http.StatusInternalServerError, "APP_IDENTITY_INVALID", "Unable to compose the tenant app identity")
+		return
+	}
+	view["tenantFile"] = manifest
 	// 签名密钥以**服务端打不开的盒子**下发。打包机本地持有封装口令，自己开。
 	// 没配就留 null，代理会当场失败并说清楚缺什么。
 	sealedKeystore, keyAlias, err := s.sealedBuildKeystoreFor(c.Request.Context(), job.TenantID)
@@ -520,6 +594,21 @@ func (s *server) completeBuildJob(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// markBuildJobFailed 在没有代理上报的情况下判一条任务失败。认领时就发现缺配置的
+// 任务必须落到 failed：留在 claimed 会被心跳超时慢慢回收，队列是跨租户的，一条
+// 卡住的任务拖的是所有人。
+func (s *server) markBuildJobFailed(ctx context.Context, id, reason string) {
+	if len(reason) > 500 {
+		reason = reason[:500]
+	}
+	now := time.Now().UTC()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE build_jobs SET status='failed',failure_reason=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('pending','claimed','running')`,
+		reason, now, now, id); err != nil {
+		slog.Error("unable to fail a build job with an incomplete tenant identity", "jobId", id, "error", err)
+	}
 }
 
 func (s *server) failBuildJob(c *gin.Context) {

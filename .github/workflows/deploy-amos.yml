@@ -36,6 +36,13 @@ jobs:
       - run: go build ./cmd/server
       - run: jq empty contracts/openapi.json
 
+      # 部署被跳过时整个 run 仍然是绿的，没有任何地方说"其实没发出去"。真踩过：
+      # 变量建成了 Secret，vars.* 取不到，validate 全绿，amos 上一次连接都没有
+      - name: Warn when deployment is disabled
+        if: vars.AMOS_DEPLOY_ENABLED != 'true'
+        run: |
+          echo "::warning title=没有部署::AMOS_DEPLOY_ENABLED 不是 'true'，deploy 会被跳过。它必须建在 Variables 标签页，不是 Secrets——vars.* 读不到 Secret。"
+
   deploy:
     needs: validate
     if: vars.AMOS_DEPLOY_ENABLED == 'true'

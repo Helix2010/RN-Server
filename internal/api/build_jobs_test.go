@@ -70,12 +70,14 @@ func TestIsHexRejectsWhatIsNotADigest(t *testing.T) {
 func TestCreateBuildJobRejectsInvalidBodiesBeforeTouchingTheDatabase(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	// db 为 nil：任何走到数据库的路径都会 panic
+	//
+	// gitRef 不在这些用例里：它已经不由请求决定了（固定 main），所以"没填分支"不再
+	// 是一种非法输入。能选分支就等于能从任意分支出一个用生产签名密钥签的包。
 	s := &server{cfg: config.Config{Environment: "production"}}
 	for name, payload := range map[string]string{
 		"not confirmed":   `{"platform":"android","gitRef":"main","version":"1.3.8","buildNumber":34,"reason":"ship signing","confirm":false}`,
 		"short reason":    `{"platform":"android","gitRef":"main","version":"1.3.8","buildNumber":34,"reason":"x","confirm":true}`,
 		"bad platform":    `{"platform":"windows","gitRef":"main","version":"1.3.8","buildNumber":34,"reason":"ship signing","confirm":true}`,
-		"no git ref":      `{"platform":"android","gitRef":"  ","version":"1.3.8","buildNumber":34,"reason":"ship signing","confirm":true}`,
 		"not semver":      `{"platform":"android","gitRef":"main","version":"1.3","buildNumber":34,"reason":"ship signing","confirm":true}`,
 		"zero build":      `{"platform":"android","gitRef":"main","version":"1.3.8","buildNumber":0,"reason":"ship signing","confirm":true}`,
 		"negative build":  `{"platform":"android","gitRef":"main","version":"1.3.8","buildNumber":-1,"reason":"ship signing","confirm":true}`,

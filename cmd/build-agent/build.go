@@ -130,12 +130,12 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	result.CommitSHA = strings.TrimSpace(string(commit))
 	buf.add("commit " + result.CommitSHA)
 
-	// 只许改 version 与 androidVersionCode；改到第三个字段就是在改产物身份
-	tenantFile := filepath.Join(worktree, "tenants", job.TenantDirectory, "tenant.json")
-	if err := applyBuildVersion(tenantFile, job.Version, job.BuildNumber); err != nil {
+	// 身份文件由服务端合成随任务下发，仓库里没有这份文件。代理仍然校验一遍——
+	// 两端分属不同信任域（见 tenantfile.go）
+	if _, err := writeTenantFile(worktree, job.TenantDirectory, job.TenantFile); err != nil {
 		return result, err
 	}
-	buf.add(fmt.Sprintf("tenant %s pinned to %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
+	buf.add(fmt.Sprintf("tenant %s written as %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
 
 	// 证书随任务下发，代理不去猜该编哪一张
 	if strings.TrimSpace(job.OTACertificatePEM) == "" {

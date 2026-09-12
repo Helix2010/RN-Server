@@ -34,6 +34,9 @@ type claimedJob struct {
 	// GoogleServicesJSON 不是机密（它原样编进每个 APK），但按租户不同，所以也随
 	// 任务下发——这样新加一台打包机仍然只需要一个封装口令。
 	GoogleServicesJSON string `json:"googleServicesJson"`
+	// TenantFile 是服务端合成的 tenants/<目录>/tenant.json。它取代了仓库里那份
+	// 提交上去的文件——开一个新租户不该需要改代码。代理仍然校验字段（tenantfile.go）。
+	TenantFile json.RawMessage `json:"tenantFile"`
 }
 
 type client struct {

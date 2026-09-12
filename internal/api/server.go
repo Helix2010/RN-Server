@@ -164,6 +164,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin())
+	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	platform.GET("/scan/chains", s.scanChains)
 	platform.PUT("/scan/chains/:chain", s.saveScanChain)
 	platform.POST("/scan/chains/:chain/probe", s.probeScanChain)
