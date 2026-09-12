@@ -292,8 +292,11 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		ArtifactToken, BaseReleaseID, Channel, SourceCommitSHA, ApplyStrategy string
 		ReleaseNotes                                                          map[string]any `json:"releaseNotes"`
 	}
-	if decode(c, &body) != nil {
-		problem(c, 400, "INVALID_OTA_RELEASE", "Invalid OTA release payload")
+	// 解码失败要说清是哪个字段。这个结构体没有 confirm，而同类接口大多要求
+	// confirm=true——照着别处的写法带上它，DisallowUnknownFields 就会拒掉整个
+	// 请求，而报错只说"payload 无效"，完全看不出多了什么
+	if err := decode(c, &body); err != nil {
+		problem(c, 400, "INVALID_OTA_RELEASE", "Request body was rejected: "+err.Error())
 		return
 	}
 	body.ApplyStrategy = strings.TrimSpace(body.ApplyStrategy)
