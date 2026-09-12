@@ -1,6 +1,6 @@
 # 扫链模块表结构（迁移 33）
 
-设计：RN-App `docs/design/wallet-receive-index-2026-09-06.md` §4.9；决策：ADR-0013。生产环境必须执行到 `schema_migrations.version=33`（web4 `MYSQL_AUTO_MIGRATE=false`，迁移由部署脚本单独执行）。
+设计：RN-App `docs/design/wallet-receive-index-2026-09-06.md` §4.9；决策：ADR-0013。生产环境必须执行到 `schema_migrations.version=33`（生产 `MYSQL_AUTO_MIGRATE=false`，迁移由 amos 上的 `rn-foundation-migrate.service` 单独执行）。
 
 ## 表职责
 

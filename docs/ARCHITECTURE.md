@@ -45,7 +45,8 @@ internal/
       infrastructure/
       presentation/
 contracts/openapi.json    # 移动端与管理端公共契约
-deploy/web4/              # 隔离部署、Caddy 与 Compose
+deploy/amos/              # **生产部署**（裸机 systemd + nginx），2026-09-12 起
+deploy/web4/              # 已退役的 Docker Compose + Caddy 部署，留作参考
 docs/                     # 当前规范和仍有效的 ADR
 ```
 

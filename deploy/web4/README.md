@@ -1,4 +1,16 @@
-# web4 deployment
+# web4 部署（已退役）
+
+> **2026-09-12 起不再是生产环境。** 生产迁到 amos，见 `deploy/amos/README.md`
+> 与 ADR-0015。web4 上四个容器已停止并移除，`.env` 及其六份历史备份已用
+> `shred` 覆写删除——**照本文操作前要先重建 `.env`**，值可以从 amos 的
+> `/etc/rn-foundation.env` 取。
+>
+> 本文保留有两个用处：一是回滚时按它重建 Compose 部署，二是它记录了 Docker +
+> Caddy 那套方案的完整细节，amos 那套在很多地方是对照着它做的。
+>
+> 回滚路径：从 amos 重建 `.env` → `./start.sh` → 把 Cloudflare 上
+> `api.anyfun.win` / `console.anyfun.win` 的 A 记录改回 web4 的 IP。数据在共用的
+> 数据库里，不需要迁移。
 
 This deployment is isolated under `/home/ubuntu/fy/service` and uses the
 `rn-foundation-*` Docker names. It does not install host-level Node, pnpm, or

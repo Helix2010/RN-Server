@@ -1,0 +1,31 @@
+# 数据库迁移，一次性任务。
+#
+# web4 退役之前，表结构由那边的 start.sh 推进，amos 这套刻意不跑迁移，免得两个
+# 写入方抢同一张 schema_migrations。web4 停掉之后就没有执行方了——这个 unit 补上
+# 那个位置。
+#
+# 做成 unit 而不是在部署脚本里直接调二进制，是为了让它和服务用**同一份**
+# EnvironmentFile：数据库口令不会出现在命令行参数里，`ps` 和 /proc/*/cmdline 都看
+# 不到。Type=oneshot + RemainAfterExit=no，`systemctl start` 会等它跑完并把退出码
+# 反映到 is-failed 上。
+#
+# 迁移是只进不退的：没有 down 脚本，回滚靠发布新版本而不是回退表结构。
+[Unit]
+Description=RN Foundation database migration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=rnfoundation
+Group=rnfoundation
+EnvironmentFile=/etc/rn-foundation.env
+WorkingDirectory=/opt/rn-foundation
+ExecStart=/opt/rn-foundation/rn-server migrate
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+InaccessiblePaths=/etc/rn-build-agent.env /var/lib/rn-build-agent /opt/rn-build-agent /var/cache/rn-build-agent
+ReadWritePaths=/var/lib/rn-foundation

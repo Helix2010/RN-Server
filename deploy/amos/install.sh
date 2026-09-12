@@ -8,6 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 for f in rn-foundation-server.service rn-foundation-indexer.service \
+         rn-foundation-migrate.service \
          rn-foundation.env.example nginx-rn-foundation.conf \
          nginx-snippet-api.inc nginx-snippet-console.inc; do
   [ -f "$f" ] || { echo "缺少 $f" >&2; exit 1; }
@@ -32,6 +33,7 @@ fi
 echo "== systemd =="
 sudo install -m 0644 rn-foundation-server.service  /etc/systemd/system/
 sudo install -m 0644 rn-foundation-indexer.service /etc/systemd/system/
+sudo install -m 0644 rn-foundation-migrate.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 echo "== 证书占位 =="

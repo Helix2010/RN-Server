@@ -24,14 +24,22 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `/opt/rn-foundation/rn-server` | 程序本体，API 与扫链共用 |
+| `/opt/rn-foundation/rn-server` | 程序本体，API、扫链、迁移共用 |
 | `/opt/rn-foundation/admin/<租户>/` | 控制台静态产物，一个租户一份 |
 | `/etc/rn-foundation.env` | 配置，0600 root，含数据库口令 |
 | `/var/lib/rn-foundation/` | 状态目录 |
 | `/etc/nginx/conf.d/rn-foundation.conf` | 四个域名的站点配置 |
 
-两个 systemd unit：`rn-foundation-server`（监听 `127.0.0.1:13080`）与
-`rn-foundation-indexer`（不监听任何端口）。
+三个 systemd unit：`rn-foundation-server`（监听 `127.0.0.1:13080`）、
+`rn-foundation-indexer`（不监听任何端口）、`rn-foundation-migrate`（oneshot，
+只在部署时被调用）。
+
+证书两套，按域名的暴露方式分：
+
+| 链接 | 证书来源 | 覆盖 |
+| --- | --- | --- |
+| `/etc/nginx/ssl/rn-foundation` | Let's Encrypt，acme.sh TLS-ALPN-01 | predict.kim（将来 any123.top） |
+| `/etc/nginx/ssl/rn-foundation-anyfun` | Cloudflare Origin CA，15 年 | anyfun.win |
 
 ## 域名与租户
 
@@ -58,7 +66,7 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
 控制台把 API 地址**编译进包里**（`VITE_API_BASE_URL`），所以两个租户是两份产物，
 不是同一份配两个 `server_name`。加租户就在 `deploy.sh` 的 `TENANTS` 里加一行。
 
-## 与 web4 共用一个数据库，安全吗
+## 与 web4 共用一个数据库，安全吗（web4 已于 2026-09-12 退役）
 
 查过三处会打架的地方：
 
@@ -66,8 +74,11 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
   `lease_until`），只有抢到的那台推进游标。两台同时开着是安全的。
 - **推送派发**：出站队列的认领是 CAS（`WHERE id=? AND status='pending'` 看
   `RowsAffected`），不会重复发。但两台一起派发只是分摊，收益为零，默认留给 web4。
-- **表结构**：只由 web4 推进。amos 这份 `MYSQL_AUTO_MIGRATE=false`，也不要从
-  amos 跑 `migrate`——两个写入方抢同一张 `schema_migrations` 没有意义。
+- **表结构**：`MYSQL_AUTO_MIGRATE=false`，迁移不在服务启动时跑。web4 在役时由
+  它的 `start.sh` 推进，amos 刻意不碰，免得两个写入方抢同一张 `schema_migrations`。
+  **web4 退役后执行方换成 amos**：`rn-foundation-migrate.service`（oneshot），
+  `deploy.sh server` 会在换完二进制、起服务之前自动调它，失败就停在那里不起服务。
+  做成 unit 是为了复用同一份 EnvironmentFile，数据库口令不进命令行参数。
 
 有两个值**必须和 web4 一致**：`STORAGE_MASTER_KEY`（它解密库里的租户对象存储
 凭据，换一把就全读不出来）和 `DEVICE_IDENTITY_HMAC_KEY`（换了同一台设备在两边
@@ -77,6 +88,7 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
 ## 装一台
 
 ```bash
+# 0. 现状：这套已经在 amos 上跑着（2026-09-12 起承接生产）。以下是从零装一台的步骤
 # 1. 把这一整个目录送上去
 ssh amos 'mkdir -p ~/rn-foundation-deploy'
 scp deploy/amos/* amos:~/rn-foundation-deploy/
@@ -135,3 +147,52 @@ nginx 配置里的证书路径指向软链接 `/etc/nginx/ssl/rn-foundation`：�
 
 服务端和 web4 的升级顺序一样：**先服务端后代理**。服务端用
 `DisallowUnknownFields`，代理比服务端新时上报会 400，任务卡在 claimed。
+
+## 注意事项
+
+按踩过的顺序记，每条都是真出过问题的。
+
+**入站只有 443，而且按 SNI 放行。** 链路上有一台设备只转发白名单内的 SNI，白名单
+外的 TLS 握手直接丢掉，连不带 SNI 的连接也丢。判断某个域名通不通，要**从外部带
+SNI 握手看拿到哪张证书**，不能比对 A 记录、更不能用裸 TCP 探——裸 TCP 没有
+ClientHello，一定被丢，会得出「443 完全不通」的错误结论。新增域名时除了改配置，
+还要请人把它加进那个白名单。
+
+**反代必须传 `$host`。** 租户是按 Host 头从 `tenant_domain` 认的。本机既有站点的
+写法是 `proxy_set_header Host 127.0.0.1:13080`，照抄过来服务端会一律回
+`TENANT_DOMAIN_NOT_FOUND`。
+
+**`conf.d` 只加载 `*.conf`。** 本机原有的 `console.any123.top`（没有后缀）从来没
+被加载过。片段文件因此**必须**用 `.inc` 结尾——用 `.conf` 会被当成独立配置加载，
+里面的 `location` 不在 `server` 块里，nginx 直接起不来。
+
+**`BIND_ADDRESS` 不能省。** 应用默认绑 `*:PORT`。Docker 部署时端口映射替我们限制
+了暴露面，裸机没有这层，不写的话 13080 绕过 nginx 直接对外，TLS 和它上面的一切
+都白设。
+
+**`.env` 里含 `$` 的值要加单引号。** `ADMIN_PASSWORD_HASH` 是 scrypt 格式，带
+`$`。systemd 读 EnvironmentFile 不做展开，但任何 `source` 这个文件的脚本都会把
+`$3` 当变量吃掉。加了引号两边都对。
+
+**证书路径写软链接，不写具体目录。** 签发脚本只改链接指向，nginx 配置本身不动。
+这样重跑 `install.sh` 不会把 TLS 退回占位证书——那种退化 `nginx -t` 照样通过，
+不会有人发现。同理不要用 certbot 的 `--nginx` 插件，它会就地改写这个文件。
+
+**certbot 不支持 TLS-ALPN-01。** 这是能力缺失不是版本问题，换新版一样报
+"None of the preferred challenges are supported by the selected plugin"。所以用
+acme.sh。
+
+**nginx reload 是优雅的。** 换完证书紧接着探一次，很可能还落在旧 worker 上拿到
+旧证书，等两秒再看。第一次装 Origin CA 时就被这个骗过一次。
+
+**`set -e` 下两种写法会静默打断脚本**：`[ 条件 ] && 赋值` 在条件不成立时整条
+AND 列返回 1；命令替换里的管道失败同样触发。探测循环第一次只跑了两个域名就停，
+就是后者。
+
+**与 web4 共库的三处并发点**已经查过：扫链每条链有租约（只有抢到的推进游标）、
+推送派发是 CAS 认领（不会重发）、表结构由单一执行方推进。`STORAGE_MASTER_KEY`
+和 `DEVICE_IDENTITY_HMAC_KEY` 必须与另一端一致，`ADMIN_API_KEY` 必须不同。
+
+**回滚**：把 Cloudflare 上的 A 记录改回 web4 的 IP，并按 `deploy/web4/README.md`
+重建那边的 `.env`（值从 `/etc/rn-foundation.env` 取，web4 上的已经 shred 掉了）。
+数据在共用的数据库里，不需要迁移。

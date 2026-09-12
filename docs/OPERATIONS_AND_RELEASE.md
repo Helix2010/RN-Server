@@ -98,7 +98,8 @@ SELECT JSON_UNQUOTE(JSON_EXTRACT(summary,'$.objectPrefix')) FROM audit_events WH
 OTA 那一侧是失败即中止（`STORAGE_LIST_FAILED`），记录不动——列不出来就不知道该删哪些
 对象，先删了行等于把线索也扔了。
 
-批量清理用 `deploy/web4/purge-history.sh`（在 web4 上跑，管理密钥只在那台机器）：
+批量清理用 `deploy/web4/purge-history.sh`（在部署机上跑，管理密钥只在那台机器；
+2026-09-12 起生产是 amos，脚本里的 `SERVICE_DIR` 要指向该机的配置目录）：
 `DRY_RUN=1 ./purge-history.sh android` 先看清单，去掉 `DRY_RUN` 才真删。脚本对
 "历史"的定义只有一条——build 号低于当前 active 全量包；比 active 更高的 verified
 是待发布，不动。OTA 一律尝试删除，留哪一条由服务端的 409 决定，脚本不自己判断。

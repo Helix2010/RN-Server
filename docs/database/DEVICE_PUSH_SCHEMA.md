@@ -1,6 +1,6 @@
 # 设备与推送表结构（最终版）
 
-最终字段由 migration 14 创建、migration 17/18/19/20 补齐、migration 21 统一字段备注。生产环境必须执行到 `schema_migrations.version=21`；仅部署二进制不会自动补齐数据库（web4 当前 `MYSQL_AUTO_MIGRATE=false`）。
+最终字段由 migration 14 创建、migration 17/18/19/20 补齐、migration 21 统一字段备注。生产环境必须执行到 `schema_migrations.version=21`；仅部署二进制不会自动补齐数据库（生产 `MYSQL_AUTO_MIGRATE=false`）。迁移由 amos 上的 `rn-foundation-migrate.service` 执行，`deploy/amos/deploy.sh server` 会在换二进制之后、起服务之前自动调它。
 
 ## 表职责
 

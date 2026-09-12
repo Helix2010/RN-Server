@@ -35,10 +35,20 @@ build_server() {
 ship_server() {
   echo "== 上传并重启 =="
   scp -q "$STAGE/rn-server" "$HOST:/tmp/rn-server"
-  # 先停扫链再停 API：扫链依赖 API 先就绪，反过来停会多打一轮连接失败的日志
-  ssh "$HOST" 'sudo systemctl stop rn-foundation-indexer rn-foundation-server || true
+  # 先停扫链再停 API：扫链依赖 API 先就绪，反过来停会多打一轮连接失败的日志。
+  # 迁移在新二进制就位之后、服务启动之前跑：新代码要的列必须先存在。迁移只进不退，
+  # 反复执行是幂等的。走 systemd unit 是为了复用同一份 EnvironmentFile，数据库口令
+  # 不会出现在命令行参数里
+  ssh "$HOST" 'set -e
+    sudo systemctl stop rn-foundation-indexer rn-foundation-server || true
     sudo install -m 0755 -o root -g root /tmp/rn-server /opt/rn-foundation/rn-server
     rm -f /tmp/rn-server
+    echo "   执行数据库迁移"
+    if ! sudo systemctl start rn-foundation-migrate; then
+      echo "   迁移失败，服务保持停止状态：" >&2
+      sudo journalctl -u rn-foundation-migrate -n 20 --no-pager -o cat >&2
+      exit 1
+    fi
     sudo systemctl start rn-foundation-server
     sudo systemctl start rn-foundation-indexer'
 }
