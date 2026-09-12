@@ -170,8 +170,11 @@ type buildJobCreate struct {
 // 包比对。没有 active 版本（新租户）就返回空，比对自然跳过。
 func (s *server) activeReleaseIdentity(ctx context.Context, tenant, platform string) (string, string, error) {
 	var raw []byte
+	// 列名是 file_metadata。app_releases 上叫这个，ota_releases 上才叫
+	// object_metadata——写错了的表现是排队直接 500，而且只在"该租户已经有 active
+	// 版本"时才触发，新租户一路顺畅，所以很容易漏掉
 	err := s.db.QueryRowContext(ctx,
-		`SELECT object_metadata FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`,
+		`SELECT file_metadata FROM app_releases WHERE tenant_id=? AND platform=? AND status='active' ORDER BY build_number DESC LIMIT 1`,
 		tenant, platform).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", nil
