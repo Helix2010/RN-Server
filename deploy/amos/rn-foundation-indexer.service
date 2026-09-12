@@ -1,0 +1,34 @@
+# 扫链进程。同一个二进制、不同子命令，配置也是同一份 /etc/rn-foundation.env。
+#
+# 和 web4 上那个同时开着是安全的：每条链在 chain_scan_state 上有一把租约
+# （lease_owner / lease_until），只有抢到的那台真的推进游标，另一台空转等续约。
+# INDEXER_ENABLED=false 时进程不退出，容器/服务不会反复重启。
+#
+# 它不监听任何端口，所以不需要 nginx，也不该出现在 conf.d 里。
+[Unit]
+Description=RN Foundation chain indexer
+After=network-online.target rn-foundation-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rnfoundation
+Group=rnfoundation
+EnvironmentFile=/etc/rn-foundation.env
+WorkingDirectory=/opt/rn-foundation
+ExecStart=/opt/rn-foundation/rn-server indexer
+Restart=always
+RestartSec=10
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+InaccessiblePaths=/etc/rn-build-agent.env /var/lib/rn-build-agent /opt/rn-build-agent /var/cache/rn-build-agent
+ReadWritePaths=/var/lib/rn-foundation
+
+[Install]
+WantedBy=multi-user.target

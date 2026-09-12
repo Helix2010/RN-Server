@@ -1,0 +1,40 @@
+# RN-Foundation API（amos）。与打包机代理同一套部署规范：程序在 /opt，配置在
+# /etc 下 0600，systemd 拉起，不引入 Docker。
+#
+#   /opt/rn-foundation/rn-server        程序本体
+#   /etc/rn-foundation.env              配置，0600 root，含数据库口令
+#   /var/lib/rn-foundation/             状态（当前只有临时文件）
+#
+# **这台机器同时是打包机。** 打包机持有 Android keystore 的封装口令
+# （/etc/rn-build-agent.env 里的 BUILD_KEYSTORE_PASSPHRASE），而被封的 keystore
+# 就在这个进程能读到的数据库里。两半原本分在两台机器上，这是整套设计的前提；
+# 同机之后，这个进程的一次 RCE 加一次提权就能把两半凑齐。下面的 InaccessiblePaths
+# 挡住的是同机非 root 的那一半路径，挡不住提权——真要恢复这条边界，得把代理挪走。
+[Unit]
+Description=RN Foundation API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rnfoundation
+Group=rnfoundation
+EnvironmentFile=/etc/rn-foundation.env
+WorkingDirectory=/opt/rn-foundation
+ExecStart=/opt/rn-foundation/rn-server
+Restart=always
+RestartSec=10
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 打包机的东西对这个进程一律不可见
+InaccessiblePaths=/etc/rn-build-agent.env /var/lib/rn-build-agent /opt/rn-build-agent /var/cache/rn-build-agent
+ReadWritePaths=/var/lib/rn-foundation
+
+[Install]
+WantedBy=multi-user.target
