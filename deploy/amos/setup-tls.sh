@@ -4,6 +4,9 @@
 #   CERTBOT_EMAIL=ops@example.com ./setup-tls.sh                       # 默认域名列表
 #   CERTBOT_EMAIL=... DOMAINS="a.example b.example" ./setup-tls.sh     # 指定域名
 #   CERTBOT_EMAIL=... STAGING=1 ./setup-tls.sh                         # 先验链路
+#   CERTBOT_EMAIL=... METHOD=dns ZONE=rn-foundation-anyfun \
+#     DOMAINS="api.anyfun.win console.anyfun.win" CF_Token=<token> \
+#     ./setup-tls.sh                                                     # 走 DNS-01
 #
 # 验证走 **TLS-ALPN-01**（443），因为这台机器的入站只有 443 没有 80，而 HTTP-01
 # 只认 80 端口。
@@ -18,11 +21,17 @@
 #
 # 只签**当前真的能从公网走到本机 443** 的域名。签不下来的那些不要硬凑进同一张证书：
 # 一个域名验证失败，整张证书都签不出来。
+#
+# METHOD=dns 走 DNS-01。挂在 Cloudflare 代理后面的域名（anyfun.win）**只能用它**：
+# TLS 由 Cloudflare 终止，ALPN 校验的握手根本到不了本机。DNS-01 也不需要任何入站
+# 端口，续期同理。代价是这台机器上要放一个能改该 zone DNS 记录的 token。
 set -euo pipefail
 
 EMAIL="${CERTBOT_EMAIL:-}"
-LINK=/etc/nginx/ssl/rn-foundation
-LIVE=/etc/nginx/ssl/rn-foundation-le
+# ZONE 决定这张证书装到哪个链接下，要和 nginx 配置里的 ssl_certificate 对上
+ZONE="${ZONE:-rn-foundation}"
+LINK="/etc/nginx/ssl/$ZONE"
+LIVE="/etc/nginx/ssl/$ZONE-le"
 ACME=/root/.acme.sh/acme.sh
 read -r -a DOMAIN_LIST <<<"${DOMAINS:-api.predict.kim console.predict.kim api.any123.top console.any123.top}"
 
@@ -36,6 +45,14 @@ else
   echo "   已存在"
 fi
 sudo "$ACME" --set-default-ca --server letsencrypt >/dev/null
+
+if [ "${METHOD:-alpn}" = "dns" ]; then
+  : "${CF_Token:?METHOD=dns 需要 CF_Token=<Cloudflare API token>}"
+  export CF_Token
+  usable=("${DOMAIN_LIST[@]}")
+  echo "== DNS-01（不探测可达性：这条路不需要入站端口）=="
+  printf '   %s\n' "${usable[@]}"
+else
 
 echo "== 探测哪些域名能走到本机的 443 =="
 # 不比对 A 记录：路径上可能有转发或 SNI 路由。真正要验的是"TLS 握手最后落在不落在
@@ -60,6 +77,7 @@ if [ "${#usable[@]}" -eq 0 ]; then
   echo "没有一个域名能走到本机的 443，不申请。" >&2
   exit 1
 fi
+fi
 
 echo "== 申请证书（TLS-ALPN-01，443）=="
 args=()
@@ -68,9 +86,14 @@ if [ "${STAGING:-0}" = "1" ]; then
   args+=(--staging)
 fi
 
-sudo "$ACME" --issue --alpn --tlsport 443 "${args[@]}" \
-  --pre-hook  'systemctl stop nginx' \
-  --post-hook 'systemctl start nginx'
+if [ "${METHOD:-alpn}" = "dns" ]; then
+  # DNS-01 不碰 443，nginx 不用停
+  sudo CF_Token="$CF_Token" "$ACME" --issue --dns dns_cf "${args[@]}"
+else
+  sudo "$ACME" --issue --alpn --tlsport 443 "${args[@]}" \
+    --pre-hook  'systemctl stop nginx' \
+    --post-hook 'systemctl start nginx'
+fi
 
 if [ "${STAGING:-0}" = "1" ]; then
   echo

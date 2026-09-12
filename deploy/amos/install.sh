@@ -8,7 +8,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 for f in rn-foundation-server.service rn-foundation-indexer.service \
-         rn-foundation.env.example nginx-rn-foundation.conf; do
+         rn-foundation.env.example nginx-rn-foundation.conf \
+         nginx-snippet-api.inc nginx-snippet-console.inc; do
   [ -f "$f" ] || { echo "缺少 $f" >&2; exit 1; }
 done
 
@@ -34,25 +35,33 @@ sudo install -m 0644 rn-foundation-indexer.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 echo "== 证书占位 =="
-# nginx 配置里的证书路径指向 /etc/nginx/ssl/rn-foundation 这个**软链接**。
-# 没有真证书时先指向自签的一份，nginx 才起得来；setup-tls.sh 签好之后把链接
-# 改指 letsencrypt 的 live 目录，nginx 配置一个字都不用改。
-if [ ! -e /etc/nginx/ssl/rn-foundation ]; then
-  sudo mkdir -p /etc/nginx/ssl/rn-foundation-self
+# nginx 配置里的证书路径指向软链接。没有真证书时先指向自签的一份，nginx 才起得来；
+# setup-tls.sh 签好之后改链接指向，nginx 配置一个字都不用改。
+# 一个 zone 一个链接：三个域名分属三套证书，各自独立续期。
+sudo mkdir -p /etc/nginx/ssl/rn-foundation-self
+if [ ! -s /etc/nginx/ssl/rn-foundation-self/fullchain.pem ]; then
   sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -subj "/CN=rn-foundation-placeholder" \
     -keyout /etc/nginx/ssl/rn-foundation-self/privkey.pem \
     -out   /etc/nginx/ssl/rn-foundation-self/fullchain.pem 2>/dev/null
   sudo chmod 0600 /etc/nginx/ssl/rn-foundation-self/privkey.pem
-  sudo ln -sfn /etc/nginx/ssl/rn-foundation-self /etc/nginx/ssl/rn-foundation
   echo "   已生成自签占位证书（浏览器会报不受信任，签发真证书后消失）"
-else
-  echo "   已存在，指向 $(readlink -f /etc/nginx/ssl/rn-foundation)"
 fi
+for zone in rn-foundation rn-foundation-anyfun; do
+  if [ ! -e "/etc/nginx/ssl/$zone" ]; then
+    sudo ln -sfn /etc/nginx/ssl/rn-foundation-self "/etc/nginx/ssl/$zone"
+    echo "   $zone -> 占位"
+  else
+    echo "   $zone -> $(readlink -f "/etc/nginx/ssl/$zone")"
+  fi
+done
 
 echo "== nginx =="
-# 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf
-sudo install -m 0644 nginx-rn-foundation.conf /etc/nginx/conf.d/rn-foundation.conf
+# 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf。片段不能用 .conf
+# 结尾，否则会被当成独立配置加载，里面的 location 不在 server 块里会直接报错
+sudo install -m 0644 nginx-snippet-api.inc     /etc/nginx/conf.d/rn-foundation-snippet-api.inc
+sudo install -m 0644 nginx-snippet-console.inc /etc/nginx/conf.d/rn-foundation-snippet-console.inc
+sudo install -m 0644 nginx-rn-foundation.conf  /etc/nginx/conf.d/rn-foundation.conf
 sudo nginx -t
 sudo systemctl reload nginx
 

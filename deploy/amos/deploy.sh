@@ -21,6 +21,7 @@ trap 'rm -rf "$STAGE"' EXIT
 TENANTS=(
   "any123:https://api.any123.top"
   "predict-kim:https://api.predict.kim"
+  "anyfun:https://api.anyfun.win"
 )
 
 build_server() {
