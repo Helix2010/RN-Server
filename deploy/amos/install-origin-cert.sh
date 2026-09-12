@@ -71,9 +71,16 @@ sudo systemctl reload nginx
 echo "   /etc/nginx/ssl/$ZONE -> $(readlink -f "/etc/nginx/ssl/$ZONE")"
 
 echo "== 本机自检（带 SNI 直连回环）=="
+# reload 是优雅的：旧 worker 会把已接管的连接处理完才退出，紧接着探一次很可能
+# 还落在旧 worker 上、拿到换之前的证书。重试几次，别把这个当成装错了
 for host in "${EXPECT_HOSTS[@]}"; do
-  got="$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$host" </dev/null 2>/dev/null |
-         openssl x509 -noout -subject 2>/dev/null || true)"
+  got=""
+  for _ in 1 2 3 4 5 6; do
+    got="$(timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$host" </dev/null 2>/dev/null |
+           openssl x509 -noout -subject 2>/dev/null || true)"
+    case "$got" in *"Origin"*) break ;; esac
+    sleep 2
+  done
   printf '   %-24s %s\n' "$host" "${got:-握手失败}"
 done
 
