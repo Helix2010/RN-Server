@@ -78,6 +78,11 @@ DELETE /v1/admin/releases/{id}
 顺序永远是先 OTA 后基线包。OTA 的包身份（`applicationId`、签名证书指纹）是从基线 APK
 读出来的，基线先消失，剩下的 OTA 行就永远校验不过去。
 
+批量清理用 `deploy/web4/purge-history.sh`（在 web4 上跑，管理密钥只在那台机器）：
+`DRY_RUN=1 ./purge-history.sh android` 先看清单，去掉 `DRY_RUN` 才真删。脚本对
+"历史"的定义只有一条——build 号低于当前 active 全量包；比 active 更高的 verified
+是待发布，不动。OTA 一律尝试删除，留哪一条由服务端的 409 决定，脚本不自己判断。
+
 对象删除**先列后删**：2026-09-10 之前入库的 OTA 没有 `object_metadata`，只按数据库枚
 举会把同目录的 bundle 和图片永久留在桶里，所以按 manifest 所在前缀 List 一遍再删。
 数据库先提交、对象后删除：反过来一旦入库失败，留下的是一行指向空对象的记录，下发时
