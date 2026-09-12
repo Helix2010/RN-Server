@@ -723,6 +723,9 @@ func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
 	}
 	var body struct {
 		ArtifactToken string `json:"artifactToken"`
+		// SBOM 与产物一起传上来，同一张票据机制，不同的对象。代理生成不出来时
+		// 整个任务就失败了，所以走到这里它一般是有值的——留空只为兼容手工重放。
+		SBOMToken string `json:"sbomToken"`
 	}
 	if decode(c, &body) != nil || strings.TrimSpace(body.ArtifactToken) == "" {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "artifactToken is required")
@@ -736,6 +739,7 @@ func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"artifactToken": body.ArtifactToken,
+		"sbomToken":     body.SBOMToken,
 		"platform":      job.Platform,
 		"version":       job.Version,
 		"buildNumber":   job.BuildNumber,

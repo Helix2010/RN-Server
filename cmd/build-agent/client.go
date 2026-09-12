@@ -133,18 +133,52 @@ type uploadTicket struct {
 	} `json:"upload"`
 }
 
-// uploadArtifact 把产物传回服务端，返回它落成的发布记录 id。
+// uploadArtifact 把产物和它的 SBOM 传回服务端，返回落成的发布记录 id。
 //
 // 走的是与人工上传**完全相同**的入库路径——APK 身份解析、ETag 固定、签名指纹
 // 比对都在服务端那一侧，代理不复制其中任何一条。
-func (c *client) uploadArtifact(ctx context.Context, jobID, path string) (string, error) {
+//
+// SBOM 必须在建发布记录**之前**传完：那条记录上要写它的对象键，不然产物入了库而
+// 清单没有归属，等于回到"扫过但没人知道扫的是哪个包"。
+func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath string) (string, error) {
+	artifactToken, err := c.putFile(ctx, jobID, path, "application/vnd.android.package-archive")
+	if err != nil {
+		return "", err
+	}
+	sbomToken := ""
+	if sbomPath != "" {
+		if sbomToken, err = c.putFile(ctx, jobID, sbomPath, "application/vnd.cyclonedx+json"); err != nil {
+			return "", fmt.Errorf("the SBOM could not be uploaded: %w", err)
+		}
+	}
+	// 只送 token：平台、版本、build 号和发布说明都取任务行上的值，代理没有理由
+	// 知道该写什么
+	var release struct {
+		Release struct {
+			ID string `json:"id"`
+		} `json:"release"`
+	}
+	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
+		"artifactToken": artifactToken,
+		"sbomToken":     sbomToken,
+	}, &release); err != nil {
+		return "", err
+	}
+	if release.Release.ID == "" {
+		return "", errors.New("the server created a release but did not say which one")
+	}
+	return release.Release.ID, nil
+}
+
+// putFile 领一张上传票据把一个文件传上去，返回可以用来建发布记录的 artifact token。
+func (c *client) putFile(ctx context.Context, jobID, path, contentType string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
 	var ticket uploadTicket
 	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/artifact-uploads", map[string]any{
-		"fileName": filepath.Base(path), "contentType": "application/vnd.android.package-archive", "size": info.Size(),
+		"fileName": filepath.Base(path), "contentType": contentType, "size": info.Size(),
 	}, &ticket); err != nil {
 		return "", err
 	}
@@ -180,24 +214,7 @@ func (c *client) uploadArtifact(ctx context.Context, jobID, path string) (string
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if response.StatusCode >= 400 {
-		return "", fmt.Errorf("artifact upload returned %d: %s", response.StatusCode, truncate(string(payload), 300))
+		return "", fmt.Errorf("upload of %s returned %d: %s", filepath.Base(path), response.StatusCode, truncate(string(payload), 300))
 	}
-	// 服务端把发布记录包在 "release" 里；第一版按 {"id":...} 解，结果任务上的
-	// releaseId 一直是空——产物其实已经入库了，只是任务行上看不见它
-	var release struct {
-		Release struct {
-			ID string `json:"id"`
-		} `json:"release"`
-	}
-	// 只送 token：平台、版本、build 号和发布说明都取任务行上的值，代理没有理由
-	// 知道该写什么
-	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
-		"artifactToken": ticket.Artifact.Token,
-	}, &release); err != nil {
-		return "", err
-	}
-	if release.Release.ID == "" {
-		return "", errors.New("the server created a release but did not say which one")
-	}
-	return release.Release.ID, nil
+	return ticket.Artifact.Token, nil
 }

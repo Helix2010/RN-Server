@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -318,5 +319,29 @@ func TestTenantFileRefusesTheRealReactNativeDebugFingerprint(t *testing.T) {
 	manifest["signerSha256"] = "0123456789abcdef" + strings.Repeat("0", 48)
 	if err := validateTenantFile(manifest); err != nil {
 		t.Fatalf("a normal fingerprint was refused: %v", err)
+	}
+}
+
+// 检出里没有 scripts/build-sbom.mjs 时要说清楚是这件事，而不是让 node 报一句
+// "Cannot find module"。这一步失败会让整个构建失败，错误信息得指到正确的地方。
+func TestGenerateSBOMWithoutScriptSaysSo(t *testing.T) {
+	worktree := t.TempDir()
+	buf := newLogBuffer(newRedactor())
+	_, err := generateSBOM(context.Background(), buf, worktree, "predict", filepath.Join(worktree, "app.apk"), os.Environ())
+	if err == nil {
+		t.Fatal("检出里没有 build-sbom.mjs 却当成功了")
+	}
+	if !strings.Contains(err.Error(), "build-sbom.mjs") {
+		t.Fatalf("错误信息没点明缺什么：%v", err)
+	}
+}
+
+// SBOM 的输出文件名要跟 APK 同名换后缀：两个文件在对象存储里是分开的两条记录，
+// 名字对不上时没人能把它们配成一对。
+func TestSBOMOutputNameTracksTheArtifact(t *testing.T) {
+	apk := "/w/artifacts/predict-1.3.12-build41-release.apk"
+	want := "/w/artifacts/predict-1.3.12-build41-release" + sbomFileSuffix
+	if got := strings.TrimSuffix(apk, filepath.Ext(apk)) + sbomFileSuffix; got != want {
+		t.Fatalf("SBOM 文件名 = %q，想要 %q", got, want)
 	}
 }

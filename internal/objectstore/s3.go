@@ -63,23 +63,7 @@ type Client interface {
 	ListParts(context.Context, string, string) ([]CompletedPart, error)
 	CompleteMultipartUpload(context.Context, string, string, []CompletedPart) error
 	AbortMultipartUpload(context.Context, string, string) error
-	// PutBucketCORS 设桶级 CORS 规则。品牌图片是浏览器**直传**对象存储的（服务端只
-	// 签票据），所以桶上没有放行控制台来源时，浏览器的预检会被拒，而界面上只显示
-	// "无法连接对象存储"——票据、签名、权限全都是好的，看不出问题在桶的配置上。
-	//
-	// 注意这是**桶级**配置，不是每租户一份：同一个桶被多个租户共用时，写入的必须是
-	// 所有相关来源的并集，否则后配的租户会把先配的踢掉。
-	PutBucketCORS(context.Context, []CORSRule) error
 	Test(context.Context) error
-}
-
-// CORSRule 是桶级跨域规则。字段名对齐 S3/OBS 的 CORSRule。
-type CORSRule struct {
-	AllowedOrigins []string
-	AllowedMethods []string
-	AllowedHeaders []string
-	ExposeHeaders  []string
-	MaxAgeSeconds  int32
 }
 
 type Factory interface {
@@ -328,33 +312,6 @@ func (c *s3Client) AbortMultipartUpload(ctx context.Context, key, uploadID strin
 	})
 	if err != nil {
 		return fmt.Errorf("abort multipart upload: %w", err)
-	}
-	return nil
-}
-
-func (c *s3Client) PutBucketCORS(ctx context.Context, rules []CORSRule) error {
-	if len(rules) == 0 {
-		return fmt.Errorf("at least one CORS rule is required")
-	}
-	converted := make([]types.CORSRule, 0, len(rules))
-	for _, rule := range rules {
-		if len(rule.AllowedOrigins) == 0 || len(rule.AllowedMethods) == 0 {
-			return fmt.Errorf("a CORS rule needs at least one origin and one method")
-		}
-		converted = append(converted, types.CORSRule{
-			AllowedOrigins: rule.AllowedOrigins,
-			AllowedMethods: rule.AllowedMethods,
-			AllowedHeaders: rule.AllowedHeaders,
-			ExposeHeaders:  rule.ExposeHeaders,
-			MaxAgeSeconds:  aws.Int32(rule.MaxAgeSeconds),
-		})
-	}
-	_, err := c.client.PutBucketCors(ctx, &s3.PutBucketCorsInput{
-		Bucket:            aws.String(c.bucket),
-		CORSConfiguration: &types.CORSConfiguration{CORSRules: converted},
-	})
-	if err != nil {
-		return fmt.Errorf("put bucket cors failed: %w", err)
 	}
 	return nil
 }

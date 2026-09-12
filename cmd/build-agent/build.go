@@ -96,6 +96,7 @@ type buildResult struct {
 	CommitSHA    string
 	ArtifactPath string
 	SHA256       string
+	SBOMPath     string
 }
 
 // buildJob 跑完一个任务的全部步骤。每一步失败都直接返回，调用方负责上报 fail
@@ -200,6 +201,12 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 		return result, err
 	}
 	buf.add("artifact sha256 " + result.SHA256)
+
+	// SBOM 在 worktree 还在的时候生成：扫的是这次构建自己的 pnpm-lock.yaml，
+	// 绑的是刚算出来的那个 sha256。
+	if result.SBOMPath, err = generateSBOM(ctx, buf, worktree, job.TenantDirectory, artifact, env); err != nil {
+		return result, err
+	}
 	return result, nil
 }
 

@@ -3,8 +3,10 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -98,6 +100,27 @@ func uniqueSuffix() string {
 // testTenant 生成本次测试专用的数字租户 ID（tenant_id 是 BIGINT），避免多次运行互相干扰。
 func testTenant(seed int) string {
 	return strconv.FormatInt(900_000_000_000+time.Now().UnixNano()%1_000_000_000*10+int64(seed), 10)
+}
+
+// 下面这几个和 testTenant 是同一件事：测试库是持久的，写死的标识会把上一次运行的
+// 数据带进这一次。表现是用例第一次绿、第二次红，而代码一个字没改——今天这两个用例
+// 就是这样被当成"本次改动弄坏了什么"查了一轮。
+//
+// 用 nanoTime 派生的十六进制串，跑第二遍换一个值，互不相干。
+func testHex(length int) string {
+	digest := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10) + uniqueSuffix()))
+	return hex.EncodeToString(digest[:])[:length]
+}
+
+// testAddress 生成本次运行专用的钱包地址。平台级查询按地址跨租户归并，写死地址
+// 会让"恰好两个租户"的断言看见历次运行累积下来的全部租户。
+func testAddress() string { return "0x" + testHex(40) }
+
+// testUpdateID 生成本次运行专用的 OTA update id。ota_releases.update_id 上有唯一键，
+// 写死的值第二次插入直接 1062。
+func testUpdateID() string {
+	h := testHex(32)
+	return h[0:8] + "-" + h[8:12] + "-4" + h[13:16] + "-8" + h[17:20] + "-" + h[20:32]
 }
 
 func insertTestUser(t *testing.T, db *sql.DB, tenant string, address string) uint64 {
@@ -234,17 +257,18 @@ func TestDBHeartbeatResolvesRunningRevision(t *testing.T) {
 	s := testServer(db)
 	tenant := testTenant(2)
 	installation := "inst_" + strings.Repeat("b", 32)
-	heartbeatInstallation(t, s, tenant, installation, "", installationHeartbeat{LaunchSource: str("ota"), RunningUpdateID: str("11111111-1111-4111-8111-111111111111")})
+	unknownUpdate, knownUpdate := testUpdateID(), testUpdateID()
+	heartbeatInstallation(t, s, tenant, installation, "", installationHeartbeat{LaunchSource: str("ota"), RunningUpdateID: str(unknownUpdate)})
 	var source sql.NullString
 	var revision sql.NullInt64
 	if err := db.QueryRow(`SELECT launch_source,running_ota_revision FROM app_installations WHERE tenant_id=? AND installation_id=?`, tenant, installation).Scan(&source, &revision); err != nil || source.String != "ota" || revision.Valid {
 		t.Fatalf("unknown update id must leave revision NULL: %v %v %v", source, revision, err)
 	}
 	now := time.Now().UTC()
-	if _, err := db.Exec(`INSERT INTO ota_releases(id,tenant_id,platform,channel,runtime_version,revision,update_id,base_release_id,status,release_notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "ota_"+uniqueSuffix(), tenant, "android", "production", "1.2.9", 9, "22222222-2222-4222-8222-222222222222", "rel_test", "active", "{}", "tester", now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO ota_releases(id,tenant_id,platform,channel,runtime_version,revision,update_id,base_release_id,status,release_notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, "ota_"+uniqueSuffix(), tenant, "android", "production", "1.2.9", 9, knownUpdate, "rel_test", "active", "{}", "tester", now, now); err != nil {
 		t.Fatalf("insert ota release: %v", err)
 	}
-	heartbeatInstallation(t, s, tenant, installation, "", installationHeartbeat{LaunchSource: str("ota"), RunningUpdateID: str("22222222-2222-4222-8222-222222222222"), SessionState: str("signed_out")})
+	heartbeatInstallation(t, s, tenant, installation, "", installationHeartbeat{LaunchSource: str("ota"), RunningUpdateID: str(knownUpdate), SessionState: str("signed_out")})
 	var state sql.NullString
 	if err := db.QueryRow(`SELECT running_ota_revision,client_session_state FROM app_installations WHERE tenant_id=? AND installation_id=?`, tenant, installation).Scan(&revision, &state); err != nil || !revision.Valid || revision.Int64 != 9 || state.String != "signed_out" {
 		t.Fatalf("known update id must resolve revision 9 and keep session state: %v %v %v", revision, state, err)
@@ -320,8 +344,8 @@ func TestDBPlatformLookupGroupsAcrossTenantsAndAudits(t *testing.T) {
 			t.Fatalf("insert tenant %s: %v", tenant, err)
 		}
 	}
-	address := "0x4444444444444444444444444444444444444444"
-	device := strings.Repeat("f", 64)
+	address := testAddress()
+	device := testHex(64)
 	for index, tenant := range []string{tenantA, tenantB} {
 		installation := "inst_" + strings.Repeat(string(rune('g'+index)), 32)
 		heartbeatInstallation(t, s, tenant, installation, device, installationHeartbeat{LaunchSource: str("embedded")})

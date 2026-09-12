@@ -100,8 +100,8 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 	// 之后包就没了，只剩一个 sha256——"成功"却拿不到任何可分发的东西。
 	releaseID := ""
 	if buildErr == nil {
-		buf.add("uploading " + filepath.Base(result.ArtifactPath))
-		releaseID, buildErr = api.uploadArtifact(buildCtx, job.ID, result.ArtifactPath)
+		buf.add("uploading " + filepath.Base(result.ArtifactPath) + " and its SBOM")
+		releaseID, buildErr = api.uploadArtifact(buildCtx, job.ID, result.ArtifactPath, result.SBOMPath)
 		if buildErr != nil {
 			buildErr = fmt.Errorf("the package was built but could not be uploaded: %w", buildErr)
 		} else {

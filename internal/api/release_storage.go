@@ -164,13 +164,6 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_SAVE_FAILED", "Unable to save release storage configuration")
 		return
 	}
-	// 顺手把桶的跨域规则写上。失败不影响保存：凭据可能没有改桶策略的权限，而配置
-	// 本身是有效的——只是浏览器直传会被挡，界面上另有「修复跨域」可以重试。
-	if origins, err := s.applyBucketCORS(c.Request.Context(), tenantID(c)); err != nil {
-		slog.Warn("release storage saved but the bucket CORS rule could not be written", "tenant", tenantID(c), "error", err)
-	} else {
-		slog.Info("bucket cors applied", "tenant", tenantID(c), "origins", len(origins))
-	}
 	c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{Value: value, SourceTenant: tenantID(c), Version: newVersion, UpdatedBy: actor(c), UpdatedAt: now}, tenantID(c)))
 }
 
@@ -386,56 +379,29 @@ func (s *server) tenantConsoleOrigins(ctx context.Context) ([]string, error) {
 	return origins, nil
 }
 
-// applyBucketCORS 把当前的来源集合写进该租户配置的那个桶。
-func (s *server) applyBucketCORS(ctx context.Context, tenant string) ([]string, error) {
-	origins, err := s.tenantConsoleOrigins(ctx)
+// 浏览器直传要的那条桶级规则长什么样。**只读**：这个接口不写桶策略。
+//
+// 曾经写过。做法是保存存储配置时顺手 PutBucketCORS，桶上的规则就跟着 tenant_domain
+// 自动更新。它要求发布存储那把 AK/SK 除了对象读写之外还有改桶配置的权限——而那把
+// 密钥同时被签发直传票据的路径用着，多给的这份权限在每一次上传里都在场，只为了一
+// 件极低频的事（加租户时改一次跨域规则）。按最小权限还原成只读，桶策略回到人工在
+// 对象存储控制台上配。
+//
+// 留下的这半边仍然有用：要配哪些来源是从 tenant_domain 算出来的，加了租户之后调
+// 一次就知道该补什么，不用去翻配置文件，也不会漏。
+func (s *server) bucketCORSRequirements(c *gin.Context) {
+	origins, err := s.tenantConsoleOrigins(c.Request.Context())
 	if err != nil {
-		return nil, err
-	}
-	if len(origins) == 0 {
-		return nil, errors.New("no active tenant domains to allow")
-	}
-	client, _, err := s.storageClientForTenant(ctx, tenant)
-	if err != nil {
-		return nil, err
-	}
-	rule := objectstore.CORSRule{
-		AllowedOrigins: origins,
-		// 直传只用 PUT；GET/HEAD 留给浏览器按 ETag 做条件请求
-		AllowedMethods: []string{"PUT", "GET", "HEAD"},
-		AllowedHeaders: []string{"*"},
-		ExposeHeaders:  []string{"ETag"},
-		MaxAgeSeconds:  3600,
-	}
-	if err := client.PutBucketCORS(ctx, []objectstore.CORSRule{rule}); err != nil {
-		return nil, err
-	}
-	return origins, nil
-}
-
-// 手动触发，给"加了租户域名之后去修一下"用。保存存储配置时也会自动跑一次。
-func (s *server) repairBucketCORS(c *gin.Context) {
-	origins, err := s.applyBucketCORS(c.Request.Context(), tenantID(c))
-	if err != nil {
-		slog.Error("unable to apply bucket cors", "tenant", tenantID(c), "error", err)
-		detail := "Unable to write the bucket CORS rule: " + err.Error()
-		// 403 在这里几乎一定是"这把密钥只被授了对象读写，没有桶管理权限"。
-		// 直接把原始 S3 错误抛给运维，他会去查签名、查端点、查桶名——而那些都是好的。
-		if strings.Contains(err.Error(), "StatusCode: 403") {
-			detail = "对象存储拒绝了写入跨域规则（403）。这把访问密钥只有对象读写权限，" +
-				"没有修改桶配置的权限。要么给它加上 PutBucketCORS，要么在对象存储控制台" +
-				"手工把下面这些来源加进该桶的跨域规则（方法 PUT/GET/HEAD，允许全部头，暴露 ETag）。"
-			origins, listErr := s.tenantConsoleOrigins(c.Request.Context())
-			if listErr == nil {
-				detail += " 需要放行：" + strings.Join(origins, "、")
-			}
-		}
-		// 不用 502：域名挂在 Cloudflare 后面，源站的 502 会被它替换成自己的错误页，
-		// 这段辛苦拼出来的说明一个字都到不了运维眼前。409 能原样穿透。
-		problem(c, http.StatusConflict, "BUCKET_CORS_FAILED", detail)
+		problem(c, http.StatusInternalServerError, "TENANT_DOMAIN_QUERY_FAILED", "Unable to list tenant domains")
 		return
 	}
-	s.auditNow(newAudit(tenantID(c), actor(c), "storage_cors_apply", "release-storage", "cors", "修复对象存储的跨域规则", requestID(c),
-		map[string]any{"origins": origins}))
-	c.JSON(http.StatusOK, gin.H{"applied": true, "allowedOrigins": origins})
+	c.JSON(http.StatusOK, gin.H{
+		"allowedOrigins": origins,
+		"allowedMethods": []string{"PUT", "GET", "HEAD"},
+		"allowedHeaders": []string{"*"},
+		"exposeHeaders":  []string{"ETag"},
+		"maxAgeSeconds":  3600,
+		"note": "把这条规则配到发布存储那个桶上（对象存储控制台 → 桶 → 跨域规则）。" +
+			"服务端不会替你写：发布存储的访问密钥按最小权限只有对象读写，没有改桶配置的权限。",
+	})
 }

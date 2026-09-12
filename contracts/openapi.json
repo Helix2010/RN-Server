@@ -418,6 +418,17 @@
         }
       }
     },
+    "/v1/admin/release-storage/cors": {
+      "get": {
+        "summary": "The bucket CORS rule this platform needs",
+        "description": "Read-only. Branding images are uploaded by the browser directly to object storage, so the bucket itself must allow the console origins; a bucket without them fails the preflight and the console can only report \"cannot reach object storage\". The origin list is derived from the tenant_domain table, so adding a tenant does not mean editing a config file. The server does not write the rule: the release-storage access key is least-privileged to object read/write and has no bucket-configuration permission.",
+        "responses": {
+          "200": {
+            "description": "The rule to configure on the bucket"
+          }
+        }
+      }
+    },
     "/v1/admin/release-storage/test": {
       "post": {
         "responses": {
@@ -2172,6 +2183,10 @@
                 "properties": {
                   "artifactToken": {
                     "type": "string"
+                  },
+                  "sbomToken": {
+                    "type": "string",
+                    "description": "Upload token for the CycloneDX SBOM the build agent produced for this artifact. Recorded on the release as file_metadata.sbom. Optional: a manually uploaded package has none."
                   }
                 }
               }

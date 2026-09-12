@@ -246,7 +246,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/localization/publish", s.publishLocalization)
 	group.GET("/release-storage", s.getReleaseStorage)
 	group.PUT("/release-storage", s.updateReleaseStorage)
-	group.POST("/release-storage/cors", s.repairBucketCORS)
+	group.GET("/release-storage/cors", s.bucketCORSRequirements)
 	group.POST("/release-storage/test", s.testReleaseStorage)
 	group.GET("/release-identity/android", s.getAndroidReleaseIdentity)
 	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)

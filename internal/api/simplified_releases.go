@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/apkinspect"
+	"github.com/Helix2010/RN-Server/internal/objectstore"
 	"github.com/gin-gonic/gin"
 )
 
@@ -203,11 +204,13 @@ func (s *server) deleteReleaseArtifact(c *gin.Context) {
 
 func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	var body struct {
-		ArtifactToken string         `json:"artifactToken"`
-		Platform      string         `json:"platform"`
-		Version       string         `json:"version"`
-		BuildNumber   int            `json:"buildNumber"`
-		ReleaseNotes  map[string]any `json:"releaseNotes"`
+		ArtifactToken string `json:"artifactToken"`
+		// SBOM 的上传票据，可选。打包机会带上；人工上传的包没有。
+		SBOMToken    string         `json:"sbomToken"`
+		Platform     string         `json:"platform"`
+		Version      string         `json:"version"`
+		BuildNumber  int            `json:"buildNumber"`
+		ReleaseNotes map[string]any `json:"releaseNotes"`
 		// 强制升级：用户在 App 里没有"稍后再说"，只能升。
 		// 按 docs/RELIABILITY_AND_RELEASE.md 只用于严重安全漏洞、协议不兼容、
 		// 法律合规阻断；为什么强制走审计 reason 留痕。
@@ -279,6 +282,14 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	// objectEtag 是校验时对象存储给的 ETag（objectstore.Stat，已去引号）；公开下载前再 Stat 一次比对，
 	// 发布后对象被换掉即拒绝下发。CopyObject / 存储类变更会改 ETag，此时必须重新入库
 	metadata := map[string]any{"fileName": artifact.FileName, "size": size, "sha256": hex.EncodeToString(hash.Sum(nil)), "objectEtag": stored.ETag}
+	// SBOM 记在发布记录上，而不是只落在对象存储里：等某个依赖明天爆 CVE，要回答
+	// "线上那个 1.3.12 受不受影响"，得先能从发布记录找到对应的那一份清单。
+	if sbom, err := s.storedSBOM(ctx, client, tenantID(c), strings.TrimSpace(body.SBOMToken)); err != nil {
+		problem(c, http.StatusUnprocessableEntity, "RELEASE_SBOM_INVALID", err.Error())
+		return
+	} else if sbom != nil {
+		metadata["sbom"] = sbom
+	}
 	runtimeVersion := ""
 	if body.Platform == "android" {
 		apk, inspectErr := apkinspect.Inspect(temporaryPath)
@@ -727,4 +738,28 @@ func safeDownloadName(name string) string {
 
 func isSafeHeaderValue(value string) bool {
 	return !strings.ContainsAny(value, "\r\n")
+}
+
+// storedSBOM 确认 SBOM 确实落进了对象存储，返回要记进发布记录的那几个字段。
+//
+// token 为空返回 (nil, nil)：人工上传的包没有 SBOM，那不是错误。给了 token 却对不
+// 上，才是错误——发布记录上写着一份取不回来的清单，比不写更糟。
+func (s *server) storedSBOM(ctx context.Context, client objectstore.Client, tenant, token string) (map[string]any, error) {
+	if token == "" {
+		return nil, nil
+	}
+	value, err := s.decodeReleaseArtifactToken(tenant, token)
+	if err != nil {
+		return nil, errors.New("the SBOM upload token is invalid or expired")
+	}
+	stored, err := client.Stat(ctx, value.ObjectKey)
+	if err != nil || stored.Size != value.Size {
+		return nil, errors.New("the SBOM object is missing or has an unexpected size")
+	}
+	return map[string]any{
+		"fileName":  value.FileName,
+		"objectKey": value.ObjectKey,
+		"size":      stored.Size,
+		"format":    "cyclonedx-json",
+	}, nil
 }

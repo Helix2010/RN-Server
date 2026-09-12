@@ -3,8 +3,6 @@ package api
 import (
 	"context"
 	"testing"
-
-	"github.com/Helix2010/RN-Server/internal/objectstore"
 )
 
 // 写进桶的必须是**全平台**活跃租户域名的并集。CORS 是桶级配置不是前缀级的，
@@ -27,28 +25,5 @@ func TestDBBucketCORSCoversEveryActiveTenantDomain(t *testing.T) {
 		if origins[i-1] > origins[i] {
 			t.Fatalf("来源没有排序：%q 在 %q 之前", origins[i-1], origins[i])
 		}
-	}
-}
-
-// 规则本身的形状：直传只需要 PUT，但要把 ETag 暴露出去，否则浏览器拿不到它做
-// 条件请求；MaxAge 让预检不必每次都发。
-func TestBucketCORSRuleShape(t *testing.T) {
-	fake := &fakeObjectStore{}
-	rule := objectstore.CORSRule{
-		AllowedOrigins: []string{"https://console.example"},
-		AllowedMethods: []string{"PUT", "GET", "HEAD"},
-		AllowedHeaders: []string{"*"},
-		ExposeHeaders:  []string{"ETag"},
-		MaxAgeSeconds:  3600,
-	}
-	if err := fake.PutBucketCORS(context.Background(), []objectstore.CORSRule{rule}); err != nil {
-		t.Fatal(err)
-	}
-	if len(fake.corsRules) != 1 {
-		t.Fatalf("规则没写进去: %v", fake.corsRules)
-	}
-	got := fake.corsRules[0]
-	if len(got.AllowedMethods) == 0 || got.MaxAgeSeconds == 0 {
-		t.Fatalf("规则缺方法或缓存时长: %+v", got)
 	}
 }
