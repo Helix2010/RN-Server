@@ -30,7 +30,7 @@ get() { curl -sS "${hdr[@]}" "$API$1"; }
 del() { curl -sS -o "$tmp" -w '%{http_code}' -X DELETE "${hdr[@]}" -d "$body" "$API$1"; }
 
 sweep() { # $1 = 接口前缀，其余 = 要删的 id
-  local path="$1" id code deleted=0 kept=0 failed=0
+  local path="$1" id code orphan deleted=0 kept=0 failed=0
   shift
   if [ "$#" -eq 0 ]; then
     echo "  没有要处理的记录"
@@ -43,7 +43,15 @@ sweep() { # $1 = 接口前缀，其余 = 要删的 id
     fi
     code="$(del "$path/$id")"
     case "$code" in
-    200) deleted=$((deleted + 1)) ;;
+    200)
+      deleted=$((deleted + 1))
+      # 记录删了但对象没删掉：存储凭据多半没有 DeleteObject 权限。
+      # 对象键留在审计里（action=release_purge / ota_release_purge 的 summary）
+      orphan="$(jq -r '.objectsFailed // 0' "$tmp")"
+      if [ "$orphan" != "0" ]; then
+        echo "  注意 $id 有 $orphan 个对象没删掉（权限？）"
+      fi
+      ;;
     409)
       kept=$((kept + 1))
       echo "  保留 $id  $(jq -r '.code // "?"' "$tmp")"

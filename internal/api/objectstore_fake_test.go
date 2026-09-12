@@ -14,8 +14,10 @@ import (
 
 // fakeObjectStore 是测试用对象存储：按 key 保存字节与 ETag，Stat/Get 可被替换成失败。
 type fakeObjectStore struct {
-	objects map[string]fakeObject
-	statErr error
+	objects   map[string]fakeObject
+	statErr   error
+	listErr   error
+	deleteErr error
 }
 
 type fakeObject struct {
@@ -74,11 +76,17 @@ func (f *fakeObjectStore) Put(_ context.Context, key string, body io.Reader, _ i
 }
 
 func (f *fakeObjectStore) Delete(_ context.Context, key string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.objects, key)
 	return nil
 }
 
 func (f *fakeObjectStore) List(_ context.Context, prefix string) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	if prefix == "" {
 		return nil, errors.New("fake object store: empty prefix")
 	}

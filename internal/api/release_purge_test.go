@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -216,6 +217,65 @@ func TestDBPurgeReleaseDeletesObjectAndDetachesBuildJob(t *testing.T) {
 	var audits int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=? AND action='release_purge' AND target_id=?`, tenant, history).Scan(&audits); err != nil || audits != 1 {
 		t.Fatalf("purge must be audited, got %d (%v)", audits, err)
+	}
+}
+
+// 存储凭据没有删除权限时，记录照删（它已经不该存在了），但响应必须把删不掉的对象
+// 条数报出来——只写日志的话界面上是"删除成功"，桶里一个字节都没少。
+func TestDBPurgeReportsObjectsItCouldNotDelete(t *testing.T) {
+	db := openTestDB(t)
+	tenant := testTenant(75)
+	store := newFakeObjectStore()
+	store.deleteErr = errors.New("access denied")
+	s := purgeServer(t, db, tenant, store)
+
+	id := scoped(tenant, "rel_orphan")
+	key := "tenants/" + tenant + "/release-uploads/art_orphan/application.apk"
+	insertPurgeRelease(t, db, tenant, id, "1.2.4", 18, "completed", "1.2.4", key)
+	store.put(key, []byte("apk"), "e1")
+
+	recorder := purgeApp(t, s, tenant, id, purgeBody)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("the row must still be deleted, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"objectsFailed":1`) {
+		t.Fatalf("the response must admit the object survived: %s", recorder.Body.String())
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_releases WHERE tenant_id=? AND id=?`, tenant, id).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("row must be gone, got %d (%v)", rows, err)
+	}
+	// 对象键留在审计里：权限修好之后照着扫孤儿对象就靠它
+	var stored string
+	if err := db.QueryRow(`SELECT JSON_UNQUOTE(JSON_EXTRACT(summary,'$.objectKey')) FROM audit_events WHERE tenant_id=? AND target_id=?`, tenant, id).Scan(&stored); err != nil || stored != key {
+		t.Fatalf("audit must keep the object key, got %q (%v)", stored, err)
+	}
+}
+
+// 列不出对象就不动数据库：删了行就再也不知道该删哪些对象了。
+func TestDBPurgeOTAKeepsTheRowWhenListingFails(t *testing.T) {
+	db := openTestDB(t)
+	tenant := testTenant(76)
+	store := newFakeObjectStore()
+	store.listErr = errors.New("access denied")
+	s := purgeServer(t, db, tenant, store)
+
+	base, ota := scoped(tenant, "rel_base_l"), scoped(tenant, "ota_unlistable")
+	insertPurgeRelease(t, db, tenant, base, "1.2.0", 20, "completed", "1.2.0", "tenants/"+tenant+"/releases/"+base+"/application.apk")
+	manifest := "tenants/" + tenant + "/ota/production/android/1.2.0/" + ota + "/manifest.json"
+	insertPurgeOTA(t, db, tenant, ota, base, "1.2.0", "superseded", manifest, 1)
+	store.put(manifest, []byte("{}"), "e1")
+
+	recorder := purgeOTA(t, s, tenant, ota, purgeBody)
+	if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "STORAGE_LIST_FAILED") {
+		t.Fatalf("listing failure must abort the purge, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM ota_releases WHERE tenant_id=? AND id=?`, tenant, ota).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("the row must survive, got %d (%v)", rows, err)
+	}
+	if _, ok := store.objects[manifest]; !ok {
+		t.Fatal("nothing may be deleted when the listing failed")
 	}
 }
 

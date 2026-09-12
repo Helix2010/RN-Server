@@ -65,6 +65,7 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 	ctx := c.Request.Context()
 	id := c.Param("id")
 	deleteStoredObjects := func() {}
+	failed := 0
 	var status, platform, runtime string
 	var manifestKey sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT status,platform,runtime_version,manifest_key FROM ota_releases WHERE tenant_id=? AND id=?`, tenantID(c), id).Scan(&status, &platform, &runtime, &manifestKey)
@@ -93,11 +94,14 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 		}
 		prefix = path.Dir(manifestKey.String) + "/"
 		if keys, err = client.List(ctx, prefix); err != nil {
-			// 列不出来就不动数据库：删了行就再也不知道该删哪些对象了
+			// 列不出来就不动数据库：删了行就再也不知道该删哪些对象了。
+			// 最常见的原因是存储凭据没有 List 权限，错误必须落日志，否则排查
+			// 只能看到一个 502。
+			slog.Error("unable to list the stored OTA objects", "tenant", tenantID(c), "otaReleaseId", id, "prefix", prefix, "error", err)
 			problem(c, http.StatusBadGateway, "STORAGE_LIST_FAILED", "Unable to list the stored OTA objects")
 			return
 		}
-		deleteStoredObjects = func() { deleteObjects(ctx, client, prefix, keys) }
+		deleteStoredObjects = func() { failed = deleteObjects(ctx, client, prefix, keys) }
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -121,7 +125,9 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 		return
 	}
 	deleteStoredObjects()
-	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objects": len(keys)})
+	// 对象删不掉不影响这次删除的结果（记录已经没了），但必须当场说出来：
+	// 只写日志的话，运营看到的是"删成功"，桶却一个字节都没少。
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objects": len(keys), "objectsFailed": failed})
 }
 
 func (s *server) purgeRelease(c *gin.Context) {
@@ -132,6 +138,7 @@ func (s *server) purgeRelease(c *gin.Context) {
 	ctx := c.Request.Context()
 	id := c.Param("id")
 	deleteStoredObjects := func() {}
+	failed := 0
 	var status, platform, version string
 	var buildNumber int
 	var objectKey sql.NullString
@@ -167,7 +174,7 @@ func (s *server) purgeRelease(c *gin.Context) {
 			problem(c, http.StatusBadGateway, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
 			return
 		}
-		deleteStoredObjects = func() { deleteObjects(ctx, client, key, []string{key}) }
+		deleteStoredObjects = func() { failed = deleteObjects(ctx, client, key, []string{key}) }
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -196,16 +203,21 @@ func (s *server) purgeRelease(c *gin.Context) {
 		return
 	}
 	deleteStoredObjects()
-	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id})
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objectsFailed": failed})
 }
 
 // deleteObjects 只在数据库那步提交之后调用——反过来一旦入库失败，删掉的对象就再也
-// 回不来，而记录还在，下发时才炸。删不掉只记日志：此时记录已经没了，把请求判失败会让
-// 运营以为没删成而重试，重试同样删不掉。日志带前缀，之后可以按前缀扫孤儿对象。
-func deleteObjects(ctx context.Context, client objectstore.Client, prefix string, keys []string) {
+// 回不来，而记录还在，下发时才炸。删不掉不改变这次删除的结果（记录已经没了，把请求
+// 判失败只会让运营重试，而重试同样删不掉），但**要把失败条数报回去**：只记日志的话，
+// 界面上是"删除成功"，桶里一个字节都没少。审计 summary 里留了对象键，权限修好之后
+// 可以照着把孤儿对象扫掉。
+func deleteObjects(ctx context.Context, client objectstore.Client, prefix string, keys []string) int {
+	failed := 0
 	for _, key := range keys {
 		if err := client.Delete(ctx, key); err != nil {
+			failed++
 			slog.Error("stored object was not deleted", "prefix", prefix, "key", key, "error", err)
 		}
 	}
+	return failed
 }

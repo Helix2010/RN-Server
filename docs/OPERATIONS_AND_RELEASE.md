@@ -78,6 +78,20 @@ DELETE /v1/admin/releases/{id}
 顺序永远是先 OTA 后基线包。OTA 的包身份（`applicationId`、签名证书指纹）是从基线 APK
 读出来的，基线先消失，剩下的 OTA 行就永远校验不过去。
 
+**存储凭据必须有 `DeleteObject` 和 `ListBucket`**，而且要覆盖 `tenants/<tenantId>/` 前缀。
+只读凭据下清理会走成这样：数据库记录删掉了，桶里一个字节都没少（2026-09-12 首次清理
+时就是这样，23 个安装包变成孤儿对象）。删不掉的对象条数会在响应的 `objectsFailed`
+里报出来，对象键留在审计事件的 `summary.objectKey` / `summary.objectPrefix`，权限修好
+之后照着扫：
+
+```sql
+SELECT JSON_UNQUOTE(JSON_EXTRACT(summary,'$.objectKey'))   FROM audit_events WHERE action='release_purge';
+SELECT JSON_UNQUOTE(JSON_EXTRACT(summary,'$.objectPrefix')) FROM audit_events WHERE action='ota_release_purge';
+```
+
+OTA 那一侧是失败即中止（`STORAGE_LIST_FAILED`），记录不动——列不出来就不知道该删哪些
+对象，先删了行等于把线索也扔了。
+
 批量清理用 `deploy/web4/purge-history.sh`（在 web4 上跑，管理密钥只在那台机器）：
 `DRY_RUN=1 ./purge-history.sh android` 先看清单，去掉 `DRY_RUN` 才真删。脚本对
 "历史"的定义只有一条——build 号低于当前 active 全量包；比 active 更高的 verified
