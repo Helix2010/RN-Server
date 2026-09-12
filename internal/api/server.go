@@ -42,6 +42,8 @@ type server struct {
 	secrets  *secretbox.Box
 	// tokens 只从平台默认端点读代币元数据；测试用假实现替换
 	tokens tokenMetadataReader
+	// adminIPs 限制 x-admin-key 自动化通道的来源；nil = 未配置，不限制
+	adminIPs *ipAllowlist
 }
 
 type attempt struct {
@@ -109,8 +111,22 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	box, _ := secretbox.New(cfg.StorageMasterKey)
-	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil)}
+	// 配了 IP 白名单却没配可信代理，白名单就是装饰——来源地址整个是请求方说了算。
+	// 这种情况下不要"尽力而为"地启动，否则运维会以为这件事做完了（安全评审 N17）。
+	if err := validateAdminIPConfiguration(cfg.AdminAPIAllowedIPs, cfg.TrustedProxies); err != nil {
+		panic(err)
+	}
+	allowlist, err := parseIPAllowlist(cfg.AdminAPIAllowedIPs)
+	if err != nil {
+		panic(err)
+	}
+	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist}
 	r := gin.New()
+	// 不配就谁都不信：ClientIP 取直连对端，而不是任何人都能写的 X-Forwarded-For。
+	// 这同时让下面的登录限流按真实来源计数（在此之前它也是可绕过的）。
+	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+		panic(err)
+	}
 	r.Use(gin.Recovery(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
 	r.GET("/health/live", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "live"}) })
 	r.GET("/health/ready", s.ready)
@@ -394,6 +410,14 @@ func (s *server) authenticate() gin.HandlerFunc {
 		// 自报身份任何持钥者都能随便写，写进 audit_events 的 actor 就成了攻击者可控的字段，
 		// 事后追责等于没有依据（安全评审 N17）。请求仍然可以带那个头，只是不再被采纳。
 		if key := c.GetHeader("x-admin-key"); s.cfg.AdminAPIKey != "" && constantEqual(key, s.cfg.AdminAPIKey) {
+			// 密钥对了还要看来源：这把密钥长期有效、没有账号绑定，泄露之后
+			// 唯一还能拦住它的就是"不是从我们的机器发出来的"（安全评审 N17）
+			if !s.adminIPs.allows(c.ClientIP()) {
+				slog.Warn("admin api key used from an address outside the allowlist", "clientIp", c.ClientIP(), "path", c.Request.URL.Path)
+				problem(c, http.StatusForbidden, "ADMIN_SOURCE_NOT_ALLOWED", "This automation credential is not accepted from this address")
+				c.Abort()
+				return
+			}
 			if claimed := strings.TrimSpace(c.GetHeader("x-admin-id")); claimed != "" && claimed != s.cfg.AdminAPIActor {
 				slog.Warn("ignoring self-declared admin identity on api-key request", "claimed", claimed, "actor", s.cfg.AdminAPIActor, "path", c.Request.URL.Path)
 			}

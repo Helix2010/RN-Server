@@ -18,6 +18,12 @@ type Config struct {
 	AdminAPIKey                string
 	BuildAgentToken            string
 	AdminAPIActor              string
+	// AdminAPIAllowedIPs limits the x-admin-key automation channel to these
+	// networks (CIDR or bare IP). Empty means no restriction — see N17.
+	AdminAPIAllowedIPs []string
+	// TrustedProxies are the hops allowed to set X-Forwarded-For. Empty means
+	// gin trusts nobody, so the client IP is the direct peer.
+	TrustedProxies []string
 	AdminUsername              string
 	AdminPasswordHash          string
 	AdminSessionTTL            int
@@ -89,6 +95,8 @@ func Load() (Config, error) {
 		CORSOrigins:                split(value("CORS_ORIGINS", "*")),
 		AdminAPIKey:                os.Getenv("ADMIN_API_KEY"),
 		AdminAPIActor:              value("ADMIN_API_ACTOR", "api-key-automation"),
+		AdminAPIAllowedIPs:         splitList(os.Getenv("ADMIN_API_ALLOWED_IPS")),
+		TrustedProxies:             splitList(os.Getenv("TRUSTED_PROXIES")),
 		AdminUsername:              os.Getenv("ADMIN_USERNAME"),
 		AdminPasswordHash:          os.Getenv("ADMIN_PASSWORD_HASH"),
 		AdminSessionTTL:            integer("ADMIN_SESSION_TTL_SECONDS", 28800),
@@ -240,4 +248,15 @@ func split(raw string) []string {
 		}
 	}
 	return result
+}
+
+// splitList 解析逗号分隔的列表，去掉空白与空项。
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

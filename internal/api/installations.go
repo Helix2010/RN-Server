@@ -403,6 +403,9 @@ type deviceIntegrityReport struct {
 	Emulator   *bool `json:"emulator"`
 	SideLoaded *bool `json:"sideLoaded"`
 	DevBundle  *bool `json:"devBundle"`
+	// 这台设备有没有锁屏或生物识别（安全评审 N10）。false = 金库的身份验证判为
+	// "不可用"而放行。我们不禁止这类设备用钱包，但要数得出来有多少台。
+	ScreenLock *bool `json:"screenLock"`
 }
 
 // encodeDeviceIntegrity 把信号存成 JSON；没上报就是 NULL，而不是一个全 false 的
@@ -411,7 +414,7 @@ func encodeDeviceIntegrity(report *deviceIntegrityReport) any {
 	if report == nil {
 		return nil
 	}
-	if report.Rooted == nil && report.Emulator == nil && report.SideLoaded == nil && report.DevBundle == nil {
+	if report.Rooted == nil && report.Emulator == nil && report.SideLoaded == nil && report.DevBundle == nil && report.ScreenLock == nil {
 		return nil
 	}
 	raw, err := json.Marshal(report)

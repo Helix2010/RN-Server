@@ -153,17 +153,39 @@ type installationListFilter struct {
 	otaRevision  sql.NullInt64
 	activeSince  time.Time
 	status       string
+	// 设备完整性信号的筛选（安全评审 N10/N31）。空 = 不筛。
+	// "yes"/"no" 按 JSON 里的布尔值筛，"unknown" 表示这台设备没报过这一项。
+	integrity    map[string]string
 	limit        int
 	cursorAt     time.Time
 	cursorID     uint64
 	hasCursor    bool
 }
 
+/**
+ * 可以筛的设备完整性信号。**白名单是必须的**：这些名字会拼进 JSON 路径，
+ * 放任请求指定等于把路径表达式交给调用方。
+ */
+var integritySignalNames = []string{"rooted", "emulator", "sideLoaded", "devBundle", "screenLock"}
+
 // parseInstallationListFilter 解析列表参数；不合法的值直接 422，不静默忽略。
 func parseInstallationListFilter(c *gin.Context, now time.Time) (installationListFilter, string) {
 	f := installationListFilter{query: strings.TrimSpace(c.Query("q")), platform: strings.ToLower(strings.TrimSpace(c.Query("platform"))), appVersion: strings.TrimSpace(c.Query("appVersion")), launchSource: strings.ToLower(strings.TrimSpace(c.Query("launchSource"))), status: strings.ToLower(strings.TrimSpace(c.Query("status"))), limit: 50}
 	if f.platform != "" && f.platform != "android" && f.platform != "ios" {
 		return f, "platform must be android or ios"
+	}
+	for _, name := range integritySignalNames {
+		raw := strings.ToLower(strings.TrimSpace(c.Query("integrity." + name)))
+		if raw == "" {
+			continue
+		}
+		if raw != "yes" && raw != "no" && raw != "unknown" {
+			return f, "integrity." + name + " must be yes, no or unknown"
+		}
+		if f.integrity == nil {
+			f.integrity = map[string]string{}
+		}
+		f.integrity[name] = raw
 	}
 	if f.launchSource != "" && f.launchSource != "embedded" && f.launchSource != "ota" && f.launchSource != "unreported" {
 		return f, "launchSource must be embedded, ota or unreported"
@@ -262,6 +284,26 @@ func (f installationListFilter) where(tenant string) (string, []any) {
 	if f.status != "" {
 		clauses = append(clauses, "i.status=?")
 		args = append(args, f.status)
+	}
+	// 走 JSON 取值而不是把整段拉出来在 Go 里过滤：设备数上来之后那会变成全表扫。
+	// 字段名来自下面的白名单，不是请求里的任意串，所以可以安全地拼进路径。
+	for _, name := range integritySignalNames {
+		want, ok := f.integrity[name]
+		if !ok {
+			continue
+		}
+		path := "$." + name
+		switch want {
+		case "unknown":
+			clauses = append(clauses, "(i.device_integrity IS NULL OR JSON_EXTRACT(i.device_integrity,?) IS NULL)")
+			args = append(args, path)
+		case "yes":
+			clauses = append(clauses, "JSON_EXTRACT(i.device_integrity,?)=TRUE")
+			args = append(args, path)
+		case "no":
+			clauses = append(clauses, "JSON_EXTRACT(i.device_integrity,?)=FALSE")
+			args = append(args, path)
+		}
 	}
 	return strings.Join(clauses, " AND "), args
 }
