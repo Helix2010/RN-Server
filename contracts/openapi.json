@@ -421,7 +421,7 @@
     "/v1/admin/release-storage/cors": {
       "get": {
         "summary": "The bucket CORS rule this platform needs",
-        "description": "Read-only. Branding images are uploaded by the browser directly to object storage, so the bucket itself must allow the console origins; a bucket without them fails the preflight and the console can only report \"cannot reach object storage\". Returns `required` (derived from the tenant_domain table, so adding a tenant does not mean editing a config file), plus `current` and `missingOrigins` when the bucket rules can be read. The server never writes the rule; on this deployment the release-storage key cannot read them either (AccessDenied on GetBucketCors), in which case `currentError` carries the reason.",
+        "description": "The bucket CORS rule a `direct` upload deployment would need, with the origins derived from the tenant_domain table so that adding a tenant does not mean editing a config file. Only relevant when ARTIFACT_UPLOAD_MODE=direct, where the browser PUTs straight to object storage and the bucket must allow the console origins itself. Under `proxy` (the default for deployments whose storage key has no bucket-configuration permission) uploads are streamed through the server and the bucket needs no CORS rule at all. The server never writes the rule.",
         "responses": {
           "200": {
             "description": "The rule to configure on the bucket"

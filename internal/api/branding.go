@@ -442,8 +442,7 @@ func (s *server) createBrandingAssetUpload(c *gin.Context) {
 		problem(c, 422, "INVALID_BRANDING_UPLOAD", "fileName, size, assetType or theme is invalid")
 		return
 	}
-	// 这里只是确认存储配好了、顺便取对象前缀；文件本身由 uploadBrandingAsset 落盘
-	_, prefix, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
+	client, prefix, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
 	if err != nil {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
@@ -465,29 +464,25 @@ func (s *server) createBrandingAssetUpload(c *gin.Context) {
 		problem(c, 503, "BRANDING_TOKEN_UNAVAILABLE", "Branding upload signing is not configured")
 		return
 	}
-	// 品牌图片**一律经服务端中转**，不给浏览器签直传地址——和发布产物不一样，这里
-	// 不看 ARTIFACT_UPLOAD_MODE。
-	//
-	// 直传要求**桶上**配了允许控制台来源的跨域规则，而那是对象存储控制台上的设置，
-	// 不在我们任何一个配置文件里。没配的表现是界面上一句"无法连接对象存储"：票据
-	// 签发 201、签名和写权限全好（curl 直接 PUT 返回 200），浏览器却连不上——预检被
-	// 桶按 CORS 规则拒了，XHR 拿到的是 status 0，我们这一侧连一条日志都没有。
-	// 2026-09-12 实测 OBS 的原话：CORSResponse: This CORS request is not allowed。
-	//
-	// 中转的代价在这里可以忽略：单个资源上限 5MB，而一个租户的品牌图一共就那么几张。
-	// 换来的是加租户不用再去对象存储控制台配一次桶策略——而那件事我们连做都做不了，
-	// 发布存储那把密钥对桶配置读写都是 AccessDenied。
-	//
-	// 发布产物（几十兆的 APK）仍然走 ARTIFACT_UPLOAD_MODE，那条路已验证可用，不动。
 	uploadURL := s.absoluteURL(c, "/v1/admin/branding/assets/upload")
 	headers := map[string]string{"content-type": body.ContentType, "x-branding-asset-token": token}
 	requiresCredentials := true
+	if s.cfg.ArtifactUploadMode == "direct" {
+		uploadURL, headers, err = client.PresignPut(c.Request.Context(), key, body.ContentType, body.Size, time.Duration(s.cfg.ArtifactUploadTTL)*time.Second)
+		if err != nil {
+			problem(c, http.StatusFailedDependency, "BRANDING_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
+			return
+		}
+		requiresCredentials = false
+	}
 	c.JSON(http.StatusCreated, gin.H{"asset": gin.H{"id": id, "token": token, "objectKey": key, "fileName": body.FileName, "contentType": body.ContentType, "size": body.Size, "expiresAt": iso(time.Unix(value.ExpiresAt, 0).UTC())}, "upload": gin.H{"method": "PUT", "url": uploadURL, "headers": headers, "expiresAt": iso(time.Unix(value.ExpiresAt, 0).UTC()), "requiresCredentials": requiresCredentials}})
 }
 
-// 品牌图片的落库入口。不再受 ARTIFACT_UPLOAD_MODE 约束：签票据那一侧已经一律指向
-// 这里，这里再按 mode 拒就成了自己把自己 404 掉。
 func (s *server) uploadBrandingAsset(c *gin.Context) {
+	if s.cfg.ArtifactUploadMode != "proxy" {
+		problem(c, 404, "BRANDING_UPLOAD_PROXY_DISABLED", "Server-side branding upload is disabled")
+		return
+	}
 	v, err := s.decodeBrandingAssetToken(tenantID(c), brandingTokenFromRequest(c))
 	if err != nil {
 		problem(c, 401, "INVALID_BRANDING_TOKEN", "Invalid branding asset token")

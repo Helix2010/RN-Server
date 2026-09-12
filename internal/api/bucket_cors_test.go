@@ -3,13 +3,11 @@ package api
 import (
 	"context"
 	"testing"
-
-	"github.com/Helix2010/RN-Server/internal/objectstore"
 )
 
-// 写进桶的必须是**全平台**活跃租户域名的并集。CORS 是桶级配置不是前缀级的，
-// 同一个桶被多个租户共用时，只写当前租户的来源会把其他租户直接踢掉——表现是
-// 另一个租户的控制台突然传不了图，而没有人改过他们的任何配置。
+// 该放行的来源是**全平台**活跃租户域名的并集，不是当前这一个租户的。CORS 是桶级
+// 配置不是前缀级的，同一个桶被多个租户共用时，照着"只有当前租户"的清单去配，等于
+// 把其他租户踢掉——表现是另一个租户的控制台突然传不了图，而没人动过他们的配置。
 func TestDBBucketCORSCoversEveryActiveTenantDomain(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db}
@@ -27,25 +25,5 @@ func TestDBBucketCORSCoversEveryActiveTenantDomain(t *testing.T) {
 		if origins[i-1] > origins[i] {
 			t.Fatalf("来源没有排序：%q 在 %q 之前", origins[i-1], origins[i])
 		}
-	}
-}
-
-// 桶上少了哪些来源要算出来，而不是让人拿两张列表肉眼比对——漏看一条的表现是
-// 某一个租户的控制台传不了图，而其他租户都好。
-func TestMissingOriginsAgainstTheBucketRules(t *testing.T) {
-	required := []string{"https://console.a.example", "https://console.b.example"}
-	rules := []objectstore.CORSRule{{AllowedOrigins: []string{"https://CONSOLE.A.EXAMPLE"}}}
-	missing := originsNotAllowed(required, rules)
-	// 来源比对不分大小写：桶上写成大写照样是放行的，报成"缺失"只会让人去加一条重复规则
-	if len(missing) != 1 || missing[0] != "https://console.b.example" {
-		t.Fatalf("缺失来源算错了：%v", missing)
-	}
-	// 通配符等于全放行
-	if got := originsNotAllowed(required, []objectstore.CORSRule{{AllowedOrigins: []string{"*"}}}); len(got) != 0 {
-		t.Fatalf("* 应当视为全部放行，却报了 %v", got)
-	}
-	// 桶上一条规则都没有时，要求的每一条都缺
-	if got := originsNotAllowed(required, nil); len(got) != 2 {
-		t.Fatalf("空桶规则应当报全部缺失，却报了 %v", got)
 	}
 }
