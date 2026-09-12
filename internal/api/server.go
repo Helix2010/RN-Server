@@ -223,6 +223,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/releases", s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)
 	group.POST("/releases/:id/:action", s.releaseAction)
+	// 清理历史产物。不是状态迁移：发布记录一旦删掉就不在升级决策里了，所以正在下发的
+	// 版本删不掉，且必须先清掉建在它上面的 OTA。见 release_purge.go
+	group.DELETE("/releases/:id", s.purgeRelease)
 	group.GET("/audit-events", s.listAudits)
 	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
@@ -272,6 +275,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.DELETE("/ota/artifacts/upload", s.deleteOTAArtifact)
 	group.POST("/ota/releases", s.saveOTARelease)
 	group.POST("/ota/releases/:id/:action", s.otaAction)
+	group.DELETE("/ota/releases/:id", s.purgeOTARelease)
 	group.POST("/upload-sessions", s.createUploadSession)
 	group.POST("/upload-sessions/cleanup-expired", s.cleanupExpiredUploadSessions)
 	group.GET("/upload-sessions/:id", s.getUploadSession)

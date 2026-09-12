@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/objectstore"
@@ -74,6 +76,20 @@ func (f *fakeObjectStore) Put(_ context.Context, key string, body io.Reader, _ i
 func (f *fakeObjectStore) Delete(_ context.Context, key string) error {
 	delete(f.objects, key)
 	return nil
+}
+
+func (f *fakeObjectStore) List(_ context.Context, prefix string) ([]string, error) {
+	if prefix == "" {
+		return nil, errors.New("fake object store: empty prefix")
+	}
+	keys := []string(nil)
+	for key := range f.objects {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 func (f *fakeObjectStore) PresignPut(context.Context, string, string, int64, time.Duration) (string, map[string]string, error) {

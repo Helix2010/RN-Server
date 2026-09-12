@@ -53,6 +53,10 @@ type Client interface {
 	// GetRange 读对象的 [start, end] 闭区间字节（HTTP Range 语义），给安装包断点续传用
 	GetRange(context.Context, string, int64, int64) (io.ReadCloser, error)
 	Delete(context.Context, string) error
+	// List 列出某个前缀下的全部对象键（自动翻页）。清理一个 OTA 版本时用它兜底：
+	// 2026-09-10 之前入库的记录没有 object_metadata，靠数据库枚举不出资源对象，
+	// 只删 manifest 会把同目录下的 bundle 和图片永久留在桶里。
+	List(context.Context, string) ([]string, error)
 	CreateMultipartUpload(context.Context, string, string) (string, error)
 	UploadPart(context.Context, string, string, int, io.Reader, int64) (string, error)
 	PresignUploadPart(context.Context, string, string, int, time.Duration) (string, map[string]string, error)
@@ -200,6 +204,32 @@ func (c *s3Client) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("delete artifact: %w", err)
 	}
 	return nil
+}
+
+// List 翻页拉完前缀下的所有键。前缀为空会列出整桶，调用方几乎不可能是有意的，直接拒绝。
+func (c *s3Client) List(ctx context.Context, prefix string) ([]string, error) {
+	if strings.TrimSpace(prefix) == "" {
+		return nil, fmt.Errorf("object prefix is required")
+	}
+	keys := []string(nil)
+	var token *string
+	for {
+		output, err := c.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(c.bucket), Prefix: aws.String(prefix), ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range output.Contents {
+			if item.Key != nil {
+				keys = append(keys, *item.Key)
+			}
+		}
+		if output.IsTruncated == nil || !*output.IsTruncated || output.NextContinuationToken == nil {
+			return keys, nil
+		}
+		token = output.NextContinuationToken
+	}
 }
 
 func (c *s3Client) CreateMultipartUpload(ctx context.Context, key, contentType string) (string, error) {
