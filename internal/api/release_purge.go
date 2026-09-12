@@ -34,16 +34,26 @@ import (
 type purgeRequest struct {
 	Reason  string `json:"reason"`
 	Confirm bool   `json:"confirm"`
+	// 只清记录、保留对象存储里的文件。默认 false（记录和文件一起清，这才是"清理"
+	// 想要的效果）。两种场景需要它：存储凭据只读（删不动，强行走完只会留下一堆孤儿
+	// 对象），以及对象由生命周期规则或另一套流程管理，服务端不该插手。置为 true 时
+	// OTA 那侧也不再列对象——没有要删的东西，列不列都无所谓，读权限也就够了。
+	KeepObjects bool `json:"keepObjects"`
+}
+
+type purgeIntentResult struct {
+	Reason      string
+	KeepObjects bool
 }
 
 // purgeIntent 校验"确认 + 理由"。和 releaseAction / otaAction 保持同一套口径。
-func purgeIntent(c *gin.Context) (string, bool) {
+func purgeIntent(c *gin.Context) (purgeIntentResult, bool) {
 	var body purgeRequest
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, http.StatusBadRequest, "CONFIRMATION_REQUIRED", "reason and confirm=true are required")
-		return "", false
+		return purgeIntentResult{}, false
 	}
-	return strings.TrimSpace(body.Reason), true
+	return purgeIntentResult{Reason: strings.TrimSpace(body.Reason), KeepObjects: body.KeepObjects}, true
 }
 
 // activeReleaseRuntime 返回某平台 active 全量包的运行时版本。没有 active 时返回空串，
@@ -58,7 +68,7 @@ func (s *server) activeReleaseRuntime(ctx context.Context, tenant, platform stri
 }
 
 func (s *server) purgeOTARelease(c *gin.Context) {
-	reason, ok := purgeIntent(c)
+	intent, ok := purgeIntent(c)
 	if !ok {
 		return
 	}
@@ -86,7 +96,7 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 	}
 
 	prefix, keys := "", []string(nil)
-	if manifestKey.Valid && strings.TrimSpace(manifestKey.String) != "" {
+	if !intent.KeepObjects && manifestKey.Valid && strings.TrimSpace(manifestKey.String) != "" {
 		client, _, clientErr := s.storageClientForTenant(ctx, tenantID(c))
 		if clientErr != nil {
 			problem(c, http.StatusBadGateway, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
@@ -114,8 +124,12 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "OTA_PURGE_FAILED", "Unable to delete the OTA release")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "ota_release_purge", "ota-release", id, reason, requestID(c),
-		map[string]any{"status": status, "platform": platform, "runtimeVersion": runtime, "objectPrefix": prefix, "objects": len(keys)})
+	// objectPrefix 即使在保留对象时也要记：这是之后能把文件找回来的唯一线索
+	if prefix == "" && manifestKey.Valid {
+		prefix = path.Dir(manifestKey.String) + "/"
+	}
+	event := newAudit(tenantID(c), actor(c), "ota_release_purge", "ota-release", id, intent.Reason, requestID(c),
+		map[string]any{"status": status, "platform": platform, "runtimeVersion": runtime, "objectPrefix": prefix, "objects": len(keys), "keptObjects": intent.KeepObjects})
 	if err = insertAudit(ctx, tx, event); err != nil {
 		problem(c, http.StatusInternalServerError, "OTA_PURGE_FAILED", "Unable to record the deletion")
 		return
@@ -127,11 +141,11 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 	deleteStoredObjects()
 	// 对象删不掉不影响这次删除的结果（记录已经没了），但必须当场说出来：
 	// 只写日志的话，运营看到的是"删成功"，桶却一个字节都没少。
-	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objects": len(keys), "objectsFailed": failed})
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objects": len(keys), "objectsFailed": failed, "objectsKept": intent.KeepObjects})
 }
 
 func (s *server) purgeRelease(c *gin.Context) {
-	reason, ok := purgeIntent(c)
+	intent, ok := purgeIntent(c)
 	if !ok {
 		return
 	}
@@ -168,7 +182,7 @@ func (s *server) purgeRelease(c *gin.Context) {
 	}
 
 	key := strings.TrimSpace(objectKey.String)
-	if key != "" {
+	if !intent.KeepObjects && key != "" {
 		client, _, clientErr := s.storageClientForTenant(ctx, tenantID(c))
 		if clientErr != nil {
 			problem(c, http.StatusBadGateway, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
@@ -192,8 +206,8 @@ func (s *server) purgeRelease(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to detach the build job")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "release_purge", "release", id, reason, requestID(c),
-		map[string]any{"status": status, "platform": platform, "version": version, "buildNumber": buildNumber, "objectKey": key})
+	event := newAudit(tenantID(c), actor(c), "release_purge", "release", id, intent.Reason, requestID(c),
+		map[string]any{"status": status, "platform": platform, "version": version, "buildNumber": buildNumber, "objectKey": key, "keptObjects": intent.KeepObjects})
 	if err = insertAudit(ctx, tx, event); err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to record the deletion")
 		return
@@ -203,7 +217,7 @@ func (s *server) purgeRelease(c *gin.Context) {
 		return
 	}
 	deleteStoredObjects()
-	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objectsFailed": failed})
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "objectsFailed": failed, "objectsKept": intent.KeepObjects})
 }
 
 // deleteObjects 只在数据库那步提交之后调用——反过来一旦入库失败，删掉的对象就再也

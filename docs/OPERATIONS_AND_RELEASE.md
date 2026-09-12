@@ -78,9 +78,15 @@ DELETE /v1/admin/releases/{id}
 顺序永远是先 OTA 后基线包。OTA 的包身份（`applicationId`、签名证书指纹）是从基线 APK
 读出来的，基线先消失，剩下的 OTA 行就永远校验不过去。
 
-**存储凭据必须有 `DeleteObject` 和 `ListBucket`**，而且要覆盖 `tenants/<tenantId>/` 前缀。
-只读凭据下清理会走成这样：数据库记录删掉了，桶里一个字节都没少（2026-09-12 首次清理
-时就是这样，23 个安装包变成孤儿对象）。删不掉的对象条数会在响应的 `objectsFailed`
+两个接口都收 `keepObjects`（默认 `false`）。置为 `true` 时只清数据库记录，桶里的文件
+原样保留，服务端不发任何 List / Delete——**只读存储凭据下唯一走得通的清理方式**。
+是有意保留还是删失败，审计里分得清：`summary.keptObjects` 记意图，响应的
+`objectsFailed` 记删不掉的条数。批量脚本用 `KEEP_OBJECTS=1` 开这个模式，管理端的删除
+面板里是一个默认不勾的"同时删除对象存储里的安装包"。
+
+**如果要连文件一起清，存储凭据必须有 `DeleteObject` 和 `ListBucket`**，而且要覆盖 `tenants/<tenantId>/` 前缀。
+不带 `keepObjects` 又用只读凭据会走成这样：数据库记录删掉了，桶里一个字节都没少
+（2026-09-12 首次清理时就是这样，23 个安装包变成孤儿对象）。删不掉的对象条数会在响应的 `objectsFailed`
 里报出来，对象键留在审计事件的 `summary.objectKey` / `summary.objectPrefix`，权限修好
 之后照着扫：
 

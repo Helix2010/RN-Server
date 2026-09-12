@@ -279,6 +279,56 @@ func TestDBPurgeOTAKeepsTheRowWhenListingFails(t *testing.T) {
 	}
 }
 
+// keepObjects：只清记录、桶一个字节不动。存储凭据只读时唯一走得通的路——
+// 连 List 都不发，所以 OTA 那侧也不会再卡在 STORAGE_LIST_FAILED。
+func TestDBPurgeKeepObjectsLeavesTheBucketAlone(t *testing.T) {
+	db := openTestDB(t)
+	tenant := testTenant(77)
+	store := newFakeObjectStore()
+	// 只读凭据：列和删都会失败。保留模式下这两个都不该被调用
+	store.listErr = errors.New("access denied")
+	store.deleteErr = errors.New("access denied")
+	s := purgeServer(t, db, tenant, store)
+
+	base, ota := scoped(tenant, "rel_base_k"), scoped(tenant, "ota_keep")
+	apk := "tenants/" + tenant + "/release-uploads/art_keep/application.apk"
+	manifest := "tenants/" + tenant + "/ota/production/android/1.2.0/" + ota + "/manifest.json"
+	insertPurgeRelease(t, db, tenant, base, "1.2.0", 20, "completed", "1.2.0", apk)
+	insertPurgeOTA(t, db, tenant, ota, base, "1.2.0", "superseded", manifest, 1)
+	store.put(apk, []byte("apk"), "e1")
+	store.put(manifest, []byte("{}"), "e2")
+
+	const keepBody = `{"reason":"drop the records only","confirm":true,"keepObjects":true}`
+	if recorder := purgeOTA(t, s, tenant, ota, keepBody); recorder.Code != http.StatusOK {
+		t.Fatalf("keepObjects must not need list permission, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	// 顺序照旧：OTA 清完，基线包才让删
+	recorder := purgeApp(t, s, tenant, base, keepBody)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("purge must succeed, got %d %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"objectsKept":true`) {
+		t.Fatalf("the response must say the objects were kept: %s", recorder.Body.String())
+	}
+	for _, key := range []string{apk, manifest} {
+		if _, ok := store.objects[key]; !ok {
+			t.Fatalf("keepObjects must not touch %s", key)
+		}
+	}
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_releases WHERE tenant_id=? AND id=?`, tenant, base).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("the release row must be gone, got %d (%v)", rows, err)
+	}
+	// 审计要同时留下对象前缀和"是有意保留的"，否则之后没人说得清桶里那堆是什么
+	var prefix, kept string
+	if err := db.QueryRow(`SELECT JSON_UNQUOTE(JSON_EXTRACT(summary,'$.objectPrefix')),JSON_EXTRACT(summary,'$.keptObjects') FROM audit_events WHERE tenant_id=? AND target_id=?`, tenant, ota).Scan(&prefix, &kept); err != nil {
+		t.Fatalf("read ota audit: %v", err)
+	}
+	if prefix == "" || kept != "true" {
+		t.Fatalf("audit must record the prefix and the intent, got %q %q", prefix, kept)
+	}
+}
+
 // 破坏性动作必须写理由：没有 confirm / 理由太短的请求什么都不该删。
 func TestDBPurgeRequiresConfirmationAndReason(t *testing.T) {
 	db := openTestDB(t)

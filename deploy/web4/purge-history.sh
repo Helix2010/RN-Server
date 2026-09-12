@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 批量清理历史发布产物。在 web4 上跑（管理密钥只在那台机器的 .env 里）：
 #
-#   DRY_RUN=1 ./purge-history.sh android    # 先看要删什么
-#   ./purge-history.sh android              # 真删
+#   DRY_RUN=1 ./purge-history.sh android      # 先看要删什么
+#   ./purge-history.sh android                # 记录和对象存储里的文件一起清
+#   KEEP_OBJECTS=1 ./purge-history.sh android # 只清记录，桶里的文件原样保留
 #
 # "历史"的定义就一条：build 号低于当前 active 全量包的那些。比 active 更高的
 # verified 记录是待发布，不动。OTA 全部尝试删除，由服务端决定哪一条要留——正在给
@@ -14,6 +15,9 @@ set -euo pipefail
 PLATFORM="${1:-android}"
 DRY_RUN="${DRY_RUN:-0}"
 REASON="${REASON:-scheduled cleanup of historical release artifacts}"
+# 只清记录、保留桶里的文件。存储凭据只读时必须开，否则 OTA 会全部卡在
+# STORAGE_LIST_FAILED——列不出对象，服务端就不肯动数据库
+KEEP_OBJECTS="${KEEP_OBJECTS:-0}"
 API="${API:-http://127.0.0.1:3100}"
 SERVICE_DIR="${SERVICE_DIR:-/home/ubuntu/fy/service}"
 
@@ -22,7 +26,11 @@ SERVICE_DIR="${SERVICE_DIR:-/home/ubuntu/fy/service}"
 
 hdr=(-H "Host: api.anyfun.win" -H "x-admin-key: $ADMIN_API_KEY"
   -H "x-admin-id: ${ADMIN_ID:-ops@local}" -H "content-type: application/json")
-body="$(jq -nc --arg r "$REASON" '{reason:$r,confirm:true}')"
+keep=false
+if [ "$KEEP_OBJECTS" = "1" ]; then
+  keep=true
+fi
+body="$(jq -nc --arg r "$REASON" --argjson k "$keep" '{reason:$r,confirm:true,keepObjects:$k}')"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
@@ -64,6 +72,10 @@ sweep() { # $1 = 接口前缀，其余 = 要删的 id
   done
   echo "  删除=$deleted 保留=$kept 失败=$failed"
 }
+
+if [ "$KEEP_OBJECTS" = "1" ]; then
+  echo "模式：只清记录，对象存储里的文件保留"
+fi
 
 echo "== OTA 修订（$PLATFORM）=="
 ota=()
