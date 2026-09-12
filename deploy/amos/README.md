@@ -35,17 +35,21 @@
 
 ## 域名与租户
 
-| 域名 | 由谁服务 |
-| --- | --- |
-| `api.any123.top` / `api.predict.kim` | nginx 反代到 `127.0.0.1:13080` |
-| `console.any123.top` / `console.predict.kim` | nginx 直接发静态文件 |
+| 域名 | 租户 | 由谁服务 |
+| --- | --- | --- |
+| `api.any123.top` | 100000003 | nginx 反代到 `127.0.0.1:13080` |
+| `console.any123.top` | 100000003 | nginx 直接发静态文件 |
+| `api.predict.kim` | 100000002 | nginx 反代到 `127.0.0.1:13080` |
+| `console.predict.kim` | 100000002 | nginx 直接发静态文件 |
+
+四行已写进 `tenant_domain`（2026-09-12）。`console.any123.top` 的 A 记录不指向
+amos，走的是一台前置机转发；这不影响 ACME，校验看的是"请求最终有没有到本机的
+:80"，不是解析结果。
 
 **租户是按 Host 头认的**（`tenant_domain` 表）。所以反代必须原样传 `$host`；
 amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0.0.1:13080`，
 照抄过来服务端会一律回 `TENANT_DOMAIN_NOT_FOUND`。顺带一提那个文件没有 `.conf`
 后缀，而 `nginx.conf` include 的是 `conf.d/*.conf`，所以它一直没被加载过。
-
-四个域名都要在 `tenant_domain` 里有行，否则请求进不到租户作用域。
 
 控制台把 API 地址**编译进包里**（`VITE_API_BASE_URL`），所以两个租户是两份产物，
 不是同一份配两个 `server_name`。加租户就在 `deploy.sh` 的 `TENANTS` 里加一行。
@@ -69,8 +73,9 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
 ## 装一台
 
 ```bash
-# 1. 把这四个文件送上去
-scp deploy/amos/{install.sh,setup-tls.sh,rn-foundation*.service,rn-foundation.env.example,nginx-rn-foundation.conf} amos:~/rn-foundation-deploy/
+# 1. 把这一整个目录送上去
+ssh amos 'mkdir -p ~/rn-foundation-deploy'
+scp deploy/amos/* amos:~/rn-foundation-deploy/
 
 # 2. 在 amos 上建目录、用户、systemd、nginx 站点
 ssh amos 'cd ~/rn-foundation-deploy && ./install.sh'
@@ -91,17 +96,29 @@ ssh amos 'cd ~/rn-foundation-deploy && CERTBOT_EMAIL=<邮箱> ./setup-tls.sh'
 
 ## 证书
 
-Let's Encrypt，HTTP-01，certbot 的 nginx 插件。**不需要 Cloudflare token**：web4
-那套走 DNS-01 是因为它的域名挂在 Cloudflare 代理后面、回源 IP 不对外；amos 这四个
-域名直接解析到本机，80 端口可达，HTTP-01 更简单。
+Let's Encrypt，HTTP-01，**webroot 方式**。不用 `--nginx` 插件：插件会就地改写
+`/etc/nginx/conf.d/rn-foundation.conf`，而那个文件是 `install.sh` 从仓库装上去的，
+下一次跑 `install.sh` 就会把 TLS 配置覆盖掉——`nginx -t` 照样通过，站点悄悄退回
+纯 HTTP，没有任何人会发现。webroot 方式下 certbot 只往 `/var/www/acme` 写校验
+文件，nginx 配置始终由我们自己管。
+
+也不需要 Cloudflare token：web4 那套走 DNS-01 是因为它的域名挂在 Cloudflare 代理
+后面、回源 IP 不对外。
+
+配置有两份，都在这个目录里：`nginx-rn-foundation.conf` 是没证书时的形态（只有
+:80 加 ACME 路径），`nginx-rn-foundation-tls.conf` 是有证书之后的（:80 只做校验
+与跳转，业务走 :443，带一年期 HSTS）。`setup-tls.sh` 签完证书换上后者；`install.sh`
+会先看 `/etc/letsencrypt/live/rn-foundation/fullchain.pem` 在不在，在就直接装 TLS
+版，所以重跑安装不会把 TLS 退掉。
 
 自动续期是 certbot 自带的 `certbot.timer`，一天两次，剩余不到 30 天才真的续。
-`setup-tls.sh` 额外装了一个 deploy hook 在续期成功后重载 nginx——不重载的话证书
-换了、nginx 还拿着旧的，直到下次重启才生效。脚本最后会 `--dry-run` 演练一次，
-演练不过就说明续期那天也会不过。
+额外装了一个 deploy hook 在续期成功后重载 nginx——不重载的话证书换了、nginx 还
+拿着旧的，直到下次重启才生效。脚本最后会 `--dry-run` 演练一次，演练不过就说明
+续期那天也会不过。
 
-申请前脚本会核对四个域名是不是都指向本机。指错了不要硬试：Let's Encrypt 对失败有
-频率限制，连撞几次会被锁一小时。
+申请前脚本会**写一个探针文件再从四个域名各读一次**，而不是比对 A 记录：解析可能
+指向一台做转发的前置机（`console.any123.top` 就是这样），比 IP 会把能用的情况误判
+成不能用。读不到就别硬试，Let's Encrypt 对失败有频率限制，连撞几次会被锁一小时。
 
 ## 日常更新
 

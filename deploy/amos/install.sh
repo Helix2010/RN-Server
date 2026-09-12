@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # 在 amos 上一次性装好目录、用户、systemd 与 nginx 站点。只跑一次，之后更新走
 # deploy.sh。在 amos 上以能 sudo 的普通用户执行，同目录下要有本仓库 deploy/amos
-# 的四个文件。
+# 的其余文件。
 #
 # 不装 Docker，也不装 Go：和打包机代理同一套规范，程序在 /opt，配置在 /etc 下 0600。
 set -euo pipefail
 
 cd "$(dirname "$0")"
 for f in rn-foundation-server.service rn-foundation-indexer.service \
-         rn-foundation.env.example nginx-rn-foundation.conf; do
+         rn-foundation.env.example nginx-rn-foundation.conf \
+         nginx-rn-foundation-tls.conf; do
   [ -f "$f" ] || { echo "缺少 $f" >&2; exit 1; }
 done
 
@@ -34,8 +35,19 @@ sudo install -m 0644 rn-foundation-indexer.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 echo "== nginx =="
-# 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf
-sudo install -m 0644 nginx-rn-foundation.conf /etc/nginx/conf.d/rn-foundation.conf
+# ACME 校验目录，两份配置都指向它
+sudo mkdir -p /var/www/acme/.well-known/acme-challenge
+sudo chmod -R a+rX /var/www/acme
+# 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf。
+# 证书已经签过就装 TLS 版——否则重跑 install.sh 会把站点悄悄退回纯 HTTP，
+# 而 nginx -t 照样通过，没有任何人会发现
+if [ -s /etc/letsencrypt/live/rn-foundation/fullchain.pem ]; then
+  echo "   已有证书，装 TLS 版配置"
+  sudo install -m 0644 nginx-rn-foundation-tls.conf /etc/nginx/conf.d/rn-foundation.conf
+else
+  echo "   还没有证书，先装 HTTP 版（setup-tls.sh 会换掉它）"
+  sudo install -m 0644 nginx-rn-foundation.conf /etc/nginx/conf.d/rn-foundation.conf
+fi
 sudo nginx -t
 sudo systemctl reload nginx
 
