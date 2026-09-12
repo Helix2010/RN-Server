@@ -598,3 +598,22 @@ func TestDBBuildFloorCountsQueuedJobsNotJustReleases(t *testing.T) {
 		t.Fatalf("版本号和排队中的任务重了却放行：%d", code)
 	}
 }
+
+// 刚排进队列的任务还没有日志，这时 logTail 必须是 []，不能是 null。
+//
+// nil 的 []string 序列化出来是 null，而契约上它是数组；控制台按数组解，整个响应校验
+// 失败，界面显示"排队失败"——可任务已经建好、打包机已经开始跑了。人会以为没排上再排
+// 一次，第二次才撞上 build 号不递增，那时才发现第一次其实成功了。
+func TestBuildJobViewSerialisesEmptyLogTailAsAnArray(t *testing.T) {
+	raw, err := json.Marshal(buildJobView(buildJob{ID: "bld_x", Platform: "android", Status: "queued"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"logTail":[]`) {
+		t.Fatalf(`logTail 不是空数组：%s`, raw)
+	}
+	// releaseNotes 同理，它一直是对的，一起钉住免得以后被改回去
+	if !strings.Contains(string(raw), `"releaseNotes":{}`) {
+		t.Fatalf(`releaseNotes 不是空对象：%s`, raw)
+	}
+}

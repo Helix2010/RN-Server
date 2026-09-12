@@ -82,7 +82,12 @@ func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 }
 
 func buildJobView(j buildJob) map[string]any {
-	var tail []string
+	// 初值是空切片而不是 nil：nil 的 []string 序列化出来是 null，不是 []。刚排进
+	// 队列的任务还没有任何日志，于是新建任务的那个响应里 logTail 是 null——控制台
+	// 按契约（数组）解，整个响应校验失败，界面上显示"排队失败"，而任务其实已经建好
+	// 并且打包机已经开始跑了。这种谎最贵：人会以为没排上，再排一次，第二次才撞上
+	// build 号不递增。releaseNotes 那边一直是对的（初值就是空 map），这里漏了。
+	tail := []string{}
 	if len(j.LogTail) > 0 {
 		_ = json.Unmarshal(j.LogTail, &tail)
 	}
