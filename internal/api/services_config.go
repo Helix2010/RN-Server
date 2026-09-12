@@ -217,7 +217,9 @@ func predictServiceFor(modules, services, wallet map[string]any) (*predictServic
 	}
 	raw, ok := services["predict"]
 	if !ok || raw == nil {
-		return nil, errors.New("the Predict module is enabled but services.predict is not configured")
+		// 新租户继承来的平台默认配置正好是 predict 开着、services 为空，所以这是
+		// 第一次保存最容易撞上的一堵墙。光说缺什么不够，要说去哪配
+		return nil, errors.New("the Predict module is enabled but services.predict is not configured（去「应用配置 → 预测市场」填接口域名、scopeId 和链，或在「配置中心」关掉预测市场模块）")
 	}
 	predict, err := parsePredictService(raw)
 	if err != nil {
@@ -229,7 +231,7 @@ func predictServiceFor(modules, services, wallet map[string]any) (*predictServic
 			return &predict, nil
 		}
 	}
-	return nil, fmt.Errorf("services.predict.chain %q is not among the tenant's enabled chains", predict.Chain)
+	return nil, fmt.Errorf("services.predict.chain %q is not among the tenant's enabled chains（去「钱包与链」启用这条链，或在「预测市场」换一条）", predict.Chain)
 }
 
 // gammaPublicInfoURL 是 public-info 地址：gamma 基址（覆盖或派生）+ /public-info；测试替换它指向本地服务。
