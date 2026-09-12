@@ -1868,7 +1868,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used"
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used. BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform, so the upload would be rejected after a full build"
           }
         }
       }

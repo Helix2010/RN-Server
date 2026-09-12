@@ -130,6 +130,21 @@ func clampLogTail(lines []string) []byte {
 // nextBuildNumberFloor 返回这个租户这个平台已经用掉的最大 build 号。产物表和任务表
 // 都要看：只看产物表的话，一个还在队列里的同号任务不会被发现，两个人各自排一个
 // build 34，装到设备上哪个赢取决于谁后装。
+// latestReleaseVersion 取该平台最新一条发布的版本号；没有发布过返回空串。
+func (s *server) latestReleaseVersion(ctx context.Context, tenant, platform string) (string, error) {
+	var version sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT version FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 1`,
+		tenant, platform).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(version.String), nil
+}
+
 func (s *server) nextBuildNumberFloor(c *gin.Context, tenant, platform string) (int, error) {
 	var fromReleases, fromJobs sql.NullInt64
 	if err := s.db.QueryRowContext(c.Request.Context(),
@@ -232,6 +247,22 @@ func (s *server) createBuildJob(c *gin.Context) {
 	if body.BuildNumber <= floor {
 		problem(c, http.StatusConflict, "BUILD_NUMBER_NOT_INCREASING",
 			fmt.Sprintf("buildNumber must be greater than %d, the highest already used for %s", floor, platform))
+		return
+	}
+	// 版本号也要递增，而且**必须在这里就查**。入库那一侧
+	// （createReleaseFromArtifact 的 RELEASE_VERSION_NOT_INCREASING）要求版本和
+	// build 号双双大于上一条发布，这里却只看 build 号——于是"1.3.12 build 42"能排
+	// 进队列、能占住机器、能编译出一个签好名的 APK，最后在上传完成的那一刻被拒。
+	// 2026-09-12 实测：六分钟的构建白跑，产物随 worktree 一起删掉，任务停在 failed。
+	// 两道闸的判据不一样，靠后的那道就成了"先干完活再告诉你不行"。
+	latestVersion, err := s.latestReleaseVersion(c.Request.Context(), tenantID(c), platform)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to inspect existing release versions")
+		return
+	}
+	if latestVersion != "" && compareVersion(version, latestVersion) <= 0 {
+		problem(c, http.StatusConflict, "BUILD_VERSION_NOT_INCREASING",
+			fmt.Sprintf("version must be greater than %s, the latest release for %s (the build would be rejected on upload)", latestVersion, platform))
 		return
 	}
 	// 身份在排队这一刻就要能合成出来。留到代理认领才发现，运维已经等了一轮队列，

@@ -485,3 +485,44 @@ func seedBuildIdentity(t *testing.T, db *sql.DB, tenant, slug string) {
 		SignerSHA256: "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694",
 	})
 }
+
+// 排队这一刻就要挡下"版本号没涨"。入库那一侧是双条件（版本和 build 号都要大于上一
+// 条发布），这里只看 build 号的话，用同一个版本号排一个更大的 build 号能一路走到
+// 编译完成，在上传完的那一刻才被拒——六分钟的构建白跑，而这件事在排队时就知道。
+func TestDBBuildJobQueueRequiresAnIncreasingVersion(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development"}}
+	tenant := testTenant(9)
+	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,file_metadata,file_name,content_type,object_key,expected_size,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"rel_"+uniqueSuffix(), tenant, "android", "1.3.12", 41, "1.3.12", "active", "{}", "{}",
+		"anyfun-1.3.12-build41-release.apk", "application/vnd.android.package-archive",
+		"tenants/"+tenant+"/releases/app.apk", 1, "tester", now, now); err != nil {
+		t.Fatalf("插入已有发布: %v", err)
+	}
+
+	queue := func(version string, buildNumber int) (int, map[string]any) {
+		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
+			"platform": "android", "gitRef": "main", "version": version,
+			"buildNumber": buildNumber, "reason": "测试版本递增闸", "confirm": true,
+		})
+		s.createBuildJob(c)
+		return recorder.Code, decodeBody(t, recorder)
+	}
+
+	// build 号涨了但版本号没涨：这正是会走到"编译完再被拒"的那条路
+	code, out := queue("1.3.12", 42)
+	if code != http.StatusConflict || out["code"] != "BUILD_VERSION_NOT_INCREASING" {
+		t.Fatalf("版本号没涨却排进了队列：%d %v", code, out)
+	}
+	// 版本号倒退同样要挡
+	if code, out = queue("1.3.11", 43); code != http.StatusConflict || out["code"] != "BUILD_VERSION_NOT_INCREASING" {
+		t.Fatalf("版本号倒退却排进了队列：%d %v", code, out)
+	}
+	// 两个都涨了才放行
+	if code, out = queue("1.3.13", 42); code != http.StatusCreated {
+		t.Fatalf("版本和 build 号都涨了却被拒：%d %v", code, out)
+	}
+}
