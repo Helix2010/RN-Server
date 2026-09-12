@@ -10,20 +10,20 @@ import (
 )
 
 type Config struct {
-	Environment                string
-	Port                       string
-	HTTPReadTimeout            int
-	HTTPWriteTimeout           int
-	CORSOrigins                []string
-	AdminAPIKey                string
-	BuildAgentToken            string
-	AdminAPIActor              string
+	Environment      string
+	Port             string
+	HTTPReadTimeout  int
+	HTTPWriteTimeout int
+	CORSOrigins      []string
+	AdminAPIKey      string
+	BuildAgentToken  string
+	AdminAPIActor    string
 	// AdminAPIAllowedIPs limits the x-admin-key automation channel to these
 	// networks (CIDR or bare IP). Empty means no restriction — see N17.
 	AdminAPIAllowedIPs []string
 	// TrustedProxies are the hops allowed to set X-Forwarded-For. Empty means
 	// gin trusts nobody, so the client IP is the direct peer.
-	TrustedProxies []string
+	TrustedProxies             []string
 	AdminUsername              string
 	AdminPasswordHash          string
 	AdminSessionTTL            int

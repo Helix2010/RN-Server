@@ -155,11 +155,11 @@ type installationListFilter struct {
 	status       string
 	// 设备完整性信号的筛选（安全评审 N10/N31）。空 = 不筛。
 	// "yes"/"no" 按 JSON 里的布尔值筛，"unknown" 表示这台设备没报过这一项。
-	integrity    map[string]string
-	limit        int
-	cursorAt     time.Time
-	cursorID     uint64
-	hasCursor    bool
+	integrity map[string]string
+	limit     int
+	cursorAt  time.Time
+	cursorID  uint64
+	hasCursor bool
 }
 
 /**
