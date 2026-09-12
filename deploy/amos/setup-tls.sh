@@ -1,110 +1,105 @@
 #!/usr/bin/env bash
-# 给四个域名申请 Let's Encrypt 证书，装上 TLS 版 nginx 配置，并把自动续期打开。
-# 在 amos 上跑，同目录要有 nginx-rn-foundation-tls.conf。
+# 申请 Let's Encrypt 证书并打开自动续期。在 amos 上跑。
 #
-#   CERTBOT_EMAIL=ops@example.com ./setup-tls.sh
+#   CERTBOT_EMAIL=ops@example.com ./setup-tls.sh                       # 默认域名列表
+#   CERTBOT_EMAIL=... DOMAINS="a.example b.example" ./setup-tls.sh     # 指定域名
+#   CERTBOT_EMAIL=... STAGING=1 ./setup-tls.sh                         # 先验链路
 #
-# 用 HTTP-01 的 **webroot** 方式，不用 --nginx 插件：插件会就地改写
-# /etc/nginx/conf.d/rn-foundation.conf，而那个文件是 install.sh 从仓库装上去的，
-# 下一次跑 install.sh 就会把 TLS 配置覆盖掉，且不报错。webroot 方式下 certbot
-# 只往 /var/www/acme 写校验文件，nginx 配置始终由我们自己管。
+# 验证走 **TLS-ALPN-01**（443），因为这台机器的入站只有 443 没有 80，而 HTTP-01
+# 只认 80 端口。
 #
-# 续期靠 certbot 自带的 certbot.timer（一天两次，剩余不到 30 天才真的续），外加
-# 一个 deploy hook 在续期成功后重载 nginx——不重载的话证书换了、进程还拿着旧的。
+# 用 acme.sh 而不是 certbot：**certbot 至今没有实现 TLS-ALPN-01**，它的 standalone
+# 只支持 HTTP-01，`--preferred-challenges tls-alpn-01` 会直接报
+# "None of the preferred challenges are supported by the selected plugin"。
+# 这不是版本问题，换新版也一样。
+#
+# 签发和续期期间 acme.sh 要独占 443，nginx 得让开几秒。pre/post hook 会写进域名
+# 配置，acme.sh 自己的 cron 续期时照样执行。
+#
+# 只签**当前真的能从公网走到本机 443** 的域名。签不下来的那些不要硬凑进同一张证书：
+# 一个域名验证失败，整张证书都签不出来。
 set -euo pipefail
 
-cd "$(dirname "$0")"
-
 EMAIL="${CERTBOT_EMAIL:-}"
-CERT_NAME=rn-foundation
-WEBROOT=/var/www/acme
-DOMAINS=(api.any123.top console.any123.top api.predict.kim console.predict.kim)
+LINK=/etc/nginx/ssl/rn-foundation
+LIVE=/etc/nginx/ssl/rn-foundation-le
+ACME=/root/.acme.sh/acme.sh
+read -r -a DOMAIN_LIST <<<"${DOMAINS:-api.predict.kim console.predict.kim api.any123.top console.any123.top}"
 
 [ -n "$EMAIL" ] || { echo "先设 CERTBOT_EMAIL=<能收到期提醒的邮箱>" >&2; exit 2; }
-[ -f nginx-rn-foundation-tls.conf ] || { echo "缺少 nginx-rn-foundation-tls.conf" >&2; exit 1; }
 
-echo "== 安装 certbot =="
-if ! command -v certbot >/dev/null 2>&1; then
-  sudo apt-get update -qq
-  sudo apt-get install -y certbot
+echo "== 安装 acme.sh =="
+if ! sudo test -x "$ACME"; then
+  curl -fsS https://get.acme.sh | sudo sh -s "email=$EMAIL" >/dev/null
+  echo "   已安装（含每日续期 cron）"
+else
+  echo "   已存在"
 fi
+sudo "$ACME" --set-default-ca --server letsencrypt >/dev/null
 
-echo "== 准备校验目录 =="
-sudo mkdir -p "$WEBROOT/.well-known/acme-challenge"
-sudo chmod -R a+rX /var/www/acme
-
-echo "== 探测四个域名能否走到本机的 :80 =="
-# 不比对 A 记录：解析可能指向一台做转发的前置机（amos 上的 console.any123.top
-# 就是这样）。真正要验证的是"这个域名的 ACME 路径能不能读到本机写下的文件"，
-# 那就直接写一个文件去读。
-probe="probe-$(date +%s)-$$"
-echo "$probe" | sudo tee "$WEBROOT/.well-known/acme-challenge/$probe" >/dev/null
-bad=0
-for d in "${DOMAINS[@]}"; do
-  got="$(curl -fsS --max-time 10 "http://$d/.well-known/acme-challenge/$probe" 2>/dev/null || true)"
-  if [ "$got" = "$probe" ]; then
-    printf '   %-24s 可达\n' "$d"
+echo "== 探测哪些域名能走到本机的 443 =="
+# 不比对 A 记录：路径上可能有转发或 SNI 路由。真正要验的是"TLS 握手最后落在不落在
+# 本机"，那就看对端证书指纹和本机现用的那张是不是同一张
+local_fp="$(sudo openssl x509 -in "$LINK/fullchain.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
+usable=()
+for d in "${DOMAIN_LIST[@]}"; do
+  # 末尾的 `|| true` 不能省：域名不可达时整条管道返回非零，而 set -e 对命令替换
+  # 里的失败同样生效，脚本会在第一个连不上的域名处当场退出，后面的一个都探不到
+  fp="$( { timeout 8 openssl s_client -connect "$d:443" -servername "$d" </dev/null 2>/dev/null || true; } |
+        openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)"
+  if [ "$fp" = "$local_fp" ]; then
+    printf '   %-24s 到本机\n' "$d"
+    usable+=("$d")
+  elif [ -n "$fp" ]; then
+    printf '   %-24s 终止在别处（对端证书不是本机这张）\n' "$d"
   else
-    printf '   %-24s 读不到校验文件\n' "$d"
-    bad=1
+    printf '   %-24s 不可达\n' "$d"
   fi
 done
-sudo rm -f "$WEBROOT/.well-known/acme-challenge/$probe"
-if [ "$bad" = 1 ]; then
-  cat >&2 <<'HINT'
-
-上面这些域名的 :80 走不到本机。先确认：
-  - nginx 已加载 rn-foundation.conf（install.sh 装的那份，含 acme-challenge 位置）
-  - 域名解析或前置转发确实落到本机的 80 端口
-不要硬试：Let's Encrypt 对失败有频率限制，连撞几次会被锁一小时。
-HINT
+if [ "${#usable[@]}" -eq 0 ]; then
+  echo "没有一个域名能走到本机的 443，不申请。" >&2
   exit 1
 fi
 
-echo "== 申请证书 =="
+echo "== 申请证书（TLS-ALPN-01，443）=="
 args=()
-for d in "${DOMAINS[@]}"; do args+=(-d "$d"); done
-sudo certbot certonly --webroot -w "$WEBROOT" \
-  --non-interactive --agree-tos --email "$EMAIL" \
-  --cert-name "$CERT_NAME" --keep-until-expiring "${args[@]}"
-
-echo "== certbot 的 nginx 参数文件 =="
-# webroot 方式不会自动生成这两个文件，而 TLS 配置 include 了它们
-if [ ! -f /etc/letsencrypt/options-ssl-nginx.conf ]; then
-  sudo tee /etc/letsencrypt/options-ssl-nginx.conf >/dev/null <<'SSLOPT'
-ssl_session_cache shared:le_nginx_SSL:10m;
-ssl_session_timeout 1440m;
-ssl_session_tickets off;
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_prefer_server_ciphers off;
-ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305";
-SSLOPT
-fi
-if [ ! -f /etc/letsencrypt/ssl-dhparams.pem ]; then
-  # ffdhe2048（RFC 7919），公开的标准参数组，不需要现生成
-  sudo curl -fsSLo /etc/letsencrypt/ssl-dhparams.pem \
-    https://ssl-config.mozilla.org/ffdhe2048.txt
+for d in "${usable[@]}"; do args+=(-d "$d"); done
+if [ "${STAGING:-0}" = "1" ]; then
+  args+=(--staging)
 fi
 
-echo "== 换上 TLS 配置 =="
-sudo install -m 0644 nginx-rn-foundation-tls.conf /etc/nginx/conf.d/rn-foundation.conf
+sudo "$ACME" --issue --alpn --tlsport 443 "${args[@]}" \
+  --pre-hook  'systemctl stop nginx' \
+  --post-hook 'systemctl start nginx'
+
+if [ "${STAGING:-0}" = "1" ]; then
+  echo
+  echo "测试环境签发成功，443 链路是通的。去掉 STAGING=1 再跑一次拿正式证书。"
+  exit 0
+fi
+
+echo "== 装到 nginx 用的位置 =="
+# nginx 配置写的是 /etc/nginx/ssl/rn-foundation/{fullchain,privkey}.pem，这里只换
+# 软链接的指向，配置文件一个字都不用改——重跑 install.sh 也不会把 TLS 退掉。
+# --reloadcmd 会存进域名配置，续期成功后自动重载，不然证书换了 nginx 还拿着旧的
+sudo mkdir -p "$LIVE"
+sudo "$ACME" --install-cert -d "${usable[0]}" \
+  --fullchain-file "$LIVE/fullchain.pem" \
+  --key-file       "$LIVE/privkey.pem" \
+  --reloadcmd      'nginx -t && systemctl reload nginx'
+sudo chmod 0600 "$LIVE/privkey.pem"
+sudo ln -sfn "$LIVE" "$LINK"
 sudo nginx -t
 sudo systemctl reload nginx
 
 echo "== 自动续期 =="
-sudo systemctl enable --now certbot.timer
-sudo systemctl list-timers certbot.timer --no-pager | head -3
-
-hook=/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
-sudo mkdir -p "$(dirname "$hook")"
-printf '#!/bin/sh\nnginx -t && systemctl reload nginx\n' | sudo tee "$hook" >/dev/null
-sudo chmod 0755 "$hook"
-
-echo "== 演练一次续期（不会真的换证书）=="
-sudo certbot renew --dry-run
+# acme.sh 装的时候就写好了 root 的 cron，每天跑一次，剩余不到 30 天才真的续
+sudo crontab -l 2>/dev/null | grep acme.sh || echo "   警告：没找到 acme.sh 的 cron"
 
 echo "== 结果 =="
-sudo certbot certificates | grep -E "Certificate Name|Domains|Expiry"
-for d in "${DOMAINS[@]}"; do
-  printf '   %-24s %s\n' "$d" "$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "https://$d/" 2>/dev/null || echo 不可达)"
+sudo "$ACME" --list
+echo "   nginx 证书指向 $(readlink -f "$LINK")"
+for d in "${usable[@]}"; do
+  printf '   %-24s %s\n' "$d" \
+    "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$d/" 2>/dev/null || echo 不可达)"
 done

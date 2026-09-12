@@ -62,7 +62,7 @@ func main() {
 	}
 
 	httpServer := &http.Server{
-		Addr:              ":" + cfg.Port,
+		Addr:              cfg.BindAddress + ":" + cfg.Port,
 		Handler:           api.New(cfg, database),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Duration(cfg.HTTPReadTimeout) * time.Second,
@@ -70,7 +70,7 @@ func main() {
 		IdleTimeout:       75 * time.Second,
 	}
 	go func() {
-		slog.Info("RN-Server listening", "port", cfg.Port)
+		slog.Info("RN-Server listening", "address", cfg.BindAddress+":"+cfg.Port)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP server failed", "error", err)
 			os.Exit(1)

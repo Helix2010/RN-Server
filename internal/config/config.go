@@ -10,8 +10,11 @@ import (
 )
 
 type Config struct {
-	Environment      string
-	Port             string
+	Environment string
+	Port        string
+	// 监听地址。空 = 所有网卡（Docker 部署靠端口映射限制暴露面）。裸机部署要显式
+	// 填 127.0.0.1，否则应用端口会绕过反向代理直接对外，TLS 和它上面的一切都白设
+	BindAddress      string
 	HTTPReadTimeout  int
 	HTTPWriteTimeout int
 	CORSOrigins      []string
@@ -90,6 +93,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Environment:                value("APP_ENV", "development"),
 		Port:                       value("PORT", "3000"),
+		BindAddress:                value("BIND_ADDRESS", ""),
 		HTTPReadTimeout:            integer("HTTP_READ_TIMEOUT_SECONDS", 3600),
 		HTTPWriteTimeout:           integer("HTTP_WRITE_TIMEOUT_SECONDS", 3600),
 		CORSOrigins:                split(value("CORS_ORIGINS", "*")),

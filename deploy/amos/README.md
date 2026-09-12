@@ -35,16 +35,20 @@
 
 ## 域名与租户
 
-| 域名 | 租户 | 由谁服务 |
-| --- | --- | --- |
-| `api.any123.top` | 100000003 | nginx 反代到 `127.0.0.1:13080` |
-| `console.any123.top` | 100000003 | nginx 直接发静态文件 |
-| `api.predict.kim` | 100000002 | nginx 反代到 `127.0.0.1:13080` |
-| `console.predict.kim` | 100000002 | nginx 直接发静态文件 |
+| 域名 | 租户 | 由谁服务 | 公网能否到本机 443 |
+| --- | --- | --- | --- |
+| `api.predict.kim` | 100000002 | nginx 反代到 `127.0.0.1:13080` | 能 |
+| `console.predict.kim` | 100000002 | nginx 直接发静态文件 | 能 |
+| `api.any123.top` | 100000003 | nginx 反代到 `127.0.0.1:13080` | **不可达** |
+| `console.any123.top` | 100000003 | nginx 直接发静态文件 | **终止在 206.223.224.29**，那台服务的是 `cca.cryptostack.ai` 的证书 |
 
-四行已写进 `tenant_domain`（2026-09-12）。`console.any123.top` 的 A 记录不指向
-amos，走的是一台前置机转发；这不影响 ACME，校验看的是"请求最终有没有到本机的
-:80"，不是解析结果。
+四行已写进 `tenant_domain`（2026-09-12）。any123.top 两个域名的入站链路还没通，
+证书里因此只有 predict.kim 那两个——一个域名验不过整张证书都签不出来，不能硬凑。
+链路打通后重跑 `setup-tls.sh`，它会自己探测并把新域名加进来。
+
+**这台机器的入站只有 443**，没有 80，也没有 13080。所以 nginx 直接听 443，应用在
+`127.0.0.1:13080`（`BIND_ADDRESS=127.0.0.1`，不写的话 Go 会绑所有网卡，裸机没有
+Docker 的端口映射兜底，13080 就绕过 nginx 直接对外了）。
 
 **租户是按 Host 头认的**（`tenant_domain` 表）。所以反代必须原样传 `$host`；
 amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0.0.1:13080`，
@@ -90,35 +94,36 @@ ssh amos 'cd ~/rn-foundation-deploy && ./install.sh'
 # 5. 开机自启
 ssh amos 'sudo systemctl enable --now rn-foundation-server rn-foundation-indexer'
 
-# 6. 证书与自动续期
+# 6. 证书与自动续期。先用测试环境验链路，再签正式的
+ssh amos 'cd ~/rn-foundation-deploy && CERTBOT_EMAIL=<邮箱> STAGING=1 ./setup-tls.sh'
 ssh amos 'cd ~/rn-foundation-deploy && CERTBOT_EMAIL=<邮箱> ./setup-tls.sh'
 ```
 
 ## 证书
 
-Let's Encrypt，HTTP-01，**webroot 方式**。不用 `--nginx` 插件：插件会就地改写
-`/etc/nginx/conf.d/rn-foundation.conf`，而那个文件是 `install.sh` 从仓库装上去的，
-下一次跑 `install.sh` 就会把 TLS 配置覆盖掉——`nginx -t` 照样通过，站点悄悄退回
-纯 HTTP，没有任何人会发现。webroot 方式下 certbot 只往 `/var/www/acme` 写校验
-文件，nginx 配置始终由我们自己管。
+Let's Encrypt，**TLS-ALPN-01**，走 443。入站没有 80，HTTP-01 用不了。
 
-也不需要 Cloudflare token：web4 那套走 DNS-01 是因为它的域名挂在 Cloudflare 代理
-后面、回源 IP 不对外。
+用 **acme.sh 而不是 certbot**：certbot 至今没有实现 TLS-ALPN-01，它的 standalone
+只支持 HTTP-01，`--preferred-challenges tls-alpn-01` 会直接报 "None of the preferred
+challenges are supported by the selected plugin"。换新版没用，这是能力缺失不是版本
+问题。
 
-配置有两份，都在这个目录里：`nginx-rn-foundation.conf` 是没证书时的形态（只有
-:80 加 ACME 路径），`nginx-rn-foundation-tls.conf` 是有证书之后的（:80 只做校验
-与跳转，业务走 :443，带一年期 HSTS）。`setup-tls.sh` 签完证书换上后者；`install.sh`
-会先看 `/etc/letsencrypt/live/rn-foundation/fullchain.pem` 在不在，在就直接装 TLS
-版，所以重跑安装不会把 TLS 退掉。
+nginx 配置里的证书路径指向软链接 `/etc/nginx/ssl/rn-foundation`：没证书时指向自签
+占位（`install.sh` 生成，浏览器会报不受信任），签好后 `setup-tls.sh` 改指
+`/etc/nginx/ssl/rn-foundation-le`。配置文件本身不含具体证书路径，所以重跑
+`install.sh` 不会把 TLS 退回去。
 
-自动续期是 certbot 自带的 `certbot.timer`，一天两次，剩余不到 30 天才真的续。
-额外装了一个 deploy hook 在续期成功后重载 nginx——不重载的话证书换了、nginx 还
-拿着旧的，直到下次重启才生效。脚本最后会 `--dry-run` 演练一次，演练不过就说明
-续期那天也会不过。
+签发和续期期间 acme.sh 要独占 443，nginx 让开几秒。pre / post hook 存在域名配置
+里（`Le_PreHook` / `Le_PostHook`），acme.sh 自己的 cron 续期时照样执行；
+`--reloadcmd` 同理，续期成功后自动 `nginx -t && systemctl reload nginx`，不然证书
+换了 nginx 还拿着旧的。cron 是安装 acme.sh 时自动写的，一天四次，只有接近到期才
+真的续。
 
-申请前脚本会**写一个探针文件再从四个域名各读一次**，而不是比对 A 记录：解析可能
-指向一台做转发的前置机（`console.any123.top` 就是这样），比 IP 会把能用的情况误判
-成不能用。读不到就别硬试，Let's Encrypt 对失败有频率限制，连撞几次会被锁一小时。
+申请前脚本会**逐个域名握手、比对对端证书指纹和本机正在用的那张**，而不是比对 A
+记录：路径上可能有转发或 SNI 路由，比 IP 会把能用的判成不能用、也会把终止在别处
+的判成能用。探不到的域名直接排除在证书之外——一个域名验不过，整张证书都签不出来。
+
+先用 `STAGING=1` 跑一遍验链路：正式环境对失败有频率限制，测试环境没有。
 
 ## 日常更新
 

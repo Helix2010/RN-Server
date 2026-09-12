@@ -8,8 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 for f in rn-foundation-server.service rn-foundation-indexer.service \
-         rn-foundation.env.example nginx-rn-foundation.conf \
-         nginx-rn-foundation-tls.conf; do
+         rn-foundation.env.example nginx-rn-foundation.conf; do
   [ -f "$f" ] || { echo "缺少 $f" >&2; exit 1; }
 done
 
@@ -34,20 +33,26 @@ sudo install -m 0644 rn-foundation-server.service  /etc/systemd/system/
 sudo install -m 0644 rn-foundation-indexer.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-echo "== nginx =="
-# ACME 校验目录，两份配置都指向它
-sudo mkdir -p /var/www/acme/.well-known/acme-challenge
-sudo chmod -R a+rX /var/www/acme
-# 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf。
-# 证书已经签过就装 TLS 版——否则重跑 install.sh 会把站点悄悄退回纯 HTTP，
-# 而 nginx -t 照样通过，没有任何人会发现
-if [ -s /etc/letsencrypt/live/rn-foundation/fullchain.pem ]; then
-  echo "   已有证书，装 TLS 版配置"
-  sudo install -m 0644 nginx-rn-foundation-tls.conf /etc/nginx/conf.d/rn-foundation.conf
+echo "== 证书占位 =="
+# nginx 配置里的证书路径指向 /etc/nginx/ssl/rn-foundation 这个**软链接**。
+# 没有真证书时先指向自签的一份，nginx 才起得来；setup-tls.sh 签好之后把链接
+# 改指 letsencrypt 的 live 目录，nginx 配置一个字都不用改。
+if [ ! -e /etc/nginx/ssl/rn-foundation ]; then
+  sudo mkdir -p /etc/nginx/ssl/rn-foundation-self
+  sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -subj "/CN=rn-foundation-placeholder" \
+    -keyout /etc/nginx/ssl/rn-foundation-self/privkey.pem \
+    -out   /etc/nginx/ssl/rn-foundation-self/fullchain.pem 2>/dev/null
+  sudo chmod 0600 /etc/nginx/ssl/rn-foundation-self/privkey.pem
+  sudo ln -sfn /etc/nginx/ssl/rn-foundation-self /etc/nginx/ssl/rn-foundation
+  echo "   已生成自签占位证书（浏览器会报不受信任，签发真证书后消失）"
 else
-  echo "   还没有证书，先装 HTTP 版（setup-tls.sh 会换掉它）"
-  sudo install -m 0644 nginx-rn-foundation.conf /etc/nginx/conf.d/rn-foundation.conf
+  echo "   已存在，指向 $(readlink -f /etc/nginx/ssl/rn-foundation)"
 fi
+
+echo "== nginx =="
+# 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf
+sudo install -m 0644 nginx-rn-foundation.conf /etc/nginx/conf.d/rn-foundation.conf
 sudo nginx -t
 sudo systemctl reload nginx
 
@@ -59,5 +64,5 @@ cat <<'NEXT'
      照抄 web4，ADMIN_API_KEY 自己另生成一把）
   2. 从开发机跑 deploy.sh，把二进制和两份控制台产物送上来
   3. sudo systemctl enable --now rn-foundation-server rn-foundation-indexer
-  4. ./setup-tls.sh 申请证书并打开自动续期
+  4. CERTBOT_EMAIL=<邮箱> ./setup-tls.sh 申请证书并打开自动续期
 NEXT

@@ -56,21 +56,23 @@ build_admin() {
 
 ship_admin() {
   echo "== 上传控制台 =="
-  # 先传到家目录下的暂存区，再用 sudo 搬进 /opt。直接 rsync 到 /opt 要先把目录
-  # chown 给登录用户，那会留下一段「网站根目录可被普通用户写」的窗口
-  local stage_remote="\$HOME/.rn-foundation-admin-stage"
+  # 用 tar 走管道，不用 rsync：amos 上没有 rsync，而为了发几个静态文件去装一个
+  # 工具不值得。解到暂存目录再整目录换过去，顺带拿到 --delete 的效果——上一版
+  # 留下的旧 chunk 必须消失，否则目录只会越长越大
   for entry in "${TENANTS[@]}"; do
     local slug="${entry%%:*}"
     # shellcheck disable=SC2029  # slug 就是要在本机展开
-    ssh "$HOST" "mkdir -p $stage_remote/$slug"
-    # --delete：上一版留下的旧 chunk 必须消失，否则目录只会越长越大
-    rsync -a --delete "$STAGE/admin/$slug/" "$HOST:.rn-foundation-admin-stage/$slug/"
-    # shellcheck disable=SC2029
-    ssh "$HOST" "sudo mkdir -p /opt/rn-foundation/admin/$slug \
-      && sudo rsync -a --delete $stage_remote/$slug/ /opt/rn-foundation/admin/$slug/ \
-      && sudo chown -R root:root /opt/rn-foundation/admin/$slug \
-      && sudo chmod -R a+rX /opt/rn-foundation/admin/$slug \
-      && rm -rf $stage_remote/$slug"
+    tar -C "$STAGE/admin/$slug" -czf - . | ssh "$HOST" "
+      set -eu
+      stage=\"\$HOME/.rn-foundation-admin-stage/$slug\"
+      rm -rf \"\$stage\" && mkdir -p \"\$stage\"
+      tar -C \"\$stage\" -xzf -
+      sudo mkdir -p /opt/rn-foundation/admin
+      sudo rm -rf /opt/rn-foundation/admin/$slug
+      sudo mv \"\$stage\" /opt/rn-foundation/admin/$slug
+      sudo chown -R root:root /opt/rn-foundation/admin/$slug
+      sudo chmod -R a+rX /opt/rn-foundation/admin/$slug"
+    echo "   $slug 已就位"
   done
   ssh "$HOST" 'sudo nginx -t && sudo systemctl reload nginx'
 }
