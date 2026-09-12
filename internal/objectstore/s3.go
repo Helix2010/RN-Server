@@ -63,7 +63,23 @@ type Client interface {
 	ListParts(context.Context, string, string) ([]CompletedPart, error)
 	CompleteMultipartUpload(context.Context, string, string, []CompletedPart) error
 	AbortMultipartUpload(context.Context, string, string) error
+	// GetBucketCORS 读桶级跨域规则。**只读**：服务端不写桶策略（发布存储那把密钥
+	// 按最小权限授的是对象读写，写桶配置会 AccessDenied）。
+	//
+	// 读出来是为了能回答"桶上现在到底配了什么"。品牌图片是浏览器直传对象存储的，
+	// 桶上少一条来源的表现只是界面上一句"无法连接对象存储"——票据、签名、写权限
+	// 全是好的，从我们这一侧看不出问题在桶的配置上。
+	GetBucketCORS(context.Context) ([]CORSRule, error)
 	Test(context.Context) error
+}
+
+// CORSRule 是桶级跨域规则。字段名对齐 S3/OBS 的 CORSRule。
+type CORSRule struct {
+	AllowedOrigins []string `json:"allowedOrigins"`
+	AllowedMethods []string `json:"allowedMethods"`
+	AllowedHeaders []string `json:"allowedHeaders,omitempty"`
+	ExposeHeaders  []string `json:"exposeHeaders,omitempty"`
+	MaxAgeSeconds  int32    `json:"maxAgeSeconds,omitempty"`
 }
 
 type Factory interface {
@@ -314,6 +330,27 @@ func (c *s3Client) AbortMultipartUpload(ctx context.Context, key, uploadID strin
 		return fmt.Errorf("abort multipart upload: %w", err)
 	}
 	return nil
+}
+
+func (c *s3Client) GetBucketCORS(ctx context.Context) ([]CORSRule, error) {
+	out, err := c.client.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(c.bucket)})
+	if err != nil {
+		return nil, fmt.Errorf("get bucket cors failed: %w", err)
+	}
+	rules := make([]CORSRule, 0, len(out.CORSRules))
+	for _, rule := range out.CORSRules {
+		converted := CORSRule{
+			AllowedOrigins: rule.AllowedOrigins,
+			AllowedMethods: rule.AllowedMethods,
+			AllowedHeaders: rule.AllowedHeaders,
+			ExposeHeaders:  rule.ExposeHeaders,
+		}
+		if rule.MaxAgeSeconds != nil {
+			converted.MaxAgeSeconds = *rule.MaxAgeSeconds
+		}
+		rules = append(rules, converted)
+	}
+	return rules, nil
 }
 
 func (c *s3Client) Test(ctx context.Context) error {

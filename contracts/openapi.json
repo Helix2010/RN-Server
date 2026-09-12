@@ -421,7 +421,7 @@
     "/v1/admin/release-storage/cors": {
       "get": {
         "summary": "The bucket CORS rule this platform needs",
-        "description": "Read-only. Branding images are uploaded by the browser directly to object storage, so the bucket itself must allow the console origins; a bucket without them fails the preflight and the console can only report \"cannot reach object storage\". The origin list is derived from the tenant_domain table, so adding a tenant does not mean editing a config file. The server does not write the rule: the release-storage access key is least-privileged to object read/write and has no bucket-configuration permission.",
+        "description": "Read-only. Branding images are uploaded by the browser directly to object storage, so the bucket itself must allow the console origins; a bucket without them fails the preflight and the console can only report \"cannot reach object storage\". Returns `required` (derived from the tenant_domain table, so adding a tenant does not mean editing a config file), plus `current` and `missingOrigins` when the bucket rules can be read. The server never writes the rule; on this deployment the release-storage key cannot read them either (AccessDenied on GetBucketCors), in which case `currentError` carries the reason.",
         "responses": {
           "200": {
             "description": "The rule to configure on the bucket"

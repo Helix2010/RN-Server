@@ -395,13 +395,54 @@ func (s *server) bucketCORSRequirements(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "TENANT_DOMAIN_QUERY_FAILED", "Unable to list tenant domains")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"allowedOrigins": origins,
-		"allowedMethods": []string{"PUT", "GET", "HEAD"},
-		"allowedHeaders": []string{"*"},
-		"exposeHeaders":  []string{"ETag"},
-		"maxAgeSeconds":  3600,
+	required := objectstore.CORSRule{
+		AllowedOrigins: origins,
+		// 直传只用 PUT；GET/HEAD 留给浏览器按 ETag 做条件请求
+		AllowedMethods: []string{"PUT", "GET", "HEAD"},
+		AllowedHeaders: []string{"*"},
+		ExposeHeaders:  []string{"ETag"},
+		MaxAgeSeconds:  3600,
+	}
+	body := gin.H{
+		"required": required,
 		"note": "把这条规则配到发布存储那个桶上（对象存储控制台 → 桶 → 跨域规则）。" +
-			"服务端不会替你写：发布存储的访问密钥按最小权限只有对象读写，没有改桶配置的权限。",
-	})
+			"服务端只读不写：写桶配置会被对象存储拒（AccessDenied）。",
+	}
+	// 顺便读一眼桶上现在配的是什么。只说"该配什么"而不说"现在是什么"，排障时还是
+	// 得去控制台上看一遍——而少的那条来源恰恰是肉眼最容易看漏的东西。
+	if client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c)); err != nil {
+		body["current"] = nil
+		body["currentError"] = "release storage is not configured for this tenant"
+	} else {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		defer cancel()
+		if rules, err := client.GetBucketCORS(ctx); err != nil {
+			body["current"] = nil
+			body["currentError"] = err.Error()
+		} else {
+			body["current"] = rules
+			body["missingOrigins"] = originsNotAllowed(origins, rules)
+		}
+	}
+	c.JSON(http.StatusOK, body)
+}
+
+// originsNotAllowed 挑出桶上还没放行的来源。"*" 视为全部放行。
+func originsNotAllowed(required []string, rules []objectstore.CORSRule) []string {
+	allowed := map[string]bool{}
+	for _, rule := range rules {
+		for _, origin := range rule.AllowedOrigins {
+			allowed[strings.ToLower(strings.TrimSpace(origin))] = true
+		}
+	}
+	if allowed["*"] {
+		return []string{}
+	}
+	missing := []string{}
+	for _, origin := range required {
+		if !allowed[strings.ToLower(origin)] {
+			missing = append(missing, origin)
+		}
+	}
+	return missing
 }
