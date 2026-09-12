@@ -1834,7 +1834,7 @@
     "/v1/admin/builds": {
       "get": {
         "summary": "List build jobs for this tenant",
-        "description": "Newest first. Each item carries status, the resolved commit, the artifact sha256 and a bounded log tail.",
+        "description": "Newest first. Each item carries status, the resolved commit, the artifact sha256 and a bounded log tail. Also returns `next` — the version and build number to default the queue form to, per platform, worked out from both app_releases and the build jobs still queued or running; a tenant with no packages yet gets 1.0.0/1, otherwise the highest used version gets a patch bump and the build number is incremented. `gitRef` is the branch every build is pinned to; the console shows it read-only because the queue endpoint ignores whatever the request carries.",
         "responses": {
           "200": {
             "description": "Build jobs"
@@ -1846,7 +1846,7 @@
       },
       "post": {
         "summary": "Queue a build",
-        "description": "Queues a build for this tenant. The job carries parameters only (tenant, git ref, version, build number) and never a command: the server must not be able to execute anything on the machine that holds the Android signing keystore. buildNumber must be strictly greater than every build number already used by this tenant and platform, across both app_releases and build_jobs.",
+        "description": "Queues a build for this tenant. The job carries parameters only (tenant, version, build number) and never a command: the server must not be able to execute anything on the machine that holds the Android signing keystore. gitRef in the request body is ignored — every build is pinned to the branch reported by GET /v1/admin/builds, because being able to pick a branch would mean being able to ship a production-signed package built from anywhere. Both version and buildNumber must be strictly greater than the highest already used by this tenant and platform, counting app_releases as well as build jobs that are still queued or running (failed and canceled jobs free their numbers again). Checking the version here rather than at upload time matters: otherwise a doomed build occupies the build machine for minutes and is only rejected once it is finished.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3082,7 +3082,6 @@
         "type": "object",
         "required": [
           "platform",
-          "gitRef",
           "version",
           "buildNumber",
           "reason",
@@ -3099,7 +3098,8 @@
           "gitRef": {
             "type": "string",
             "maxLength": 200,
-            "description": "Branch name or commit sha to build"
+            "deprecated": true,
+            "description": "Ignored. Every build is pinned to one branch; see GET /v1/admin/builds. Still accepted so that older callers do not start failing, but sending it changes nothing."
           },
           "version": {
             "type": "string",

@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -234,27 +236,29 @@ func TestDBBuildJobQueueEnforcesMonotonicBuildNumbers(t *testing.T) {
 	// 这个用例原本连 tenants 行都没建，所以 tenantSlug 查不到，报的是 500
 	seedBuildIdentity(t, db, tenant, seedBuildTenant(t, s, tenant))
 
-	create := func(buildNumber int) *httptest.ResponseRecorder {
+	// 版本号跟着 build 号一起动：两道闸是并列的，版本号不动的话先开口的是版本闸，
+	// 这个用例就测不到它想测的东西了
+	create := func(version string, buildNumber int) *httptest.ResponseRecorder {
 		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
-			"platform": "android", "gitRef": "main", "version": "1.3.8",
+			"platform": "android", "gitRef": "main", "version": version,
 			"buildNumber": buildNumber, "reason": "ship ota signing", "confirm": true,
 		})
 		s.createBuildJob(c)
 		return recorder
 	}
 
-	if code := create(34).Code; code != http.StatusCreated {
+	if code := create("1.3.8", 34).Code; code != http.StatusCreated {
 		t.Fatalf("first job: %d", code)
 	}
 	// 同号必须被拒。两个人各排一个 build 34，装到设备上哪个赢取决于谁后装
-	if recorder := create(34); recorder.Code != http.StatusConflict ||
+	if recorder := create("1.3.9", 34); recorder.Code != http.StatusConflict ||
 		!strings.Contains(recorder.Body.String(), "BUILD_NUMBER_NOT_INCREASING") {
 		t.Fatalf("duplicate build number: %d %s", recorder.Code, recorder.Body.String())
 	}
-	if recorder := create(33); recorder.Code != http.StatusConflict {
+	if recorder := create("1.3.9", 33); recorder.Code != http.StatusConflict {
 		t.Fatalf("a lower build number was accepted: %d", recorder.Code)
 	}
-	if code := create(35).Code; code != http.StatusCreated {
+	if code := create("1.3.9", 35).Code; code != http.StatusCreated {
 		t.Fatalf("a higher build number was refused: %d", code)
 	}
 }
@@ -310,9 +314,11 @@ func TestDBBuildJobClaimHandsEachJobToExactlyOneAgent(t *testing.T) {
 	tenant := testTenant(2)
 	slug := seedBuildTenant(t, s, tenant)
 	seedBuildIdentity(t, db, tenant, slug)
-	for _, buildNumber := range []int{101, 102} {
+	// 两条任务的版本号也必须不同：同一个版本号的第二个包在入库那一刻必然被拒，
+	// 排队时就不该放行（见 createBuildJob 的版本闸）
+	for index, buildNumber := range []int{101, 102} {
 		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
-			"platform": "android", "gitRef": "main", "version": "1.3.8",
+			"platform": "android", "gitRef": "main", "version": fmt.Sprintf("1.3.%d", 8+index),
 			"buildNumber": buildNumber, "reason": "queue two builds", "confirm": true,
 		})
 		s.createBuildJob(c)
@@ -524,5 +530,71 @@ func TestDBBuildJobQueueRequiresAnIncreasingVersion(t *testing.T) {
 	// 两个都涨了才放行
 	if code, out = queue("1.3.13", 42); code != http.StatusCreated {
 		t.Fatalf("版本和 build 号都涨了却被拒：%d %v", code, out)
+	}
+}
+
+// 第一个包和后续包的默认值。空库给 1.0.0/1，有数据就在最高的那一组上各进一位。
+func TestBuildFloorNextDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		floor       buildFloor
+		wantVersion string
+		wantBuild   int
+	}{
+		{"空库", buildFloor{}, "1.0.0", 1},
+		{"有发布", buildFloor{Version: "1.3.13", BuildNumber: 43}, "1.3.14", 44},
+		// 9 → 10 而不是字符串序上的 1.3.9 > 1.3.10
+		{"跨十位", buildFloor{Version: "1.3.9", BuildNumber: 9}, "1.3.10", 10},
+		{"大版本", buildFloor{Version: "2.0.0", BuildNumber: 100}, "2.0.1", 101},
+		// 版本号是脏的也要给出一个能用的默认值，而不是把坏值原样抛回页面
+		{"版本号不合法", buildFloor{Version: "latest", BuildNumber: 7}, "1.0.0", 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			version, number := tc.floor.next()
+			if version != tc.wantVersion || number != tc.wantBuild {
+				t.Fatalf("默认值 = %s/%d，想要 %s/%d", version, number, tc.wantVersion, tc.wantBuild)
+			}
+		})
+	}
+}
+
+// 下限必须把**排队中**的任务算进去。只看发布表的话，连着排两个任务会拿到同一个版本
+// 号，第二个要等六分钟编译完才在上传那一刻被拒。
+func TestDBBuildFloorCountsQueuedJobsNotJustReleases(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development"}}
+	tenant := testTenant(10)
+	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
+
+	floor, err := s.buildFloorFor(context.Background(), tenant, "android")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, number := floor.next(); version != "1.0.0" || number != 1 {
+		t.Fatalf("空库的第一个包应当是 1.0.0/1，得到 %s/%d", version, number)
+	}
+
+	queue := func(version string, buildNumber int) int {
+		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
+			"platform": "android", "gitRef": "main", "version": version,
+			"buildNumber": buildNumber, "reason": "测试下限", "confirm": true,
+		})
+		s.createBuildJob(c)
+		return recorder.Code
+	}
+	if code := queue("1.0.0", 1); code != http.StatusCreated {
+		t.Fatalf("第一个包被拒了：%d", code)
+	}
+	// 这一条还只是排队中、没有任何发布记录，但它已经占住了 1.0.0/1
+	floor, err = s.buildFloorFor(context.Background(), tenant, "android")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version, number := floor.next(); version != "1.0.1" || number != 2 {
+		t.Fatalf("排队中的任务没被算进下限：下一个给了 %s/%d", version, number)
+	}
+	if code := queue("1.0.0", 2); code != http.StatusConflict {
+		t.Fatalf("版本号和排队中的任务重了却放行：%d", code)
 	}
 }

@@ -127,44 +127,77 @@ func clampLogTail(lines []string) []byte {
 	return raw
 }
 
-// nextBuildNumberFloor 返回这个租户这个平台已经用掉的最大 build 号。产物表和任务表
-// 都要看：只看产物表的话，一个还在队列里的同号任务不会被发现，两个人各自排一个
-// build 34，装到设备上哪个赢取决于谁后装。
-// latestReleaseVersion 取该平台最新一条发布的版本号；没有发布过返回空串。
-func (s *server) latestReleaseVersion(ctx context.Context, tenant, platform string) (string, error) {
-	var version sql.NullString
-	err := s.db.QueryRowContext(ctx,
-		`SELECT version FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 1`,
-		tenant, platform).Scan(&version)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(version.String), nil
+// buildFloor 是"下一个包必须越过的线"：版本号和 build 号都要严格大于它。
+type buildFloor struct {
+	Version     string // 已用掉的最高版本号；一个都没有时为空
+	BuildNumber int    // 已用掉的最大 build 号；一个都没有时为 0
 }
 
-func (s *server) nextBuildNumberFloor(c *gin.Context, tenant, platform string) (int, error) {
-	var fromReleases, fromJobs sql.NullInt64
-	if err := s.db.QueryRowContext(c.Request.Context(),
-		`SELECT MAX(build_number) FROM app_releases WHERE tenant_id=? AND platform=?`, tenant, platform).Scan(&fromReleases); err != nil {
-		return 0, err
+// next 返回照着这条线该填的下一组值。
+//
+// 第一个包给 1.0.0/1；之后版本号进一位修订、build 号加一。发版想跳小版本或大版本
+// 是常事，所以这只是**默认值**，控制台上仍然可以改——这里只负责让"下一个"不必靠人
+// 去翻上一次发了什么。
+func (f buildFloor) next() (string, int) {
+	if f.Version == "" && f.BuildNumber == 0 {
+		return "1.0.0", 1
 	}
-	if err := s.db.QueryRowContext(c.Request.Context(),
-		// 失败与取消的任务不占号：失败的构建没有产物，那个号根本没被用掉，
-		// 而"改一行再用同一个版本号重来"是最常见的那条路径
-		`SELECT MAX(build_number) FROM build_jobs WHERE tenant_id=? AND platform=? AND status NOT IN ('canceled','failed')`, tenant, platform).Scan(&fromJobs); err != nil {
-		return 0, err
+	return nextPatchVersion(f.Version), f.BuildNumber + 1
+}
+
+func nextPatchVersion(version string) string {
+	parts := strings.Split(strings.TrimSpace(version), ".")
+	if len(parts) != 3 {
+		return "1.0.0"
 	}
-	floor := 0
-	if fromReleases.Valid && int(fromReleases.Int64) > floor {
-		floor = int(fromReleases.Int64)
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return "1.0.0"
 	}
-	if fromJobs.Valid && int(fromJobs.Int64) > floor {
-		floor = int(fromJobs.Int64)
+	return parts[0] + "." + parts[1] + "." + strconv.Itoa(patch+1)
+}
+
+// buildFloorFor 同时算出版本号和 build 号的下限。
+//
+// **两张表都要看**：已经入库的发布（app_releases），加上排着队还没落地的任务
+// （build_jobs，除掉取消和失败的——那些没有产物，号根本没被用掉，"改一行用同一个号
+// 重来"是最常见的那条路径）。
+//
+// 只看发布表的后果不一样但都很实：build 号那一侧是两个人各排一个 34，装到设备上哪个
+// 赢取决于谁后装；版本号那一侧是连排两个任务拿到同一个版本号，第二个要等六分钟编译完
+// 才在上传那一刻被拒。
+//
+// 取最近 50 条再在 Go 里比：版本号是 semver，SQL 的字符串序会把 1.3.9 排在 1.3.10
+// 后面。build 号单调递增，最高的版本号不可能落在这 50 条之外。
+func (s *server) buildFloorFor(ctx context.Context, tenant, platform string) (buildFloor, error) {
+	var floor buildFloor
+	rows, err := s.db.QueryContext(ctx, `
+		(SELECT version,build_number FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 50)
+		UNION ALL
+		(SELECT version,build_number FROM build_jobs WHERE tenant_id=? AND platform=? AND status NOT IN ('canceled','failed') ORDER BY build_number DESC LIMIT 50)`,
+		tenant, platform, tenant, platform)
+	if err != nil {
+		return floor, err
 	}
-	return floor, nil
+	defer rows.Close()
+	for rows.Next() {
+		var version sql.NullString
+		var number sql.NullInt64
+		if err := rows.Scan(&version, &number); err != nil {
+			return floor, err
+		}
+		if number.Valid && int(number.Int64) > floor.BuildNumber {
+			floor.BuildNumber = int(number.Int64)
+		}
+		candidate := strings.TrimSpace(version.String)
+		if !semverPattern.MatchString(candidate) {
+			continue
+		}
+		if floor.Version == "" || compareVersion(candidate, floor.Version) > 0 {
+			floor.Version = candidate
+		}
+	}
+	return floor, rows.Err()
 }
 
 type buildJobCreate struct {
@@ -237,16 +270,16 @@ func (s *server) createBuildJob(c *gin.Context) {
 	}
 	encodedNotes, _ := json.Marshal(notes)
 
-	floor, err := s.nextBuildNumberFloor(c, tenantID(c), platform)
+	floor, err := s.buildFloorFor(c.Request.Context(), tenantID(c), platform)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to inspect existing build numbers")
 		return
 	}
 	// 严格递增。装到设备上的 APK 靠 versionCode 决定谁能覆盖谁，重号意味着"哪个赢"
 	// 取决于谁后装——这不是一个应该留给运气的问题。
-	if body.BuildNumber <= floor {
+	if body.BuildNumber <= floor.BuildNumber {
 		problem(c, http.StatusConflict, "BUILD_NUMBER_NOT_INCREASING",
-			fmt.Sprintf("buildNumber must be greater than %d, the highest already used for %s", floor, platform))
+			fmt.Sprintf("buildNumber must be greater than %d, the highest already used for %s", floor.BuildNumber, platform))
 		return
 	}
 	// 版本号也要递增，而且**必须在这里就查**。入库那一侧
@@ -255,14 +288,9 @@ func (s *server) createBuildJob(c *gin.Context) {
 	// 进队列、能占住机器、能编译出一个签好名的 APK，最后在上传完成的那一刻被拒。
 	// 2026-09-12 实测：六分钟的构建白跑，产物随 worktree 一起删掉，任务停在 failed。
 	// 两道闸的判据不一样，靠后的那道就成了"先干完活再告诉你不行"。
-	latestVersion, err := s.latestReleaseVersion(c.Request.Context(), tenantID(c), platform)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to inspect existing release versions")
-		return
-	}
-	if latestVersion != "" && compareVersion(version, latestVersion) <= 0 {
+	if floor.Version != "" && compareVersion(version, floor.Version) <= 0 {
 		problem(c, http.StatusConflict, "BUILD_VERSION_NOT_INCREASING",
-			fmt.Sprintf("version must be greater than %s, the latest release for %s (the build would be rejected on upload)", latestVersion, platform))
+			fmt.Sprintf("version must be greater than %s, the highest already used for %s (the build would be rejected on upload)", floor.Version, platform))
 		return
 	}
 	// 身份在排队这一刻就要能合成出来。留到代理认领才发现，运维已经等了一轮队列，
@@ -351,7 +379,22 @@ func (s *server) listBuildJobs(c *gin.Context) {
 		}
 		items = append(items, buildJobView(job))
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	// 下一个包该填什么，由服务端算——控制台不该自己去推。它要看的两张表里有一张
+	// （build_jobs 里排队中的任务）根本不在列表这一页上，而且 semver 的比较规则
+	// 客户端复制一份就会漂。默认值给出来，页面上仍然可以改。
+	next := gin.H{}
+	for _, platform := range []string{"android", "ios"} {
+		floor, err := s.buildFloorFor(c.Request.Context(), tenantID(c), platform)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to list builds")
+			return
+		}
+		version, buildNumber := floor.next()
+		next[platform] = gin.H{"version": version, "buildNumber": buildNumber}
+	}
+	// 分支固定 main：排队时根本不看请求里带什么（见 createBuildJob）。告诉控制台
+	// 这件事，省得它画一个改了也没用的输入框。
+	c.JSON(http.StatusOK, gin.H{"items": items, "next": next, "gitRef": buildGitRef})
 }
 
 func (s *server) buildJobDetail(c *gin.Context) {
