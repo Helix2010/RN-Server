@@ -127,7 +127,7 @@ func (s *server) createUploadSession(c *gin.Context) {
 	key := strings.TrimLeft(path.Join(prefix, "tenants", tenantID(c), "upload-sessions", id, "payload"+path.Ext(body.FileName)), "/")
 	uploadID, err := client.CreateMultipartUpload(c.Request.Context(), key, body.ContentType)
 	if err != nil {
-		problem(c, 502, "UPLOAD_SESSION_CREATE_FAILED", "Unable to create multipart upload")
+		problem(c, http.StatusFailedDependency, "UPLOAD_SESSION_CREATE_FAILED", "Unable to create multipart upload")
 		return
 	}
 	now := time.Now().UTC()
@@ -201,7 +201,7 @@ func (s *server) uploadSessionPart(c *gin.Context) {
 	limited := io.LimitReader(c.Request.Body, expected+1)
 	etag, err := client.UploadPart(c.Request.Context(), session.ObjectKey, tok.UploadID, partNumber, limited, expected)
 	if err != nil {
-		problem(c, 502, "UPLOAD_PART_FAILED", "Unable to upload part")
+		problem(c, http.StatusFailedDependency, "UPLOAD_PART_FAILED", "Unable to upload part")
 		return
 	}
 	if err := s.recordUploadPart(c, session.ID, partNumber, etag, expected); err != nil {
@@ -228,7 +228,7 @@ func (s *server) presignUploadSessionPart(c *gin.Context) {
 	}
 	url, headers, err := client.PresignUploadPart(c.Request.Context(), session.ObjectKey, tok.UploadID, partNumber, time.Duration(s.cfg.ArtifactMultipartTTL)*time.Second)
 	if err != nil {
-		problem(c, 502, "UPLOAD_PART_PRESIGN_FAILED", "Unable to create part upload URL")
+		problem(c, http.StatusFailedDependency, "UPLOAD_PART_PRESIGN_FAILED", "Unable to create part upload URL")
 		return
 	}
 	c.JSON(200, gin.H{"partNumber": partNumber, "url": url, "headers": headers, "expiresAt": iso(session.ExpiresAt)})
@@ -305,7 +305,7 @@ func (s *server) completeUploadSession(c *gin.Context) {
 			// Keep the session active so a transient/provider compatibility error
 			// can be retried without uploading all parts again. Expiry cleanup
 			// will abort abandoned sessions.
-			problem(c, 502, "UPLOAD_COMPLETE_FAILED", "Unable to complete multipart upload; the uploaded parts were kept for retry")
+			problem(c, http.StatusFailedDependency, "UPLOAD_COMPLETE_FAILED", "Unable to complete multipart upload; the uploaded parts were kept for retry")
 			return
 		}
 	}

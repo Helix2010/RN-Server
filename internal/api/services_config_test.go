@@ -199,7 +199,7 @@ func TestProbePredictServiceComparesScopeAndChain(t *testing.T) {
 
 func TestProbePredictServiceReportsUpstreamFailures(t *testing.T) {
 	code, out := probeWith(t, map[string]any{"error": "expired"}, 403, predictConfig("predict.prax1s.xyz", testScope, "op-sepolia"))
-	if code != 502 || out["code"] != "PREDICT_PROBE_FAILED" {
+	if code != 424 || out["code"] != "PREDICT_PROBE_FAILED" {
 		t.Fatalf("upstream 403 = %d %v", code, out)
 	}
 	code, _ = probeWith(t, nil, 200, predictConfig("predict.prax1s.xyz:443", testScope, "op-sepolia"))

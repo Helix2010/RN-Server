@@ -267,7 +267,7 @@ func TestDBPurgeOTAKeepsTheRowWhenListingFails(t *testing.T) {
 	store.put(manifest, []byte("{}"), "e1")
 
 	recorder := purgeOTA(t, s, tenant, ota, purgeBody)
-	if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "STORAGE_LIST_FAILED") {
+	if recorder.Code != http.StatusFailedDependency || !strings.Contains(recorder.Body.String(), "STORAGE_LIST_FAILED") {
 		t.Fatalf("listing failure must abort the purge, got %d %s", recorder.Code, recorder.Body.String())
 	}
 	var rows int

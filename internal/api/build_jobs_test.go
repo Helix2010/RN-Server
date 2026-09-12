@@ -1,11 +1,13 @@
 package api
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/gin-gonic/gin"
@@ -229,6 +231,8 @@ func TestDBBuildJobQueueEnforcesMonotonicBuildNumbers(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db, cfg: config.Config{Environment: "development"}}
 	tenant := testTenant(1)
+	// 这个用例原本连 tenants 行都没建，所以 tenantSlug 查不到，报的是 500
+	seedBuildIdentity(t, db, tenant, seedBuildTenant(t, s, tenant))
 
 	create := func(buildNumber int) *httptest.ResponseRecorder {
 		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
@@ -261,7 +265,7 @@ func TestDBBuildJobNumberIsFreeAgainAfterAFailure(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db, cfg: config.Config{Environment: "development", BuildAgentToken: "token"}}
 	tenant := testTenant(4)
-	seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, seedBuildTenant(t, s, tenant))
 
 	queue := func(buildNumber int) *httptest.ResponseRecorder {
 		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
@@ -305,6 +309,7 @@ func TestDBBuildJobClaimHandsEachJobToExactlyOneAgent(t *testing.T) {
 	s := &server{db: db, cfg: config.Config{Environment: "development", BuildAgentToken: "token"}}
 	tenant := testTenant(2)
 	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
 	for _, buildNumber := range []int{101, 102} {
 		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
 			"platform": "android", "gitRef": "main", "version": "1.3.8",
@@ -356,7 +361,7 @@ func TestDBBuildJobLifecycleRefusesOutOfOrderTransitions(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db, cfg: config.Config{Environment: "development", BuildAgentToken: "token"}}
 	tenant := testTenant(3)
-	seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, seedBuildTenant(t, s, tenant))
 	c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
 		"platform": "android", "gitRef": "main", "version": "2.0.0",
 		"buildNumber": 200, "reason": "lifecycle test", "confirm": true,
@@ -436,4 +441,47 @@ func TestBuildJobCarriesReleaseNotesAndValidatesThemLikeAManualRelease(t *testin
 	if got := buildJobReleaseNotes(stored)["zh-CN"]; len(got) != 1 || got[0] != "修了两个崩溃" {
 		t.Fatalf("stored notes did not round trip: %v", got)
 	}
+}
+
+// seedBuildIdentity 补上"这个租户能排队打包"所缺的那部分：应用身份。
+//
+// 为什么需要：2026-09-12 把 tenant.json 从 App 仓库搬到服务端之后，createBuildJob 会
+// 在排队这一刻就合成身份文件（tenantManifestFor），缺任何一项直接拒。下面这几个用例
+// 想验的是"build 号必须递增""认领只能有一个赢家"这类和身份无关的事，却因此全挂了。
+//
+// 租户行由 seedBuildTenant 插；这里只种 tenantManifestFor 要求的最小集合，不是全集：
+// google-services 只在已配置时才校验，所以不种；图标底色有默认值。
+func seedBuildIdentity(t *testing.T, db *sql.DB, tenant, slug string) {
+	t.Helper()
+	now := time.Now().UTC()
+	put := func(key string, value any) {
+		t.Helper()
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+			VALUES(?,?,?,1,'test',?)`, tenant, key, raw, now); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+	put(buildConfigKey, buildConfig{
+		RepoDirectory: slug,
+		DefaultGitRef: buildGitRef,
+		Identity: appIdentity{
+			AppName:    "Seeded",
+			Scheme:     "seeded",
+			APIBaseURL: "https://api.seeded.example",
+		},
+	})
+	// 地址是公开信息；私钥在这条路径上用不到（合成身份文件只读地址）
+	put(bootstrapSigningConfigKey, bootstrapSigningKey{
+		KeyID:      "main",
+		PrivateKey: "unused-in-this-path",
+		Address:    "0x9269Ca361b9F0427ac883e89cD5B5fe113BBAD17",
+	})
+	put(releaseAndroidIdentityConfigKey, androidReleaseIdentity{
+		PackageName:  "com.seeded.app",
+		SignerSHA256: "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694",
+	})
 }

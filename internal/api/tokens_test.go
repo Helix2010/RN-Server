@@ -266,7 +266,7 @@ func TestTokenChainProblemMapsEveryKind(t *testing.T) {
 		chain.KindNotAContract:    {400, "TOKEN_NOT_A_CONTRACT"},
 		chain.KindChainMismatch:   {400, "TOKEN_CHAIN_MISMATCH"},
 		chain.KindMetadataInvalid: {400, "TOKEN_METADATA_INVALID"},
-		chain.KindUnavailable:     {502, "TOKEN_CHAIN_UNAVAILABLE"},
+		chain.KindUnavailable:     {424, "TOKEN_CHAIN_UNAVAILABLE"},
 	}
 	for kind, want := range cases {
 		got := tokenChainProblem(&chain.Error{Kind: kind, Err: errors.New("x")})

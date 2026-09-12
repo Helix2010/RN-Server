@@ -470,7 +470,7 @@ func (s *server) createBrandingAssetUpload(c *gin.Context) {
 	if s.cfg.ArtifactUploadMode == "direct" {
 		uploadURL, headers, err = client.PresignPut(c.Request.Context(), key, body.ContentType, body.Size, time.Duration(s.cfg.ArtifactUploadTTL)*time.Second)
 		if err != nil {
-			problem(c, 502, "BRANDING_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
+			problem(c, http.StatusFailedDependency, "BRANDING_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
 			return
 		}
 		requiresCredentials = false
@@ -494,7 +494,7 @@ func (s *server) uploadBrandingAsset(c *gin.Context) {
 	}
 	size, err := s.receiveAndStoreArtifact(c, v.ObjectKey, v.ContentType, v.Size)
 	if err != nil {
-		problem(c, 502, "BRANDING_UPLOAD_FAILED", "Unable to store branding asset")
+		problem(c, http.StatusFailedDependency, "BRANDING_UPLOAD_FAILED", "Unable to store branding asset")
 		return
 	}
 	c.JSON(200, gin.H{"asset": gin.H{"id": v.ID, "token": brandingTokenFromRequest(c), "objectKey": v.ObjectKey, "fileName": v.FileName, "contentType": v.ContentType, "size": size}})

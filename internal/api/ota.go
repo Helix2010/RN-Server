@@ -170,13 +170,13 @@ func (s *server) otaReleaseDetail(c *gin.Context) {
 		}
 		body, getErr := client.Get(c.Request.Context(), manifestKey.String)
 		if getErr != nil {
-			problem(c, http.StatusBadGateway, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
+			problem(c, http.StatusFailedDependency, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
 			return
 		}
 		raw, readErr := io.ReadAll(io.LimitReader(body, 8*1024*1024))
 		_ = body.Close()
 		if readErr != nil || (manifestSHA.Valid && hex.EncodeToString(hashBytes(raw)) != manifestSHA.String) || json.Unmarshal(raw, &manifest) != nil {
-			problem(c, http.StatusBadGateway, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
+			problem(c, http.StatusFailedDependency, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
 			return
 		}
 	}
@@ -247,7 +247,7 @@ func (s *server) createOTAUploader(c *gin.Context) {
 		url, headers, err = client.PresignPut(c.Request.Context(), key, body.ContentType, body.Size, time.Duration(s.cfg.ArtifactUploadTTL)*time.Second)
 		requires = false
 		if err != nil {
-			problem(c, 502, "OTA_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
+			problem(c, http.StatusFailedDependency, "OTA_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
 			return
 		}
 	}
@@ -271,7 +271,7 @@ func (s *server) uploadOTAArtifact(c *gin.Context) {
 	size, err := s.receiveAndStoreArtifact(c, v.ObjectKey, v.ContentType, v.Size)
 	if err != nil {
 		slog.Error("OTA artifact proxy upload failed", "tenant", tenantID(c), "artifactId", v.ID, "objectKey", v.ObjectKey, "expectedSize", v.Size, "error", err)
-		problem(c, 502, "OTA_UPLOAD_FAILED", err.Error())
+		problem(c, http.StatusFailedDependency, "OTA_UPLOAD_FAILED", err.Error())
 		return
 	}
 	c.JSON(200, gin.H{"artifact": gin.H{"id": v.ID, "fileSize": size, "objectKey": v.ObjectKey}})
@@ -363,12 +363,12 @@ func (s *server) saveOTARelease(c *gin.Context) {
 			baseApplicationID, err = s.backfillReleaseApplicationID(ctx, client, source, requestID(c))
 			if errors.Is(err, errBaseReleaseChanged) {
 				// 对象存储里的基线 APK 已不是入库时校验过的那个：不能拿它的身份写回数据库
-				problem(c, 502, "OTA_BASE_RELEASE_CHANGED", "Stored base APK no longer matches the verified release; re-create the base release before publishing OTA")
+				problem(c, http.StatusFailedDependency, "OTA_BASE_RELEASE_CHANGED", "Stored base APK no longer matches the verified release; re-create the base release before publishing OTA")
 				return
 			}
 			if err != nil {
 				slog.Error("unable to read the base APK for application id back-fill", "tenant", tenantID(c), "baseReleaseId", body.BaseReleaseID, "error", err)
-				problem(c, 502, "OTA_BASE_RELEASE_UNREADABLE", "Unable to read the base APK to determine its application id")
+				problem(c, http.StatusFailedDependency, "OTA_BASE_RELEASE_UNREADABLE", "Unable to read the base APK to determine its application id")
 				return
 			}
 		}
@@ -394,7 +394,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	defer os.Remove(tmpPath)
 	if _, err = io.Copy(tmp, io.LimitReader(zipBody, otaMaxPackageBytes+1)); err != nil {
 		tmp.Close()
-		problem(c, 502, "OTA_READ_FAILED", "Unable to read OTA package")
+		problem(c, http.StatusFailedDependency, "OTA_READ_FAILED", "Unable to read OTA package")
 		return
 	}
 	if err = tmp.Close(); err != nil {
@@ -465,18 +465,18 @@ func (s *server) saveOTARelease(c *gin.Context) {
 			continue
 		}
 		if err := s.putZipEntry(ctx, client, baseKey, clean, f); err != nil {
-			problem(c, 502, "OTA_RESOURCE_SAVE_FAILED", "Unable to store OTA resources")
+			problem(c, http.StatusFailedDependency, "OTA_RESOURCE_SAVE_FAILED", "Unable to store OTA resources")
 			return
 		}
 		uploadedKeys = append(uploadedKeys, path.Join(baseKey, clean))
 		storedObject, statErr := client.Stat(ctx, path.Join(baseKey, clean))
 		if statErr != nil {
-			problem(c, 502, "OTA_RESOURCE_SAVE_FAILED", "Unable to verify stored OTA resources")
+			problem(c, http.StatusFailedDependency, "OTA_RESOURCE_SAVE_FAILED", "Unable to verify stored OTA resources")
 			return
 		}
 		if strings.TrimSpace(storedObject.ETag) == "" {
 			// 没有 ETag 就没有"对象被替换"的可检测性：不能带着空值入库，否则下发时只剩大小比对
-			problem(c, 502, "OTA_OBJECT_ETAG_MISSING", "Object storage returned no ETag for a stored OTA resource; the package cannot be pinned")
+			problem(c, http.StatusFailedDependency, "OTA_OBJECT_ETAG_MISSING", "Object storage returned no ETag for a stored OTA resource; the package cannot be pinned")
 			return
 		}
 		objectMetadata[clean] = map[string]any{"size": storedObject.Size, "etag": storedObject.ETag}
@@ -498,7 +498,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	finalManifest, _ := json.Marshal(manifest)
 	manifestKey := path.Join(baseKey, "manifest.json")
 	if err := client.Put(ctx, manifestKey, strings.NewReader(string(finalManifest)), int64(len(finalManifest)), "application/json"); err != nil {
-		problem(c, 502, "OTA_RESOURCE_SAVE_FAILED", "Unable to store OTA manifest")
+		problem(c, http.StatusFailedDependency, "OTA_RESOURCE_SAVE_FAILED", "Unable to store OTA manifest")
 		return
 	}
 	uploadedKeys = append(uploadedKeys, manifestKey)
@@ -1037,7 +1037,7 @@ func (s *server) otaManifest(c *gin.Context) {
 		return
 	}
 	if !key.Valid || !sha.Valid {
-		problem(c, http.StatusBadGateway, "OTA_MANIFEST_INVALID", "OTA manifest is unavailable")
+		problem(c, http.StatusFailedDependency, "OTA_MANIFEST_INVALID", "OTA manifest is unavailable")
 		return
 	}
 	client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
@@ -1047,17 +1047,17 @@ func (s *server) otaManifest(c *gin.Context) {
 	}
 	body, err := client.Get(c.Request.Context(), key.String)
 	if err != nil {
-		problem(c, 502, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
+		problem(c, http.StatusFailedDependency, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
 		return
 	}
 	defer body.Close()
 	raw, err := io.ReadAll(io.LimitReader(body, 8*1024*1024))
 	if err != nil {
-		problem(c, 502, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
+		problem(c, http.StatusFailedDependency, "OTA_MANIFEST_UNAVAILABLE", "Unable to read OTA manifest")
 		return
 	}
 	if hex.EncodeToString(hashBytes(raw)) != sha.String {
-		problem(c, 502, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
+		problem(c, http.StatusFailedDependency, "OTA_MANIFEST_INVALID", "OTA manifest integrity check failed")
 		return
 	}
 	// 生效策略以数据库为准（管理端可事后改）：ETag 要把策略算进去，否则改完客户端拿到 304。
@@ -1074,7 +1074,7 @@ func (s *server) otaManifest(c *gin.Context) {
 		return
 	}
 	if raw, err = applyManifestStrategy(raw, strategy); err != nil {
-		problem(c, 502, "OTA_MANIFEST_INVALID", "OTA manifest is not valid JSON")
+		problem(c, http.StatusFailedDependency, "OTA_MANIFEST_INVALID", "OTA manifest is not valid JSON")
 		return
 	}
 	// 签的是**改写完成后**的字节。对入库原文签名等于把 applyManifestStrategy 那段
@@ -1249,18 +1249,18 @@ func (s *server) otaAsset(c *gin.Context) {
 	case otaObjectRecorded:
 		actual, mismatch, statErr := verifyStoredObject(c.Request.Context(), client, assetKey, record.Size, record.ETag)
 		if statErr != nil {
-			problem(c, 502, "OTA_ASSET_UNAVAILABLE", "Unable to read OTA resource from storage")
+			problem(c, http.StatusFailedDependency, "OTA_ASSET_UNAVAILABLE", "Unable to read OTA resource from storage")
 			return
 		}
 		if mismatch != "" {
 			s.noteObjectChanged("ota", tenantID(c), id, mismatch+":"+relPath, requestID(c), actual, record.Size, record.ETag, map[string]any{"path": relPath})
-			problem(c, 502, "OTA_OBJECT_CHANGED", "OTA resource in storage no longer matches the verified package")
+			problem(c, http.StatusFailedDependency, "OTA_OBJECT_CHANGED", "OTA resource in storage no longer matches the verified package")
 			return
 		}
 	}
 	body, err := client.Get(c.Request.Context(), assetKey)
 	if err != nil {
-		problem(c, 502, "OTA_ASSET_UNAVAILABLE", "Unable to read OTA resource from storage")
+		problem(c, http.StatusFailedDependency, "OTA_ASSET_UNAVAILABLE", "Unable to read OTA resource from storage")
 		return
 	}
 	defer body.Close()

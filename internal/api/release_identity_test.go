@@ -115,7 +115,7 @@ func TestVerifyStoredObjectAgainstAFakeStore(t *testing.T) {
 	}
 	store.statErr = errors.New("storage down")
 	if _, _, err := verifyStoredObject(ctx, store, "tenants/t1/releases/rel_1.apk", 18, "etag-verified"); err == nil {
-		t.Fatal("storage failure must surface an error so the handler answers 502, never serves")
+		t.Fatal("storage failure must surface an error so the handler answers 424, never serves")
 	}
 }
 

@@ -416,7 +416,7 @@ func tokenChainProblem(err error) *tokenError {
 	case chain.KindMetadataInvalid:
 		return &tokenError{status: http.StatusBadRequest, code: "TOKEN_METADATA_INVALID", detail: "链上返回的 symbol 或 decimals 不合法，这个合约不是规范的 ERC-20"}
 	default:
-		return &tokenError{status: http.StatusBadGateway, code: "TOKEN_CHAIN_UNAVAILABLE", detail: "链上节点暂时无法访问，请稍后重试"}
+		return &tokenError{status: http.StatusFailedDependency, code: "TOKEN_CHAIN_UNAVAILABLE", detail: "链上节点暂时无法访问，请稍后重试"}
 	}
 }
 

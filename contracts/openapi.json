@@ -290,7 +290,7 @@
           "500": {
             "description": "RELEASE_METADATA_INVALID (base release file_metadata is invalid)"
           },
-          "502": {
+          "424": {
             "description": "OTA_BASE_RELEASE_UNREADABLE (base APK unreadable, oversized, or without stored sha256/size), OTA_BASE_RELEASE_CHANGED (stored base APK no longer matches its verified sha256/size), OTA_RESOURCE_SAVE_FAILED, OTA_OBJECT_ETAG_MISSING (object storage returned no ETag for a resource)"
           },
           "503": {
@@ -449,7 +449,7 @@
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored release.android pin is invalid), RELEASE_CREATE_FAILED"
           },
-          "502": {
+          "424": {
             "description": "RELEASE_READ_FAILED, RELEASE_OBJECT_ETAG_MISSING (object storage returned no ETag; the release cannot be pinned)"
           },
           "503": {
@@ -831,7 +831,7 @@
           "500": {
             "description": "OTA_OBJECT_METADATA_INVALID: stored object metadata is not valid; OTA_OBJECT_METADATA_INVALID (object_metadata invalid, or a recorded entry without an ETag)"
           },
-          "502": {
+          "424": {
             "description": "OTA_ASSET_UNAVAILABLE (storage unreadable) or OTA_OBJECT_CHANGED (object in storage no longer matches the verified package)"
           },
           "503": {
@@ -952,7 +952,7 @@
           "404": {
             "description": "Published release not found; a canary release is 404 for every device outside its audience, so knowing the release id is not enough"
           },
-          "502": {
+          "424": {
             "description": "RELEASE_DOWNLOAD_FAILED (storage unreadable) or RELEASE_OBJECT_CHANGED (object in storage no longer matches the verified artifact)"
           },
           "503": {
@@ -1004,7 +1004,7 @@
           "400": {
             "description": "INVALID_TOKEN_REQUEST (chain, address, displayDecimals, reason or expectedVersion invalid), TOKEN_NOT_A_CONTRACT (no code at the address), TOKEN_CHAIN_MISMATCH (platform endpoint reports another chain) or TOKEN_METADATA_INVALID (symbol/decimals on chain are not acceptable)"
           },
-          "502": {
+          "424": {
             "description": "TOKEN_CHAIN_UNAVAILABLE: the platform endpoint timed out or failed"
           },
           "409": {
@@ -1032,7 +1032,7 @@
           "400": {
             "description": "chain 不受支持、contractAddress 不是合法地址、地址上没有合约代码（TOKEN_NOT_A_CONTRACT）、端点链 ID 不符（TOKEN_CHAIN_MISMATCH）或链上元数据不合法（TOKEN_METADATA_INVALID）"
           },
-          "502": {
+          "424": {
             "description": "TOKEN_CHAIN_UNAVAILABLE: the platform endpoint timed out or failed"
           }
         }
@@ -1147,7 +1147,7 @@
           "409": {
             "description": "CONFIG_VERSION_CONFLICT: expectedVersion does not match metadata.databaseVersion"
           },
-          "502": {
+          "424": {
             "description": "TOKEN_CHAIN_UNAVAILABLE"
           }
         }
@@ -1191,7 +1191,7 @@
           "400": {
             "description": "INVALID_SERVICES_CONFIG"
           },
-          "502": {
+          "424": {
             "description": "PREDICT_PROBE_FAILED: gamma-api.{domain} unreachable, non-200 or not JSON"
           }
         }

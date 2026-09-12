@@ -753,13 +753,13 @@ func (s *server) publishLocalization(c *gin.Context) {
 		objectKey := languageResourceObjectKey(objectPrefix, tenantID(c), code, version)
 		if err := client.Put(c.Request.Context(), objectKey, bytes.NewReader(raw), int64(len(raw)), "application/json; charset=utf-8"); err != nil {
 			s.markLocalizationPublishFailure(c.Request.Context(), tenantID(c), current, code, err.Error())
-			problem(c, 502, "LOCALIZATION_UPLOAD_FAILED", "Unable to upload localization document")
+			problem(c, http.StatusFailedDependency, "LOCALIZATION_UPLOAD_FAILED", "Unable to upload localization document")
 			return
 		}
 		size, _, err := client.Head(c.Request.Context(), objectKey)
 		if err != nil || size != int64(len(raw)) {
 			s.markLocalizationPublishFailure(c.Request.Context(), tenantID(c), current, code, "uploaded localization resource could not be verified")
-			problem(c, 502, "LOCALIZATION_UPLOAD_FAILED", "Uploaded localization document could not be verified")
+			problem(c, http.StatusFailedDependency, "LOCALIZATION_UPLOAD_FAILED", "Uploaded localization document could not be verified")
 			return
 		}
 		resources[code] = languageResource{Version: version, ObjectKey: objectKey, FileURL: "/v1/mobile/languages/" + code + "/document?v=" + version, SHA256: hex.EncodeToString(hash[:]), Size: size, PublishedAt: iso(time.Now().UTC())}
@@ -1011,7 +1011,7 @@ func (s *server) mobileLanguageDocument(c *gin.Context) {
 	}
 	body, err := client.Get(c.Request.Context(), resource.ObjectKey)
 	if err != nil {
-		problem(c, 502, "LANGUAGE_RESOURCE_READ_FAILED", "Unable to read language resource")
+		problem(c, http.StatusFailedDependency, "LANGUAGE_RESOURCE_READ_FAILED", "Unable to read language resource")
 		return
 	}
 	defer body.Close()

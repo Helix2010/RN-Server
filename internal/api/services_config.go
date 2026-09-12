@@ -275,12 +275,12 @@ func (s *server) probePredictService(c *gin.Context) {
 	request.Header.Set("Accept", "application/json")
 	response, err := predictProbeHTTP.Do(request)
 	if err != nil {
-		problem(c, 502, "PREDICT_PROBE_FAILED", gammaBase(predict)+" is unreachable: "+err.Error())
+		problem(c, http.StatusFailedDependency, "PREDICT_PROBE_FAILED", gammaBase(predict)+" is unreachable: "+err.Error())
 		return
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		problem(c, 502, "PREDICT_PROBE_FAILED", fmt.Sprintf("%s answered HTTP %d for /public-info", gammaBase(predict), response.StatusCode))
+		problem(c, http.StatusFailedDependency, "PREDICT_PROBE_FAILED", fmt.Sprintf("%s answered HTTP %d for /public-info", gammaBase(predict), response.StatusCode))
 		return
 	}
 	var info struct {
@@ -294,7 +294,7 @@ func (s *server) probePredictService(c *gin.Context) {
 		} `json:"brand"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&info); err != nil {
-		problem(c, 502, "PREDICT_PROBE_FAILED", "public-info is not valid JSON")
+		problem(c, http.StatusFailedDependency, "PREDICT_PROBE_FAILED", "public-info is not valid JSON")
 		return
 	}
 	problems := []string{}

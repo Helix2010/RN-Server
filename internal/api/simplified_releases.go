@@ -113,7 +113,7 @@ func (s *server) createReleaseArtifactUpload(c *gin.Context) {
 	if s.cfg.ArtifactUploadMode == "direct" {
 		uploadURL, headers, err = client.PresignPut(c.Request.Context(), key, body.ContentType, body.Size, time.Duration(s.cfg.ArtifactUploadTTL)*time.Second)
 		if err != nil {
-			problem(c, http.StatusBadGateway, "ARTIFACT_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
+			problem(c, http.StatusFailedDependency, "ARTIFACT_UPLOAD_CREATE_FAILED", "Unable to create storage upload URL")
 			return
 		}
 		requiresCredentials = false
@@ -138,7 +138,7 @@ func (s *server) uploadReleaseArtifact(c *gin.Context) {
 	storedSize, err := s.receiveAndStoreArtifact(c, value.ObjectKey, value.ContentType, value.Size)
 	if err != nil {
 		slog.Error("release artifact proxy upload failed", "tenant", tenantID(c), "artifactId", value.ID, "objectKey", value.ObjectKey, "expectedSize", value.Size, "error", err)
-		problem(c, http.StatusBadGateway, "RELEASE_UPLOAD_FAILED", err.Error())
+		problem(c, http.StatusFailedDependency, "RELEASE_UPLOAD_FAILED", err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"artifact": gin.H{"id": value.ID, "fileSize": storedSize, "objectKey": value.ObjectKey}})
@@ -251,7 +251,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	}
 	if strings.TrimSpace(stored.ETag) == "" {
 		// 没有 ETag 就没有"对象被替换"的可检测性：不能带着空值入库，否则下载时只剩大小比对
-		problem(c, http.StatusBadGateway, "RELEASE_OBJECT_ETAG_MISSING", "Object storage returned no ETag for the uploaded artifact; the release cannot be pinned")
+		problem(c, http.StatusFailedDependency, "RELEASE_OBJECT_ETAG_MISSING", "Object storage returned no ETag for the uploaded artifact; the release cannot be pinned")
 		return
 	}
 	size := stored.Size
@@ -265,7 +265,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	objectBody, err := client.Get(ctx, artifact.ObjectKey)
 	if err != nil {
 		_ = temporary.Close()
-		problem(c, http.StatusBadGateway, "RELEASE_READ_FAILED", "Unable to read uploaded release")
+		problem(c, http.StatusFailedDependency, "RELEASE_READ_FAILED", "Unable to read uploaded release")
 		return
 	}
 	hash := sha256.New()
@@ -273,7 +273,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	_ = objectBody.Close()
 	closeErr := temporary.Close()
 	if copyErr != nil || closeErr != nil || written != size {
-		problem(c, http.StatusBadGateway, "RELEASE_READ_FAILED", "Unable to read the complete release")
+		problem(c, http.StatusFailedDependency, "RELEASE_READ_FAILED", "Unable to read the complete release")
 		return
 	}
 	// objectEtag 是校验时对象存储给的 ETag（objectstore.Stat，已去引号）；公开下载前再 Stat 一次比对，
@@ -638,12 +638,12 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	}
 	actual, mismatch, statErr := verifyStoredObject(c.Request.Context(), client, key, size, storedEtag)
 	if statErr != nil {
-		problem(c, 502, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
+		problem(c, http.StatusFailedDependency, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
 		return
 	}
 	if mismatch != "" {
 		s.noteObjectChanged("release", tenantID(c), c.Param("id"), mismatch, requestID(c), actual, size, storedEtag, nil)
-		problem(c, 502, "RELEASE_OBJECT_CHANGED", "Release package in storage no longer matches the verified artifact")
+		problem(c, http.StatusFailedDependency, "RELEASE_OBJECT_CHANGED", "Release package in storage no longer matches the verified artifact")
 		return
 	}
 	rng, hasRange, satisfiable := parseByteRange(c.GetHeader("Range"), size)
@@ -664,7 +664,7 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 		body, err = client.Get(c.Request.Context(), key)
 	}
 	if err != nil {
-		problem(c, 502, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
+		problem(c, http.StatusFailedDependency, "RELEASE_DOWNLOAD_FAILED", "Unable to read release package")
 		return
 	}
 	defer body.Close()

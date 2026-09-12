@@ -99,7 +99,7 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 	if !intent.KeepObjects && manifestKey.Valid && strings.TrimSpace(manifestKey.String) != "" {
 		client, _, clientErr := s.storageClientForTenant(ctx, tenantID(c))
 		if clientErr != nil {
-			problem(c, http.StatusBadGateway, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
+			problem(c, http.StatusFailedDependency, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
 			return
 		}
 		prefix = path.Dir(manifestKey.String) + "/"
@@ -108,7 +108,7 @@ func (s *server) purgeOTARelease(c *gin.Context) {
 			// 最常见的原因是存储凭据没有 List 权限，错误必须落日志，否则排查
 			// 只能看到一个 502。
 			slog.Error("unable to list the stored OTA objects", "tenant", tenantID(c), "otaReleaseId", id, "prefix", prefix, "error", err)
-			problem(c, http.StatusBadGateway, "STORAGE_LIST_FAILED", "Unable to list the stored OTA objects")
+			problem(c, http.StatusFailedDependency, "STORAGE_LIST_FAILED", "Unable to list the stored OTA objects")
 			return
 		}
 		deleteStoredObjects = func() { failed = deleteObjects(ctx, client, prefix, keys) }
@@ -185,7 +185,7 @@ func (s *server) purgeRelease(c *gin.Context) {
 	if !intent.KeepObjects && key != "" {
 		client, _, clientErr := s.storageClientForTenant(ctx, tenantID(c))
 		if clientErr != nil {
-			problem(c, http.StatusBadGateway, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
+			problem(c, http.StatusFailedDependency, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
 			return
 		}
 		deleteStoredObjects = func() { failed = deleteObjects(ctx, client, key, []string{key}) }

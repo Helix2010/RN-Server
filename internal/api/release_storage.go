@@ -189,7 +189,7 @@ func (s *server) testReleaseStorage(c *gin.Context) {
 	defer cancel()
 	if err := client.Test(ctx); err != nil {
 		slog.Error("release storage connectivity test failed", "provider", record.Value.Provider, "endpoint", record.Value.Endpoint, "bucket", record.Value.Bucket, "error", err)
-		problem(c, http.StatusBadGateway, "STORAGE_TEST_FAILED", "Unable to access the configured release storage bucket")
+		problem(c, http.StatusFailedDependency, "STORAGE_TEST_FAILED", "Unable to access the configured release storage bucket")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": record.Value.Bucket, "checkedAt": iso(time.Now())})
