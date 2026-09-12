@@ -1912,7 +1912,7 @@
     "/v1/admin/build-config": {
       "get": {
         "summary": "Tenant build configuration",
-        "description": "Returns {repoDirectory, defaultGitRef, tenantSlug, version}. repoDirectory is the directory under tenants/ in the app repository, which is a different namespace from this platform's tenant slug: production runs slug Predict.Kim against repository directory anyfun. Falls back to the slug when unset.",
+        "description": "Returns {repoDirectory, defaultGitRef, googleServicesConfigured, googleServicesPackages, tenantSlug, version, identity, identityConfigured}. repoDirectory is the directory under tenants/ in the app repository, which is a different namespace from this platform's tenant slug: production runs slug Predict.Kim against repository directory anyfun. Falls back to the slug when unset. googleServicesPackages lists the Android packages the stored google-services.json registers, so the console can say which app that file actually belongs to.",
         "responses": {
           "200": {
             "description": "Build configuration"
@@ -1940,13 +1940,13 @@
             "description": "Saved"
           },
           "400": {
-            "description": "INVALID_BUILD_CONFIG"
+            "description": "INVALID_BUILD_CONFIG, INVALID_APP_IDENTITY, SECRET_IN_BUILD_CONFIG or GOOGLE_SERVICES_PACKAGE_MISMATCH"
           },
           "401": {
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_CONFIG"
+            "description": "STALE_BUILD_CONFIG or APP_IDENTITY_CHANGE"
           }
         }
       }
@@ -2193,6 +2193,39 @@
           },
           "422": {
             "description": "RELEASE_FILE_INVALID, RELEASE_IDENTITY_MISMATCH"
+          }
+        }
+      }
+    },
+    "/v1/admin/build-keystore/generate": {
+      "post": {
+        "summary": "Generate the Android signing keystore on the server",
+        "description": "Generates an RSA key and a self-signed certificate, seals them with the caller's passphrase, stores the sealed box, and pins packageName plus the certificate SHA-256 as release.android — all in one transaction. Returns the plaintext keystore and its generated store password once so the operator can back them up; they cannot be retrieved again. Both optimistic locks are checked before the key is generated, because generating one takes seconds and reporting the conflict afterwards only makes the operator repeat it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildKeystoreGenerate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Generated. Body carries keystoreBase64, fileName, storePassword, keyAlias, keystoreSha256, signerSha256, packageName, certificateNotAfter, version and releaseIdentityVersion. keystoreBase64 and storePassword appear only here."
+          },
+          "400": {
+            "description": "INVALID_BUILD_KEYSTORE, INVALID_KEYSTORE_PARAMETERS, INVALID_RELEASE_IDENTITY or WEAK_SEAL_PASSPHRASE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_BUILD_KEYSTORE or STALE_RELEASE_IDENTITY"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_SAVE_FAILED"
           }
         }
       }
@@ -3193,7 +3226,8 @@
         "properties": {
           "repoDirectory": {
             "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+            "description": "Directory under tenants/ in the app repository. Optional in effect: an empty value falls back to the tenant slug, which is what the console sends when the operator leaves the field blank."
           },
           "defaultGitRef": {
             "type": "string",
@@ -3210,6 +3244,18 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/AppIdentityWrite"
+          },
+          "googleServicesJson": {
+            "type": "string",
+            "format": "byte",
+            "description": "base64 of google-services.json. Not a secret — the same bytes are compiled into every APK — but per tenant. The server refuses a Firebase service-account credential (it carries private_key and would be shipped to every user), and refuses a file whose client[].client_info.android_client_info.package_name does not include this tenant's pinned Android package: that mismatch builds and installs cleanly and only shows up as push silently not working."
+          },
+          "acknowledgeIdentityChange": {
+            "type": "boolean",
+            "description": "Required when the write changes the deep link scheme."
           }
         }
       },
@@ -3296,6 +3342,127 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "signerSha256": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "description": "Certificate SHA-256 of the key inside the sealed bundle, computed by `build-keystore`. Present it together with packageName and releaseIdentityExpectedVersion and the server writes release.android in the same transaction, so there is never a window where the keystore has been rotated but the pinned fingerprint still names the old certificate."
+          },
+          "packageName": {
+            "type": "string",
+            "description": "Android applicationId to pin alongside signerSha256. Required whenever signerSha256 is present."
+          },
+          "releaseIdentityExpectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock for release.android. Required whenever packageName or signerSha256 is present; supplying only some of the three is refused rather than silently ignored."
+          }
+        }
+      },
+      "BuildKeystoreGenerate": {
+        "type": "object",
+        "description": "Generate an Android signing key on the server. This does NOT weaken the property that the server cannot open a stored keystore: the generated key is sealed with sealPassphrase before it is stored, and the server keeps only that sealed box. The difference is confined to the moment of generation, when the plaintext private key exists in the server process. The plaintext keystore and its store password are returned exactly once, in this response, and are never persisted or logged. Operators who do not accept the transient exposure use `build-keystore create` instead.",
+        "required": [
+          "packageName",
+          "commonName",
+          "keyAlias",
+          "keySize",
+          "validityYears",
+          "sealPassphrase",
+          "expectedVersion",
+          "releaseIdentityExpectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "packageName": {
+            "type": "string",
+            "description": "Android applicationId. Pinned as release.android in the same transaction."
+          },
+          "commonName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Certificate CN. Android never validates it; it is what apksigner and keytool print."
+          },
+          "organization": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "country": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 2
+          },
+          "keyAlias": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+            "description": "Passed to Gradle as ANDROID_RELEASE_KEY_ALIAS, and written as the PKCS#12 friendlyName so keytool reports the same alias."
+          },
+          "keySize": {
+            "type": "integer",
+            "enum": [
+              2048,
+              4096
+            ]
+          },
+          "validityYears": {
+            "type": "integer",
+            "minimum": 25,
+            "maximum": 60,
+            "description": "Once the certificate expires this key can no longer sign an upgrade that installs over the existing app, and direct distribution has no store to warn about it."
+          },
+          "sealPassphrase": {
+            "type": "string",
+            "minLength": 12,
+            "description": "Seals the generated key. The build machine must carry the same value in BUILD_KEYSTORE_PASSPHRASE."
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock for build.keystore."
+          },
+          "releaseIdentityExpectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Optimistic lock for release.android."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AppIdentityWrite": {
+        "type": "object",
+        "description": "The app identity fields a tenant maintains. androidPackage is deliberately absent: it lives in release.android, which is the same record the server uses to admit an uploaded APK. Storing it here too would be two truths that can disagree, and the disagreement only surfaces when the artifact is rejected at upload.",
+        "required": [
+          "appName",
+          "apiBaseUrl"
+        ],
+        "properties": {
+          "appName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "scheme": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9.+-]{1,31}$",
+            "description": "Deep link scheme. Changing it breaks links already handed out, so the write must carry acknowledgeIdentityChange."
+          },
+          "apiBaseUrl": {
+            "type": "string",
+            "format": "uri",
+            "description": "https origin with no path. http would put the whole config on a plaintext link, and the client's trust in that config comes from a signature, which cannot tell you that you never reached us."
+          },
+          "iconBackgroundColor": {
+            "type": "string",
+            "pattern": "^#[0-9A-Fa-f]{6}$"
           }
         }
       }

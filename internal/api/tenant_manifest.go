@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -91,16 +92,16 @@ func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg build
 
 	identity := cfg.Identity
 	if strings.TrimSpace(cfg.RepoDirectory) == "" {
-		add("repoDirectory", "打包配置")
+		add("repoDirectory", "Android 打包与签名 → 构建位置")
 	}
 	if strings.TrimSpace(identity.AppName) == "" {
-		add("appName", "打包配置 → 应用身份")
+		add("appName", "Android 打包与签名 → App 参数")
 	}
 	if strings.TrimSpace(identity.Scheme) == "" {
-		add("scheme", "打包配置 → 应用身份")
+		add("scheme", "Android 打包与签名 → App 参数")
 	}
 	if strings.TrimSpace(identity.APIBaseURL) == "" {
-		add("apiBaseUrl", "打包配置 → 应用身份")
+		add("apiBaseUrl", "Android 打包与签名 → App 参数")
 	}
 
 	// 客户端自 1.3.11 起强制验签。这把没配，包打出来照样成功，装上去却停在
@@ -114,17 +115,30 @@ func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg build
 	}
 
 	// 包名和签名指纹都取自发布身份——那是服务端校验上传的 APK 用的同一份记录。
-	// 在打包配置里再存一份包名，就有了两份可以对不上的真相：配歪了构建照样成功，
+	// 在 App 参数里再存一份包名，就有了两份可以对不上的真相：配歪了构建照样成功，
 	// 产物却在入库那一步被拒，而报错看不出是两个页面填了不同的包名。
 	release, err := s.androidReleaseIdentityRecord(ctx, tenant)
 	if err != nil {
 		return tenantManifest{}, err
 	}
 	if release == nil || strings.TrimSpace(release.Value.PackageName) == "" {
-		add("androidPackage", "打包与发布 → Android 签名与身份")
+		add("androidPackage", "Android 打包与签名 → 正式包身份")
 	}
 	if release == nil || strings.TrimSpace(release.Value.SignerSHA256) == "" {
-		add("signerSha256", "打包与发布 → Android 签名与身份")
+		add("signerSha256", "Android 打包与签名 → 签名密钥")
+	}
+
+	// google-services.json 的包名要和这个租户的包名一致。这条在保存 App 参数时已经
+	// 拦过一次，这里再拦一次是因为两件事可以按任意顺序配：先传文件、后登记包名，
+	// 那次保存时还没有包名可比。放过去的表现是推送在用户手机上静默不工作。
+	if encoded := strings.TrimSpace(cfg.GoogleServicesJSON); encoded != "" && len(missing) == 0 {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return tenantManifest{}, fmt.Errorf("stored googleServicesJson is not base64: %w", err)
+		}
+		if detail := googleServicesPackageProblem(decoded, strings.TrimSpace(release.Value.PackageName)); detail != "" {
+			add("google-services.json", detail+"；到「Android 打包与签名」重新上传")
+		}
 	}
 
 	if len(missing) > 0 {

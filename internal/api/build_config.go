@@ -135,8 +135,10 @@ func (s *server) getBuildConfig(c *gin.Context) {
 		"defaultGitRef": cfg.DefaultGitRef,
 		// 只报有没有配、多大，不把整段 base64 塞进每一次列表请求
 		"googleServicesConfigured": cfg.GoogleServicesJSON != "",
-		"tenantSlug":               slug,
-		"version":                  version,
+		// 界面上要能说出"现在这份文件是给哪个包名的"。只回包名，不回整段 base64
+		"googleServicesPackages": storedGoogleServicesPackages(cfg.GoogleServicesJSON),
+		"tenantSlug":             slug,
+		"version":                version,
 		"identity": gin.H{
 			"appName":             cfg.Identity.AppName,
 			"scheme":              cfg.Identity.Scheme,
@@ -170,10 +172,27 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "repoDirectory, expectedVersion, reason and confirm=true are required")
 		return
 	}
+	// slug 是仓库目录的默认值，读取那一侧本来就这么回退（buildConfigFor）。写入这一侧
+	// 原先要求必填，于是"默认值"只对从没保存过的租户成立——存过一次之后就必须有人
+	// 手抄一个系统已经知道的名字。默认值由服务端声明，前端只负责把它显示出来。
+	slug, err := s.tenantSlug(c.Request.Context(), tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_SAVE_FAILED", "Unable to resolve this tenant")
+		return
+	}
 	directory := strings.TrimSpace(body.RepoDirectory)
+	if directory == "" {
+		directory = strings.TrimSpace(slug)
+	}
 	// 这个值会被代理拼进文件路径。放开一点点就等于给一条"跳出 tenants/ 目录"的路。
 	if !repoDirectoryPattern.MatchString(directory) || strings.Contains(directory, "..") {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "repoDirectory must be a plain directory name under tenants/")
+		detail := "repoDirectory must be a plain directory name under tenants/"
+		if strings.TrimSpace(body.RepoDirectory) == "" {
+			// 留空是允许的，但这个租户的 slug 本身当不了目录名。说清楚是哪一个不行，
+			// 否则运维会盯着一个自己没填的字段看
+			detail = "repoDirectory was left empty and this tenant's slug (" + slug + ") is not usable as a directory name under tenants/; set it explicitly"
+		}
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", detail)
 		return
 	}
 	if err := body.Identity.validate(); err != nil {
@@ -194,6 +213,16 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		if err := rejectServiceAccountJSON(decoded); err != nil {
 			problem(c, http.StatusBadRequest, "SECRET_IN_BUILD_CONFIG", err.Error())
 			return
+		}
+		// 包名一致性在这里就挡住。放过去的话，唯一的表现是推送在用户手机上静默
+		// 不工作——没有任何一步会报错，而排查会从推送服务一路查到证书。
+		// 还没登记包名的租户不拦：这一页可以先配 google-services 再配身份，
+		// 那种顺序下的错漏由排队时的同一条检查兜底（tenantManifestFor）。
+		if release, err := s.androidReleaseIdentityRecord(c.Request.Context(), tenantID(c)); err == nil && release != nil {
+			if detail := googleServicesPackageProblem(decoded, release.Value.PackageName); detail != "" {
+				problem(c, http.StatusBadRequest, "GOOGLE_SERVICES_PACKAGE_MISMATCH", detail)
+				return
+			}
 		}
 	}
 	value, _ := json.Marshal(buildConfig{
@@ -267,6 +296,8 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		"repoDirectory":            directory,
 		"defaultGitRef":            buildGitRef,
 		"googleServicesConfigured": googleServices != "",
+		"googleServicesPackages":   storedGoogleServicesPackages(googleServices),
+		"tenantSlug":               slug,
 		"identity": gin.H{
 			"appName":             body.Identity.AppName,
 			"scheme":              body.Identity.Scheme,
@@ -304,6 +335,70 @@ func rejectServiceAccountJSON(raw []byte) error {
 		return errors.New("这不像 google-services.json：顶层没有 project_info。请从 Firebase 控制台的「项目设置 → 你的应用 → Android」下载")
 	}
 	return nil
+}
+
+// googleServicesFile 只声明我们要看的那一部分。这份文件里还有一堆 Firebase 自己的
+// 字段，逐个建模没有意义，也会让"多了一个新字段"变成解析失败。
+type googleServicesFile struct {
+	Client []struct {
+		ClientInfo struct {
+			AndroidClientInfo struct {
+				PackageName string `json:"package_name"`
+			} `json:"android_client_info"`
+		} `json:"client_info"`
+	} `json:"client"`
+}
+
+// googleServicesPackages 列出这份文件为哪些 Android 包名注册过。
+//
+// 一个 Firebase 项目下可以有多个 Android 应用（正式、测试、不同租户），下载下来的
+// 文件里 client 是个数组，每一项对应一个包名。所以"文件对不对"这个问题的答案是
+// "它的 client 里有没有我们这个包名"，不是"它的第一个 client 是不是我们"。
+func googleServicesPackages(raw []byte) []string {
+	var parsed googleServicesFile
+	if json.Unmarshal(raw, &parsed) != nil {
+		return nil
+	}
+	var packages []string
+	for _, client := range parsed.Client {
+		if name := strings.TrimSpace(client.ClientInfo.AndroidClientInfo.PackageName); name != "" {
+			packages = append(packages, name)
+		}
+	}
+	return packages
+}
+
+// googleServicesPackageProblem 检查这份文件是不是这个包名的。空串表示没问题。
+//
+// 这是这条链路上最沉默的一种配错：包名对不上，构建照样成功，APK 照样能装，
+// 只有推送在运行时静默失效——Firebase SDK 初始化时发现 applicationId 与文件里
+// 的不符，就不注册。没有任何一步会报错。
+func googleServicesPackageProblem(raw []byte, packageName string) string {
+	packages := googleServicesPackages(raw)
+	if len(packages) == 0 {
+		return "这份 google-services.json 里没有任何 Android 应用（client[].client_info.android_client_info.package_name）"
+	}
+	for _, name := range packages {
+		if name == packageName {
+			return ""
+		}
+	}
+	return "这份 google-services.json 是给 " + strings.Join(packages, "、") + " 的，本租户的包名是 " + packageName +
+		"。请到 Firebase 控制台用这个包名注册一个 Android 应用，再下载它的 google-services.json"
+}
+
+// storedGoogleServicesPackages 是 googleServicesPackages 的 base64 入口，给两个
+// 接口回参用。解不开就当没有——存进来的时候校验过，这里不该再报错。
+func storedGoogleServicesPackages(encoded string) []string {
+	packages := []string{}
+	if encoded == "" {
+		return packages
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return packages
+	}
+	return append(packages, googleServicesPackages(decoded)...)
 }
 
 // identityBreakingChanges 只列真正会让已装设备升不上去、或者会改变这个 App 认领

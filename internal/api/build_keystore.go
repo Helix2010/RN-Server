@@ -100,6 +100,12 @@ func (s *server) getBuildKeystore(c *gin.Context) {
 	})
 }
 
+// saveBuildKeystore 收下一个离线封好的盒子。
+//
+// 可以顺带把发布身份的签名指纹一起写了：指纹本来就是这把 keystore 里那张证书的
+// 摘要，`build-keystore seal` 算得出来。让人再跑一次 keytool 把 64 位十六进制抄
+// 进另一个表单，抄错的表现是构建成功、产物却在入库那一步被 SIGNER_MISMATCH 拒。
+// 两条写在一个事务里，不留"密钥换了、pin 还是旧的"这个中间态。
 func (s *server) saveBuildKeystore(c *gin.Context) {
 	var body struct {
 		Sealed          buildkeystore.Sealed `json:"sealed"`
@@ -108,8 +114,17 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		ExpectedVersion int                  `json:"expectedVersion"`
 		Reason          string               `json:"reason"`
 		Confirm         bool                 `json:"confirm"`
+		// 下面三项一起出现或者一起不出现。带上就同时更新发布身份的指纹。
+		SignerSHA256                   string `json:"signerSha256"`
+		PackageName                    string `json:"packageName"`
+		ReleaseIdentityExpectedVersion *int   `json:"releaseIdentityExpectedVersion"`
 	}
-	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
+	if err := decode(c, &body); err != nil {
+		problem(c, http.StatusBadRequest, "MALFORMED_BUILD_KEYSTORE",
+			"Request body was rejected: "+err.Error()+"。如果提到 unknown field，多半是浏览器里还开着旧版控制台，强制刷新一次。")
+		return
+	}
+	if !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", "sealed, keyAlias, keystoreSha256, expectedVersion, reason and confirm=true are required")
 		return
 	}
@@ -133,6 +148,36 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Storage master key is unavailable")
 		return
 	}
+
+	// 要不要顺带写发布身份。三项要么都给、要么都不给——只给一半的请求多半是
+	// 调用方拼错了，静默忽略会让人以为指纹已经更新了
+	pinIdentity := strings.TrimSpace(body.SignerSHA256) != "" || strings.TrimSpace(body.PackageName) != "" || body.ReleaseIdentityExpectedVersion != nil
+	var identity androidReleaseIdentity
+	releaseVersion := 0
+	if pinIdentity {
+		if body.ReleaseIdentityExpectedVersion == nil || *body.ReleaseIdentityExpectedVersion < 0 {
+			problem(c, http.StatusBadRequest, "INVALID_RELEASE_IDENTITY", "releaseIdentityExpectedVersion is required when packageName or signerSha256 is present")
+			return
+		}
+		identity = normalizeAndroidReleaseIdentity(androidReleaseIdentity{PackageName: body.PackageName, SignerSHA256: body.SignerSHA256})
+		if err := validateAndroidReleaseIdentity(identity); err != nil {
+			problem(c, http.StatusBadRequest, "INVALID_RELEASE_IDENTITY", err.Error())
+			return
+		}
+		current, err := s.androidReleaseIdentityRecord(c.Request.Context(), tenantID(c))
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.android configuration is invalid")
+			return
+		}
+		if current != nil {
+			releaseVersion = current.Version
+		}
+		if releaseVersion != *body.ReleaseIdentityExpectedVersion {
+			problem(c, http.StatusConflict, "STALE_RELEASE_IDENTITY", "Release identity changed; refresh and retry")
+			return
+		}
+	}
+
 	sealedJSON, err := json.Marshal(body.Sealed)
 	if err != nil {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", "sealed is not serializable")
@@ -165,29 +210,49 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusConflict, "STALE_BUILD_KEYSTORE", "Keystore changed; refresh and retry")
 		return
 	}
-	var result sql.Result
 	newVersion := current + 1
-	if current == 0 {
-		result, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) SELECT ?,?,?,1,?,? WHERE NOT EXISTS (SELECT 1 FROM app_configs WHERE tenant_id=? AND config_key=?)`,
-			tenantID(c), buildKeystoreConfigKey, value, actor(c), now, tenantID(c), buildKeystoreConfigKey)
-	} else {
-		result, err = tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key=? AND version=?`,
-			value, actor(c), now, tenantID(c), buildKeystoreConfigKey, current)
-	}
-	if err != nil {
+	if affected, err := upsertAppConfig(c, tx, buildKeystoreConfigKey, value, current, now); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to save the sealed keystore")
 		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	} else if affected != 1 {
 		problem(c, http.StatusConflict, "STALE_BUILD_KEYSTORE", "Keystore changed; refresh and retry")
 		return
 	}
 	// 审计记别名与 keystore 指纹，绝不记盒子内容
 	event := newAudit(tenantID(c), actor(c), "build_keystore_update", "app-config", buildKeystoreConfigKey, strings.TrimSpace(body.Reason), requestID(c),
 		map[string]any{"keyAlias": alias, "keystoreSha256": digest, "databaseVersion": newVersion})
-	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
+	if insertAudit(c.Request.Context(), tx, event) != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to save the sealed keystore")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"configured": true, "keyAlias": alias, "keystoreSha256": digest, "version": newVersion})
+
+	// 回参与 GET 同形。管理端两处用的是同一个 schema，少两个键就会在解析响应时
+	// 失败——服务端明明存好了，界面却报错，而错误信息说的是"字段类型不对"
+	response := gin.H{
+		"configured": true, "keyAlias": alias, "keystoreSha256": digest,
+		"version": newVersion, "updatedBy": nullableString(actor(c)), "updatedAt": nullableTime(now),
+	}
+	if pinIdentity {
+		identityValue, _ := json.Marshal(identity)
+		newReleaseVersion := releaseVersion + 1
+		if affected, err := upsertAppConfig(c, tx, releaseAndroidIdentityConfigKey, identityValue, releaseVersion, now); err != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_SAVE_FAILED", "Unable to save release identity")
+			return
+		} else if affected != 1 {
+			problem(c, http.StatusConflict, "STALE_RELEASE_IDENTITY", "Release identity changed; refresh and retry")
+			return
+		}
+		identityEvent := newAudit(tenantID(c), actor(c), "release_identity_update", "app-config", releaseAndroidIdentityConfigKey, strings.TrimSpace(body.Reason), requestID(c),
+			map[string]any{"packageName": identity.PackageName, "signerSha256": identity.SignerSHA256, "source": "build_keystore_update", "databaseVersion": newReleaseVersion})
+		if insertAudit(c.Request.Context(), tx, identityEvent) != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_SAVE_FAILED", "Unable to save release identity")
+			return
+		}
+		response["releaseIdentityVersion"] = newReleaseVersion
+	}
+	if tx.Commit() != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to save the sealed keystore")
+		return
+	}
+	c.JSON(http.StatusOK, response)
 }

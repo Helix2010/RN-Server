@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Helix2010/RN-Server/internal/androidkeystore"
 	"github.com/Helix2010/RN-Server/internal/apkinspect"
 	"github.com/Helix2010/RN-Server/internal/objectstore"
 	"github.com/gin-gonic/gin"
@@ -24,7 +25,11 @@ const releaseAndroidIdentityConfigKey = "release.android"
 
 // React Native 模板附带的公开 debug keystore 的证书指纹。任何人都持有这把密钥，
 // 用它签出的安装包在任何环境、任何租户都不允许入库，也不允许被 pin。
-const reactNativeDebugSignerSHA256 = "fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c"
+//
+// 值放在 internal/androidkeystore：打包代理那边有同一道闸，而两份各写各的字面量
+// 已经出过一次事——代理那份填的是 debug key 的 SHA-1 补零凑到 64 位，于是那道闸
+// 永远匹配不上。
+const reactNativeDebugSignerSHA256 = androidkeystore.PublicDebugSignerSHA256
 
 var (
 	androidPackagePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$`)

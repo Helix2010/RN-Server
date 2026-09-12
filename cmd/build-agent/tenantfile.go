@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/Helix2010/RN-Server/internal/androidkeystore"
 )
 
 // 租户身份文件由服务端合成、随任务下发，代理把它写进本次任务的 worktree。
@@ -31,7 +33,12 @@ var (
 // React Native 模板自带的 debug keystore 的证书指纹。它的私钥在每一台装了 RN 的
 // 机器上，谁都能用它签一个同包名的 APK 原地覆盖安装。拿它当 signerSha256 等于
 // 把自校验关掉，还留下一行"已经校验过了"的假象。
-const reactNativeDebugSigner = "a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc"
+//
+// 2026-09-12 修正：原先这里写的是 a40da80a59d170caa950cf15c18c454d47a39b26 后面
+// 补了 12 个字节——那前 20 个字节是 debug key 的 **SHA-1**。指纹是 SHA-256，两者
+// 永远不会相等，所以这道闸从来没有生效过：一条恒假的断言比没有断言更坏，因为它
+// 让人以为这里已经拦住了。值与服务端共用一处定义，见 androidkeystore。
+const reactNativeDebugSigner = androidkeystore.PublicDebugSignerSHA256
 
 func writeTenantFile(worktree, directory string, raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {

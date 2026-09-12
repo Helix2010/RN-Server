@@ -268,6 +268,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/build-keystore", s.saveBuildKeystore)
 	// 在服务端生成签名密钥。它不削弱"服务端打不开已存密钥"这条性质——生成出来
 	// 立刻用管理员的封装口令封盒，明文只在这一次响应里回给浏览器。
+	group.POST("/build-keystore/generate", s.generateBuildKeystore)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)

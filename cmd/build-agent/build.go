@@ -218,7 +218,7 @@ func removeWorktree(cfg config, job claimedJob, buf *logBuffer) {
 // 签名密钥放进数据库还能成立的原因。
 func unsealKeystore(cfg config, job claimedJob, worktree string) (string, []string, []string, error) {
 	if job.SealedKeystore == nil {
-		return "", nil, nil, fmt.Errorf("tenant %s has no signing keystore configured; upload one with build-keystore seal before building", job.TenantSlug)
+		return "", nil, nil, fmt.Errorf("tenant %s has no signing keystore configured; create one on the console page 「Android 打包与签名」 or run build-keystore create locally, before building", job.TenantSlug)
 	}
 	if strings.TrimSpace(cfg.KeystorePassphrase) == "" {
 		return "", nil, nil, errors.New("BUILD_KEYSTORE_PASSPHRASE is not set on this build machine, so the sealed keystore cannot be opened")

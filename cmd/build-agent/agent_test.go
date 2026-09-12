@@ -286,3 +286,37 @@ func TestUTF16LEMatchesHowAndroidStoresManifestStrings(t *testing.T) {
 		t.Fatal("an empty string produced bytes")
 	}
 }
+
+// 代理这道闸是第二个信任域：服务端已经拒绝把 RN 那把公开 debug 密钥登记成发布身份，
+// 代理再独立拦一次。它在 2026-09-12 之前从来没有生效过——常量填的是那把密钥的
+// SHA-1 补零凑到 64 位，而比对的是 SHA-256，两者永远不相等。
+//
+// 指纹用字面量写死而不是引常量：这条测试要证明的就是"常量的值是对的"，两边都引
+// 同一个常量就退化成同义反复了。值来自
+// `keytool -list -v -keystore RN-App/android/app/debug.keystore -storepass android`。
+func TestTenantFileRefusesTheRealReactNativeDebugFingerprint(t *testing.T) {
+	const realDebugSigner = "fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c"
+	manifest := map[string]any{
+		"slug":                   "anyfun",
+		"appName":                "AnyFun",
+		"androidPackage":         "com.anyfun.wallet",
+		"apiBaseUrl":             "https://api.anyfun.win",
+		"bootstrapSignerAddress": "0x1234567890abcdef1234567890abcdef12345678",
+		"signerSha256":           realDebugSigner,
+		"version":                "1.0.0",
+		"androidVersionCode":     float64(1),
+	}
+	err := validateTenantFile(manifest)
+	if err == nil {
+		t.Fatal("the public React Native debug fingerprint was accepted as this app's signing identity")
+	}
+	if !strings.Contains(err.Error(), "debug key") {
+		t.Fatalf("the error does not say why it was refused: %v", err)
+	}
+
+	// 换成一把真的密钥就该放行，否则上面那条可能只是被别的校验挡下来了
+	manifest["signerSha256"] = "0123456789abcdef" + strings.Repeat("0", 48)
+	if err := validateTenantFile(manifest); err != nil {
+		t.Fatalf("a normal fingerprint was refused: %v", err)
+	}
+}
