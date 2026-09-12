@@ -43,13 +43,17 @@ type buildConfig struct {
 	Identity appIdentity `json:"identity"`
 }
 
-// appIdentity 只放**必须由人决定**的字段。其余的服务端自己知道（签名地址、签名
-// 指纹、版本号），不让人填也就不会填错。
+// appIdentity 只放**必须由人决定、而且别处没有**的字段。
+//
+// 包名和 bundleId 不在这里：它们已经是「发布身份」的内容（服务端拿它校验上传的
+// APK 是不是这个租户的包），在这边再配一次就是两份可以对不上的真相——配歪了构建
+// 会成功，产物却在入库那一步被拒，而报错完全看不出是"两个页面填了不同的包名"。
+// 合成身份文件时从发布身份取，见 tenantManifestFor。
+//
+// 签名地址、签名指纹、版本号同理，服务端自己知道，不让人填也就不会填错。
 type appIdentity struct {
 	AppName             string `json:"appName"`
 	Scheme              string `json:"scheme"`
-	AndroidPackage      string `json:"androidPackage"`
-	IOSBundleID         string `json:"iosBundleId"`
 	APIBaseURL          string `json:"apiBaseUrl"`
 	IconBackgroundColor string `json:"iconBackgroundColor"`
 }
@@ -66,12 +70,6 @@ func (a appIdentity) validate() error {
 	if strings.TrimSpace(a.Scheme) != "" && !schemePattern.MatchString(a.Scheme) {
 		// scheme 决定这个 App 认领哪些深链。写松了就是去抢别人的链接
 		return errors.New("scheme must be lowercase letters, digits, . + - and start with a letter")
-	}
-	if !androidPackagePattern.MatchString(strings.TrimSpace(a.AndroidPackage)) {
-		return errors.New("androidPackage must be a reverse-DNS application id")
-	}
-	if bundle := strings.TrimSpace(a.IOSBundleID); bundle != "" && !androidPackagePattern.MatchString(bundle) {
-		return errors.New("iosBundleId must be a reverse-DNS bundle id")
 	}
 	if err := validateAPIBaseURL(a.APIBaseURL); err != nil {
 		return err
@@ -142,8 +140,6 @@ func (s *server) getBuildConfig(c *gin.Context) {
 		"identity": gin.H{
 			"appName":             cfg.Identity.AppName,
 			"scheme":              cfg.Identity.Scheme,
-			"androidPackage":      cfg.Identity.AndroidPackage,
-			"iosBundleId":         cfg.Identity.IOSBundleID,
 			"apiBaseUrl":          cfg.Identity.APIBaseURL,
 			"iconBackgroundColor": cfg.Identity.IconBackgroundColor,
 		},
@@ -246,7 +242,6 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		map[string]any{
 			"repoDirectory": directory, "gitRef": buildGitRef,
 			"googleServicesConfigured": googleServices != "",
-			"androidPackage":           body.Identity.AndroidPackage,
 			"scheme":                   body.Identity.Scheme,
 			// 身份真的变了才记，事后翻审计时这一条要显眼
 			"identityBreakingChanges": changed,
@@ -263,8 +258,6 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		"identity": gin.H{
 			"appName":             body.Identity.AppName,
 			"scheme":              body.Identity.Scheme,
-			"androidPackage":      body.Identity.AndroidPackage,
-			"iosBundleId":         body.Identity.IOSBundleID,
 			"apiBaseUrl":          body.Identity.APIBaseURL,
 			"iconBackgroundColor": body.Identity.IconBackgroundColor,
 		},
@@ -275,16 +268,13 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 
 // identityBreakingChanges 只列真正会让已装设备升不上去、或者会改变这个 App 认领
 // 什么的字段。appName 改了不算——那只是显示名。
+// 包名变更不在这里判：它归发布身份管，而真正的闸在排队那一刻——queueBuild 会拿
+// 要打的包和**正在分发**的那一版对一遍，无论是谁在哪个页面改的都拦得住。
 func identityBreakingChanges(before, after appIdentity) []string {
 	var changed []string
-	if b := strings.TrimSpace(before.AndroidPackage); b != "" && b != strings.TrimSpace(after.AndroidPackage) {
-		changed = append(changed, "androidPackage")
-	}
+	// scheme 决定这个 App 认领哪些深链。改了它，已经发出去的链接会打不开
 	if b := strings.TrimSpace(before.Scheme); b != "" && b != strings.TrimSpace(after.Scheme) {
 		changed = append(changed, "scheme")
-	}
-	if b := strings.TrimSpace(before.IOSBundleID); b != "" && b != strings.TrimSpace(after.IOSBundleID) {
-		changed = append(changed, "iosBundleId")
 	}
 	return changed
 }

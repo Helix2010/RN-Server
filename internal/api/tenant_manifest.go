@@ -99,9 +99,6 @@ func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg build
 	if strings.TrimSpace(identity.Scheme) == "" {
 		add("scheme", "打包配置 → 应用身份")
 	}
-	if strings.TrimSpace(identity.AndroidPackage) == "" {
-		add("androidPackage", "打包配置 → 应用身份")
-	}
 	if strings.TrimSpace(identity.APIBaseURL) == "" {
 		add("apiBaseUrl", "打包配置 → 应用身份")
 	}
@@ -116,13 +113,18 @@ func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg build
 		add("bootstrapSignerAddress", "初始化引导 → bootstrap 响应签名密钥")
 	}
 
-	// App 用它自校验运行中的签名者。发布身份没配，就没有可编进去的期望指纹
+	// 包名和签名指纹都取自发布身份——那是服务端校验上传的 APK 用的同一份记录。
+	// 在打包配置里再存一份包名，就有了两份可以对不上的真相：配歪了构建照样成功，
+	// 产物却在入库那一步被拒，而报错看不出是两个页面填了不同的包名。
 	release, err := s.androidReleaseIdentityRecord(ctx, tenant)
 	if err != nil {
 		return tenantManifest{}, err
 	}
+	if release == nil || strings.TrimSpace(release.Value.PackageName) == "" {
+		add("androidPackage", "打包与发布 → Android 签名与身份")
+	}
 	if release == nil || strings.TrimSpace(release.Value.SignerSHA256) == "" {
-		add("signerSha256", "发布管理 → Android 发布身份")
+		add("signerSha256", "打包与发布 → Android 签名与身份")
 	}
 
 	if len(missing) > 0 {
@@ -133,18 +135,21 @@ func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg build
 	if background == "" {
 		background = defaultIconBackground
 	}
-	bundleID := strings.TrimSpace(identity.IOSBundleID)
-	if bundleID == "" {
-		// iOS 还没有流水线，但字段必须在：app.config.ts 读不到会直接抛。跟 Android
-		// 用同一个反向域名是这套 App 的现状，不是规则——iOS 上线时该显式配
-		bundleID = identity.AndroidPackage
+	// iOS 还没有流水线，但字段必须在：app.config.ts 读不到会直接抛。配了 iOS 发布
+	// 身份就用它的 bundleId，没配就沿用 Android 包名——同一个反向域名是这套 App 的
+	// 现状，不是规则，iOS 上线时该显式配
+	bundleID := strings.TrimSpace(release.Value.PackageName)
+	if ios, err := s.iosReleaseIdentityRecord(ctx, tenant); err != nil {
+		return tenantManifest{}, err
+	} else if ios != nil && strings.TrimSpace(ios.Value.BundleID) != "" {
+		bundleID = strings.TrimSpace(ios.Value.BundleID)
 	}
 
 	return tenantManifest{
 		Slug:                   cfg.RepoDirectory,
 		AppName:                strings.TrimSpace(identity.AppName),
 		Scheme:                 strings.TrimSpace(identity.Scheme),
-		AndroidPackage:         strings.TrimSpace(identity.AndroidPackage),
+		AndroidPackage:         strings.TrimSpace(release.Value.PackageName),
 		IOSBundleID:            bundleID,
 		APIBaseURL:             strings.TrimRight(strings.TrimSpace(identity.APIBaseURL), "/"),
 		BootstrapSignerAddress: signer.Value.Address,

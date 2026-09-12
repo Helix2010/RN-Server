@@ -7,18 +7,15 @@ import (
 
 func validIdentity() appIdentity {
 	return appIdentity{
-		AppName:        "AnyFun",
-		Scheme:         "anyfun",
-		AndroidPackage: "com.anyfun.foundation",
-		APIBaseURL:     "https://api.anyfun.win",
+		AppName:    "AnyFun",
+		Scheme:     "anyfun",
+		APIBaseURL: "https://api.anyfun.win",
 	}
 }
 
 func TestAppIdentityRejectsWhatWouldProduceABrokenApp(t *testing.T) {
 	for name, mutate := range map[string]func(*appIdentity){
-		"应用名为空":         func(a *appIdentity) { a.AppName = "  " },
-		"包名不是反向域名":      func(a *appIdentity) { a.AndroidPackage = "anyfun" },
-		"iOS bundle 乱写": func(a *appIdentity) { a.IOSBundleID = "not a bundle" },
+		"应用名为空": func(a *appIdentity) { a.AppName = "  " },
 		// scheme 决定这个 App 认领哪些深链，写松了就是去抢别人的链接
 		"scheme 带大写":   func(a *appIdentity) { a.Scheme = "AnyFun" },
 		"scheme 以数字开头": func(a *appIdentity) { a.Scheme = "1fun" },
@@ -54,11 +51,13 @@ func TestIdentityBreakingChangesOnlyCountsWhatBreaksUpgrades(t *testing.T) {
 	if got := identityBreakingChanges(before, renamed); len(got) != 0 {
 		t.Fatalf("改显示名被当成了破坏性变更: %v", got)
 	}
-	repackaged := before
-	repackaged.AndroidPackage = "com.other.app"
-	if got := identityBreakingChanges(before, repackaged); len(got) != 1 || got[0] != "androidPackage" {
-		t.Fatalf("改包名没有被拦下: %v", got)
+	// 深链 scheme 改了，已经发出去的链接会打不开
+	rescheme := before
+	rescheme.Scheme = "other"
+	if got := identityBreakingChanges(before, rescheme); len(got) != 1 || got[0] != "scheme" {
+		t.Fatalf("改 scheme 没有被拦下: %v", got)
 	}
+	// 包名不在这里判：它归发布身份管，真正的闸是排队时和正在分发的那一版比对
 	// 第一次配置（旧值为空）不算变更，否则新租户建档就要先确认一次
 	fresh := identityBreakingChanges(appIdentity{}, before)
 	if len(fresh) != 0 {
