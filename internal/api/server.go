@@ -234,6 +234,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/ota/signing-key", s.getOTASigningKey)
 	group.PUT("/ota/signing-key", s.updateOTASigningKey)
 	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)
+	// bootstrap 响应签名（N3）。与 OTA 那把分开：共用一把等于把两个信任域焊在一起。
+	group.GET("/bootstrap/signing-key", s.getBootstrapSigningKey)
+	group.POST("/bootstrap/signing-key/generate", s.generateBootstrapSigningKey)
 	group.GET("/builds", s.listBuildJobs)
 	group.POST("/builds", s.createBuildJob)
 	group.GET("/builds/:id", s.buildJobDetail)
@@ -1626,7 +1629,10 @@ func (s *server) bootstrap(c *gin.Context) {
 			ota["revision"], ota["updateId"], ota["baseReleaseId"], ota["applyStrategy"], ota["releaseNotes"] = otaRevision, otaID, baseID, applyStrategy, releaseNotesForLocale(notes, locale)
 		}
 	}
-	c.JSON(200, gin.H{"schemaVersion": 1, "configVersion": cfg["configVersion"], "generatedAt": iso(time.Now()), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": directUpdateEnabled, "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	// issuedAt 是给客户端做重放判定的：签名本身挡不住"把昨天那份合法响应再发一遍"
+	// 把更新策略或链配置回滚回去。客户端记住见过的最大值，拒绝更小的（安全评审 N3）。
+	issuedAt := time.Now()
+	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": directUpdateEnabled, "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
