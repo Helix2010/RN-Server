@@ -57,6 +57,7 @@ var migrations = []migration{
 	{version: 41, name: "build_jobs_retryable", apply: buildJobsRetryableMigration},
 	{version: 42, name: "build_jobs_release_notes", apply: buildJobsReleaseNotesMigration},
 	{version: 43, name: "installation_device_integrity", apply: installationDeviceIntegrityMigration},
+	{version: 44, name: "consistent_default_config", apply: consistentDefaultConfigMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1418,4 +1419,27 @@ func installationDeviceIntegrityMigration(ctx context.Context, db *sql.DB) error
 		return fmt.Errorf("installation device integrity migration: %w", err)
 	}
 	return nil
+}
+
+// consistentDefaultConfigMigration 让平台默认配置成为一份**自己能通过校验**的配置。
+//
+// 默认那份（tenant_id=0）一直是 modules.predict=true 而 services 为空。服务端的
+// predictServiceFor 对这种组合是硬拒：写入 400、下发 503。后果不是"预测市场用不了"，
+// 而是**每个继承默认配置的新租户都被整体卡住**——App 拉配置拿 503（界面上只显示
+// "配置连接失败"），而运营想在控制台改任何东西，哪怕只改一个主题色，保存也会被拒，
+// 报错还只说 services.predict 没配。
+//
+// 这里只修那个矛盾，不改变任何"本来就说得通"的默认：仅当 predict 开着而
+// services.predict 确实不存在时，把模块关掉。谁要用预测市场，在控制台打开并配上
+// 平台关联即可——默认不开，是因为它需要外部平台的域名和 scopeId，平台不可能替租户
+// 猜一个。
+func consistentDefaultConfigMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE app_configs
+		SET config_value=JSON_SET(config_value,'$.modules.predict',CAST(false AS JSON)),
+		    version=version+1, updated_by='system-default-consistency', updated_at=UTC_TIMESTAMP(3)
+		WHERE config_key='mobile-bootstrap'
+		  AND tenant_id=0
+		  AND JSON_EXTRACT(config_value,'$.modules.predict')=CAST(true AS JSON)
+		  AND JSON_EXTRACT(config_value,'$.services.predict') IS NULL`)
+	return err
 }
