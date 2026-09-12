@@ -158,7 +158,15 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		// AcknowledgeIdentityChange：改包名或 scheme 时必须显式带上。见下面的说明。
 		AcknowledgeIdentityChange bool `json:"acknowledgeIdentityChange"`
 	}
-	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
+	// 解码失败和字段没填是两种完全不同的毛病，报同一句话会把人送去查错的地方。
+	// 真踩过：控制台挪走了 identity.androidPackage，浏览器里还是旧包，发上来的
+	// 多余字段让 DisallowUnknownFields 拒了整个请求，而报错说的是"缺 reason"。
+	if err := decode(c, &body); err != nil {
+		problem(c, http.StatusBadRequest, "MALFORMED_BUILD_CONFIG",
+			"Request body was rejected: "+err.Error()+"。如果提到 unknown field，多半是浏览器里还开着旧版控制台，强制刷新一次。")
+		return
+	}
+	if !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "repoDirectory, expectedVersion, reason and confirm=true are required")
 		return
 	}
@@ -181,6 +189,10 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		}
 		if len(decoded) > 256*1024 {
 			problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", "googleServicesJson is too large")
+			return
+		}
+		if err := rejectServiceAccountJSON(decoded); err != nil {
+			problem(c, http.StatusBadRequest, "SECRET_IN_BUILD_CONFIG", err.Error())
 			return
 		}
 	}
@@ -264,6 +276,34 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		"identityConfigured": true,
 		"version":            newVersion,
 	})
+}
+
+// rejectServiceAccountJSON 挡住把 Firebase **服务账号**当 google-services.json 传
+// 上来这件事。
+//
+// 两个文件都从 Firebase 控制台下载、都叫 json、名字还长得像，但性质相反：
+// google-services.json 是客户端配置，本来就会原样编进每一个 APK；
+// service-account.json 里有 private_key，是服务端发推送用的凭据。
+//
+// 传错的后果不是"配置不生效"，而是**那把私钥会被编进 APK 发给所有用户**——而且
+// 装出去之后没有任何补救办法，只能吊销密钥重发。所以这里判死，不做兼容。
+func rejectServiceAccountJSON(raw []byte) error {
+	var probe map[string]any
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		// 顶层不是对象的 JSON 走不到这里的判断，交给后面的形状校验
+		return nil
+	}
+	if _, hasPrivateKey := probe["private_key"]; hasPrivateKey {
+		return errors.New("这个文件里有 private_key，是 Firebase 服务账号凭据，不是 google-services.json。它会被原样编进 APK 发给所有用户——不要上传。google-services.json 的顶层是 project_info 和 client")
+	}
+	if kind, _ := probe["type"].(string); kind == "service_account" {
+		return errors.New("这是 Firebase 服务账号凭据（type=service_account），不是 google-services.json")
+	}
+	// 正品的形状：project_info + client。缺了就是选错了文件，早点说比让构建跑完再说便宜
+	if _, ok := probe["project_info"]; !ok {
+		return errors.New("这不像 google-services.json：顶层没有 project_info。请从 Firebase 控制台的「项目设置 → 你的应用 → Android」下载")
+	}
+	return nil
 }
 
 // identityBreakingChanges 只列真正会让已装设备升不上去、或者会改变这个 App 认领

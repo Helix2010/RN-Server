@@ -92,3 +92,34 @@ func TestTenantIdentityDriftComparesAgainstWhatUsersAlreadyHave(t *testing.T) {
 		t.Fatalf("只是大小写不同却报了漂移: %v", upper)
 	}
 }
+
+// 两个文件都从 Firebase 控制台下载、都叫 json、名字还长得像，但性质相反：
+// google-services.json 本来就会原样编进每一个 APK；service-account.json 里有
+// private_key。传错的后果是那把私钥被编进 APK 发给所有用户，装出去之后只能吊销
+// 密钥重发。这条用例守的就是这个。
+func TestGoogleServicesUploadRefusesAServiceAccount(t *testing.T) {
+	serviceAccount := []byte(`{"type":"service_account","project_id":"anyfun","private_key_id":"abc","private_key":"-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n","client_email":"a@b.iam.gserviceaccount.com"}`)
+	err := rejectServiceAccountJSON(serviceAccount)
+	if err == nil {
+		t.Fatal("服务账号凭据被当成 google-services.json 接受了")
+	}
+	if !strings.Contains(err.Error(), "private_key") {
+		t.Fatalf("报错没点明是 private_key: %v", err)
+	}
+
+	// 去掉 private_key 但仍标着 service_account 的，也不是正品
+	if rejectServiceAccountJSON([]byte(`{"type":"service_account","project_id":"anyfun"}`)) == nil {
+		t.Fatal("type=service_account 被接受了")
+	}
+
+	// 选错成别的 json（比如 firebase.json、package.json）同样要早点说
+	if rejectServiceAccountJSON([]byte(`{"hosting":{}}`)) == nil {
+		t.Fatal("一个不相干的 json 被接受了")
+	}
+
+	// 正品：顶层是 project_info + client
+	valid := []byte(`{"project_info":{"project_id":"anyfun"},"client":[{"client_info":{"mobilesdk_app_id":"1:2:android:3"}}]}`)
+	if err := rejectServiceAccountJSON(valid); err != nil {
+		t.Fatalf("正常的 google-services.json 被拒了: %v", err)
+	}
+}
