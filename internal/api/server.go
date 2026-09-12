@@ -945,8 +945,18 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	var stored []byte
-	if err := tx.QueryRowContext(c.Request.Context(), `SELECT config_value FROM app_configs WHERE config_key='mobile-bootstrap' AND tenant_id IN (?,0) ORDER BY (tenant_id=?) DESC LIMIT 1 FOR UPDATE`, tenantID(c), tenantID(c)).Scan(&stored); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var storedVersion int
+	if err := tx.QueryRowContext(c.Request.Context(), `SELECT config_value,version FROM app_configs WHERE config_key='mobile-bootstrap' AND tenant_id IN (?,0) ORDER BY (tenant_id=?) DESC LIMIT 1 FOR UPDATE`, tenantID(c), tenantID(c)).Scan(&stored, &storedVersion); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
+		return
+	}
+	// 版本对不上要在校验内容**之前**判。否则拿着一份过期的配置提交，撞到的是内容
+	// 校验的报错（"predict 模块开着但没配服务"），而那说的是他浏览器里那份旧配置的
+	// 毛病，不是库里的现状——人会照着去修一个已经不存在的问题。真踩过：一条迁移
+	// 刚把默认配置里的 predict 关掉，页面还开着旧的，保存就一直报 predict 没配。
+	if storedVersion > 0 && body.ExpectedVersion != storedVersion {
+		problem(c, http.StatusConflict, "STALE_APP_CONFIG",
+			fmt.Sprintf("这份配置在你打开之后被改过（你的版本 %d，当前 %d）。刷新页面拿到最新的再改。", body.ExpectedVersion, storedVersion))
 		return
 	}
 	if incoming, present := body.Config["wallet"]; present && incoming != nil {
