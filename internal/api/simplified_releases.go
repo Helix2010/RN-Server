@@ -487,14 +487,14 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 		problem(c, 400, "INVALID_PLATFORM", "A supported platform is required")
 		return
 	}
-	var id, version, fileName, key, status string
+	var id, version, fileName, key, status, runtime string
 	var rawNotes []byte
 	var build int
 	var size sql.NullInt64
 	var sha sql.NullString
 	// 匿名请求只看得到 active；带上有效安装凭证的设备还能看到发给它的灰度版本
 	audience := s.canaryAudienceID(c, tenantID(c))
-	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id,version,build_number,file_name,object_key,file_size,sha256,status,release_notes FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenantID(c), platform, audience, audience).Scan(&id, &version, &build, &fileName, &key, &size, &sha, &status, &rawNotes)
+	err := s.db.QueryRowContext(c.Request.Context(), `SELECT id,version,build_number,runtime_version,file_name,object_key,file_size,sha256,status,release_notes FROM app_releases WHERE tenant_id=? AND platform=? AND `+canaryVisibleSQL+` ORDER BY build_number DESC LIMIT 1`, tenantID(c), platform, audience, audience).Scan(&id, &version, &build, &runtime, &fileName, &key, &size, &sha, &status, &rawNotes)
 	if err != nil {
 		problem(c, 404, "RELEASE_NOT_FOUND", "Active release not found")
 		return
@@ -503,7 +503,11 @@ func (s *server) publicLatestReleaseFromDomain(c *gin.Context) {
 	var notes map[string][]string
 	_ = json.Unmarshal(rawNotes, &notes)
 	c.Header("Cache-Control", "public, max-age=60")
-	c.JSON(200, gin.H{"tenantId": tenantID(c), "platform": platform, "version": version, "buildNumber": build, "status": status, "fileName": fileName, "size": nullableInt64(size), "sha256": nullableSQLString(sha), "downloadUrl": download, "releaseId": id, "releaseNotes": notes})
+	// runtimeVersion 是给 OTA 构建用的：热更新包必须对准"正在分发的那一版"的 runtime，
+	// 否则没有任何设备会收到它。这个值本来就不是秘密——/v1/ota/manifest 对任何客户端
+	// 都会返回它——只是这个接口一直漏了，于是构建脚本只能去读仓库里那份会过期的
+	// tenant.json（见 RN-App scripts/build-ota.mjs）
+	c.JSON(200, gin.H{"tenantId": tenantID(c), "platform": platform, "version": version, "buildNumber": build, "runtimeVersion": runtime, "status": status, "fileName": fileName, "size": nullableInt64(size), "sha256": nullableSQLString(sha), "downloadUrl": download, "releaseId": id, "releaseNotes": notes})
 }
 
 // publicLatestReleaseDownload 是"永远给最新包"的固定下载地址。

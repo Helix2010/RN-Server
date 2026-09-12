@@ -246,6 +246,7 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/localization/publish", s.publishLocalization)
 	group.GET("/release-storage", s.getReleaseStorage)
 	group.PUT("/release-storage", s.updateReleaseStorage)
+	group.POST("/release-storage/cors", s.repairBucketCORS)
 	group.POST("/release-storage/test", s.testReleaseStorage)
 	group.GET("/release-identity/android", s.getAndroidReleaseIdentity)
 	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)
@@ -265,6 +266,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/build-config", s.saveBuildConfig)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	group.PUT("/build-keystore", s.saveBuildKeystore)
+	// 在服务端生成签名密钥。它不削弱"服务端打不开已存密钥"这条性质——生成出来
+	// 立刻用管理员的封装口令封盒，明文只在这一次响应里回给浏览器。
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
@@ -367,13 +370,46 @@ func (s *server) cors() gin.HandlerFunc {
 	}
 }
 
+// originAllowed 先看配置里的白名单，再问租户域名表。
+//
+// 加一个租户原本要改 CORS_ORIGINS 并重启服务端——而那份名单和 tenant_domain 说的
+// 是同一件事：哪些域名属于这个平台。两处维护迟早会漂，漏了就是控制台打不开而且
+// 报错只体现为浏览器被 CORS 拦下，看不出是配置少了一行。
+//
+// 复用 tenantResolver 而不是另起一套查询：它本来就有 60s 正向缓存和 5s 负向缓存，
+// 未知来源不会反复打数据库；租户域名改动时 invalidate 也已经接好了。
+//
+// 只认 https：这条通道会带上 Access-Control-Allow-Credentials，明文来源拿到凭证
+// 等于把会话交给链路上任何人。
 func (s *server) originAllowed(origin string) bool {
 	for _, allowed := range s.cfg.CORSOrigins {
 		if allowed == "*" || allowed == origin {
 			return true
 		}
 	}
-	return false
+	return s.originIsTenantDomain(origin)
+}
+
+func (s *server) originIsTenantDomain(origin string) bool {
+	if s.tenant == nil {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return false
+	}
+	// Origin 头里不带路径；带了就不是一个正常的 Origin，不要猜
+	if parsed.Path != "" || parsed.RawQuery != "" {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = s.tenant.resolve(ctx, host)
+	return err == nil
 }
 
 func (s *server) ready(c *gin.Context) {

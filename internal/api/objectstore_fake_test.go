@@ -14,6 +14,8 @@ import (
 
 // fakeObjectStore 是测试用对象存储：按 key 保存字节与 ETag，Stat/Get 可被替换成失败。
 type fakeObjectStore struct {
+	corsRules []objectstore.CORSRule
+	corsErr   error
 	objects   map[string]fakeObject
 	statErr   error
 	listErr   error
@@ -125,5 +127,14 @@ func (f *fakeObjectStore) AbortMultipartUpload(context.Context, string, string) 
 	return errors.New("not supported by fake")
 }
 func (f *fakeObjectStore) Test(context.Context) error { return nil }
+
+// 记下最后一次写入的 CORS 规则，断言用
+func (f *fakeObjectStore) PutBucketCORS(_ context.Context, rules []objectstore.CORSRule) error {
+	if f.corsErr != nil {
+		return f.corsErr
+	}
+	f.corsRules = rules
+	return nil
+}
 
 var _ objectstore.Client = (*fakeObjectStore)(nil)
