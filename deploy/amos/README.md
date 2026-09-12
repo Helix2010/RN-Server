@@ -214,6 +214,22 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 
 ## 注意事项
 
+### `ARTIFACT_UPLOAD_MODE` 必须是 `proxy`
+
+改成 `direct` 会让控制台**所有**上传（品牌图、安装包、OTA 包）当场失效，而且几乎查
+不出来：票据签发 201、`curl` 直接 PUT 200、签名和权限全对，只有浏览器传不上去，界面
+上一句"无法连接对象存储"，**服务端日志里一条都没有**——因为 direct 模式下上传那一跳
+根本不经过我们，是浏览器直接发给对象存储的。
+
+桶必须自己配了允许控制台来源的跨域规则才行。我们这个桶一条都没有（六个来源全测过，
+一律 403 `AccessForbidden: CORSResponse: This CORS request is not allowed`），而发布
+存储那把密钥对桶配置 `GetBucketCors` / `PutBucketCors` **都是 AccessDenied**——这件事
+不是没做，是做不了。
+
+`GET /v1/admin/release-storage/cors` 会从租户域名表算出该放行哪些来源。哪天桶上真配
+好了，再考虑换回 `direct`。
+
+
 按踩过的顺序记，每条都是真出过问题的。
 
 **入站只有 443，而且按 SNI 放行。** 链路上有一台设备只转发白名单内的 SNI，白名单
