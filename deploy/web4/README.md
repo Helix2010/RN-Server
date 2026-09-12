@@ -72,20 +72,17 @@ origins instead of exposing the application containers directly.
 `./stop.sh` removes only this Compose project's containers and network. MySQL
 data is external and is not deleted by the script.
 
-## GitHub Actions deployment
+## GitHub Actions deployment（已删除）
 
-The `main` branch workflow validates the repository, uploads an isolated
-staging directory, acquires `/home/ubuntu/fy/service/.deploy.lock`, rebuilds
-only its own Compose service, checks container health, and restores the prior
-source on failure. Configure these repository secrets in both repositories:
+`deploy-web4.yml` 已从两个仓库移除，换成了 `deploy-amos.yml`。留着它的风险是有人
+把 `WEB4_DEPLOY_ENABLED` 打开，就会把代码发到一台不再是生产环境的机器上，而它连
+的还是同一个数据库。
 
-- `WEB4_HOST`
-- `WEB4_USER`
-- `WEB4_SSH_KEY`
-- `WEB4_KNOWN_HOSTS`
+`WEB4_HOST` / `WEB4_USER` / `WEB4_SSH_KEY` / `WEB4_KNOWN_HOSTS` 这几个 secret 和
+`WEB4_DEPLOY_ENABLED` 变量已经没有任何 workflow 会读，可以在 GitHub 上删掉。
 
-Then set the repository variable `WEB4_DEPLOY_ENABLED=true`. Until it is set,
-validation still runs on every push to `main`, while deployment is safely
-skipped.
+要回滚到 web4，从 git 历史里取回这个 workflow（最后一版在移除 amos workflow 的
+那次提交之前），或者直接用本文上面的手工步骤——回滚是低频操作，不值得为它一直
+留着一条能自动往退役机器上发版的路。
 
 The production `.env` remains only on web4 and is never uploaded from GitHub.

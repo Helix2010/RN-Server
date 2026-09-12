@@ -30,6 +30,8 @@
 | `/etc/rn-foundation.env` | 配置，0600 root，含数据库口令 |
 | `/var/lib/rn-foundation/` | 状态目录 |
 | `/etc/nginx/conf.d/rn-foundation.conf` | 四个域名的站点配置 |
+| `/usr/local/sbin/rn-foundation-apply` | 特权收口脚本，换二进制／换控制台都走它 |
+| `/var/lib/rn-foundation-deploy/incoming/` | 部署暂存目录，属 `rndeploy` |
 
 三个 systemd unit：`rn-foundation-server`（监听 `127.0.0.1:13080`）、
 `rn-foundation-indexer`（不监听任何端口）、`rn-foundation-migrate`（oneshot，
@@ -110,6 +112,9 @@ ssh amos 'sudo systemctl enable --now rn-foundation-server rn-foundation-indexer
 # 6. 证书与自动续期。先用测试环境验链路，再签正式的
 ssh amos 'cd ~/rn-foundation-deploy && CERTBOT_EMAIL=<邮箱> STAGING=1 ./setup-tls.sh'
 ssh amos 'cd ~/rn-foundation-deploy && CERTBOT_EMAIL=<邮箱> ./setup-tls.sh'
+
+# 7. 开 CI 部署：建受限账号、装特权脚本、生成 CI 密钥
+ssh amos 'cd ~/rn-foundation-deploy && ./setup-ci-deploy.sh <对外地址> <SSH 端口>'
 ```
 
 ## 证书
@@ -140,14 +145,72 @@ nginx 配置里的证书路径指向软链接 `/etc/nginx/ssl/rn-foundation`：�
 
 ## 日常更新
 
+**正常路径是 CI。** 两个仓库各有一个 `.github/workflows/deploy-amos.yml`，推到
+`main` 就跑：RN-Server 交叉编译服务端，RN-Admin 给每个租户各构建一份控制台，都通过
+amos 上的 `rndeploy` 账号送过去，再调用同一个 `rn-foundation-apply`。
+
+手工／应急路径：
+
 ```bash
-./deploy/amos/deploy.sh          # 服务端 + 控制台
+./deploy/amos/deploy.sh          # 服务端 + 全部控制台
 ./deploy/amos/deploy.sh server   # 只换二进制
 ./deploy/amos/deploy.sh admin    # 只换控制台
 ```
 
+两条路径最后调的是同一个脚本，停服务、换二进制、跑迁移、健康检查、失败回滚都在
+那里面，不存在"CI 那套和手工这套行为不一样"的问题。
+
 服务端和 web4 的升级顺序一样：**先服务端后代理**。服务端用
 `DisallowUnknownFields`，代理比服务端新时上报会 400，任务卡在 claimed。
+
+### CI 是怎么授权的
+
+CI 用的是 amos 上的 `rndeploy`，它**全部**的 sudo 权限就一条：
+
+```
+rndeploy ALL=(root) NOPASSWD: /usr/local/sbin/rn-foundation-apply
+```
+
+不给 `ubuntu` 的密钥，是因为 `ubuntu` 是 `NOPASSWD: ALL`——把它交给 GitHub 等于把
+这台机器的 root 交出去，而这台机器上放着 Android keystore 的封装口令。实测过边界：
+`rndeploy` 读不到 `/etc/rn-build-agent.env`，也读不到 `/etc/rn-foundation.env`，
+`sudo` 跑任何别的命令都要密码。换上去的二进制以 `rnfoundation` 身份运行，不是 root。
+CI 密钥被偷的最坏结果是"发了一版坏代码"，不是"整台机器没了"。
+
+`sudoers` 里故意不限制参数——参数校验在脚本里。把 `install`/`mv`/`rm`/`systemctl`
+逐条写进 sudoers，任何一条带通配符的规则写松一点就等于给了 root。
+
+**这个特权脚本不由 CI 自己更新**，那等于把 root 还回去。仓库里改了它，要有人在
+amos 上重跑一次 `setup-ci-deploy.sh`；workflow 会比对两边的 sha256，不一致时打
+warning，没装时直接报错。
+
+一次性配置：
+
+```bash
+scp deploy/amos/{rn-foundation-apply,rn-foundation-deploy.sudoers,setup-ci-deploy.sh} amos:~/
+ssh amos './setup-ci-deploy.sh <这台机器对外的地址> <SSH 端口>'
+```
+
+它会建账号、装脚本与 sudoers（先 `visudo -c` 验语法再落地）、生成一把只给 CI 用的
+ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器上，用
+`sudo cat /var/lib/rn-foundation-deploy/.ssh/ci_ed25519` 自己取——**在你自己的终端里
+取**，别经过任何会被记录的通道。
+
+两个仓库都要有：
+
+| 名称 | 位置 | 值 |
+| --- | --- | --- |
+| `AMOS_HOST` | Secret | amos 对外地址 |
+| `AMOS_PORT` | Secret | SSH 端口（非 22） |
+| `AMOS_KNOWN_HOSTS` | Secret | `setup-ci-deploy.sh` 打印的那一行 |
+| `AMOS_SSH_KEY` | Secret | 上面那把私钥全文 |
+| `AMOS_DEPLOY_ENABLED` | Variable | `true`，否则只跑校验不部署 |
+
+### 加一个租户
+
+租户清单只有一份：`RN-Admin/deploy/tenants.txt`，CI 和 `deploy.sh` 读的是同一个
+文件。加一行还不够，另外两件事：nginx 里要有对应域名的 `server` 块，链路上按 SNI
+放行的那台设备的白名单里也要有这个域名。
 
 ## 注意事项
 
@@ -193,6 +256,13 @@ AND 列返回 1；命令替换里的管道失败同样触发。探测循环第�
 **与 web4 共库的三处并发点**已经查过：扫链每条链有租约（只有抢到的推进游标）、
 推送派发是 CAS 认领（不会重发）、表结构由单一执行方推进。`STORAGE_MASTER_KEY`
 和 `DEVICE_IDENTITY_HMAC_KEY` 必须与另一端一致，`ADMIN_API_KEY` 必须不同。
+
+**回滚只回二进制，不回迁移。** `rn-foundation-apply` 在迁移失败或健康检查不过时
+会把上一版二进制装回去重启。已经执行过的迁移不会退回来——这套迁移只加不减，旧代码
+能在新表结构上跑，回滚才成立。哪天写了一条破坏性迁移，这个前提就没了。
+
+**部署账号的权限边界是设计的一部分。** 别图省事把 CI 换成 `ubuntu` 账号，也别把
+`rn-foundation-apply` 拆成一串 sudoers 规则。理由见上面「CI 是怎么授权的」。
 
 **回滚**：把 Cloudflare 上的 A 记录改回 web4 的 IP，并按 `deploy/web4/README.md`
 重建那边的 `.env`（值从 `/etc/rn-foundation.env` 取，web4 上的已经 shred 掉了）。

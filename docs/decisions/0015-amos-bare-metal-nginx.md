@@ -34,6 +34,14 @@ DNS-01 签泛域名证书（ADR-0006）。迁到 amos 有三个硬约束：
 - **证书按域名的暴露方式分两种**：直接解析到本机的域名走 TLS-ALPN-01（acme.sh，
   签发与续期时 nginx 让开几秒）；挂在 Cloudflare 代理后面的域名走 Cloudflare
   Origin CA 证书，15 年有效、不需要 ACME、不需要在这台机器上留能改 DNS 的凭据。
+- **CI 用一个只能部署的受限账号**（`rndeploy`），它唯一的 sudo 权限是
+  `/usr/local/sbin/rn-foundation-apply`。web4 时代 CI 用的是能 `NOPASSWD: ALL`
+  的 `ubuntu`，在 web4 上那只是"CI 能拿到那台机器"；搬到 amos 之后同一条授权意味着
+  CI 能拿到 Android keystore 的封装口令，而签名能力泄漏没有补救办法。所以随迁移
+  一起把授权收窄了。特权动作全部收口在那一个脚本里，参数校验也在脚本里——拆成
+  sudoers 规则清单反而更危险，带通配符的规则松一点就等于给了 root。
+- **特权脚本不由 CI 自己更新**。仓库里改了它要有人上机重装，workflow 只比对
+  sha256 并告警。让 CI 能改自己的提权入口，等于没有这道收窄。
 
 ## 为什么不继续用 Caddy 或 certbot
 

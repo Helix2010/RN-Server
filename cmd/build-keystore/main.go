@@ -13,13 +13,13 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"bufio"
 	"os"
 	"strings"
 

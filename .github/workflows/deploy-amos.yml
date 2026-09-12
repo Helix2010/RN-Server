@@ -1,0 +1,122 @@
+# 把服务端发到 amos。web4 那套（Docker + Caddy + compose）已经退役，见 ADR-0015。
+#
+# 与手工部署（deploy/amos/deploy.sh）的关系：两边最后都调用 amos 上的
+# /usr/local/sbin/rn-foundation-apply，停服务、换二进制、跑迁移、健康检查、回滚
+# 都在那一个脚本里，这里只负责"编译 + 送过去"。
+#
+# 权限：CI 用的是 amos 上的 rndeploy 账号，它全部的 sudo 权限就是那个脚本。它读不到
+# /etc/rn-build-agent.env 里 Android keystore 的封装口令——这台机器同时是打包机，
+# 那把口令泄漏没有补救办法。别为了省事换成 ubuntu 账号，那是 NOPASSWD: ALL。
+name: Validate and deploy RN-Server to amos
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amos-production-server
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: test -z "$(gofmt -l cmd internal)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./cmd/server
+      - run: jq empty contracts/openapi.json
+
+  deploy:
+    needs: validate
+    if: vars.AMOS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AMOS_HOST: ${{ secrets.AMOS_HOST }}
+      AMOS_PORT: ${{ secrets.AMOS_PORT }}
+      AMOS_USER: rndeploy
+      STAGE: /var/lib/rn-foundation-deploy/incoming
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile for amos
+        # 与 deploy/amos/deploy.sh 同一组参数。GOTOOLCHAIN=local：go.mod 固定了版本，
+        # 不让它自己去下别的工具链
+        run: |
+          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o rn-server ./cmd/server
+          ls -l rn-server
+
+      - name: Configure SSH
+        env:
+          AMOS_SSH_KEY: ${{ secrets.AMOS_SSH_KEY }}
+          AMOS_KNOWN_HOSTS: ${{ secrets.AMOS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$AMOS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$AMOS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          # 非标准端口的 known_hosts 条目形如 [host]:port，查的时候也得带上端口
+          cat >> ~/.ssh/config <<CONF
+          Host amos
+            HostName $AMOS_HOST
+            Port ${AMOS_PORT:-22}
+            User $AMOS_USER
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            BatchMode yes
+            ConnectTimeout 15
+            StrictHostKeyChecking yes
+          CONF
+          chmod 600 ~/.ssh/config
+
+      - name: Validate SSH material
+        run: |
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
+          host="$AMOS_HOST"
+          [ "${AMOS_PORT:-22}" = "22" ] || host="[$AMOS_HOST]:$AMOS_PORT"
+          if ! ssh-keygen -F "$host" -f ~/.ssh/known_hosts >/dev/null; then
+            echo "::error::AMOS_KNOWN_HOSTS 里没有 $host 的条目"
+            exit 1
+          fi
+
+      - name: Verify SSH connection
+        run: ssh amos 'printf "ssh-ready\n"'
+
+      - name: Check the host helper matches this revision
+        # 特权脚本不由 CI 自己更新——那等于把 root 交给 CI。仓库里改了它，就得有人
+        # 在 amos 上重跑一次 deploy/amos/setup-ci-deploy.sh，这里只负责提醒
+        run: |
+          want=$(sha256sum deploy/amos/rn-foundation-apply | cut -d' ' -f1)
+          got=$(ssh amos 'sha256sum /usr/local/sbin/rn-foundation-apply 2>/dev/null || true' | cut -d' ' -f1)
+          if [ -z "$got" ]; then
+            echo "::error::amos 上没装 rn-foundation-apply，先在那台机器上跑 deploy/amos/setup-ci-deploy.sh"
+            exit 1
+          fi
+          [ "$want" = "$got" ] || echo "::warning::amos 上的 rn-foundation-apply 与本仓库版本不一致，考虑重跑 setup-ci-deploy.sh"
+
+      - name: Upload binary
+        run: |
+          ssh amos "mkdir -p '$STAGE'"
+          # 先写 .part 再改名：传到一半断掉时暂存目录里不会留下一个像是完整的二进制
+          ssh amos "cat > '$STAGE/rn-server.part'" < rn-server
+          ssh amos "mv '$STAGE/rn-server.part' '$STAGE/rn-server'"
+
+      - name: Apply
+        # 停服务、换二进制、跑迁移、健康检查、失败回滚都在 amos 那个脚本里
+        run: ssh amos 'sudo /usr/local/sbin/rn-foundation-apply server'

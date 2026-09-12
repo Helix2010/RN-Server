@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# 装到 /usr/local/sbin/rn-foundation-apply（root:root 0755）。
+#
+#   sudo rn-foundation-apply server
+#   sudo rn-foundation-apply admin <租户 slug>
+#
+# 这是**唯一**一个 CI 能用 sudo 跑的东西。sudoers 里放行的是这个文件、不带参数
+# 限制，参数合法性由脚本自己管——理由是：把 install/mv/rm/systemctl 逐条写进
+# sudoers，任何一条带通配符的规则写松一点就等于给了 root（`mv * /etc/` 之类）。
+# 收口成一个脚本，攻击面就只剩这段代码。
+#
+# 这台机器同时是打包机，/etc/rn-build-agent.env 里有 Android keystore 的封装口令。
+# 部署账号除了这个脚本没有任何 sudo 权限，所以拿到 CI 密钥也读不到那把口令；脚本
+# 换上去的二进制以 rnfoundation 身份运行，不是 root。这两条是这套权限设计的全部
+# 意义，改 sudoers 之前先想清楚会不会把它们破坏掉。
+set -euo pipefail
+
+STAGE_ROOT=/var/lib/rn-foundation-deploy/incoming
+ADMIN_ROOT=/opt/rn-foundation/admin
+BINARY=/opt/rn-foundation/rn-server
+PREVIOUS=/opt/rn-foundation/rn-server.prev
+ENV_FILE=/etc/rn-foundation.env
+
+log() { printf '   %s\n' "$*"; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# 两个仓库的 CI 各有各的 concurrency group，管不到对方，服务端和控制台的部署可能
+# 同时落到这台机器上。串行化的代价只是多等几十秒
+exec 9>/var/lib/rn-foundation-deploy/.apply.lock
+flock -w 300 9 || die "另一个部署正在进行，等了 5 分钟还没轮到"
+
+# 端口从配置里读，别在两个地方各写一遍一个会变的数字
+# 一条 awk 搞定，不接管道：`… | head -1` 在 pipefail 下会因为 SIGPIPE 让整个
+# 命令替换返回非零，配上 set -e 就是脚本从中间无声地断掉——这个坑踩过一次了
+app_port() {
+  local port
+  port="$(awk -F= '/^PORT=/{gsub(/[^0-9]/, "", $2); print $2; exit}' "$ENV_FILE" 2>/dev/null || true)"
+  printf '%s' "${port:-13080}"
+}
+
+wait_ready() { # $1 = 最多等几秒
+  local port deadline
+  port="$(app_port)"
+  deadline=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:$port/health/ready" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+apply_server() {
+  local src="$STAGE_ROOT/rn-server"
+  [ -s "$src" ] || die "暂存目录里没有 rn-server：$src"
+  # 只认 ELF：上传环节出问题时（截断、传成了 tar）早点炸，别等到 systemd 起不来
+  [ "$(head -c 4 "$src" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
+    || die "$src 不是 ELF 可执行文件"
+
+  log "停服务"
+  # 先停扫链再停 API：扫链依赖 API 先就绪，反过来停会多打一轮连接失败的日志
+  systemctl stop rn-foundation-indexer rn-foundation-server || true
+
+  if [ -f "$BINARY" ]; then
+    cp -a "$BINARY" "$PREVIOUS"
+  else
+    rm -f "$PREVIOUS"
+  fi
+  install -m 0755 -o root -g root "$src" "$BINARY"
+  rm -f "$src"
+
+  log "执行数据库迁移"
+  # 迁移在新二进制就位之后、服务启动之前跑：新代码要的列必须先存在。迁移只进不退，
+  # 反复执行是幂等的
+  if ! systemctl start rn-foundation-migrate; then
+    journalctl -u rn-foundation-migrate -n 30 --no-pager -o cat >&2
+    rollback_server "迁移失败"
+    die "迁移失败，已回滚二进制"
+  fi
+
+  log "启动"
+  systemctl start rn-foundation-server
+  if ! wait_ready 90; then
+    journalctl -u rn-foundation-server -n 40 --no-pager -o cat >&2
+    rollback_server "健康检查没通过"
+    die "新版本起不来，已回滚二进制"
+  fi
+  systemctl start rn-foundation-indexer \
+    || log "警告：扫链没起来，API 不受影响，去看 journalctl -u rn-foundation-indexer"
+
+  rm -f "$PREVIOUS"
+  log "服务端已更新"
+}
+
+rollback_server() {
+  # 注意：迁移已经跑过的不会退回去。迁移只加不减，旧代码能在新表结构上跑，这是
+  # 回滚成立的前提——哪天写了一条破坏性迁移，这里就不再安全了
+  log "回滚（$1）"
+  if [ -f "$PREVIOUS" ]; then
+    install -m 0755 -o root -g root "$PREVIOUS" "$BINARY"
+    rm -f "$PREVIOUS"
+    systemctl start rn-foundation-server || true
+    systemctl start rn-foundation-indexer || true
+    if wait_ready 60; then
+      log "已回到上一版"
+    else
+      log "上一版也没起来，需要人工介入"
+    fi
+  else
+    log "没有上一版可回滚（首次部署）"
+  fi
+}
+
+apply_admin() {
+  local slug="${1:-}"
+  # slug 会拼进路径。限死字符集并挡住 ..，别让部署账号能写到 admin 目录之外
+  case "$slug" in
+    ""|*/*|*..*) die "非法的租户 slug: ${slug:-（空）}" ;;
+  esac
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9._-]{0,30}$ ]] || die "非法的租户 slug: $slug"
+
+  local src="$STAGE_ROOT/admin/$slug"
+  [ -d "$src" ] || die "暂存目录里没有 $slug：$src"
+  # 没有 index.html 的目录换上去等于把控制台换成 404
+  [ -s "$src/index.html" ] || die "$src 里没有 index.html，不换"
+
+  local dest="$ADMIN_ROOT/$slug" old="$ADMIN_ROOT/.$slug.old"
+  mkdir -p "$ADMIN_ROOT"
+  rm -rf "$old"
+  # 不写成 `[ -d ] && mv || true`：mv 真失败时会被 || true 吞掉，接着那句
+  # `mv "$src" "$dest"` 就变成把新产物塞进旧目录里面，而不是替换它
+  if [ -d "$dest" ]; then
+    mv "$dest" "$old"
+  fi
+  mv "$src" "$dest"
+  chown -R root:root "$dest"
+  # 显式定死权限而不是 a+rX：tar 解出来的目录带着上传账号 umask 留下的组写位，
+  # 这些文件是 nginx 直接对外发的，不该保留任何多余的可写位
+  chmod -R u=rwX,go=rX "$dest"
+  rm -rf "$old"
+  # 整目录换掉而不是覆盖：上一版留下的旧 chunk 必须消失，否则目录只会越长越大。
+  # 不 reload nginx——静态文件不经过它的缓存（open_file_cache 默认关），换完即生效
+  log "$slug 控制台已更新"
+}
+
+case "${1:-}" in
+server) apply_server ;;
+admin)  apply_admin "${2:-}" ;;
+*) die "用法: $0 server | $0 admin <租户 slug>" ;;
+esac

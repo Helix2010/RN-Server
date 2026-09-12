@@ -1,93 +1,92 @@
 #!/usr/bin/env bash
-# 从开发机部署 amos 上的 RN-Foundation（API + 扫链 + 两个租户的控制台）。
+# 从开发机部署 amos 上的 RN-Foundation（API + 扫链 + 各租户的控制台）。
 #
-#   ./deploy.sh            全量：服务端 + 两份控制台
+#   ./deploy.sh            全量：服务端 + 全部控制台
 #   ./deploy.sh server     只更新服务端与扫链
 #   ./deploy.sh admin      只更新控制台静态产物
 #
-# 和打包机代理同一套做法：在开发机交叉编译，scp 过去，systemd 换进程。amos 上
-# 没有 Go 工具链，也不装——那台机器上能跑的东西越少越好。
+# 正常情况下走 GitHub Actions（两个仓库各一个 deploy-amos.yml），这个脚本是手工／
+# 应急通道。两边最后都调用 amos 上的 /usr/local/sbin/rn-foundation-apply：停服务、
+# 换二进制、跑迁移、健康检查、失败回滚都在那一个脚本里，这里只负责"编译 + 送过去"。
+#
+# 和打包机代理同一套做法：在开发机交叉编译，送过去，systemd 换进程。amos 上没有 Go
+# 工具链，也不装——那台机器上能跑的东西越少越好。
 set -euo pipefail
 
 HOST="${AMOS_HOST:-amos}"
 SERVER_REPO="${SERVER_REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
 ADMIN_REPO="${ADMIN_REPO:-$(cd "$SERVER_REPO/../RN-Admin" && pwd)}"
 WHAT="${1:-all}"
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+APPLY=/usr/local/sbin/rn-foundation-apply
+STAGE=/var/lib/rn-foundation-deploy/incoming
+STAGING_LOCAL=$(mktemp -d)
+trap 'rm -rf "$STAGING_LOCAL"' EXIT
 
-# 租户 → 控制台目录 → 该租户的 API 源。控制台把 API 地址编译进包里，所以一个租户
-# 一份产物；加租户就在这里加一行
-TENANTS=(
-  "any123:https://api.any123.top"
-  "predict-kim:https://api.predict.kim"
-  "anyfun:https://api.anyfun.win"
-)
+require_apply() {
+  # shellcheck disable=SC2029  # 这些路径就是要在本机展开，远端只收到最终字符串
+  ssh "$HOST" "test -x $APPLY" || {
+    echo "amos 上没装 $APPLY。在那台机器上跑一次 deploy/amos/setup-ci-deploy.sh" >&2
+    exit 1
+  }
+}
+
+# 租户清单只有一份，在 RN-Admin 里；CI 读的是同一个文件
+read_tenants() {
+  local list="$ADMIN_REPO/deploy/tenants.txt"
+  [ -f "$list" ] || { echo "找不到租户清单 $list" >&2; exit 1; }
+  grep -vE '^[[:space:]]*(#|$)' "$list"
+}
 
 build_server() {
   echo "== 编译服务端 =="
-  # GOTOOLCHAIN=local：go.mod 的 go 指令固定在 1.24，不让它自己去下别的工具链
+  # GOTOOLCHAIN=local：go.mod 的 go 指令固定了版本，不让它自己去下别的工具链
   (cd "$SERVER_REPO" && GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-    go build -trimpath -ldflags="-s -w" -o "$STAGE/rn-server" ./cmd/server)
-  echo "   $(du -h "$STAGE/rn-server" | cut -f1)"
+    go build -trimpath -ldflags="-s -w" -o "$STAGING_LOCAL/rn-server" ./cmd/server)
+  echo "   $(du -h "$STAGING_LOCAL/rn-server" | cut -f1)"
 }
 
 ship_server() {
-  echo "== 上传并重启 =="
-  scp -q "$STAGE/rn-server" "$HOST:/tmp/rn-server"
-  # 先停扫链再停 API：扫链依赖 API 先就绪，反过来停会多打一轮连接失败的日志。
-  # 迁移在新二进制就位之后、服务启动之前跑：新代码要的列必须先存在。迁移只进不退，
-  # 反复执行是幂等的。走 systemd unit 是为了复用同一份 EnvironmentFile，数据库口令
-  # 不会出现在命令行参数里
-  ssh "$HOST" 'set -e
-    sudo systemctl stop rn-foundation-indexer rn-foundation-server || true
-    sudo install -m 0755 -o root -g root /tmp/rn-server /opt/rn-foundation/rn-server
-    rm -f /tmp/rn-server
-    echo "   执行数据库迁移"
-    if ! sudo systemctl start rn-foundation-migrate; then
-      echo "   迁移失败，服务保持停止状态：" >&2
-      sudo journalctl -u rn-foundation-migrate -n 20 --no-pager -o cat >&2
-      exit 1
-    fi
-    sudo systemctl start rn-foundation-server
-    sudo systemctl start rn-foundation-indexer'
+  echo "== 上传并切换 =="
+  # 经一次 /tmp 是因为这个账号（一般是 ubuntu）对暂存目录没有写权限，那个目录属于
+  # CI 的 rndeploy。传完 sudo install 进去，再调同一个特权脚本
+  ssh "$HOST" "cat > /tmp/rn-server.part" < "$STAGING_LOCAL/rn-server"
+  # shellcheck disable=SC2029
+  ssh "$HOST" "set -e
+    sudo mkdir -p '$STAGE'
+    sudo install -m 0644 -o root -g root /tmp/rn-server.part '$STAGE/rn-server'
+    rm -f /tmp/rn-server.part
+    sudo $APPLY server"
 }
 
 build_admin() {
   echo "== 构建控制台 =="
   (cd "$ADMIN_REPO" && pnpm install --frozen-lockfile >/dev/null)
-  for entry in "${TENANTS[@]}"; do
-    local slug="${entry%%:*}" api="${entry#*:}"
+  while read -r slug api; do
     echo "   $slug -> $api"
-    (cd "$ADMIN_REPO" && VITE_API_BASE_URL="$api" pnpm build >/dev/null)
-    mkdir -p "$STAGE/admin/$slug"
-    cp -r "$ADMIN_REPO/dist/." "$STAGE/admin/$slug/"
-  done
+    (cd "$ADMIN_REPO" && rm -rf dist && VITE_API_BASE_URL="$api" pnpm build >/dev/null)
+    [ -s "$ADMIN_REPO/dist/index.html" ] || { echo "   $slug 构建产物里没有 index.html" >&2; exit 1; }
+    mkdir -p "$STAGING_LOCAL/admin/$slug"
+    cp -r "$ADMIN_REPO/dist/." "$STAGING_LOCAL/admin/$slug/"
+  done < <(read_tenants)
 }
 
 ship_admin() {
   echo "== 上传控制台 =="
-  # 用 tar 走管道，不用 rsync：amos 上没有 rsync，而为了发几个静态文件去装一个
-  # 工具不值得。解到暂存目录再整目录换过去，顺带拿到 --delete 的效果——上一版
-  # 留下的旧 chunk 必须消失，否则目录只会越长越大
-  for entry in "${TENANTS[@]}"; do
-    local slug="${entry%%:*}"
-    # shellcheck disable=SC2029  # slug 就是要在本机展开
-    tar -C "$STAGE/admin/$slug" -czf - . | ssh "$HOST" "
+  # 用 tar 走管道，不用 rsync：amos 上没有 rsync，为了发几个静态文件去装一个工具
+  # 不值得。整目录换过去，顺带拿到 --delete 的效果
+  while read -r slug _; do
+    # shellcheck disable=SC2029
+    tar -C "$STAGING_LOCAL/admin/$slug" -czf - . | ssh "$HOST" "
       set -eu
-      stage=\"\$HOME/.rn-foundation-admin-stage/$slug\"
-      rm -rf \"\$stage\" && mkdir -p \"\$stage\"
-      tar -C \"\$stage\" -xzf -
-      sudo mkdir -p /opt/rn-foundation/admin
-      sudo rm -rf /opt/rn-foundation/admin/$slug
-      sudo mv \"\$stage\" /opt/rn-foundation/admin/$slug
-      sudo chown -R root:root /opt/rn-foundation/admin/$slug
-      sudo chmod -R a+rX /opt/rn-foundation/admin/$slug"
-    echo "   $slug 已就位"
-  done
-  ssh "$HOST" 'sudo nginx -t && sudo systemctl reload nginx'
+      sudo mkdir -p '$STAGE/admin'
+      sudo rm -rf '$STAGE/admin/$slug'
+      sudo mkdir -p '$STAGE/admin/$slug'
+      sudo tar -C '$STAGE/admin/$slug' -xzf -
+      sudo $APPLY admin '$slug'"
+  done < <(read_tenants)
 }
 
+require_apply
 case "$WHAT" in
 all)    build_server; build_admin; ship_server; ship_admin ;;
 server) build_server; ship_server ;;

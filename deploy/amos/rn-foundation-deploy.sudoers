@@ -1,0 +1,10 @@
+# 装到 /etc/sudoers.d/rn-foundation-deploy（root:root 0440）。
+#
+# CI 部署账号全部的 sudo 权限就这一行。它换得了服务端二进制和控制台产物，但读不到
+# /etc/rn-foundation.env（数据库口令、STORAGE_MASTER_KEY）也读不到
+# /etc/rn-build-agent.env（Android keystore 的封装口令）——这台机器同时是打包机，
+# 那把口令配上库里的密文 keystore 就是完整的签名能力，泄漏没有补救办法。
+#
+# 别把这行拆成 install/mv/rm/systemctl 的清单：带通配符的 sudoers 规则松一点就是
+# root（`mv * /etc/` 之类）。参数校验放在脚本里，攻击面收在一个文件上。
+rndeploy ALL=(root) NOPASSWD: /usr/local/sbin/rn-foundation-apply
