@@ -2039,7 +2039,7 @@
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
-        "description": "Atomically claims the oldest queued job for the requested platforms (FOR UPDATE SKIP LOCKED, so two agents never get the same job) and returns its parameters together with the tenant slug and the tenant OTA code signing certificate. The private key is never returned. Shipping the certificate with the job is what keeps the certificate compiled into the app in sync with the key the server signs with. Returns 204 when the queue is empty. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "description": "Atomically claims the oldest queued job for the requested platforms (FOR UPDATE SKIP LOCKED, so two agents never get the same job) and returns its parameters together with the tenant slug and the tenant OTA code signing certificate. The private key is never returned. icons is a list of file NAMES, not image bytes: the agent fetches each one from GET /v1/build-agent/jobs/{id}/icons/{name}. They were inlined as base64 until 2026-09-13, when real 2048x2048 icons made this response 5.1 MB, past the agent 1 MiB read cap - the truncated JSON could not be parsed, and because the row is marked claimed before the response is written, the job was stranded forever. Claiming also reaps jobs whose agent stopped reporting for longer than the heartbeat timeout, which is what releases their build numbers. Shipping the certificate with the job is what keeps the certificate compiled into the app in sync with the key the server signs with. Returns 204 when the queue is empty. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2192,6 +2192,23 @@
           },
           "409": {
             "description": "BUILD_JOB_NOT_RUNNING"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/icons/{name}": {
+      "get": {
+        "summary": "Download one launcher icon for this build",
+        "description": "Returns the raw PNG for one of icon.png, android-icon-foreground.png, android-icon-background.png, android-icon-monochrome.png - the names the claim response lists in icons, which are also the paths app.config.ts reads. An unset background layer is generated here as a solid fill from identity.iconBackgroundColor, so a tenant only has to upload three. Any other name is 404, so the name cannot be used to read arbitrary files. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "responses": {
+          "200": {
+            "description": "image/png"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          },
+          "404": {
+            "description": "BUILD_ICON_NOT_FOUND"
           }
         }
       }

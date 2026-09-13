@@ -524,6 +524,11 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	// 按字符截，不是按字节：切坏一个多字节字符，JSON 编码时会变成更长的 U+FFFD
 	agent := clipRunes(strings.TrimSpace(body.Agent), 120)
 
+	// 发新活之前先把心跳停了的旧任务收掉。挂在这条路径上而不是另起一个后台循环：
+	// 打包机每 10 秒问一次活，回收就有了节拍；而没有任何打包机在问活的时候，本来
+	// 也没有什么需要回收。
+	s.reapStaleBuildJobs(c.Request.Context())
+
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
@@ -707,9 +712,52 @@ func (s *server) completeBuildJob(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// 心跳停了太久的任务判成失败。
+//
+// 那句"留在 claimed 会被心跳超时慢慢回收"写在 markBuildJobFailed 上面，但**回收这件
+// 事根本没人做**——2026-09-13 两条任务因为代理解不开领取响应而卡在 claimed，13 分钟
+// 之后还在那儿，而且占着各自的 build 号（buildFloorFor 只排除 canceled/failed）。
+//
+// 代理每 30 秒报一次心跳，构建再慢也不会停。所以超过这个时限没有动静，只有两种可能：
+// 那台机器挂了，或者它压根不知道自己领了这条任务。两种都该判失败——号放出来，人能
+// 重排。
+const buildJobHeartbeatTimeout = 10 * time.Minute
+
+func (s *server) reapStaleBuildJobs(ctx context.Context) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, status, claimed_by FROM build_jobs
+		  WHERE status IN ('claimed','running')
+		    AND COALESCE(heartbeat_at, claimed_at, created_at) < ?`,
+		time.Now().UTC().Add(-buildJobHeartbeatTimeout))
+	if err != nil {
+		slog.Error("cannot look for stale build jobs", "error", err)
+		return
+	}
+	type stale struct{ id, tenant, status, agent string }
+	var found []stale
+	for rows.Next() {
+		var item stale
+		var agent sql.NullString
+		if err := rows.Scan(&item.id, &item.tenant, &item.status, &agent); err != nil {
+			continue
+		}
+		item.agent = agent.String
+		found = append(found, item)
+	}
+	rows.Close()
+	for _, item := range found {
+		reason := fmt.Sprintf("打包机 %s 超过 %s 没有回报进度，任务按失败处理。"+
+			"多半是那台机器挂了、网断了，或者它没能读完领取任务的响应——build 号已经释放，改完可以重排。",
+			item.agent, buildJobHeartbeatTimeout)
+		s.markBuildJobFailed(ctx, item.id, reason)
+		slog.Warn("reaped a build job whose agent stopped reporting",
+			"job", item.id, "tenant", item.tenant, "was", item.status, "agent", item.agent)
+	}
+}
+
 // markBuildJobFailed 在没有代理上报的情况下判一条任务失败。认领时就发现缺配置的
-// 任务必须落到 failed：留在 claimed 会被心跳超时慢慢回收，队列是跨租户的，一条
-// 卡住的任务拖的是所有人。
+// 任务必须落到 failed：队列是跨租户的，一条卡住的任务占着 build 号，拖的是所有人。
+// 真卡住的（代理领了却没动静）由 reapStaleBuildJobs 兜底。
 func (s *server) markBuildJobFailed(ctx context.Context, id, reason string) {
 	if len(reason) > 500 {
 		reason = reason[:500]

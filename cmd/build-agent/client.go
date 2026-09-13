@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -34,9 +35,9 @@ type claimedJob struct {
 	// GoogleServicesJSON 不是机密（它原样编进每个 APK），但按租户不同，所以也随
 	// 任务下发——这样新加一台打包机仍然只需要一个封装口令。
 	GoogleServicesJSON string `json:"googleServicesJson"`
-	// Icons 是启动图标，键是文件名（icon.png 等），值是 base64 的 PNG。和
-	// google-services.json 一样不是机密，按租户不同，所以随任务下发而不是留在仓库里
-	Icons map[string]string `json:"icons"`
+	// Icons 是这个租户要用的启动图标**文件名**。内容不在这里——一张 2048 见方的
+	// PNG 将近 1MB，四张塞进这条响应会顶爆读取上限（见 downloadIcon）
+	Icons []string `json:"icons"`
 	// TenantFile 是服务端合成的 tenants/<目录>/tenant.json。它取代了仓库里那份
 	// 提交上去的文件——开一个新租户不该需要改代码。代理仍然校验字段（tenantfile.go）。
 	TenantFile json.RawMessage `json:"tenantFile"`
@@ -281,4 +282,37 @@ func (c *client) registerPublicKey(ctx context.Context, publicKey, agent string)
 		return "", err
 	}
 	return out.Status, nil
+}
+
+// downloadIcon 取一张图标，直接写进 worktree，不经过内存里的字符串。
+//
+// 图标原来是 base64 塞在领取任务的响应里的，而那条响应有 1 MiB 的读取上限。
+// 2026-09-13 真图标传上来之后响应被截断成半截 JSON，代理解不开就把整条任务丢了，
+// 而服务端那边已经标成 claimed——任务从此卡死。
+func (c *client) downloadIcon(ctx context.Context, jobID, name, target string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.cfg.Server+"/v1/build-agent/jobs/"+jobID+"/icons/"+url.PathEscape(name), nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("x-build-agent-token", c.cfg.Token)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return fmt.Errorf("icon %s returned %d: %s", name, response.StatusCode, truncate(string(payload), 200))
+	}
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
+	if _, err := io.Copy(file, io.LimitReader(response.Body, 12<<20)); err != nil {
+		return err
+	}
+	return nil
 }

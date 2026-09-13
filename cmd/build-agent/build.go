@@ -101,7 +101,7 @@ type buildResult struct {
 
 // buildJob 跑完一个任务的全部步骤。每一步失败都直接返回，调用方负责上报 fail
 // 并清理 worktree。
-func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (buildResult, error) {
+func buildJob(ctx context.Context, cfg config, api *client, job claimedJob, buf *logBuffer) (buildResult, error) {
 	var result buildResult
 	if job.Platform != "android" {
 		return result, fmt.Errorf("this agent only builds android, got %q", job.Platform)
@@ -140,7 +140,7 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 
 	// 启动图标随任务下发，写进仓库约定的那个目录。服务端没下发的（老租户）就用
 	// 仓库里已有的那一份，所以两种来源可以共存
-	written, err := writeTenantIcons(worktree, job.TenantDirectory, job.Icons)
+	written, err := fetchTenantIcons(ctx, api, job, worktree)
 	if err != nil {
 		return result, err
 	}
@@ -227,32 +227,25 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	return result, nil
 }
 
-// writeTenantIcons 把服务端下发的图标写进 assets/tenants/<slug>/。
+// fetchTenantIcons 把服务端列出的图标一张一张取下来，写进 assets/tenants/<slug>/。
 //
 // 文件名由服务端给（约定的那四个），这里仍然挡一次路径逃逸：两端分属不同信任域，
 // 各自把住自己那一侧。
-func writeTenantIcons(worktree, directory string, icons map[string]string) (int, error) {
-	if len(icons) == 0 {
+func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, worktree string) (int, error) {
+	if len(job.Icons) == 0 {
 		return 0, nil
 	}
-	dir := filepath.Join(worktree, "assets", "tenants", directory)
+	dir := filepath.Join(worktree, "assets", "tenants", job.TenantDirectory)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, fmt.Errorf("create tenant asset directory: %w", err)
 	}
 	written := 0
-	for name, encoded := range icons {
+	for _, name := range job.Icons {
 		if name != filepath.Base(name) || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
 			return written, fmt.Errorf("refusing an icon name that escapes the tenant directory: %q", name)
 		}
-		raw, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			return written, fmt.Errorf("icon %s is not base64: %w", name, err)
-		}
-		if len(raw) == 0 {
-			continue
-		}
-		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
-			return written, fmt.Errorf("write icon %s: %w", name, err)
+		if err := api.downloadIcon(ctx, job.ID, name, filepath.Join(dir, name)); err != nil {
+			return written, fmt.Errorf("cannot fetch icon %s: %w", name, err)
 		}
 		written++
 	}

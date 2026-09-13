@@ -326,23 +326,80 @@ func (s *server) writeBuildIcons(c *gin.Context, reason, name string, apply func
 	s.getBuildIcons(c)
 }
 
-// buildIconsForJob 组出随任务下发的那一份。
+// buildIconsForJob 列出随任务要下发哪几个图标文件——**只给文件名，不给内容**。
+//
+// 内容一开始是 base64 塞在领取任务的响应里的，而那条响应在代理那边有 1 MiB 的读取
+// 上限。2026-09-13 真图标传上来之后（2048×2048，四张 3.8MB，base64 之后 5.1MB），
+// 响应被截断成半截 JSON，代理解不开就丢掉了——而服务端**在返回之前已经把任务标成
+// claimed**，于是任务被一台"不知道自己领了它"的机器认领，永远卡在那里。
+//
+// 现在代理按名字一个个取（见 buildJobIcon），一张一张写进磁盘：领取响应回到几 KB，
+// 也不用为了塞进 JSON 把二进制放大 4/3。
 //
 // 背景层没传就用 appIdentity 上那个颜色现生成一张——自适应图标的背景多数就是一块
 // 纯色，而那个颜色控制台上本来就有。
-func (s *server) buildIconsForJob(ctx context.Context, tenant string, identity appIdentity) (map[string]string, error) {
+func (s *server) buildIconsForJob(ctx context.Context, tenant string, identity appIdentity) ([]string, error) {
 	icons, err := s.buildIconsFor(ctx, tenant)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]string{}
-	for name, icon := range icons {
-		out[buildIconFileNames[name]] = icon.Data
-	}
-	if _, ok := icons["androidBackground"]; !ok {
-		if generated, err := solidIcon(identity.IconBackgroundColor); err == nil {
-			out[buildIconFileNames["androidBackground"]] = generated.Data
+	names := []string{}
+	for _, slot := range buildIconNames {
+		if _, ok := icons[slot]; ok {
+			names = append(names, buildIconFileNames[slot])
+			continue
+		}
+		if slot == "androidBackground" && identity.IconBackgroundColor != "" {
+			names = append(names, buildIconFileNames[slot])
 		}
 	}
-	return out, nil
+	return names, nil
+}
+
+// buildJobIcon 把一张图发给打包机。走任务作用域，所以只有正在做这条任务的代理拿得到。
+func (s *server) buildJobIcon(c *gin.Context) {
+	item, _ := c.Get("buildJob")
+	job, ok := item.(buildJob)
+	if !ok {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read the build job")
+		return
+	}
+	slot := ""
+	for name, fileName := range buildIconFileNames {
+		if fileName == c.Param("name") {
+			slot = name
+			break
+		}
+	}
+	if slot == "" {
+		problem(c, http.StatusNotFound, "BUILD_ICON_NOT_FOUND", "No such icon")
+		return
+	}
+	icons, err := s.buildIconsFor(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_INVALID", "Stored build.icons configuration is invalid")
+		return
+	}
+	icon, ok := icons[slot]
+	if !ok {
+		// 背景层没传时现生成一张纯色的，颜色取自应用身份
+		slug, slugErr := s.tenantSlug(c.Request.Context(), job.TenantID)
+		buildCfg, _, cfgErr := s.buildConfigFor(c.Request.Context(), job.TenantID, slug)
+		if slot != "androidBackground" || slugErr != nil || cfgErr != nil {
+			problem(c, http.StatusNotFound, "BUILD_ICON_NOT_FOUND", "This tenant has no such icon")
+			return
+		}
+		generated, genErr := solidIcon(buildCfg.Identity.IconBackgroundColor)
+		if genErr != nil {
+			problem(c, http.StatusNotFound, "BUILD_ICON_NOT_FOUND", "This tenant has no background icon and no colour to generate one from")
+			return
+		}
+		icon = generated
+	}
+	raw, err := base64.StdEncoding.DecodeString(icon.Data)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_INVALID", "Stored icon is not decodable")
+		return
+	}
+	c.Data(http.StatusOK, "image/png", raw)
 }

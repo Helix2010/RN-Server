@@ -128,7 +128,7 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 		}
 	}()
 
-	result, buildErr := buildJob(buildCtx, cfg, job, buf)
+	result, buildErr := buildJob(buildCtx, cfg, api, job, buf)
 
 	// 产物必须在删掉 worktree **之前**传走。第一版把删除放在前面，于是构建成功
 	// 之后包就没了，只剩一个 sha256——"成功"却拿不到任何可分发的东西。

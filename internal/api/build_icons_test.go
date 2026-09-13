@@ -11,10 +11,13 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/Helix2010/RN-Server/internal/config"
 )
 
 func pngOf(width, height int) string {
@@ -94,9 +97,12 @@ func TestSolidIconIsGeneratedFromTheConfiguredColour(t *testing.T) {
 	}
 }
 
-// 下发给打包机的是"文件名 → base64"，文件名必须和 app.config.ts 拼的路径对得上。
-// 背景层没传时用配置里的颜色补一张，这样租户只需要传三张。
-func TestDBBuildIconsForJobFillsInTheBackground(t *testing.T) {
+// 下发给打包机的是**文件名清单**，不是内容。这一条钉住的就是"清单里不许出现图像数据"：
+// 内容曾经是 base64 塞在领取任务的响应里的，真图标传上来之后那条响应 5.1MB，代理读到
+// 1 MiB 就截断，解不开 JSON 直接丢掉——而任务那时已经被标成 claimed 了。
+//
+// 背景层没传时也要出现在清单里（取图的时候用配置里的颜色现生成），这样租户只传三张。
+func TestDBBuildIconsForJobListsFileNamesWithoutData(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db}
 	tenant := testTenant(30)
@@ -105,20 +111,63 @@ func TestDBBuildIconsForJobFillsInTheBackground(t *testing.T) {
 	for _, name := range []string{"icon", "androidForeground", "androidMonochrome"} {
 		putBuildIcon(t, s, tenant, name, pngOf(512, 512), 200)
 	}
-	c, _ := testContext(t, tenant, "GET", "/v1/admin/build-icons", nil)
 
-	out, err := s.buildIconsForJob(c.Request.Context(), tenant, appIdentity{IconBackgroundColor: "#112233"})
+	out, err := s.buildIconsForJob(context.Background(), tenant, appIdentity{IconBackgroundColor: "#112233"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"icon.png", "android-icon-foreground.png", "android-icon-monochrome.png", "android-icon-background.png"} {
-		if out[want] == "" {
-			t.Fatalf("下发里缺 %s：%v", want, keysOf(out))
+	want := []string{"icon.png", "android-icon-foreground.png", "android-icon-monochrome.png", "android-icon-background.png"}
+	sorted := append([]string{}, out...)
+	sort.Strings(sorted)
+	sort.Strings(want)
+	if strings.Join(sorted, ",") != strings.Join(want, ",") {
+		t.Fatalf("下发清单不对：%v", out)
+	}
+	// 名字必须和 app.config.ts 拼的路径对得上，而且清单里不许夹带内容
+	for _, name := range out {
+		if len(name) > 64 || strings.Contains(name, "/") {
+			t.Fatalf("清单里混进了不像文件名的东西：%q", name)
 		}
 	}
-	// 没传的那一张是现生成的纯色，颜色取自配置
-	raw, _ := base64.StdEncoding.DecodeString(out["android-icon-background.png"])
-	decoded, err := png.Decode(bytes.NewReader(raw))
+}
+
+// 图是一张一张按名字取的，走任务作用域。背景层没传时在这里现生成，颜色取自应用身份。
+func TestDBBuildJobIconServesRawPNG(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development"}}
+	tenant := testTenant(31)
+	slug := seedBuildTenant(t, s, tenant)
+	if _, err := db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+		VALUES(?,?,?,1,'test',UTC_TIMESTAMP(3))`, tenant, buildConfigKey,
+		`{"repoDirectory":"`+slug+`","identity":{"appName":"Seeded","scheme":"seeded","iconBackgroundColor":"#112233"}}`); err != nil {
+		t.Fatal(err)
+	}
+	putBuildIcon(t, s, tenant, "icon", pngOf(512, 512), 200)
+
+	serve := func(name string) *httptest.ResponseRecorder {
+		t.Helper()
+		c, recorder := testContext(t, tenant, "GET", "/v1/build-agent/jobs/bld_icon/icons/"+name, nil)
+		c.Params = gin.Params{{Key: "id", Value: "bld_icon"}, {Key: "name", Value: name}}
+		c.Set("buildJob", buildJob{ID: "bld_icon", TenantID: tenant})
+		s.buildJobIcon(c)
+		return recorder
+	}
+
+	// 传上来的那张原样回去——二进制，不再过 base64
+	recorder := serve("icon.png")
+	if recorder.Code != 200 || recorder.Header().Get("content-type") != "image/png" {
+		t.Fatalf("取 icon.png：%d %s", recorder.Code, recorder.Header().Get("content-type"))
+	}
+	if _, err := png.Decode(bytes.NewReader(recorder.Body.Bytes())); err != nil {
+		t.Fatalf("回的不是 PNG：%v", err)
+	}
+
+	// 没传的背景层是现生成的纯色，颜色取自配置
+	recorder = serve("android-icon-background.png")
+	if recorder.Code != 200 {
+		t.Fatalf("取背景层：%d %s", recorder.Code, recorder.Body.String())
+	}
+	decoded, err := png.Decode(bytes.NewReader(recorder.Body.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,31 +175,10 @@ func TestDBBuildIconsForJobFillsInTheBackground(t *testing.T) {
 	if r>>8 != 0x11 || g>>8 != 0x22 || b>>8 != 0x33 {
 		t.Fatalf("补的背景色不对：%d %d %d", r>>8, g>>8, b>>8)
 	}
-}
 
-// 空串是"删掉这一张"，让它回落到仓库里那份——老租户的图标还在仓库里
-func TestDBBuildIconsCanBeCleared(t *testing.T) {
-	db := openTestDB(t)
-	s := &server{db: db}
-	tenant := testTenant(31)
-	putBuildIcon(t, s, tenant, "icon", pngOf(512, 512), 200)
-	icons, _ := s.buildIconsFor(context.Background(), tenant)
-	if _, ok := icons["icon"]; !ok {
-		t.Fatal("没存进去")
-	}
-	// 删一张走 DELETE，不再用"空串代表删除"——一张一个请求之后，空 body 和
-	// "这一张没改"分不开
-	c, recorder := testContext(t, tenant, "DELETE", "/v1/admin/build-icons/icon",
-		map[string]any{"reason": "去掉这张", "confirm": true})
-	c.Params = gin.Params{{Key: "name", Value: "icon"}}
-	c.Set("actorId", "tester")
-	s.deleteBuildIcon(c)
-	if recorder.Code != 200 {
-		t.Fatalf("删除失败: %d %s", recorder.Code, recorder.Body.String())
-	}
-	icons, _ = s.buildIconsFor(context.Background(), tenant)
-	if _, ok := icons["icon"]; ok {
-		t.Fatal("DELETE 之后它应当没了")
+	// 名字不认识的一律 404，别让它变成读任意文件的口子
+	if recorder := serve("../../etc/passwd"); recorder.Code != 404 {
+		t.Fatalf("越界的名字没被挡：%d", recorder.Code)
 	}
 }
 

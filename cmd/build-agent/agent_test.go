@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -475,34 +476,41 @@ func TestMissingTenantIconsAreCaughtBeforeTheExpensiveSteps(t *testing.T) {
 	}
 }
 
-// 图标随任务下发，写进 app.config.ts 会去读的那个目录。老租户服务端不下发，
-// 仓库里那份照旧生效——两种来源共存。
-func TestWriteTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
+// 图标由代理一张一张取下来，写进 app.config.ts 会去读的那个目录。老租户服务端不
+// 下发，仓库里那份照旧生效——两种来源共存。
+func TestFetchTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "image/png")
+		_, _ = w.Write([]byte("png-" + filepath.Base(r.URL.Path)))
+	}))
+	defer server.Close()
+	api := newClient(config{Server: server.URL, Token: "t"})
+
 	worktree := t.TempDir()
-	written, err := writeTenantIcons(worktree, "predict-kim", map[string]string{
-		"icon.png":                    base64.StdEncoding.EncodeToString([]byte("png-1")),
-		"android-icon-foreground.png": base64.StdEncoding.EncodeToString([]byte("png-2")),
-	})
+	job := claimedJob{ID: "bld_x", TenantDirectory: "predict-kim",
+		Icons: []string{"icon.png", "android-icon-foreground.png"}}
+	written, err := fetchTenantIcons(context.Background(), api, job, worktree)
 	if err != nil || written != 2 {
-		t.Fatalf("写了 %d 张：%v", written, err)
+		t.Fatalf("取了 %d 张：%v", written, err)
 	}
 	got, err := os.ReadFile(filepath.Join(worktree, "assets", "tenants", "predict-kim", "icon.png"))
-	if err != nil || string(got) != "png-1" {
-		t.Fatalf("图标没落到约定的路径上：%v", err)
+	if err != nil || string(got) != "png-icon.png" {
+		t.Fatalf("图标没落到约定的路径上：%v %q", err, got)
 	}
+
 	// 一张都不下发时什么也不做，不去动仓库里已有的
-	if n, err := writeTenantIcons(worktree, "predict-kim", nil); err != nil || n != 0 {
+	if n, err := fetchTenantIcons(context.Background(), api, claimedJob{ID: "bld_x"}, worktree); err != nil || n != 0 {
 		t.Fatalf("空下发不该动任何东西：%d %v", n, err)
 	}
 }
 
 // 文件名是服务端给的，但服务端和代理分属不同信任域，路径逃逸各自挡一次
-func TestWriteTenantIconsRefusesNamesThatEscape(t *testing.T) {
+func TestFetchTenantIconsRefusesNamesThatEscape(t *testing.T) {
+	api := newClient(config{Server: "https://example.invalid", Token: "t"})
 	worktree := t.TempDir()
 	for _, name := range []string{"../outside.png", "sub/dir.png", "..", "a/../../b.png"} {
-		if _, err := writeTenantIcons(worktree, "predict-kim", map[string]string{
-			name: base64.StdEncoding.EncodeToString([]byte("x")),
-		}); err == nil {
+		job := claimedJob{ID: "bld_x", TenantDirectory: "predict-kim", Icons: []string{name}}
+		if _, err := fetchTenantIcons(context.Background(), api, job, worktree); err == nil {
 			t.Fatalf("%q 应当被拒", name)
 		}
 	}

@@ -193,6 +193,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	agent.POST("/public-key", s.registerBuildAgentKey)
 	agent.GET("/keystore-checks", s.pendingKeystoreChecks)
 	agent.POST("/keystore-checks", s.reportKeystoreCheck)
+	// 图标一张一张取，不塞进领取响应——那条响应在代理那边有 1 MiB 上限，
+	// 真图标（2048 见方，四张 3.8MB）会把它截断成半截 JSON
+	agent.GET("/jobs/:id/icons/:name", s.buildAgentJobScope(s.buildJobIcon))
 	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
 	agent.POST("/jobs/:id/complete", s.completeBuildJob)
 	agent.POST("/jobs/:id/fail", s.failBuildJob)

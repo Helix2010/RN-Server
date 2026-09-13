@@ -199,3 +199,53 @@ func TestDBBuildJobQueueRefusesAKeystoreTheMachineCannotOpen(t *testing.T) {
 		t.Fatalf("验证通过却被拦：%d %v", code, out)
 	}
 }
+
+// 心跳停了太久的任务要被收掉。2026-09-13 两条任务因为代理解不开领取响应而卡在
+// claimed，13 分钟后还在那儿，而且占着各自的 build 号——那句"会被心跳超时慢慢回收"
+// 写在代码注释里，但回收这件事根本没人做。
+func TestDBStaleBuildJobsAreReaped(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development"}}
+	tenant := testTenant(16)
+	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
+	now := time.Now().UTC()
+
+	number := 0
+	insert := func(id, status string, beat time.Time) {
+		number++
+		if _, err := db.Exec(`INSERT INTO build_jobs(id,tenant_id,platform,git_ref,version,build_number,status,reason,release_notes,created_by,claimed_by,claimed_at,heartbeat_at,created_at,updated_at) VALUES(?,?,'android','main','1.0.0',?,?,'测试','{}','tester','amos-builder-1',?,?,?,?)`,
+			id, tenant, number, status, beat, beat, beat, beat); err != nil {
+			t.Fatalf("种子 %s: %v", id, err)
+		}
+	}
+	// 刚领走的不该被动；心跳停了 20 分钟的要被收掉
+	insert("bld_fresh_"+uniqueSuffix(), "claimed", now.Add(-time.Minute))
+	staleID := "bld_stale_" + uniqueSuffix()
+	insert(staleID, "claimed", now.Add(-20*time.Minute))
+	runningID := "bld_run_" + uniqueSuffix()
+	insert(runningID, "running", now.Add(-20*time.Minute))
+
+	s.reapStaleBuildJobs(context.Background())
+
+	for _, id := range []string{staleID, runningID} {
+		var status, reason string
+		if err := db.QueryRow(`SELECT status,COALESCE(failure_reason,'') FROM build_jobs WHERE id=?`, id).Scan(&status, &reason); err != nil {
+			t.Fatal(err)
+		}
+		if status != "failed" {
+			t.Fatalf("%s 还是 %s，没被收掉", id, status)
+		}
+		// 原因要让人知道该去看哪台机器，以及号已经放出来了
+		if !strings.Contains(reason, "没有回报进度") || !strings.Contains(reason, "build 号已经释放") {
+			t.Fatalf("失败原因没说清楚：%q", reason)
+		}
+	}
+	var fresh int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM build_jobs WHERE tenant_id=? AND status='claimed'`, tenant).Scan(&fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh != 1 {
+		t.Fatalf("刚领走的那条也被收了：还剩 %d 条 claimed", fresh)
+	}
+}
