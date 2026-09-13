@@ -1965,7 +1965,7 @@
     "/v1/admin/build-keystore": {
       "get": {
         "summary": "Android signing keystore status (metadata only)",
-        "description": "Returns {configured, keyAlias, keystoreSha256, version, updatedBy, updatedAt}. The sealed bundle itself is never returned to admin readers; only the build-agent channel receives it. The server cannot open the bundle in any case: it is sealed with an operator passphrase the server does not have, and the server only wraps it with the storage master key on top.",
+        "description": "Never returns the sealed box itself — that goes only to the build agent. Alongside the key alias and keystore sha256 it returns `check` (pending | ok | failed: whether the build machine could actually open the box, since the server holds no passphrase and cannot tell on its own) and `sealedTenantCount` (how many tenants platform-wide already have a sealed keystore). The count is what lets the console tell the truth about the sealing passphrase: there is exactly one BUILD_KEYSTORE_PASSPHRASE per build machine, shared by every tenant, so from the second tenant onward the operator must enter the existing passphrase rather than invent one — pointing the machine at a new tenant's passphrase locks every earlier tenant out of its own signing key.",
         "responses": {
           "200": {
             "description": "Keystore status"
@@ -2003,6 +2003,35 @@
           },
           "500": {
             "description": "BUILD_KEYSTORE_SAVE_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/keystore-checks": {
+      "get": {
+        "summary": "Sealed keystores this build machine has not verified yet",
+        "description": "The sealing passphrase exists only on the build machine, which is what makes storing signing keys in the database acceptable — and it also means the server cannot tell whether a freshly stored box was sealed with the right passphrase. Storing looks fine, the fingerprint is registered, the console shows it configured, and the first sign of trouble is a build failing at unseal time minutes later. So the one party that holds the passphrase verifies instead: this returns the sealed boxes whose current version has no verification result yet. Same credential and same payload as claiming a build, so the agent sees nothing new.",
+        "responses": {
+          "200": {
+            "description": "Boxes to verify"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          }
+        }
+      },
+      "post": {
+        "summary": "Report whether the build machine can open a sealed keystore",
+        "description": "Stores the result against the app_configs version of the keystore that was checked, so rewriting the keystore invalidates the verdict rather than letting a stale green one vouch for a new box. A result for a version that is no longer current is accepted and discarded (stored:false). The reported reason is shown in the console: it is trimmed to 300 characters, newlines removed, and never contains the passphrase.",
+        "responses": {
+          "200": {
+            "description": "Result stored, or discarded because the keystore changed meanwhile"
+          },
+          "400": {
+            "description": "INVALID_KEYSTORE_CHECK"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
           }
         }
       }

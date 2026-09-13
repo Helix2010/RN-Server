@@ -81,6 +81,30 @@ func (c *client) post(ctx context.Context, path string, body any, out any) (int,
 	return response.StatusCode, nil
 }
 
+// get 和 post 走同一套鉴权与错误处理，只是没有请求体。
+func (c *client) get(ctx context.Context, path string, out any) (int, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.Server+path, nil)
+	if err != nil {
+		return 0, err
+	}
+	request.Header.Set("x-build-agent-token", c.cfg.Token)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode >= 400 {
+		return response.StatusCode, fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300))
+	}
+	if out != nil && len(payload) > 0 {
+		if err := json.Unmarshal(payload, out); err != nil {
+			return response.StatusCode, fmt.Errorf("%s returned a body we cannot read: %w", path, err)
+		}
+	}
+	return response.StatusCode, nil
+}
+
 // claim 返回 (任务, 有没有任务, 错误)。队列空时服务端给 204。
 func (c *client) claim(ctx context.Context) (claimedJob, bool, error) {
 	var job claimedJob
@@ -217,4 +241,27 @@ func (c *client) putFile(ctx context.Context, jobID, path, contentType string) (
 		return "", fmt.Errorf("upload of %s returned %d: %s", filepath.Base(path), response.StatusCode, truncate(string(payload), 300))
 	}
 	return ticket.Artifact.Token, nil
+}
+
+type pendingKeystoreCheck struct {
+	Tenant         string          `json:"tenant"`
+	Version        int             `json:"version"`
+	SealedKeystore json.RawMessage `json:"sealedKeystore"`
+}
+
+func (c *client) pendingKeystoreChecks(ctx context.Context) ([]pendingKeystoreCheck, error) {
+	var out struct {
+		Items []pendingKeystoreCheck `json:"items"`
+	}
+	if _, err := c.get(ctx, "/v1/build-agent/keystore-checks", &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *client) reportKeystoreCheck(ctx context.Context, tenant string, version int, ok bool, reason, agent string) error {
+	_, err := c.post(ctx, "/v1/build-agent/keystore-checks", map[string]any{
+		"tenant": tenant, "version": version, "ok": ok, "error": reason, "agent": agent,
+	}, nil)
+	return err
 }

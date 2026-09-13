@@ -498,10 +498,8 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	if len(platforms) == 0 {
 		platforms = []string{"android", "ios"}
 	}
-	agent := strings.TrimSpace(body.Agent)
-	if len(agent) > 120 {
-		agent = agent[:120]
-	}
+	// 按字符截，不是按字节：切坏一个多字节字符，JSON 编码时会变成更长的 U+FFFD
+	agent := clipRunes(strings.TrimSpace(body.Agent), 120)
 
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
 
 func baseTenant() map[string]any {
@@ -343,5 +345,50 @@ func TestSBOMOutputNameTracksTheArtifact(t *testing.T) {
 	want := "/w/artifacts/predict-1.3.12-build41-release" + sbomFileSuffix
 	if got := strings.TrimSuffix(apk, filepath.Ext(apk)) + sbomFileSuffix; got != want {
 		t.Fatalf("SBOM 文件名 = %q，想要 %q", got, want)
+	}
+}
+
+// 开不了盒子时给出的那句话，必须指向真正的原因：封装口令是**整台打包机共用的一个**，
+// 新租户要填已有的那一个。第一版的提示是"把打包机上的 BUILD_KEYSTORE_PASSPHRASE
+// 设成同一个"——第二个租户照着做，第一个租户的密钥当场就开不了了。
+func TestOpenableExplainsTheSharedPassphrase(t *testing.T) {
+	sealed, err := buildkeystore.Seal(buildkeystore.Bundle{
+		KeystoreBase64: "eA==", StorePassword: "s", KeyAlias: "a", KeyPassword: "k",
+	}, "passphrase-number-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(sealed)
+
+	ok, reason := openable(raw, "passphrase-number-one")
+	if !ok || reason != "" {
+		t.Fatalf("对的口令应当能打开：%v %q", ok, reason)
+	}
+
+	ok, reason = openable(raw, "a-completely-different-one")
+	if ok {
+		t.Fatal("错的口令却报成能打开")
+	}
+	if !strings.Contains(reason, "整台打包机共用") {
+		t.Fatalf("没有点明口令是共用的：%q", reason)
+	}
+	// 口令本身绝不能出现在报给服务端、最终显示在控制台上的文字里
+	for _, secret := range []string{"passphrase-number-one", "a-completely-different-one"} {
+		if strings.Contains(reason, secret) {
+			t.Fatalf("原因里带上了口令：%q", reason)
+		}
+	}
+}
+
+// 没有配口令、盒子是空的、盒子坏掉——三种都要能分辨，而不是都报成"口令不对"
+func TestOpenableDistinguishesTheOtherFailures(t *testing.T) {
+	if ok, reason := openable(nil, "x"); ok || !strings.Contains(reason, "没有下发") {
+		t.Fatalf("空盒子：%v %q", ok, reason)
+	}
+	if ok, reason := openable(json.RawMessage(`{}`), ""); ok || !strings.Contains(reason, "BUILD_KEYSTORE_PASSPHRASE") {
+		t.Fatalf("没配口令：%v %q", ok, reason)
+	}
+	if ok, reason := openable(json.RawMessage(`not json`), "passphrase-long-enough"); ok || !strings.Contains(reason, "JSON") {
+		t.Fatalf("坏盒子：%v %q", ok, reason)
 	}
 }

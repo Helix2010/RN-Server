@@ -184,6 +184,10 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	agent := r.Group("/v1/build-agent")
 	agent.Use(s.buildAgentAuth())
 	agent.POST("/claim", s.claimBuildJob)
+	// 封装口令只在打包机上，所以只有它能回答"这个盒子开不开得了"（见
+	// build_keystore_check.go）
+	agent.GET("/keystore-checks", s.pendingKeystoreChecks)
+	agent.POST("/keystore-checks", s.reportKeystoreCheck)
 	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
 	agent.POST("/jobs/:id/complete", s.completeBuildJob)
 	agent.POST("/jobs/:id/fail", s.failBuildJob)

@@ -84,8 +84,21 @@ func (s *server) getBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration is invalid")
 		return
 	}
+	// 全平台已经封了密钥的租户数。封装口令是**整台打包机共用的一个**，所以第二个
+	// 租户开始，这里不能再让人自己想一个——控制台要按这个数字说不同的话。
+	sealedTenants, err := s.sealedKeystoreTenantCount(c.Request.Context())
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Unable to count configured keystores")
+		return
+	}
 	if record == nil {
-		c.JSON(http.StatusOK, gin.H{"configured": false, "keyAlias": nil, "keystoreSha256": nil, "version": 0, "updatedBy": nil, "updatedAt": nil})
+		c.JSON(http.StatusOK, gin.H{"configured": false, "keyAlias": nil, "keystoreSha256": nil, "version": 0, "updatedBy": nil, "updatedAt": nil,
+			"sealedTenantCount": sealedTenants, "check": keystoreCheckView(nil, 0)})
+		return
+	}
+	check, err := s.keystoreCheckFor(c.Request.Context(), tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Unable to read the verification result")
 		return
 	}
 	// 盒子本身**不经过管理端**。管理端要的是"这个租户配的是哪把密钥"，那由
@@ -97,6 +110,9 @@ func (s *server) getBuildKeystore(c *gin.Context) {
 		"version":        version,
 		"updatedBy":      nullableString(updatedBy),
 		"updatedAt":      nullableTime(updatedAt),
+		// 打包机验过没有：pending / ok / failed。服务端自己验不了——它没有口令
+		"check":             keystoreCheckView(check, version),
+		"sealedTenantCount": sealedTenants,
 	})
 }
 
@@ -228,9 +244,16 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 
 	// 回参与 GET 同形。管理端两处用的是同一个 schema，少两个键就会在解析响应时
 	// 失败——服务端明明存好了，界面却报错，而错误信息说的是"字段类型不对"
+	sealedTenants, err := s.sealedKeystoreTenantCount(c.Request.Context())
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to count configured keystores")
+		return
+	}
 	response := gin.H{
 		"configured": true, "keyAlias": alias, "keystoreSha256": digest,
 		"version": newVersion, "updatedBy": nullableString(actor(c)), "updatedAt": nullableTime(now),
+		// 刚写进去的盒子必然还没验过：验它的是打包机，下一轮轮询才发生
+		"check": keystoreCheckView(nil, newVersion), "sealedTenantCount": sealedTenants,
 	}
 	if pinIdentity {
 		identityValue, _ := json.Marshal(identity)

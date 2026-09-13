@@ -48,6 +48,14 @@ func main() {
 			// 刚做完一个，队列里可能还有，不必等满一轮
 			continue
 		}
+		// 队列空着的这一轮顺手验一下新存进来的盒子。放在这里是因为它要用同一个
+		// 封装口令，而构建正忙时没有理由和它抢——验证不急，早几秒晚几秒都行，
+		// 但它必须发生在"有人发起构建"之前。
+		verifyPendingKeystores(ctx, cfg, api)
+		if ctx.Err() != nil {
+			slog.Info("build agent stopped")
+			return
+		}
 		select {
 		case <-ctx.Done():
 			slog.Info("build agent stopped")
