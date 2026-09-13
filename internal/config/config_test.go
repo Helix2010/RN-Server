@@ -131,28 +131,63 @@ func TestPasswordWithAtSignSurvivesParsingAndRedaction(t *testing.T) {
 	}
 }
 
-// 过渡期：代码和 env 是分别部署的，只认 MYSQL_DSN 会让"代码先到"的那次部署
-// 连不上库。旧的 11 个键要继续拼出等价的一份。
-func TestLegacyMySQLKeysStillAssembleAnEquivalentConfig(t *testing.T) {
+// 旧的十一个键已经不再被读取。**静默忽略它们是不行的**：那样会落到开发默认连接
+// 上（本机 3306 的 rn_foundation），报错只会说"连不上"，而真正的原因是这台机器
+// 的配置没有迁移过。
+func TestLegacyMySQLKeysAreRefusedWithDirections(t *testing.T) {
 	t.Setenv("APP_ENV", "development")
 	t.Setenv("MYSQL_HOST", "db.internal")
 	t.Setenv("MYSQL_PORT", "13306")
 	t.Setenv("MYSQL_USER", "app")
 	t.Setenv("MYSQL_PASSWORD", "secret")
 	t.Setenv("MYSQL_DATABASE", "foundation")
-	t.Setenv("MYSQL_TIMEZONE", "Z") // 旧示例里写的就是 Z，要继续认
-	t.Setenv("MYSQL_CONNECT_TIMEOUT_SECONDS", "23")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("只剩旧键时必须拒绝启动，而不是连到开发默认的那个库上")
+	}
+	// 报错要点名是哪几个键，并给出该写成什么样
+	for _, want := range []string{"MYSQL_DSN", "MYSQL_HOST", "MYSQL_DATABASE", "tcp(host:port)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("报错要包含 %q，得到：%v", want, err)
+		}
+	}
+
+	// 写了 DSN 之后旧键就只是无人读取的噪声，不再拦着启动
+	t.Setenv("MYSQL_DSN", "app:secret@tcp(db.internal:13306)/foundation")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("有 MYSQL_DSN 时旧键不该再拦路：%v", err)
+	}
+	if cfg.MySQL.Addr != "db.internal:13306" || cfg.MySQLSource != "MYSQL_DSN" {
+		t.Fatalf("unexpected driver config: %#v", cfg.MySQL)
+	}
+}
+
+// 生产上不给默认连接：默默连本机 3306 不是一个可接受的猜测。
+func TestProductionRefusesToGuessTheDatabase(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("ADMIN_USERNAME", "admin")
+	t.Setenv("ADMIN_PASSWORD_HASH", "$2a$10$abcdefghijklmnopqrstuv")
+	t.Setenv("STORAGE_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "MYSQL_DSN is required in production") {
+		t.Fatalf("生产没有 MYSQL_DSN 必须拒绝启动：%v", err)
+	}
+}
+
+// 本地不写 MYSQL_DSN 仍然能起来：`go test` 和裸跑 rn-server 不该先要一行配置。
+func TestDevelopmentFallsBackToALocalDatabase(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MySQLSource != "legacy MYSQL_* keys" {
-		t.Fatalf("unexpected source: %q", cfg.MySQLSource)
+	if cfg.MySQL.Addr != "127.0.0.1:3306" || cfg.MySQLSource == "MYSQL_DSN" {
+		t.Fatalf("unexpected driver config: %#v (source %q)", cfg.MySQL, cfg.MySQLSource)
 	}
-	if cfg.MySQL.Addr != "db.internal:13306" || cfg.MySQL.DBName != "foundation" || cfg.MySQL.Passwd != "secret" ||
-		!cfg.MySQL.ParseTime || cfg.MySQL.Loc.String() != "UTC" || cfg.MySQL.Timeout != 23*time.Second ||
-		!strings.Contains(cfg.MySQL.FormatDSN(), "charset=utf8mb4") {
-		t.Fatalf("unexpected driver config: %#v", cfg.MySQL)
+	// 默认连接同样要补上那五项，否则本地会撞上和生产不同的驱动默认值
+	if !cfg.MySQL.ParseTime || cfg.MySQL.Timeout == 0 {
+		t.Fatalf("开发默认连接也要补默认参数：%#v", cfg.MySQL)
 	}
 }
 

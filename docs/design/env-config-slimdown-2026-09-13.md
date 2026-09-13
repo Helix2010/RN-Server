@@ -374,7 +374,7 @@ ARTIFACT_UPLOAD_MODE=proxy          # 桶没有跨域规则且我们改不了，
 ### 还没做的
 
 - **第 4 步的后半段**：`push-credentials import-env` 还没在 amos 上跑，env 里的 `FCM_*` 也还没删。要在部署之后做。
-- **第 5 步（DSN 第二版）**：要等 amos 的 env 换成 `MYSQL_DSN` 并跑过一轮，才能删旧键读取。
+- ~~**第 5 步（DSN 第二版）**~~：已完成，见 §12。
 - **amos env 的实际收缩**：新二进制部署之前不能动 env（旧二进制不认 `MYSQL_DSN`）。顺序是：部署 → `rn-server config` 核对 → 写 `MYSQL_DSN` → 删十一行和二十多行默认值 → `import-env` → 删 `FCM_*` → 重启。
 
 ## 11. 上线记录（2026-09-13 07:42–07:44 UTC）
@@ -408,3 +408,21 @@ root:***@tcp(…:13306)/rn?charset=utf8mb4&parseTime=true&readTimeout=15s&timeou
 ### 顺带发现，与本次改动无关
 
 `any123.top` 的 TLS 一直是坏的：`/etc/nginx/ssl/rn-foundation-le` 那张证书（2026-09-12 签）的 SAN 只有 `api.predict.kim` 和 `console.predict.kim`，而 `setup-tls.sh` 的默认 `DOMAINS` 里是带 any123 两个名字的。nginx 配置第 4 行自己写着"本机现存的 `console.any123.top` ⋯⋯一直没生效"。该租户的 API 在本机带 Host 头是通的（上面那张表就是这么查的），坏的只是公网 TLS。要修就重跑一次 `setup-tls.sh`。
+
+
+## 12. DSN 第二版（2026-09-13）
+
+删掉 `legacyDSN()` 与它的调用点、启动时那条弃用警告、`rn-server config` 里的迁移提示。发这一版之前核对过还有谁依赖旧键：代码里只有 `legacyDSN()` 一处，CI 跑测试根本不设 `MYSQL_*`（集成测试用的是 `RN_TEST_MYSQL_*`，另一套前缀），仓库里还写着旧键的只剩 `deploy/web4/.env.example` 和两处文档——都已改成 DSN 写法。
+
+**关键不是删，是删完之后旧键要给出指路的报错。** 静默忽略它们会落到开发默认连接（本机 3306 的 `rn_foundation`）上，报错只会说"连不上"，而真正的原因是这台机器的配置没迁移过——那是最难查的一类失败。所以：
+
+| env 的状态 | 行为 |
+|---|---|
+| 有 `MYSQL_DSN` | 用它（旧键即便还在也只是无人读取的噪声） |
+| 没有 DSN，但旧键还在 | **拒绝启动**，点名是哪几个键、该写成什么样 |
+| 都没有，生产 | 拒绝启动：`MYSQL_DSN is required in production` |
+| 都没有，开发 / 测试 | 用本地默认 `root@tcp(127.0.0.1:3306)/rn_foundation`，并同样补齐那五项参数 |
+
+最后一行是有意保留的：`go test` 和裸跑 `rn-server` 不该先要一行配置。生产不给这个默认——在生产上默默连本机 3306 不是一个可接受的猜测。
+
+上一版说这一步"没有回退路径"是错的：`rn-foundation-apply` 把上一版二进制留成 `rn-server.prev`，迁移失败或健康检查不过都自动装回去（该脚本第 78、86 行）。真正的风险从来不是回不去，而是**看不到的机器**——别人笔记本上还写着旧键的 `.env`。那个由上面第二行的报错接住。

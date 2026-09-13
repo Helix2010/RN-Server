@@ -98,9 +98,7 @@ func printConfig(cfg config.Config) {
 
 	if cfg.MySQLSource != "MYSQL_DSN" {
 		fmt.Println()
-		fmt.Println("⚠ 数据库还在用弃用的 MYSQL_HOST/PORT/USER/PASSWORD/DATABASE/CHARSET/TIMEZONE/")
-		fmt.Println("  PARSE_TIME/CONNECT_TIMEOUT/READ_TIMEOUT/WRITE_TIMEOUT 十一个键。把上面那条")
-		fmt.Println("  「连接」写成一行 MYSQL_DSN（口令换回真值）加进 env，再删掉这十一行。")
+		fmt.Println("⚠ 没有设 MYSQL_DSN，用的是开发默认连接。生产上这会直接拒绝启动。")
 	}
 	if unknown := unknownMySQLKeys(); len(unknown) > 0 {
 		fmt.Println()

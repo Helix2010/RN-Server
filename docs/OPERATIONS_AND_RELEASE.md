@@ -271,10 +271,10 @@ WHERE bad.application_id = bad.package_id
 
 ```bash
 docker run -d --name rn-test-mysql -e MYSQL_ROOT_PASSWORD=rn-test -e MYSQL_DATABASE=rn_test -p 127.0.0.1:33061:3306 mysql:8.0
-RN_TEST_MYSQL_HOST=127.0.0.1 RN_TEST_MYSQL_PORT=33061 RN_TEST_MYSQL_USER=root RN_TEST_MYSQL_PASSWORD=rn-test RN_TEST_MYSQL_DATABASE=rn_test go test ./internal/api/ -run TestDB -v
+RN_TEST_MYSQL_DSN='root:rn-test@tcp(127.0.0.1:33061)/rn_test?parseTime=true&charset=utf8mb4' go test ./internal/api/ -run TestDB -v
 ```
 
-没有设置 `RN_TEST_MYSQL_HOST` 时这组测试跳过（CI 里显示 skip，不算通过）。
+没有设置 `RN_TEST_MYSQL_DSN`（或旧的 `RN_TEST_MYSQL_HOST` 那一组，仍然认）时这组测试跳过（CI 里显示 skip，不算通过）。
 
 ## 10. 多租户对象存储上线检查
 

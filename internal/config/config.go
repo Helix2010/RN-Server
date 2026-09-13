@@ -170,7 +170,7 @@ func Load() (Config, error) {
 	}
 	cfg.CORSOrigins = split(l.value("CORS_ORIGINS", corsFallback))
 
-	cfg.MySQL, cfg.MySQLSource, cfg.MySQLDefaulted = l.mysql()
+	cfg.MySQL, cfg.MySQLSource, cfg.MySQLDefaulted = l.mysql(cfg.Environment)
 	if cfg.MySQL != nil && cfg.Environment == "test" && !strings.HasSuffix(cfg.MySQL.DBName, "_test") {
 		cfg.MySQL.DBName += "_test"
 	}
@@ -230,20 +230,53 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// legacyMySQLKeys 是被 MYSQL_DSN 取代的那十一个键。代码不再读它们，但要认得出
+// 它们还在，好把人指到该去的地方——静默忽略的后果是连到 127.0.0.1:3306 上一个
+// 不存在的库，而报错只会说"连不上"。
+var legacyMySQLKeys = []string{
+	"MYSQL_HOST", "MYSQL_PORT", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE",
+	"MYSQL_CHARSET", "MYSQL_TIMEZONE", "MYSQL_PARSE_TIME",
+	"MYSQL_CONNECT_TIMEOUT_SECONDS", "MYSQL_READ_TIMEOUT_SECONDS", "MYSQL_WRITE_TIMEOUT_SECONDS",
+}
+
+// developmentDSN 是本地开发不写 MYSQL_DSN 时的默认连接。生产不给这个默认——
+// 在生产上默默连本机 3306 不是一个可接受的猜测。
+const developmentDSN = "root@tcp(127.0.0.1:3306)/rn_foundation"
+
 // mysql 组装驱动级连接配置。
 //
-// MYSQL_DSN 优先；没有它就用旧的 11 个键拼出一条**等价的 DSN**，再走同一条解析
-// 路径。两条路合流而不是各拼一份 mysql.Config，是因为只有驱动自己知道每个参数
-// 的语义（charset 就不落在 Params 里，而是驱动的私有字段）——自己拼第二份迟早
-// 和它对不上。旧键留着是因为代码和 env 是分别部署的：CI 推上来的二进制只认 DSN
-// 而 env 还没改的那一刻，迁移和服务都会连不上库，那次部署整个是红的。
-func (l *loader) mysql() (*mysql.Config, string, []string) {
+// 只认 MYSQL_DSN：参数语义由驱动定义，我们不再维护第二套拼装。旧的十一个键在
+// 上一版里还被接受（那是为了让"代码先到、env 后改"的那次部署不红），现在已经
+// 从 amos 上删干净，这一版把兼容层一起删掉。
+func (l *loader) mysql(environment string) (*mysql.Config, string, []string) {
 	raw := strings.TrimSpace(os.Getenv("MYSQL_DSN"))
-	source := "MYSQL_DSN"
 	if raw == "" {
-		raw, source = l.legacyDSN(), "legacy MYSQL_* keys"
+		// 旧键还在却没有 DSN：这是"配置没迁移"，不是"没配"。说清楚是哪几个键、
+		// 该写成什么样，比一句 MYSQL_DSN is required 有用得多。
+		if stale := presentKeys(legacyMySQLKeys); len(stale) > 0 {
+			l.fail("MYSQL_DSN is required: " + strings.Join(stale, ", ") +
+				" 已经不再被读取，把它们合成一行 MYSQL_DSN=user:password@tcp(host:port)/database" +
+				"?parseTime=true&loc=UTC&charset=utf8mb4&timeout=15s&readTimeout=15s&writeTimeout=15s")
+			return nil, "MYSQL_DSN", nil
+		}
+		if environment == "production" {
+			l.fail("MYSQL_DSN is required in production")
+			return nil, "MYSQL_DSN", nil
+		}
+		return l.parseDSN(developmentDSN, "development default")
 	}
-	return l.parseDSN(raw, source)
+	return l.parseDSN(raw, "MYSQL_DSN")
+}
+
+// presentKeys 挑出 env 里真的写了的那些键。
+func presentKeys(keys []string) []string {
+	var present []string
+	for _, key := range keys {
+		if _, ok := os.LookupEnv(key); ok {
+			present = append(present, key)
+		}
+	}
+	return present
 }
 
 func (l *loader) parseDSN(raw, source string) (*mysql.Config, string, []string) {
@@ -302,45 +335,6 @@ func appendDSNParams(dsn string, params url.Values) string {
 		separator = "&"
 	}
 	return dsn + separator + params.Encode()
-}
-
-// legacyDSN 用弃用的 11 个 MYSQL_* 键拼一条等价的 DSN。它同时是启动时那条弃用
-// 警告要打印的内容（口令打码后），运维照着它把一行加进 env 就完成了迁移。
-func (l *loader) legacyDSN() string {
-	base := mysql.NewConfig()
-	base.User = l.value("MYSQL_USER", "root")
-	base.Passwd = os.Getenv("MYSQL_PASSWORD")
-	base.Net = "tcp"
-	port := l.integer("MYSQL_PORT", 3306)
-	l.between("MYSQL_PORT", port, 1, 65535)
-	if port < 1 || port > 65535 {
-		port = 3306
-	}
-	base.Addr = fmt.Sprintf("%s:%d", l.value("MYSQL_HOST", "127.0.0.1"), port)
-	base.DBName = l.value("MYSQL_DATABASE", "rn_foundation")
-	params := url.Values{}
-	params.Set("parseTime", strconv.FormatBool(l.boolean("MYSQL_PARSE_TIME", mysqlDefaults.parseTime)))
-	params.Set("charset", l.value("MYSQL_CHARSET", mysqlDefaults.charset))
-	// "Z" 是 ISO-8601 的 UTC 记号，不是时区名，LoadLocation 不认它——而旧示例里
-	// 写的就是 Z。这里翻译一下；DSN 那条路上它会被驱动直接拒掉，那是对的。
-	zone := l.value("MYSQL_TIMEZONE", "UTC")
-	if zone == "Z" {
-		zone = "UTC"
-	}
-	params.Set("loc", zone)
-	params.Set("timeout", l.seconds("MYSQL_CONNECT_TIMEOUT_SECONDS", mysqlDefaults.timeout))
-	params.Set("readTimeout", l.seconds("MYSQL_READ_TIMEOUT_SECONDS", mysqlDefaults.readTimeout))
-	params.Set("writeTimeout", l.seconds("MYSQL_WRITE_TIMEOUT_SECONDS", mysqlDefaults.writeTimeout))
-	return appendDSNParams(base.FormatDSN(), params)
-}
-
-func (l *loader) seconds(key string, fallback time.Duration) string {
-	got := l.integer(key, int(fallback/time.Second))
-	l.atLeast(key, got, 1)
-	if got < 1 {
-		got = int(fallback / time.Second)
-	}
-	return (time.Duration(got) * time.Second).String()
 }
 
 // validateMySQL 挡住那些驱动不会报错、但结果不是我们想要的形状。

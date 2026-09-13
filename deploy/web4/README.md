@@ -16,11 +16,14 @@ This deployment is isolated under `/home/ubuntu/fy/service` and uses the
 `rn-foundation-*` Docker names. It does not install host-level Node, pnpm, or
 Nginx.
 
-1. Edit `.env` and replace every `CHANGE_ME_MYSQL_*` value. Connection
-   behavior is configurable with `MYSQL_CHARSET`, `MYSQL_TIMEZONE`, and
-   `MYSQL_PARSE_TIME`, plus the `MYSQL_*_TIMEOUT_SECONDS` and bounded retry
-   settings. The configured database must already exist; RN-Server never runs
-   `CREATE DATABASE` during application startup.
+1. Edit `.env` and fill in `MYSQL_DSN` — one line in go-sql-driver form,
+   `user:password@tcp(host:port)/database?params`. Since 2026-09-13 the old
+   eleven `MYSQL_HOST`/`MYSQL_CHARSET`/… keys are no longer read; leaving them
+   in place without a `MYSQL_DSN` makes the server refuse to start and name
+   them. Pool size, startup retries and the query timeout stay as their own
+   `MYSQL_*` keys — the driver does not know about those. The configured
+   database must already exist; RN-Server never runs `CREATE DATABASE` during
+   application startup.
 2. Set `ADMIN_USERNAME` and a scrypt `ADMIN_PASSWORD_HASH`. The browser never receives `ADMIN_API_KEY`;
    that optional value is only for controlled automation.
 3. Set `PUBLIC_BASE_DOMAIN` and `PUBLIC_CONSOLE_DOMAIN`, point `PUBLIC_SERVER_URL` and
