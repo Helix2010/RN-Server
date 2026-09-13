@@ -91,9 +91,20 @@ func (s *server) getBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Unable to count configured keystores")
 		return
 	}
+	// 密钥会加密给哪一台打包机——**租户也要看得到**。指纹不是秘密，而没有它租户就
+	// 不知道自己能不能建密钥；只把它放在平台专属接口上，租户侧拿到 403，表单会
+	// 一直处于"不让生成"。待确认/接受那套仍然只在平台侧。
+	agentKeyView := gin.H{"registered": false, "fingerprint": nil, "agent": nil}
+	if agentKey, err := s.buildAgentKey(c.Request.Context()); err == nil && agentKey != nil {
+		agentKeyView = gin.H{
+			"registered":  true,
+			"fingerprint": agentKey.Current.Fingerprint(),
+			"agent":       nullableString(agentKey.Agent),
+		}
+	}
 	if record == nil {
 		c.JSON(http.StatusOK, gin.H{"configured": false, "keyAlias": nil, "keystoreSha256": nil, "version": 0, "updatedBy": nil, "updatedAt": nil,
-			"sealedTenantCount": sealedTenants, "check": keystoreCheckView(nil, 0)})
+			"sealedTenantCount": sealedTenants, "check": keystoreCheckView(nil, 0), "agentKey": agentKeyView})
 		return
 	}
 	check, err := s.keystoreCheckFor(c.Request.Context(), tenantID(c))
@@ -113,6 +124,7 @@ func (s *server) getBuildKeystore(c *gin.Context) {
 		// 打包机验过没有：pending / ok / failed。服务端自己验不了——它没有口令
 		"check":             keystoreCheckView(check, version),
 		"sealedTenantCount": sealedTenants,
+		"agentKey":          agentKeyView,
 	})
 }
 
@@ -249,11 +261,16 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to count configured keystores")
 		return
 	}
+	agentKeyView := gin.H{"registered": false, "fingerprint": nil, "agent": nil}
+	if agentKey, err := s.buildAgentKey(c.Request.Context()); err == nil && agentKey != nil {
+		agentKeyView = gin.H{"registered": true, "fingerprint": agentKey.Current.Fingerprint(), "agent": nullableString(agentKey.Agent)}
+	}
 	response := gin.H{
 		"configured": true, "keyAlias": alias, "keystoreSha256": digest,
 		"version": newVersion, "updatedBy": nullableString(actor(c)), "updatedAt": nullableTime(now),
 		// 刚写进去的盒子必然还没验过：验它的是打包机，下一轮轮询才发生
 		"check": keystoreCheckView(nil, newVersion), "sealedTenantCount": sealedTenants,
+		"agentKey": agentKeyView,
 	}
 	if pinIdentity {
 		identityValue, _ := json.Marshal(identity)
