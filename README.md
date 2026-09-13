@@ -23,9 +23,7 @@ go run ./cmd/server
 - RN-App 正式文案：迁移 8 会重置 `type=14` 为 AnyFun 基座实际使用的 zh-CN/en-US 文案，并清空旧语言资源引用；迁移后需由管理端重新发布语言包。
 - RN-App 文案持续同步：迁移 29 从 RN-App 的 `i18n/seed` 补齐当前完整 UI 文案到全局 `language_document`（现为 748 个 key × 2 种语言），只补缺失记录，不覆盖已有全局内容或租户自定义覆盖；变更 App 内置文案后先在 RN-App 执行 `pnpm i18n:seed`，再在本仓库执行 `node scripts/sync-rn-app-i18n-seed.mjs`。
 - Admin 登录：`POST /v1/admin/auth/login` 创建 HttpOnly 会话；管理 API 默认拒绝未认证请求。`x-admin-key` 仅保留给受控自动化，不再进入 Web 构建。
-- MySQL 连接：一行 `MYSQL_DSN`，格式是 go-sql-driver 的标准写法 `user:password@tcp(host:port)/database?params`。口令里含 `@ / : & $` 都不用转义（驱动取最后一个 `@` 作分隔），但**用户名**不能含 `:`；时区写 `loc=UTC` 不能写 `Z`。DSN 里没写的参数服务端会补成我们的默认值（`parseTime=true`、连接/读/写超时、`charset=utf8mb4`），补了什么 `rn-server config` 会逐项列出——驱动自己的默认值和我们的不一样，`parseTime` 默认 `false` 会让每个读 `DATETIME` 的接口 500 而启动仍是绿的。旧的 `MYSQL_HOST`/`MYSQL_PORT`/… 十一个键**已经不再被读取**；env 里还留着它们而没有 `MYSQL_DSN` 时服务拒绝启动，并在报错里点名是哪几个键、该写成什么样（静默忽略会落到本机 3306 上，报错只会说连不上）。开发环境不写 `MYSQL_DSN` 时用本地默认连接，生产不给这个默认。`APP_ENV=test` 时库名自动加 `_test` 后缀。
-- MySQL 其余行为：连接池（`MYSQL_CONNECTION_LIMIT` 等四项）、启动重试（`MYSQL_INIT_*`）、查询超时（`MYSQL_QUERY_TIMEOUT_SECONDS`）不在 DSN 里——它们是 `database/sql` 和我们自己的事，驱动不认。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。生产环境保持 `MYSQL_AUTO_MIGRATE=false`，迁移作为独立发布步骤执行。
-- 看配置：`rn-server config` 打印这台机器上**实际生效**的配置，并标出每一项来自 env 还是默认值；机密只显示长度，可以直接贴进工单。
+- 配置：所有环境变量、默认值、必填项和排查办法见 **[配置参考](docs/CONFIGURATION.md)**。数据库是一行 `MYSQL_DSN`（go-sql-driver 标准写法）；`rn-server config` 打印这台机器上**实际生效**的配置并标出每一项来自 env 还是默认值，机密只显示长度。
 - 推送凭据：按租户存在 `app_configs` 的 `push.fcm`（用 `STORAGE_MASTER_KEY` 加密），管理接口 `GET /v1/admin/push/credentials`、`PUT|DELETE /v1/admin/push/credentials/fcm`、`POST /v1/admin/push/credentials/fcm/test`，平台默认走 `/v1/admin/platform/push/credentials/fcm`。保存时会真去 Google 换一次访问令牌，换不到就不保存。它必须和该租户 `google-services.json` 的 `project_info.project_id` 是同一个 Firebase 项目，两边保存时互相校验。见 `docs/decisions/0017-per-tenant-push-credentials.md`。
 - OTA（实验性）：迁移 10 增加租户级 `ota_releases`，基线 APK、Runtime、Channel、Manifest 和资产由 RN-Server/华为 OBS 管理；`/v1/ota/manifest` 实现 Expo Updates v1 基础协议。当前尚未接入 Manifest 签名密钥和客户端公钥验签，生产启用前必须完成签名链路与真机回退验证。
 - OTA Manifest 身份：上传 ZIP 中的客户端字段只作为构建提示。保存发布记录时，服务端会按当前请求域名和所选基线 APK 重写 `extra.expoClient`、API Base URL、应用版本、Build、Runtime、平台、分发渠道与 OTA Channel，避免跨租户或跨版本复用时继承构建机写死值。
@@ -43,6 +41,7 @@ go run ./cmd/server
 
 - [总体架构](docs/ARCHITECTURE.md)
 - [API、数据与安全规范](docs/API_STANDARD.md)
+- [配置参考](docs/CONFIGURATION.md)
 - [可观测、升级与运行规范](docs/OPERATIONS_AND_RELEASE.md)
 - [独立管理前端与插件模块决策](docs/decisions/0002-independent-admin-and-plugin-modules.md)
 - [MySQL 持久化决策](docs/decisions/0003-mysql-persistence.md)

@@ -225,6 +225,7 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
 - `x-admin-key` 自动化通道写进 `audit_events` 的 actor 由 `ADMIN_API_ACTOR`（默认 `api-key-automation`）决定，**不再取请求自报的 `x-admin-id`**——那是持钥者可任意填写的字段，审计链等于没有依据。请求仍可带该头，只会被忽略并记一条 warning 日志；因此这条通道现在也不再要求带 `x-admin-id`。要区分多个自动化调用方，就给它们各自的部署配不同的 `ADMIN_API_ACTOR`（`ADMIN_API_KEY` 目前仍是单值）。
 - `ADMIN_COOKIE_SECURE` 默认改为 `true`，管理会话 cookie 只走 TLS。本地用 http 调管理端时在 `.env` 里显式设 `false`。
 - 旁路本身的存废（是否保留 `x-admin-key`）、按租户 RBAC 与发布双人分离仍是未决项，见钱包安全评审 N17。
+- 这两个键以及其余全部环境变量的含义、默认值与校验范围见[配置参考](CONFIGURATION.md)。
 
 ## 9. Runbook 最小集合
 
