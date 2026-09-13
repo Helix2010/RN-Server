@@ -2324,6 +2324,46 @@
           }
         }
       }
+    },
+    "/v1/admin/build-icons": {
+      "get": {
+        "summary": "Launcher icons this tenant has configured",
+        "description": "Metadata only (configured / sha256 / dimensions); the images themselves come from /v1/admin/build-icons/{name}. These four PNGs used to live in the app repository under assets/tenants/<slug>/, which meant a new tenant could not build at all until someone committed files there — the first predict-kim build failed on exactly that, with every other piece of configuration correct.",
+        "responses": {
+          "200": {
+            "description": "Icon status"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          }
+        }
+      },
+      "put": {
+        "summary": "Upload launcher icons",
+        "description": "Takes base64 PNGs keyed by icon, androidForeground, androidBackground, androidMonochrome; an empty string clears one. Each must be a square PNG between 256 and 2048 pixels and under 2 MiB — rejecting here rather than letting prebuild fail two minutes into a build with an ENOENT or a sharp stack trace. androidBackground may be omitted: the server generates a solid PNG from the tenant's iconBackgroundColor, which the console already collects.",
+        "responses": {
+          "200": {
+            "description": "Saved; returns the same shape as GET"
+          },
+          "422": {
+            "description": "INVALID_BUILD_ICONS"
+          }
+        }
+      }
+    },
+    "/v1/admin/build-icons/{name}": {
+      "get": {
+        "summary": "One launcher icon as a PNG",
+        "description": "Returns image/png for console previews.",
+        "responses": {
+          "200": {
+            "description": "The icon"
+          },
+          "404": {
+            "description": "BUILD_ICON_NOT_FOUND"
+          }
+        }
+      }
     }
   },
   "components": {

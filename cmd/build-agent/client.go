@@ -34,6 +34,9 @@ type claimedJob struct {
 	// GoogleServicesJSON 不是机密（它原样编进每个 APK），但按租户不同，所以也随
 	// 任务下发——这样新加一台打包机仍然只需要一个封装口令。
 	GoogleServicesJSON string `json:"googleServicesJson"`
+	// Icons 是启动图标，键是文件名（icon.png 等），值是 base64 的 PNG。和
+	// google-services.json 一样不是机密，按租户不同，所以随任务下发而不是留在仓库里
+	Icons map[string]string `json:"icons"`
 	// TenantFile 是服务端合成的 tenants/<目录>/tenant.json。它取代了仓库里那份
 	// 提交上去的文件——开一个新租户不该需要改代码。代理仍然校验字段（tenantfile.go）。
 	TenantFile json.RawMessage `json:"tenantFile"`

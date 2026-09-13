@@ -273,6 +273,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/builds/:id/cancel", s.cancelBuildJob)
 	group.GET("/build-config", s.getBuildConfig)
 	group.PUT("/build-config", s.saveBuildConfig)
+	// 启动图标：租户自己维护，随任务下发，不再放在 App 仓库里
+	group.GET("/build-icons", s.getBuildIcons)
+	group.PUT("/build-icons", s.updateBuildIcons)
+	group.GET("/build-icons/:name", s.getBuildIcon)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	group.PUT("/build-keystore", s.saveBuildKeystore)
 	// 在服务端生成签名密钥。它不削弱"服务端打不开已存密钥"这条性质——生成出来

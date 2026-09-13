@@ -599,6 +599,14 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	view["tenantSlug"] = slug
 	view["tenantDirectory"] = buildCfg.RepoDirectory
 	view["googleServicesJson"] = nullableString(buildCfg.GoogleServicesJSON)
+	// 启动图标随任务下发。它们是最后一个还留在 App 仓库里的按租户资源，而"加一个
+	// 租户要往仓库提交四个 png"这件事本身就把租户自助堵死了（见 build_icons.go）
+	icons, err := s.buildIconsForJob(c.Request.Context(), job.TenantID, buildCfg.Identity)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_INVALID", "Stored build.icons configuration is invalid")
+		return
+	}
+	view["icons"] = icons
 	// tenant.json 由服务端合成随任务下发，仓库里不再有这个文件。合成不出来就让
 	// 这条任务当场失败：缺的是签名密钥或发布身份这类东西，硬打出来的包装上去也
 	// 起不来，而那时候报的是"配置连接失败"，看不出根因（见 tenant_manifest.go）

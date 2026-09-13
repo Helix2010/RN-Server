@@ -138,11 +138,20 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	}
 	buf.add(fmt.Sprintf("tenant %s written as %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
 
+	// 启动图标随任务下发，写进仓库约定的那个目录。服务端没下发的（老租户）就用
+	// 仓库里已有的那一份，所以两种来源可以共存
+	written, err := writeTenantIcons(worktree, job.TenantDirectory, job.Icons)
+	if err != nil {
+		return result, err
+	}
+	if written > 0 {
+		buf.add(fmt.Sprintf("%d icons written from the tenant configuration", written))
+	}
 	// 图标在 prebuild 里才被读到，而那是 pnpm install 之后的事——少一个文件要等两
 	// 分钟才报错，报的还是一句 ENOENT 加一串 @expo 的栈。这里先看一眼。
 	if missing := missingTenantIcons(worktree, job.TenantDirectory); len(missing) > 0 {
-		return result, fmt.Errorf("这个租户的启动图标不在仓库里：%s。"+
-			"图标是构建期资源，目前仍然要提交到 App 仓库的 assets/tenants/%s/ 下",
+		return result, fmt.Errorf("这个租户缺这几张启动图标：%s。"+
+			"在控制台「Android 打包与签名 → 启动图标」上传，或者提交到 App 仓库的 assets/tenants/%s/ 下",
 			strings.Join(missing, "、"), job.TenantDirectory)
 	}
 
@@ -216,6 +225,38 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 		return result, err
 	}
 	return result, nil
+}
+
+// writeTenantIcons 把服务端下发的图标写进 assets/tenants/<slug>/。
+//
+// 文件名由服务端给（约定的那四个），这里仍然挡一次路径逃逸：两端分属不同信任域，
+// 各自把住自己那一侧。
+func writeTenantIcons(worktree, directory string, icons map[string]string) (int, error) {
+	if len(icons) == 0 {
+		return 0, nil
+	}
+	dir := filepath.Join(worktree, "assets", "tenants", directory)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, fmt.Errorf("create tenant asset directory: %w", err)
+	}
+	written := 0
+	for name, encoded := range icons {
+		if name != filepath.Base(name) || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+			return written, fmt.Errorf("refusing an icon name that escapes the tenant directory: %q", name)
+		}
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return written, fmt.Errorf("icon %s is not base64: %w", name, err)
+		}
+		if len(raw) == 0 {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+			return written, fmt.Errorf("write icon %s: %w", name, err)
+		}
+		written++
+	}
+	return written, nil
 }
 
 // missingTenantIcons 返回 prebuild 会去读、而仓库里还没有的那几个图标。

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -471,5 +472,38 @@ func TestMissingTenantIconsAreCaughtBeforeTheExpensiveSteps(t *testing.T) {
 	// 别的租户目录不该影响判断
 	if left := missingTenantIcons(worktree, "anyfun"); len(left) != 4 {
 		t.Fatalf("另一个租户应当照样报缺：%v", left)
+	}
+}
+
+// 图标随任务下发，写进 app.config.ts 会去读的那个目录。老租户服务端不下发，
+// 仓库里那份照旧生效——两种来源共存。
+func TestWriteTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
+	worktree := t.TempDir()
+	written, err := writeTenantIcons(worktree, "predict-kim", map[string]string{
+		"icon.png":                    base64.StdEncoding.EncodeToString([]byte("png-1")),
+		"android-icon-foreground.png": base64.StdEncoding.EncodeToString([]byte("png-2")),
+	})
+	if err != nil || written != 2 {
+		t.Fatalf("写了 %d 张：%v", written, err)
+	}
+	got, err := os.ReadFile(filepath.Join(worktree, "assets", "tenants", "predict-kim", "icon.png"))
+	if err != nil || string(got) != "png-1" {
+		t.Fatalf("图标没落到约定的路径上：%v", err)
+	}
+	// 一张都不下发时什么也不做，不去动仓库里已有的
+	if n, err := writeTenantIcons(worktree, "predict-kim", nil); err != nil || n != 0 {
+		t.Fatalf("空下发不该动任何东西：%d %v", n, err)
+	}
+}
+
+// 文件名是服务端给的，但服务端和代理分属不同信任域，路径逃逸各自挡一次
+func TestWriteTenantIconsRefusesNamesThatEscape(t *testing.T) {
+	worktree := t.TempDir()
+	for _, name := range []string{"../outside.png", "sub/dir.png", "..", "a/../../b.png"} {
+		if _, err := writeTenantIcons(worktree, "predict-kim", map[string]string{
+			name: base64.StdEncoding.EncodeToString([]byte("x")),
+		}); err == nil {
+			t.Fatalf("%q 应当被拒", name)
+		}
 	}
 }
