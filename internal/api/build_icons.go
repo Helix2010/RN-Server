@@ -53,6 +53,15 @@ const (
 	buildIconMaxBytes = 6 << 20
 	buildIconMinSide  = 256
 	buildIconMaxSide  = 2048
+
+	// buildIconBodyMaxBytes 是单张图那个请求的请求体上限，**由 buildIconMaxBytes
+	// 推出来**，不另写一个常数。
+	//
+	// 2026-09-13 的故障就是两个上限各改各的：单张上限从 2 MiB 抬到 6 MiB，而所有
+	// JSON 接口共用的 decode 还卡在 1 MiB，于是校验器接受的图永远送不进来——报错
+	// 还只说一句"payload 不合法"，看的人只会去换图片格式。
+	// base64 涨 4/3，再留 64 KiB 给 reason 和字段名。
+	buildIconBodyMaxBytes = buildIconMaxBytes*4/3 + (1 << 16)
 )
 
 type buildIcon struct {
@@ -194,63 +203,126 @@ func (s *server) getBuildIcon(c *gin.Context) {
 	c.Data(http.StatusOK, "image/png", raw)
 }
 
-func (s *server) updateBuildIcons(c *gin.Context) {
-	var body struct {
-		Icons   map[string]string `json:"icons"`
-		Reason  string            `json:"reason"`
-		Confirm bool              `json:"confirm"`
+// updateBuildIcon 收下一张图。一张一个请求：四张一起发的话，请求体要按"四张都取
+// 满"来放上限，那是 33 MB 的 JSON，而实际每次只改一两张。
+func (s *server) updateBuildIcon(c *gin.Context) {
+	name := c.Param("name")
+	if _, known := buildIconFileNames[name]; !known {
+		problem(c, http.StatusNotFound, "UNKNOWN_BUILD_ICON",
+			"unknown icon "+name+"; expected one of "+strings.Join(buildIconNames, ", "))
+		return
 	}
-	if decode(c, &body) != nil {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_ICONS", "Invalid build icons payload")
+	var body struct {
+		Data    string `json:"data"`
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := decodeLimited(c, &body, buildIconBodyMaxBytes); err != nil {
+		// 体积超限要单独说，而且要用人能动手的单位：他手上是一个几 MB 的 png，
+		// 不是一个"请求体"
+		if requestTooLarge(err) {
+			problem(c, http.StatusRequestEntityTooLarge, "BUILD_ICON_TOO_LARGE",
+				fmt.Sprintf("这张图太大了。单张 PNG 上限 %d KB，导出时压一下——它要随每次构建下发给打包机",
+					buildIconMaxBytes/1024))
+			return
+		}
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_ICONS", "Invalid build icon payload: "+err.Error())
 		return
 	}
 	if !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_ICONS", "reason and confirm=true are required")
 		return
 	}
-	current, err := s.buildIconsFor(c.Request.Context(), tenantID(c))
+	// 校验放在事务外：一次 PNG 解码不该握着行锁
+	icon, err := validateBuildIcon(body.Data)
 	if err != nil {
+		problem(c, http.StatusUnprocessableEntity, "INVALID_BUILD_ICONS", name+"："+err.Error())
+		return
+	}
+	s.writeBuildIcons(c, strings.TrimSpace(body.Reason), name, func(icons buildIcons) {
+		icons[name] = icon
+	})
+}
+
+// deleteBuildIcon 删掉一张，让它回落到别的来源（背景层回落成配置里那个纯色）。
+func (s *server) deleteBuildIcon(c *gin.Context) {
+	name := c.Param("name")
+	if _, known := buildIconFileNames[name]; !known {
+		problem(c, http.StatusNotFound, "UNKNOWN_BUILD_ICON",
+			"unknown icon "+name+"; expected one of "+strings.Join(buildIconNames, ", "))
+		return
+	}
+	var body struct {
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_ICONS", "reason and confirm=true are required")
+		return
+	}
+	s.writeBuildIcons(c, strings.TrimSpace(body.Reason), name, func(icons buildIcons) {
+		delete(icons, name)
+	})
+}
+
+// writeBuildIcons 把"读—改—写"放进一个事务并锁住那一行。
+//
+// 四张图存在同一个配置行里，而现在是一张一个请求——控制台一次保存会连着发几个。
+// 不加锁的话，后写的那个会拿着自己读到的旧副本把前一个刚写进去的覆盖掉，表现是
+// "传了四张，保存完只剩一张"。
+func (s *server) writeBuildIcons(c *gin.Context, reason, name string, apply func(buildIcons)) {
+	ctx := c.Request.Context()
+	tenant := tenantID(c)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_SAVE_FAILED", "Unable to save the icons")
+		return
+	}
+	defer tx.Rollback()
+
+	var raw []byte
+	err = tx.QueryRowContext(ctx,
+		`SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=? FOR UPDATE`,
+		tenant, buildIconsConfigKey).Scan(&raw)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		problem(c, http.StatusInternalServerError, "BUILD_ICONS_INVALID", "Stored build.icons configuration is invalid")
 		return
 	}
-	for name, encoded := range body.Icons {
-		if _, known := buildIconFileNames[name]; !known {
-			problem(c, http.StatusUnprocessableEntity, "INVALID_BUILD_ICONS",
-				"unknown icon "+name+"; expected one of "+strings.Join(buildIconNames, ", "))
-			return
-		}
-		// 空串是"删掉这一张"，让它回落到别的来源
-		if strings.TrimSpace(encoded) == "" {
-			delete(current, name)
-			continue
-		}
-		icon, err := validateBuildIcon(encoded)
-		if err != nil {
-			problem(c, http.StatusUnprocessableEntity, "INVALID_BUILD_ICONS", name+"："+err.Error())
-			return
-		}
-		current[name] = icon
+	icons := buildIcons{}
+	if len(raw) > 0 {
+		// 存坏了就当没有：这一行里是四张图，为了一张读不出来把另外三张也拒了更糟
+		_ = json.Unmarshal(raw, &icons)
 	}
-	value, err := json.Marshal(current)
+	apply(icons)
+
+	value, err := json.Marshal(icons)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_ICONS_SAVE_FAILED", "Unable to save the icons")
 		return
 	}
 	now := time.Now().UTC()
-	if _, err := s.db.ExecContext(c.Request.Context(),
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,?,?)
 		 ON DUPLICATE KEY UPDATE config_value=VALUES(config_value),version=app_configs.version+1,updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)`,
-		tenantID(c), buildIconsConfigKey, value, actor(c), now); err != nil {
+		tenant, buildIconsConfigKey, value, actor(c), now); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_ICONS_SAVE_FAILED", "Unable to save the icons")
 		return
 	}
-	// 审计记的是每一张的指纹：换图标等于换 App 在桌面上的样子，要能查是谁什么时候换的
-	digests := map[string]any{}
-	for name, icon := range current {
-		digests[name] = icon.SHA256
+	// 审计记这次动的是哪一张，以及动完之后四张各自的指纹：换图标等于换 App 在
+	// 桌面上的样子，要能查是谁什么时候换的
+	summary := map[string]any{"changed": name}
+	for iconName, icon := range icons {
+		summary[iconName] = icon.SHA256
 	}
-	s.auditNow(newAudit(tenantID(c), actor(c), "build_icons_update", "app-config", buildIconsConfigKey,
-		strings.TrimSpace(body.Reason), requestID(c), digests))
+	if err := insertAudit(ctx, tx, newAudit(tenant, actor(c), "build_icons_update", "app-config",
+		buildIconsConfigKey, reason, requestID(c), summary)); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_SAVE_FAILED", "Unable to save the icons")
+		return
+	}
+	if tx.Commit() != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_SAVE_FAILED", "Unable to save the icons")
+		return
+	}
 	s.getBuildIcons(c)
 }
 

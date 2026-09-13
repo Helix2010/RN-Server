@@ -275,8 +275,11 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/build-config", s.saveBuildConfig)
 	// 启动图标：租户自己维护，随任务下发，不再放在 App 仓库里
 	group.GET("/build-icons", s.getBuildIcons)
-	group.PUT("/build-icons", s.updateBuildIcons)
 	group.GET("/build-icons/:name", s.getBuildIcon)
+	// 一张一个请求。四张一起发的话，请求体要按"四张都取满"来放上限，那是 33 MB
+	// 的 JSON——为了一张 600 KB 的图给每个请求留那么大的口子不值得。
+	group.PUT("/build-icons/:name", s.updateBuildIcon)
+	group.DELETE("/build-icons/:name", s.deleteBuildIcon)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	group.PUT("/build-keystore", s.saveBuildKeystore)
 	// 在服务端生成签名密钥。它不削弱"服务端打不开已存密钥"这条性质——生成出来
@@ -1800,9 +1803,26 @@ func configSummary(v map[string]any) gin.H {
 	return gin.H{"configVersion": v["configVersion"], "localization": gin.H{"supportedLocales": l["supportedLocales"], "messagesVersion": l["messagesVersion"]}, "theme": gin.H{"paletteVersion": t["paletteVersion"], "modes": []string{"light", "dark"}}, "featureFlags": enabled, "updatePolicy": gin.H{"source": "mysql", "approvalRequired": false}, "wallet": gin.H{"chains": chains, "walletConnectConfigured": strings.TrimSpace(projectID) != ""}}
 }
 func decode(c *gin.Context, v any) error {
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+	return decodeLimited(c, v, 1<<20)
+}
+
+// decodeLimited 和 decode 一样，只是请求体上限由调用方给。
+//
+// 1 MiB 对配置 JSON 是合适的默认值，但对"正文里塞着一张 base64 图片"的接口不是。
+// 2026-09-13 的故障就是这么来的：图标校验器的单张上限抬到了 6 MiB，而所有接口共用
+// 的 decode 还卡在 1 MiB，于是校验器接受的图永远送不进来。把全局上限抬上去也不对
+// ——那等于给每一个接口都开一个更大的内存口子。
+func decodeLimited(c *gin.Context, v any, limit int64) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, limit))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(v)
+}
+
+// requestTooLarge 区分"请求体超限"和别的解码错误。
+// 不区分的代价是运营看到的永远是一句"数据不合法"，只会去换图片格式，不会想到大小。
+func requestTooLarge(err error) bool {
+	var tooLarge *http.MaxBytesError
+	return errors.As(err, &tooLarge)
 }
 func problem(c *gin.Context, status int, code, detail string) {
 	c.Header("Content-Type", "application/problem+json")

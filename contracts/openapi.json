@@ -2328,25 +2328,13 @@
     "/v1/admin/build-icons": {
       "get": {
         "summary": "Launcher icons this tenant has configured",
-        "description": "Metadata only (configured / sha256 / dimensions); the images themselves come from /v1/admin/build-icons/{name}. These four PNGs used to live in the app repository under assets/tenants/<slug>/, which meant a new tenant could not build at all until someone committed files there — the first predict-kim build failed on exactly that, with every other piece of configuration correct.",
+        "description": "Returns {icons, required, maxBytes}. The image bytes are not in this response — the console only needs \"is it set, what size\"; previews come from GET /v1/admin/build-icons/{name}. maxBytes is the per-icon PNG limit the console enforces when the operator picks a file.",
         "responses": {
           "200": {
             "description": "Icon status"
           },
           "401": {
             "description": "Admin authentication required"
-          }
-        }
-      },
-      "put": {
-        "summary": "Upload launcher icons",
-        "description": "Takes base64 PNGs keyed by icon, androidForeground, androidBackground, androidMonochrome; an empty string clears one. Each must be a square PNG between 256 and 2048 pixels and under 2 MiB — rejecting here rather than letting prebuild fail two minutes into a build with an ENOENT or a sharp stack trace. androidBackground may be omitted: the server generates a solid PNG from the tenant's iconBackgroundColor, which the console already collects.",
-        "responses": {
-          "200": {
-            "description": "Saved; returns the same shape as GET"
-          },
-          "422": {
-            "description": "INVALID_BUILD_ICONS"
           }
         }
       }
@@ -2361,6 +2349,67 @@
           },
           "404": {
             "description": "BUILD_ICON_NOT_FOUND"
+          }
+        }
+      },
+      "put": {
+        "summary": "Set one launcher icon",
+        "description": "Read-modify-write of the single build.icons row under a row lock: the four icons live in one row and the console sends them one after another, so an unlocked read-modify-write would let the later write drop the earlier one.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildIconWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved; the body is the same shape as GET /v1/admin/build-icons"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "UNKNOWN_BUILD_ICON"
+          },
+          "400": {
+            "description": "INVALID_BUILD_ICONS"
+          },
+          "413": {
+            "description": "BUILD_ICON_TOO_LARGE — the request body exceeded the limit derived from the per-icon PNG limit"
+          },
+          "422": {
+            "description": "INVALID_BUILD_ICONS — not a PNG, not square, or outside 256-2048 px"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove one launcher icon",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildIconDelete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved; the body is the same shape as GET /v1/admin/build-icons"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "UNKNOWN_BUILD_ICON"
+          },
+          "400": {
+            "description": "INVALID_BUILD_ICONS"
           }
         }
       }
@@ -3598,6 +3647,46 @@
           "iconBackgroundColor": {
             "type": "string",
             "pattern": "^#[0-9A-Fa-f]{6}$"
+          }
+        }
+      },
+      "BuildIconWrite": {
+        "type": "object",
+        "description": "One icon per request. Sending all four in one body would require a request-body limit sized for four maxed-out icons (~33 MB of JSON), and that limit would then exist on an endpoint that usually carries one 600 KB image. Before 2026-09-13 this was a bulk PUT and it hit the 1 MiB body limit every JSON endpoint shares: the per-icon validation limit had been raised to 6 MiB while the body limit had not, so an icon the validator accepted could never arrive — and the failure was reported as a generic \"payload is invalid\".",
+        "required": [
+          "data",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "format": "byte",
+            "description": "base64 of the PNG. Square, 256-2048 px a side, at most 6 MiB. Over the body limit the server answers 413 BUILD_ICON_TOO_LARGE naming the PNG limit, not the body limit — the operator is holding a png, not a request."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BuildIconDelete": {
+        "type": "object",
+        "description": "Removes one icon so it falls back to another source — the adaptive background falls back to a solid PNG generated from iconBackgroundColor.",
+        "required": [
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
           }
         }
       }
