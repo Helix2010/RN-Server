@@ -974,7 +974,7 @@ func (s *server) otaManifest(c *gin.Context) {
 	}
 	channel := strings.TrimSpace(c.GetHeader("expo-channel-name"))
 	if channel == "" {
-		channel = s.cfg.OTAChannel
+		channel = tenantOTAChannel
 	}
 	if platform == "" || runtime == "" {
 		writeExpoNoUpdate(c)

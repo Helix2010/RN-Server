@@ -58,8 +58,6 @@ func TestDBCanaryOverTheRealRouter(t *testing.T) {
 		Environment:       "test",
 		DeviceIdentityKey: base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)),
 		StorageMasterKey:  base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
-		OTAChannel:        "production",
-		AndroidDirectURL:  "https://" + domain + "/download",
 		MySQLQueryTimeout: 10,
 	}
 	router := New(cfg, &store.Store{DB: db})

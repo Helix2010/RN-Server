@@ -32,6 +32,18 @@ func main() {
 		slog.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
+	// `rn-server config` 不连库：配置有问题的时候多半正是连不上库的时候
+	if len(os.Args) == 2 && os.Args[1] == "config" {
+		printConfig(cfg)
+		return
+	}
+	// 旧的十一个 MYSQL_* 键还认，但每次启动都说一次，并把等价的那一行直接给出来
+	// ——运维照抄进 env 就完成了迁移。代码和 env 是分别部署的，只认 DSN 会让
+	// "代码先到"的那次部署红掉。
+	if cfg.MySQLSource != "MYSQL_DSN" {
+		slog.Warn("MYSQL_HOST/PORT/USER/PASSWORD/DATABASE and friends are deprecated; put this one line in the env file as MYSQL_DSN (with the real password) and delete the eleven keys",
+			"equivalent", cfg.RedactedMySQLDSN())
+	}
 	database, err := store.Open(cfg)
 	if err != nil {
 		slog.Error("database initialization failed", "error", err)

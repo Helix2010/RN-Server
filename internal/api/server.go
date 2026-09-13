@@ -1603,7 +1603,10 @@ func (s *server) bootstrap(c *gin.Context) {
 	updatePolicy := object(cfg["updatePolicy"])
 	latest := text(updatePolicy["latestVersion"], "1.1.0")
 	minimum := text(updatePolicy["minSupportedVersion"], "0.9.0")
-	actionURL := s.actionURL(platform, distribution)
+	// 下载地址是按租户的：有可见发布时由下面的 /v1/public/releases/{id}/download
+	// 填上。商店 / MDM 渠道没有直装包，留空。从前这里读 env 里的四个全局链接，
+	// 那是错的——一个全局值不可能同时对四个租户都对，而且它总会被下面覆盖掉。
+	actionURL := ""
 	var releaseID any
 	var artifactSHA any
 	var artifactSize any
@@ -1710,7 +1713,7 @@ func (s *server) bootstrap(c *gin.Context) {
 	}
 	branding := resolveBranding(brandingConfig, locale, text(localization["fallbackLocale"], "zh-CN"), brandingMessages)
 	runtime := text(c.GetHeader("x-runtime-version"), "embedded")
-	otaChannel := text(updatePolicy["otaChannel"], s.cfg.OTAChannel)
+	otaChannel := text(updatePolicy["otaChannel"], tenantOTAChannel)
 	ota := gin.H{"enabled": features["otaEnabled"], "channel": otaChannel, "runtimeVersion": runtime, "revision": nil, "updateId": nil, "baseReleaseId": nil, "applyStrategy": nil, "releaseNotes": []string{}}
 	if runtime != "embedded" && truth(features["otaEnabled"]) {
 		var otaRevision int
@@ -1739,22 +1742,6 @@ func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
 	}
 	sort.Strings(codes)
 	return codes
-}
-
-func (s *server) actionURL(platform, distribution string) string {
-	if platform == "android" && distribution == "direct" {
-		return s.cfg.AndroidDirectURL
-	}
-	if platform == "android" && distribution == "store" {
-		return s.cfg.AndroidStoreURL
-	}
-	if platform == "ios" && distribution == "mdm" {
-		return s.cfg.IOSMDMURL
-	}
-	if platform == "ios" && distribution == "store" {
-		return s.cfg.IOSStoreURL
-	}
-	return ""
 }
 
 func insertAudit(ctx context.Context, tx *sql.Tx, a auditEvent) error {

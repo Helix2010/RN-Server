@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/Helix2010/RN-Server/internal/store"
@@ -25,20 +26,47 @@ import (
 
 // 数据库集成测试（设计 device-account-aggregation-2026-09-07 §4.12）：
 // 需要一个可清空的 MySQL 8，通过环境变量指定；没有配置时整组跳过，不算通过。
-//   RN_TEST_MYSQL_HOST=127.0.0.1 RN_TEST_MYSQL_PORT=33061 RN_TEST_MYSQL_USER=root \
-//   RN_TEST_MYSQL_PASSWORD=rn-test RN_TEST_MYSQL_DATABASE=rn_test go test ./internal/api/ -run TestDB
+//   RN_TEST_MYSQL_DSN='root:rn-test@tcp(127.0.0.1:33061)/rn_test?parseTime=true' go test ./internal/api/ -run TestDB
+// 旧的五个变量（RN_TEST_MYSQL_HOST/PORT/USER/PASSWORD/DATABASE）仍然认，见 testMySQLDSN。
 // 每个测试用自己的租户 ID，互不干扰；迁移只在首次打开时跑一遍。
 
 var testDB *sql.DB
 
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	host := os.Getenv("RN_TEST_MYSQL_HOST")
-	if host == "" {
-		t.Skip("RN_TEST_MYSQL_HOST not set; database-backed tests skipped")
+	dsn := testMySQLDSN()
+	if dsn == "" {
+		t.Skip("RN_TEST_MYSQL_DSN / RN_TEST_MYSQL_HOST not set; database-backed tests skipped")
 	}
 	if testDB != nil {
 		return testDB
+	}
+	driverCfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("RN_TEST_MYSQL_DSN is not a valid DSN: %v", err)
+	}
+	cfg := config.Config{
+		MySQL:                driverCfg,
+		MySQLConnectionLimit: 5, MySQLMaxIdleConnections: 2, MySQLConnectionMaxLifetime: 600, MySQLConnectionMaxIdleTime: 60, MySQLQueryTimeout: 10,
+		MySQLInitTimeout: 60, MySQLInitMaxAttempts: 3, MySQLInitRetryDelay: 1, MySQLAutoMigrate: true,
+	}
+	st, err := store.Open(cfg)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	testDB = st.DB
+	return testDB
+}
+
+// testMySQLDSN 优先用 RN_TEST_MYSQL_DSN；没有它就拿五个旧变量拼一份，这样 CI 上
+// 已有的 RN_TEST_MYSQL_HOST 等设置不必跟着这次改动一起改。
+func testMySQLDSN() string {
+	if dsn := strings.TrimSpace(os.Getenv("RN_TEST_MYSQL_DSN")); dsn != "" {
+		return dsn
+	}
+	host := os.Getenv("RN_TEST_MYSQL_HOST")
+	if host == "" {
+		return ""
 	}
 	port, _ := strconv.Atoi(os.Getenv("RN_TEST_MYSQL_PORT"))
 	if port == 0 {
@@ -50,18 +78,15 @@ func openTestDB(t *testing.T) *sql.DB {
 		}
 		return fallback
 	}
-	cfg := config.Config{
-		MySQLHost: host, MySQLPort: port, MySQLUser: env("RN_TEST_MYSQL_USER", "root"), MySQLPassword: os.Getenv("RN_TEST_MYSQL_PASSWORD"), MySQLDatabase: env("RN_TEST_MYSQL_DATABASE", "rn_test"),
-		MySQLConnectionLimit: 5, MySQLMaxIdleConnections: 2, MySQLConnectionMaxLifetime: 600, MySQLConnectionMaxIdleTime: 60, MySQLQueryTimeout: 10,
-		MySQLCharset: "utf8mb4", MySQLTimezone: "UTC", MySQLParseTime: true, MySQLConnectTimeout: 5, MySQLReadTimeout: 30, MySQLWriteTimeout: 30,
-		MySQLInitTimeout: 60, MySQLInitMaxAttempts: 3, MySQLInitRetryDelay: 1, MySQLAutoMigrate: true,
-	}
-	st, err := store.Open(cfg)
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	testDB = st.DB
-	return testDB
+	driverCfg := mysql.NewConfig()
+	driverCfg.User = env("RN_TEST_MYSQL_USER", "root")
+	driverCfg.Passwd = os.Getenv("RN_TEST_MYSQL_PASSWORD")
+	driverCfg.Net, driverCfg.Addr = "tcp", fmt.Sprintf("%s:%d", host, port)
+	driverCfg.DBName = env("RN_TEST_MYSQL_DATABASE", "rn_test")
+	driverCfg.ParseTime = true
+	driverCfg.Params = map[string]string{"charset": "utf8mb4"}
+	driverCfg.Timeout, driverCfg.ReadTimeout, driverCfg.WriteTimeout = 5*time.Second, 30*time.Second, 30*time.Second
+	return driverCfg.FormatDSN()
 }
 
 func testContext(t *testing.T, tenant, method, target string, body any) (*gin.Context, *httptest.ResponseRecorder) {

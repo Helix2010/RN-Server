@@ -29,7 +29,6 @@ func canaryTestServer(db *sql.DB) *server {
 		panic(err)
 	}
 	s.secrets = box
-	s.cfg.OTAChannel = "production"
 	return s
 }
 

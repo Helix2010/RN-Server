@@ -7,31 +7,8 @@ import (
 	"github.com/Helix2010/RN-Server/internal/config"
 )
 
-func TestDriverConfigUsesConfiguredConnectionOptions(t *testing.T) {
-	cfg := config.Config{
-		MySQLHost:           "db.internal",
-		MySQLPort:           13306,
-		MySQLUser:           "app",
-		MySQLPassword:       "secret",
-		MySQLDatabase:       "foundation",
-		MySQLCharset:        "utf8mb4",
-		MySQLTimezone:       "Asia/Shanghai",
-		MySQLParseTime:      true,
-		MySQLConnectTimeout: 17,
-		MySQLReadTimeout:    29,
-		MySQLWriteTimeout:   31,
-	}
-
-	driverCfg, err := driverConfig(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if driverCfg.Addr != "db.internal:13306" || driverCfg.DBName != "foundation" || driverCfg.Params["charset"] != "utf8mb4" ||
-		!driverCfg.ParseTime || driverCfg.Loc.String() != "Asia/Shanghai" || driverCfg.Timeout != 17*time.Second ||
-		driverCfg.ReadTimeout != 29*time.Second || driverCfg.WriteTimeout != 31*time.Second || !driverCfg.AllowNativePasswords {
-		t.Fatalf("unexpected driver config: %#v", driverCfg)
-	}
-}
+// 连接参数的断言搬到了 internal/config：它们现在由 MYSQL_DSN 解析而来，
+// store 这边只负责连接池——那几项驱动不认，必须留在 database/sql 这一层。
 
 func TestPoolSettingsUseConfiguredLimits(t *testing.T) {
 	cfg := config.Config{

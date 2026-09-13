@@ -3,12 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/config"
-	"github.com/go-sql-driver/mysql"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 type Store struct{ DB *sql.DB }
@@ -21,11 +21,10 @@ type poolSettings struct {
 }
 
 func Open(cfg config.Config) (*Store, error) {
-	driverCfg, err := driverConfig(cfg)
-	if err != nil {
-		return nil, err
+	if cfg.MySQL == nil {
+		return nil, errors.New("database connection is not configured (MYSQL_DSN)")
 	}
-	db, err := sql.Open("mysql", driverCfg.FormatDSN())
+	db, err := sql.Open("mysql", cfg.MySQL.FormatDSN())
 	if err != nil {
 		return nil, err
 	}
@@ -55,35 +54,6 @@ func configuredPoolSettings(cfg config.Config) poolSettings {
 		maxLifetime: time.Duration(cfg.MySQLConnectionMaxLifetime) * time.Second,
 		maxIdleTime: time.Duration(cfg.MySQLConnectionMaxIdleTime) * time.Second,
 	}
-}
-
-func driverConfig(cfg config.Config) (mysql.Config, error) {
-	location := cfg.MySQLTimezone
-	if location == "Z" {
-		location = "UTC"
-	}
-	loc := time.Local
-	if !strings.EqualFold(location, "local") {
-		var err error
-		loc, err = time.LoadLocation(location)
-		if err != nil {
-			return mysql.Config{}, fmt.Errorf("invalid MYSQL_TIMEZONE: %w", err)
-		}
-	}
-	return mysql.Config{
-		User:                 cfg.MySQLUser,
-		Passwd:               cfg.MySQLPassword,
-		Net:                  "tcp",
-		Addr:                 cfg.MySQLAddress(),
-		DBName:               cfg.MySQLDatabase,
-		ParseTime:            cfg.MySQLParseTime,
-		Loc:                  loc,
-		AllowNativePasswords: true,
-		Params:               map[string]string{"charset": cfg.MySQLCharset},
-		Timeout:              time.Duration(cfg.MySQLConnectTimeout) * time.Second,
-		ReadTimeout:          time.Duration(cfg.MySQLReadTimeout) * time.Second,
-		WriteTimeout:         time.Duration(cfg.MySQLWriteTimeout) * time.Second,
-	}, nil
 }
 
 func pingWithRetry(db *sql.DB, cfg config.Config) error {
