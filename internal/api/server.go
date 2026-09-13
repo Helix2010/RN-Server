@@ -204,12 +204,16 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// 真图标（2048 见方，四张 3.8MB）会把它截断成半截 JSON
 	agent.GET("/jobs/:id/icons/:name", s.buildAgentJobScope(s.buildJobIcon))
 	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
-	agent.POST("/jobs/:id/complete", s.completeBuildJob)
+	// 走任务作用域是为了拿到 kind：热更新任务的产物 id 要落到 ota_release_id
+	agent.POST("/jobs/:id/complete", s.buildAgentJobScope(s.completeBuildJob))
 	agent.POST("/jobs/:id/fail", s.failBuildJob)
 	// 产物回传：三条都先用任务把租户定下来，再交给与人工上传完全相同的处理函数
 	agent.POST("/jobs/:id/artifact-uploads", s.buildAgentJobScope(s.createReleaseArtifactUpload))
 	agent.PUT("/jobs/:id/artifact", s.buildAgentJobScope(s.uploadReleaseArtifact))
 	agent.POST("/jobs/:id/release", s.buildAgentJobScope(s.buildAgentReleaseFromArtifact))
+	// 热更新包：票据与修订都取任务行上的参数，代理不带 base / channel / 生效方式
+	agent.POST("/jobs/:id/ota-uploads", s.buildAgentJobScope(s.buildJobOTAUpload))
+	agent.POST("/jobs/:id/ota-release", s.buildAgentJobScope(s.buildJobOTARelease))
 	current := protected.Group("")
 	current.Use(s.domainTenantScope())
 	current.GET("/tenant", s.currentTenant)

@@ -49,9 +49,16 @@ const buildJobLogTailMax = 200
 var semverPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 type buildJob struct {
-	ID             string
-	TenantID       string
-	Platform       string
+	ID       string
+	TenantID string
+	Platform string
+	// Kind 区分"编译安装包"和"构建热更新包"。两者共用这张表、这套状态流转和这套
+	// 回收：它们是同一种实体——一个排队等打包机干的活。
+	Kind           string
+	BaseReleaseID  sql.NullString
+	Channel        sql.NullString
+	ApplyStrategy  sql.NullString
+	OTAReleaseID   sql.NullString
 	GitRef         string
 	CommitSHA      sql.NullString
 	Version        string
@@ -71,11 +78,12 @@ type buildJob struct {
 	UpdatedAt      time.Time
 }
 
-const buildJobColumns = `id,tenant_id,platform,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at`
+const buildJobColumns = `id,tenant_id,platform,kind,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at`
 
 func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 	var j buildJob
-	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.GitRef, &j.CommitSHA, &j.Version, &j.BuildNumber,
+	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.Kind, &j.BaseReleaseID, &j.Channel, &j.ApplyStrategy,
+		&j.OTAReleaseID, &j.GitRef, &j.CommitSHA, &j.Version, &j.BuildNumber,
 		&j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.HeartbeatAt, &j.ReleaseID, &j.ArtifactSHA256, &j.LogTail,
 		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt)
 	return j, err
@@ -94,6 +102,11 @@ func buildJobView(j buildJob) map[string]any {
 	return map[string]any{
 		"id":             j.ID,
 		"platform":       j.Platform,
+		"kind":           j.Kind,
+		"baseReleaseId":  nullableString(j.BaseReleaseID.String),
+		"channel":        nullableString(j.Channel.String),
+		"applyStrategy":  nullableString(j.ApplyStrategy.String),
+		"otaReleaseId":   nullableString(j.OTAReleaseID.String),
 		"gitRef":         j.GitRef,
 		"commitSha":      nullableString(j.CommitSHA.String),
 		"version":        j.Version,
@@ -215,6 +228,11 @@ type buildJobCreate struct {
 	ReleaseNotes map[string]any `json:"releaseNotes"`
 	Reason       string         `json:"reason"`
 	Confirm      bool           `json:"confirm"`
+	// Kind 空或 "apk" 走安装包那条；"ota" 走热更新那条（见 build_ota_jobs.go），
+	// 那条不看 version / buildNumber，改看 baseReleaseId / applyStrategy。
+	Kind          string `json:"kind"`
+	BaseReleaseID string `json:"baseReleaseId"`
+	ApplyStrategy string `json:"applyStrategy"`
 	// AcknowledgeIdentityChange：这次构建会改变包名或签名指纹时必须显式带上。
 	AcknowledgeIdentityChange bool `json:"acknowledgeIdentityChange"`
 }
@@ -254,6 +272,10 @@ func (s *server) createBuildJob(c *gin.Context) {
 	var body buildJobCreate
 	if decode(c, &body) != nil {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_JOB", "platform, gitRef, version, buildNumber, reason and confirm=true are required")
+		return
+	}
+	if strings.TrimSpace(body.Kind) == "ota" {
+		s.createOTABuildJob(c, body)
 		return
 	}
 	platform := strings.ToLower(strings.TrimSpace(body.Platform))
@@ -627,6 +649,23 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		return
 	}
 	view["tenantFile"] = manifest
+	// 热更新任务到此为止：它不需要签名密钥，也就不该拿到。这不是省事——最小权限在
+	// 这条链路上是可执行的，一个不需要 keystore 的任务拿到 keystore 只会扩大爆炸半径。
+	// runtimeVersion 取基线那一版：热更新包必须对准它，否则一台设备都收不到。
+	if job.Kind == "ota" {
+		base, baseErr := s.otaJobBaseFor(c.Request.Context(), job.TenantID, job.BaseReleaseID.String)
+		if baseErr != nil {
+			detail := "这条热更新任务的基线安装包已经不可用了：" + baseErr.Error()
+			s.markBuildJobFailed(c.Request.Context(), job.ID, detail)
+			problem(c, http.StatusConflict, "OTA_BASE_RELEASE_INVALID", detail)
+			return
+		}
+		view["runtimeVersion"] = base.RuntimeVersion
+		view["sealedKeystore"] = nil
+		view["keyAlias"] = nil
+		c.JSON(http.StatusOK, view)
+		return
+	}
 	// 签名密钥以**服务端打不开的盒子**下发。打包机本地持有封装口令，自己开。
 	// 没配就留 null，代理会当场失败并说清楚缺什么。
 	sealedKeystore, keyAlias, err := s.sealedBuildKeystoreFor(c.Request.Context(), job.TenantID)
@@ -698,8 +737,17 @@ func (s *server) completeBuildJob(c *gin.Context) {
 		return
 	}
 	now := time.Now().UTC()
+	// 热更新任务产出的是 ota_releases 里的一条修订，不是 app_releases。两者共用
+	// 代理那一个 releaseId 字段，落库时按 kind 分开——一列里混两种外键，读的人早晚
+	// 会拿它去 JOIN 错的表。
+	releaseColumn := "release_id"
+	if job, ok := c.Get("buildJob"); ok {
+		if item, ok := job.(buildJob); ok && item.Kind == "ota" {
+			releaseColumn = "ota_release_id"
+		}
+	}
 	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='succeeded',commit_sha=?,artifact_sha256=?,release_id=?,log_tail=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
+		`UPDATE build_jobs SET status='succeeded',commit_sha=?,artifact_sha256=?,`+releaseColumn+`=?,log_tail=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
 		commit, digest, sqlNullableString(strings.TrimSpace(body.ReleaseID)), clampLogTail(body.LogTail), now, now, c.Param("id"))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build result")
@@ -884,6 +932,8 @@ func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
 		// SBOM 与产物一起传上来，同一张票据机制，不同的对象。代理生成不出来时
 		// 整个任务就失败了，所以走到这里它一般是有值的——留空只为兼容手工重放。
 		SBOMToken string `json:"sbomToken"`
+		// 原生面指纹：决定这个包以后能不能收热更新（见 ota_fingerprint.go）
+		NativeFingerprint string `json:"nativeFingerprint"`
 	}
 	if decode(c, &body) != nil || strings.TrimSpace(body.ArtifactToken) == "" {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "artifactToken is required")
@@ -895,16 +945,23 @@ func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
 	for language, lines := range buildJobReleaseNotes(job) {
 		notes[language] = lines
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"artifactToken": body.ArtifactToken,
-		"sbomToken":     body.SBOMToken,
-		"platform":      job.Platform,
-		"version":       job.Version,
-		"buildNumber":   job.BuildNumber,
-		"releaseNotes":  notes,
-		"mandatory":     false,
+	rewriteJSONBody(c, map[string]any{
+		"artifactToken":     body.ArtifactToken,
+		"sbomToken":         body.SBOMToken,
+		"nativeFingerprint": body.NativeFingerprint,
+		"platform":          job.Platform,
+		"version":           job.Version,
+		"buildNumber":       job.BuildNumber,
+		"releaseNotes":      notes,
+		"mandatory":         false,
 	})
-	c.Request.Body = io.NopCloser(bytes.NewReader(payload))
-	c.Request.ContentLength = int64(len(payload))
 	s.createReleaseFromArtifact(c)
+}
+
+// rewriteJSONBody 把请求体换成服务端自己拼的那一份，供内部转调的处理器读。
+// 代理只送它确实知道的东西（票据、提交）；决定产物发给谁的参数一律来自任务行。
+func rewriteJSONBody(c *gin.Context, payload map[string]any) {
+	raw, _ := json.Marshal(payload)
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	c.Request.ContentLength = int64(len(raw))
 }

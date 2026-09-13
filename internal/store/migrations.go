@@ -58,6 +58,7 @@ var migrations = []migration{
 	{version: 42, name: "build_jobs_release_notes", apply: buildJobsReleaseNotesMigration},
 	{version: 43, name: "installation_device_integrity", apply: installationDeviceIntegrityMigration},
 	{version: 44, name: "consistent_default_config", apply: consistentDefaultConfigMigration},
+	{version: 45, name: "build_jobs_ota", apply: buildJobsOTAMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1442,4 +1443,77 @@ func consistentDefaultConfigMigration(ctx context.Context, db *sql.DB) error {
 		  AND JSON_EXTRACT(config_value,'$.modules.predict')=CAST(true AS JSON)
 		  AND JSON_EXTRACT(config_value,'$.services.predict') IS NULL`)
 	return err
+}
+
+// buildJobsOTAMigration 让打包任务也能是"构建一个热更新包"。
+//
+// 复用 build_jobs 而不是新建表：这就是同一种实体——一个排队等打包机干的活，状态流转、
+// 心跳、超时回收、日志尾部、取消全都一样（见 AGENTS.md「先复用再建表」）。
+//
+// 唯一索引必须跟着改，否则 OTA 任务会和**产生它基线的那条 APK 任务**撞号：
+// live_build_number 原来对 queued/claimed/running/succeeded 都取 build_number，而基线那条
+// APK 任务正是 succeeded。表现是排队直接 500，而报错完全看不出根因。OTA 不产生新的
+// build 号，索引里干脆不收它。
+//
+// 同时加一条 OTA 自己的并发闸：live_ota_slot 让同租户同平台**同时只能有一条在跑的 OTA
+// 任务**。APK 那边的并发上限是 build 号递增天然给的，OTA 没有这个约束——不加闸，一个
+// 租户点十下就把跨租户的队列占满了。
+func buildJobsOTAMigration(ctx context.Context, db *sql.DB) error {
+	columns := []struct{ name, ddl string }{
+		{"kind", `ALTER TABLE build_jobs ADD COLUMN kind ENUM('apk','ota') NOT NULL DEFAULT 'apk'
+			COMMENT '任务类型：apk=编译安装包，ota=构建热更新包。老数据都是 apk' AFTER platform`},
+		{"base_release_id", `ALTER TABLE build_jobs ADD COLUMN base_release_id VARCHAR(80) NULL
+			COMMENT 'OTA 的基线安装包（app_releases.id）：热更新只发给装着这一版的设备。apk 任务为 NULL'`},
+		{"channel", `ALTER TABLE build_jobs ADD COLUMN channel VARCHAR(40) NULL
+			COMMENT 'OTA 发布 channel（production 等）；apk 任务为 NULL'`},
+		{"apply_strategy", `ALTER TABLE build_jobs ADD COLUMN apply_strategy ENUM('next_launch','immediate') NULL
+			COMMENT 'OTA 生效方式：next_launch=下次冷启动，immediate=拉到后立刻重启应用；apk 任务为 NULL'`},
+		{"ota_release_id", `ALTER TABLE build_jobs ADD COLUMN ota_release_id VARCHAR(80) NULL
+			COMMENT '构建成功后落到 ota_releases 的那条修订；NULL=还没有。apk 任务用 release_id'`},
+	}
+	for _, column := range columns {
+		if err := addColumnIfMissing(ctx, db, "build_jobs", column.name, column.ddl); err != nil {
+			return fmt.Errorf("build jobs ota migration add %s: %w", column.name, err)
+		}
+	}
+	// 生成列的表达式改不了，只能连索引一起重建
+	var current string
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(GENERATION_EXPRESSION,'') FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='build_jobs' AND COLUMN_NAME='live_build_number'`).Scan(&current); err != nil {
+		return fmt.Errorf("build jobs ota migration inspect generated column: %w", err)
+	}
+	if !strings.Contains(current, "kind") {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE build_jobs DROP INDEX ux_build_jobs_live_build_number`); err != nil &&
+			!strings.Contains(err.Error(), "check that column/key exists") {
+			return fmt.Errorf("build jobs ota migration drop build number index: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE build_jobs DROP COLUMN live_build_number`); err != nil {
+			return fmt.Errorf("build jobs ota migration drop generated column: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE build_jobs ADD COLUMN live_build_number INT UNSIGNED
+			GENERATED ALWAYS AS (CASE WHEN kind='apk' AND status IN ('queued','claimed','running','succeeded') THEN build_number ELSE NULL END) STORED
+			COMMENT '还活着的 APK 任务的 build 号：失败/取消/以及全部 OTA 任务为 NULL。唯一索引建在它上面'`); err != nil {
+			return fmt.Errorf("build jobs ota migration add generated column: %w", err)
+		}
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX ux_build_jobs_live_build_number ON build_jobs (tenant_id, platform, live_build_number)`); err != nil {
+			return fmt.Errorf("build jobs ota migration recreate build number index: %w", err)
+		}
+	}
+	if err := addColumnIfMissing(ctx, db, "build_jobs", "live_ota_slot",
+		`ALTER TABLE build_jobs ADD COLUMN live_ota_slot TINYINT UNSIGNED
+			GENERATED ALWAYS AS (CASE WHEN kind='ota' AND status IN ('queued','claimed','running') THEN 1 ELSE NULL END) STORED
+			COMMENT '在跑的 OTA 任务占位：同租户同平台同时只允许一条。做完（成功或失败）就释放'`); err != nil {
+		return fmt.Errorf("build jobs ota migration add ota slot: %w", err)
+	}
+	var exists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='build_jobs' AND INDEX_NAME='ux_build_jobs_live_ota'`).Scan(&exists); err != nil {
+		return fmt.Errorf("build jobs ota migration inspect ota index: %w", err)
+	}
+	if exists == 0 {
+		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX ux_build_jobs_live_ota ON build_jobs (tenant_id, platform, live_ota_slot)`); err != nil {
+			return fmt.Errorf("build jobs ota migration create ota index: %w", err)
+		}
+	}
+	return nil
 }

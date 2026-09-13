@@ -617,7 +617,7 @@ func TestUploadRetriesTransientFailuresButNotRejections(t *testing.T) {
 	api := newClient(config{Server: server.URL, Token: "t"})
 	buf := newLogBuffer(newRedactor())
 
-	release, err := api.uploadArtifact(context.Background(), "bld_1", apk, "", buf)
+	release, err := api.uploadArtifact(context.Background(), "bld_1", apk, "", "", buf)
 	if err != nil {
 		t.Fatalf("两次 502 之后应该传上去：%v", err)
 	}
@@ -628,7 +628,7 @@ func TestUploadRetriesTransientFailuresButNotRejections(t *testing.T) {
 	// 409 是拒绝，不许重试
 	mode = "reject"
 	attempts["release"] = 0
-	if _, err = api.uploadArtifact(context.Background(), "bld_1", apk, "", buf); err == nil {
+	if _, err = api.uploadArtifact(context.Background(), "bld_1", apk, "", "", buf); err == nil {
 		t.Fatal("版本号没涨还是建出了发布记录")
 	}
 	if attempts["release"] != 1 {

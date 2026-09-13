@@ -442,6 +442,21 @@ func (s *server) saveOTARelease(c *gin.Context) {
 			return
 		}
 	}
+	// 更新包不能改变应用身份：apiBaseUrl 决定设备此后把请求发给谁，
+	// bootstrapSignerAddress 决定它信谁的签名。见 ota_identity.go。
+	if err := s.otaIdentityMismatch(c.Request.Context(), tenantID(c), manifest, baseVersion, baseBuild); err != nil {
+		problem(c, 422, "OTA_IDENTITY_MISMATCH", err.Error())
+		return
+	}
+	// 原生面变了就不能走热更新：设备会去调一个 APK 里不存在的原生模块（见 ota_fingerprint.go）
+	if err := otaFingerprintMismatch(manifest, baseFileMetadata); err != nil {
+		code := "OTA_NATIVE_CHANGED"
+		if errors.Is(err, errOTAFingerprintMissing) {
+			code = "OTA_BASE_FINGERPRINT_MISSING"
+		}
+		problem(c, 422, code, err.Error())
+		return
+	}
 	updateID := manifest["id"].(string)
 	releaseID := "ota_" + randomID(16)
 	_, prefix, _ := s.storageClientForTenant(c.Request.Context(), tenantID(c))

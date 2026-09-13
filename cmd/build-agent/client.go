@@ -22,8 +22,15 @@ type claimedJob struct {
 	TenantSlug string `json:"tenantSlug"`
 	// TenantDirectory 是仓库里 tenants/ 下的目录名。它与 TenantSlug 是两套命名，
 	// 代理只用这一个去拼路径。
-	TenantDirectory      string `json:"tenantDirectory"`
-	Platform             string `json:"platform"`
+	TenantDirectory string `json:"tenantDirectory"`
+	Platform        string `json:"platform"`
+	// Kind 是 "apk" 或 "ota"。热更新任务不带签名密钥——它不需要，也就不该拿到。
+	Kind          string `json:"kind"`
+	BaseReleaseID string `json:"baseReleaseId"`
+	Channel       string `json:"channel"`
+	ApplyStrategy string `json:"applyStrategy"`
+	// RuntimeVersion 是基线安装包的 runtime：热更新包必须对准它，否则一台设备都收不到。
+	RuntimeVersion       string `json:"runtimeVersion"`
 	GitRef               string `json:"gitRef"`
 	Version              string `json:"version"`
 	BuildNumber          int    `json:"buildNumber"`
@@ -41,6 +48,20 @@ type claimedJob struct {
 	// TenantFile 是服务端合成的 tenants/<目录>/tenant.json。它取代了仓库里那份
 	// 提交上去的文件——开一个新租户不该需要改代码。代理仍然校验字段（tenantfile.go）。
 	TenantFile json.RawMessage `json:"tenantFile"`
+}
+
+// APIBaseURL / ApplicationID 从服务端合成的身份文件里取。代理不自己拼这些值：
+// 它们决定设备此后跟谁说话，唯一来源是服务端。
+func (j claimedJob) APIBaseURL() string    { return j.tenantField("apiBaseUrl") }
+func (j claimedJob) ApplicationID() string { return j.tenantField("applicationId") }
+
+func (j claimedJob) tenantField(name string) string {
+	var fields map[string]any
+	if json.Unmarshal(j.TenantFile, &fields) != nil {
+		return ""
+	}
+	value, _ := fields[name].(string)
+	return value
 }
 
 type client struct {
@@ -184,7 +205,7 @@ type uploadTicket struct {
 //
 // 仍然可能多留一份：PUT 落了地而响应丢在回来的路上，重试就是第二次上传。这一侧无
 // 解——票据是一次性的，服务端也没法凭空知道那次传成没传成——只是把窗口收到最小。
-func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath string, buf *logBuffer) (string, error) {
+func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath, fingerprint string, buf *logBuffer) (string, error) {
 	artifactToken := ""
 	err := withRetry(ctx, buf, "artifact upload", 6, func(ctx context.Context) error {
 		token, err := c.putFile(ctx, jobID, path, "application/vnd.android.package-archive")
@@ -214,8 +235,9 @@ func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath strin
 	}
 	if err := withRetry(ctx, buf, "release creation", 6, func(ctx context.Context) error {
 		_, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
-			"artifactToken": artifactToken,
-			"sbomToken":     sbomToken,
+			"artifactToken":     artifactToken,
+			"sbomToken":         sbomToken,
+			"nativeFingerprint": fingerprint,
 		}, &release)
 		return err
 	}); err != nil {
@@ -239,14 +261,28 @@ func (c *client) putFile(ctx context.Context, jobID, path, contentType string) (
 	}, &ticket); err != nil {
 		return "", err
 	}
+	if err := c.putTo(ctx, ticket, path); err != nil {
+		return "", err
+	}
+	return ticket.Artifact.Token, nil
+}
+
+// putTo 按票据把一个文件 PUT 上去。内容类型跟着票据走（服务端在 headers 里给了），
+// 这里不再自己拼。票据和 PUT 分开是因为热更新那条链路重试时要连票据一起重领——
+// 票据是一次性的。
+func (c *client) putTo(ctx context.Context, ticket uploadTicket, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
 	file, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer file.Close()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPut, ticket.Upload.URL, file)
 	if err != nil {
-		return "", err
+		return err
 	}
 	request.ContentLength = info.Size()
 	// GetBody 让传输层在需要重试时能把请求体从头再读一遍。没有它，一次 h2 流错误
@@ -266,15 +302,15 @@ func (c *client) putFile(ctx context.Context, jobID, path, contentType string) (
 	}
 	response, err := uploader.Do(request)
 	if err != nil {
-		return "", retryLater{err}
+		return retryLater{err}
 	}
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if response.StatusCode >= 400 {
-		return "", classify(response.StatusCode,
+		return classify(response.StatusCode,
 			fmt.Errorf("upload of %s returned %d: %s", filepath.Base(path), response.StatusCode, truncate(string(payload), 300)))
 	}
-	return ticket.Artifact.Token, nil
+	return nil
 }
 
 type pendingKeystoreCheck struct {
@@ -345,4 +381,45 @@ func (c *client) downloadIcon(ctx context.Context, jobID, name, target string) e
 		return err
 	}
 	return nil
+}
+
+// uploadOTAPackage 把热更新包传回服务端，返回落成的修订 id。
+//
+// base、channel、生效方式和发布说明都取任务行上的值——代理只送它确实知道的东西
+// （包本身和这次构建的提交）。和 APK 那条同一个原则。
+func (c *client) uploadOTAPackage(ctx context.Context, jobID, path, commit string, buf *logBuffer) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	token := ""
+	if err := withRetry(ctx, buf, "OTA upload ticket", 6, func(ctx context.Context) error {
+		var ticket uploadTicket
+		if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/ota-uploads", map[string]any{
+			"fileName": filepath.Base(path), "size": info.Size(),
+		}, &ticket); err != nil {
+			return err
+		}
+		token = ticket.Artifact.Token
+		return c.putTo(ctx, ticket, path)
+	}); err != nil {
+		return "", err
+	}
+	var created struct {
+		Release struct {
+			ID string `json:"id"`
+		} `json:"release"`
+	}
+	if err := withRetry(ctx, buf, "OTA revision", 6, func(ctx context.Context) error {
+		_, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/ota-release", map[string]any{
+			"artifactToken": token, "sourceCommitSha": commit,
+		}, &created)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	if created.Release.ID == "" {
+		return "", errors.New("the server created an OTA revision but did not say which one")
+	}
+	return created.Release.ID, nil
 }

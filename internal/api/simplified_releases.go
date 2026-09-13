@@ -215,9 +215,19 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		// 按 docs/RELIABILITY_AND_RELEASE.md 只用于严重安全漏洞、协议不兼容、
 		// 法律合规阻断；为什么强制走审计 reason 留痕。
 		Mandatory bool `json:"mandatory"`
+		// NativeFingerprint 是打包机用 @expo/fingerprint 算出来的"原生面"指纹：
+		// 自动链接的原生模块、权限、原生配置变了它就变，纯 JS/样式改动不变。
+		// 热更新包能不能发给这个安装包，靠它判（见 ota_fingerprint.go）。
+		// 人工上传的包没有，那样的基线不能发热更新。
+		NativeFingerprint string `json:"nativeFingerprint"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "Invalid release payload")
+		return
+	}
+	body.NativeFingerprint = strings.ToLower(strings.TrimSpace(body.NativeFingerprint))
+	if body.NativeFingerprint != "" && !isHex(body.NativeFingerprint, 32, 128) {
+		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "nativeFingerprint must be a hex digest")
 		return
 	}
 	body.Platform = strings.ToLower(strings.TrimSpace(body.Platform))
@@ -334,6 +344,9 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		metadata["packageName"], metadata["versionName"], metadata["versionCode"], metadata["runtimeVersion"] = apk.PackageName, apk.VersionName, apk.VersionCode, runtimeVersion
 		metadata["minSdk"], metadata["signerSha256"], metadata["signingScheme"] = apk.MinSDK, normalizeFingerprint(apk.SignerSHA256), apk.SigningScheme
 		metadata["applicationId"] = apk.ApplicationID
+		if body.NativeFingerprint != "" {
+			metadata["nativeFingerprint"] = body.NativeFingerprint
+		}
 		if apk.VersionName != body.Version || apk.VersionCode != int64(body.BuildNumber) {
 			rejectRelease("RELEASE_IDENTITY_MISMATCH", "APK versionName/versionCode does not match the release version and build number")
 			return

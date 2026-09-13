@@ -97,52 +97,58 @@ type buildResult struct {
 	ArtifactPath string
 	SHA256       string
 	SBOMPath     string
+	// NativeFingerprint 决定这个包以后能不能收热更新（见 ota.go 的 nativeFingerprint）
+	NativeFingerprint string
 }
 
 // buildJob 跑完一个任务的全部步骤。每一步失败都直接返回，调用方负责上报 fail
 // 并清理 worktree。
 func buildJob(ctx context.Context, cfg config, api *client, job claimedJob, buf *logBuffer) (buildResult, error) {
-	var result buildResult
-	if job.Platform != "android" {
-		return result, fmt.Errorf("this agent only builds android, got %q", job.Platform)
+	if job.Kind == "ota" {
+		return buildOTAPackage(ctx, cfg, api, job, buf)
 	}
+	return buildAPK(ctx, cfg, api, job, buf)
+}
+
+// prepareWorktree 做两种任务都要做的那一段：拉代码、开一份干净检出、写身份文件、
+// 取图标。返回这次检出的 worktree 路径与确切提交。
+func prepareWorktree(ctx context.Context, cfg config, api *client, job claimedJob, buf *logBuffer) (string, string, error) {
 	if job.TenantDirectory == "" {
-		return result, fmt.Errorf("the job does not say which tenants/ directory to build; set repoDirectory in this tenant's build configuration")
+		return "", "", fmt.Errorf("the job does not say which tenants/ directory to build; set repoDirectory in this tenant's build configuration")
 	}
 	// 目录名会被拼进路径。服务端已经校验过，代理再挡一次——两端分属不同的信任域，
 	// 各自把住自己那一侧是这类路径拼接的常规做法。
 	if strings.ContainsAny(job.TenantDirectory, `/\`) || strings.Contains(job.TenantDirectory, "..") {
-		return result, fmt.Errorf("refusing a tenant directory that escapes tenants/: %q", job.TenantDirectory)
+		return "", "", fmt.Errorf("refusing a tenant directory that escapes tenants/: %q", job.TenantDirectory)
 	}
 	worktree := filepath.Join(cfg.Workspace, job.ID)
 	env := os.Environ()
-
 	// 每个任务一个全新 worktree。共用检出会把别人未提交的改动混进产物。
 	if err := run(ctx, buf, cfg.Workspace, env, "git", "-C", cfg.Repo, "fetch", "--all", "--prune"); err != nil {
-		return result, err
+		return "", "", err
 	}
 	if err := run(ctx, buf, cfg.Workspace, env, "git", "-C", cfg.Repo, "worktree", "add", "--detach", worktree, job.GitRef); err != nil {
-		return result, err
+		return "", "", err
 	}
 	commit, err := exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "HEAD").Output()
 	if err != nil {
-		return result, fmt.Errorf("cannot resolve %s: %w", job.GitRef, err)
+		return worktree, "", fmt.Errorf("cannot resolve %s: %w", job.GitRef, err)
 	}
-	result.CommitSHA = strings.TrimSpace(string(commit))
-	buf.add("commit " + result.CommitSHA)
+	sha := strings.TrimSpace(string(commit))
+	buf.add("commit " + sha)
 
 	// 身份文件由服务端合成随任务下发，仓库里没有这份文件。代理仍然校验一遍——
 	// 两端分属不同信任域（见 tenantfile.go）
 	if _, err := writeTenantFile(worktree, job.TenantDirectory, job.TenantFile); err != nil {
-		return result, err
+		return worktree, sha, err
 	}
 	buf.add(fmt.Sprintf("tenant %s written as %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
 
-	// 启动图标随任务下发，写进仓库约定的那个目录。服务端没下发的（老租户）就用
-	// 仓库里已有的那一份，所以两种来源可以共存
+	// 启动图标随任务下发，写进仓库约定的那个目录。热更新不打原生资源，但 app.config.ts
+	// 求值时会读这些路径，少一张就整条失败在一句 ENOENT 上。
 	written, err := fetchTenantIcons(ctx, api, job, worktree)
 	if err != nil {
-		return result, err
+		return worktree, sha, err
 	}
 	if written > 0 {
 		buf.add(fmt.Sprintf("%d icons written from the tenant configuration", written))
@@ -150,10 +156,24 @@ func buildJob(ctx context.Context, cfg config, api *client, job claimedJob, buf 
 	// 图标在 prebuild 里才被读到，而那是 pnpm install 之后的事——少一个文件要等两
 	// 分钟才报错，报的还是一句 ENOENT 加一串 @expo 的栈。这里先看一眼。
 	if missing := missingTenantIcons(worktree, job.TenantDirectory); len(missing) > 0 {
-		return result, fmt.Errorf("这个租户缺这几张启动图标：%s。"+
+		return worktree, sha, fmt.Errorf("这个租户缺这几张启动图标：%s。"+
 			"在控制台「Android 打包与签名 → 启动图标」上传，或者提交到 App 仓库的 assets/tenants/%s/ 下",
 			strings.Join(missing, "、"), job.TenantDirectory)
 	}
+	return worktree, sha, nil
+}
+
+func buildAPK(ctx context.Context, cfg config, api *client, job claimedJob, buf *logBuffer) (buildResult, error) {
+	var result buildResult
+	if job.Platform != "android" {
+		return result, fmt.Errorf("this agent only builds android, got %q", job.Platform)
+	}
+	worktree, commitSHA, err := prepareWorktree(ctx, cfg, api, job, buf)
+	if err != nil {
+		return result, err
+	}
+	result.CommitSHA = commitSHA
+	env := os.Environ()
 
 	// 证书随任务下发，代理不去猜该编哪一张
 	if strings.TrimSpace(job.OTACertificatePEM) == "" {
@@ -198,6 +218,8 @@ func buildJob(ctx context.Context, cfg config, api *client, job claimedJob, buf 
 	if err := run(ctx, buf, worktree, env, "pnpm", "install", "--frozen-lockfile"); err != nil {
 		return result, err
 	}
+	// 原生面指纹：随发布记录存下来，将来判断热更新能不能发给这个包。算不出来不致命。
+	result.NativeFingerprint = nativeFingerprint(ctx, buf, worktree, job.TenantDirectory, env)
 	// 现成的产物身份门禁在这条命令里面：权限清单、applicationId、签名指纹、
 	// Gradle 依赖校验。代理不复制其中任何一条，也不绕过它们。
 	if err := run(ctx, buf, worktree, env, "pnpm", "android:release", job.TenantDirectory); err != nil {
