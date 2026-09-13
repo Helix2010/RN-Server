@@ -1868,7 +1868,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used. BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform, so the upload would be rejected after a full build"
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used. BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform, so the upload would be rejected after a full build BUILD_KEYSTORE_UNUSABLE: the build machine has already reported that it cannot open this tenant's sealed signing keystore, so the build would fail at unseal time after occupying the machine; the verdict is tied to the current keystore version and clears as soon as the keystore is replaced."
           }
         }
       }

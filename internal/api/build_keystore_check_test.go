@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -128,5 +130,72 @@ func TestDBSealedKeystoreTenantCountOnlyCountsRows(t *testing.T) {
 	}
 	if after != before+2 {
 		t.Fatalf("数出来 %d，应当是 %d", after, before+2)
+	}
+}
+
+// 打包机已经说过打不开的密钥，构建不该排进队列：它注定在解盒那一步失败，而那之前
+// 已经 git fetch、建了 worktree、占了机器。2026-09-13 实测过这条路，代理报 failed
+// 之后 69 秒还是排进了一个任务。
+func TestDBBuildJobQueueRefusesAKeystoreTheMachineCannotOpen(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development"}}
+	tenant := testTenant(15)
+	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,?,?,?)`,
+		tenant, buildKeystoreConfigKey, `{"sealed":"x","keyAlias":"release","keystoreSha256":"b"}`, 4, "tester", now); err != nil {
+		t.Fatalf("种子: %v", err)
+	}
+
+	// 每次换一组号：build 号和版本号那两道闸排在密钥闸前面，重号的话先被它们挡下
+	next := 0
+	queue := func() (int, map[string]any) {
+		next++
+		c, recorder := testContext(t, tenant, "POST", "/v1/admin/builds", map[string]any{
+			"platform": "android", "gitRef": "main", "version": fmt.Sprintf("1.0.%d", next),
+			"buildNumber": next, "reason": "测试密钥闸", "confirm": true,
+		})
+		s.createBuildJob(c)
+		return recorder.Code, decodeBody(t, recorder)
+	}
+
+	report := func(version int, ok bool, reason string) {
+		c, recorder := testContext(t, tenant, "POST", "/v1/build-agent/keystore-checks", map[string]any{
+			"tenant": tenant, "version": version, "ok": ok, "error": reason, "agent": "amos-builder-1",
+		})
+		s.reportKeystoreCheck(c)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("上报失败: %d", recorder.Code)
+		}
+	}
+
+	// 还没验过（pending）：不拦。代理没跑、或者刚存完密钥都会落在这个态上，
+	// 拿它挡构建等于把一个正常状态当成故障
+	if code, out := queue(); code != http.StatusCreated {
+		t.Fatalf("pending 不该被拦：%d %v", code, out)
+	}
+
+	report(4, false, "打包机上的 BUILD_KEYSTORE_PASSPHRASE 打不开这个盒子")
+	code, out := queue()
+	if code != http.StatusConflict || out["code"] != "BUILD_KEYSTORE_UNUSABLE" {
+		t.Fatalf("打不开的密钥仍然排进了队列：%d %v", code, out)
+	}
+	if detail, _ := out["detail"].(string); !strings.Contains(detail, "打不开这个盒子") {
+		t.Fatalf("没把打包机给的原因带出来：%v", out["detail"])
+	}
+
+	// 换了一把新密钥（version 变了）之后，旧结论立刻作废，不该再拦着
+	if _, err := db.Exec(`UPDATE app_configs SET version=5 WHERE tenant_id=? AND config_key=?`, tenant, buildKeystoreConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := queue(); code != http.StatusCreated {
+		t.Fatalf("换了密钥之后旧结论还在拦：%d %v", code, out)
+	}
+
+	// 验过并且能打开：当然放行
+	report(5, true, "")
+	if code, out := queue(); code != http.StatusCreated {
+		t.Fatalf("验证通过却被拦：%d %v", code, out)
 	}
 }

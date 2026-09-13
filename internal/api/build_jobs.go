@@ -298,6 +298,29 @@ func (s *server) createBuildJob(c *gin.Context) {
 			fmt.Sprintf("version must be greater than %s, the highest already used for %s (the build would be rejected on upload)", floor.Version, platform))
 		return
 	}
+	// 打包机已经说过这把密钥它打不开的话，这个构建是注定失败的——别让它占机器。
+	//
+	// 2026-09-13 实测过这条路：00:37:44 代理报了 failed，00:38:53 还是排进了一个任务，
+	// 它 git fetch、建 worktree、写完身份文件，然后在解盒那一步倒下。整条链路上这是
+	// **唯一**一处在花掉任何时间之前就知道结论的地方。
+	//
+	// 只挡 failed，不挡 pending：pending 是"还没验"，代理没跑或刚存完密钥都会落在
+	// 这个态上，拿它挡构建等于把一个正常状态当成故障。
+	if check, err := s.keystoreCheckFor(c.Request.Context(), tenantID(c)); err == nil && check != nil && !check.OK {
+		if current, _, _, _, err := s.buildKeystoreRecord(c.Request.Context(), tenantID(c)); err == nil && current != nil {
+			var keystoreVersion int
+			_ = s.db.QueryRowContext(c.Request.Context(),
+				`SELECT version FROM app_configs WHERE tenant_id=? AND config_key=? LIMIT 1`,
+				tenantID(c), buildKeystoreConfigKey).Scan(&keystoreVersion)
+			if keystoreVersion == check.Version {
+				problem(c, http.StatusConflict, "BUILD_KEYSTORE_UNUSABLE",
+					"打包机打不开这个租户的签名密钥，构建一定会失败，所以没有排进队列。"+
+						check.Error+"（打包机 "+check.Agent+" 于 "+check.CheckedAt+" 验过）")
+				return
+			}
+		}
+	}
+
 	// 身份在排队这一刻就要能合成出来。留到代理认领才发现，运维已经等了一轮队列，
 	// 而缺的往往是"签名密钥没配"这种在控制台点两下就好的事
 	slug, err := s.tenantSlug(c.Request.Context(), tenantID(c))
