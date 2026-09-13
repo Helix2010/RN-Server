@@ -449,7 +449,12 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	}
 	// 更新包不能改变应用身份：apiBaseUrl 决定设备此后把请求发给谁，
 	// bootstrapSignerAddress 决定它信谁的签名。见 ota_identity.go。
-	if err := s.otaIdentityMismatch(c.Request.Context(), tenantID(c), manifest, baseVersion, baseBuild); err != nil {
+	identity, err := s.tenantIdentityFor(c.Request.Context(), tenantID(c), baseVersion, baseBuild)
+	if err != nil {
+		problem(c, 500, "APP_IDENTITY_INVALID", err.Error())
+		return
+	}
+	if err := otaIdentityMismatchAgainst(identity, manifest); err != nil {
 		problem(c, 422, "OTA_IDENTITY_MISMATCH", err.Error())
 		return
 	}
@@ -504,8 +509,15 @@ func (s *server) saveOTARelease(c *gin.Context) {
 	manifest["runtimeVersion"] = baseRuntime
 	manifest["platform"] = basePlatform
 	manifest["channel"] = body.Channel
+	// 地址取**租户自己的** apiBaseUrl，不是请求的 Host。
+	//
+	// 2026-09-13 实测：打包机所有请求都发到它配置的那一个域名（api.anyfun.win），于是
+	// 代理帮 predict 建的修订被写进了 anyfun 的资源地址，设备拉不到任何资源，报
+	// AssetsFailedToLoad；而 extra.apiBaseUrl 也被一起改掉了——正是上面那道身份闸要防的
+	// 事，只不过是服务端自己干的。Host 本来就不该决定"这个租户的 App 该连谁"。
+	assetBase := strings.TrimRight(identity.APIBaseURL, "/")
 	rewriteOTAClientIdentity(manifest, otaClientIdentity{
-		APIBaseURL:    s.absoluteURL(c, ""),
+		APIBaseURL:    assetBase,
 		ApplicationID: otaManifestExtraString(manifest, "applicationId"),
 		AppVersion:    baseVersion,
 		BuildNumber:   baseBuild,
@@ -514,7 +526,7 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		OTAChannel:    body.Channel,
 	})
 	manifest["metadata"] = mergeManifestMetadata(manifest["metadata"], body.Channel, body.ApplyStrategy)
-	manifest = rewriteManifestURLs(manifest, s.absoluteURL(c, "/v1/ota/assets/"+releaseID+"/"))
+	manifest = rewriteManifestURLs(manifest, assetBase+"/v1/ota/assets/"+releaseID+"/")
 	finalManifest, _ := json.Marshal(manifest)
 	manifestKey := path.Join(baseKey, "manifest.json")
 	if err := client.Put(ctx, manifestKey, strings.NewReader(string(finalManifest)), int64(len(finalManifest)), "application/json"); err != nil {

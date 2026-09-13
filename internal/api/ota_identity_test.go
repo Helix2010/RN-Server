@@ -102,3 +102,35 @@ func TestOTAFingerprintGate(t *testing.T) {
 		t.Fatalf("没有基线指纹时应该说清楚怎么办：%v", err)
 	}
 }
+
+// 资源地址必须来自租户自己的 apiBaseUrl，不能来自请求的 Host。
+//
+// 打包机所有请求都发到它配置的那一个域名，于是它帮 B 租户建的修订会被写进 A 租户的
+// 地址：设备一个资源都拉不到（AssetsFailedToLoad），而 extra.apiBaseUrl 也被一起改掉
+// ——正是身份闸要防的那件事，只不过是服务端自己干的。
+func TestDBOTAAssetURLsComeFromTheTenantNotTheHost(t *testing.T) {
+	db := openTestDB(t)
+	s := otaTestServer(t, db)
+	tenant := testTenant(21)
+	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
+
+	identity, err := s.tenantIdentityFor(context.Background(), tenant, "1.0.0", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.APIBaseURL == "" {
+		t.Fatal("合成身份里没有 apiBaseUrl")
+	}
+	manifest := map[string]any{
+		"assets":      []any{map[string]any{"path": "assets/x.png"}},
+		"launchAsset": map[string]any{"path": "bundle.hbc"},
+		"extra":       map[string]any{},
+	}
+	base := strings.TrimRight(identity.APIBaseURL, "/")
+	rewritten := rewriteManifestURLs(manifest, base+"/v1/ota/assets/ota_x/")
+	raw, _ := json.Marshal(rewritten)
+	if !strings.Contains(string(raw), base+"/v1/ota/assets/ota_x/") {
+		t.Fatalf("资源地址没有指向租户自己的域名：%s", raw)
+	}
+}

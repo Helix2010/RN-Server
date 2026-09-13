@@ -24,18 +24,31 @@ import (
 // 比对的基准是服务端为这个租户合成的身份（tenantManifestFor），也就是打包机构建时用的
 // 同一份。改域名这类事本来就必须重新出包（confirm + reason + 审计 + 身份漂移提示）。
 func (s *server) otaIdentityMismatch(ctx context.Context, tenant string, manifest map[string]any, version string, buildNumber int) error {
+	identity, err := s.tenantIdentityFor(ctx, tenant, version, buildNumber)
+	if err != nil {
+		return err
+	}
+	return otaIdentityMismatchAgainst(identity, manifest)
+}
+
+// tenantIdentityFor 取服务端为这个租户合成的身份，绑定到指定的版本与 build 号。
+func (s *server) tenantIdentityFor(ctx context.Context, tenant, version string, buildNumber int) (tenantManifest, error) {
 	slug, err := s.tenantSlug(ctx, tenant)
 	if err != nil {
-		return fmt.Errorf("cannot resolve this tenant to check the OTA identity: %w", err)
+		return tenantManifest{}, fmt.Errorf("cannot resolve this tenant to check the OTA identity: %w", err)
 	}
 	buildCfg, _, err := s.buildConfigFor(ctx, tenant, slug)
 	if err != nil {
-		return fmt.Errorf("cannot read this tenant's build configuration to check the OTA identity: %w", err)
+		return tenantManifest{}, fmt.Errorf("cannot read this tenant's build configuration to check the OTA identity: %w", err)
 	}
 	identity, err := s.tenantManifestFor(ctx, tenant, buildCfg, version, buildNumber)
 	if err != nil {
-		return fmt.Errorf("cannot compose this tenant's app identity to check the OTA package: %w", err)
+		return tenantManifest{}, fmt.Errorf("cannot compose this tenant's app identity to check the OTA package: %w", err)
 	}
+	return identity, nil
+}
+
+func otaIdentityMismatchAgainst(identity tenantManifest, manifest map[string]any) error {
 	expected := map[string]string{
 		"extra.apiBaseUrl":                              identity.APIBaseURL,
 		"extra.expoClient.extra.apiBaseUrl":             identity.APIBaseURL,
