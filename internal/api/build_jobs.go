@@ -649,6 +649,22 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		return
 	}
 	view["tenantFile"] = manifest
+	// 证书两种任务都要：它编进包里的 expo-updates 配置，也因此进原生指纹——热更新那条
+	// 少了它就会算出另一个指纹，永远和基线对不上（见 cmd/build-agent/build.go）。
+	record, err := s.otaSigningRecord(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "OTA_SIGNING_CONFIG_INVALID", "Stored ota.signing configuration is invalid")
+		return
+	}
+	if record == nil {
+		view["otaCertificatePem"] = nil
+		view["otaCertificateSha256"] = nil
+	} else {
+		fingerprint, _ := certificateFingerprint(record.Value.Certificate)
+		view["otaCertificatePem"] = nullableString(record.Value.Certificate)
+		view["otaCertificateSha256"] = nullableString(fingerprint)
+	}
+
 	// 热更新任务到此为止：它不需要签名密钥，也就不该拿到。这不是省事——最小权限在
 	// 这条链路上是可执行的，一个不需要 keystore 的任务拿到 keystore 只会扩大爆炸半径。
 	// runtimeVersion 取基线那一版：热更新包必须对准它，否则一台设备都收不到。
@@ -679,19 +695,6 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	} else {
 		view["sealedKeystore"] = sealedKeystore
 		view["keyAlias"] = nullableString(keyAlias)
-	}
-	record, err := s.otaSigningRecord(c.Request.Context(), job.TenantID)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "OTA_SIGNING_CONFIG_INVALID", "Stored ota.signing configuration is invalid")
-		return
-	}
-	if record == nil {
-		view["otaCertificatePem"] = nil
-		view["otaCertificateSha256"] = nil
-	} else {
-		fingerprint, _ := certificateFingerprint(record.Value.Certificate)
-		view["otaCertificatePem"] = nullableString(record.Value.Certificate)
-		view["otaCertificateSha256"] = nullableString(fingerprint)
 	}
 	c.JSON(http.StatusOK, view)
 }

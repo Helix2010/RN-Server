@@ -170,7 +170,25 @@ func prepareWorktree(ctx context.Context, cfg config, api *client, job claimedJo
 	//
 	// 而且 OTA 那条也必须写：少了它 expo config 里 nativePushConfigured 会翻成 false，
 	// 同样是一个不同的指纹。
+	// 证书也在这里写，两种任务都写。
+	//
+	// 它是**真实的原生输入**（编进包里的 expo-updates 配置），所以它必然进指纹；而两条
+	// 链路只要有一条不设它，算出来的就是两个指纹，热更新永远和基线对不上。2026-09-13
+	// 实测：同一个 worktree 里只加这两个环境变量，哈希就变了。
+	//
+	// 与其在算指纹时把环境"洗干净"，不如让两条链路的环境**由同一段代码构造**——洗干净
+	// 的那种做法，下一个人往 buildAPK 里加一个环境变量就又坏了，而且坏在很远的地方。
 	extraEnv := []string{"EXPO_PUBLIC_TENANT=" + job.TenantDirectory}
+	if strings.TrimSpace(job.OTACertificatePEM) == "" {
+		return worktree, sha, nil, fmt.Errorf("tenant %s has no OTA signing key; install one before building a package that must verify updates", job.TenantSlug)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "ota-certificate.pem"), []byte(job.OTACertificatePEM), 0o644); err != nil {
+		return worktree, sha, nil, err
+	}
+	extraEnv = append(extraEnv,
+		"EXPO_UPDATES_CODE_SIGNING_CERTIFICATE=./ota-certificate.pem",
+		"EXPO_REQUIRE_OTA_SIGNING=1",
+	)
 	if strings.TrimSpace(job.GoogleServicesJSON) != "" {
 		decoded, err := base64.StdEncoding.DecodeString(job.GoogleServicesJSON)
 		if err != nil {
@@ -196,20 +214,6 @@ func buildAPK(ctx context.Context, cfg config, api *client, job claimedJob, buf 
 	}
 	result.CommitSHA = commitSHA
 	env := append(os.Environ(), extraEnv...)
-
-	// 证书随任务下发，代理不去猜该编哪一张
-	if strings.TrimSpace(job.OTACertificatePEM) == "" {
-		return result, fmt.Errorf("tenant %s has no OTA signing key; install one before building a package that must verify updates", job.TenantSlug)
-	}
-	certPath := filepath.Join(worktree, "ota-certificate.pem")
-	if err := os.WriteFile(certPath, []byte(job.OTACertificatePEM), 0o644); err != nil {
-		return result, err
-	}
-	env = append(env,
-		"EXPO_UPDATES_CODE_SIGNING_CERTIFICATE=./ota-certificate.pem",
-		"EXPO_REQUIRE_OTA_SIGNING=1",
-		"EXPO_PUBLIC_TENANT="+job.TenantDirectory,
-	)
 
 	// 签名密钥：服务端转交盒子，口令只在这台机器上。开出来写进任务工作区，
 	// 0600，构建完随 worktree 一起删。
