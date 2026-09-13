@@ -43,6 +43,16 @@ func main() {
 	cfg.AgentPublicKey = public
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 停机信号只用来"不再领新活"，正在跑的构建不打断（见 pollOnce）。单独起一个
+	// goroutine 说一声，否则 systemctl stop 会静静地挂着，看的人不知道它在等什么。
+	go func() {
+		<-ctx.Done()
+		slog.Info("stop requested: not claiming any more builds; the one in flight will finish")
+	}()
+
+	// 上一条命留下的检出：硬杀时收尾那一步执行不到，检出、登记和里面解开的 keystore
+	// 都会留在盘上。这一刻手上没有任务，凡是在 workspace 里的都是孤儿。
+	pruneOrphanWorktrees(ctx, cfg)
 
 	slog.Info("build agent started", "server", cfg.Server, "agent", cfg.Name,
 		"platforms", cfg.Platforms, "workspace", cfg.Workspace,
@@ -109,7 +119,11 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 
 	red := newRedactor()
 	buf := newLogBuffer(red)
-	buildCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	// 构建不挂在 ctx 上：收到 SIGTERM 就把一个跑了五分钟、已经签完名的构建拦腰砍掉
+	// 是不值当的，何况换二进制是我们自己发起的动作。信号让循环停在下一次领活之前，
+	// 这一条做完为止。unit 里的 TimeoutStopSec 必须给得比 BUILD_AGENT_TIMEOUT_MINUTES
+	// 长，否则 systemd 会在中途补一刀 SIGKILL。
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.Timeout)
 	defer cancel()
 
 	beats := make(chan struct{})
@@ -135,7 +149,7 @@ func pollOnce(ctx context.Context, cfg config, api *client) bool {
 	releaseID := ""
 	if buildErr == nil {
 		buf.add("uploading " + filepath.Base(result.ArtifactPath) + " and its SBOM")
-		releaseID, buildErr = api.uploadArtifact(buildCtx, job.ID, result.ArtifactPath, result.SBOMPath)
+		releaseID, buildErr = api.uploadArtifact(buildCtx, job.ID, result.ArtifactPath, result.SBOMPath, buf)
 		if buildErr != nil {
 			buildErr = fmt.Errorf("the package was built but could not be uploaded: %w", buildErr)
 		} else {

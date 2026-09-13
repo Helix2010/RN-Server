@@ -23,6 +23,14 @@ EnvironmentFile=/etc/rn-build-agent.env
 ExecStart=/opt/rn-build-agent/build-agent
 Restart=always
 RestartSec=10
+# 停机时先做完手上那一条构建，再退出（代理收到 SIGTERM 只是不再领新活）。所以这个
+# 值必须比 BUILD_AGENT_TIMEOUT_MINUTES 长，否则 systemd 会在构建中途补一刀 SIGKILL
+# ——那正是留下孤儿 worktree 和一份解开的 keystore 的那条路径。
+#
+# 代价是 systemctl stop / 换二进制最长要等一轮构建（默认 45 分钟）。急着换就
+# `systemctl kill -s SIGKILL rn-build-agent`：任务会在服务端那边由心跳超时回收，
+# 留下的检出下次启动时自动清掉。
+TimeoutStopSec=3600
 # 代理只出不进，不需要任何监听端口
 PrivateTmp=true
 ProtectSystem=strict

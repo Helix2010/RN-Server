@@ -747,7 +747,9 @@ func (s *server) reapStaleBuildJobs(ctx context.Context) {
 	rows.Close()
 	for _, item := range found {
 		reason := fmt.Sprintf("打包机 %s 超过 %s 没有回报进度，任务按失败处理。"+
-			"多半是那台机器挂了、网断了，或者它没能读完领取任务的响应——build 号已经释放，改完可以重排。",
+			"多半是那台机器挂了、网断了，或者它没能读完领取任务的响应。"+
+			"中断的构建不会自动续跑（半截的依赖安装和编译状态续下去比重来更危险），"+
+			"build 号已经释放，重新排一个任务即可。",
 			item.agent, buildJobHeartbeatTimeout)
 		s.markBuildJobFailed(ctx, item.id, reason)
 		slog.Warn("reaped a build job whose agent stopped reporting",

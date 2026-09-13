@@ -69,20 +69,30 @@ func (c *client) post(ctx context.Context, path string, body any, out any) (int,
 	request.Header.Set("x-build-agent-token", c.cfg.Token)
 	response, err := c.http.Do(request)
 	if err != nil {
-		return 0, err
+		return 0, retryLater{err}
 	}
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if response.StatusCode >= 400 {
 		// 错误正文里不会有机密，但也不需要原样带出去——只留状态码和一小段
-		return response.StatusCode, fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300))
+		return response.StatusCode, classify(response.StatusCode,
+			fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300)))
 	}
 	if out != nil && len(payload) > 0 {
 		if err := json.Unmarshal(payload, out); err != nil {
-			return response.StatusCode, fmt.Errorf("%s returned a body we cannot read: %w", path, err)
+			// 半截正文多半是链路上出的事（反代截断、连接断在中途），下一次多半就好了
+			return response.StatusCode, retryLater{fmt.Errorf("%s returned a body we cannot read: %w", path, err)}
 		}
 	}
 	return response.StatusCode, nil
+}
+
+// classify 决定一个 HTTP 失败要不要再试：5xx 和 429 是"现在不行"，4xx 是"不行"。
+func classify(status int, err error) error {
+	if status >= 500 || status == http.StatusTooManyRequests {
+		return retryLater{err}
+	}
+	return err
 }
 
 // get 和 post 走同一套鉴权与错误处理，只是没有请求体。
@@ -94,16 +104,17 @@ func (c *client) get(ctx context.Context, path string, out any) (int, error) {
 	request.Header.Set("x-build-agent-token", c.cfg.Token)
 	response, err := c.http.Do(request)
 	if err != nil {
-		return 0, err
+		return 0, retryLater{err}
 	}
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if response.StatusCode >= 400 {
-		return response.StatusCode, fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300))
+		return response.StatusCode, classify(response.StatusCode,
+			fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300)))
 	}
 	if out != nil && len(payload) > 0 {
 		if err := json.Unmarshal(payload, out); err != nil {
-			return response.StatusCode, fmt.Errorf("%s returned a body we cannot read: %w", path, err)
+			return response.StatusCode, retryLater{fmt.Errorf("%s returned a body we cannot read: %w", path, err)}
 		}
 	}
 	return response.StatusCode, nil
@@ -168,14 +179,29 @@ type uploadTicket struct {
 //
 // SBOM 必须在建发布记录**之前**传完：那条记录上要写它的对象键，不然产物入了库而
 // 清单没有归属，等于回到"扫过但没人知道扫的是哪个包"。
-func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath string) (string, error) {
-	artifactToken, err := c.putFile(ctx, jobID, path, "application/vnd.android.package-archive")
+// 三步各自重试，而不是整段重来：包已经传上去了却卡在建记录那一步时，重来一遍要把
+// 几十兆再传一次，还会在对象存储里多留一份没人引用的副本。
+//
+// 仍然可能多留一份：PUT 落了地而响应丢在回来的路上，重试就是第二次上传。这一侧无
+// 解——票据是一次性的，服务端也没法凭空知道那次传成没传成——只是把窗口收到最小。
+func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath string, buf *logBuffer) (string, error) {
+	artifactToken := ""
+	err := withRetry(ctx, buf, "artifact upload", 6, func(ctx context.Context) error {
+		token, err := c.putFile(ctx, jobID, path, "application/vnd.android.package-archive")
+		artifactToken = token
+		return err
+	})
 	if err != nil {
 		return "", err
 	}
 	sbomToken := ""
 	if sbomPath != "" {
-		if sbomToken, err = c.putFile(ctx, jobID, sbomPath, "application/vnd.cyclonedx+json"); err != nil {
+		err := withRetry(ctx, buf, "SBOM upload", 6, func(ctx context.Context) error {
+			token, err := c.putFile(ctx, jobID, sbomPath, "application/vnd.cyclonedx+json")
+			sbomToken = token
+			return err
+		})
+		if err != nil {
 			return "", fmt.Errorf("the SBOM could not be uploaded: %w", err)
 		}
 	}
@@ -186,10 +212,13 @@ func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath strin
 			ID string `json:"id"`
 		} `json:"release"`
 	}
-	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
-		"artifactToken": artifactToken,
-		"sbomToken":     sbomToken,
-	}, &release); err != nil {
+	if err := withRetry(ctx, buf, "release creation", 6, func(ctx context.Context) error {
+		_, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
+			"artifactToken": artifactToken,
+			"sbomToken":     sbomToken,
+		}, &release)
+		return err
+	}); err != nil {
 		return "", err
 	}
 	if release.Release.ID == "" {
@@ -237,12 +266,13 @@ func (c *client) putFile(ctx context.Context, jobID, path, contentType string) (
 	}
 	response, err := uploader.Do(request)
 	if err != nil {
-		return "", err
+		return "", retryLater{err}
 	}
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if response.StatusCode >= 400 {
-		return "", fmt.Errorf("upload of %s returned %d: %s", filepath.Base(path), response.StatusCode, truncate(string(payload), 300))
+		return "", classify(response.StatusCode,
+			fmt.Errorf("upload of %s returned %d: %s", filepath.Base(path), response.StatusCode, truncate(string(payload), 300)))
 	}
 	return ticket.Artifact.Token, nil
 }

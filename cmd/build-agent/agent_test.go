@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
@@ -513,5 +515,123 @@ func TestFetchTenantIconsRefusesNamesThatEscape(t *testing.T) {
 		if _, err := fetchTenantIcons(context.Background(), api, job, worktree); err == nil {
 			t.Fatalf("%q 应当被拒", name)
 		}
+	}
+}
+
+// 硬杀之后留下的检出必须在下次启动时被清掉——连同裸库里那份登记。只删目录的话
+// `git worktree list` 会一直列着一个指向不存在路径的条目；只 prune 的话磁盘照占。
+// 真正的理由不是磁盘：那个目录里躺着本次构建解开的 .build-keystore.jks。
+func TestPruneOrphanWorktreesRemovesTheCheckoutAndItsRegistration(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("没有 git")
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	bare := filepath.Join(root, "rn-app.git")
+	workspace := filepath.Join(root, "workspace")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(source, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(source, "README"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(source, "add", "README")
+	git(source, "commit", "-qm", "first")
+	git(root, "clone", "-q", "--bare", source, bare)
+	if err := os.MkdirAll(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟一条跑到一半被杀掉的任务：检出还在，登记还在，里面还有解开的 keystore
+	orphan := filepath.Join(workspace, "bld_orphan")
+	git(workspace, "-C", bare, "worktree", "add", "--detach", orphan, "main")
+	keystore := filepath.Join(orphan, ".build-keystore.jks")
+	if err := os.WriteFile(keystore, []byte("not really a keystore"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneOrphanWorktrees(context.Background(), config{Workspace: workspace, Repo: bare})
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("检出还在：%v", err)
+	}
+	listed, err := exec.Command("git", "-C", bare, "worktree", "list").CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(listed), "bld_orphan") {
+		t.Fatalf("登记还挂在裸库上：\n%s", listed)
+	}
+}
+
+// 重试要分清"现在不行"和"不行"。5xx 值得再试；4xx 是服务端的判断，重试一百次也是
+// 同一个答案，只会把失败原因推迟几分钟才送到人眼前。
+func TestUploadRetriesTransientFailuresButNotRejections(t *testing.T) {
+	restore := retryBaseDelay
+	retryBaseDelay = time.Millisecond
+	defer func() { retryBaseDelay = restore }()
+	attempts := map[string]int{}
+	var mode string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/artifact-uploads"):
+			attempts["ticket"]++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"artifact": map[string]any{"token": "tok"},
+				"upload":   map[string]any{"method": "PUT", "url": "http://" + r.Host + "/put"},
+			})
+		case r.URL.Path == "/put":
+			attempts["put"]++
+			// 前两次装成网关抖动，第三次成功
+			if attempts["put"] < 3 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/release"):
+			attempts["release"]++
+			if mode == "reject" {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"code":"RELEASE_VERSION_NOT_INCREASING"}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]any{"id": "rel_x"}})
+		}
+	}))
+	defer server.Close()
+
+	apk := filepath.Join(t.TempDir(), "app.apk")
+	if err := os.WriteFile(apk, []byte("apk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	api := newClient(config{Server: server.URL, Token: "t"})
+	buf := newLogBuffer(newRedactor())
+
+	release, err := api.uploadArtifact(context.Background(), "bld_1", apk, "", buf)
+	if err != nil {
+		t.Fatalf("两次 502 之后应该传上去：%v", err)
+	}
+	if release != "rel_x" || attempts["put"] != 3 {
+		t.Fatalf("release=%q put 次数=%d", release, attempts["put"])
+	}
+
+	// 409 是拒绝，不许重试
+	mode = "reject"
+	attempts["release"] = 0
+	if _, err = api.uploadArtifact(context.Background(), "bld_1", apk, "", buf); err == nil {
+		t.Fatal("版本号没涨还是建出了发布记录")
+	}
+	if attempts["release"] != 1 {
+		t.Fatalf("409 被重试了 %d 次", attempts["release"])
 	}
 }
