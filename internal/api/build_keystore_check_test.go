@@ -249,3 +249,54 @@ func TestDBStaleBuildJobsAreReaped(t *testing.T) {
 		t.Fatalf("刚领走的那条也被收了：还剩 %d 条 claimed", fresh)
 	}
 }
+
+// 合成身份要对准"正在分发的那一版"。OTA 包在导出时把 appVersion / buildNumber 烧进
+// manifest，App 应用之后读的就是那一份——对不上就会拿一个倒退的版本号去问服务端要不
+// 要升级。
+func TestDBAppIdentityTracksTheActiveRelease(t *testing.T) {
+	db := openTestDB(t)
+	s := &server{db: db, cfg: config.Config{Environment: "development"}}
+	tenant := testTenant(17)
+	slug := seedBuildTenant(t, s, tenant)
+	seedBuildIdentity(t, db, tenant, slug)
+
+	c, recorder := testContext(t, tenant, "GET", "/v1/admin/app-identity", nil)
+	s.getAppIdentity(c)
+	// 还没有在分发的版本时要说清楚，而不是合成一个假的版本号
+	if recorder.Code != 409 || !strings.Contains(recorder.Body.String(), "APP_IDENTITY_NO_ACTIVE_RELEASE") {
+		t.Fatalf("没有已发布版本时应该 409：%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	insert := func(id, version string, build int, status string) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,created_by,created_at,updated_at)
+			VALUES(?,?,'android',?,?,?,?,'{}','k','f','application/vnd.android.package-archive',1,1,'sha','{}',0,'test',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+			id, tenant, version, build, version, status); err != nil {
+			t.Fatalf("种子 %s: %v", id, err)
+		}
+	}
+	insert("rel_old_"+uniqueSuffix(), "1.0.0", 1, "active")
+	insert("rel_new_"+uniqueSuffix(), "1.0.1", 2, "active")
+	// 还没激活的那一版不算：设备上跑的不是它
+	insert("rel_draft_"+uniqueSuffix(), "1.0.2", 3, "verified")
+
+	c, recorder = testContext(t, tenant, "GET", "/v1/admin/app-identity", nil)
+	s.getAppIdentity(c)
+	if recorder.Code != 200 {
+		t.Fatalf("取合成身份失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+	body := decodeBody(t, recorder)
+	release, _ := body["release"].(map[string]any)
+	if release["version"] != "1.0.1" || release["buildNumber"].(float64) != 2 {
+		t.Fatalf("没有对准在分发的那一版：%v", release)
+	}
+	manifest, _ := body["manifest"].(map[string]any)
+	if manifest["version"] != "1.0.1" || manifest["androidVersionCode"].(float64) != 2 {
+		t.Fatalf("合成身份里的版本号不对：%v", manifest)
+	}
+	// 私钥一个都不许出现在这条响应里
+	if strings.Contains(recorder.Body.String(), "unused-in-this-path") ||
+		strings.Contains(strings.ToLower(recorder.Body.String()), "privatekey") {
+		t.Fatal("合成身份里带出了私钥")
+	}
+}

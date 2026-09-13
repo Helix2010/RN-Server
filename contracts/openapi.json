@@ -2342,6 +2342,20 @@
         }
       }
     },
+    "/v1/admin/app-identity": {
+      "get": {
+        "summary": "The tenant app identity the server composes",
+        "description": "Returns the same synthesized tenant.json that build jobs carry to the build machine, bound to the version and build number of the currently active Android release. OTA packages bake this identity into their manifest extra (apiBaseUrl, scopeKey, appVersion, buildNumber) and the app reads that copy after applying an update, so an OTA must be built from exactly the identity the running APK has. The repository copy under tenants/<slug>/tenant.json stopped being authoritative on 2026-09-12 and drifts (anyfun sat at 1.3.7 while 1.3.14 was shipping). Public identity only - package name, signer fingerprint and bootstrap signer address are compiled into every APK; no private keys.",
+        "responses": {
+          "200": {
+            "description": "{tenantDirectory, release:{id,version,buildNumber}, manifest}"
+          },
+          "409": {
+            "description": "APP_IDENTITY_NO_ACTIVE_RELEASE or APP_IDENTITY_INCOMPLETE"
+          }
+        }
+      }
+    },
     "/v1/admin/build-icons": {
       "get": {
         "summary": "Launcher icons this tenant has configured",

@@ -281,6 +281,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/builds", s.createBuildJob)
 	group.GET("/builds/:id", s.buildJobDetail)
 	group.POST("/builds/:id/cancel", s.cancelBuildJob)
+	// 服务端合成的 tenant.json：打包任务下发的是同一份。构建 OTA 的人要拿它，
+	// 仓库里那份早就不是权威来源了（见 app_identity.go）
+	group.GET("/app-identity", s.getAppIdentity)
 	group.GET("/build-config", s.getBuildConfig)
 	group.PUT("/build-config", s.saveBuildConfig)
 	// 启动图标：租户自己维护，随任务下发，不再放在 App 仓库里
