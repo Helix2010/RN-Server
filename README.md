@@ -10,7 +10,7 @@
 
 ```bash
 cp .env.example .env
-set -a && source .env && set +a
+set -a && source .env && set +a  # MYSQL_DSN 的值里有 &，.env 里要给它加单引号
 go run ./cmd/server
 ```
 
@@ -23,8 +23,10 @@ go run ./cmd/server
 - RN-App 正式文案：迁移 8 会重置 `type=14` 为 AnyFun 基座实际使用的 zh-CN/en-US 文案，并清空旧语言资源引用；迁移后需由管理端重新发布语言包。
 - RN-App 文案持续同步：迁移 29 从 RN-App 的 `i18n/seed` 补齐当前完整 UI 文案到全局 `language_document`（现为 748 个 key × 2 种语言），只补缺失记录，不覆盖已有全局内容或租户自定义覆盖；变更 App 内置文案后先在 RN-App 执行 `pnpm i18n:seed`，再在本仓库执行 `node scripts/sync-rn-app-i18n-seed.mjs`。
 - Admin 登录：`POST /v1/admin/auth/login` 创建 HttpOnly 会话；管理 API 默认拒绝未认证请求。`x-admin-key` 仅保留给受控自动化，不再进入 Web 构建。
-- MySQL：通过 `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 配置；`MYSQL_CHARSET`、`MYSQL_TIMEZONE`、`MYSQL_PARSE_TIME` 控制字符集、日期时区和日期解析；测试使用 `<database>_test`
-- MySQL 连接行为：最大/空闲连接数、连接生命周期、空闲回收、查询/读写/初始化超时与有限重试均由 `MYSQL_*` 配置。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。生产环境保持 `MYSQL_AUTO_MIGRATE=false`，迁移作为独立发布步骤执行。
+- MySQL 连接：一行 `MYSQL_DSN`，格式是 go-sql-driver 的标准写法 `user:password@tcp(host:port)/database?params`。口令里含 `@ / : & $` 都不用转义（驱动取最后一个 `@` 作分隔），但**用户名**不能含 `:`；时区写 `loc=UTC` 不能写 `Z`。DSN 里没写的参数服务端会补成我们的默认值（`parseTime=true`、连接/读/写超时、`charset=utf8mb4`），补了什么 `rn-server config` 会逐项列出——驱动自己的默认值和我们的不一样，`parseTime` 默认 `false` 会让每个读 `DATETIME` 的接口 500 而启动仍是绿的。旧的 `MYSQL_HOST`/`MYSQL_PORT`/… 十一个键仍被接受，但启动会打弃用警告并给出等价的 DSN。`APP_ENV=test` 时库名自动加 `_test` 后缀。
+- MySQL 其余行为：连接池（`MYSQL_CONNECTION_LIMIT` 等四项）、启动重试（`MYSQL_INIT_*`）、查询超时（`MYSQL_QUERY_TIMEOUT_SECONDS`）不在 DSN 里——它们是 `database/sql` 和我们自己的事，驱动不认。目标数据库必须预先创建；服务启动不会执行 `CREATE DATABASE`。生产环境保持 `MYSQL_AUTO_MIGRATE=false`，迁移作为独立发布步骤执行。
+- 看配置：`rn-server config` 打印这台机器上**实际生效**的配置，并标出每一项来自 env 还是默认值；机密只显示长度，可以直接贴进工单。
+- 推送凭据：按租户存在 `app_configs` 的 `push.fcm`（用 `STORAGE_MASTER_KEY` 加密），管理接口 `GET /v1/admin/push/credentials`、`PUT|DELETE /v1/admin/push/credentials/fcm`、`POST /v1/admin/push/credentials/fcm/test`，平台默认走 `/v1/admin/platform/push/credentials/fcm`。保存时会真去 Google 换一次访问令牌，换不到就不保存。它必须和该租户 `google-services.json` 的 `project_info.project_id` 是同一个 Firebase 项目，两边保存时互相校验。见 `docs/decisions/0017-per-tenant-push-credentials.md`。
 - OTA（实验性）：迁移 10 增加租户级 `ota_releases`，基线 APK、Runtime、Channel、Manifest 和资产由 RN-Server/华为 OBS 管理；`/v1/ota/manifest` 实现 Expo Updates v1 基础协议。当前尚未接入 Manifest 签名密钥和客户端公钥验签，生产启用前必须完成签名链路与真机回退验证。
 - OTA Manifest 身份：上传 ZIP 中的客户端字段只作为构建提示。保存发布记录时，服务端会按当前请求域名和所选基线 APK 重写 `extra.expoClient`、API Base URL、应用版本、Build、Runtime、平台、分发渠道与 OTA Channel，避免跨租户或跨版本复用时继承构建机写死值。
 - 扫链进程：`./rn-server indexer`（迁移 33；设计见 RN-App `docs/design/wallet-receive-index-2026-09-06.md`，表结构见 `docs/database/CHAIN_SCAN_SCHEMA.md`）。按链读 `app_configs` 里 `chain-scan.<chain>`（tenant 0）的端点与节奏，把目录内 ERC-20 转账与原生币入账写进 `wallet_transfer_index`；游标与端点健康在 `chain_scan_state`。`INDEXER_ENABLED=false` 时进程空转；扫链端点独立于 App 端 RPC，由平台管理员在管理端维护并用 `STORAGE_MASTER_KEY` 加密落库。追平之后每轮最多花 20 秒执行 `chain_scan_state.jobs` 里的后台任务（`rescan` 重扫区间、`attribute` 补原生币归属），进度按行锁写回、管理端随时可取消，完成写 `audit_events`（`chain_scan.job_done`）。告警（端点全断、落后、重组、端点错链、任务失败）除写 `open_alerts` 与审计外，可选 POST 到 `INDEXER_ALERT_WEBHOOK`：JSON `{text, chain, kind, message, raisedAt, resolved}`，顶层 `text` 直接兼容 Slack / Discord incoming webhook；企业微信要求 `msgtype` 结构，需经一层中转。移动端记录接口 `GET /v1/mobile/wallet/transfers`（Wallet 会话鉴权）返回索引记录与每链进度。收款推送：钱包登录（`/v1/mobile/auth/verify`）可带 `X-Installation-ID` + `Authorization: Installation <credential>` 把会话关联到安装（`wallet_session.installation_id`）；索引器首次写入 `in` 行时给该地址有效会话所在的安装入队 `wallet.transfer.received`（`app_push_outbox.payload.targetInstallationIds`，dispatcher 只发这些安装；重扫 / 补归属不推），文案 `wallet.receivedTitle` / `wallet.receivedBody` / `wallet.receivedUnattributedBody`（迁移 34，占位符 `{amount} {symbol} {chain}`，租户可覆盖）。新链门禁：`supportedNetworks[].MinBuild{Android, IOS}` 是认识该链的最低 App 构建号（加链先出 App 构建再填），bootstrap 按 `x-platform` / `x-build-number` 只下发达到门槛的链（`chains / networks / tokens` 同步过滤，一条不剩返回 426 `APP_BUILD_TOO_OLD`）；管理端目录带 `minBuild`，扫链管理页对未启用的链显示接入向导（门槛、低于门槛的活跃安装数、目录条目、配置、监听地址），租户「钱包与链」页显示看不到该链的安装数。

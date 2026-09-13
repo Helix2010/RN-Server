@@ -71,8 +71,9 @@ cat <<'NEXT'
 
 装好了。接下来按顺序：
 
-  1. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*（数据库四项与 STORAGE_MASTER_KEY
-     照抄 web4，ADMIN_API_KEY 自己另生成一把）
+  1. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*（MYSQL_DSN 一行、STORAGE_MASTER_KEY、
+     两个管理端凭据、BUILD_AGENT_TOKEN；ADMIN_API_KEY 用 openssl rand -hex 32 生成）
+     填完跑 `rn-server config` 核对一遍——它打印实际生效的值，机密只显示长度
   2. 从开发机跑 deploy.sh，把二进制和两份控制台产物送上来
   3. sudo systemctl enable --now rn-foundation-server rn-foundation-indexer
   4. CERTBOT_EMAIL=<邮箱> ./setup-tls.sh 申请证书并打开自动续期

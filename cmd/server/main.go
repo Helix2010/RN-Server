@@ -58,6 +58,13 @@ func main() {
 		slog.Info("database migrations complete")
 		return
 	}
+	if len(os.Args) == 3 && os.Args[1] == "push-credentials" && os.Args[2] == "import-env" {
+		if err := importPushCredentialsFromEnv(cfg, database); err != nil {
+			slog.Error("cannot import push credentials from the env file", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "indexer" {
 		runIndexer(cfg, database)
 		return
@@ -65,7 +72,13 @@ func main() {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 	if cfg.PushDispatchEnabled {
-		dispatcher, dispatchErr := push.New(workerCtx, database.DB, cfg)
+		// 推送凭据按租户存在库里，用主密钥封着；派发器要能解开它们才能发出去
+		box, boxErr := secretbox.New(cfg.StorageMasterKey)
+		if boxErr != nil {
+			slog.Error("push dispatcher cannot decrypt per-tenant credentials", "error", boxErr)
+			os.Exit(1)
+		}
+		dispatcher, dispatchErr := push.New(workerCtx, database.DB, cfg, box)
 		if dispatchErr != nil {
 			slog.Error("push dispatcher initialization failed", "error", dispatchErr)
 			os.Exit(1)

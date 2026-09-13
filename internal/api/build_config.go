@@ -224,6 +224,13 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 				return
 			}
 		}
+		// 项目一致性是同一条缝的另一半：这份文件（编进 APK）和服务端那把服务账号
+		// 必须属于同一个 Firebase 项目。先配了凭据、后换一份别的项目的文件，是这
+		// 条链路上最容易发生的顺序。
+		if detail := s.pushCredentialProjectProblem(c.Request.Context(), tenantID(c), googleServicesProjectID(decoded)); detail != "" {
+			problem(c, http.StatusUnprocessableEntity, "GOOGLE_SERVICES_PROJECT_MISMATCH", detail)
+			return
+		}
 	}
 	value, _ := json.Marshal(buildConfig{
 		RepoDirectory:      directory,
@@ -340,6 +347,12 @@ func rejectServiceAccountJSON(raw []byte) error {
 // googleServicesFile 只声明我们要看的那一部分。这份文件里还有一堆 Firebase 自己的
 // 字段，逐个建模没有意义，也会让"多了一个新字段"变成解析失败。
 type googleServicesFile struct {
+	// ProjectInfo 是另一半的接缝：编进 APK 的这份文件和留在服务端的服务账号
+	// 必须属于同一个 Firebase 项目，否则 token 注册得上、推送发不出去。
+	ProjectInfo struct {
+		ProjectID     string `json:"project_id"`
+		ProjectNumber string `json:"project_number"`
+	} `json:"project_info"`
 	Client []struct {
 		ClientInfo struct {
 			AndroidClientInfo struct {
@@ -366,6 +379,27 @@ func googleServicesPackages(raw []byte) []string {
 		}
 	}
 	return packages
+}
+
+// googleServicesProjectID 取这份文件所属的 Firebase 项目。
+func googleServicesProjectID(raw []byte) string {
+	var parsed googleServicesFile
+	if json.Unmarshal(raw, &parsed) != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.ProjectInfo.ProjectID)
+}
+
+// googleServicesProjectIDFromBase64 是它的 base64 入口，给推送凭据那一侧用。
+func googleServicesProjectIDFromBase64(encoded string) string {
+	if strings.TrimSpace(encoded) == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return ""
+	}
+	return googleServicesProjectID(decoded)
 }
 
 // googleServicesPackageProblem 检查这份文件是不是这个包名的。空串表示没问题。

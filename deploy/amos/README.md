@@ -76,7 +76,8 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
 - **扫链**：每条链在 `chain_scan_state` 上有一把租约（`lease_owner` /
   `lease_until`），只有抢到的那台推进游标。两台同时开着是安全的。
 - **推送派发**：出站队列的认领是 CAS（`WHERE id=? AND status='pending'` 看
-  `RowsAffected`），不会重复发。但两台一起派发只是分摊，收益为零，默认留给 web4。
+  `RowsAffected`），不会重复发。web4 退役后 amos 是唯一的派发方，所以
+  `PUSH_DISPATCH_ENABLED=true`。凭据按租户存在库里（`push.fcm`），不在 env。
 - **表结构**：`MYSQL_AUTO_MIGRATE=false`，迁移不在服务启动时跑。web4 在役时由
   它的 `start.sh` 推进，amos 刻意不碰，免得两个写入方抢同一张 `schema_migrations`。
   **web4 退役后执行方换成 amos**：`rn-foundation-migrate.service`（oneshot），
@@ -100,8 +101,9 @@ scp deploy/amos/* amos:~/rn-foundation-deploy/
 ssh amos 'cd ~/rn-foundation-deploy && ./install.sh'
 
 # 3. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*
-#    数据库四项与 STORAGE_MASTER_KEY 照抄 web4 的 .env；ADMIN_API_KEY 另生成：
-#    openssl rand -hex 32
+#    MYSQL_DSN 一行（user:password@tcp(host:port)/database?params）、STORAGE_MASTER_KEY、
+#    ADMIN_* 与 BUILD_AGENT_TOKEN。ADMIN_API_KEY 另生成：openssl rand -hex 32
+#    填完 `rn-server config` 核对：它打印实际生效的值并标出哪些来自 env
 
 # 4. 回开发机，编译并推送二进制与两份控制台
 ./deploy/amos/deploy.sh

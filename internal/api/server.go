@@ -25,6 +25,7 @@ import (
 	"github.com/Helix2010/RN-Server/internal/chain"
 	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/Helix2010/RN-Server/internal/objectstore"
+	"github.com/Helix2010/RN-Server/internal/pushcreds"
 	"github.com/Helix2010/RN-Server/internal/secretbox"
 	"github.com/Helix2010/RN-Server/internal/store"
 	"github.com/gin-gonic/gin"
@@ -42,6 +43,9 @@ type server struct {
 	secrets  *secretbox.Box
 	// tokens 只从平台默认端点读代币元数据；测试用假实现替换
 	tokens tokenMetadataReader
+	// verifyFCM 真去 Google 换一次访问令牌。做成字段是因为保存推送凭据这条路
+	// **必须**联网验证（见 pushcreds.Verify 的注释），而测试不该联网。
+	verifyFCM func(context.Context, pushcreds.ServiceAccount) error
 	// adminIPs 限制 x-admin-key 自动化通道的来源；nil = 未配置，不限制
 	adminIPs *ipAllowlist
 }
@@ -120,7 +124,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	if err != nil {
 		panic(err)
 	}
-	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist}
+	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify}
 	r := gin.New()
 	// 不配就谁都不信：ClientIP 取直连对端，而不是任何人都能写的 X-Forwarded-For。
 	// 这同时让下面的登录限流按真实来源计数（在此之前它也是可绕过的）。
@@ -168,6 +172,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	platform.GET("/build-agent/public-key", s.getBuildAgentKey)
 	platform.POST("/build-agent/public-key/accept", s.acceptBuildAgentKey)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
+	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
+	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
+	platform.DELETE("/push/credentials/fcm", s.deletePlatformPushCredentialsFCM)
 	platform.GET("/scan/chains", s.scanChains)
 	platform.PUT("/scan/chains/:chain", s.saveScanChain)
 	platform.POST("/scan/chains/:chain/probe", s.probeScanChain)
@@ -283,6 +290,12 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 的 JSON——为了一张 600 KB 的图给每个请求留那么大的口子不值得。
 	group.PUT("/build-icons/:name", s.updateBuildIcon)
 	group.DELETE("/build-icons/:name", s.deleteBuildIcon)
+	// 推送凭据：google-services.json 的服务端另一半，所以挨着 build-config 放。
+	// 两者必须属于同一个 Firebase 项目，视图里直接给出比对结果。
+	group.GET("/push/credentials", s.getPushCredentials)
+	group.PUT("/push/credentials/fcm", s.updatePushCredentialsFCM)
+	group.DELETE("/push/credentials/fcm", s.deletePushCredentialsFCM)
+	group.POST("/push/credentials/fcm/test", s.testPushCredentialsFCM)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	group.PUT("/build-keystore", s.saveBuildKeystore)
 	// 在服务端生成签名密钥。它不削弱"服务端打不开已存密钥"这条性质——生成出来
