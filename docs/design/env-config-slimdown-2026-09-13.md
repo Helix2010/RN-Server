@@ -376,3 +376,35 @@ ARTIFACT_UPLOAD_MODE=proxy          # 桶没有跨域规则且我们改不了，
 - **第 4 步的后半段**：`push-credentials import-env` 还没在 amos 上跑，env 里的 `FCM_*` 也还没删。要在部署之后做。
 - **第 5 步（DSN 第二版）**：要等 amos 的 env 换成 `MYSQL_DSN` 并跑过一轮，才能删旧键读取。
 - **amos env 的实际收缩**：新二进制部署之前不能动 env（旧二进制不认 `MYSQL_DSN`）。顺序是：部署 → `rn-server config` 核对 → 写 `MYSQL_DSN` → 删十一行和二十多行默认值 → `import-env` → 删 `FCM_*` → 重启。
+
+## 11. 上线记录（2026-09-13 07:42–07:44 UTC）
+
+CI 部署 → `import-env` → 收缩 env → 重启，全程 2 分钟，没有中断。
+
+**env：60 个键 → 18 个**（`deploy/amos/slim-env.py`，备份在 `/etc/rn-foundation.env.bak-20260913-074333`）。删掉的 43 个分四类：11 个合进 `MYSQL_DSN`、7 个代码从不读取或键已删除、20 个值就是默认值、2 个推送凭据（已进库）、3 个空的。
+
+**等价性是在重启之前验的**，这一步不能省：用 systemd 自己的 `EnvironmentFile` 加载新文件跑 `rn-server config`，得到的连接串和旧的十一个键拼出来的**逐字节相同**——
+
+```
+root:***@tcp(…:13306)/rn?charset=utf8mb4&parseTime=true&readTimeout=15s&timeout=15s&writeTimeout=15s
+```
+
+**推送凭据**：`import-env` 向 Google 真换了一次令牌（通过，说明生产这把钥匙是活的），存为 tenant 0。重启后逐租户查 `GET /v1/admin/push/credentials`：
+
+| 租户 | configured | inherited | 项目 | google-services | projectMatches |
+|---|---|---|---|---|---|
+| anyfun | true | true (0) | anyfun | anyfun | **true** |
+| predict.kim | true | true (0) | anyfun | anyfun | **true** |
+| any123 | true | true (0) | anyfun | 未上传 | **null** |
+
+和 §8.4 预测的一致：两个配齐的租户全绿，第三个是"待配置"而不是红叉。
+
+**删掉 `CORS_ORIGINS` 之前核对过 §2.5 那个推断**，没有照它写的做。三个 `console.*` 域名确实都在 `tenant_domain` 里（`api.*` 也在），所以删得掉；删完预检仍然逐个回正确的 `Access-Control-Allow-Origin`，而 `https://evil.example` 不放行。**换一台机器之前要重新核对**——这个结论属于这份数据，不属于这套代码。
+
+**`INDEXER_ENABLED` 删掉之后扫链照常起**（`chain worker started chain=op-sepolia`），子命令默认值生效。
+
+**两条弃用警告在重启后消失**，说明 `MYSQL_DSN` 和库里的凭据都走通了。
+
+### 顺带发现，与本次改动无关
+
+`any123.top` 的 TLS 一直是坏的：`/etc/nginx/ssl/rn-foundation-le` 那张证书（2026-09-12 签）的 SAN 只有 `api.predict.kim` 和 `console.predict.kim`，而 `setup-tls.sh` 的默认 `DOMAINS` 里是带 any123 两个名字的。nginx 配置第 4 行自己写着"本机现存的 `console.any123.top` ⋯⋯一直没生效"。该租户的 API 在本机带 Host 头是通的（上面那张表就是这么查的），坏的只是公网 TLS。要修就重跑一次 `setup-tls.sh`。
