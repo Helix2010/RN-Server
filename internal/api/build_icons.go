@@ -45,9 +45,12 @@ var buildIconFileNames = map[string]string{
 }
 
 const (
-	// 1024×1024 的 PNG 通常在 1MB 以内。留 2MB 的余量，再大基本是没压缩过的原图，
-	// 而它要经过任务下发通道，一次构建拉四张
-	buildIconMaxBytes = 2 << 20
+	// 上限取 6MB：anyfun 线上那两张就是 2048×2048 / 2.6MB，一开始定的 2MB 会把
+	// **正在用的**图标判成不合法。真实素材比想象的大，这类阈值不该靠猜。
+	//
+	// 代价是它随任务下发：四张满打满算 24MB，base64 之后 32MB。实际只发租户传过的
+	// 那几张，而多数租户传的是压过的图。哪天真顶到这个量，再换成签名下载地址。
+	buildIconMaxBytes = 6 << 20
 	buildIconMinSide  = 256
 	buildIconMaxSide  = 2048
 )

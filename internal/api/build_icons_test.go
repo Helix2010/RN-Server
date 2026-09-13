@@ -45,6 +45,11 @@ func TestValidateBuildIconRejectsWhatPrebuildWouldChokeOn(t *testing.T) {
 		})
 	}
 
+	// 线上正在用的那两张是 2048×2048 / 2.6MB，不能被判成不合法
+	if _, err := validateBuildIcon(pngOf(2048, 2048)); err != nil {
+		t.Fatalf("2048 见方的图被拒了，而线上正在用这个尺寸：%v", err)
+	}
+
 	// JPEG 没有透明通道，自适应图标会露出白底——这类错在设备上才看得出来
 	img := image.NewRGBA(image.Rect(0, 0, 1024, 1024))
 	var buf bytes.Buffer
