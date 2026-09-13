@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -407,26 +408,49 @@ func (s *server) createBuildJob(c *gin.Context) {
 }
 
 func (s *server) listBuildJobs(c *gin.Context) {
-	limit := 50
-	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
-		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 200 {
-			limit = parsed
-		}
+	filter, invalid := parseBuildJobListFilter(c)
+	if invalid != "" {
+		problem(c, http.StatusUnprocessableEntity, "INVALID_BUILD_FILTER", invalid)
+		return
 	}
+	where, args := filter.where(tenantID(c))
+	var total int
+	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*) FROM build_jobs WHERE `+where, args...).Scan(&total); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to count builds")
+		return
+	}
+	pageWhere, pageArgs := where, append([]any{}, args...)
+	if filter.hasCursor {
+		pageWhere += ` AND (created_at<? OR (created_at=? AND id<?))`
+		pageArgs = append(pageArgs, filter.cursorAt, filter.cursorAt, filter.cursorID)
+	}
+	pageArgs = append(pageArgs, filter.limit+1)
 	rows, err := s.db.QueryContext(c.Request.Context(),
-		`SELECT `+buildJobColumns+` FROM build_jobs WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?`, tenantID(c), limit)
+		`SELECT `+buildJobColumns+` FROM build_jobs WHERE `+pageWhere+` ORDER BY created_at DESC,id DESC LIMIT ?`, pageArgs...)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to list builds")
 		return
 	}
 	defer rows.Close()
-	items := []map[string]any{}
+	jobs := []buildJob{}
 	for rows.Next() {
 		job, err := scanBuildJob(rows)
 		if err != nil {
 			problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to list builds")
 			return
 		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read builds")
+		return
+	}
+	hasMore := len(jobs) > filter.limit
+	if hasMore {
+		jobs = jobs[:filter.limit]
+	}
+	items := make([]map[string]any, 0, len(jobs))
+	for _, job := range jobs {
 		items = append(items, buildJobView(job))
 	}
 	// 下一个包该填什么，由服务端算——控制台不该自己去推。它要看的两张表里有一张
@@ -444,7 +468,109 @@ func (s *server) listBuildJobs(c *gin.Context) {
 	}
 	// 分支固定 main：排队时根本不看请求里带什么（见 createBuildJob）。告诉控制台
 	// 这件事，省得它画一个改了也没用的输入框。
-	c.JSON(http.StatusOK, gin.H{"items": items, "next": next, "gitRef": buildGitRef})
+	var nextCursor any
+	if hasMore && len(jobs) > 0 {
+		last := jobs[len(jobs)-1]
+		nextCursor = encodeBuildCursor(last.CreatedAt, last.ID)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "next": next, "gitRef": buildGitRef, "total": total, "limit": filter.limit, "nextCursor": nextCursor, "hasMore": hasMore})
+}
+
+const buildJobListMaxLimit = 100
+
+type buildJobListFilter struct {
+	kind, platform, status, version, query string
+	limit                                  int
+	cursorAt                               time.Time
+	cursorID                               string
+	hasCursor                              bool
+}
+
+func parseBuildJobListFilter(c *gin.Context) (buildJobListFilter, string) {
+	f := buildJobListFilter{
+		kind:     strings.ToLower(strings.TrimSpace(c.Query("kind"))),
+		platform: strings.ToLower(strings.TrimSpace(c.Query("platform"))),
+		status:   strings.ToLower(strings.TrimSpace(c.Query("status"))),
+		version:  strings.TrimSpace(c.Query("version")),
+		query:    strings.TrimSpace(c.Query("q")),
+		limit:    20,
+	}
+	if f.kind != "" && f.kind != "apk" && f.kind != "ota" {
+		return f, "kind must be apk or ota"
+	}
+	if f.platform != "" && f.platform != "android" && f.platform != "ios" {
+		return f, "platform must be android or ios"
+	}
+	switch f.status {
+	case "", "queued", "claimed", "running", "succeeded", "failed", "canceled":
+	default:
+		return f, "status is invalid"
+	}
+	if len(f.version) > 128 || len(f.query) > 200 {
+		return f, "version and q are too long"
+	}
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > buildJobListMaxLimit {
+			return f, fmt.Sprintf("limit must be between 1 and %d", buildJobListMaxLimit)
+		}
+		f.limit = value
+	}
+	if raw := strings.TrimSpace(c.Query("cursor")); raw != "" {
+		at, id, err := decodeBuildCursor(raw)
+		if err != nil {
+			return f, "cursor is invalid"
+		}
+		f.cursorAt, f.cursorID, f.hasCursor = at, id, true
+	}
+	return f, ""
+}
+
+func encodeBuildCursor(at time.Time, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%d:%s", at.UnixNano(), id)))
+}
+
+func decodeBuildCursor(raw string) (time.Time, string, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return time.Time{}, "", errors.New("cursor must have timestamp:id")
+	}
+	nanos, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	return time.Unix(0, nanos).UTC(), parts[1], nil
+}
+
+func (f buildJobListFilter) where(tenant string) (string, []any) {
+	clauses := []string{"tenant_id=?"}
+	args := []any{tenant}
+	if f.kind != "" {
+		clauses = append(clauses, "kind=?")
+		args = append(args, f.kind)
+	}
+	if f.platform != "" {
+		clauses = append(clauses, "platform=?")
+		args = append(args, f.platform)
+	}
+	if f.status != "" {
+		clauses = append(clauses, "status=?")
+		args = append(args, f.status)
+	}
+	if f.version != "" {
+		clauses = append(clauses, "version=?")
+		args = append(args, f.version)
+	}
+	if f.query != "" {
+		pattern := "%" + f.query + "%"
+		clauses = append(clauses, "(id LIKE ? OR version LIKE ? OR git_ref LIKE ? OR commit_sha LIKE ? OR claimed_by LIKE ?)")
+		args = append(args, pattern, pattern, pattern, pattern, pattern)
+	}
+	return strings.Join(clauses, " AND "), args
 }
 
 func (s *server) buildJobDetail(c *gin.Context) {

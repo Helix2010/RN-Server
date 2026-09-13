@@ -79,7 +79,7 @@ CREATE TABLE build_jobs (
 **管理端**（`x-admin-key` 或浏览器会话）
 
 - `POST /v1/admin/builds` — `{platform, gitRef, version, buildNumber, reason, confirm}`。校验 `buildNumber` 严格大于该租户该平台已有的最大值（`app_releases` 与 `build_jobs` 取大者），否则 409。
-- `GET /v1/admin/builds` — 列表，带状态与产物指纹。
+- `GET /v1/admin/builds` — 列表，服务端按 `kind`（apk/ota）、`platform`、`status`、`version` 和 `q` 筛选，并用 `cursor` + `limit` 返回分页结果，带状态与产物指纹。
 - `GET /v1/admin/builds/{id}` — 详情，含 `logTail`。
 - `POST /v1/admin/builds/{id}/cancel` — 只能取消 `queued` / `claimed`。
 

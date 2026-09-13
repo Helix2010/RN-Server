@@ -1834,7 +1834,16 @@
     "/v1/admin/builds": {
       "get": {
         "summary": "List build jobs for this tenant",
-        "description": "Newest first. Each item carries status, the resolved commit, the artifact sha256 and a bounded log tail. Also returns `next` — the version and build number to default the queue form to, per platform, worked out from both app_releases and the build jobs still queued or running; a tenant with no packages yet gets 1.0.0/1, otherwise the highest used version gets a patch bump and the build number is incremented. `gitRef` is the branch every build is pinned to; the console shows it read-only because the queue endpoint ignores whatever the request carries.",
+        "description": "Newest first, with server-side filtering and cursor pagination. Each item carries status, the resolved commit, the artifact sha256 and a bounded log tail. Filters include kind (apk/ota), platform, status, exact version and q (job id, version, commit, branch or builder). Also returns `next` — the version and build number to default the queue form to, per platform, worked out from both app_releases and the build jobs still queued or running; a tenant with no packages yet gets 1.0.0/1, otherwise the highest used version gets a patch bump and the build number is incremented. `gitRef` is the branch every build is pinned to; the console shows it read-only because the queue endpoint ignores whatever the request carries.",
+        "parameters": [
+          { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["apk", "ota"] } },
+          { "name": "platform", "in": "query", "schema": { "type": "string", "enum": ["android", "ios"] } },
+          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["queued", "claimed", "running", "succeeded", "failed", "canceled"] } },
+          { "name": "version", "in": "query", "schema": { "type": "string" } },
+          { "name": "q", "in": "query", "schema": { "type": "string" } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
+        ],
         "responses": {
           "200": {
             "description": "Build jobs"
