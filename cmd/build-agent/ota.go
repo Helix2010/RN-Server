@@ -23,16 +23,16 @@ func buildOTAPackage(ctx context.Context, cfg config, api *client, job claimedJo
 	if strings.TrimSpace(job.RuntimeVersion) == "" || strings.TrimSpace(job.BaseReleaseID) == "" {
 		return result, fmt.Errorf("the OTA job carries no base release or runtime version")
 	}
-	worktree, commitSHA, err := prepareWorktree(ctx, cfg, api, job, buf)
+	worktree, commitSHA, extraEnv, err := prepareWorktree(ctx, cfg, api, job, buf)
 	if err != nil {
 		return result, err
 	}
 	result.CommitSHA = commitSHA
 
-	env := append(os.Environ(),
-		"EXPO_PUBLIC_TENANT="+job.TenantDirectory,
-		"EXPO_PUBLIC_API_BASE_URL="+job.APIBaseURL(),
-	)
+	// 和编 APK 用同一套环境：原生指纹把 expo config 整份算进去，少一个变量就是另一个
+	// 指纹，热更新就永远和基线对不上。
+	env := append(os.Environ(), extraEnv...)
+	env = append(env, "EXPO_PUBLIC_API_BASE_URL="+job.APIBaseURL())
 	if err := run(ctx, buf, worktree, env, "pnpm", "install", "--frozen-lockfile"); err != nil {
 		return result, err
 	}
@@ -81,10 +81,10 @@ func buildOTAPackage(ctx context.Context, cfg config, api *client, job claimedJo
 //
 // 算不出来不让整条构建失败：指纹只影响"这个包以后能不能收热更新"，而一个能装能跑的
 // 安装包本身是有价值的。缺指纹的后果会在发热更新那一刻被明确告知。
-func nativeFingerprint(ctx context.Context, buf *logBuffer, worktree, tenantDirectory string, env []string) string {
+func nativeFingerprint(ctx context.Context, buf *logBuffer, worktree string, env []string) string {
 	cmd := exec.CommandContext(ctx, "pnpm", "exec", "fingerprint", ".")
 	cmd.Dir = worktree
-	cmd.Env = append(env, "EXPO_PUBLIC_TENANT="+tenantDirectory)
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		buf.add("native fingerprint unavailable: " + err.Error())

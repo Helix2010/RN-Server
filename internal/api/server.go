@@ -213,6 +213,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	agent.POST("/jobs/:id/release", s.buildAgentJobScope(s.buildAgentReleaseFromArtifact))
 	// 热更新包：票据与修订都取任务行上的参数，代理不带 base / channel / 生效方式
 	agent.POST("/jobs/:id/ota-uploads", s.buildAgentJobScope(s.buildJobOTAUpload))
+	agent.PUT("/jobs/:id/ota-artifact", s.buildAgentJobScope(s.uploadOTAArtifact))
 	agent.POST("/jobs/:id/ota-release", s.buildAgentJobScope(s.buildJobOTARelease))
 	current := protected.Group("")
 	current.Use(s.domainTenantScope())

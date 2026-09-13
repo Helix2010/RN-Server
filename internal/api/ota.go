@@ -240,7 +240,12 @@ func (s *server) createOTAUploader(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	url := s.absoluteURL(c, "/v1/admin/ota/artifacts/upload")
+	// 代理走自己那条回传地址：它没有管理端凭据，拿到管理端的 URL 只会 401
+	uploadPath := "/v1/admin/ota/artifacts/upload"
+	if buildAgentUploadsArtifact(c) {
+		uploadPath = "/v1/build-agent/jobs/" + c.Param("id") + "/ota-artifact"
+	}
+	url := s.absoluteURL(c, uploadPath)
 	headers := map[string]string{"content-type": body.ContentType, "x-ota-artifact-token": tok}
 	requires := true
 	if s.cfg.ArtifactUploadMode == "direct" {
