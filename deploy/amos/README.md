@@ -214,6 +214,26 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 
 ## 注意事项
 
+### 轮换封装口令
+
+`BUILD_KEYSTORE_PASSPHRASE` 泄漏（或怀疑泄漏）时跑
+`deploy/amos/rotate-keystore-passphrase.sh`（在开发机上，需要 `go` 和 `ssh amos`）。
+先跑一次 `--check` 看当前状态。
+
+换的是**口令不是密钥**：只要明文 keystore 还在手上，就用同一把密钥重新封一次盒子，
+对 App 侧零影响。换密钥等于换签名证书——Android 认为那是另一个 App，装着旧版的用户
+升不上去，只能换包名让每个人手动卸载重装。
+
+脚本里 `RESEAL`（有明文 keystore，重新封）和 `REGENERATE`（没有明文、也没有已发布的
+包，直接重新生成）两张表要随租户增减维护。
+
+口令全程走 `read -rsp` 和标准输入，不进命令行、不进 shell 历史、不落盘。**不要**图省事
+用 `ssh amos 'sudo grep BUILD_KEYSTORE_PASSPHRASE ...'` 去读它——那会把它打印到终端和
+任何记录着那次会话的地方。
+
+打包机上只有一个口令、全租户共用，所以"上传新盒子"和"改打包机"之间必然有几秒对不上，
+那段时间构建会失败。脚本按「先传新盒子，再改机器」的顺序把它压到最小。
+
 ### `ARTIFACT_UPLOAD_MODE` 必须是 `proxy`
 
 改成 `direct` 会让控制台**所有**上传（品牌图、安装包、OTA 包）当场失效，而且几乎查
