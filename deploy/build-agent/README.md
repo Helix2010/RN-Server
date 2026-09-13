@@ -26,6 +26,7 @@
 | Android SDK | platform-tools / platforms;android-36 / build-tools 36.0.0、35.0.0 / cmake 3.22.1 | 编译与签名 | 构建到一半才报缺组件 |
 | Android NDK | `27.0.12077973`、`27.1.12297006` | RN 的原生模块 | 见下面那条"SDK 只读" |
 | syft | `1.51.1`（固定版本+校验和） | 生成 SBOM，构建的必经步骤 | **构建直接失败**，不是警告 |
+| zip | 系统包 | 打热更新包（`build-ota.mjs` 调它） | 热更新任务失败在 `spawnSync zip ENOENT`；APK 那条不受影响 |
 
 syft 用 `deploy/amos/install-syft.sh` 装，版本和 sha256 都写死在脚本里：SBOM 是要被别人当证据读的东西，同一个 commit 在两台机器上扫出不同组件数的话，没人分得清是依赖变了还是工具变了。
 
@@ -98,7 +99,7 @@ builder:x:998:998::/var/lib/rn-build-agent:/bin/bash     系统账号
 
 ```bash
 # 1. 工具链
-sudo apt-get install -y openjdk-17-jdk-headless
+sudo apt-get install -y openjdk-17-jdk-headless zip
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs
 sudo corepack enable && sudo corepack prepare pnpm@latest --activate
 
