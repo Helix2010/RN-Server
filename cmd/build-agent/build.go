@@ -138,6 +138,14 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 	}
 	buf.add(fmt.Sprintf("tenant %s written as %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
 
+	// 图标在 prebuild 里才被读到，而那是 pnpm install 之后的事——少一个文件要等两
+	// 分钟才报错，报的还是一句 ENOENT 加一串 @expo 的栈。这里先看一眼。
+	if missing := missingTenantIcons(worktree, job.TenantDirectory); len(missing) > 0 {
+		return result, fmt.Errorf("这个租户的启动图标不在仓库里：%s。"+
+			"图标是构建期资源，目前仍然要提交到 App 仓库的 assets/tenants/%s/ 下",
+			strings.Join(missing, "、"), job.TenantDirectory)
+	}
+
 	// 证书随任务下发，代理不去猜该编哪一张
 	if strings.TrimSpace(job.OTACertificatePEM) == "" {
 		return result, fmt.Errorf("tenant %s has no OTA signing key; install one before building a package that must verify updates", job.TenantSlug)
@@ -208,6 +216,26 @@ func buildJob(ctx context.Context, cfg config, job claimedJob, buf *logBuffer) (
 		return result, err
 	}
 	return result, nil
+}
+
+// missingTenantIcons 返回 prebuild 会去读、而仓库里还没有的那几个图标。
+//
+// 文件名是约定（见服务端 tenantIcon），所以这里能提前判断。图标是唯一还留在 App
+// 仓库里的按租户资源——tenant.json 和 google-services.json 都已经搬到服务端了。
+func missingTenantIcons(worktree, directory string) []string {
+	var missing []string
+	for _, name := range []string{
+		"icon.png",
+		"android-icon-foreground.png",
+		"android-icon-background.png",
+		"android-icon-monochrome.png",
+	} {
+		path := filepath.Join(worktree, "assets", "tenants", directory, name)
+		if _, err := os.Stat(path); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 func removeWorktree(cfg config, job claimedJob, buf *logBuffer) {

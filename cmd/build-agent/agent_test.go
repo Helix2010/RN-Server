@@ -447,3 +447,29 @@ func TestAgentKeyIsCreatedOnceAndKeptPrivate(t *testing.T) {
 		t.Fatal("第二次读到了另一把私钥——已经存下去的密钥会全部打不开")
 	}
 }
+
+// 图标缺了要在花两分钟装依赖**之前**说，而且要说清楚缺哪几个、该放哪里。
+// prebuild 报的是一句 ENOENT 加一串 @expo 的栈，看的人不知道那是租户资源没提交。
+func TestMissingTenantIconsAreCaughtBeforeTheExpensiveSteps(t *testing.T) {
+	worktree := t.TempDir()
+	dir := filepath.Join(worktree, "assets", "tenants", "predict-kim")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	missing := missingTenantIcons(worktree, "predict-kim")
+	if len(missing) != 4 {
+		t.Fatalf("一个都没有时应当报四个：%v", missing)
+	}
+	for _, name := range missing {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("png"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if left := missingTenantIcons(worktree, "predict-kim"); len(left) != 0 {
+		t.Fatalf("补齐之后还报缺：%v", left)
+	}
+	// 别的租户目录不该影响判断
+	if left := missingTenantIcons(worktree, "anyfun"); len(left) != 4 {
+		t.Fatalf("另一个租户应当照样报缺：%v", left)
+	}
+}
