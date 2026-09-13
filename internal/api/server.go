@@ -164,6 +164,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin())
+	// 打包机公钥是平台级的一把，不属于任何租户；换它要人核对指纹后接受
+	platform.GET("/build-agent/public-key", s.getBuildAgentKey)
+	platform.POST("/build-agent/public-key/accept", s.acceptBuildAgentKey)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	platform.GET("/scan/chains", s.scanChains)
 	platform.PUT("/scan/chains/:chain", s.saveScanChain)
@@ -186,6 +189,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	agent.POST("/claim", s.claimBuildJob)
 	// 封装口令只在打包机上，所以只有它能回答"这个盒子开不开得了"（见
 	// build_keystore_check.go）
+	// 打包机启动时登记自己的公钥；签名密钥从此加密给它，没有人需要敲封装口令
+	agent.POST("/public-key", s.registerBuildAgentKey)
 	agent.GET("/keystore-checks", s.pendingKeystoreChecks)
 	agent.POST("/keystore-checks", s.reportKeystoreCheck)
 	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)

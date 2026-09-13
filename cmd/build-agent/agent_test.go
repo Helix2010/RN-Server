@@ -348,10 +348,37 @@ func TestSBOMOutputNameTracksTheArtifact(t *testing.T) {
 	}
 }
 
-// 开不了盒子时给出的那句话，必须指向真正的原因：封装口令是**整台打包机共用的一个**，
-// 新租户要填已有的那一个。第一版的提示是"把打包机上的 BUILD_KEYSTORE_PASSPHRASE
-// 设成同一个"——第二个租户照着做，第一个租户的密钥当场就开不了了。
-func TestOpenableExplainsTheSharedPassphrase(t *testing.T) {
+// 新格式：盒子加密给本机公钥，解得开就是解得开，没有任何口令参与。
+func TestOpenableAcceptsABoxSealedToThisMachine(t *testing.T) {
+	private, recipient, err := buildkeystore.NewAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := buildkeystore.SealTo(buildkeystore.Bundle{
+		KeystoreBase64: "eA==", StorePassword: "s", KeyAlias: "a", KeyPassword: "k",
+	}, recipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(sealed)
+	cfg := config{AgentPrivateKey: private}
+	if ok, reason := openable(raw, cfg); !ok {
+		t.Fatalf("加密给本机的盒子应当能打开：%q", reason)
+	}
+
+	// 加密给另一台打包机的，必须打不开，并且说清楚是"换了公钥"而不是"口令不对"
+	otherPrivate, _, _ := buildkeystore.NewAgentKey()
+	ok, reason := openable(raw, config{AgentPrivateKey: otherPrivate})
+	if ok {
+		t.Fatal("另一台机器的私钥竟然解开了")
+	}
+	if !strings.Contains(reason, "公钥") {
+		t.Fatalf("原因没指向公钥不匹配：%q", reason)
+	}
+}
+
+// 旧格式还在库里（迁移之前存的），本机有对的口令时照样要能开
+func TestOpenableStillHandlesTheOldPassphraseFormat(t *testing.T) {
 	sealed, err := buildkeystore.Seal(buildkeystore.Bundle{
 		KeystoreBase64: "eA==", StorePassword: "s", KeyAlias: "a", KeyPassword: "k",
 	}, "passphrase-number-one")
@@ -360,35 +387,63 @@ func TestOpenableExplainsTheSharedPassphrase(t *testing.T) {
 	}
 	raw, _ := json.Marshal(sealed)
 
-	ok, reason := openable(raw, "passphrase-number-one")
-	if !ok || reason != "" {
-		t.Fatalf("对的口令应当能打开：%v %q", ok, reason)
+	if ok, reason := openable(raw, config{KeystorePassphrase: "passphrase-number-one"}); !ok {
+		t.Fatalf("旧格式打不开了：%q", reason)
 	}
-
-	ok, reason = openable(raw, "a-completely-different-one")
+	// 口令不对时要告诉人"重新生成一次就换成新格式"，而不是让他继续猜口令
+	ok, reason := openable(raw, config{KeystorePassphrase: "a-completely-different-one"})
 	if ok {
-		t.Fatal("错的口令却报成能打开")
+		t.Fatal("错的口令报成能打开")
 	}
-	if !strings.Contains(reason, "整台打包机共用") {
-		t.Fatalf("没有点明口令是共用的：%q", reason)
+	if !strings.Contains(reason, "重新生成") {
+		t.Fatalf("没有指向出路：%q", reason)
 	}
-	// 口令本身绝不能出现在报给服务端、最终显示在控制台上的文字里
+	// 口令和私钥都不能出现在报给服务端、最终显示在控制台上的文字里
 	for _, secret := range []string{"passphrase-number-one", "a-completely-different-one"} {
 		if strings.Contains(reason, secret) {
 			t.Fatalf("原因里带上了口令：%q", reason)
 		}
 	}
+	// 本机连旧口令都没有：说清楚出路是重新生成，不是去找那个口令
+	if ok, reason := openable(raw, config{}); ok || !strings.Contains(reason, "重新生成") {
+		t.Fatalf("没配旧口令时的提示不对：%v %q", ok, reason)
+	}
 }
 
-// 没有配口令、盒子是空的、盒子坏掉——三种都要能分辨，而不是都报成"口令不对"
+// 没有下发盒子、盒子坏掉——两种都要能分辨，而不是都报成"解不开"
 func TestOpenableDistinguishesTheOtherFailures(t *testing.T) {
-	if ok, reason := openable(nil, "x"); ok || !strings.Contains(reason, "没有下发") {
+	if ok, reason := openable(nil, config{}); ok || !strings.Contains(reason, "没有下发") {
 		t.Fatalf("空盒子：%v %q", ok, reason)
 	}
-	if ok, reason := openable(json.RawMessage(`{}`), ""); ok || !strings.Contains(reason, "BUILD_KEYSTORE_PASSPHRASE") {
-		t.Fatalf("没配口令：%v %q", ok, reason)
-	}
-	if ok, reason := openable(json.RawMessage(`not json`), "passphrase-long-enough"); ok || !strings.Contains(reason, "JSON") {
+	if ok, reason := openable(json.RawMessage(`not json`), config{}); ok || !strings.Contains(reason, "JSON") {
 		t.Fatalf("坏盒子：%v %q", ok, reason)
+	}
+}
+
+// 本机私钥：没有就生成一把 0600 的，有就读回来，两次读到同一把
+func TestAgentKeyIsCreatedOnceAndKeptPrivate(t *testing.T) {
+	dir := t.TempDir()
+	private, recipient, err := loadOrCreateAgentKey(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recipient.Fingerprint() == "" {
+		t.Fatal("生成出来的公钥没有指纹")
+	}
+	info, err := os.Stat(filepath.Join(dir, agentKeyFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 私钥的权限和 keystore 解出来的临时文件同级。0644 意味着这台机器上任何一个
+	// 用户都能拿走所有租户的签名密钥
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("私钥文件权限是 %o，必须是 600", info.Mode().Perm())
+	}
+	again, sameRecipient, err := loadOrCreateAgentKey(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(private) || sameRecipient.PublicKey != recipient.PublicKey {
+		t.Fatal("第二次读到了另一把私钥——已经存下去的密钥会全部打不开")
 	}
 }

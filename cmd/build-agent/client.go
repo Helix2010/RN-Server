@@ -265,3 +265,17 @@ func (c *client) reportKeystoreCheck(ctx context.Context, tenant string, version
 	}, nil)
 	return err
 }
+
+func (c *client) registerPublicKey(ctx context.Context, publicKey, agent string) (string, error) {
+	var out struct {
+		Status             string `json:"status"`
+		Fingerprint        string `json:"fingerprint"`
+		CurrentFingerprint string `json:"currentFingerprint"`
+	}
+	if _, err := c.post(ctx, "/v1/build-agent/public-key", map[string]any{
+		"publicKey": publicKey, "agent": agent,
+	}, &out); err != nil {
+		return "", err
+	}
+	return out.Status, nil
+}

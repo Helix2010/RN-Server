@@ -2244,7 +2244,7 @@
     "/v1/admin/build-keystore/generate": {
       "post": {
         "summary": "Generate the Android signing keystore on the server",
-        "description": "Generates an RSA key and a self-signed certificate, seals them with the caller's passphrase, stores the sealed box, and pins packageName plus the certificate SHA-256 as release.android — all in one transaction. Returns the plaintext keystore and its generated store password once so the operator can back them up; they cannot be retrieved again. Both optimistic locks are checked before the key is generated, because generating one takes seconds and reporting the conflict afterwards only makes the operator repeat it.",
+        "description": "Generates an Android signing key on the server and encrypts it to the build machine's registered public key, in the same transaction that pins the certificate fingerprint as the tenant's release identity. No sealing passphrase is involved: the server holds only the public key, so it cannot open what it just stored, and nobody has to type a secret. Fails with 424 NO_BUILD_AGENT_KEY when no build agent has registered a key yet — there would be nothing to encrypt to. The plaintext keystore and its store password are returned exactly once and are never logged or audited.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2270,6 +2270,57 @@
           },
           "500": {
             "description": "BUILD_KEYSTORE_SAVE_FAILED"
+          },
+          "424": {
+            "description": "NO_BUILD_AGENT_KEY: no build agent has registered a public key"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/public-key": {
+      "post": {
+        "summary": "Register this build machine's public key",
+        "description": "The build agent generates an X25519 keypair on first start; the private key never leaves that machine. Signing keystores are encrypted to this public key, so nobody has to type a sealing passphrase — the previous design asked whoever was at the console for a platform-wide secret that protects every tenant's key, which a tenant cannot know and which even the platform operator mistyped three times. The key is pinned: the first registration is accepted, a later registration of a different key is only recorded as pending and needs a platform admin to accept it after checking the fingerprint. Without pinning, anyone holding the agent token could register their own public key and every keystore created afterwards would be encrypted to them.",
+        "responses": {
+          "200": {
+            "description": "registered | unchanged | pending_acceptance"
+          },
+          "400": {
+            "description": "INVALID_AGENT_KEY"
+          },
+          "401": {
+            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/build-agent/public-key": {
+      "get": {
+        "summary": "Which build machine key signing keystores are encrypted to",
+        "description": "Returns the pinned public key fingerprint and, when a build agent has reported a different one, the pending fingerprint waiting to be accepted. Platform admin only: the build machine is one per platform, not per tenant.",
+        "responses": {
+          "200": {
+            "description": "Current and pending build agent keys"
+          },
+          "403": {
+            "description": "Platform admin required"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/build-agent/public-key/accept": {
+      "post": {
+        "summary": "Accept a new build machine public key",
+        "description": "Requires the pending fingerprint to be typed back, which is the only evidence that someone actually checked it on the machine itself. Accepting does NOT re-encrypt existing keystores — the server has no plaintext and cannot — so every tenant's verification result is cleared, the agent re-checks each box with its new private key, and tenants whose keystore is now unopenable show up immediately instead of at their next build.",
+        "responses": {
+          "200": {
+            "description": "Accepted"
+          },
+          "400": {
+            "description": "INVALID_AGENT_KEY_ACCEPT"
+          },
+          "409": {
+            "description": "NO_PENDING_AGENT_KEY, AGENT_KEY_FINGERPRINT_MISMATCH"
           }
         }
       }

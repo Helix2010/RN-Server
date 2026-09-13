@@ -49,13 +49,22 @@ type Bundle struct {
 }
 
 // Sealed 是可以安全存进数据库、经过服务端的那个盒子。
+//
+// 两种格式共存：v1 是口令封的（scrypt 那几个字段），v2 是加密给打包机公钥的
+// （alg/epk/kid）。v1 只读不写——已经存在的盒子照样能开，新写的一律 v2，理由见
+// recipient.go。
 type Sealed struct {
-	Version    int    `json:"v"`
-	KDF        string `json:"kdf"`
-	N          int    `json:"n"`
-	R          int    `json:"r"`
-	P          int    `json:"p"`
-	Salt       string `json:"salt"`
+	Version int    `json:"v"`
+	KDF     string `json:"kdf,omitempty"`
+	N       int    `json:"n,omitempty"`
+	R       int    `json:"r,omitempty"`
+	P       int    `json:"p,omitempty"`
+	Salt    string `json:"salt,omitempty"`
+	// v2 专有
+	Algorithm          string `json:"alg,omitempty"`
+	EphemeralPublicKey string `json:"epk,omitempty"`
+	RecipientKeyID     string `json:"kid,omitempty"`
+
 	Nonce      string `json:"nonce"`
 	Ciphertext string `json:"ciphertext"`
 }

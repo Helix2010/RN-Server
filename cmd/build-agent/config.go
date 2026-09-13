@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
 
 // 配置全部来自**构建机本地**。服务端下发的只有租户 slug、git ref、version、
@@ -21,9 +23,17 @@ type config struct {
 	Platforms []string
 	Timeout   time.Duration
 	PollEvery time.Duration
-	// KeystorePassphrase 开服务端下发的那个盒子。它只存在于这台机器上——
-	// 服务端没有它，所以服务端打不开签名密钥。
+	// KeystorePassphrase 开**旧格式**（v1，口令封）的盒子。留着是为了让已经存在的
+	// 密钥继续能用；新写的一律加密给本机公钥（见 agentkey.go），不需要它。
 	KeystorePassphrase string
+	// StateDir 放本机私钥等需要长期保留的东西。默认是 workspace 的上一级，和
+	// unit 文件里的 /var/lib/rn-build-agent 对齐：缓存删了只是慢一点，这里删了
+	// 要重新配。
+	StateDir string
+	// AgentPrivateKey 是本机 X25519 私钥，永不外发
+	AgentPrivateKey []byte
+	// AgentPublicKey 登记给服务端，签名密钥加密给它
+	AgentPublicKey buildkeystore.Recipient
 }
 
 func envOr(key, fallback string) string {
@@ -43,6 +53,7 @@ func loadConfig() (config, error) {
 		Workspace:          envOr("BUILD_AGENT_WORKSPACE", ""),
 		PollEvery:          10 * time.Second,
 		KeystorePassphrase: envOr("BUILD_KEYSTORE_PASSPHRASE", ""),
+		StateDir:           envOr("BUILD_AGENT_STATE_DIR", ""),
 	}
 	for _, p := range strings.Split(envOr("BUILD_AGENT_PLATFORMS", "android"), ",") {
 		if p = strings.ToLower(strings.TrimSpace(p)); p == "android" || p == "ios" {
@@ -75,5 +86,14 @@ func loadConfig() (config, error) {
 	if !filepath.IsAbs(cfg.Workspace) {
 		return cfg, errors.New("BUILD_AGENT_WORKSPACE must be an absolute path")
 	}
+	if cfg.StateDir == "" {
+		// workspace 是 /var/lib/rn-build-agent/workspace，状态放它的上一级
+		cfg.StateDir = filepath.Dir(strings.TrimRight(cfg.Workspace, "/"))
+	}
+	if !filepath.IsAbs(cfg.StateDir) {
+		return cfg, errors.New("BUILD_AGENT_STATE_DIR must be an absolute path")
+	}
+	// 私钥不在这里读：loadConfig 只该解析配置，不该在磁盘上留下东西。落盘那一步
+	// 在 main 里做，那样这个函数也能在测试里随便调
 	return cfg, nil
 }

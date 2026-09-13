@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -9,24 +10,23 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/internal/androidkeystore"
 	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 	"github.com/Helix2010/RN-Server/internal/secretbox"
 )
 
-const testSealPassphrase = "correct-horse-battery-staple"
-
 func generateRequest(pkg string) map[string]any {
 	return map[string]any{
 		"packageName": pkg, "commonName": "AnyFun Wallet", "organization": "AnyFun", "country": "SG",
 		"keyAlias": "anyfun-release", "keySize": 2048, "validityYears": 30,
-		"sealPassphrase": testSealPassphrase, "expectedVersion": 0, "releaseIdentityExpectedVersion": 0,
+		"expectedVersion": 0, "releaseIdentityExpectedVersion": 0,
 		"reason": "new tenant setup", "confirm": true,
 	}
 }
 
-func signingServer(t *testing.T) *server {
+func signingServer(t *testing.T) (*server, []byte) {
 	t.Helper()
 	// 32 字节的测试主密钥。外层加密用它，内层那个盒子它打不开——这个测试要证明的
 	// 正是这一点
@@ -34,14 +34,26 @@ func signingServer(t *testing.T) *server {
 	if err != nil {
 		t.Fatalf("secretbox: %v", err)
 	}
-	return &server{db: openTestDB(t), secrets: box}
+	s := &server{db: openTestDB(t), secrets: box}
+	// 生成出来的密钥要加密给打包机的公钥。没登记的话生成会被拒——这本身也是一条
+	// 用例（见 TestDBGenerateRefusesWhenNoBuildAgentKeyIsRegistered）
+	agentPrivate, recipient, err := buildkeystore.NewAgentKey()
+	if err != nil {
+		t.Fatalf("agent key: %v", err)
+	}
+	if err := s.saveBuildAgentKey(context.Background(), buildAgentKeyRecord{
+		Current: recipient, Agent: "test-builder", RegisteredAt: iso(time.Now().UTC()),
+	}, "tester"); err != nil {
+		t.Fatalf("register agent key: %v", err)
+	}
+	return s, agentPrivate
 }
 
 // 生成这条路径要一次交付三样东西，而且必须一致：打包机拿到的盒子、发布身份 pin 的
 // 指纹、还给管理员备份的那个文件。任何两样对不上，表现都是"构建成功但产物被拒"或者
 // "包签出来了但装不上去"，而报错都指不到根因。
 func TestDBGenerateBuildKeystorePinsTheFingerprintItActuallyGenerated(t *testing.T) {
-	s := signingServer(t)
+	s, agentPrivate := signingServer(t)
 	tenant := testTenant(1)
 
 	c, recorder := testContext(t, tenant, http.MethodPost, "/v1/admin/build-keystore/generate", generateRequest("com.anyfun.wallet"))
@@ -84,10 +96,16 @@ func TestDBGenerateBuildKeystorePinsTheFingerprintItActuallyGenerated(t *testing
 	if err := json.Unmarshal(sealedJSON, &sealed); err != nil {
 		t.Fatalf("sealed box is not the expected shape: %v", err)
 	}
-	if _, err := buildkeystore.Open(sealed, "a-different-passphrase-entirely"); err == nil {
-		t.Fatal("the box opened with the wrong passphrase")
+	// 服务端自己打不开它刚存下去的盒子——它只有公钥。这正是签名密钥可以放进数据库
+	// 的那条论证，换成公钥之后必须仍然成立
+	if _, err := buildkeystore.OpenWith(sealed, nil); err == nil {
+		t.Fatal("没有私钥也解开了")
 	}
-	bundle, err := buildkeystore.Open(sealed, testSealPassphrase)
+	otherPrivate, _, _ := buildkeystore.NewAgentKey()
+	if _, err := buildkeystore.OpenWith(sealed, otherPrivate); err == nil {
+		t.Fatal("另一台打包机的私钥解开了")
+	}
+	bundle, err := buildkeystore.OpenWith(sealed, agentPrivate)
 	if err != nil {
 		t.Fatalf("the build machine could not open the box: %v", err)
 	}
@@ -135,7 +153,7 @@ func TestDBGenerateBuildKeystorePinsTheFingerprintItActuallyGenerated(t *testing
 // 两个乐观锁分别管两条记录，任何一条过期都要在生成之前就说清楚——生成一把密钥
 // 要几秒，跑完再报冲突只会让人重来一次。
 func TestDBGenerateBuildKeystoreRefusesStaleVersions(t *testing.T) {
-	s := signingServer(t)
+	s, _ := signingServer(t)
 	tenant := testTenant(2)
 	c, recorder := testContext(t, tenant, http.MethodPost, "/v1/admin/build-keystore/generate", generateRequest("com.anyfun.wallet"))
 	s.generateBuildKeystore(c)
@@ -168,12 +186,11 @@ func TestDBGenerateBuildKeystoreRefusesStaleVersions(t *testing.T) {
 }
 
 func TestDBGenerateBuildKeystoreRejectsUnusableInput(t *testing.T) {
-	s := signingServer(t)
+	s, _ := signingServer(t)
 	for name, mutate := range map[string]struct {
 		change func(map[string]any)
 		code   string
 	}{
-		"weak seal passphrase":         {func(b map[string]any) { b["sealPassphrase"] = "short" }, "WEAK_SEAL_PASSPHRASE"},
 		"not an application id":        {func(b map[string]any) { b["packageName"] = "wallet" }, "INVALID_RELEASE_IDENTITY"},
 		"alias Gradle cannot use":      {func(b map[string]any) { b["keyAlias"] = "my alias" }, "INVALID_KEYSTORE_PARAMETERS"},
 		"certificate expires too soon": {func(b map[string]any) { b["validityYears"] = 2 }, "INVALID_KEYSTORE_PARAMETERS"},
@@ -209,7 +226,7 @@ func findKeytoolForTest() string {
 // 服务端明明存好了，界面却报"上传失败"，而错误说的是字段类型不对——上传这条路
 // 就是因为这个从来没有成功过一次。
 func TestDBBuildKeystoreReadAndWriteReturnTheSameShape(t *testing.T) {
-	s := signingServer(t)
+	s, _ := signingServer(t)
 	tenant := testTenant(4)
 
 	c, recorder := testContext(t, tenant, http.MethodPut, "/v1/admin/build-keystore", map[string]any{

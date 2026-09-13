@@ -54,10 +54,12 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `用法:
   build-keystore create --package <applicationId> --alias <alias> --name <证书里的名字>
+                        --agent-key <打包机公钥 base64>
                         [--org <组织>] [--country <两位国家码>] [--key-size 2048|4096]
                         [--years 30] [--out-keystore <file>] [--out <file>]
-  build-keystore seal   --keystore <file> --alias <alias> [--package <applicationId>]
-                        [--out <file>] [--expected-version N] [--release-identity-version N]`)
+  build-keystore seal   --keystore <file> --alias <alias> --agent-key <打包机公钥 base64>
+                        [--package <applicationId>] [--out <file>]
+                        [--expected-version N] [--release-identity-version N]`)
 	os.Exit(2)
 }
 
@@ -75,6 +77,7 @@ func create(args []string) {
 	keySize := set.Int("key-size", 2048, "RSA 密钥长度：2048 或 4096")
 	years := set.Int("years", 30, "证书有效期（年）")
 	outKeystore := set.String("out-keystore", "", "明文 keystore 的输出路径，默认 <alias>.p12")
+	agentKey := set.String("agent-key", "", "打包机的 X25519 公钥（base64），在控制台「平台维护 → 打包机公钥」上")
 	out := set.String("out", "build-keystore.json", "输出的请求体路径")
 	expectedVersion := set.Int("expected-version", 0, "乐观锁：线上 build.keystore 当前版本号，首次上传填 0")
 	releaseVersion := set.Int("release-identity-version", 0, "乐观锁：线上 release.android 当前版本号，首次填 0")
@@ -107,13 +110,21 @@ func create(args []string) {
 	if err := os.WriteFile(keystorePath, generated.PKCS12, 0o600); err != nil {
 		fail("写不出 keystore: " + err.Error())
 	}
-	passphrase := secret("BUILD_KEYSTORE_PASSPHRASE", "封装口令（打包机上要用同一个）")
-	sealed := sealBundle(buildkeystore.Bundle{
+	// 加密给打包机的公钥，没有口令。公钥不是秘密，控制台「平台维护 → 打包机公钥」上有
+	recipient := buildkeystore.Recipient{PublicKey: strings.TrimSpace(*agentKey)}
+	if recipient.Fingerprint() == "" {
+		fail("--agent-key 必填，而且要是打包机那把 X25519 公钥的 base64。\n" +
+			"在控制台「平台维护 → 打包机公钥」上能看到它和它的指纹。")
+	}
+	sealed, err := buildkeystore.SealTo(buildkeystore.Bundle{
 		KeystoreBase64: base64.StdEncoding.EncodeToString(generated.PKCS12),
 		StorePassword:  generated.StorePassword,
 		KeyAlias:       strings.TrimSpace(*alias),
 		KeyPassword:    generated.StorePassword,
-	}, passphrase)
+	}, recipient)
+	if err != nil {
+		fail("加密给打包机公钥失败: " + err.Error())
+	}
 
 	writeBody(*out, map[string]any{
 		"sealed":                         sealed,
@@ -161,6 +172,7 @@ func seal(args []string) {
 	alias := set.String("alias", "", "签名用的 key alias")
 	pkg := set.String("package", "", "Android 包名。带上就把证书指纹一并登记为发布身份")
 	out := set.String("out", "build-keystore.json", "输出的请求体路径")
+	agentKey := set.String("agent-key", "", "打包机的 X25519 公钥（base64），在控制台「平台维护 → 打包机公钥」上")
 	expectedVersion := set.Int("expected-version", 0, "乐观锁：线上 build.keystore 当前版本号，首次上传填 0")
 	releaseVersion := set.Int("release-identity-version", 0, "乐观锁：线上 release.android 当前版本号，首次填 0")
 	_ = set.Parse(args)
@@ -181,14 +193,22 @@ func seal(args []string) {
 	if keyPassword == "" {
 		keyPassword = storePassword
 	}
-	passphrase := secret("BUILD_KEYSTORE_PASSPHRASE", "封装口令（打包机上要用同一个）")
-
-	sealed := sealBundle(buildkeystore.Bundle{
+	// 加密给打包机的公钥，不再问任何封装口令。公钥不是秘密，从平台维护页面抄过来
+	// （或者 GET /v1/admin/platform/build-agent/public-key）。
+	recipient := buildkeystore.Recipient{PublicKey: strings.TrimSpace(*agentKey)}
+	if recipient.Fingerprint() == "" {
+		fail("--agent-key 必填，而且要是打包机那把 X25519 公钥的 base64。\n" +
+			"在控制台「平台维护 → 打包机公钥」上能看到它和它的指纹。")
+	}
+	sealed, err := buildkeystore.SealTo(buildkeystore.Bundle{
 		KeystoreBase64: base64.StdEncoding.EncodeToString(raw),
 		StorePassword:  storePassword,
 		KeyAlias:       strings.TrimSpace(*alias),
 		KeyPassword:    keyPassword,
-	}, passphrase)
+	}, recipient)
+	if err != nil {
+		fail("加密给打包机公钥失败: " + err.Error())
+	}
 
 	digest := sha256.Sum256(raw)
 	body := map[string]any{
@@ -232,25 +252,11 @@ keystore SHA256: %s
     --data-binary @%s
   shred -u %s
 
-打包机上设同一个封装口令：BUILD_KEYSTORE_PASSPHRASE。
-
-服务端存的是这个盒子，它没有钥匙，打不开。丢了封装口令就只能重新封一次——
-原始 keystore 仍在你手上，所以这不是不可恢复的。
+这个盒子是**加密给打包机那把公钥**的，没有任何口令。服务端只有公钥，它打不开；
+换了打包机（或者打包机换了私钥）之后要用新公钥重新封一次——原始 keystore 仍在你
+手上，所以这不是不可恢复的。
 `, *keystorePath, strings.TrimSpace(*alias), hex.EncodeToString(digest[:]),
 		orDash(signer), *out, *out, *out)
-}
-
-// sealBundle 封盒并立刻开一次。封完打不开的盒子要等到第一次构建才会暴露，
-// 而那时候明文 keystore 多半已经 shred 掉了。
-func sealBundle(bundle buildkeystore.Bundle, passphrase string) buildkeystore.Sealed {
-	sealed, err := buildkeystore.Seal(bundle, passphrase)
-	if err != nil {
-		fail(err.Error())
-	}
-	if _, err := buildkeystore.Open(sealed, passphrase); err != nil {
-		fail("刚封好的盒子打不开，不要上传: " + err.Error())
-	}
-	return sealed
 }
 
 func writeBody(path string, body map[string]any) {

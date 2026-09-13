@@ -27,7 +27,7 @@ func verifyPendingKeystores(ctx context.Context, cfg config, api *client) {
 		return
 	}
 	for _, item := range pending {
-		ok, reason := openable(item.SealedKeystore, cfg.KeystorePassphrase)
+		ok, reason := openable(item.SealedKeystore, cfg)
 		if err := api.reportKeystoreCheck(ctx, item.Tenant, item.Version, ok, reason, cfg.Name); err != nil {
 			slog.Warn("cannot report a keystore verification", "tenant", item.Tenant, "error", err)
 			continue
@@ -46,25 +46,29 @@ func verifyPendingKeystores(ctx context.Context, cfg config, api *client) {
 // 原因里绝不能出现口令本身。buildkeystore.Open 的错误文字是固定的几种，不含输入，
 // 但这里仍然只挑我们自己写的那一句转出去——错误链上游将来加了什么，不会顺着这条
 // 通道被送到控制台上显示。
-func openable(sealed json.RawMessage, passphrase string) (bool, string) {
+func openable(sealed json.RawMessage, cfg config) (bool, string) {
 	if len(sealed) == 0 {
 		return false, "服务端没有下发盒子"
-	}
-	if passphrase == "" {
-		return false, "这台打包机没有设 BUILD_KEYSTORE_PASSPHRASE"
 	}
 	var box buildkeystore.Sealed
 	if err := json.Unmarshal(sealed, &box); err != nil {
 		return false, "盒子不是合法的 JSON，多半是存的时候就坏了"
 	}
-	bundle, err := buildkeystore.Open(box, passphrase)
-	if err != nil {
-		return false, "打包机上的 BUILD_KEYSTORE_PASSPHRASE 打不开这个盒子：" +
-			"密钥是用另一个封装口令封的。封装口令是整台打包机共用的一个，" +
-			"新租户必须填已有的那一个，而不是另想一个。"
-	}
-	if bundle.KeystoreBase64 == "" {
-		return false, "盒子能打开，但里面没有 keystore"
+	switch {
+	case box.Version == 2:
+		if _, err := buildkeystore.OpenWith(box, cfg.AgentPrivateKey); err != nil {
+			// 只有一种可能：它是加密给另一台打包机的公钥的
+			return false, "这个盒子是加密给另一把打包机公钥的，本机私钥解不开。" +
+				"多半是打包机换过机器或换过私钥——在平台维护里核对公钥指纹。"
+		}
+	case cfg.KeystorePassphrase == "":
+		return false, "这是旧格式（口令封）的密钥，而本机没有设 BUILD_KEYSTORE_PASSPHRASE。" +
+			"在控制台重新生成一次就会换成新格式，不再需要任何口令。"
+	default:
+		if _, err := buildkeystore.Open(box, cfg.KeystorePassphrase); err != nil {
+			return false, "这是旧格式（口令封）的密钥，本机的 BUILD_KEYSTORE_PASSPHRASE 打不开它。" +
+				"在控制台重新生成一次就会换成新格式，不再需要任何口令。"
+		}
 	}
 	return true, ""
 }

@@ -32,12 +32,38 @@ func main() {
 		slog.Error("cannot create the workspace", "path", cfg.Workspace, "error", err)
 		os.Exit(2)
 	}
+	// 本机私钥。没有就生成一把——服务端从此把签名密钥加密给对应的公钥，没有人需要
+	// 敲封装口令。丢了它的后果和丢了封装口令一样：已有的盒子全部打不开
+	private, public, err := loadOrCreateAgentKey(cfg.StateDir)
+	if err != nil {
+		slog.Error("cannot load this machine's build agent key", "stateDir", cfg.StateDir, "error", err)
+		os.Exit(2)
+	}
+	cfg.AgentPrivateKey = private
+	cfg.AgentPublicKey = public
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	slog.Info("build agent started", "server", cfg.Server, "agent", cfg.Name,
-		"platforms", cfg.Platforms, "workspace", cfg.Workspace)
+		"platforms", cfg.Platforms, "workspace", cfg.Workspace,
+		"keyFingerprint", cfg.AgentPublicKey.Fingerprint())
 	api := newClient(cfg)
+
+	// 登记本机公钥。服务端此后把签名密钥加密给它，没有人需要敲封装口令。
+	//
+	// 登记不成功不退出：服务端可能正在重启，而已经存在的任务还应该照常跑。第一次
+	// 登记之前也确实没有任何密钥加密给这台机器，没什么可损失的。
+	registerCtx, cancelRegister := context.WithTimeout(ctx, 30*time.Second)
+	if status, err := api.registerPublicKey(registerCtx, cfg.AgentPublicKey.PublicKey, cfg.Name); err != nil {
+		slog.Warn("cannot register this machine's public key; the server has nothing to encrypt new keystores to",
+			"fingerprint", cfg.AgentPublicKey.Fingerprint(), "error", err)
+	} else {
+		// pending_acceptance：服务端上已经固定了另一把公钥，换它要人核对指纹后接受。
+		// 自动接受的话，偷到令牌的人登记自己的公钥就能收下以后每一把新密钥
+		slog.Info("registered this machine's public key", "status", status,
+			"fingerprint", cfg.AgentPublicKey.Fingerprint())
+	}
+	cancelRegister()
 	for {
 		worked := pollOnce(ctx, cfg, api)
 		if ctx.Err() != nil {

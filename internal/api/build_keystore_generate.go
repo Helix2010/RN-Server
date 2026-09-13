@@ -41,7 +41,6 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 		KeyAlias                       string `json:"keyAlias"`
 		KeySize                        int    `json:"keySize"`
 		ValidityYears                  int    `json:"validityYears"`
-		SealPassphrase                 string `json:"sealPassphrase"`
 		ExpectedVersion                int    `json:"expectedVersion"`
 		ReleaseIdentityExpectedVersion int    `json:"releaseIdentityExpectedVersion"`
 		Reason                         string `json:"reason"`
@@ -56,11 +55,15 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", "reason, confirm=true and both expected versions are required")
 		return
 	}
-	// 封装口令是数据库落到手里之后唯一挡在签名密钥前面的东西，所以下限和离线
-	// 封装那条路一致，不因为"这次是服务端生成的"就放松
-	if len([]rune(body.SealPassphrase)) < buildkeystore.MinPassphase {
-		problem(c, http.StatusBadRequest, "WEAK_SEAL_PASSPHRASE",
-			"sealPassphrase must be at least 12 characters: it is the only thing standing between a database dump and the signing key")
+	// 加密给打包机登记的那把公钥。没登记就没法生成——而不是退回去问人要一个口令
+	agentKey, err := s.buildAgentKey(c.Request.Context())
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "AGENT_KEY_QUERY_FAILED", "Unable to read the registered build agent key")
+		return
+	}
+	if agentKey == nil {
+		problem(c, http.StatusFailedDependency, "NO_BUILD_AGENT_KEY",
+			"打包机还没有登记公钥，密钥没有地方可以加密给。确认打包机上的 build-agent 在跑，它启动时会自己登记一次。")
 		return
 	}
 	identity := normalizeAndroidReleaseIdentity(androidReleaseIdentity{PackageName: body.PackageName})
@@ -121,22 +124,18 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 		return
 	}
 
-	sealed, err := buildkeystore.Seal(buildkeystore.Bundle{
+	// 加密给打包机的公钥。服务端只有公钥，存下去之后它自己也打不开——这正是签名
+	// 密钥可以放进数据库的那条论证，换成公钥之后一个字都不用改
+	sealed, err := buildkeystore.SealTo(buildkeystore.Bundle{
 		KeystoreBase64: base64.StdEncoding.EncodeToString(generated.PKCS12),
 		StorePassword:  generated.StorePassword,
 		KeyAlias:       strings.TrimSpace(body.KeyAlias),
 		// PKCS#12 里 key 和 store 用同一个口令。Java 允许它们不同，但那只会多一个
 		// 能配错的地方，而没有任何人需要单独知道其中一个
 		KeyPassword: generated.StorePassword,
-	}, body.SealPassphrase)
+	}, agentKey.Current)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to seal the generated keystore")
-		return
-	}
-	// 开箱自检。封完打不开的盒子要到第一次构建时才会暴露，那时候人已经把明文
-	// keystore 关掉了
-	if _, err := buildkeystore.Open(sealed, body.SealPassphrase); err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "The sealed keystore could not be reopened; nothing was saved")
 		return
 	}
 	sealedJSON, err := json.Marshal(sealed)
