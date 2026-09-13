@@ -129,12 +129,16 @@ func healthcheck() error {
 	return nil
 }
 
-// runIndexer 是 `./rn-server indexer`：扫链进程。INDEXER_ENABLED=false 时空转等信号，
-// 容器不会因为进程退出而反复重启；开关翻到 true 要重启进程。
+// runIndexer 是 `./rn-server indexer`：扫链进程。
+//
+// 这个子命令**默认就扫**：跑它就是要扫链。空转等信号那套是给 Docker Compose 防
+// 容器反复重启设计的，裸机部署下不想扫就不启那个 unit，不必启一个 unit 再让它
+// 什么都不做。所以 INDEXER_ENABLED 在这里的默认值是 true，只有显式写 false 才
+// 空转——留着这条是因为容器部署还在用它。
 func runIndexer(cfg config.Config, database *store.Store) {
 	shutdown, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if !cfg.IndexerEnabled {
+	if !cfg.IndexerEnabledFor("indexer") {
 		slog.Info("indexer is disabled (INDEXER_ENABLED=false); idling until signal")
 		<-shutdown.Done()
 		return

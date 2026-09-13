@@ -8,7 +8,7 @@ App 的钱包记录页只有本机发起的转出（RN-App `onchain-transfers.ts
 
 ## 决策
 
-- **独立进程**：`./rn-server indexer`，同镜像不同命令（compose `indexer` 服务），不在 API 进程里跑；`INDEXER_ENABLED=false` 时空转等信号。每条链一把租约（`chain_scan_state.lease_owner/lease_until`），多副本可分摊。
+- **独立进程**：`./rn-server indexer`，同镜像不同命令（compose `indexer` 服务），不在 API 进程里跑；这个子命令默认就扫，显式写 `INDEXER_ENABLED=false` 时空转等信号（那条留给容器部署防反复重启，裸机上不启 unit 即可）。每条链一把租约（`chain_scan_state.lease_owner/lease_until`），多副本可分摊。
 - **三类 RPC 端点互不读取**：App 端用租户 `wallet.networks[].rpcUrls`；服务端读代币元数据用 `supportedNetworks` 默认端点；扫链只用 `app_configs(tenant_id=0, config_key='chain-scan.<chain>')` 里的端点列表，URL 用 `secretbox`（`STORAGE_MASTER_KEY`）加密，关联数据绑定链 id。
 - **先复用再建表**（AGENTS.md「数据库表设计原则」）：配置复用 `app_configs`，历史（告警触发 / 恢复、重组、任务）复用 `audit_events`（actor `system-indexer`），监听集合派生自 `wallet_user` × 租户 `mobile-bootstrap.wallet`（`onchainSends=true` 且 `chains` 含该链，规则就是 `normalizeWallet`，indexer 不复制），只新增 `chain_scan_state`（每链一行：游标、状态、端点健康 JSON、任务 JSON、未恢复告警 JSON）与 `wallet_transfer_index`（唯一的数据表），加 `wallet_user.scan_state`、`wallet_session.installation_id` 两列。
 - **不遗漏**：记录与游标同一事务写入，唯一键幂等；任何中断从 `scanned_to_block+1` 追；每轮核对游标区块哈希，不符回退 `confirmations` 块并把区间行标 `orphaned`。

@@ -2,7 +2,8 @@
 #
 # 和 web4 上那个同时开着是安全的：每条链在 chain_scan_state 上有一把租约
 # （lease_owner / lease_until），只有抢到的那台真的推进游标，另一台空转等续约。
-# INDEXER_ENABLED=false 时进程不退出，容器/服务不会反复重启。
+# 起了这个 unit 就是要扫链，不必再在 env 里写一行开关。显式写 INDEXER_ENABLED=false
+# 时进程不退出而是空转——那条是留给容器部署的（防反复重启），裸机上不用。
 #
 # 它不监听任何端口，所以不需要 nginx，也不该出现在 conf.d 里。
 [Unit]

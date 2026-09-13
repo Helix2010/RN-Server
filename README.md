@@ -10,7 +10,7 @@
 
 ```bash
 cp .env.example .env
-set -a && source .env && set +a  # MYSQL_DSN 的值里有 &，.env 里要给它加单引号
+set -a && source .env && set +a  # .env 里 MYSQL_DSN 要加单引号：值里的 ( ) & 都会被 shell 解释
 go run ./cmd/server
 ```
 

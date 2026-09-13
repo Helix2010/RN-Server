@@ -90,7 +90,8 @@ func printConfig(cfg config.Config) {
 	}
 
 	section("扫链", []entry{
-		yesNo("INDEXER_ENABLED", cfg.IndexerEnabled),
+		// 按 `rn-server indexer` 那个入口报告：那才是这个键唯一起作用的地方
+		yesNo("INDEXER_ENABLED", cfg.IndexerEnabledFor("indexer")),
 		yesNo("INDEXER_ALLOW_PLAIN_HTTP", cfg.IndexerAllowPlainHTTP),
 		secret("INDEXER_ALERT_WEBHOOK", cfg.IndexerAlertWebhook),
 	})

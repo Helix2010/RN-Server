@@ -248,3 +248,28 @@ func TestLoadAdminSecurityDefaults(t *testing.T) {
 		t.Fatalf("environment must still win: %#v", cfg)
 	}
 }
+
+// `rn-server indexer` 跑起来就该扫链。从前默认 false，于是裸机部署要在 env 里补
+// 一行才能让那个 unit 真干活——而"启一个 unit 再让它空转"是给容器防重启设计的。
+func TestIndexerSubcommandScansByDefaultButEnvStillWins(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.IndexerEnabledFor("indexer") {
+		t.Fatal("`rn-server indexer` 默认就该扫链")
+	}
+	if cfg.IndexerEnabledFor("serve") {
+		t.Fatal("别的入口默认不扫")
+	}
+
+	t.Setenv("INDEXER_ENABLED", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IndexerEnabledFor("indexer") {
+		t.Fatal("显式写了 false 就要听 env 的——容器部署还靠它")
+	}
+}

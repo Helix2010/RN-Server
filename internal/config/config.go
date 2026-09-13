@@ -80,8 +80,11 @@ type Config struct {
 	HMSAppID              string
 	HMSClientID           string
 	HMSClientSecret       string
-	// IndexerEnabled 是否运行扫链进程（`./rn-server indexer`）。
+	// IndexerEnabled 是否运行扫链进程。别直接读它，用 IndexerEnabledFor——
+	// 默认值取决于在哪个子命令里问。
 	IndexerEnabled bool
+	// indexerEnabledSet 记录 env 里到底写没写 INDEXER_ENABLED。
+	indexerEnabledSet bool
 	// IndexerAllowPlainHTTP 私网部署允许 http:// 扫链端点。
 	IndexerAllowPlainHTTP bool
 	// IndexerAlertWebhook 告警 webhook（企业微信 / Slack 通用 JSON）；空表示不发。
@@ -153,6 +156,7 @@ func Load() (Config, error) {
 		HMSClientID:                strings.TrimSpace(os.Getenv("HMS_CLIENT_ID")),
 		HMSClientSecret:            strings.TrimSpace(os.Getenv("HMS_CLIENT_SECRET")),
 		IndexerEnabled:             l.boolean("INDEXER_ENABLED", false),
+		indexerEnabledSet:          strings.TrimSpace(os.Getenv("INDEXER_ENABLED")) != "",
 		IndexerAllowPlainHTTP:      l.boolean("INDEXER_ALLOW_PLAIN_HTTP", false),
 		IndexerAlertWebhook:        strings.TrimSpace(os.Getenv("INDEXER_ALERT_WEBHOOK")),
 		PlatformAdminUsernames:     split(strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_USERNAMES"))),
@@ -402,6 +406,21 @@ func (c Config) RedactedMySQLDSN() string {
 		masked.Passwd = "***"
 	}
 	return masked.FormatDSN()
+}
+
+// IndexerEnabledFor 回答"这个进程要不要扫链"。
+//
+// `rn-server indexer` 这个子命令默认就扫——跑它就是要扫。别的入口默认不扫。
+// 显式写了 INDEXER_ENABLED 时一律听 env 的。
+//
+// 从前这里只有一个默认 false，于是裸机部署要在 env 里写一行 INDEXER_ENABLED=true
+// 才能让 rn-foundation-indexer 这个 unit 真的干活——启一个 unit 再让它空转，是给
+// Docker Compose 防容器反复重启设计的，裸机上那一行只是一个能忘记写的地方。
+func (c Config) IndexerEnabledFor(command string) bool {
+	if c.indexerEnabledSet {
+		return c.IndexerEnabled
+	}
+	return command == "indexer"
 }
 
 func validMasterKey(encoded string) bool {
