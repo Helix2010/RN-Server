@@ -1620,9 +1620,25 @@ func (s *server) bootstrap(c *gin.Context) {
 		return
 	}
 	requestedLocale := strings.TrimSpace(c.Query("locale"))
+	if requestedLocale != "" && !validLanguageCode(requestedLocale) {
+		problem(c, 400, "INVALID_LANGUAGE_CODE", "Language code must use canonical BCP 47 format")
+		return
+	}
+	// 语言设置解析不出来（存储的配置被改坏、刷新间隔越界、fallback 语言被停用）是
+	// 要人去修的配置事故。此前这里会静默跳过，下发一个缺刷新间隔、缺语言目录的
+	// localization 段；App 按"缺了就失败"的原则严格解析，那样只会在客户端炸得更远
+	settings, _, _, settingsErr := s.effectiveLanguageSettings(c.Request.Context(), tenant.ID)
+	if settingsErr != nil {
+		slog.Error("language settings could not be resolved for bootstrap", "tenant", tenant.ID, "error", settingsErr)
+		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
+		return
+	}
+	// 默认语言就是管理端「多语言管理」里设的回退语言：App 没指定语言、或指定的语言没开启，
+	// 都用它。以前没指定时先落到应用配置里旧的 localization.fallbackLocale（种子里是 zh-CN），
+	// 管理端改了回退语言也不生效；更新说明也在语言定下来之前就按 zh-CN 取了
 	locale := requestedLocale
-	if locale == "" {
-		locale = "zh-CN"
+	if language, supported := settings.Languages[locale]; !supported || !language.Enabled {
+		locale = settings.FallbackLanguage
 	}
 	platform := strings.ToLower(c.GetHeader("x-platform"))
 	if !oneOf(platform, "android", "ios", "harmony") {
@@ -1691,35 +1707,9 @@ func (s *server) bootstrap(c *gin.Context) {
 		ActionURL:        actionURL,
 		MandatoryVersion: mandatoryVersion,
 	})
-	localization := object(cfg["localization"])
-	localeCatalog, _ := languageCatalog(effectiveLanguagesConfig{
-		Languages: map[string]effectiveLanguage{
-			"zh-CN": {Label: "简体中文", NativeName: "中文", Enabled: true, Sort: 1},
-			"en-US": {Label: "English", NativeName: "English", Enabled: true, Sort: 2},
-		},
-	})
-	locale = text(localization["fallbackLocale"], "zh-CN")
-	if requestedLocale != "" {
-		if !validLanguageCode(requestedLocale) {
-			problem(c, 400, "INVALID_LANGUAGE_CODE", "Language code must use canonical BCP 47 format")
-			return
-		}
-		locale = requestedLocale
-	}
-	// 语言设置解析不出来（存储的配置被改坏、刷新间隔越界、fallback 语言被停用）是
-	// 要人去修的配置事故。此前这里会静默跳过，下发一个缺刷新间隔、缺语言目录的
-	// localization 段；App 按"缺了就失败"的原则严格解析，那样只会在客户端炸得更远
-	settings, _, _, settingsErr := s.effectiveLanguageSettings(c.Request.Context(), tenant.ID)
-	if settingsErr != nil {
-		slog.Error("language settings could not be resolved for bootstrap", "tenant", tenant.ID, "error", settingsErr)
-		problem(c, 503, "BOOTSTRAP_UNAVAILABLE", "Configuration is unavailable")
-		return
-	}
+	localeCatalog, _ := languageCatalog(settings)
+	var localization map[string]any
 	{
-		if language, supported := settings.Languages[locale]; !supported || !language.Enabled {
-			locale = settings.FallbackLanguage
-		}
-		localeCatalog, _ = languageCatalog(settings)
 		localization = map[string]any{"fallbackLocale": settings.FallbackLanguage, "supportedLocales": enabledLanguageCodes(settings), "localeCatalog": localeCatalog, "messagesVersion": cfg["configVersion"], "refreshIntervalSeconds": settings.RefreshIntervalSeconds}
 		if compiled, compileErr := s.compiledMessages(c.Request.Context(), tenant.ID, locale, settings.FallbackLanguage); compileErr == nil {
 			localization["messages"] = map[string]any{locale: compiled}
