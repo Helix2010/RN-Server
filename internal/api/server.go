@@ -1779,18 +1779,23 @@ func validConfig(v map[string]any) bool {
 	}
 	_, ok1 := v["configVersion"].(string)
 	ttl, ok2 := v["ttlSeconds"].(float64)
-	modules := object(v["modules"])
-	if modules == nil {
-		modules = map[string]any{"predict": true, "dex": true}
-	}
 	policy := object(v["updatePolicy"])
 	// 版本号不是 semver 时，compareVersion 会把非法值当成 "1.0.0"，强制升级静默失效
 	policyValid := policy != nil && validVersion(text(policy["minSupportedVersion"], "")) && validVersion(text(policy["latestVersion"], ""))
-	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && (truth(modules["predict"]) || truth(modules["dex"])) && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && policyValid && object(v["support"]) != nil
+	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && policyValid && object(v["support"]) != nil
 }
 
+// normalizeModules 把 modules 段收敛成两个布尔。
+//
+// 四种组合都是正式形态，包括 00（Wallet-only）——那是一个可独立售卖的纯钱包产品。
+// 这里**不能**把 00 改写成 11：那会把管理员的显式选择悄悄换掉，管理端看到的和
+// App 拿到的从此不是一回事。
+//
+// value == nil 只在整段缺失时出现（v23 的 app_modules_config 迁移已给存量行补齐，
+// initialConfig 也显式声明），此时用平台默认值双开——这是文档化、管理端可见的
+// 声明式默认，不是"坏了换一个值顶上"。
 func normalizeModules(value map[string]any) map[string]any {
-	if value == nil || (!truth(value["predict"]) && !truth(value["dex"])) {
+	if value == nil {
 		return map[string]any{"predict": true, "dex": true}
 	}
 	return map[string]any{"predict": truth(value["predict"]), "dex": truth(value["dex"])}
@@ -2017,4 +2022,4 @@ func normalizeVersion(v string) string {
 func validVersion(v string) bool     { return semver.IsValid("v" + v) }
 func compareVersion(a, b string) int { return semver.Compare("v"+a, "v"+b) }
 
-const initialConfig = `{"configVersion":"2026.08.24.1","ttlSeconds":300,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`
+const initialConfig = `{"configVersion":"2026.08.24.1","ttlSeconds":300,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`
