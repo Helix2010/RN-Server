@@ -14,7 +14,7 @@ rn-server config
 
 机密与这台机器的拓扑。有默认值的不写，能从库里推导的不填，按租户变化的进租户配置。
 
-写一行等于默认值的配置，代价不是磁盘，是**以后没人能一眼看出哪些是特意设成这样的**。amos 上这份文件曾经有 61 行，其中 24 行复述默认值、7 行是空的或代码从不读取的；真正承载信息的不到 30 行。收缩之后是 18 行（见 §6）。
+写一行等于默认值的配置，代价不是磁盘，是**以后没人能一眼看出哪些是特意设成这样的**。amos 上这份文件曾经有 61 行，其中 24 行复述默认值、7 行是空的或代码从不读取的；真正承载信息的不到 30 行。收缩之后是 18 行（见 §7）。
 
 按"这个值由什么决定"分，51 个键落在五类里，只有前三类真的属于 .env：
 
@@ -51,7 +51,11 @@ MYSQL_DSN=user:password@tcp(host:port)/database?parseTime=true&loc=UTC&charset=u
 
 **时区写 `loc=UTC`，不能写 `Z`。** `Z` 是 ISO-8601 的 UTC 记号，不是时区名；驱动用 `time.LoadLocation`，不认它。（旧的 `MYSQL_TIMEZONE` 示例里写的就是 `Z`，迁移时要改。）
 
-**本地 `.env` 里这一行要加单引号。** 用 `set -a && source .env` 加载时，值里的 `(` `)` `&` 都会被 shell 解释，不加引号直接报 `syntax error near unexpected token '('`。systemd 的 `EnvironmentFile` 不做 shell 展开，所以 `/etc/rn-foundation.env` 里**不要**加引号。
+**这一行必须加单引号——本地和生产都要。** 用 `set -a && source .env` 加载时，值里的 `(` `)` `&` 会被 shell 解释，不加引号直接报 `syntax error near unexpected token '('`。
+
+这不只是"加载不了"：**bash 报这个语法错误时会把出错那一整行连口令一起回显出来**，2026-09-13 就是这么泄的一次。systemd 的 `EnvironmentFile` 会剥掉引号（在 amos 上验过），所以加引号对两条加载路径都成立，没有取舍。
+
+线上用 `deploy/amos/slim-env.py --check` 查、`--fix-quoting` 修；示例文件由 `TestEnvExamplesAreSafeToSource` 在 CI 上守着。
 
 ### 3.2 服务端会替你补五项
 
@@ -173,7 +177,27 @@ APNs（`APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_PRIVATE_KEY` / `APNS_BUNDLE_ID` / 
 |---|---|---|
 | `DEVICE_IDENTITY_HMAC_KEY` | 空 | 跨 App 设备归并用的独立 HMAC 密钥。空时回落到 `STORAGE_MASTER_KEY`，一直是这么跑的 |
 
-## 5. 报错怎么读
+## 5. 机密不会被打印出来
+
+`config.Config` 与 `pushcreds.ServiceAccount` / `FCM` 都实现了 `String` / `GoString` /
+`LogValue`，走**白名单**——只列可以打印的字段，新加的字段默认不出现。所以下面这些
+都不会泄密，包括最容易被写出来的最后一种：
+
+```go
+fmt.Printf("%v\n", cfg)          // config{env=production listen=… mysql=root:***@tcp(…)/rn …}
+slog.Info("startup", "cfg", cfg)  // 同上
+t.Fatalf("unexpected: %#v", cfg)  // 同上——测试输出会进 CI 日志
+```
+
+DSN 的口令打码走结构体复制而不是字符串正则：口令里可以合法地含 `@`，正则会打错位置、
+把后半截留在输出里。摘要末尾的 `secretsSet=[…]` 只报**哪几个机密设了**，不报值。
+
+`internal/config` 和 `internal/pushcreds` 里各有一组测试，用哨兵值把这条性质钉住；
+`deploy/amos/slim-env.py --check` 与 `TestEnvExamplesAreSafeToSource` 则守着另一条路径
+——env 文件里未加引号的值会让 `source` 报错，而 bash 报这个错时会把整行连口令一起
+回显（2026-09-13 就是这么泄的一次）。规则见 `AGENTS.md`「机密的操作纪律」。
+
+## 6. 报错怎么读
 
 配置问题**一次报完**，逐键一句，带上你写的原值：
 
@@ -185,7 +209,7 @@ APNs（`APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_PRIVATE_KEY` / `APNS_BUNDLE_ID` / 
 
 在此之前，二十几个键共用一句 `invalid MySQL numeric configuration`，而解析失败会静默变成 `-1` 再被那句拦住——任何笔误得到的都是同一句话，看的人只能 ssh 上去一个一个键地试。
 
-## 6. 一份真实的生产配置
+## 7. 一份真实的生产配置
 
 amos 上 `/etc/rn-foundation.env` 的全部内容（值已抹去），**18 行**：
 
@@ -221,7 +245,7 @@ ARTIFACT_UPLOAD_MODE=proxy          # 桶没有跨域规则，见 deploy/amos/RE
 
 模板：`deploy/amos/rn-foundation.env.example`（生产）、`.env.example`（本地）。
 
-## 7. 常见问题
+## 8. 常见问题
 
 **"我改了 env，怎么没生效？"** — systemd 的 `EnvironmentFile` 在进程启动时读一次。`systemctl restart`，不是 `reload`。改完先 `rn-server config` 核对。
 

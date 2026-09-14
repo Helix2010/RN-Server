@@ -1,8 +1,11 @@
 package pushcreds
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -105,5 +108,41 @@ func TestKeyHintNeverPrintsTheWholeID(t *testing.T) {
 	hint := KeyHint(full)
 	if hint == full || !strings.HasPrefix(full, strings.TrimSuffix(hint, "…")) {
 		t.Fatalf("密钥 id 提示不对：%q", hint)
+	}
+}
+
+// 一次 fmt.Errorf("...%v", account) 就够把发推送的能力整个交出去。
+func TestPrintingCredentialsNeverRevealsThePrivateKey(t *testing.T) {
+	account, err := ParseServiceAccount(serviceAccountJSON("anyfun"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := FCM{ProjectID: "anyfun", ClientEmail: account.ClientEmail,
+		PrivateKeyID: account.PrivateKeyID, ServiceAccountEncrypted: "SENTINEL-ciphertext"}
+
+	var logged bytes.Buffer
+	slog.New(slog.NewTextHandler(&logged, nil)).Error("send failed", "account", account, "stored", sealed)
+
+	for how, out := range map[string]string{
+		"%v":   fmt.Sprintf("%v %v", account, sealed),
+		"%+v":  fmt.Sprintf("%+v %+v", account, sealed),
+		"%#v":  fmt.Sprintf("%#v %#v", account, sealed),
+		"slog": logged.String(),
+	} {
+		for _, secret := range []string{"PRIVATE KEY", "MIIB", "SENTINEL-ciphertext"} {
+			if strings.Contains(out, secret) {
+				t.Errorf("%s 打印出了 %q：\n%s", how, secret, out)
+			}
+		}
+		// 摘要仍要能回答"现在用的是哪一把"
+		if !strings.Contains(out, "anyfun") {
+			t.Errorf("%s 的摘要没用：%s", how, out)
+		}
+	}
+
+	// 交给 Google 的那条路不受影响——它不是打印
+	raw, err := json.Marshal(account)
+	if err != nil || !bytes.Contains(raw, []byte("PRIVATE KEY")) {
+		t.Fatalf("json.Marshal 必须仍然带上私钥，否则换不到令牌：%v", err)
 	}
 }

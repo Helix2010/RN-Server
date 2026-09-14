@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -248,4 +249,39 @@ func KeyHint(privateKeyID string) string {
 		return privateKeyID
 	}
 	return privateKeyID[:8] + "…"
+}
+
+// ---- 打印时的机密防护 ----
+//
+// ServiceAccount 里装着 private_key：一次 `fmt.Errorf("...%v", account)` 或
+// `slog.Error("...", "account", account)` 就够把发推送的能力整个交出去。和
+// config.Config 一样用白名单——只列可以打印的三项，新加字段默认不出现。
+//
+// 注意 Verify / NewHTTPClient 里的 json.Marshal(account) **不受影响也不该受影响**：
+// 那是把它交给 Google，不是打印。
+
+func (a ServiceAccount) safeSummary() string {
+	return fmt.Sprintf("serviceAccount{project=%s client=%s keyId=%s privateKey=%s}",
+		a.ProjectID, a.ClientEmail, KeyHint(a.PrivateKeyID), presence(a.PrivateKey))
+}
+
+func (a ServiceAccount) String() string       { return a.safeSummary() }
+func (a ServiceAccount) GoString() string     { return a.safeSummary() }
+func (a ServiceAccount) LogValue() slog.Value { return slog.StringValue(a.safeSummary()) }
+
+// FCM 的 config_value 也一样：密文不该出现在日志里，它的长度和存在与否才是有用的。
+func (f FCM) safeSummary() string {
+	return fmt.Sprintf("push.fcm{project=%s client=%s keyId=%s sealed=%s}",
+		f.ProjectID, f.ClientEmail, KeyHint(f.PrivateKeyID), presence(f.ServiceAccountEncrypted))
+}
+
+func (f FCM) String() string       { return f.safeSummary() }
+func (f FCM) GoString() string     { return f.safeSummary() }
+func (f FCM) LogValue() slog.Value { return slog.StringValue(f.safeSummary()) }
+
+func presence(value string) string {
+	if value == "" {
+		return "unset"
+	}
+	return fmt.Sprintf("<set,%d chars>", len(value))
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
@@ -510,3 +511,55 @@ func splitList(raw string) []string {
 	}
 	return out
 }
+
+// ---- 打印时的机密防护 ----
+//
+// 2026-09-13 一天泄了两次，都不是代码写错，而是**输出跑到了不该去的地方**。这一段
+// 让"把配置打出来"这件事结构上不可能泄密。
+//
+// 关键是用**白名单**而不是黑名单：下面只列出可以打印的字段，新加的字段默认不出现。
+// 反过来做（"打印全部，减去机密"）迟早会漏——漏的那次没有人会发现，直到它出现在
+// 一条 CI 日志里。
+//
+// 覆盖四条路径：`%v`/`%s`（String）、`%#v`（GoString）、slog（LogValue）、以及
+// 测试失败信息里的 `t.Fatalf("%#v", cfg)`——最后这条是真实存在过的口子。
+
+// safeSummary 是唯一被允许打印的内容。
+func (c Config) safeSummary() string {
+	set := []string{}
+	for _, item := range []struct {
+		name  string
+		value string
+	}{
+		{"STORAGE_MASTER_KEY", c.StorageMasterKey},
+		{"ADMIN_PASSWORD_HASH", c.AdminPasswordHash},
+		{"ADMIN_API_KEY", c.AdminAPIKey},
+		{"BUILD_AGENT_TOKEN", c.BuildAgentToken},
+		{"DEVICE_IDENTITY_HMAC_KEY", c.DeviceIdentityKey},
+		{"FCM_SERVICE_ACCOUNT_JSON", c.FCMServiceAccountJSON},
+		{"APNS_PRIVATE_KEY", c.APNsPrivateKey},
+		{"HMS_CLIENT_SECRET", c.HMSClientSecret},
+		{"INDEXER_ALERT_WEBHOOK", c.IndexerAlertWebhook},
+	} {
+		if item.value != "" {
+			set = append(set, item.name)
+		}
+	}
+	present := "none"
+	if len(set) > 0 {
+		present = strings.Join(set, ",")
+	}
+	return fmt.Sprintf("config{env=%s listen=%s:%s mysql=%s mysqlSource=%s pool=%d/%d push=%t indexer=%t automigrate=%t secretsSet=[%s]}",
+		c.Environment, c.BindAddress, c.Port, c.RedactedMySQLDSN(), c.MySQLSource,
+		c.MySQLConnectionLimit, c.MySQLMaxIdleConnections,
+		c.PushDispatchEnabled, c.IndexerEnabledFor("indexer"), c.MySQLAutoMigrate, present)
+}
+
+// String 挡住 %v / %s。
+func (c Config) String() string { return c.safeSummary() }
+
+// GoString 挡住 %#v——`t.Fatalf("%#v", cfg)` 是最容易被写出来的那一种。
+func (c Config) GoString() string { return c.safeSummary() }
+
+// LogValue 挡住 slog.Info("...", "cfg", cfg)。
+func (c Config) LogValue() slog.Value { return slog.StringValue(c.safeSummary()) }

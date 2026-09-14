@@ -84,6 +84,38 @@ FCM_ENV_KEYS = ["FCM_PROJECT_ID", "FCM_SERVICE_ACCOUNT_JSON"]
 DROP_CORS_ORIGINS_ONLY_IF_IN_TENANT_DOMAIN = True
 
 
+# 值里含这些字符时，不加引号就会在 `set -a; . file` 那一刻被 shell 解释。
+#
+# 2026-09-13 的第二次泄漏就是这么来的：MYSQL_DSN 的值里有 tcp(...)，bash 报
+# "syntax error near unexpected token '('" 并**把出错那一整行连口令一起回显**。
+# systemd 的 EnvironmentFile 会剥掉引号（在 amos 上验过），所以加引号对两边都对。
+SHELL_UNSAFE = set("()&$`|;<>*?#'\" \t")
+
+
+def needs_quoting(value):
+    return any(ch in SHELL_UNSAFE for ch in value)
+
+
+def quoted(value):
+    """按单引号包起来。值里自己含单引号时用 '\'' 的经典写法拼接。"""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def unsafe_lines(lines):
+    """挑出未加引号、而值里含 shell 元字符的行。返回 [(行号, 键)]。"""
+    bad = []
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            continue  # 已经加了引号
+        if needs_quoting(value):
+            bad.append((number, key))
+    return bad
+
+
 def read_env(path):
     """按行读，保留注释和空行的位置——把注释一起洗掉会让剩下的键失去解释。"""
     with open(path) as handle:
@@ -138,13 +170,21 @@ def build_dsn(lines):
         sys.exit("MYSQL_PARSE_TIME 不是 true，而整套代码把 DATETIME 扫进 time.Time；"
                  "先弄清为什么会这样，别让这个脚本把它带进 DSN")
     query = "&".join(f"{k}={urllib.parse.quote(v, safe='')}" for k, v in params.items())
-    return f"MYSQL_DSN={user}:{password}@tcp({host}:{port})/{database}?{query}"
+    # 一定加引号：值里必然有 tcp(...) 和 &，不加引号 source 这个文件时 bash 会报错
+    # 并把整行连口令一起打出来。systemd 会剥掉引号，所以两边都对。
+    return "MYSQL_DSN=" + quoted(f"{user}:{password}@tcp({host}:{port})/{database}?{query}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true", help="真的改文件；不加就只报告")
+    parser.add_argument("--fix-quoting", action="store_true",
+                        help="给所有需要引号的值加上单引号，其它一概不动。"
+                             "这是 --check 报出问题之后的最小修法")
+    parser.add_argument("--check", action="store_true",
+                        help="只检查有没有未加引号、会让 source 报错的值，然后退出。"
+                             "报错会把整行连值一起回显，所以这是一条机密泄漏路径")
     parser.add_argument("--target", default=TARGET)
     parser.add_argument("--keep-cors", action="store_true",
                         help="保留 CORS_ORIGINS。控制台来源不在 tenant_domain 表里时必须加")
@@ -155,6 +195,44 @@ def main():
     args = parser.parse_args()
 
     lines = read_env(args.target)
+
+    if args.fix_quoting:
+        bad = unsafe_lines(lines)
+        if not bad:
+            print(f"{args.target}: 没有需要加引号的值，未改动。")
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = f"{args.target}.bak-{stamp}"
+        shutil.copy2(args.target, backup)
+        os.chmod(backup, 0o600)
+        doomed = {number for number, _ in bad}
+        out = []
+        for number, raw in enumerate(lines, 1):
+            if number in doomed:
+                key, value = raw.strip().split("=", 1)
+                out.append(f"{key}={quoted(value)}")
+            else:
+                out.append(raw)
+        with open(args.target, "w") as handle:
+            handle.write("\n".join(out).rstrip("\n") + "\n")
+        os.chmod(args.target, 0o600)
+        # 只报键名，不报值
+        print(f"{args.target}: 给这些键的值加了单引号：" + ", ".join(key for _, key in bad))
+        print(f"备份在 {backup}。systemd 会剥掉引号，重启服务即可。")
+        return
+
+    if args.check:
+        bad = unsafe_lines(lines)
+        if not bad:
+            print(f"{args.target}: 所有值都可以安全地 source。")
+            return
+        print(f"{args.target}: 这些行的值含 shell 元字符却没加引号——")
+        for number, key in bad:
+            print(f"  第 {number} 行  {key}")
+        print("\nsource 这个文件时 bash 会在这里报错，并把整行**连值一起**回显。")
+        print("给这些值加单引号（systemd 会剥掉，不影响服务）。")
+        raise SystemExit(1)
+
     have = {line.split("=", 1)[0] for line in lines if "=" in line and not line.startswith("#")}
 
     if "MYSQL_DSN" in have:

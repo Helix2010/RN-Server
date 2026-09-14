@@ -101,3 +101,40 @@ func TestExamplesDoNotOfferKeysNobodyReads(t *testing.T) {
 		}
 	}
 }
+
+// 值里含 shell 元字符却没加引号，是一条**机密泄漏路径**，不只是"加载不了"。
+//
+// 2026-09-13 的第二次泄漏就是这么来的：MYSQL_DSN 的值里有 tcp(...)，
+// `set -a; . /etc/rn-foundation.env` 让 bash 报 syntax error，而 bash 报这个错时会
+// 把出错那一整行**连口令一起**回显出来。
+//
+// systemd 的 EnvironmentFile 会剥掉引号（在 amos 上验过），所以加引号对两条加载
+// 路径都成立，没有取舍。`deploy/amos/slim-env.py --check` 是同一条检查的线上版本。
+func TestEnvExamplesAreSafeToSource(t *testing.T) {
+	// 未加引号时会被 shell 解释的字符。空格和制表符也算：它们让赋值在中间断开。
+	unsafe := "()&$`|;<>*?#'\" \t"
+	for _, path := range []string{productionExample, developmentExample} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for number, line := range strings.Split(string(raw), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			key, value, found := strings.Cut(trimmed, "=")
+			if !found {
+				continue
+			}
+			if len(value) >= 2 && value[0] == value[len(value)-1] && (value[0] == '\'' || value[0] == '"') {
+				continue // 已经加了引号
+			}
+			if strings.ContainsAny(value, unsafe) {
+				t.Errorf("%s:%d %s 的值含 shell 元字符却没加引号。"+
+					"source 这个文件时 bash 会报错并把整行连值一起回显——那是一条泄漏路径。",
+					path, number+1, key)
+			}
+		}
+	}
+}

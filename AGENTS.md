@@ -50,12 +50,23 @@
   `set -a; . /etc/rn-foundation.env` 报错时连口令一起打了出来；`curl -v` 打 header；
   `set -x` 打参数；`ps` 看得到命令行。默认不加 `-v`、不开 `set -x`、不把机密放命令行参数。
 - env 文件里凡是值含空格、括号、`#` 或引号的必须加引号。不只是为了能 source——解析失败
-  时的报错会把整行打出来，而且从那一行起后面的键全部读不到。
+  时的报错会把整行打出来，而且从那一行起后面的键全部读不到。systemd 的 `EnvironmentFile`
+  会剥掉引号（在 amos 上验过），所以加引号对两条加载路径都成立，没有取舍。
+  线上用 `deploy/amos/slim-env.py --check` 查、`--fix-quoting` 修；示例文件由
+  `TestEnvExamplesAreSafeToSource` 在 CI 上守着。
+- 别把机密放进命令行参数——`ps` 看得到。`curl` 要带机密头就从 stdin 读配置：
+  `printf 'header = "x-admin-key: %s"\n' "$KEY" | curl --config - …`。
 - 需要人工执行的取密动作，必须明确要求在**他自己的终端**里跑，并且禁止使用任何会把输出
   送回对话或工单的通道（Claude Code 里的 `!` 前缀正是这种通道：`BUILD_KEYSTORE_PASSPHRASE`
   是这么泄的，当时还写着"别贴到这里来"）。
 - 机密在机器之间传递走主机到主机（`ssh a 'sudo cat x' | ssh b 'sudo tee y >/dev/null'`）
   或由人用 `read -rsp` 手输；禁止经过对话、剪贴板截图或聊天工具。
+- **别只靠记住这些规则。** 能让机器挡住的就让机器挡：装机密的结构体要实现
+  `String` / `GoString` / `LogValue`，并且用**白名单**（只列可以打印的字段，新加的字段
+  默认不出现），反过来做漏掉的那次没人会发现，直到它出现在一条 CI 日志里。
+  `config.Config` 和 `pushcreds.ServiceAccount` / `FCM` 已经这么做了，`internal/config`
+  与 `internal/pushcreds` 里各有一组测试用哨兵值守着——包括 `t.Fatalf("%#v", cfg)`
+  这条（测试输出会进 CI 日志，而这正是最容易被写出来的一种）。
 - 可以贴出来的只有公开部分：证书、公钥、指纹、链上地址。私钥、口令、token、DSN、助记词
   一律不行。
 - 机器的地址、端口、账号按需脱敏：它们和口令一样属于"连接信息"。
