@@ -3,8 +3,9 @@ coverage/
 .env.*
 !.env.example
 rn-server
-# 在仓库根编译出来的二进制。跟踪它的代价见根目录那个 22MB 的 server：
-# 每次 go build 都把工作区弄脏，误提交一次就往历史里塞 20 多兆。
+# 在仓库根编译出来的二进制（`go build ./cmd/server` 默认产出 ./server）。
+# 跟踪它的代价：每次 go build 都把工作区弄脏，误提交一次就往历史里塞 20 多兆。
+/server
 /build-agent
 bin/
 .DS_Store
