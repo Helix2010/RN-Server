@@ -595,18 +595,67 @@ func (s *server) failedLogin(ip string) {
 	s.attempts[ip] = a
 }
 
+// listReleases GET /v1/admin/releases（设计 admin-list-pagination-2026-09-14 §4.2）。
 func (s *server) listReleases(c *gin.Context) {
-	releases, err := s.queryReleases(c.Request.Context(), tenantID(c), c.Query("platform"), c.Query("status"))
+	where, page, invalid := parseReleaseListFilter(c, tenantID(c))
+	if invalid != "" {
+		problem(c, 422, "INVALID_RELEASE_FILTER", invalid)
+		return
+	}
+	total, err := s.countListRows(c.Request.Context(), "app_releases", where)
 	if err != nil {
 		problem(c, 500, "RELEASE_QUERY_FAILED", "Unable to load releases")
 		return
 	}
-	c.JSON(200, gin.H{"items": releases, "nextCursor": nil, "hasMore": false})
+	query := where.and(page.after)
+	// 排序不带 updated_at：它随每次状态动作变化，拿来做键集会让行在翻页途中换位置
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT `+releaseColumns+` FROM app_releases WHERE `+query.sql()+` ORDER BY build_number DESC, id DESC LIMIT ?`, append(query.args, page.limit+1)...)
+	if err != nil {
+		problem(c, 500, "RELEASE_QUERY_FAILED", "Unable to load releases")
+		return
+	}
+	defer rows.Close()
+	items, cursors := []release{}, []string{}
+	for rows.Next() {
+		item, err := scanRelease(rows)
+		if err != nil {
+			problem(c, 500, "RELEASE_QUERY_FAILED", "Unable to read releases")
+			return
+		}
+		items, cursors = append(items, item), append(cursors, encodeListCursor(item.BuildNumber, item.ID))
+	}
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "RELEASE_QUERY_FAILED", "Unable to read releases")
+		return
+	}
+	items, next := finishListPage(items, cursors, page.limit)
+	c.JSON(200, listResponse(items, total, next, page.limit))
 }
 
-func (s *server) queryReleases(ctx context.Context, tenant, platform, status string) ([]release, error) {
-	query := `SELECT id,platform,version,build_number,runtime_version,status,canary_installations,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at FROM app_releases WHERE tenant_id=? AND (?='' OR platform=?) AND (?='' OR status=?) ORDER BY build_number DESC, updated_at DESC, id DESC`
-	rows, err := s.db.QueryContext(ctx, query, tenant, platform, platform, status, status)
+var releaseStatuses = []string{"uploaded", "verified", "active", "canary", "paused", "completed", "rejected", "rolled_back"}
+
+func parseReleaseListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	where.add("tenant_id=?", tenant)
+	if invalid := addEnumFilter(c, &where, "platform", "platform", "android", "ios", "harmony"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	// 多个状态：新租户向导问的是"有没有已校验/可分发的版本"，一次查三种
+	if invalid := addEnumListFilter(c, &where, "status", "status", releaseStatuses...); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		where.add("version LIKE ?", likePrefix(q))
+	}
+	page, invalid := parseListPage(c, sortKey{"build_number", cursorUint}, sortKey{"id", cursorText})
+	return where, page, invalid
+}
+
+const releaseColumns = `id,platform,version,build_number,runtime_version,status,canary_installations,release_notes,file_name,content_type,expected_size,file_size,sha256,file_metadata,rejection_reason,mandatory,verified_at,published_at,last_action,created_at,updated_at`
+
+// queryReleases 本租户全部发布（总览计数用）。
+func (s *server) queryReleases(ctx context.Context, tenant string) ([]release, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+releaseColumns+` FROM app_releases WHERE tenant_id=? ORDER BY build_number DESC, updated_at DESC, id DESC`, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -930,7 +979,7 @@ func (s *server) setReleaseCanaryAudience(c *gin.Context, r release, installatio
 }
 
 func (s *server) overview(c *gin.Context) {
-	items, err := s.queryReleases(c.Request.Context(), tenantID(c), "", "")
+	items, err := s.queryReleases(c.Request.Context(), tenantID(c))
 	if err != nil {
 		problem(c, 500, "OVERVIEW_FAILED", "Unable to load overview")
 		return
@@ -948,34 +997,91 @@ func (s *server) overview(c *gin.Context) {
 	c.JSON(200, gin.H{"generatedAt": iso(time.Now()), "current": current, "counts": counts, "signals": gin.H{"crashFreeSessions": nil, "updateSuccessRate": nil, "note": "Connect telemetry provider before production SLO decisions"}})
 }
 
+// listAudits GET /v1/admin/audit-events（设计 admin-list-pagination-2026-09-14 §4.1）。
 func (s *server) listAudits(c *gin.Context) {
-	items, err := s.queryAudits(c.Request.Context(), tenantID(c), "")
+	tenant := tenantID(c)
+	where, page, invalid := parseAuditListFilter(c, tenant)
+	if invalid != "" {
+		problem(c, 422, "INVALID_AUDIT_FILTER", invalid)
+		return
+	}
+	total, err := s.countListRows(c.Request.Context(), "audit_events", where)
 	if err != nil {
 		problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to load audit events")
 		return
 	}
-	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT `+auditColumns+` FROM audit_events WHERE `+query.sql()+` ORDER BY created_at DESC, id DESC LIMIT ?`, append(query.args, page.limit+1)...)
+	if err != nil {
+		problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to load audit events")
+		return
+	}
+	defer rows.Close()
+	items, cursors := []auditEvent{}, []string{}
+	for rows.Next() {
+		item, created, err := scanAudit(rows, tenant)
+		if err != nil {
+			problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to read audit events")
+			return
+		}
+		items, cursors = append(items, item), append(cursors, encodeListCursor(created, item.ID))
+	}
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to read audit events")
+		return
+	}
+	items, next := finishListPage(items, cursors, page.limit)
+	c.JSON(200, listResponse(items, total, next, page.limit))
 }
+
+func parseAuditListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	where.add("tenant_id=?", tenant)
+	addExactFilter(c, &where, "action", "action")
+	addExactFilter(c, &where, "targetType", "target_type")
+	addExactFilter(c, &where, "actorId", "actor_id")
+	// 关键字只做精确匹配：拿到手的是某个目标的 ID，或者某次请求的 request id
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		where.add("(target_id=? OR request_id=?)", q, q)
+	}
+	if invalid := addTimeRange(c, &where, "created_at"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	page, invalid := parseListPage(c, sortKey{"created_at", cursorTime}, sortKey{"id", cursorText})
+	return where, page, invalid
+}
+
+const auditColumns = `id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at`
+
+// queryAudits 某一个目标的审计记录（发布详情里用）。
 func (s *server) queryAudits(ctx context.Context, tenant, target string) ([]auditEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at FROM audit_events WHERE tenant_id=? AND (?='' OR target_id=?) ORDER BY created_at DESC LIMIT 1000`, tenant, target, target)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+auditColumns+` FROM audit_events WHERE tenant_id=? AND target_id=? ORDER BY created_at DESC LIMIT 1000`, tenant, target)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	items := []auditEvent{}
 	for rows.Next() {
-		var a auditEvent
-		var summary []byte
-		var created time.Time
-		if err := rows.Scan(&a.ID, &a.ActorID, &a.Action, &a.TargetType, &a.TargetID, &a.Reason, &a.RequestID, &summary, &created); err != nil {
+		item, _, err := scanAudit(rows, tenant)
+		if err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(summary, &a.Summary)
-		a.TenantID = tenant
-		a.CreatedAt = iso(created)
-		items = append(items, a)
+		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func scanAudit(row scanner, tenant string) (auditEvent, time.Time, error) {
+	var a auditEvent
+	var summary []byte
+	var created time.Time
+	if err := row.Scan(&a.ID, &a.ActorID, &a.Action, &a.TargetType, &a.TargetID, &a.Reason, &a.RequestID, &summary, &created); err != nil {
+		return a, created, err
+	}
+	_ = json.Unmarshal(summary, &a.Summary)
+	a.TenantID = tenant
+	a.CreatedAt = iso(created)
+	return a, created, nil
 }
 
 func (s *server) getAppConfig(c *gin.Context) {

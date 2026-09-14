@@ -378,14 +378,32 @@ func (s *server) listInstallations(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items, "total": total, "nextCursor": nextCursor, "limit": filter.limit})
 }
 
+var (
+	pushOutboxStatuses   = []string{"pending", "processing", "sent", "partial_failed", "failed", "cancelled"}
+	pushDeliveryStatuses = []string{"sent", "failed"}
+	pushProviders        = []string{"fcm", "apns", "hms"}
+)
+
+// listPushOutbox GET /v1/admin/push/outbox（设计 admin-list-pagination-2026-09-14 §4.4）。
 func (s *server) listPushOutbox(c *gin.Context) {
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.event_type,o.status,o.attempts,o.last_error,o.created_at,o.sent_at,COALESCE(SUM(d.status='sent'),0),COALESCE(SUM(d.status='failed'),0) FROM app_push_outbox o LEFT JOIN app_push_deliveries d ON d.event_id=o.id AND d.tenant_id=o.tenant_id WHERE o.tenant_id=? GROUP BY o.id ORDER BY o.created_at DESC LIMIT 200`, tenantID(c))
+	where, page, invalid := parsePushOutboxFilter(c, tenantID(c))
+	if invalid != "" {
+		problem(c, 422, "INVALID_PUSH_FILTER", invalid)
+		return
+	}
+	total, err := s.countListRows(c.Request.Context(), "app_push_outbox o", where)
+	if err != nil {
+		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to load push events")
+		return
+	}
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.event_type,o.status,o.attempts,o.last_error,o.created_at,o.sent_at,COALESCE(SUM(d.status='sent'),0),COALESCE(SUM(d.status='failed'),0) FROM app_push_outbox o LEFT JOIN app_push_deliveries d ON d.event_id=o.id AND d.tenant_id=o.tenant_id WHERE `+query.sql()+` GROUP BY o.id ORDER BY o.created_at DESC, o.id DESC LIMIT ?`, append(query.args, page.limit+1)...)
 	if err != nil {
 		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to load push events")
 		return
 	}
 	defer rows.Close()
-	items := []gin.H{}
+	items, cursors := []gin.H{}, []string{}
 	for rows.Next() {
 		var id, eventType, status string
 		var attempts, sent, failed int
@@ -396,23 +414,50 @@ func (s *server) listPushOutbox(c *gin.Context) {
 			return
 		}
 		items = append(items, gin.H{"id": id, "eventType": eventType, "status": status, "attempts": attempts, "lastError": nullableSQLString(lastError), "createdAt": nullableOTAFieldTime(created), "sentAt": nullableOTAFieldTime(sentAt), "sent": sent, "failed": failed})
+		cursors = append(cursors, encodeListCursor(created.Time, id))
 	}
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to read push events")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+	items, next := finishListPage(items, cursors, page.limit)
+	c.JSON(http.StatusOK, listResponse(items, total, next, page.limit))
 }
 
+func parsePushOutboxFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	where.add("o.tenant_id=?", tenant)
+	if invalid := addEnumFilter(c, &where, "status", "o.status", pushOutboxStatuses...); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	addExactFilter(c, &where, "eventType", "o.event_type")
+	if invalid := addTimeRange(c, &where, "o.created_at"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	page, invalid := parseListPage(c, sortKey{"o.created_at", cursorTime}, sortKey{"o.id", cursorText})
+	return where, page, invalid
+}
+
+// listPushDeliveries GET /v1/admin/push/deliveries（设计 admin-list-pagination-2026-09-14 §4.4）。
 func (s *server) listPushDeliveries(c *gin.Context) {
-	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT d.event_id,d.installation_id,d.provider,d.provider_message_id,d.status,d.failure_code,d.sent_at,d.delivered_at,d.created_at FROM app_push_deliveries d WHERE d.tenant_id=? AND (?='' OR d.status=?) ORDER BY d.created_at DESC LIMIT 500`, tenantID(c), status, status)
+	where, page, invalid := parsePushDeliveryFilter(c, tenantID(c))
+	if invalid != "" {
+		problem(c, 422, "INVALID_PUSH_FILTER", invalid)
+		return
+	}
+	total, err := s.countListRows(c.Request.Context(), "app_push_deliveries d", where)
+	if err != nil {
+		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to load push deliveries")
+		return
+	}
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT d.event_id,d.installation_id,d.provider,d.provider_message_id,d.status,d.failure_code,d.sent_at,d.delivered_at,d.created_at FROM app_push_deliveries d WHERE `+query.sql()+` ORDER BY d.created_at DESC, d.event_id DESC, d.installation_id DESC, d.provider DESC LIMIT ?`, append(query.args, page.limit+1)...)
 	if err != nil {
 		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to load push deliveries")
 		return
 	}
 	defer rows.Close()
-	items := []gin.H{}
+	items, cursors := []gin.H{}, []string{}
 	for rows.Next() {
 		var eventID, installationID, provider, status string
 		var messageID, failure sql.NullString
@@ -422,6 +467,31 @@ func (s *server) listPushDeliveries(c *gin.Context) {
 			return
 		}
 		items = append(items, gin.H{"eventId": eventID, "installationId": installationID, "provider": provider, "providerMessageId": nullableSQLString(messageID), "status": status, "failureCode": nullableSQLString(failure), "sentAt": nullableOTAFieldTime(sent), "deliveredAt": nullableOTAFieldTime(delivered), "createdAt": nullableOTAFieldTime(created)})
+		cursors = append(cursors, encodeListCursor(created.Time, eventID, installationID, provider))
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "PUSH_QUERY_FAILED", "Unable to read push deliveries")
+		return
+	}
+	items, next := finishListPage(items, cursors, page.limit)
+	c.JSON(http.StatusOK, listResponse(items, total, next, page.limit))
+}
+
+func parsePushDeliveryFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	where.add("d.tenant_id=?", tenant)
+	if invalid := addEnumFilter(c, &where, "status", "d.status", pushDeliveryStatuses...); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	if invalid := addEnumFilter(c, &where, "provider", "d.provider", pushProviders...); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	addExactFilter(c, &where, "installationId", "d.installation_id")
+	addExactFilter(c, &where, "eventId", "d.event_id")
+	if invalid := addTimeRange(c, &where, "d.created_at"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	// 主键是 (event_id, installation_id, provider)，三列都进排序才能唯一决胜
+	page, invalid := parseListPage(c, sortKey{"d.created_at", cursorTime}, sortKey{"d.event_id", cursorText}, sortKey{"d.installation_id", cursorText}, sortKey{"d.provider", cursorText})
+	return where, page, invalid
 }

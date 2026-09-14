@@ -199,24 +199,26 @@ func (s *server) platformDeviceLookup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"device": gin.H{"deviceClientId": deviceClientID, "platform": platform, "firstSeenAt": iso(firstSeen), "lastSeenAt": iso(lastSeen)}, "installations": installations})
 }
 
+// listPlatformWalletBlocks GET /v1/admin/platform/wallet/blocks（设计 admin-list-pagination-2026-09-14 §4.5）。
 func (s *server) listPlatformWalletBlocks(c *gin.Context) {
-	key := ""
-	if raw := strings.TrimSpace(c.Query("address")); raw != "" {
-		_, normalized, ok := normalizeWalletAddress(raw)
-		if !ok {
-			problem(c, 422, "INVALID_WALLET_ADDRESS", "address must be a full 0x-prefixed EVM address")
-			return
-		}
-		key = normalized
+	where, page, invalid := parsePlatformBlockFilter(c)
+	if invalid != "" {
+		problem(c, 422, "INVALID_PLATFORM_BLOCK_FILTER", invalid)
+		return
 	}
-	includeRevoked := strings.TrimSpace(c.Query("includeRevoked")) == "true"
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT id,address,reason,created_by,created_at,revoked_at,revoked_by,revoked_reason FROM platform_wallet_block WHERE (?='' OR address_key=?) AND (? OR revoked_at IS NULL) ORDER BY created_at DESC LIMIT 200`, key, key, includeRevoked)
+	total, err := s.countListRows(c.Request.Context(), "platform_wallet_block", where)
+	if err != nil {
+		problem(c, 500, "PLATFORM_BLOCK_QUERY_FAILED", "Unable to load platform blocks")
+		return
+	}
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT id,address,reason,created_by,created_at,revoked_at,revoked_by,revoked_reason FROM platform_wallet_block WHERE `+query.sql()+` ORDER BY created_at DESC, id DESC LIMIT ?`, append(query.args, page.limit+1)...)
 	if err != nil {
 		problem(c, 500, "PLATFORM_BLOCK_QUERY_FAILED", "Unable to load platform blocks")
 		return
 	}
 	defer rows.Close()
-	items := []gin.H{}
+	items, cursors := []gin.H{}, []string{}
 	for rows.Next() {
 		var id uint64
 		var address, reason, createdBy string
@@ -228,8 +230,36 @@ func (s *server) listPlatformWalletBlocks(c *gin.Context) {
 			return
 		}
 		items = append(items, gin.H{"id": id, "address": address, "reason": reason, "createdBy": createdBy, "createdAt": iso(createdAt), "revokedAt": nullableOTAFieldTime(revokedAt), "revokedBy": nullableSQLString(revokedBy), "revokedReason": nullableSQLString(revokedReason), "active": !revokedAt.Valid})
+		cursors = append(cursors, encodeListCursor(createdAt, id))
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "PLATFORM_BLOCK_QUERY_FAILED", "Unable to read platform blocks")
+		return
+	}
+	items, next := finishListPage(items, cursors, page.limit)
+	c.JSON(http.StatusOK, listResponse(items, total, next, page.limit))
+}
+
+func parsePlatformBlockFilter(c *gin.Context) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	if raw := strings.TrimSpace(c.Query("address")); raw != "" {
+		_, normalized, ok := normalizeWalletAddress(raw)
+		if !ok {
+			return where, listPage{}, "address must be a full 0x-prefixed EVM address"
+		}
+		where.add("address_key=?", normalized)
+	}
+	switch strings.TrimSpace(c.Query("status")) {
+	case "":
+	case "active":
+		where.add("revoked_at IS NULL")
+	case "revoked":
+		where.add("revoked_at IS NOT NULL")
+	default:
+		return where, listPage{}, "status must be active or revoked"
+	}
+	page, invalid := parseListPage(c, sortKey{"created_at", cursorTime}, sortKey{"id", cursorUint})
+	return where, page, invalid
 }
 
 // createPlatformWalletBlock 平台级封禁：写封禁记录并结束该地址在所有租户的有效会话；已有生效中的封禁返回 409。

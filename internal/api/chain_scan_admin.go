@@ -621,28 +621,31 @@ func (s *server) mutateScanJobs(ctx context.Context, chain string, mutate func([
 }
 
 // scanTransfers GET /v1/admin/platform/scan/transfers?chain=&address= 客服查询。
+// scanTransfers GET /v1/admin/platform/scan/transfers（设计 admin-list-pagination-2026-09-14 §4.6）。
+// 不返回 total：这条查询跨租户按 (chain,address_key) 查，现有索引首列是 tenant_id 用不上，
+// 再加一次 COUNT 等于把全表扫翻倍。
 func (s *server) scanTransfers(c *gin.Context) {
-	chain := strings.TrimSpace(c.Query("chain"))
-	address := strings.ToLower(strings.TrimSpace(c.Query("address")))
-	if _, ok := platformNetwork(chain); !ok || !addressPattern.MatchString(address) {
-		problem(c, 400, "INVALID_SCAN_REQUEST", "chain must be a catalog chain and address a 0x address")
+	where, page, invalid := parseScanTransferFilter(c)
+	if invalid != "" {
+		problem(c, 400, "INVALID_SCAN_REQUEST", invalid)
 		return
 	}
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT tenant_id,direction,asset,contract_address,CAST(amount_raw AS CHAR),counterparty,tx_hash,log_index,block_number,block_hash,block_time,attribution,gap_from_block,status,created_at FROM wallet_transfer_index WHERE chain=? AND address_key=? ORDER BY block_number DESC,id DESC LIMIT 200`, chain, address)
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT id,tenant_id,chain,address_key,direction,asset,contract_address,CAST(amount_raw AS CHAR),counterparty,tx_hash,log_index,block_number,block_hash,block_time,attribution,gap_from_block,status,created_at FROM wallet_transfer_index WHERE `+query.sql()+` ORDER BY block_number DESC, id DESC LIMIT ?`, append(query.args, page.limit+1)...)
 	if err != nil {
 		problem(c, 500, "SCAN_QUERY_FAILED", "Unable to load transfers")
 		return
 	}
 	defer rows.Close()
-	items := []gin.H{}
+	items, cursors := []gin.H{}, []string{}
 	for rows.Next() {
-		var tenant uint64
-		var direction, asset, contract, amount, counterparty, txHash, blockHash, attribution, status string
+		var id, tenant uint64
+		var chain, address, direction, asset, contract, amount, counterparty, txHash, blockHash, attribution, status string
 		var logIndex int
 		var blockNumber uint64
 		var gap sql.NullInt64
 		var blockTime, created time.Time
-		if err := rows.Scan(&tenant, &direction, &asset, &contract, &amount, &counterparty, &txHash, &logIndex, &blockNumber, &blockHash, &blockTime, &attribution, &gap, &status, &created); err != nil {
+		if err := rows.Scan(&id, &tenant, &chain, &address, &direction, &asset, &contract, &amount, &counterparty, &txHash, &logIndex, &blockNumber, &blockHash, &blockTime, &attribution, &gap, &status, &created); err != nil {
 			problem(c, 500, "SCAN_QUERY_FAILED", "Unable to load transfers")
 			return
 		}
@@ -651,10 +654,34 @@ func (s *server) scanTransfers(c *gin.Context) {
 		if gap.Valid {
 			item["gapFromBlock"] = gap.Int64
 		}
-		items = append(items, item)
+		items, cursors = append(items, item), append(cursors, encodeListCursor(blockNumber, id))
 	}
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "SCAN_QUERY_FAILED", "Unable to load transfers")
+		return
+	}
+	items, next := finishListPage(items, cursors, page.limit)
 	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"items": items})
+	c.JSON(200, gin.H{"items": items, "nextCursor": next, "hasMore": next != nil, "limit": page.limit})
+}
+
+func parseScanTransferFilter(c *gin.Context) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	chain := strings.TrimSpace(c.Query("chain"))
+	address := strings.ToLower(strings.TrimSpace(c.Query("address")))
+	if _, ok := platformNetwork(chain); !ok || !addressPattern.MatchString(address) {
+		return where, listPage{}, "chain must be a catalog chain and address a 0x address"
+	}
+	where.add("chain=?", chain)
+	where.add("address_key=?", address)
+	if invalid := addEnumFilter(c, &where, "direction", "direction", "in", "out"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	if invalid := addEnumFilter(c, &where, "status", "status", "confirmed", "orphaned"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	page, invalid := parseListPage(c, sortKey{"block_number", cursorUint}, sortKey{"id", cursorUint})
+	return where, page, invalid
 }
 
 // tenantIndexStatus GET /v1/admin/wallet/index-status：租户视角的只读状态。

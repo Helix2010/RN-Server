@@ -47,9 +47,84 @@
     },
     "/v1/admin/audit-events": {
       "get": {
+        "summary": "List audit events for this tenant",
+        "description": "Newest first by (created_at, id). Keyset-paginated (design admin-list-pagination-2026-09-14). The response is { items, total, nextCursor, hasMore, limit }; total counts every row matching the filters, not just this page. Invalid filter values are 422. q matches target_id or request_id exactly.",
+        "parameters": [
+          {
+            "name": "action",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "targetType",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "actorId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Exact target_id or request_id"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Inclusive lower bound on created_at (RFC 3339)."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Exclusive upper bound on created_at (RFC 3339)."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Audit events"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "Invalid filter, limit or cursor"
           }
         }
       }
@@ -456,9 +531,78 @@
     },
     "/v1/admin/ota/releases": {
       "get": {
+        "summary": "List OTA releases for this tenant",
+        "description": "Ordered by (revision, created_at, id) descending. Keyset-paginated (design admin-list-pagination-2026-09-14). The response is { items, total, nextCursor, hasMore, limit }; total counts every row matching the filters, not just this page. Invalid filter values are 422. Also returns baseReleases: every base APK that has OTA records (optionally limited to platform), for the base filter's options.",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "verified",
+                "active",
+                "canary",
+                "paused",
+                "superseded",
+                "rejected"
+              ]
+            }
+          },
+          {
+            "name": "channel",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "baseReleaseId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Tenant OTA release list"
+            "description": "OTA releases"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "Invalid filter, limit or cursor"
           }
         }
       },
@@ -545,18 +689,169 @@
     },
     "/v1/admin/push/deliveries": {
       "get": {
+        "summary": "List push deliveries for this tenant",
+        "description": "Newest first by (created_at, event_id, installation_id, provider). Tokens are never returned. Keyset-paginated (design admin-list-pagination-2026-09-14). The response is { items, total, nextCursor, hasMore, limit }; total counts every row matching the filters, not just this page. Invalid filter values are 422.",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "sent",
+                "failed"
+              ]
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "fcm",
+                "apns",
+                "hms"
+              ]
+            }
+          },
+          {
+            "name": "installationId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "eventId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Inclusive lower bound on created_at (RFC 3339)."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Exclusive upper bound on created_at (RFC 3339)."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Tenant push delivery details"
+            "description": "Push deliveries"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "Invalid filter, limit or cursor"
           }
         }
       }
     },
     "/v1/admin/push/outbox": {
       "get": {
+        "summary": "List push outbox events for this tenant",
+        "description": "Newest first by (created_at, id), with per-event sent/failed delivery counts. Keyset-paginated (design admin-list-pagination-2026-09-14). The response is { items, total, nextCursor, hasMore, limit }; total counts every row matching the filters, not just this page. Invalid filter values are 422.",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "processing",
+                "sent",
+                "partial_failed",
+                "failed",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "eventType",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Inclusive lower bound on created_at (RFC 3339)."
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "Exclusive upper bound on created_at (RFC 3339)."
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Tenant push outbox events"
+            "description": "Push events"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "Invalid filter, limit or cursor"
           }
         }
       }
@@ -633,9 +928,65 @@
     },
     "/v1/admin/releases": {
       "get": {
+        "summary": "List APK releases for this tenant",
+        "description": "Ordered by (build_number, id) descending; updated_at is deliberately not a sort key because every state action changes it. Keyset-paginated (design admin-list-pagination-2026-09-14). The response is { items, total, nextCursor, hasMore, limit }; total counts every row matching the filters, not just this page. Invalid filter values are 422.",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios",
+                "harmony"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "One status or a comma-separated list of: uploaded, verified, active, canary, paused, completed, rejected, rolled_back"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Version prefix; % and _ are literal"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Release list; each release carries canaryInstallations (installation ID array) only while status is canary"
+            "description": "Releases"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "Invalid filter, limit or cursor"
           }
         }
       },
@@ -1981,35 +2332,136 @@
         ]
       }
     },
-    "/v1/admin/platform/scan/transfers": {
+    "/v1/admin/platform/wallet/blocks": {
       "get": {
-        "summary": "客服查询某地址的索引记录（含 orphaned / unattributed）",
+        "summary": "List platform-wide wallet blocks (platform admins only)",
+        "description": "Newest first by (created_at, id). Keyset-paginated (design admin-list-pagination-2026-09-14). The response is { items, total, nextCursor, hasMore, limit }; total counts every row matching the filters, not just this page. Invalid filter values are 422.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Full 0x address"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "revoked"
+              ]
+            },
+            "description": "Omit for both"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "{items:[{tenantId,chain,addressKey,direction,asset,contractAddress,amountRaw,counterparty,txHash,logIndex,blockNumber,blockHash,blockTime,attribution,gapFromBlock,status,createdAt}]}"
+            "description": "Platform wallet blocks"
           },
-          "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "Invalid filter, limit or cursor"
           }
-        },
+        }
+      }
+    },
+    "/v1/admin/platform/scan/transfers": {
+      "get": {
+        "summary": "Look up indexed transfers for one address (platform admins only)",
+        "description": "Every indexed row for (chain, address), including orphaned and unattributed ones, newest block first by (block_number, id). Keyset-paginated: { items, nextCursor, hasMore, limit }. There is no total: the lookup spans tenants and cannot use the tenant-first index, so a COUNT would double a full scan.",
         "parameters": [
           {
             "name": "chain",
             "in": "query",
-            "required": true,
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "Catalog chain id (required)"
           },
           {
             "name": "address",
             "in": "query",
-            "required": true,
             "schema": {
               "type": "string"
+            },
+            "description": "0x address (required)"
+          },
+          {
+            "name": "direction",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "in",
+                "out"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "confirmed",
+                "orphaned"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor taken from the previous page's nextCursor. A malformed cursor is 422, never silently treated as the first page."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
             }
           }
-        ]
+        ],
+        "responses": {
+          "200": {
+            "description": "Transfers"
+          },
+          "400": {
+            "description": "Invalid chain, address, filter, limit or cursor"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          }
+        }
       }
     },
     "/v1/admin/wallet/index-status": {

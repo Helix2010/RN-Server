@@ -109,15 +109,31 @@ func (s *server) listOTABaseReleases(c *gin.Context) {
 	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
 }
 
+var otaStatuses = []string{"draft", "verified", "active", "canary", "paused", "superseded", "rejected"}
+
+// listOTAReleases GET /v1/admin/ota/releases（设计 admin-list-pagination-2026-09-14 §4.3）。
 func (s *server) listOTAReleases(c *gin.Context) {
-	platform, status := strings.ToLower(strings.TrimSpace(c.Query("platform"))), strings.ToLower(strings.TrimSpace(c.Query("status")))
-	rows, err := s.db.QueryContext(c.Request.Context(), `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.canary_installations,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) AND (?='' OR o.status=?) ORDER BY o.revision DESC, o.created_at DESC, o.id DESC LIMIT 200`, tenantID(c), platform, platform, status, status)
+	ctx, tenant := c.Request.Context(), tenantID(c)
+	where, page, invalid := parseOTAListFilter(c, tenant)
+	if invalid != "" {
+		problem(c, 422, "INVALID_OTA_FILTER", invalid)
+		return
+	}
+	// 计数与取页用同一个 JOIN：基线行不在的 OTA 取页时查不出来，计数也不能算它
+	const from = `ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id`
+	total, err := s.countListRows(ctx, from, where)
+	if err != nil {
+		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
+		return
+	}
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.canary_installations,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM `+from+` WHERE `+query.sql()+` ORDER BY o.revision DESC, o.created_at DESC, o.id DESC LIMIT ?`, append(query.args, page.limit+1)...)
 	if err != nil {
 		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 		return
 	}
 	defer rows.Close()
-	items := []gin.H{}
+	items, cursors := []gin.H{}, []string{}
 	for rows.Next() {
 		var id, base, p, channel, runtime, updateID, kind, applyStrategy, st, creator, notes, baseVersion string
 		var sha, source, rejection sql.NullString
@@ -136,8 +152,57 @@ func (s *server) listOTAReleases(c *gin.Context) {
 			return
 		}
 		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": st, "canaryInstallations": canaryAudienceForStatus(st, audience), "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
+		cursors = append(cursors, encodeListCursor(revision, created.Time, id))
 	}
-	c.JSON(200, gin.H{"items": items, "nextCursor": nil, "hasMore": false})
+	if err := rows.Err(); err != nil {
+		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
+		return
+	}
+	bases, err := s.otaListBaseReleases(ctx, tenant, strings.TrimSpace(c.Query("platform")))
+	if err != nil {
+		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
+		return
+	}
+	items, next := finishListPage(items, cursors, page.limit)
+	response := listResponse(items, total, next, page.limit)
+	response["baseReleases"] = bases
+	c.JSON(200, response)
+}
+
+func parseOTAListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
+	where := sqlWhere{}
+	where.add("o.tenant_id=?", tenant)
+	if invalid := addEnumFilter(c, &where, "platform", "o.platform", "android", "ios"); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	if invalid := addEnumFilter(c, &where, "status", "o.status", otaStatuses...); invalid != "" {
+		return where, listPage{}, invalid
+	}
+	addExactFilter(c, &where, "channel", "o.channel")
+	addExactFilter(c, &where, "baseReleaseId", "o.base_release_id")
+	page, invalid := parseListPage(c, sortKey{"o.revision", cursorUint}, sortKey{"o.created_at", cursorTime}, sortKey{"o.id", cursorText})
+	return where, page, invalid
+}
+
+// otaListBaseReleases 有 OTA 记录的基线 APK（去重），给列表的"基线 APK"筛选当选项。
+// 不能从当前页去重：分页之后当前页不代表全集。也不能用 /ota/base-releases：那里只列
+// verified/active 的基线，已暂停、已完成基线上的 OTA 记录会筛不出来。
+func (s *server) otaListBaseReleases(ctx context.Context, tenant, platform string) ([]gin.H, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT a.id,a.platform,a.version,a.build_number FROM ota_releases o JOIN app_releases a ON a.id=o.base_release_id AND a.tenant_id=o.tenant_id WHERE o.tenant_id=? AND (?='' OR o.platform=?) ORDER BY a.build_number DESC, a.id DESC`, tenant, platform, platform)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []gin.H{}
+	for rows.Next() {
+		var id, p, version string
+		var build int
+		if err := rows.Scan(&id, &p, &version, &build); err != nil {
+			return nil, err
+		}
+		items = append(items, gin.H{"id": id, "platform": p, "version": version, "buildNumber": build})
+	}
+	return items, rows.Err()
 }
 
 func (s *server) otaReleaseDetail(c *gin.Context) {
