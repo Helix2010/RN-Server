@@ -34,6 +34,9 @@ type otaJobBase struct {
 	Version        string
 	BuildNumber    int
 	RuntimeVersion string
+	// NativeFingerprint 是基线 APK 的原生面指纹。空串表示这个包在指纹功能上线
+	// 之前构建，没法用来判断热更新是否只含 JS 改动，因此不能做基线。
+	NativeFingerprint string
 }
 
 // createOTABuildJob 排一个构建热更新包的任务。
@@ -171,9 +174,10 @@ func (e *otaBaseInvalid) Error() string { return e.detail }
 func (s *server) otaJobBaseFor(ctx context.Context, tenant, id string) (otaJobBase, error) {
 	var base otaJobBase
 	var status string
+	var fileMetadata []byte
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT id,platform,version,build_number,runtime_version,status FROM app_releases WHERE tenant_id=? AND id=?`,
-		tenant, id).Scan(&base.ID, &base.Platform, &base.Version, &base.BuildNumber, &base.RuntimeVersion, &status); err != nil {
+		`SELECT id,platform,version,build_number,runtime_version,status,file_metadata FROM app_releases WHERE tenant_id=? AND id=?`,
+		tenant, id).Scan(&base.ID, &base.Platform, &base.Version, &base.BuildNumber, &base.RuntimeVersion, &status, &fileMetadata); err != nil {
 		return base, err
 	}
 	if status != "verified" && status != "active" && status != "canary" {
@@ -181,6 +185,16 @@ func (s *server) otaJobBaseFor(ctx context.Context, tenant, id string) (otaJobBa
 	}
 	if strings.TrimSpace(base.RuntimeVersion) == "" {
 		return base, &otaBaseInvalid{"这个安装包没有记录 runtimeVersion，不能作为热更新基线（它是在记录该字段之前入库的）"}
+	}
+	// 没有原生指纹的基线，上传那一步必然被 otaFingerprintMismatch 拒掉——这里就说，
+	// 别让它先跑完一趟构建。2026-09-14 anyfun 就是这么失败的：装依赖、Metro 打完
+	// 3651 个模块、产出 11MB 的包，66 秒之后才在最后一步收到这句话。
+	//
+	// 判据和上传时是同一个（baseNativeFingerprint），措辞也用同一句：控制台上看到的
+	// 和打包机日志里看到的必须是同一件事，不然排查的人会以为是两个问题。
+	base.NativeFingerprint = baseNativeFingerprint(fileMetadata)
+	if base.NativeFingerprint == "" {
+		return base, &otaBaseInvalid{errOTAFingerprintMissing.Error()}
 	}
 	return base, nil
 }

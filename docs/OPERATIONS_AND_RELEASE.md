@@ -179,6 +179,18 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
 - 应用身份（App 请求头 `X-Application-ID`，即租户配置的 `applicationId`）由 OTA 包自己带上（`extra.applicationId`），服务端只校验不改写；缺失即拒绝上传（`OTA_MANIFEST_INVALID`）。基线 APK 的包名是 `package_id`，不是应用身份，不能拿来顶替，否则装了 OTA 的设备会以另一个身份上报，`app_installations` 里出现同一台设备的两条记录，安装凭证也对不上。
 - **应用身份绑定基线（2026-09-10）**：Android 基线的 OTA，其 `extra.applicationId` 必须等于基线 APK 内嵌的 `extra.applicationId`（`OTA_APPLICATION_ID_MISMATCH`）。基线在 `file_metadata` 里没有该值时，服务端从对象存储重新解析 APK 并回填（系统写入，审计 `release_applicationid_backfilled`，actor `system-ota`，在 OTA 事务之外，OTA 随后失败也不撤回）。回填前先核对下载到的对象与入库记录的 `sha256` / `file_size` 一致：不一致返回 502 `OTA_BASE_RELEASE_CHANGED` 并记审计（`ota_base_release_changed`），绝不把替换件的身份写进数据库；记录里没有 sha256 / 大小、对象读不到或超过 `ARTIFACT_MAX_SIZE_MB` 返回 502 `OTA_BASE_RELEASE_UNREADABLE`（不截断解析）；解析出来为空的基线不能再挂 OTA（`OTA_BASE_APPLICATION_ID_UNKNOWN`）。服务端没有租户级 applicationId 配置，所以只绑基线 APK，不与租户配置比对。**已知缺口**：iOS 基线（IPA）服务端不解析，iOS OTA 不做该绑定，只记 warning。
 - **资源对象校验**：OTA 入库时用 `objectstore.Stat` 记录每个资源对象的大小与 ETag（`ota_releases.object_metadata`，迁移 37；不含 `manifest.json`，manifest 由 `manifest_sha256` 全文校验）；入库时任一资源对象没有 ETag 即拒绝（502 `OTA_OBJECT_ETAG_MISSING`）；`GET /v1/ota/assets/{id}/*` 下发前 `Stat` 比对，不符返回 502 `OTA_OBJECT_CHANGED` 并记审计（`ota_object_changed`，同一 (租户, OTA, 维度, 路径) 每 10 分钟最多一次，进程内去重）；对象表里的条目缺 ETag 视为损坏（500）；对象存储不可达返回 502 `OTA_ASSET_UNAVAILABLE`；对象表里没有这条路径返回 404（包里没有这个文件，不拿前缀下的其它对象顶上）；对象表损坏返回 500 `OTA_OBJECT_METADATA_INVALID`。迁移 37 之前的 OTA 记录为 NULL，只受 manifest 内容 hash（服务端）与资源 hash（expo-updates 客户端）保护。
+- **原生指纹绑定基线（2026-09-13）**：热更新只能承载纯 JS / 样式 / 随包资源的改动。判据是 `@expo/fingerprint`——它只看自动链接的原生模块、原生配置和 expo config，不看 JS 源码。打包机编 APK 时算一次存进 `file_metadata.nativeFingerprint`，构建热更新包时在同一套环境再算一次写进 manifest 的 `extra.nativeFingerprint`，两者不等就拒绝上传。`runtimeVersion` 不能替代它：`app.config.ts` 用的是 `runtimeVersion: appVersion`，同一个版本号下加一个原生模块它一个字都不变。
+
+  这道闸在**排队时**和**上传时**各判一次，判据是同一个函数（`baseNativeFingerprint`）。排队时只能判"基线有没有这个值"，上传时才能判"两个值等不等"——更新包的指纹要构建完才知道。基线没有值时排队就 422 `OTA_BASE_RELEASE_INVALID`，管理端的基线下拉框也会把这种版本标成「不能做基线」。2026-09-14 补上排队那一道之前，这种任务会先跑完一整趟构建（装依赖、Metro 打包、产出 zip），在最后一步才被拒。
+
+  **指纹功能上线（2026-09-13 09:00 UTC）之前构建的包一个都没有这个值**，因此永远不能作为热更新基线。补法只有一条：在那个 APK 对应的提交上、用打包机构建热更新时的同一套环境把指纹重算一遍，然后在服务器上跑
+
+  ```bash
+  sudo systemd-run --pipe --quiet --property=EnvironmentFile=/etc/rn-foundation.env \
+    /usr/local/bin/rn-foundation-server release-fingerprint <releaseId> <hex> <actor> "<原因>"
+  ```
+
+  它只写不算——算错等于把这道闸关掉。所以它不是 HTTP 接口（管理端上能改的指纹等于没有指纹：谁都能把基线的值改成手里那个包的值），已经有值的记录拒绝覆盖（补缺失值是补数据，改已有值是篡改判据），并且必须给 reason，连同操作者写进 `audit_events`（`release_fingerprint_backfilled`）。
 - 生成给客户端的绝对地址（下载、OTA 资源、上传入口）在 `APP_ENV=production` 下一律 `https://`；代理缺 `x-forwarded-proto` 只记一次 warning，不再烘出 `http://` 地址。
 - 对象存储配置在 `APP_ENV=production` 下必须使用 https 的 `endpoint` / `publicBaseUrl`：保存时拒绝 http（422 `STORAGE_ENDPOINT_INSECURE`），已存的 http 配置在使用时被拒并记 error（503 `STORAGE_UNAVAILABLE`）。原因：`direct` 上传模式的上传入口是对象存储的 presigned URL，不经 `absoluteURL`，协议只能由配置本身保证。
 

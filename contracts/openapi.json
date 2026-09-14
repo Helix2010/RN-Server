@@ -256,7 +256,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Verified APK releases available as OTA bases"
+            "description": "Verified APK releases available as OTA bases. Each item carries nativeFingerprint: the @expo/fingerprint digest the build machine recorded for that APK, or null for releases built before that was recorded. A null fingerprint means the release cannot be used as an OTA base - POST /v1/admin/builds rejects it with 422."
           }
         }
       }
@@ -1878,6 +1878,9 @@
           },
           "409": {
             "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used. BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform, so the upload would be rejected after a full build BUILD_KEYSTORE_UNUSABLE: the build machine has already reported that it cannot open this tenant's sealed signing keystore, so the build would fail at unseal time after occupying the machine; the verdict is tied to the current keystore version and clears as soon as the keystore is replaced."
+          },
+          "422": {
+            "description": "OTA_BASE_RELEASE_INVALID: this release cannot be used as an OTA base - it is not verified/active, it has no runtimeVersion, or it has no recorded native fingerprint (built before the fingerprint was recorded, so there is no way to tell whether the update is JS-only). INVALID_OTA_APPLY_STRATEGY: applyStrategy must be next_launch or immediate."
           }
         }
       }

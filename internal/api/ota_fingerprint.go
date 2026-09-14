@@ -29,16 +29,25 @@ var errOTAFingerprintMissing = errors.New(
 	"这个基线安装包没有记录原生指纹（它在该功能上线之前构建），无法判断热更新是否只含 JS 改动。" +
 		"请先出一个新的安装包，再基于它发热更新")
 
+// baseNativeFingerprint 从基线发布记录的 file_metadata 里读原生指纹，没有就返回空串。
+//
+// 排队时和上传时读的是同一个值，所以只留这一处解析：两边要是各写一遍，
+// 早晚会一边改了另一边没改，于是控制台放行的任务在最后一步被拒——这次就是这样。
+func baseNativeFingerprint(fileMetadata []byte) string {
+	if len(fileMetadata) == 0 {
+		return ""
+	}
+	var metadata map[string]any
+	if json.Unmarshal(fileMetadata, &metadata) != nil {
+		return ""
+	}
+	value, _ := metadata[otaFingerprintMetadataKey].(string)
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
 // otaFingerprintMismatch 比对更新包与基线的原生指纹。
 func otaFingerprintMismatch(manifest map[string]any, baseFileMetadata []byte) error {
-	base := ""
-	if len(baseFileMetadata) > 0 {
-		var metadata map[string]any
-		if json.Unmarshal(baseFileMetadata, &metadata) == nil {
-			base, _ = metadata[otaFingerprintMetadataKey].(string)
-		}
-	}
-	base = strings.ToLower(strings.TrimSpace(base))
+	base := baseNativeFingerprint(baseFileMetadata)
 	if base == "" {
 		return errOTAFingerprintMissing
 	}

@@ -43,8 +43,16 @@ func TestDBOTABuildJobQueueGuards(t *testing.T) {
 		t.Fatalf("没有 runtimeVersion 的基线应该 422：%d %s", code, body)
 	}
 
+	// 指纹功能上线之前构建的包不能当基线：上传那一步一定会被 otaFingerprintMismatch
+	// 拒掉，而那时打包机已经白跑了一整趟。2026-09-14 anyfun 就是这么失败的。
+	noFingerprint := "rel_nofp_" + uniqueSuffix()
+	seedReleaseWithMetadata(t, db, tenant, noFingerprint, "1.0.0", 2, "1.0.0", "active", `{"sha256":"x"}`)
+	if code, body := queue(noFingerprint); code != 422 || !strings.Contains(body, "没有记录原生指纹") {
+		t.Fatalf("没有原生指纹的基线应该在排队时就被挡下：%d %s", code, body)
+	}
+
 	base := "rel_ok_" + uniqueSuffix()
-	seedRelease(t, db, tenant, base, "1.0.1", 2, "1.0.1", "active")
+	seedRelease(t, db, tenant, base, "1.0.1", 3, "1.0.1", "active")
 
 	// 没有 OTA 签名密钥：设备会静默拒绝这次更新，构建出来也是白费
 	if code, body := queue(base); code != 409 || !strings.Contains(body, "OTA_SIGNING_KEY_MISSING") {
@@ -127,9 +135,19 @@ func otaTestServer(t *testing.T, db *sql.DB) *server {
 
 func seedRelease(t *testing.T, db *sql.DB, tenant, id, version string, build int, runtime, status string) {
 	t.Helper()
+	seedReleaseWithMetadata(t, db, tenant, id, version, build, runtime, status,
+		`{"nativeFingerprint":"`+testBaseFingerprint+`"}`)
+}
+
+// testBaseFingerprint 是种子基线的原生指纹。打包机编 APK 时算出来的那个值，
+// 没有它的基线一律不能挂热更新（见 otaJobBaseFor）。
+const testBaseFingerprint = "1111111111111111111111111111111111111111"
+
+func seedReleaseWithMetadata(t *testing.T, db *sql.DB, tenant, id, version string, build int, runtime, status, metadata string) {
+	t.Helper()
 	if _, err := db.Exec(`INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,created_by,created_at,updated_at)
-		VALUES(?,?,'android',?,?,?,?,'{}','k','f','application/vnd.android.package-archive',1,1,'sha','{}',0,'test',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
-		id, tenant, version, build, runtime, status); err != nil {
+		VALUES(?,?,'android',?,?,?,?,'{}','k','f','application/vnd.android.package-archive',1,1,'sha',?,0,'test',UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		id, tenant, version, build, runtime, status, metadata); err != nil {
 		t.Fatalf("种子发布 %s: %v", id, err)
 	}
 }

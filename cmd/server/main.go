@@ -58,6 +58,15 @@ func main() {
 		}
 		return
 	}
+	// 给指纹功能上线之前构建的安装包补记原生指纹。只在服务器上跑，不开成接口——
+	// 理由写在 recordReleaseFingerprint 的注释里。
+	if len(os.Args) == 6 && os.Args[1] == "release-fingerprint" {
+		if err := recordReleaseFingerprint(database, os.Args[2], os.Args[3], os.Args[4], os.Args[5]); err != nil {
+			slog.Error("cannot record the native fingerprint", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "indexer" {
 		runIndexer(cfg, database)
 		return
