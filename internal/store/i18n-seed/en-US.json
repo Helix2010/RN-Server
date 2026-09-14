@@ -166,6 +166,7 @@
     "diagnostics.preview": "What will be sent",
     "diagnostics.previewEntries": "{count} log entries",
     "diagnostics.previewNoEntries": "No log entries",
+    "diagnostics.previewRunningUpdate": "Running update (update id)",
     "diagnostics.previewScreen": "Screen",
     "diagnostics.reference": "Reference",
     "diagnostics.referenceHint": "Give this reference to support",

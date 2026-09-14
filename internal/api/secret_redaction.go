@@ -67,18 +67,6 @@ func mnemonicRanges(text string) []textRange {
 	return ranges
 }
 
-// findSecretKinds 返回文本里有哪几类秘密（按字母序），与 App 侧 findSecrets 对齐。
-func findSecretKinds(text string) []string {
-	kinds := []string{}
-	if len(mnemonicRanges(text)) > 0 {
-		kinds = append(kinds, "mnemonic")
-	}
-	if pairingURI.MatchString(text) {
-		kinds = append(kinds, "pairing-uri")
-	}
-	return kinds
-}
-
 // redactSecrets 把命中的部分换成 [redacted:secret]，其余原样保留；返回结果与是否命中。
 // 顺序与 App 侧一致：先配对 URI，再在替换后的文本上找助记词。
 func redactSecrets(text string) (string, bool) {

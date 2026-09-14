@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"os"
-	"reflect"
 	"testing"
 )
 
@@ -38,11 +37,9 @@ func TestSecretRedactionMatchesTheSharedVectors(t *testing.T) {
 		if got != tc.Redacted {
 			t.Errorf("%s: redacted\n got  %q\n want %q", tc.Name, got, tc.Redacted)
 		}
+		// 服务端只需要"有没有命中"（记 redaction_hits）；具体是哪一类由 App 侧的同一组向量守着
 		if hit != (len(tc.Kinds) > 0) {
 			t.Errorf("%s: hit=%v but kinds=%v", tc.Name, hit, tc.Kinds)
-		}
-		if kinds := findSecretKinds(tc.Input); !reflect.DeepEqual(kinds, tc.Kinds) {
-			t.Errorf("%s: kinds got %v want %v", tc.Name, kinds, tc.Kinds)
 		}
 	}
 }

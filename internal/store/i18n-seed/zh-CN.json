@@ -166,6 +166,7 @@
     "diagnostics.preview": "将要发送的内容",
     "diagnostics.previewEntries": "日志 {count} 条",
     "diagnostics.previewNoEntries": "暂无日志",
+    "diagnostics.previewRunningUpdate": "运行中的热更新（update id）",
     "diagnostics.previewScreen": "所在页面",
     "diagnostics.reference": "参考号",
     "diagnostics.referenceHint": "把这个号告诉客服即可",
