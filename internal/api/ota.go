@@ -573,7 +573,11 @@ func (s *server) saveOTARelease(c *gin.Context) {
 		problem(c, 500, "OTA_CREATE_FAILED", "Unable to save OTA release")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "ota_create", "ota-release", releaseID, "OTA package verified and saved", requestID(c), map[string]any{"baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "runtimeVersion": baseRuntime, "revision": revision})
+	// applyStrategy 和 channel 一起记：applyStrategy=immediate 的含义是"拉到之后当场
+	// 打断所有用户并重启应用"，是这条记录里后果最重的一个字段，而在此之前它**不在审计
+	// 里**——2026-09-14 排查"我明明选了立即重启"时，只能从别处间接推断这条修订建出来
+	// 时到底是什么值。后果最重的字段必须自己留痕。
+	event := newAudit(tenantID(c), actor(c), "ota_create", "ota-release", releaseID, "OTA package verified and saved", requestID(c), map[string]any{"baseReleaseId": body.BaseReleaseID, "platform": basePlatform, "runtimeVersion": baseRuntime, "revision": revision, "applyStrategy": body.ApplyStrategy, "channel": body.Channel})
 	if insertAudit(c.Request.Context(), tx, event) != nil {
 		problem(c, 500, "OTA_CREATE_FAILED", "Unable to save OTA audit")
 		return
