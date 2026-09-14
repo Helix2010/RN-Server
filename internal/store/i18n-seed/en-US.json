@@ -880,6 +880,7 @@
     "settings.clearCache": "Clear cache",
     "settings.clearCacheConfirm": "Clear image and market cache? Login and preferences are kept.",
     "settings.colorScheme": "Price colors",
+    "settings.defaultLanguage": "Default language",
     "settings.dexRiskWarning": "High-risk token warning",
     "settings.dexRiskWarning.hint": "Warn before swapping tokens that fail security checks",
     "settings.dexSlippage": "Default swap slippage",

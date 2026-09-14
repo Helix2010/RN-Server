@@ -880,6 +880,7 @@
     "settings.clearCache": "清除缓存",
     "settings.clearCacheConfirm": "清除图片与行情缓存？不影响登录态与偏好。",
     "settings.colorScheme": "涨跌颜色",
+    "settings.defaultLanguage": "默认语言",
     "settings.dexRiskWarning": "高风险代币提醒",
     "settings.dexRiskWarning.hint": "安全检测未全部通过时兑换前弹窗",
     "settings.dexSlippage": "兑换默认滑点",
