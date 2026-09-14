@@ -400,8 +400,12 @@ func (s *server) createBuildJob(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to queue the build")
 		return
 	}
+	// Kind 必须显式给。这里的结构体是手工拼的、不是从库里读的，漏掉的字段就是零值：
+	// 2026-09-13 加 OTA 类型之后，这个响应一直带着 "kind": ""，而管理端按 apk|ota 校验
+	// 响应——于是每一次**成功的** APK 排队都显示成"排队失败"，重试一次就真的多排一个包。
+	// 库里那一行没问题（列默认 'apk'），坏的只是这份响应。
 	c.JSON(http.StatusCreated, buildJobView(buildJob{
-		ID: id, TenantID: tenantID(c), Platform: platform, GitRef: gitRef, Version: version,
+		ID: id, TenantID: tenantID(c), Platform: platform, Kind: "apk", GitRef: gitRef, Version: version,
 		BuildNumber: body.BuildNumber, Status: "queued", Reason: reason, ReleaseNotes: encodedNotes,
 		CreatedBy: actor(c), CreatedAt: now, UpdatedAt: now,
 	}))

@@ -247,8 +247,18 @@ func TestDBBuildJobQueueEnforcesMonotonicBuildNumbers(t *testing.T) {
 		return recorder
 	}
 
-	if code := create("1.3.8", 34).Code; code != http.StatusCreated {
-		t.Fatalf("first job: %d", code)
+	first := create("1.3.8", 34)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first job: %d", first.Code)
+	}
+	// 响应里的 kind 必须是 apk。管理端按 apk|ota 校验这份响应，空串会让一次成功的排队
+	// 显示成"排队失败"——用户一重试就真的多排一个包（2026-09-14 anyfun 1.3.15 就是这样）。
+	var created map[string]any
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if created["kind"] != "apk" || created["status"] != "queued" {
+		t.Fatalf("create response must say kind=apk status=queued, got kind=%#v status=%#v", created["kind"], created["status"])
 	}
 	// 同号必须被拒。两个人各排一个 build 34，装到设备上哪个赢取决于谁后装
 	if recorder := create("1.3.9", 34); recorder.Code != http.StatusConflict ||
