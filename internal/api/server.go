@@ -48,6 +48,8 @@ type server struct {
 	verifyFCM func(context.Context, pushcreds.ServiceAccount) error
 	// adminIPs 限制 x-admin-key 自动化通道的来源；nil = 未配置，不限制
 	adminIPs *ipAllowlist
+	// diagnosticIPs 是一键上报按来源 IP 的小时窗口计数；零值可用
+	diagnosticIPs diagnosticIPLimiter
 }
 
 type attempt struct {
@@ -140,6 +142,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.POST("/v1/mobile/installations/heartbeat", s.domainTenantScope(), s.installationHeartbeat)
 	r.POST("/v1/mobile/installations/register", s.domainTenantScope(), s.registerInstallation)
 	r.POST("/v1/mobile/push-tokens", s.domainTenantScope(), s.registerPushToken)
+	// 一键上报：先元数据拿参考号，再传日志正文（设计 diagnostic-report-2026-09-14）
+	r.POST("/v1/mobile/diagnostics/reports", s.domainTenantScope(), s.createDiagnosticReport)
+	r.PUT("/v1/mobile/diagnostics/reports/:reportId/log", s.domainTenantScope(), s.uploadDiagnosticLog)
 	r.POST("/v1/mobile/auth/nonce", s.domainTenantScope(), s.walletAuthNonce)
 	r.POST("/v1/mobile/auth/verify", s.domainTenantScope(), s.walletAuthVerify)
 	r.GET("/v1/mobile/auth/session", s.domainTenantScope(), s.walletAuthSession)
@@ -237,6 +242,14 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/installations", s.listInstallations)
 	group.GET("/installations/:id", s.installationDetail)
 	group.POST("/installations/:id/revoke", s.revokeInstallation)
+	// 一键上报（设计 diagnostic-report-2026-09-14 §5.8）。按安装实例查用列表的 installationId 筛选，不另开接口
+	group.GET("/diagnostics/reports", s.listDiagnosticReports)
+	group.GET("/diagnostics/reports/:id", s.diagnosticReportDetail)
+	group.GET("/diagnostics/reports/:id/log", s.diagnosticReportLog)
+	group.GET("/diagnostics/reports/:id/log/raw", s.diagnosticReportRawLog)
+	group.POST("/diagnostics/reports/:id/status", s.updateDiagnosticReportStatus)
+	group.DELETE("/diagnostics/reports/:id", s.deleteDiagnosticReports)
+	group.POST("/diagnostics/reports/bulk-delete", s.deleteDiagnosticReports)
 	group.GET("/wallet/users", s.listWalletUsers)
 	group.GET("/wallet/users/:id", s.walletUserDetail)
 	group.POST("/wallet/users/:id/block", s.blockWalletUser(true))
@@ -1751,7 +1764,7 @@ func (s *server) bootstrap(c *gin.Context) {
 	// issuedAt 是给客户端做重放判定的：签名本身挡不住"把昨天那份合法响应再发一遍"
 	// 把更新策略或链配置回滚回去。客户端记住见过的最大值，拒绝更小的（安全评审 N3）。
 	issuedAt := time.Now()
-	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": gin.H{"updateCenter": features["updateCenter"], "otaEnabled": features["otaEnabled"], "directUpdateEnabled": directUpdateEnabled, "diagnosticsEnabled": features["diagnosticsEnabled"]}, "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": bootstrapFeatures(features, directUpdateEnabled), "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
@@ -1763,6 +1776,20 @@ func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {
 	}
 	sort.Strings(codes)
 	return codes
+}
+
+// bootstrapFeatures 是下发给 App 的 features 段。App 侧每一项都是必填布尔，缺一项整份配置无效。
+//
+// crashAutoReport 用 truth()：它会让 App 在用户不操作的情况下上传崩溃日志，默认必须是关。
+// 迁移 v46 已把它补进所有配置；这里不是兜底，是和 modules 同样的规范化写法。
+func bootstrapFeatures(features map[string]any, directUpdateEnabled bool) gin.H {
+	return gin.H{
+		"updateCenter":        features["updateCenter"],
+		"otaEnabled":          features["otaEnabled"],
+		"directUpdateEnabled": directUpdateEnabled,
+		"diagnosticsEnabled":  features["diagnosticsEnabled"],
+		"crashAutoReport":     truth(features["crashAutoReport"]),
+	}
 }
 
 func insertAudit(ctx context.Context, tx *sql.Tx, a auditEvent) error {
@@ -2022,4 +2049,4 @@ func normalizeVersion(v string) string {
 func validVersion(v string) bool     { return semver.IsValid("v" + v) }
 func compareVersion(a, b string) int { return semver.Compare("v"+a, "v"+b) }
 
-const initialConfig = `{"configVersion":"2026.08.24.1","ttlSeconds":300,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`
+const initialConfig = `{"configVersion":"2026.08.24.1","ttlSeconds":300,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true,"crashAutoReport":false},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`

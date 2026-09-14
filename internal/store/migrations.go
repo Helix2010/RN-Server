@@ -59,6 +59,7 @@ var migrations = []migration{
 	{version: 43, name: "installation_device_integrity", apply: installationDeviceIntegrityMigration},
 	{version: 44, name: "consistent_default_config", apply: consistentDefaultConfigMigration},
 	{version: 45, name: "build_jobs_ota", apply: buildJobsOTAMigration},
+	{version: 46, name: "diagnostic_reports", apply: diagnosticReportsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1514,6 +1515,78 @@ func buildJobsOTAMigration(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX ux_build_jobs_live_ota ON build_jobs (tenant_id, platform, live_ota_slot)`); err != nil {
 			return fmt.Errorf("build jobs ota migration create ota index: %w", err)
 		}
+	}
+	return nil
+}
+
+// diagnosticReportsMigration 建一键上报的元数据表，并把 features.crashAutoReport 显式补进
+// 每一份 mobile-bootstrap（设计 docs/design/diagnostic-report-2026-09-14.md，存于 RN-App）。
+//
+// 复用映射（AGENTS.md「先复用再建表」）：
+//   - 报告本身是新实体：现有表里没有"用户/崩溃提交的一次诊断"，不能挂进 audit_events
+//     （那是管理操作与系统事件的历史，报告有自己的状态流转和筛选维度）；
+//   - 日志正文不进库，放对象存储，这里只存 object_key；
+//   - 设备归并 ID、钱包地址**不复制**：前者由 installation_id 关联 app_installations 得到，
+//     后者由 wallet_user_id 关联 wallet_user 得到（地址即账号，不会变）；
+//   - 版本、渠道、系统这些列与 app_installations **不是**同一个事实：那边是最新状态、每次
+//     心跳覆盖，这里是上报那一刻的快照——排查要的正是"出问题时跑的是哪一版"；
+//   - running_ota_revision 同理：ota_releases 的行可以被清理掉，上报时解析出的修订号是历史事实。
+//
+// features.crashAutoReport 补 false：bootstrap 下发用 truth() 取值，缺键也是 false，所以不补
+// 契约也成立；补是为了管理端「功能开关」区能看见这一项——那一区按 config.features 的键渲染。
+// 只补缺的，已经有值的不动。
+func diagnosticReportsMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS app_diagnostic_reports (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+		tenant_id BIGINT UNSIGNED NOT NULL COMMENT '租户ID；由请求域名解析，不信任客户端',
+		reference CHAR(8) NOT NULL COMMENT '给用户念给客服的参考号：Crockford base32，不含 I/L/O/U，租户内唯一',
+		report_id VARCHAR(80) NOT NULL COMMENT '客户端生成的幂等键；同一安装实例重复提交返回同一条',
+		installation_id VARCHAR(80) NOT NULL COMMENT '上报的安装实例（app_installations.installation_id），由安装凭证校验得出；设备归并 ID 由此关联，不复制',
+		wallet_user_id BIGINT UNSIGNED NULL COMMENT '上报时该安装实例上有效会话的钱包用户（wallet_user.id），服务端由会话解析；NULL=未登录',
+		kind ENUM('user','crash','crash_auto') NOT NULL COMMENT '来源：user=用户主动上报，crash=崩溃后用户确认上报，crash_auto=崩溃后下次启动自动上报',
+		note VARCHAR(200) NULL COMMENT '用户填写的问题描述，截断到 200 字符；crash_auto 恒为 NULL',
+		crash_fingerprint CHAR(16) NULL COMMENT '崩溃指纹：error.name + 顶层栈帧的哈希前 16 位十六进制，用于按同一崩溃聚合；非崩溃为 NULL',
+		crash_error_name VARCHAR(80) NULL COMMENT '崩溃的错误类名（如 TypeError）；非崩溃为 NULL',
+		platform ENUM('android','ios') NOT NULL COMMENT '上报时的平台（快照）',
+		app_version VARCHAR(40) NOT NULL COMMENT '上报时的 App 版本（快照；app_installations 那边是最新值，会被心跳覆盖）',
+		build_number VARCHAR(40) NOT NULL COMMENT '上报时的构建号（快照）',
+		runtime_version VARCHAR(160) NOT NULL COMMENT '上报时的 expo 运行时版本（快照）',
+		distribution_channel VARCHAR(40) NOT NULL COMMENT '上报时的分发渠道（快照）',
+		ota_channel VARCHAR(40) NOT NULL COMMENT '上报时的 OTA channel（快照）',
+		launch_source ENUM('embedded','ota') NULL COMMENT '上报时运行的 bundle 来源：embedded=内置包，ota=热更新包；NULL=客户端未上报',
+		running_update_id CHAR(36) NULL COMMENT '上报时运行的 expo-updates update id；embedded 时为 NULL',
+		running_ota_revision INT UNSIGNED NULL COMMENT '写入时由 running_update_id 关联本租户 ota_releases 得到的修订号；关联不上为 NULL。存下来是因为 OTA 发布记录可能被清理',
+		locale VARCHAR(40) NULL COMMENT '上报时的界面语言，如 zh-CN',
+		os_version VARCHAR(40) NULL COMMENT '上报时的系统版本',
+		device_class VARCHAR(80) NULL COMMENT '上报时的设备类别，如 android-phone',
+		context JSON NULL COMMENT '上报现场：{"screen":路由名,"lastRequestId":最近一次失败请求的ID,"networkType":网络类型}；键都可缺省',
+		object_key VARCHAR(512) NULL COMMENT '日志正文在对象存储里的键（服务端重新序列化并 gzip 后的 NDJSON）；不存访问 URL。NULL=还没有日志',
+		log_status ENUM('awaiting','stored','storage_unavailable','failed') NOT NULL DEFAULT 'awaiting' COMMENT '日志状态：awaiting=元数据已收、等日志；stored=已落盘；storage_unavailable=租户没有可用对象存储；failed=收到了但落盘失败。awaiting 超过 30 分钟由读取方显示为未上传，不回写',
+		entry_count SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '落盘的日志条数（服务端解析、丢弃非法行之后）',
+		byte_size INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '落盘对象大小，单位字节（gzip 后）；计入租户每日字节预算',
+		dropped_lines SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '被丢弃的日志行数：解析失败、level/tag 不在枚举内、单行超长、超出总行数',
+		redaction_hits SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '服务端二次脱敏命中的行数；>0 表示客户端那一遍没拦住（旧版本或被改过的客户端），管理端标红',
+		status ENUM('new','triaged','closed') NOT NULL DEFAULT 'new' COMMENT '处理状态：new=未处理，triaged=已处理，closed=已关闭；变更写 audit_events',
+		occurred_at DATETIME(3) NOT NULL COMMENT '客户端声明的问题发生时间（UTC）；仅作展示，排序与配额用 created_at',
+		created_at DATETIME(3) NOT NULL COMMENT '服务端收到元数据的时间（UTC）',
+		updated_at DATETIME(3) NOT NULL COMMENT '最后一次变更时间（UTC）：日志落盘或状态变更',
+		PRIMARY KEY(id),
+		UNIQUE KEY uq_diag_reference(tenant_id, reference),
+		UNIQUE KEY uq_diag_idempotent(tenant_id, installation_id, report_id),
+		KEY ix_diag_tenant_time(tenant_id, created_at, byte_size),
+		KEY ix_diag_installation(tenant_id, installation_id, kind, created_at),
+		KEY ix_diag_user(tenant_id, wallet_user_id, created_at),
+		KEY ix_diag_fingerprint(tenant_id, crash_fingerprint, created_at)
+	) ENGINE=InnoDB COMMENT='App 诊断上报元数据。移动端接口写入、管理端读取与处理；日志正文在对象存储，这里只存键。不设保留期'`); err != nil {
+		return fmt.Errorf("create app_diagnostic_reports: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE app_configs
+		SET config_value=JSON_SET(config_value,'$.features.crashAutoReport',CAST(false AS JSON)),
+		    version=version+1, updated_by='system-diagnostic-reports', updated_at=UTC_TIMESTAMP(3)
+		WHERE config_key='mobile-bootstrap'
+		  AND JSON_EXTRACT(config_value,'$.features') IS NOT NULL
+		  AND JSON_EXTRACT(config_value,'$.features.crashAutoReport') IS NULL`); err != nil {
+		return fmt.Errorf("backfill features.crashAutoReport: %w", err)
 	}
 	return nil
 }
