@@ -182,6 +182,15 @@ func (s *server) walletAuthVerify(c *gin.Context) {
 		return
 	}
 
+	// 邀请码候选在开事务之前预抽：下面的事务一开就持有 nonce 行的 FOR UPDATE 锁，
+	// 并且跨越 siwe.Verify，不该再被随机数生成拉长（设计 §3.3）。
+	inviteCandidates, err := referralCodeCandidates()
+	if err != nil {
+		slog.Error("referral code generation failed", "error", err, "requestId", requestID(c))
+		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
+		return
+	}
+
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
@@ -259,15 +268,26 @@ func (s *server) walletAuthVerify(c *gin.Context) {
 
 	var userID uint64
 	var status string
+	var inviteCode sql.NullString
 	if err := tx.QueryRowContext(c.Request.Context(),
-		`SELECT id,status FROM wallet_user WHERE tenant_id=? AND address_key=?`,
-		tenantID(c), strings.ToLower(address)).Scan(&userID, &status); err != nil {
+		`SELECT id,status,invite_code FROM wallet_user WHERE tenant_id=? AND address_key=?`,
+		tenantID(c), strings.ToLower(address)).Scan(&userID, &status, &inviteCode); err != nil {
 		problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
 		return
 	}
 	if status != "active" {
 		problem(c, 403, "WALLET_USER_BLOCKED", "This wallet is not allowed to sign in")
 		return
+	}
+	// "人人有码"这条不变量在这里强制：invite_code 不能进上面那条 ON DUPLICATE KEY
+	// UPDATE（多唯一键下它会去改别人那一行，而且不抛 1062），所以码由这条独立语句赋予。
+	// 注册失败就整个失败，不降级成"这个人暂时没有码"（设计 §3.3）。
+	if !inviteCode.Valid {
+		if err := assignInviteCode(c, tx, tenantID(c), userID, inviteCandidates); err != nil {
+			slog.Error("invite code assignment failed", "error", err, "requestId", requestID(c))
+			problem(c, 500, "WALLET_VERIFY_FAILED", "Unable to verify the signature")
+			return
+		}
 	}
 
 	token, tokenHash, err := newWalletToken()

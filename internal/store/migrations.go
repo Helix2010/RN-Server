@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/Helix2010/RN-Server/internal/referral"
 )
 
 type migration struct {
@@ -60,7 +61,16 @@ var migrations = []migration{
 	{version: 44, name: "consistent_default_config", apply: consistentDefaultConfigMigration},
 	{version: 45, name: "build_jobs_ota", apply: buildJobsOTAMigration},
 	{version: 46, name: "diagnostic_reports", apply: diagnosticReportsMigration},
+	// 邀请关系分三版：加可空列 -> 幂等回填 -> 索引与 CHECK。没有第四版，
+	// invite_code 不收紧成 NOT NULL（见 referralColumnsMigration 的注释）
+	{version: 47, name: "referral_columns", apply: referralColumnsMigration},
+	{version: 48, name: "referral_code_backfill", apply: referralCodeBackfillMigration},
+	{version: 49, name: "referral_indexes", apply: referralIndexesMigration},
 }
+
+// referralCodeAttempts 邀请码碰撞后的重试次数。空间 32^8=1.0995e12，
+// 单次失败率 N/1.1e12（N=10 万时 9.1e-8），连续三次失败的概率 7.5e-22。
+const referralCodeAttempts = 3
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
 // 白名单。灰度行只对名单里的安装可见，不参与"发布时收尾同平台其它 active"那条语句，
@@ -1587,6 +1597,158 @@ func diagnosticReportsMigration(ctx context.Context, db *sql.DB) error {
 		  AND JSON_EXTRACT(config_value,'$.features') IS NOT NULL
 		  AND JSON_EXTRACT(config_value,'$.features.crashAutoReport') IS NULL`); err != nil {
 		return fmt.Errorf("backfill features.crashAutoReport: %w", err)
+	}
+	return nil
+}
+
+// ---------- 邀请关系（设计 RN-App/docs/design/referral-graph-2026-09-15.md §3.5、ADR 0018） ----------
+//
+// 三个独立版本，不是一条 ALTER。把加列与唯一键写在一起会先给已有行填空串，
+// 唯一键随即全表冲突（实测 ERROR 1062）；而且失败后不幂等——ALTER 已自动提交，
+// 重启会报 Duplicate column name，服务永久起不来，必须人工改库。
+//
+// 没有第四步：invite_code 永久可空，不收紧成 NOT NULL。理由见 referralColumnsMigration
+// 的注释与 docs/database/REFERRAL_SCHEMA.md。
+
+// referralColumnsMigration 加四列，全部可空。
+func referralColumnsMigration(ctx context.Context, db *sql.DB) error {
+	columns := []struct{ column, ddl string }{
+		// invite_code 必须可空，而且永远不收紧：
+		//  1. 登录是 INSERT ... ON DUPLICATE KEY UPDATE（api/wallet_auth.go）。MySQL 对
+		//     任意唯一键冲突都走 ON DUPLICATE 分支，把 invite_code 放进那条语句，抽到的码
+		//     撞上他人的码时会去更新"那一行"（实测 address 被改成新用户的地址、
+		//     ROW_COUNT()=2），随后按 address_key 查不到自己 -> 500；且 ODUP 不抛 1062，
+		//     "碰撞后重试"无从捕获。所以码由注册事务里一条独立 UPDATE 赋予。
+		//  2. 改成 NOT NULL 无默认值，服务端回滚到旧二进制后旧 INSERT 不带该列，
+		//     strict 模式报 ERROR 1364，老用户也登不上——回滚等于全站登录中断。
+		//  3. NOT NULL DEFAULT '' 则两个并发新用户都插空串，在唯一键上互撞，回到第 1 条。
+		// 可空列上的多个 NULL 在唯一索引里不冲突，这正是需要的。
+		{"invite_code", `ALTER TABLE wallet_user ADD COLUMN invite_code CHAR(8) NULL COMMENT '该账号的邀请码，注册事务内生成、永不更换；Crockford Base32 大写（0-9A-Z 去掉 I L O U），租户内唯一。可空是为了与登录的 ON DUPLICATE KEY UPDATE 共存，人人有码由注册事务保证；读到 NULL 是事故' AFTER status`},
+		{"inviter_user_id", `ALTER TABLE wallet_user ADD COLUMN inviter_user_id BIGINT UNSIGNED NULL COMMENT '直接邀请人的 wallet_user.id，必为同租户；NULL=没有邀请人。一次性写入，写入后不可改、不可解除' AFTER invite_code`},
+		{"invited_at", `ALTER TABLE wallet_user ADD COLUMN invited_at DATETIME(3) NULL COMMENT '绑定邀请人的时刻（UTC）；与 inviter_user_id 同生共死。后续返佣按此时间分期' AFTER inviter_user_id`},
+		{"invite_source", `ALTER TABLE wallet_user ADD COLUMN invite_source ENUM('code','link','admin') NULL COMMENT '绑定渠道：code 手输邀请码，link 邀请链接深链（相机扫二维码也走这条），admin 管理端补录；只用于运营统计，不参与任何判定' AFTER invited_at`},
+	}
+	for _, item := range columns {
+		if err := addColumnIfMissing(ctx, db, "wallet_user", item.column, item.ddl); err != nil {
+			return fmt.Errorf("referral columns migration %s: %w", item.column, err)
+		}
+	}
+	return nil
+}
+
+// referralCodeBackfillMigration 给存量账号补邀请码。
+//
+// 只处理 invite_code IS NULL 的行，可以重复执行：中断后重跑不会给已经有码的行换码。
+// 此时唯一键还没建（下一版才建），所以这里自己查重；真正的兜底是下一版建唯一键时
+// 若仍有重复会失败，而不是悄悄放过。
+//
+// 不假设"线上只有个位数用户"：任何测试库、任何租户长到 2 人，这段都得照样正确。
+func referralCodeBackfillMigration(ctx context.Context, db *sql.DB) error {
+	for {
+		rows, err := db.QueryContext(ctx, `SELECT id, tenant_id FROM wallet_user WHERE invite_code IS NULL LIMIT 500`)
+		if err != nil {
+			return fmt.Errorf("referral backfill select: %w", err)
+		}
+		type pending struct {
+			id       uint64
+			tenantID uint64
+		}
+		var batch []pending
+		for rows.Next() {
+			var item pending
+			if err := rows.Scan(&item.id, &item.tenantID); err != nil {
+				rows.Close()
+				return fmt.Errorf("referral backfill scan: %w", err)
+			}
+			batch = append(batch, item)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("referral backfill rows: %w", err)
+		}
+		rows.Close()
+		if len(batch) == 0 {
+			return nil
+		}
+		for _, item := range batch {
+			if err := backfillOneInviteCode(ctx, db, item.id, item.tenantID); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// backfillOneInviteCode 给一行补码，撞上同租户已有的码就换一个再试。
+func backfillOneInviteCode(ctx context.Context, db *sql.DB, userID, tenantID uint64) error {
+	for attempt := 0; attempt < referralCodeAttempts; attempt++ {
+		code, err := referral.Generate()
+		if err != nil {
+			return fmt.Errorf("referral backfill generate: %w", err)
+		}
+		// 唯一键此时还不存在，自己查重；条件里带 invite_code IS NULL 让这条语句可重入
+		result, err := db.ExecContext(ctx, `UPDATE wallet_user SET invite_code=?, updated_at=UTC_TIMESTAMP(3)
+			WHERE id=? AND invite_code IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM (SELECT 1 FROM wallet_user WHERE tenant_id=? AND invite_code=?) AS taken)`,
+			code, userID, tenantID, code)
+		if err != nil {
+			return fmt.Errorf("referral backfill update: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("referral backfill rows affected: %w", err)
+		}
+		if affected == 1 {
+			return nil
+		}
+		// 0 行有两种可能：码被占（换一个重试），或这一行已经被并发的迁移补上了（直接算完成）
+		var stillEmpty int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wallet_user WHERE id=? AND invite_code IS NULL`, userID).Scan(&stillEmpty); err != nil {
+			return fmt.Errorf("referral backfill recheck: %w", err)
+		}
+		if stillEmpty == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("referral backfill: could not find a free invite code for wallet_user %d after %d attempts", userID, referralCodeAttempts)
+}
+
+// referralIndexesMigration 建两个新索引与 CHECK 约束。
+//
+// 三个索引不是两个：管理端的关系列表没有 inviter_user_id 等值条件，
+// ix_wallet_user_inviter 的第二列断开，优化器会退回 filesort（实测 rows≈9918），
+// 所以它需要自己的 (tenant_id, invited_at, id)。
+//
+// CHECK 不是锦上添花：漏写一列产生的 inviter_user_id 非空、invited_at 为 NULL 的行，
+// 会被键集分页的游标条件（NULL < ts 不为真）全部排除，在上级的下级列表里永久不可见，
+// 而 total 仍把它算进去。
+func referralIndexesMigration(ctx context.Context, db *sql.DB) error {
+	indexes := []struct{ index, ddl string }{
+		{"uq_wallet_user_invite_code", `ALTER TABLE wallet_user ADD UNIQUE KEY uq_wallet_user_invite_code (tenant_id, invite_code) COMMENT '邀请码租户内唯一；生成碰撞由该键抛 1062，应用层换码重试。可空列上的多个 NULL 不冲突'`},
+		{"ix_wallet_user_inviter", `ALTER TABLE wallet_user ADD KEY ix_wallet_user_inviter (tenant_id, inviter_user_id, invited_at, id) COMMENT '移动端「我的下级」：按绑定时间键集分页，末列 id 唯一决胜'`},
+		{"ix_wallet_user_invited_at", `ALTER TABLE wallet_user ADD KEY ix_wallet_user_invited_at (tenant_id, invited_at, id) COMMENT '管理端关系列表：没有 inviter_user_id 等值条件，用不上 ix_wallet_user_inviter'`},
+	}
+	for _, item := range indexes {
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='wallet_user' AND INDEX_NAME=?`, item.index).Scan(&count); err != nil {
+			return fmt.Errorf("referral indexes migration inspect %s: %w", item.index, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, item.ddl); err != nil {
+			return fmt.Errorf("referral indexes migration add %s: %w", item.index, err)
+		}
+	}
+	var checks int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='wallet_user' AND CONSTRAINT_NAME='ck_wallet_user_referral_triple'`).Scan(&checks); err != nil {
+		return fmt.Errorf("referral indexes migration inspect check: %w", err)
+	}
+	if checks == 0 {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE wallet_user ADD CONSTRAINT ck_wallet_user_referral_triple CHECK (
+			(inviter_user_id IS NULL AND invited_at IS NULL AND invite_source IS NULL)
+			OR (inviter_user_id IS NOT NULL AND invited_at IS NOT NULL AND invite_source IS NOT NULL))`); err != nil {
+			return fmt.Errorf("referral indexes migration add check: %w", err)
+		}
 	}
 	return nil
 }

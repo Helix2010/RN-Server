@@ -50,6 +50,8 @@ type server struct {
 	adminIPs *ipAllowlist
 	// diagnosticIPs 是一键上报按来源 IP 的小时窗口计数；零值可用
 	diagnosticIPs diagnosticIPLimiter
+	// referrals 是邀请接口的窗口计数（解析码、绑定、租户级未知码底线）；零值可用
+	referrals referralLimiter
 }
 
 type attempt struct {
@@ -150,6 +152,15 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/v1/mobile/auth/session", s.domainTenantScope(), s.walletAuthSession)
 	r.POST("/v1/mobile/auth/logout", s.domainTenantScope(), s.walletAuthLogout)
 	r.GET("/v1/mobile/wallet/transfers", s.domainTenantScope(), s.walletTransfers)
+	// 邀请关系（设计 referral-graph-2026-09-15 §4.2）。codes/:code 免登录：
+	// 落地页与"绑定前确认"都发生在登录之前；它只回答"码是否有效"
+	r.GET("/v1/mobile/referral/me", s.domainTenantScope(), s.referralMe)
+	r.POST("/v1/mobile/referral/bind", s.domainTenantScope(), s.referralBind)
+	r.GET("/v1/mobile/referral/invitees", s.domainTenantScope(), s.referralInvitees)
+	r.GET("/v1/mobile/referral/codes/:code", s.domainTenantScope(), s.referralCodeLookup)
+	// 邀请落地页。没装 App 的人从这里拿到邀请码与下载引导；装了且系统校验通过的
+	// 会被 App Links 直接唤起，走不到这里。与上面那条共用同一个限流计数器
+	r.GET("/app/invite/:code", s.domainTenantScope(), s.referralLandingPage)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
 	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)
@@ -255,6 +266,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/wallet/users/:id/block", s.blockWalletUser(true))
 	group.POST("/wallet/users/:id/unblock", s.blockWalletUser(false))
 	group.POST("/wallet/sessions/:id/revoke", s.revokeWalletSession)
+	// 邀请关系（设计 referral-graph-2026-09-15 §4.4）。只有补录，没有解绑：
+	// 后续返佣账本会引用关系，关系可改等于历史可改
+	group.GET("/referral/relations", s.listReferralRelations)
+	group.POST("/referral/bind", s.adminBindReferral)
 	group.GET("/push/outbox", s.listPushOutbox)
 	group.GET("/push/deliveries", s.listPushDeliveries)
 	group.GET("/releases", s.listReleases)
@@ -1120,6 +1135,9 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	value["modules"] = normalizeModules(object(value["modules"]))
 	value["wallet"] = normalizeWallet(object(value["wallet"]))
 	value["services"] = normalizeServices(value["services"])
+	// 管理端要看到实际生效值（含未配置时的声明式默认）。linkBase 在管理端不参与编辑，
+	// 给空串：它只在 bootstrap 下发时按请求 Host 算得出来
+	value["referral"] = normalizeReferral(object(value["referral"]), "")
 	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0", "walletCatalog": walletCatalog()}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
@@ -1165,6 +1183,15 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		// projectId 和链端点顺手清空。沿用的值不再校验——它已经在库里，
 		// 读路径会把不合法的部分归一化掉
 		body.Config["wallet"] = carried
+	}
+	if incoming, present := body.Config["referral"]; present && incoming != nil {
+		if err := validateReferralSection(incoming); err != nil {
+			problem(c, 400, "INVALID_REFERRAL_CONFIG", err.Error())
+			return
+		}
+	} else if carried := storedSection(stored, "referral"); carried != nil {
+		// 同 wallet：不带这一段就沿用库里的，改一次主题色不能把邀请开关清掉
+		body.Config["referral"] = carried
 	}
 	if incoming, present := body.Config["services"]; present && incoming != nil {
 		section, err := parseServicesSection(incoming)
@@ -1478,18 +1505,20 @@ func validateWalletSection(raw any) error {
 	return nil
 }
 
-// storedWalletSection reads the wallet section already in the database, so a
-// config that arrives without one carries it over instead of erasing it. Any
+// storedSection reads one section of the config already in the database, so a
+// config that arrives without it carries it over instead of erasing it. Any
 // client that round-trips the config through a schema that does not know about
-// `wallet` would otherwise wipe the tenant's project id and endpoints as a side
-// effect of an unrelated edit.
-func storedWalletSection(stored []byte) any {
+// that section would otherwise wipe it as a side effect of an unrelated edit.
+func storedSection(stored []byte, key string) any {
 	var current map[string]any
 	if len(stored) == 0 || json.Unmarshal(stored, &current) != nil {
 		return nil
 	}
-	return current["wallet"]
+	return current[key]
 }
+
+// storedWalletSection 保留租户的 projectId 与链端点，见 storedSection。
+func storedWalletSection(stored []byte) any { return storedSection(stored, "wallet") }
 
 // normalizeWallet fills in the wallet section a client needs at startup:
 // the WalletConnect project id (a client identifier, not a secret) and the
@@ -1860,7 +1889,7 @@ func (s *server) bootstrap(c *gin.Context) {
 	// issuedAt 是给客户端做重放判定的：签名本身挡不住"把昨天那份合法响应再发一遍"
 	// 把更新策略或链配置回滚回去。客户端记住见过的最大值，拒绝更小的（安全评审 N3）。
 	issuedAt := time.Now()
-	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "features": bootstrapFeatures(features, directUpdateEnabled), "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "referral": normalizeReferral(object(cfg["referral"]), referralInviteLinkBase(c)), "features": bootstrapFeatures(features, directUpdateEnabled), "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

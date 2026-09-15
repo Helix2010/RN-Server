@@ -5,6 +5,313 @@
     "version": "2026.09.21"
   },
   "paths": {
+    "/v1/mobile/referral/me": {
+      "get": {
+        "summary": "我的邀请码、我的邀请人、我的下级数与绑定窗口",
+        "description": "鉴权 Authorization: Wallet <token>。响应不含任何地址派生值：邀请人用邀请码表示，下级用 per-viewer 别名——前 6 后 4 的脱敏地址是 32 bit，对现实候选集等同唯一键。inviteLink 由服务端按请求 Host 拼好，客户端不要自己拼。",
+        "responses": {
+          "200": {
+            "description": "邀请状态",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralMeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "WALLET_SESSION_REQUIRED / WALLET_SESSION_INVALID"
+          },
+          "500": {
+            "description": "REFERRAL_READ_FAILED（含账号没有邀请码这种不该出现的情况）"
+          }
+        }
+      }
+    },
+    "/v1/mobile/referral/bind": {
+      "post": {
+        "summary": "绑定邀请人（一次性、不可解除）",
+        "description": "鉴权 Authorization: Wallet <token>。code 提交原文，归一化只在服务端做（全角、分隔符、大小写、Crockford 的 I L→1 与 O→0；U 不映射，出现即输错）。格式非法与码不存在是两个错误码：前者提示重新输入，后者提示向邀请人核对。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReferralBindRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "已绑定",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralBindResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_REFERRAL_BIND"
+          },
+          "401": {
+            "description": "WALLET_SESSION_REQUIRED / WALLET_SESSION_INVALID"
+          },
+          "403": {
+            "description": "REFERRAL_DISABLED（租户未开启）/ REFERRAL_INVITER_BLOCKED（邀请人被封禁，两级都查）"
+          },
+          "404": {
+            "description": "REFERRAL_CODE_UNKNOWN"
+          },
+          "409": {
+            "description": "REFERRAL_ALREADY_BOUND / REFERRAL_WINDOW_CLOSED / REFERRAL_BIND_BUSY（同租户绑定串行化，重试即可）"
+          },
+          "422": {
+            "description": "REFERRAL_CODE_MALFORMED / REFERRAL_SELF / REFERRAL_CYCLE（含链路超过上溯上界）"
+          },
+          "429": {
+            "description": "REFERRAL_RATE_LIMITED"
+          }
+        }
+      }
+    },
+    "/v1/mobile/referral/invitees": {
+      "get": {
+        "summary": "我的直接下级（别名与加入时间）",
+        "description": "鉴权 Authorization: Wallet <token>。键集分页 (invited_at DESC, id DESC)。每项只有 alias 与 joinedAt：alias 是 HMAC(tenant secret, viewer‖invitee)，每个观察者看到的不同，无法跨账号 join、无法反查地址。",
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "上一页返回的 nextCursor；不传取第一页"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "下级页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralInviteesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "WALLET_SESSION_REQUIRED / WALLET_SESSION_INVALID"
+          },
+          "422": {
+            "description": "INVALID_REFERRAL_FILTER（limit 越界或游标损坏）"
+          }
+        }
+      }
+    },
+    "/v1/mobile/referral/codes/{code}": {
+      "get": {
+        "summary": "校验一个邀请码是否有效（免登录）",
+        "description": "免登录：落地页与绑定前确认都发生在登录之前。只返回 valid，不返回邀请人的任何信息——它曾经返回脱敏地址，那等于提供一个「码 → 32 bit 地址指纹」的 oracle。与落地页 GET /app/invite/{code} 共用同一个限流计数器；未命中另计更严的子配额。",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "邀请码原文，服务端归一化"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "码有效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "valid"
+                  ],
+                  "properties": {
+                    "valid": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "REFERRAL_CODE_UNKNOWN（租户未开启邀请时也返回这个，不透露租户状态）"
+          },
+          "422": {
+            "description": "REFERRAL_CODE_MALFORMED"
+          },
+          "429": {
+            "description": "REFERRAL_RATE_LIMITED"
+          }
+        }
+      }
+    },
+    "/v1/admin/referral/relations": {
+      "get": {
+        "summary": "邀请关系列表",
+        "description": "管理端返回完整地址（有权看），并标注双方的租户级与平台级封禁状态。封禁不改变已有关系，只影响能否新建。查询恒带 inviter_user_id IS NOT NULL 与 invited_at IS NOT NULL。",
+        "parameters": [
+          {
+            "name": "inviterAddress",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "完整地址"
+          },
+          {
+            "name": "inviteeAddress",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "完整地址"
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "code",
+                "link",
+                "admin"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "绑定时间下界（含）"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "绑定时间上界（不含）"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "关系页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralRelationsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "INVALID_REFERRAL_FILTER"
+          },
+          "500": {
+            "description": "REFERRAL_QUERY_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/admin/referral/bind": {
+      "post": {
+        "summary": "补录一条邀请关系（豁免绑定窗口）",
+        "description": "只豁免绑定窗口，其余条件照判。没有解绑接口：后续返佣账本会引用关系，关系可改等于历史可改。补录不可回滚，因此要求 confirm=true + reason，受租户日配额限制，并且拒绝 x-admin-key 自动化通道。inviterCode 与 inviterAddress 恰好给一个。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReferralAdminBindRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "已补录",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferralAdminBindResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_ACTION"
+          },
+          "403": {
+            "description": "REFERRAL_ADMIN_KEY_FORBIDDEN（走了自动化通道）/ REFERRAL_DISABLED / REFERRAL_INVITER_BLOCKED"
+          },
+          "404": {
+            "description": "REFERRAL_INVITEE_UNKNOWN（该地址还没在本租户登录过，账号在首次登录时才创建）/ REFERRAL_INVITER_UNKNOWN / REFERRAL_CODE_UNKNOWN"
+          },
+          "409": {
+            "description": "REFERRAL_ALREADY_BOUND / REFERRAL_BIND_BUSY"
+          },
+          "422": {
+            "description": "INVALID_ACTION / REFERRAL_CODE_MALFORMED / REFERRAL_SELF / REFERRAL_CYCLE"
+          },
+          "429": {
+            "description": "REFERRAL_ADMIN_QUOTA（租户当日补录配额已满）"
+          }
+        }
+      }
+    },
     "/health/live": {
       "get": {
         "responses": {
@@ -3390,6 +3697,330 @@
       }
     },
     "schemas": {
+      "ReferralMeResponse": {
+        "type": "object",
+        "required": [
+          "inviteCode",
+          "inviteLink",
+          "inviter",
+          "bindWindow",
+          "inviteeCount"
+        ],
+        "properties": {
+          "inviteCode": {
+            "type": "string",
+            "description": "不带分隔符；展示时分段为 XXXX-XXXX"
+          },
+          "inviteLink": {
+            "type": "string",
+            "description": "服务端拼好的完整邀请链接"
+          },
+          "inviter": {
+            "nullable": true,
+            "type": "object",
+            "required": [
+              "inviteCode",
+              "boundAt"
+            ],
+            "properties": {
+              "inviteCode": {
+                "type": "string",
+                "description": "绑定时用的那个码。不返回邀请人地址"
+              },
+              "boundAt": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          },
+          "bindWindow": {
+            "type": "object",
+            "required": [
+              "open",
+              "closesAt"
+            ],
+            "properties": {
+              "open": {
+                "type": "boolean",
+                "description": "尚未绑定且仍在窗口内"
+              },
+              "closesAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "从首次登录起算"
+              }
+            }
+          },
+          "inviteeCount": {
+            "type": "integer"
+          }
+        }
+      },
+      "ReferralBindRequest": {
+        "type": "object",
+        "required": [
+          "code",
+          "source"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "用户输入的原文，服务端归一化"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "code",
+              "link"
+            ],
+            "description": "提交路径决定：手输为 code，深链为 link。只用于运营统计，不参与判定；admin 只能由管理端路径写入"
+          }
+        }
+      },
+      "ReferralBindResponse": {
+        "type": "object",
+        "required": [
+          "inviter",
+          "boundAt"
+        ],
+        "properties": {
+          "inviter": {
+            "type": "object",
+            "required": [
+              "inviteCode",
+              "boundAt"
+            ],
+            "properties": {
+              "inviteCode": {
+                "type": "string"
+              },
+              "boundAt": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          },
+          "boundAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ReferralInviteesResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "nextCursor",
+          "hasMore",
+          "limit"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "alias",
+                "joinedAt"
+              ],
+              "properties": {
+                "alias": {
+                  "type": "string",
+                  "description": "per-viewer 别名，不是地址派生值"
+                },
+                "joinedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        }
+      },
+      "ReferralRelationsResponse": {
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "nextCursor",
+          "hasMore",
+          "limit"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "invitee",
+                "inviter",
+                "boundAt",
+                "source"
+              ],
+              "properties": {
+                "invitee": {
+                  "type": "object",
+                  "required": [
+                    "userId",
+                    "address",
+                    "status",
+                    "platformBlocked"
+                  ],
+                  "properties": {
+                    "userId": {
+                      "type": "integer"
+                    },
+                    "address": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active",
+                        "blocked"
+                      ],
+                      "description": "租户级状态"
+                    },
+                    "platformBlocked": {
+                      "type": "boolean",
+                      "description": "平台级封禁生效中"
+                    }
+                  }
+                },
+                "inviter": {
+                  "type": "object",
+                  "required": [
+                    "userId",
+                    "address",
+                    "inviteCode",
+                    "status",
+                    "platformBlocked"
+                  ],
+                  "properties": {
+                    "userId": {
+                      "type": "integer"
+                    },
+                    "address": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active",
+                        "blocked"
+                      ],
+                      "description": "租户级状态"
+                    },
+                    "platformBlocked": {
+                      "type": "boolean",
+                      "description": "平台级封禁生效中"
+                    },
+                    "inviteCode": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "boundAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "source": {
+                  "type": "string",
+                  "enum": [
+                    "code",
+                    "link",
+                    "admin"
+                  ]
+                }
+              }
+            }
+          },
+          "total": {
+            "type": "integer"
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        }
+      },
+      "ReferralAdminBindRequest": {
+        "type": "object",
+        "required": [
+          "inviteeAddress",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "inviteeAddress": {
+            "type": "string",
+            "description": "被邀请人的完整地址；该地址必须已在本租户登录过"
+          },
+          "inviterCode": {
+            "type": "string",
+            "description": "与 inviterAddress 恰好给一个"
+          },
+          "inviterAddress": {
+            "type": "string",
+            "description": "与 inviterCode 恰好给一个"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        }
+      },
+      "ReferralAdminBindResponse": {
+        "type": "object",
+        "required": [
+          "inviteeUserId",
+          "inviterUserId",
+          "inviterCode",
+          "boundAt"
+        ],
+        "properties": {
+          "inviteeUserId": {
+            "type": "integer"
+          },
+          "inviterUserId": {
+            "type": "integer"
+          },
+          "inviterCode": {
+            "type": "string",
+            "description": "分段展示形态 XXXX-XXXX"
+          },
+          "boundAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
       "LoginRequest": {
         "type": "object",
         "required": [

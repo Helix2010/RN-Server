@@ -398,7 +398,13 @@ func (s *server) walletUserDetail(c *gin.Context) {
 		return
 	}
 	platformBlock := s.platformWalletBlocked(c, address) != ""
-	c.JSON(http.StatusOK, gin.H{"user": gin.H{"id": userID, "address": address, "status": status, "firstSeenAt": iso(first), "lastLoginAt": iso(last), "loginCount": loginCount, "platformBlocked": platformBlock}, "devices": devices, "sessions": sessions})
+	// 邀请关系是这个账号的属性，扩展既有响应而不新开接口（设计 §4.4）
+	referralView, err := s.referralOfWalletUser(c, tenant, userID)
+	if err != nil {
+		problem(c, 500, "WALLET_USER_QUERY_FAILED", "Unable to load wallet user")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"user": gin.H{"id": userID, "address": address, "status": status, "firstSeenAt": iso(first), "lastLoginAt": iso(last), "loginCount": loginCount, "platformBlocked": platformBlock}, "devices": devices, "sessions": sessions, "referral": referralView})
 }
 
 // walletUserDevices 按设备归并分组返回该账号用过的安装实例；分组键只在本次响应内有意义（device-1、device-2…），

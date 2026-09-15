@@ -105,6 +105,34 @@ CHECK 约束（MySQL 8.0.16+ 强制）：`inviter_user_id`、`invited_at`、`inv
 - 存储、URL、二维码内容一律不带分隔符（链接形如 `https://<租户 API 域名>/app/invite/ABCD1234`）。
 - 归一化第 2 步会去掉连字符，所以用户把带横线的码粘进输入框也认。
 
+## 租户配置
+
+邀请的两个旋钮存在 `app_configs` 的 `mobile-bootstrap` 里，与 `modules` / `wallet` / `services` 并列：
+
+```json
+"referral": { "enabled": true, "bindWindowHours": 168 }
+```
+
+| 键 | 取值 | 未配置时（声明式默认） |
+|---|---|---|
+| `enabled` | 布尔 | `false`。它会在 App 上多出一个入口，该由运营明确打开 |
+| `bindWindowHours` | 整数 1–8760 | `168`（7 天），从 `wallet_user.first_seen_at` 起算 |
+
+越界值在**写入时**拒绝（400，报错说清是哪个键、填了什么、期望什么），读路径不修复。
+除了"不修复坏数据"这条原则，还有一个具体后果：新版 App 的 bootstrap schema 会校验
+`referral` 的取值范围，下发一个越界值会让新版 App 整份 `safeParse` 失败——未知字段被
+zod strip 掉是安全的，已知字段的取值校验仍然严格。
+
+bootstrap 另外下发一个 `inviteLinkBase`（`https://<租户 API 域名>/app/invite/`），由服务端
+按请求 Host 算，不进库、不可配置：落地页是服务端的，路径规则只该有一个来源。
+
+上溯上界是**服务端内部常量**（`internal/api/referral.go` 的 `referralMaxDepth`），不做租户
+配置——本期没有任何功能按层级分叉，做成旋钮运营也无从判断该填几。
+
+> 这一节没有放进 `docs/CONFIGURATION.md`：那份文档在 §1 明确把"按租户变化的"划在
+> 范围之外（"租户数据……**不在这里**，在库里按租户存"）。设计稿原本写的是放进那里，
+> 按它自己的分类应该落在本文档。
+
 ## 关系与账号状态
 
 封禁不改变已有关系，只影响能否**新建**关系（绑定时校验邀请人未被封禁）。
