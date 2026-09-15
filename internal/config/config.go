@@ -92,6 +92,8 @@ type Config struct {
 	IndexerAlertWebhook string
 	// PlatformAdminUsernames 能进"扫链管理"等平台级页面的管理员用户名；空表示平台路由一律 403。
 	PlatformAdminUsernames []string
+	// Backup 是打包服务故障恢复备份（设计 platform-backup-recovery-2026-09-15）
+	Backup Backup
 }
 
 // mysqlDefaults 是 DSN 里没写时服务端补上的值。
@@ -162,6 +164,7 @@ func Load() (Config, error) {
 		IndexerAlertWebhook:        strings.TrimSpace(os.Getenv("INDEXER_ALERT_WEBHOOK")),
 		PlatformAdminUsernames:     split(strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_USERNAMES"))),
 	}
+	cfg.Backup = l.backup(cfg.Environment)
 	// CORS_ORIGINS 是额外放行项，不是"允许列表的全部"：租户域名由 tenant_domain
 	// 表推导。开发环境默认放开，生产环境默认**空**——生产上继续默认 "*" 等于
 	// 把这个改动做成一个洞。

@@ -26,15 +26,33 @@ const (
 // envKeysReadByCode 把 config.go 里真正读取的键名抠出来。
 func envKeysReadByCode(t *testing.T) []string {
 	t.Helper()
-	source, err := os.ReadFile("config.go")
+	// 扫**整个包**而不是只扫 config.go。备份那组键住在 backup.go 里，只读一个
+	// 文件的话它们会从这道门禁底下整组溜过去——而它们恰恰是灾难当天要用的键。
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
+	var sources []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		sources = append(sources, name)
+	}
+	sort.Strings(sources)
+
 	// l.value("KEY", …) / l.integer / l.boolean / os.Getenv("KEY") / os.LookupEnv("KEY")
 	pattern := regexp.MustCompile(`(?:l\.(?:value|integer|boolean)|os\.(?:Getenv|LookupEnv))\("([A-Z][A-Z0-9_]+)"`)
 	seen := map[string]bool{}
-	for _, match := range pattern.FindAllStringSubmatch(string(source), -1) {
-		seen[match[1]] = true
+	for _, name := range sources {
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range pattern.FindAllStringSubmatch(string(source), -1) {
+			seen[match[1]] = true
+		}
 	}
 	// legacyMySQLKeys 是"已经不读了、但要认得出"的那一组，不属于可用键
 	for _, key := range legacyMySQLKeys {
@@ -46,7 +64,7 @@ func envKeysReadByCode(t *testing.T) []string {
 	}
 	sort.Strings(keys)
 	if len(keys) < 40 {
-		t.Fatalf("只从 config.go 里认出 %d 个键，正则多半失配了：%v", len(keys), keys)
+		t.Fatalf("只从 %v 里认出 %d 个键，正则多半失配了：%v", sources, len(keys), keys)
 	}
 	return keys
 }
@@ -65,8 +83,8 @@ func TestEveryEnvKeyIsInTheConfigurationReference(t *testing.T) {
 		}
 	}
 	if len(missing) > 0 {
-		t.Fatalf("这些键 config.go 会读，但 %s 里没有：\n  %s\n"+
-			"加一个配置项要同时改三处：config.go、配置参考、两份 .env.example。",
+		t.Fatalf("这些键代码会读，但 %s 里没有：\n  %s\n"+
+			"加一个配置项要同时改三处：config 包、配置参考、两份 .env.example。",
 			configurationDoc, strings.Join(missing, "\n  "))
 	}
 }

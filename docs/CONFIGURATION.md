@@ -147,7 +147,35 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 
 对象存储的 endpoint / 桶 / 凭据**不在 env**：按租户存在 `app_configs.release.storage`，用 `STORAGE_MASTER_KEY` 加密，由管理端写入。
 
-### 4.4 推送
+### 4.4 打包服务的故障恢复备份
+
+打包机硬盘坏了，数据库里的签名密钥全在但没有任何东西能打开它们——能解开的只有打包机上那个 `agent-key`。这组键配的就是防这件事的备份（设计 `docs/design/platform-backup-recovery-2026-09-15.md`）。
+
+**这组键要么全配，要么全不配。** 只要配了桶（`BACKUP_BUCKET_BUCKET`）或开了定时（`BACKUP_INTERVAL_HOURS`），就算「备份已投用」，三把恢复公钥从那一刻起是硬前置，缺一把服务端**拒绝启动**。没投用时这组键全空，服务端照常跑——不能让一个还没上线的功能扣住整个后端。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `BACKUP_RECOVERY_RECIPIENT_A` | 空 | 槽位 A 的恢复公钥，**PEM 的 base64，单行**。RSA ≥ 3072 位（4096 推荐） |
+| `BACKUP_RECOVERY_RECIPIENT_B` | 空 | 槽位 B，同上 |
+| `BACKUP_RECOVERY_RECIPIENT_C` | 空 | 槽位 C，同上。三把**必须两两不同** |
+| `BACKUP_INSTANCE_ID` | 空 | 进对象键前缀，`^[a-z0-9-]{1,32}$`。**显式配，不要从主机名推导**——改名或在新机器上恢复之后前缀就变了，历史备份全部下载不到 |
+| `BACKUP_INTERVAL_HOURS` | `0` | `0` = 关闭定时只留手动；否则 **6–168**，建议 `24` |
+| `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露 |
+| `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域 |
+| `BACKUP_BUCKET_ENDPOINT` | 空 | 自定义 endpoint（兼容 S3 的对象存储）。生产强制 https |
+| `BACKUP_BUCKET_PREFIX` | 空 | 对象键前缀 |
+| `BACKUP_BUCKET_ACCESS_KEY_ID` | 空 | 只需要 `s3:PutObject` + `s3:GetObject` + `s3:GetBucketVersioning` |
+| `BACKUP_BUCKET_SECRET_ACCESS_KEY` | 空 | 同上 |
+
+**为什么公钥要再套一层 base64**：PEM 带换行，直接写进 systemd 的 `EnvironmentFile` 极易写坏，而这个键要用的那一天正好是最不该出意外的那一天。生成方式：
+
+```bash
+openssl rsa -in my-recovery.key -pubout | base64 -w0
+```
+
+**门限是 2-of-3**：三个人各持一把私钥，任意两个人凑齐就能打开备份包，一个人单独拿到什么都读不到。三把公钥同样要写进打包机的 `/etc/rn-build-agent.env`（`BUILD_AGENT_RECOVERY_RECIPIENT_A` / `_B` / `_C`），两边逐指纹一致，否则打包机拒绝产出备份。
+
+### 4.5 推送
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -161,7 +189,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 
 APNs（`APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_PRIVATE_KEY` / `APNS_BUNDLE_ID` / `APNS_ENVIRONMENT`）和 HMS（`HMS_APP_ID` / `HMS_CLIENT_ID` / `HMS_CLIENT_SECRET`）目前**仍是全局的**，没有租户在用。谁把它们改成按租户，必须同时把 `Dispatcher.apns` 和 `Dispatcher.hmsToken` 这两个全局字段改成 `map[tenant]`，否则两个租户会互相拿到对方的令牌。
 
-### 4.5 扫链
+### 4.6 扫链
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -171,7 +199,7 @@ APNs（`APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_PRIVATE_KEY` / `APNS_BUNDLE_ID` / 
 
 扫链端点按链存在 `app_configs.chain-scan.<chain>`（tenant 0），用 `STORAGE_MASTER_KEY` 加密，由平台管理员在管理端维护。
 
-### 4.6 其它
+### 4.7 其它
 
 | 键 | 默认 | 说明 |
 |---|---|---|
