@@ -158,11 +158,109 @@ mysqldump（全库） | gzip | openssl smime -encrypt -binary -aes-256-cbc -outf
 
 **恢复到新机器等于永久扩大签名密钥的信任边界。** 旧机器若并非物理损毁，必须按已泄露处理并销毁介质。这条与 `build-concurrency-2026-09-15.md` §8 同源。
 
-## 5. 管理端
+## 5. 控制台：打包材料备份
 
-本阶段**不新增页面**。需要改一处既有的：`GET /platform/build-agent/public-key` 加上 `publicKey` 字段之后，把它显示在页面上（§3.2）。
+### 5.1 和整库备份的分工
 
-顺带订正一个初稿写错的事实：**「平台维护」页今天只有「管理员口令」一项**（`RN-Admin/src/modules/build-config/plugin.ts:68-75`）；打包机公钥的 UI 在 `keystore-section.tsx`，由 `android-build-page.tsx:283` 渲染，属于**租户级**的「打包与签名」页——而后端那条路由是平台级的（`internal/api/server.go:177-178`）。这是一个独立的 UI 归位小修。
+两个备份，两套机制，受众不同：
+
+| | 整库备份（§4.2） | 打包材料备份（本节） |
+|---|---|---|
+| 产出者 | amos 上的 cron 脚本 | rn-server（控制台按钮 / 定时） |
+| 范围 | 全库 | 打包与发布所需的那几张表，**排除图标 blob** |
+| 体积 | 几十 MB 起 | 几百 KB |
+| 用途 | 灾难恢复底座，覆盖场景 C | 可下载、可手工归档、可放进离线信封 |
+| 控制台 | 不进 | 有配置、状态、按钮、下载 |
+
+**后者不是前者的替代，也不是纯粹的重复。** 它填的是离线信封的一个真实缺口：信封里的内容会**随新租户、新密钥漂移**，而「每建一个租户密钥就去更新信封」是纯流程纪律，没人会记得。一个小到能下载、能随手归档的包正好覆盖这段漂移。但要清楚：**必须先有整库备份**，只有这个包不构成灾难恢复。
+
+范围（对照 §4.2，去掉图标、加上两张必需表）：
+
+`app_configs`（**排除 `build.icons` 那些行**）、`tenants`、`tenant_domain`、`app_releases`、`ota_releases`、`chain_token_catalog`、`language_document`。不含 `schema_migrations`（§3.3c）。
+
+排除 `build.icons` 的理由：图标不是机密（`internal/api/build_icons.go:31-33` 自己说的，它原样编进每个 APK），丢了重传即可，而它单租户就能占 32MB（§8）。整库备份里有它。
+
+### 5.2 产出
+
+服务端内部产出 `tar.gz`（Go 代码，不 shell out），外层用现有的 X25519 原语封给**恢复公钥**。
+
+**恢复公钥放 env（`BACKUP_RECOVERY_RECIPIENT`），与 `STORAGE_MASTER_KEY` 同一个文件、同一种保护。管理端只读显示指纹，不能写。** 它写进 `app_configs` 就意味着任何能写配置的路径都能改收件人。
+
+`manifest.json` 必须有：格式版本、**实例 id + 序号 + 生成时间**（同时进 AEAD 的 AAD，见 §5.5）、每个成员的 sha256、逐租户的 keystore 校验**三态**（`ok` / `failed` / `pending`——`pending` 和 `failed` 一样危险，它意味着从来没验过）、`build.agent.recipient` 的当前指纹、以及外层的 `RecipientKeyID`。
+
+**fail-closed**：`BACKUP_RECOVERY_RECIPIENT` 缺失或不是合法 X25519 公钥（用现成的 `Recipient.Fingerprint()` 返回 `""` 做判据，`internal/buildkeystore/recipient.go:50-57`）时，**拒绝产出**并说清缺什么，而不是产出一个少了东西却看起来正常的包。那种失败只会在灾难当天暴露。
+
+### 5.3 两套凭据，职责分离
+
+| 凭据 | 存放 | 权限 | 用途 |
+|---|---|---|---|
+| `platform.backup.storage` | `app_configs(0,...)`，管理端可配 | **只给 `PutObject`** | 产出备份时上传 |
+| `BACKUP_READ_ACCESS_KEY_ID` / `..._SECRET` | **env**，不进数据库 | 只给 `GetObject` | 下载接口 |
+
+**为什么分开**：写凭据在 `app_configs` 里，因而随备份包一起走；读凭据在 env 里，不进包。一个只拿到数据库或只拿到备份包的攻击者，**读不到桶**。
+
+**要诚实说明它挡不住什么**：服务端 RCE 能读 env，所以它仍然能拉走全部历史备份。这是「要控制台下载按钮」必然付的代价——没有任何办法让服务端既能提供下载又不能自己下载。缓解是：包**封给恢复公钥**，服务端没有那把私钥，所以拉走的是**打不开的密文**；下载逐次记审计；服务端**没有 Delete 权限**，销毁不了备份。
+
+**「测试连接」不能用现成的 `objectstore.Test()`**：它 Put 一个**固定键** `.rn-foundation-storage-check` 然后 Head（`internal/objectstore/s3.go:319-336`）——既要求 Get/Head 权限（和只给 Put 冲突），固定键在开了 versioning 的桶上还会永久留存。备份桶要单独写一个只 Put 到 `<objectPrefix>/.probe/<随机>` 的版本。
+
+### 5.4 接口
+
+全部挂 `platform.*`（`requirePlatformAdmin()`，按 `PLATFORM_ADMIN_USERNAMES` 白名单；列表为空时整组 403，fail-closed）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET / PUT | `/platform/backup/storage` | 备份桶配置，凭据只回 hint |
+| POST | `/platform/backup/storage/test` | 只 Put 到随机探针键（§5.3） |
+| GET | `/platform/backup` | 状态 + 恢复公钥指纹 + 最近 N 次清单 |
+| POST | `/platform/backup/run` | 立即备份，返回序号与 sha256 |
+| GET | `/platform/backup/download/:seq` | **按序号**下载 |
+
+两条硬性约束：
+
+- **清单从 `platform.backup.state` 的本地记录读，不 List 桶。** 服务端不需要 `ListBucket`，少一项权限。
+- **下载只接受序号，不接受对象键。** 服务端用 `objectPrefix` + 记录里的键自己拼。初稿写的 `:key` 在 gin 默认设置下只匹配一个路径段（对象键必然含 `/`），那条路由写出来是 404；而「修好」的自然写法 `*key` 会把同桶任意对象读打开——`s3Client.Get` 把 key 原样交给 `GetObject`，没有任何前缀约束（`internal/objectstore/s3.go:178-184`）。
+- **下载只认会话 cookie，不认 `x-admin-key`。** 备份下载不该是自动化能力，而 `x-admin-key` 的 actor 是一个固定值（`ADMIN_API_ACTOR`，默认 `api-key-automation`）——只要有人把它写进 `PLATFORM_ADMIN_USERNAMES`，一把长期有效的 API key 就能拉备份。
+
+### 5.5 真实性：光加密不够
+
+`SealTo` 是匿名 sealed box，没有发送方认证（`internal/buildkeystore/recipient.go:96-146`）。**知道恢复公钥的人**（公钥不是秘密，还要显示在管理端上）加上任意一条往桶里写对象的路径，就能伪造一个密码学上无法与真备份区分的包。恢复流程会把它写进新系统的配置根——`tenant_domain`（Host→租户映射）和 `build.android.identity.apiBaseUrl`（重建出来的 App 此后跟谁说话）都在里面，而 `apiBaseUrl` 只校验是个 https origin（`internal/api/build_config.go:85-98`）。
+
+两条一起做：
+
+1. **身份进 AAD**。`SealTo` 现在只把临时公钥放进 AAD（`recipient.go:131`）。把 `(实例 id, 序号, 生成时间)` 也放进去，伪造者就无法复用同一条身份。
+2. **sha256 在包外。** 每次产出把 sealed 对象自身的 sha256 写进 `platform.backup.state` **和** `audit_events`，控制台显示它；恢复工具强制 `--expect-sha256`，值来自控制台或审计，**不来自包本身**。`manifest.json` 里的摘要只覆盖内层成员，对「这是哪一份备份」零贡献。
+
+顺带：`audit_events` 不在打包材料备份的范围里，所以「曾经做过哪些备份」这段历史要同时写进 `platform.backup.state`（那一行在包里）。
+
+### 5.6 定时
+
+`cmd/server` 起一个 ticker，抄 push dispatcher 的形态（`cmd/server/main.go:88` 的 `go dispatcher.Run(workerCtx)`）。
+
+- 跨实例互斥用 `platform.backup.state` 的 `version` 做 CAS。**注意现成的 `upsertAppConfig` 绑死在 `*gin.Context` 上**（`internal/api/build_keystore_generate.go:225-231`，内部用 `tenantID(c)` / `actor(c)` / `c.Request.Context()`），定时任务里复用不了，要另写一个 ctx 版本。今天是单实例部署，但不写这一条，将来加实例时会静默地每天备份 N 份。
+- **服务端永不删除备份**，保留交给桶的生命周期规则。一个被拿下的服务端销毁不了你的备份。
+- 连续失败要有声音：写 `audit_events`，并在页面上把「上次成功：N 天前」做成醒目状态。平台没有告警基建，这是最低限度。
+
+### 5.7 管理端页面
+
+放**平台维护**（`RN-Admin/src/modules/build-config/plugin.ts:68-75`，今天只有「管理员口令」一项）。
+
+顺带订正初稿写错的事实：打包机公钥的 UI 在 `keystore-section.tsx`、由 `android-build-page.tsx:283` 渲染，属于**租户级**的「打包与签名」页——而后端那条路由是平台级的（`internal/api/server.go:177-178`）。这是个独立的 UI 归位小修，可以和本节一起做。
+
+页面元素：
+
+- 备份桶配置表单 + 「测试连接」
+- 恢复公钥指纹（**只读**，来自 env），旁边一句「核对它和你手上那把离线私钥是同一对」
+- 上次成功时间 / 序号 / sha256、连续失败计数
+- 「立即备份」按钮
+- 最近 N 次清单 + 逐条下载
+- 打包机公钥（`publicKey` 字段，§3.2 加上之后）
+
+**页面上必须写死两段文字**，不能只写在文档里：
+
+1. **备份桶的只读凭据必须离线抄一份。** 凭据本身在备份包里，机器全丢时你需要凭据才能取到那个装着凭据的包——这是循环依赖，靠人记住不行。
+2. **信封甲 / 乙的内容清单**（§4.1），以及「每新建一个租户签名密钥，当场把 `.p12` 和口令存进信封乙」。
+
+全部文案、`aria-label`、`title`、placeholder 要过 `src/core/admin-i18n.tsx` 并双语，新页面配 `.spec.tsx`（`RN-Admin/docs/ADMIN_ENGINEERING_STANDARD.md:206-221`）。
 
 ## 6. 演练
 
@@ -176,13 +274,27 @@ mysqldump（全库） | gzip | openssl smime -encrypt -binary -aes-256-cbc -outf
 
 1. **§3.1 + §3.2 两个阻断**。独立收益，不依赖本方案其余部分；不修则场景 B 无解。
 2. **§4.1 离线信封**（今天就能做完，覆盖场景 A 与 B 的全部），写进 `deploy/amos/README.md` 里 `agent-key` 那段旁边，**点名责任人**。
-3. **§4.2 `deploy/amos/backup-db.sh` + cron**（覆盖场景 C，这是今天最大的洞）。
+3. **§4.2 `deploy/amos/backup-db.sh` + cron**（覆盖场景 C，这是今天最大的洞）。**必须排在 §5 之前**——只有打包材料备份不构成灾难恢复，先上控制台会给人「已经有备份了」的错觉。
 4. **§3.3 四颗地雷 + LIMIT 20**（大部分是文档，两处是小代码改动）。
-5. **§6 一次真实演练。**
+5. **§5 控制台**，内部顺序不能换：
+   1. §5.3 的两套凭据（决定配置形状，做在后面就是返工）
+   2. §5.5 的真实性（决定 manifest 结构与恢复工具入口校验，后补会让已产出的包全部作废）
+   3. §5.2 产出 + §5.4 的 `run` 与 `download`
+   4. §5.7 页面
+   5. §5.6 定时（最后上，先用手动按钮跑几天）
+6. **§6 一次真实演练**，包含那条负面用例。
 
-## 8. 已撤回：服务端自动备份子系统
+### 7.1 演练的负面用例
 
-初稿提出：管理端配置入口 + 每日定时任务 + 代理侧把 `agent-key` 封给恢复公钥上报 + 服务端产出加密包上传 + 清单与下载接口 + 独立 `cmd/rn-backup`。三路对抗性评审之后撤回。记在这里是为了让下一个想到这个主意的人不用再走一遍。
+**给恢复工具喂一个伪造包，它必须拒绝。** 做法：用恢复**公钥**自己封一个内容任意的包，放进桶里，然后按正常流程走恢复——它应该在 `--expect-sha256` 这一步停住。这条通不过，说明 §5.5 还没真正生效。
+
+## 8. 初稿被撤回的部分
+
+初稿提出：管理端配置入口 + 每日定时任务 + **代理侧把 `agent-key` 封给恢复公钥上报** + 服务端产出加密包上传 + **清单与按对象键下载的接口** + 独立 `cmd/rn-backup`。
+
+其中**管理端入口、定时、产出与上传、按序号下载**保留，见 §5——但要满足评审给出的前置条件（两套凭据、真实性、fail-closed、排除图标 blob）。
+
+**撤回的是代理侧封装 `agent-key` 这一整块**，以及初稿据以论证它安全的那些判断。记在这里是为了让下一个想到这个主意的人不用再走一遍。
 
 **它自动化的是一个永不变化的文件。** `agent-key` 只在缺失时生成、不轮换、不过期。而信封里本来就要放主密钥和桶凭据——**多写一行的边际成本是零**。为了省掉这一行，初稿新增了：代理 env 变量、一条新接口、三个新配置键、一对恢复密钥及其轮换流程、`SealBytes`、以及「代理必须忽略服务端下发收件人」的专门用例。
 
@@ -200,17 +312,21 @@ mysqldump（全库） | gzip | openssl smime -encrypt -binary -aes-256-cbc -outf
 
 **而它声称堵死的那条攻击其实没堵死。** 初稿 §4.3 把恢复公钥固定在代理 env 里，论证是「服务端改不了收件人」。但服务端 RCE 根本不需要改收件人：`build_jobs.git_ref` 是从库里读出来下发的（`build_jobs.go:713` → `buildJobView` 的 `"gitRef"`，`:111`），代理拿到就直接 `git worktree add --detach <worktree> <job.GitRef>`，**对它没有任何校验**（`cmd/build-agent/build.go:130`；同一个函数对 `TenantDirectory` 是校验了的，`:121-123`），而仓库是 `--mirror` 克隆、上游每个分支和 tag 都在本地可达。改掉 ref → 代理以 `builder` 身份执行那个提交的代码 → 直接读走 `agent-key`（属主就是 `builder`）。**「服务端能选检出哪个提交」就等于「服务端能在打包机上执行命令」**，只是叫构建。这条应当单独修：**把 main 的固定挪到代理侧**，代理忽略 `job.GitRef`、硬编码只从 `refs/heads/main` 检出，服务端下发的 ref 只用于日志核对。这和 `tenantfile.go` 顶部「两端分属不同信任域，各自把住自己那一侧」是同一条原则，只是这一项漏了。
 
-### 如果将来还是要做控制台版本
+### 8.1 控制台版本据此加的护栏
 
-用户原本要的是「平台一键 + 管理端配置入口 + 定时 + 云存储 + 下载」。§4.2 的脚本给了其中的定时、云存储、加密、租户不可操作，**没给的是控制台上的按钮和下载链接**。真要补上那两样，最低条件：
+§5 保留了控制台，但每一条都对应上面的一个发现：
 
-1. **服务端的备份桶凭据只给 `PutObject`**，不给 Get / List / Delete。因此**不做下载与清单接口**——清单从 `platform.backup.state` 读本地记录（对象键 + sha256 + 时间），取包的人拿信封乙里的只读凭据直接去桶里取。这一条同时解掉上面第 2 点和 `GET /platform/backup/:key` 的路径问题（gin 默认设置下 `:key` 只匹配一个路径段，而对象键必然含 `/`，那条路由今天写出来是 404；「修好」的自然写法 `*key` 就把同桶任意对象读打开了）。
-2. **解决真实性**：把 `(实例 id, 序号, 生成时间)` 放进 AEAD 的 AAD，并强制恢复工具带 `--expect-sha256`，值来自控制台/审计而不是包本身。
-3. **备份不带 `build.icons`** 等 blob 型配置行（图标不是机密、丢了重传即可），让包回到几百 KB。
-4. **失败方向三段式**：代理侧**不** fail-closed 启动（把备份做成构建的单点故障是负收益，而且第一次配置正好发生在恢复当天）；但代理必须显式上报「未配置」而不是静默不调；**服务端侧 fail-closed**——`RecipientKeyID` 与当前恢复公钥不匹配就拒绝产出备份，绝不产出一个缺了东西却看起来正常的包。
-5. `Sealed.RecipientKeyID` 必须进 manifest 与状态行——否则恢复公钥轮换时会产出「外层封给新公钥、内层封给旧公钥」的分裂包，而它在结构自检上完全正常。
-6. 恢复工具解包必须校验每个成员名（禁绝对路径、禁 `..`、禁符号链接、白名单），手工路径要写 `tar --no-absolute-names -C <空目录>`。
-7. 演练必须包含**一次负面用例**：给恢复工具喂一个伪造包，它必须拒绝。
+| 发现 | §5 里的护栏 |
+|---|---|
+| 备份可伪造 | §5.5：身份进 AAD + sha256 在包外 + 恢复工具 `--expect-sha256` |
+| 服务端能读全部历史 | §5.3：写凭据只给 Put 且在库里，读凭据只给 Get 且在 env 里；包封给恢复公钥，拉走的是打不开的密文；服务端无 Delete |
+| 按对象键下载 = 任意对象读 | §5.4：只接受序号，服务端自己拼键；清单从本地状态读，不 List 桶 |
+| 包是几十 MB | §5.1：排除 `build.icons`，回到几百 KB |
+| 产出一个缺东西却看起来正常的包 | §5.2：恢复公钥缺失或非法就拒绝产出 |
+| 恢复公钥轮换会产出分裂包 | §5.2：`RecipientKeyID` 进 manifest 与状态行 |
+| 解包路径遍历 | §5 之外：恢复工具必须校验每个成员名（禁绝对路径、禁 `..`、禁符号链接、白名单），手工路径写 `tar --no-absolute-names -C <空目录>` |
+
+**代理侧封装仍然不做。** `agent-key` 永不变化，抄进信封乙一次就够（§4.1、§8 开头）；而上面那条 `git_ref` 的缝说明「把收件人固定在代理 env」这个保护本来就绕得开。控制台备份的范围里**不含 `agent-key`**——它只备份数据库里的东西。
 
 ## 9. 顺带修的既有问题
 
