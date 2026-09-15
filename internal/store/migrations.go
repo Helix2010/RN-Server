@@ -1001,7 +1001,8 @@ func (s *Store) Migrate(cfg config.Config) error {
 			return fmt.Errorf("record schema migration %d: %w", item.version, err)
 		}
 	}
-	// 内嵌的 RN-App 文案种子每次启动都补齐缺失键（只插不改，运营在 RN-Admin 的改动不受影响）。
+	// 内嵌的 RN-App 文案种子每次启动都跟全局文案目录对齐：补缺键、改过的值跟着更新。
+	// 只动全局行，运营在 RN-Admin 的租户覆盖不受影响（见 localization_seed.go 的说明）。
 	// 迁移 29 只在 2026-09-02 跑过一次，之后同步的新键一直没进库，App 只能显示键名；
 	// 现在同步种子 + 部署就够了，不用再记得加迁移版本
 	if err := currentRNAppLocalizationSeedMigration(ctx, s.DB); err != nil {
