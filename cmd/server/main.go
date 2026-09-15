@@ -88,6 +88,11 @@ func main() {
 		go dispatcher.Run(workerCtx)
 	}
 
+	// 备份的后台节拍：回收超时记录 + 到点建定时待办。两件事都必须跑在服务端
+	// 自己的定时器上——认领超时的触发条件恰恰是「打包机不轮询了」，挂在轮询
+	// 路径上就永远不会触发（见 BackupScheduler 的注释）
+	go api.NewBackupScheduler(cfg, database.DB).Run(workerCtx)
+
 	httpServer := &http.Server{
 		Addr:              cfg.BindAddress + ":" + cfg.Port,
 		Handler:           api.New(cfg, database),

@@ -199,6 +199,16 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	platform.POST("/build-agent/public-key/accept", s.acceptBuildAgentKey)
 	platform.GET("/backup/signing-key", s.getBackupSigningKey)
 	platform.POST("/backup/signing-key/accept", s.acceptBackupSigningKey)
+	// 备份路由单独加一道同源闸：authenticate 的 Origin 闸只管非安全方法，
+	// 而 originAllowed 会回落去查 tenant_domain 表——不补的话，「谁能读平台备份」
+	// 实际由那张表的内容决定（见 requireBackupSameOrigin 的注释）
+	backup := platform.Group("/backup", s.requireBackupSameOrigin())
+	backup.GET("", s.getBackupStatus)
+	backup.POST("/run", s.runBackupNow)
+	backup.PUT("/holders", s.updateBackupHolders)
+	backup.POST("/storage/test", s.testBackupBucket)
+	backup.POST("/:seq/force-fail", s.forceFailBackup)
+	backup.GET("/:seq/:pair/download", s.downloadBackup)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
