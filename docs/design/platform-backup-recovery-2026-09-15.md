@@ -240,9 +240,21 @@ mysqldump（全库） | gzip | openssl smime -encrypt -binary -aes-256-cbc -outf
 - **服务端永不删除备份**，保留交给桶的生命周期规则。一个被拿下的服务端销毁不了你的备份。
 - 连续失败要有声音：写 `audit_events`，并在页面上把「上次成功：N 天前」做成醒目状态。平台没有告警基建，这是最低限度。
 
-### 5.7 管理端页面
+### 5.7 只有平台管理员可见、可下载
 
-放**平台维护**（`RN-Admin/src/modules/build-config/plugin.ts:68-75`，今天只有「管理员口令」一项）。
+两道独立的门，前端那道不作为安全依据：
+
+- **前端**：插件声明 `platformOnly: true`，`RN-Admin/src/app/App.tsx:205-207` 按 `session.platformAdmin` 过滤掉整个插件——菜单不渲染、页面不可达。`platformAdmin` 来自 `/auth/session`（`internal/api/server.go:566`）。
+- **后端**：路由挂 `platform.*` 组，`requirePlatformAdmin()` 按 `PLATFORM_ADMIN_USERNAMES` 白名单校验（`internal/api/chain_scan_admin.go:26-48`）；**白名单为空时整组 403**，fail-closed。
+- **下载接口额外只认会话 cookie，不认 `x-admin-key`**。`x-admin-key` 的 actor 是固定的 `ADMIN_API_ACTOR`（默认 `api-key-automation`，`internal/config/config.go:120`），是一把长期有效的自动化密钥；备份下载不该是自动化能力。这条在路由层强制，不依赖白名单怎么填。
+
+**要知道这道门今天挡不住谁。** 控制台只有**一个**登录账号：`server.go:543` 是 `constantEqual(input.Username, s.cfg.AdminUsername)`，整个服务端一对 `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH`，会话的 `actor_id` 永远是这一个值。**「租户管理员」这个身份不存在**——租户是靠打开哪个域名（Host 头，`domainTenantScope()`）区分的，不是靠账号。所以白名单要么包含那个唯一账号（凡是能登录的人都看得见备份），要么不包含（平台路由整组 403）。`docs/OPERATIONS_AND_RELEASE.md:233` 记录了这个阶段性决定：「当前阶段不加入 RBAC」。
+
+**结论**：`platformOnly` 是正确的门，哪天多账号登录落地它已经是关好的；但「有些人能进控制台管租户、却看不到备份」今天做不到，那需要先有多账号管理员登录，属于另一件事。不要在备份这个功能里自己造一套账号。
+
+### 5.8 管理端页面
+
+放**平台维护**（`RN-Admin/src/modules/build-config/plugin.ts:68-75`，今天只有「管理员口令」一项）。现有的平台级菜单一共三个——平台运维（扫链管理）、平台账号（账号查询）、平台维护（管理员口令），备份和管理员口令并排。
 
 顺带订正初稿写错的事实：打包机公钥的 UI 在 `keystore-section.tsx`、由 `android-build-page.tsx:283` 渲染，属于**租户级**的「打包与签名」页——而后端那条路由是平台级的（`internal/api/server.go:177-178`）。这是个独立的 UI 归位小修，可以和本节一起做。
 
@@ -280,7 +292,7 @@ mysqldump（全库） | gzip | openssl smime -encrypt -binary -aes-256-cbc -outf
    1. §5.3 的两套凭据（决定配置形状，做在后面就是返工）
    2. §5.5 的真实性（决定 manifest 结构与恢复工具入口校验，后补会让已产出的包全部作废）
    3. §5.2 产出 + §5.4 的 `run` 与 `download`
-   4. §5.7 页面
+   4. §5.7 的权限门 + §5.8 页面
    5. §5.6 定时（最后上，先用手动按钮跑几天）
 6. **§6 一次真实演练**，包含那条负面用例。
 
