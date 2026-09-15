@@ -67,6 +67,7 @@ var migrations = []migration{
 	{version: 48, name: "referral_columns", apply: referralColumnsMigration},
 	{version: 49, name: "referral_code_backfill", apply: referralCodeBackfillMigration},
 	{version: 50, name: "referral_indexes", apply: referralIndexesMigration},
+	{version: 51, name: "tenant_neutral_platform_brand_copy", apply: tenantNeutralPlatformBrandCopyMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -972,6 +973,27 @@ func otaObjectMetadataMigration(ctx context.Context, db *sql.DB) error {
 func normalizeRNAppLocalizationKeysMigration(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, `UPDATE language_document SET `+"`key`"+`=LOWER(`+"`key`"+`) WHERE type=14`)
 	return err
+}
+
+// tenantNeutralPlatformBrandCopyMigration 把**平台全局**（tenant_id=0）文案里的
+// 租户品牌名清空。早期的文案迁移（13、15）把当时唯一那个租户的名字写成了平台默认值：
+// launch.title 与 app.name 全局行都是「AnyFun」。全局行是所有没自己配的租户继承的
+// 那一份，于是任何新租户的启动页和关于页都会显示别人的品牌。
+//
+// 清成空串而不是删行：bootstrap 的 branding.launch.title 是
+// `messages[titleKey]`，键不存在就下发 null，而 App 侧 schema 是
+// `z.string()` 非空——现网所有安装会直接解析失败。空串是合法的 string，
+// App 拿到空值后退到自己这个包的名字（appRuntime.appName，来源是
+// tenants/<slug>/tenant.json 的 appName），那对每个包都必然是对的那个名字。
+//
+// 只动 tenant_id=0。租户自己写的覆盖是运营的选择，不碰。
+func tenantNeutralPlatformBrandCopyMigration(ctx context.Context, db *sql.DB) error {
+	for _, key := range []string{"launch.title", "app.name"} {
+		if _, err := db.ExecContext(ctx, "UPDATE language_document SET content='',mtime=UTC_TIMESTAMP(3) WHERE tenant_id=0 AND `key`=? AND type=14 AND content<>''", key); err != nil {
+			return fmt.Errorf("clear platform brand copy %s: %w", key, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Migrate(cfg config.Config) error {

@@ -18,7 +18,6 @@
     "action.retry": "重新下载",
     "action.retryNow": "重试",
     "app.exitHint": "再滑一次退出应用",
-    "app.name": "AnyFun",
     "appearance.colorScheme.greenUp": "绿涨红跌",
     "appearance.colorScheme.hint": "影响价格涨跌、K 线、兑换价格影响的颜色。预测市场的 Yes / No 固定为绿 / 红，不受此项影响。",
     "appearance.colorScheme.redUp": "红涨绿跌",

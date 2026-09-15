@@ -18,7 +18,6 @@
     "action.retry": "Download again",
     "action.retryNow": "Retry",
     "app.exitHint": "Swipe again to exit",
-    "app.name": "AnyFun",
     "appearance.colorScheme.greenUp": "Green up / red down",
     "appearance.colorScheme.hint": "Affects price changes, candles and swap price impact. Predict Yes / No stay green / red.",
     "appearance.colorScheme.redUp": "Red up / green down",
