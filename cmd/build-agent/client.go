@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -422,4 +424,111 @@ func (c *client) uploadOTAPackage(ctx context.Context, jobID, path, commit strin
 		return "", errors.New("the server created an OTA revision but did not say which one")
 	}
 	return created.Release.ID, nil
+}
+
+// ---- 备份（设计 platform-backup-recovery-2026-09-15 §8.1）----
+
+// pendingBackup 认领一条备份待办。没有待办返回 (_, false, nil)。
+//
+// 用 POST 不是 GET：它会改状态，而服务端把 GET 当安全方法——Origin 闸对它完全
+// 不生效，何况任何 HTTP 客户端和代理都会对 GET 自动重试。
+func (c *client) pendingBackup(ctx context.Context) (backupRequest, bool, error) {
+	var out backupRequest
+	status, err := c.post(ctx, "/v1/build-agent/backup-requests/claim",
+		map[string]string{"agent": c.cfg.Name}, &out)
+	if err != nil {
+		return backupRequest{}, false, err
+	}
+	if status == http.StatusNoContent || out.ID == "" {
+		return backupRequest{}, false, nil
+	}
+	return out, true, nil
+}
+
+func (c *client) backupKeystores(ctx context.Context, requestID string) ([]sealedKeystoreItem, error) {
+	var out struct {
+		Items []sealedKeystoreItem `json:"items"`
+	}
+	if _, err := c.get(ctx, "/v1/build-agent/backup-keystores?request="+url.QueryEscape(requestID), &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+func (c *client) failBackup(ctx context.Context, requestID, reason string) error {
+	_, err := c.post(ctx, "/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/fail",
+		map[string]string{"reason": truncate(reason, 480)}, nil)
+	return err
+}
+
+func (c *client) registerBackupSigningKey(ctx context.Context, publicKey string) (string, error) {
+	var out struct {
+		Status string `json:"status"`
+	}
+	_, err := c.post(ctx, "/v1/build-agent/backup-signing-key",
+		map[string]string{"publicKey": publicKey, "agent": c.cfg.Name}, &out)
+	return out.Status, err
+}
+
+// uploadBackupPayload 上报一份内层密文（multipart：meta / payload / sig，见 §4.7）。
+//
+// **meta 必须排在 payload 之前**：服务端靠这个顺序先解析元数据、校验通过再决定
+// 要不要收那几十 MB。顺序反了服务端会直接拒。
+func (c *client) uploadBackupPayload(ctx context.Context, requestID string,
+	meta backupbundle.PayloadMeta, payload, signature []byte) error {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	metaPart, err := writer.CreateFormField("meta")
+	if err != nil {
+		return err
+	}
+	if _, err := metaPart.Write(encoded); err != nil {
+		return err
+	}
+	payloadPart, err := writer.CreateFormFile("payload", "inner.rnbk")
+	if err != nil {
+		return err
+	}
+	if _, err := payloadPart.Write(payload); err != nil {
+		return err
+	}
+	sigPart, err := writer.CreateFormFile("sig", "inner.rnbk.sig")
+	if err != nil {
+		return err
+	}
+	if _, err := sigPart.Write(signature); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.cfg.Server+"/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/payload", &body)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("content-type", writer.FormDataContentType())
+	request.Header.Set("x-build-agent-token", c.cfg.Token)
+
+	// 上传和收尾都可能要几分钟，而 client.http 的默认超时是 30 秒。
+	// 用调用方的 ctx 兜底（runBackup 给了 25 分钟，小于服务端 30 分钟的产出超时）
+	uploader := &http.Client{}
+	response, err := uploader.Do(request)
+	if err != nil {
+		return retryLater{err}
+	}
+	defer response.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if response.StatusCode >= 400 {
+		return classify(response.StatusCode,
+			fmt.Errorf("uploading the backup payload returned %d: %s",
+				response.StatusCode, truncate(string(raw), 300)))
+	}
+	return nil
 }

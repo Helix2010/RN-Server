@@ -307,7 +307,7 @@ func (s *server) assembleAndUploadBackup(ctx context.Context, run backupRun) ([]
 
 func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string) (backupbundle.Input, error) {
 	inner := map[string]backupbundle.InnerPart{}
-	var anyMeta backupPayloadMeta
+	var anyMeta backupbundle.PayloadMeta
 	for _, slot := range backupcontainer.InnerSlots() {
 		sealed, err := os.ReadFile(filepath.Join(dir, slot+".enc"))
 		if err != nil {
@@ -321,7 +321,7 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 		if err != nil {
 			return backupbundle.Input{}, fmt.Errorf("the meta for slot %s is gone: %w", slot, err)
 		}
-		meta, err := parseBackupPayloadMeta(rawMeta)
+		meta, err := backupbundle.ParsePayloadMeta(rawMeta)
 		if err != nil {
 			return backupbundle.Input{}, err
 		}
@@ -343,18 +343,10 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 		})
 	}
 
-	tenants := make([]backupbundle.Tenant, 0, len(anyMeta.Tenants))
-	for _, t := range anyMeta.Tenants {
-		tenants = append(tenants, backupbundle.Tenant{
-			Slug: t.Slug, Domain: t.Domain, HasKeystore: t.HasKeystore, SignerSHA256: t.SignerSHA256,
-		})
-	}
-	agentManifest := make([]backupbundle.FileEntry, 0, len(anyMeta.InnerFiles))
-	for _, f := range anyMeta.InnerFiles {
-		agentManifest = append(agentManifest, backupbundle.FileEntry{
-			Path: f.Path, Size: f.Size, SHA256: f.SHA256, Target: f.Target, Mode: f.Mode, Owner: f.Owner,
-		})
-	}
+	// 元数据现在就是 backupbundle 的类型，不用再转一遍——两份定义迟早会漂开，
+	// 而漂开的表现是恢复说明里少一列，没人会发现
+	tenants := anyMeta.Tenants
+	agentManifest := anyMeta.InnerFiles
 
 	return backupbundle.Input{
 		Seq: run.Seq, InstanceID: s.cfg.Backup.InstanceID, CreatedAt: time.Now().UTC(),

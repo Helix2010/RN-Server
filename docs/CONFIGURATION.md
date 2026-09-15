@@ -173,7 +173,23 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 openssl rsa -in my-recovery.key -pubout | base64 -w0
 ```
 
-**门限是 2-of-3**：三个人各持一把私钥，任意两个人凑齐就能打开备份包，一个人单独拿到什么都读不到。三把公钥同样要写进打包机的 `/etc/rn-build-agent.env`（`BUILD_AGENT_RECOVERY_RECIPIENT_A` / `_B` / `_C`），两边逐指纹一致，否则打包机拒绝产出备份。
+**门限是 2-of-3**：三个人各持一把私钥，任意两个人凑齐就能打开备份包，一个人单独拿到什么都读不到。
+
+**打包机那一侧**（`/etc/rn-build-agent.env`，不是服务端的 env）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `BUILD_AGENT_RECOVERY_RECIPIENT_A` / `_B` / `_C` | 空 | 和服务端**同样那三把**，逐指纹一致。对不上打包机拒绝产出备份并上报原因 |
+| `BUILD_AGENT_ENV_PATH` | `/etc/rn-build-agent.env` | 收进备份包的那份配置在哪 |
+| `BUILD_AGENT_UNIT_PATH` | `/etc/systemd/system/rn-build-agent.service` | systemd unit 在哪 |
+| `BUILD_AGENT_SSH_KEY_PATH` | 空 | 拉 RN-App 用的 deploy key。不配的话恢复时要重新配一把 |
+| `BUILD_AGENT_SSH_CONFIG_PATH` | 空 | 走 ssh host alias 时那段 `~/.ssh/config` |
+
+打包机侧**缺配置不会拒绝启动**——把备份做成构建的单点故障是负收益，而且第一次配置往往正好发生在恢复当天。但它会拒绝认领备份待办并上报原因，控制台上看得见。
+
+**服务端那一侧另有四个可选路径键**，用途同上：`BACKUP_SERVER_ENV_PATH`、`BACKUP_SERVER_UNIT_PATH`、`BACKUP_SERVER_NGINX_PATH`、`BACKUP_SERVER_TLS_CERT_PATH` / `BACKUP_SERVER_TLS_KEY_PATH`。前两项读不到直接判这次备份失败——安静地产出一个装不回去的包，比没有备份更糟，因为你以为自己有。
+
+**核对身份**：恢复时用 `build-agent show-key` 打印本机的 agent-key 指纹（16 字符）和备份签名公钥指纹（64 字符），和包里 `manifest.json` 的对应字段比对。
 
 ### 4.5 推送
 

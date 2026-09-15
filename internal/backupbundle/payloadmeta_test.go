@@ -1,4 +1,4 @@
-package api
+package backupbundle
 
 import (
 	"encoding/json"
@@ -6,23 +6,23 @@ import (
 	"testing"
 )
 
-func validMeta() backupPayloadMeta {
-	return backupPayloadMeta{
+func validPayloadMeta() PayloadMeta {
+	return PayloadMeta{
 		RecipientSlot:            "A",
 		AgentVersion:             "2026-09-15-abc1234",
 		AgentKeyFingerprint:      strings.Repeat("a", 16),
 		BackupSigningFingerprint: strings.Repeat("b", 64),
-		Tenants: []backupMetaTenant{
+		Tenants: []Tenant{
 			{Slug: "acme", Domain: "api.acme.example", HasKeystore: true, SignerSHA256: strings.Repeat("c", 64)},
 		},
-		InnerFiles: []backupMetaFile{
+		InnerFiles: []FileEntry{
 			{Path: "agent-key", Size: 32, SHA256: strings.Repeat("d", 64),
 				Target: "/var/lib/rn-build-agent/agent-key", Mode: "0600", Owner: "builder:builder"},
 		},
 	}
 }
 
-func encodeMeta(t *testing.T, meta backupPayloadMeta) []byte {
+func encodePayloadMeta(t *testing.T, meta PayloadMeta) []byte {
 	t.Helper()
 	raw, err := json.Marshal(meta)
 	if err != nil {
@@ -32,7 +32,7 @@ func encodeMeta(t *testing.T, meta backupPayloadMeta) []byte {
 }
 
 func TestBackupMetaAcceptsAWellFormedReport(t *testing.T) {
-	parsed, err := parseBackupPayloadMeta(encodeMeta(t, validMeta()))
+	parsed, err := ParsePayloadMeta(encodePayloadMeta(t, validPayloadMeta()))
 	if err != nil {
 		t.Fatalf("a well-formed report must be accepted: %v", err)
 	}
@@ -66,15 +66,15 @@ func TestBackupMetaRefusesPathsThatWouldBecomeCommands(t *testing.T) {
 	}
 	for _, bad := range poison {
 		t.Run(strings.ReplaceAll(bad, "\n", "\\n"), func(t *testing.T) {
-			meta := validMeta()
+			meta := validPayloadMeta()
 			meta.InnerFiles[0].Path = bad
-			if _, err := parseBackupPayloadMeta(encodeMeta(t, meta)); err == nil {
+			if _, err := ParsePayloadMeta(encodePayloadMeta(t, meta)); err == nil {
 				t.Fatalf("path %q was accepted; it would be rendered into recover.sh", bad)
 			}
 			// target 走同一条渲染路径，同样要挡
-			meta = validMeta()
+			meta = validPayloadMeta()
 			meta.InnerFiles[0].Target = bad
-			if _, err := parseBackupPayloadMeta(encodeMeta(t, meta)); err == nil {
+			if _, err := ParsePayloadMeta(encodePayloadMeta(t, meta)); err == nil {
 				t.Fatalf("target %q was accepted", bad)
 			}
 		})
@@ -92,10 +92,10 @@ func TestBackupMetaAcceptsOrdinaryPaths(t *testing.T) {
 		"/var/lib/rn-build-agent/agent-key",
 		"ssh/id_deploy",
 	} {
-		meta := validMeta()
+		meta := validPayloadMeta()
 		meta.InnerFiles[0].Path = good
 		meta.InnerFiles[0].Target = "/opt/" + strings.TrimPrefix(good, "/")
-		if _, err := parseBackupPayloadMeta(encodeMeta(t, meta)); err != nil {
+		if _, err := ParsePayloadMeta(encodePayloadMeta(t, meta)); err != nil {
 			t.Fatalf("ordinary path %q was refused: %v", good, err)
 		}
 	}
@@ -104,40 +104,40 @@ func TestBackupMetaAcceptsOrdinaryPaths(t *testing.T) {
 func TestBackupMetaFieldValidation(t *testing.T) {
 	cases := []struct {
 		name string
-		edit func(*backupPayloadMeta)
+		edit func(*PayloadMeta)
 		want string
 	}{
-		{"unknown slot", func(m *backupPayloadMeta) { m.RecipientSlot = "D" }, "recipientSlot"},
-		{"empty slot", func(m *backupPayloadMeta) { m.RecipientSlot = "" }, "recipientSlot"},
+		{"unknown slot", func(m *PayloadMeta) { m.RecipientSlot = "D" }, "recipientSlot"},
+		{"empty slot", func(m *PayloadMeta) { m.RecipientSlot = "" }, "recipientSlot"},
 		// 两种指纹形式不能混：16 字符是 agent-key，64 字符是备份签名公钥
-		{"agent fingerprint wrong length", func(m *backupPayloadMeta) {
+		{"agent fingerprint wrong length", func(m *PayloadMeta) {
 			m.AgentKeyFingerprint = strings.Repeat("a", 64)
 		}, "16 lowercase hex"},
-		{"signing fingerprint wrong length", func(m *backupPayloadMeta) {
+		{"signing fingerprint wrong length", func(m *PayloadMeta) {
 			m.BackupSigningFingerprint = strings.Repeat("b", 16)
 		}, "64 lowercase hex"},
-		{"fingerprint not hex", func(m *backupPayloadMeta) {
+		{"fingerprint not hex", func(m *PayloadMeta) {
 			m.AgentKeyFingerprint = strings.Repeat("Z", 16)
 		}, "16 lowercase hex"},
-		{"no tenants", func(m *backupPayloadMeta) { m.Tenants = nil }, "tenants is empty"},
-		{"slug not slug-shaped", func(m *backupPayloadMeta) { m.Tenants[0].Slug = "Acme Corp" }, "slug"},
-		{"duplicate slug", func(m *backupPayloadMeta) {
+		{"no tenants", func(m *PayloadMeta) { m.Tenants = nil }, "tenants is empty"},
+		{"slug not slug-shaped", func(m *PayloadMeta) { m.Tenants[0].Slug = "Acme Corp" }, "slug"},
+		{"duplicate slug", func(m *PayloadMeta) {
 			m.Tenants = append(m.Tenants, m.Tenants[0])
 		}, "appears twice"},
-		{"no inner files", func(m *backupPayloadMeta) { m.InnerFiles = nil }, "innerFiles is empty"},
-		{"mode not octal", func(m *backupPayloadMeta) { m.InnerFiles[0].Mode = "rw-------" }, "mode"},
-		{"mode missing leading zero", func(m *backupPayloadMeta) { m.InnerFiles[0].Mode = "600" }, "mode"},
-		{"owner not user:group", func(m *backupPayloadMeta) { m.InnerFiles[0].Owner = "root" }, "owner"},
-		{"owner with shell metachar", func(m *backupPayloadMeta) { m.InnerFiles[0].Owner = "a$b:c" }, "owner"},
-		{"file sha not 64 hex", func(m *backupPayloadMeta) { m.InnerFiles[0].SHA256 = "abc" }, "sha256"},
-		{"negative size", func(m *backupPayloadMeta) { m.InnerFiles[0].Size = -1 }, "negative"},
-		{"agent version with metachar", func(m *backupPayloadMeta) { m.AgentVersion = "v1;rm -rf /" }, "agentVersion"},
+		{"no inner files", func(m *PayloadMeta) { m.InnerFiles = nil }, "innerFiles is empty"},
+		{"mode not octal", func(m *PayloadMeta) { m.InnerFiles[0].Mode = "rw-------" }, "mode"},
+		{"mode missing leading zero", func(m *PayloadMeta) { m.InnerFiles[0].Mode = "600" }, "mode"},
+		{"owner not user:group", func(m *PayloadMeta) { m.InnerFiles[0].Owner = "root" }, "owner"},
+		{"owner with shell metachar", func(m *PayloadMeta) { m.InnerFiles[0].Owner = "a$b:c" }, "owner"},
+		{"file sha not 64 hex", func(m *PayloadMeta) { m.InnerFiles[0].SHA256 = "abc" }, "sha256"},
+		{"negative size", func(m *PayloadMeta) { m.InnerFiles[0].Size = -1 }, "negative"},
+		{"agent version with metachar", func(m *PayloadMeta) { m.AgentVersion = "v1;rm -rf /" }, "agentVersion"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			meta := validMeta()
+			meta := validPayloadMeta()
 			tc.edit(&meta)
-			_, err := parseBackupPayloadMeta(encodeMeta(t, meta))
+			_, err := ParsePayloadMeta(encodePayloadMeta(t, meta))
 			if err == nil {
 				t.Fatal("expected a refusal")
 			}
@@ -151,7 +151,7 @@ func TestBackupMetaFieldValidation(t *testing.T) {
 // 未知字段要拒掉：打包机和服务端版本不一致时，静默忽略一个字段意味着
 // 服务端按一份它读不全的元数据去渲染恢复说明，而那份说明要在灾难当天被照着执行
 func TestBackupMetaRefusesUnknownFields(t *testing.T) {
-	raw := encodeMeta(t, validMeta())
+	raw := encodePayloadMeta(t, validPayloadMeta())
 	var generic map[string]any
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		t.Fatal(err)
@@ -161,7 +161,7 @@ func TestBackupMetaRefusesUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseBackupPayloadMeta(extended); err == nil {
+	if _, err := ParsePayloadMeta(extended); err == nil {
 		t.Fatal("an unknown field was silently ignored")
 	}
 }
@@ -169,13 +169,13 @@ func TestBackupMetaRefusesUnknownFields(t *testing.T) {
 // meta 排在 payload 之前就是为了在收那 512 MiB 之前拒掉坏的元数据；
 // 它自己也要有上限，否则「先解析再决定」这句话不成立
 func TestBackupMetaHasItsOwnSizeLimit(t *testing.T) {
-	meta := validMeta()
+	meta := validPayloadMeta()
 	for i := 0; i < backupMaxTenants; i++ {
-		meta.Tenants = append(meta.Tenants, backupMetaTenant{
+		meta.Tenants = append(meta.Tenants, Tenant{
 			Slug: strings.Repeat("a", 200) + "-" + strings.Repeat("b", 200), Domain: "x.example",
 		})
 	}
-	if _, err := parseBackupPayloadMeta(encodeMeta(t, meta)); err == nil {
+	if _, err := ParsePayloadMeta(encodePayloadMeta(t, meta)); err == nil {
 		t.Fatal("an oversized meta was accepted")
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"github.com/Helix2010/RN-Server/internal/objectstore"
 	"github.com/gin-gonic/gin"
@@ -201,7 +202,7 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 
 	reader := multipart.NewReader(c.Request.Body, params["boundary"])
 	var (
-		meta      backupPayloadMeta
+		meta      backupbundle.PayloadMeta
 		haveMeta  bool
 		signature []byte
 		staged    string
@@ -223,12 +224,12 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 		}
 		switch part.FormName() {
 		case "meta":
-			raw, err := io.ReadAll(io.LimitReader(part, backupMetaMaxBytes+1))
+			raw, err := io.ReadAll(io.LimitReader(part, backupbundle.PayloadMetaMaxBytes+1))
 			if err != nil {
 				problem(c, http.StatusBadRequest, "BACKUP_PAYLOAD_MALFORMED", "the meta part could not be read")
 				return
 			}
-			parsed, err := parseBackupPayloadMeta(raw)
+			parsed, err := backupbundle.ParsePayloadMeta(raw)
 			if err != nil {
 				problem(c, http.StatusBadRequest, "BACKUP_META_INVALID", err.Error())
 				return
@@ -279,7 +280,7 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 	s.completeBackup(c, run)
 }
 
-func (s *server) checkBackupSigningFingerprint(c *gin.Context, run backupRun, meta backupPayloadMeta) error {
+func (s *server) checkBackupSigningFingerprint(c *gin.Context, run backupRun, meta backupbundle.PayloadMeta) error {
 	record, err := s.backupSigningKeyRecord(c.Request.Context())
 	if err != nil || record == nil || record.Current.Fingerprint != meta.BackupSigningFingerprint {
 		reason := "the build agent reported a backup signing key that is not the registered one"
@@ -317,7 +318,7 @@ func stageBackupPayload(dir, slot string, body io.Reader) (string, error) {
 	return path, nil
 }
 
-func writeStagedSidecars(dir string, meta backupPayloadMeta, signature []byte) error {
+func writeStagedSidecars(dir string, meta backupbundle.PayloadMeta, signature []byte) error {
 	if err := os.WriteFile(filepath.Join(dir, meta.RecipientSlot+".sig"), signature, 0o600); err != nil {
 		return err
 	}

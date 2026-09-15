@@ -1,4 +1,4 @@
-package api
+package backupbundle
 
 import (
 	"encoding/json"
@@ -19,42 +19,23 @@ import (
 // 个脚本恢复时以 root 跑——这条路径就是一个命令注入面。而且「服务端能让打包机执行
 // 任意代码」那个洞修好之前，打包机本身也不完全可信，所以这里的每一项都当外部输入
 // 校验。校验很便宜，正好把注入路径一起堵掉。
-type backupPayloadMeta struct {
+type PayloadMeta struct {
 	// RecipientSlot 说明这一份内层封给了哪个槽位。一次备份要传两份（A 和 B），
 	// 服务端靠它决定哪一份进哪个包
-	RecipientSlot            string             `json:"recipientSlot"`
-	AgentVersion             string             `json:"agentVersion"`
-	AgentKeyFingerprint      string             `json:"agentKeyFingerprint"`
-	BackupSigningFingerprint string             `json:"backupSigningFingerprint"`
-	Tenants                  []backupMetaTenant `json:"tenants"`
-	InnerFiles               []backupMetaFile   `json:"innerFiles"`
-}
-
-type backupMetaTenant struct {
-	Slug         string `json:"slug"`
-	Domain       string `json:"domain"`
-	HasKeystore  bool   `json:"hasKeystore"`
-	SignerSHA256 string `json:"signerSha256"`
-}
-
-// backupMetaFile 就是内层 manifest.json 的 files[] 一项，原样上来。
-// 服务端拿 Target / Mode / Owner 渲染 RECOVERY.md 里「哪个文件放到哪」那一段，
-// 以及 recover.sh 里对应的那几行
-type backupMetaFile struct {
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
-	Target string `json:"target"`
-	Mode   string `json:"mode"`
-	Owner  string `json:"owner"`
+	RecipientSlot            string      `json:"recipientSlot"`
+	AgentVersion             string      `json:"agentVersion"`
+	AgentKeyFingerprint      string      `json:"agentKeyFingerprint"`
+	BackupSigningFingerprint string      `json:"backupSigningFingerprint"`
+	Tenants                  []Tenant    `json:"tenants"`
+	InnerFiles               []FileEntry `json:"innerFiles"`
 }
 
 const (
-	// backupMetaMaxBytes 是 meta 部件的上限。它排在 payload 之前，所以服务端可以
+	// PayloadMetaMaxBytes 是 meta 部件的上限。它排在 payload 之前，所以服务端可以
 	// 先解析元数据、校验通过再决定要不要收那 512 MiB
-	backupMetaMaxBytes = 256 * 1024
-	backupMaxTenants   = 500
-	backupMaxInnerFile = 2000
+	PayloadMetaMaxBytes = 256 * 1024
+	backupMaxTenants    = 500
+	backupMaxInnerFile  = 2000
 )
 
 var (
@@ -76,24 +57,24 @@ const backupUnsafeInPath = "$&|;<>()*?[]{}!#~" + // shell 元字符
 	"\\" + // 反斜杠
 	"\n\r\t" // 空白，会让一行命令断成两条
 
-func parseBackupPayloadMeta(raw []byte) (backupPayloadMeta, error) {
-	if len(raw) > backupMetaMaxBytes {
-		return backupPayloadMeta{}, fmt.Errorf("meta is %d bytes, the limit is %d", len(raw), backupMetaMaxBytes)
+func ParsePayloadMeta(raw []byte) (PayloadMeta, error) {
+	if len(raw) > PayloadMetaMaxBytes {
+		return PayloadMeta{}, fmt.Errorf("meta is %d bytes, the limit is %d", len(raw), PayloadMetaMaxBytes)
 	}
-	var meta backupPayloadMeta
+	var meta PayloadMeta
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&meta); err != nil {
-		return backupPayloadMeta{}, fmt.Errorf("meta is not valid JSON: %w", err)
+		return PayloadMeta{}, fmt.Errorf("meta is not valid JSON: %w", err)
 	}
 	if err := meta.validate(); err != nil {
-		return backupPayloadMeta{}, err
+		return PayloadMeta{}, err
 	}
 	return meta, nil
 }
 
-func (m backupPayloadMeta) validate() error {
-	if !isBackupSlotName(m.RecipientSlot) {
+func (m PayloadMeta) validate() error {
+	if !IsSlotName(m.RecipientSlot) {
 		return fmt.Errorf("recipientSlot %q is not one of %v", m.RecipientSlot, backupcontainer.SlotNames)
 	}
 	if err := checkBackupText("agentVersion", m.AgentVersion, 120, true); err != nil {
@@ -159,7 +140,7 @@ func (m backupPayloadMeta) validate() error {
 	return nil
 }
 
-func isBackupSlotName(slot string) bool {
+func IsSlotName(slot string) bool {
 	for _, name := range backupcontainer.SlotNames {
 		if slot == name {
 			return true

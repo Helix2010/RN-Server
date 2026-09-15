@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"github.com/gin-gonic/gin"
 )
@@ -297,7 +298,7 @@ func (s *server) updateBackupHolders(c *gin.Context) {
 	}
 	cleaned := map[string]string{}
 	for slot, name := range body.Holders {
-		if !isBackupSlotName(slot) {
+		if !backupbundle.IsSlotName(slot) {
 			problem(c, http.StatusBadRequest, "INVALID_BACKUP_HOLDERS", "unknown slot "+slot)
 			return
 		}
