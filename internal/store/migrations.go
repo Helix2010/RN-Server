@@ -60,6 +60,7 @@ var migrations = []migration{
 	{version: 44, name: "consistent_default_config", apply: consistentDefaultConfigMigration},
 	{version: 45, name: "build_jobs_ota", apply: buildJobsOTAMigration},
 	{version: 46, name: "diagnostic_reports", apply: diagnosticReportsMigration},
+	{version: 47, name: "bootstrap_ttl_owns_refresh_interval", apply: bootstrapTTLOwnsRefreshIntervalMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1445,6 +1446,42 @@ func consistentDefaultConfigMigration(ctx context.Context, db *sql.DB) error {
 		  AND JSON_EXTRACT(config_value,'$.services.predict') IS NULL`)
 	return err
 }
+
+// bootstrapTTLOwnsRefreshIntervalMigration 把"App 多久重新拉一次配置"搬到它该在的地方。
+//
+// 这个节奏一直由语言设置里的 refreshIntervalSeconds 决定（平台默认 21600 秒），而
+// mobile-bootstrap 里的 ttlSeconds 下发到了设备却没有任何人读——两个字段，一个管用
+// 一个不管用，管理端还分在两个页面上。从这一版起 ttlSeconds 是唯一的那个。
+//
+// 必须先搬值再改下发口径，而且两件事要在同一个二进制里：存量 ttlSeconds 大多是种子
+// 配置里的 300，直接改口径会把全量设备的重拉从 6 小时变成 5 分钟，请求量涨 72 倍。
+//
+// 取值按"现在生效的那个"：租户自己的覆盖 > 平台默认 > 21600，再夹到 [300,86400]，
+// 保证迁移之后每一行都满足新的下限（客户端也按这个下限严格解析）。
+func bootstrapTTLOwnsRefreshIntervalMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `UPDATE app_configs bootstrap_config`+
+		bootstrapTTLLanguagesJoin+
+		`SET bootstrap_config.config_value=JSON_SET(bootstrap_config.config_value,'$.ttlSeconds',`+bootstrapTTLInEffect+`),
+		    bootstrap_config.version=bootstrap_config.version+1,
+		    bootstrap_config.updated_by='system-bootstrap-ttl',
+		    bootstrap_config.updated_at=UTC_TIMESTAMP(3)
+		WHERE bootstrap_config.config_key='mobile-bootstrap'`)
+	return err
+}
+
+// 取值与夹取分开命名，测试可以单独对这段表达式求值：搬错了的后果是全量设备的
+// 重拉节奏被改掉，而那是线上才看得见的事故。
+const bootstrapTTLLanguagesJoin = `
+		LEFT JOIN app_configs tenant_languages
+		       ON tenant_languages.tenant_id=bootstrap_config.tenant_id AND tenant_languages.config_key='languages'
+		LEFT JOIN app_configs global_languages
+		       ON global_languages.tenant_id=0 AND global_languages.config_key='languages'
+		`
+
+const bootstrapTTLInEffect = `LEAST(GREATEST(COALESCE(
+			NULLIF(CAST(JSON_EXTRACT(tenant_languages.config_value,'$.refreshIntervalSeconds') AS UNSIGNED),0),
+			NULLIF(CAST(JSON_EXTRACT(global_languages.config_value,'$.refreshIntervalSeconds') AS UNSIGNED),0),
+			21600),300),86400)`
 
 // buildJobsOTAMigration 让打包任务也能是"构建一个热更新包"。
 //

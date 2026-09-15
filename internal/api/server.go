@@ -1120,6 +1120,8 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	value["modules"] = normalizeModules(object(value["modules"]))
 	value["wallet"] = normalizeWallet(object(value["wallet"]))
 	value["services"] = normalizeServices(value["services"])
+	// 存储里可能还留着历史上手填的那个字符串；读出来的永远是行自己的版本
+	value["configVersion"] = derivedConfigVersion(updated, version)
 	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0", "walletCatalog": walletCatalog()}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
@@ -1183,6 +1185,8 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
 		return
 	}
+	// 不落库：读路径按行的版本派生，存一份手填的字符串就是第二个事实源
+	delete(body.Config, "configVersion")
 	raw, _ := json.Marshal(body.Config)
 	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key='mobile-bootstrap' AND version=?`, raw, actor(c), now, tenantID(c), body.ExpectedVersion)
 	if err != nil {
@@ -1205,12 +1209,13 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		problem(c, 409, "STALE_APP_CONFIG", "App config changed since it was loaded; refresh and retry")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "config_update", "app-config", "mobile-bootstrap", body.Reason, requestID(c), map[string]any{"status": "active", "databaseVersionBefore": body.ExpectedVersion, "databaseVersionAfter": newVersion, "configVersion": body.Config["configVersion"]})
+	savedConfigVersion := derivedConfigVersion(now, newVersion)
+	event := newAudit(tenantID(c), actor(c), "config_update", "app-config", "mobile-bootstrap", body.Reason, requestID(c), map[string]any{"status": "active", "databaseVersionBefore": body.ExpectedVersion, "databaseVersionAfter": newVersion, "configVersion": savedConfigVersion})
 	if insertAudit(c.Request.Context(), tx, event) != nil {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config audit")
 		return
 	}
-	if err := enqueuePushEvent(c.Request.Context(), tx, tenantID(c), "bootstrap_updated", map[string]any{"configVersion": body.Config["configVersion"]}); err != nil {
+	if err := enqueuePushEvent(c.Request.Context(), tx, tenantID(c), "bootstrap_updated", map[string]any{"configVersion": savedConfigVersion}); err != nil {
 		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to enqueue config notification")
 		return
 	}
@@ -1816,7 +1821,14 @@ func (s *server) bootstrap(c *gin.Context) {
 	localeCatalog, _ := languageCatalog(settings)
 	var localization map[string]any
 	{
-		localization = map[string]any{"fallbackLocale": settings.FallbackLanguage, "supportedLocales": enabledLanguageCodes(settings), "localeCatalog": localeCatalog, "messagesVersion": cfg["configVersion"], "refreshIntervalSeconds": settings.RefreshIntervalSeconds}
+		// refreshIntervalSeconds 下发的是配置自己的有效期 ttlSeconds。这个值决定
+		// "一直开着不动的 App 多久重新拉一次配置"，它是配置下发的属性，不是语言
+		// 设置的属性——历史上放在语言设置里，于是管理端要去「多语言管理」改一个
+		// 跟语言无关的东西，而「基础配置」里那个 TTL 谁也没在读。
+		//
+		// 字段名保留：已装机的 App 严格解析 bootstrap，少一个必填字段会让它们直接
+		// 解析失败。等最低支持版本越过读 ttlSeconds 的那一版再删。
+		localization = map[string]any{"fallbackLocale": settings.FallbackLanguage, "supportedLocales": enabledLanguageCodes(settings), "localeCatalog": localeCatalog, "messagesVersion": cfg["configVersion"], "refreshIntervalSeconds": cfg["ttlSeconds"]}
 		if compiled, compileErr := s.compiledMessages(c.Request.Context(), tenant.ID, locale, settings.FallbackLanguage); compileErr == nil {
 			localization["messages"] = map[string]any{locale: compiled}
 		} else {
@@ -1896,16 +1908,29 @@ func insertAudit(ctx context.Context, tx *sql.Tx, a auditEvent) error {
 func newAudit(tenant, actor, action, targetType, targetID, reason, requestID string, summary map[string]any) auditEvent {
 	return auditEvent{ID: "audit_" + randomID(16), TenantID: tenant, ActorID: actor, Action: action, TargetType: targetType, TargetID: targetID, Reason: reason, RequestID: requestID, CreatedAt: iso(time.Now()), Summary: summary}
 }
+
+// derivedConfigVersion 回答"这份配置是哪一版"。答案直接来自配置行自己的身份
+// （数据库版本 + 写入时刻），不再让人在管理端手填一个字符串：手填的那个可以重复、
+// 可以往回写，而 app_configs.version 是保存时乐观锁依据的那一个，本来就是权威。
+// 一个事实只有一个存放处。
+//
+// 在读取时派生而不是保存时写进 JSON：保存路径上 config_value 在知道新版本号之前
+// 就 marshal 完了（新版本是 ExpectedVersion+1 还是 1，取决于走 UPDATE 还是从平台
+// 行继承的 INSERT），要在那里生成就得再补一次 JSON_SET，凭空多一处能写错的地方。
+//
+// 两个租户继承同一份平台配置时拿到同一个值，这是对的——那本来就是同一份配置。
+func derivedConfigVersion(updatedAt time.Time, version int) string {
+	return fmt.Sprintf("%s-v%d", updatedAt.UTC().Format("20060102"), version)
+}
 func validConfig(v map[string]any) bool {
 	if v == nil {
 		return false
 	}
-	_, ok1 := v["configVersion"].(string)
 	ttl, ok2 := v["ttlSeconds"].(float64)
 	policy := object(v["updatePolicy"])
 	// 版本号不是 semver 时，compareVersion 会把非法值当成 "1.0.0"，强制升级静默失效
 	policyValid := policy != nil && validVersion(text(policy["minSupportedVersion"], "")) && validVersion(text(policy["latestVersion"], ""))
-	return ok1 && ok2 && ttl >= 30 && ttl <= 86400 && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && policyValid && object(v["support"]) != nil
+	return ok2 && ttl >= 300 && ttl <= 86400 && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && policyValid && object(v["support"]) != nil
 }
 
 // normalizeModules 把 modules 段收敛成两个布尔。
@@ -2145,4 +2170,4 @@ func normalizeVersion(v string) string {
 func validVersion(v string) bool     { return semver.IsValid("v" + v) }
 func compareVersion(a, b string) int { return semver.Compare("v"+a, "v"+b) }
 
-const initialConfig = `{"configVersion":"2026.08.24.1","ttlSeconds":300,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true,"crashAutoReport":false},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`
+const initialConfig = `{"ttlSeconds":21600,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true,"crashAutoReport":false},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`

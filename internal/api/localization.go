@@ -484,9 +484,13 @@ func diffLanguageSettings(global, desired storedLanguagesConfig) storedLanguages
 	if desired.FallbackLanguage != global.FallbackLanguage {
 		result.FallbackLanguage = desired.FallbackLanguage
 	}
-	if desired.RefreshIntervalSeconds != global.RefreshIntervalSeconds {
-		result.RefreshIntervalSeconds = desired.RefreshIntervalSeconds
-	}
+	// 刷新间隔不再从这里写入：配置的刷新节奏是 mobile-bootstrap 的 ttlSeconds，
+	// 管理端在「基础配置」里改。两个地方都能写同一件事的话，改了不生效的那一次
+	// 没人查得出来。
+	//
+	// 后果是租户历史上的那个覆盖会在下一次保存语言设置时从存储里消失——迁移 47
+	// 已经把它当时生效的值搬进 ttlSeconds，所以这只是让那份副本退场，不改变行为。
+	_ = desired.RefreshIntervalSeconds
 	for code, desiredValue := range desired.Languages {
 		globalValue, exists := global.Languages[code]
 		if !exists {
