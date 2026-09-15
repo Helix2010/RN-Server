@@ -194,6 +194,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// 打包机公钥是平台级的一把，不属于任何租户；换它要人核对指纹后接受
 	platform.GET("/build-agent/public-key", s.getBuildAgentKey)
 	platform.POST("/build-agent/public-key/accept", s.acceptBuildAgentKey)
+	platform.GET("/backup/signing-key", s.getBackupSigningKey)
+	platform.POST("/backup/signing-key/accept", s.acceptBackupSigningKey)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
@@ -221,6 +223,8 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// build_keystore_check.go）
 	// 打包机启动时登记自己的公钥；签名密钥从此加密给它，没有人需要敲封装口令
 	agent.POST("/public-key", s.registerBuildAgentKey)
+	// 备份签名公钥。和上面那把 X25519 是两把不同算法、不同用途的钥匙（见 backup_signing_key.go）
+	agent.POST("/backup-signing-key", s.registerBackupSigningKey)
 	agent.GET("/keystore-checks", s.pendingKeystoreChecks)
 	agent.POST("/keystore-checks", s.reportKeystoreCheck)
 	// 图标一张一张取，不塞进领取响应——那条响应在代理那边有 1 MiB 上限，

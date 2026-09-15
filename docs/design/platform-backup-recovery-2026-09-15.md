@@ -847,7 +847,9 @@ CREATE TABLE IF NOT EXISTS platform_backups (
 - **`payload_received_at` 是新列。** 没有它，「产出超时：running 超过 30 分钟没上报」在打包机已经上报完的情况下语义是空的。2-of-3 下打包机要传两份，这一列记的是**最后一份**到齐的时间；没到齐之前它保持 NULL，超时按 `claimed_at` 算。
 - **`objects` 取代了 v5 的 `object_key` / `sha256` / `size_bytes` 三个单数列**，因为一次备份现在产出三个对象。
 
-**备份签名公钥另有归宿**：它进既有的 `build_agent_keys`（`internal/api/build_agent_key.go` 那张表），加一个 `kind` 维度区分 `x25519-keystore`（既有那把）和 `ed25519-backup-sign`（新的），**旧行保留不删**——历史包的签名要靠它验（§4.3 第 3 条）。这是给既有表加列，不是新建表。
+**备份签名公钥另有归宿，而且不是一张表**：打包机公钥今天存在 `app_configs(tenant_id='0', config_key='build.agent.recipient')` 的**一行 JSON** 里（`Current` / `Pending` 结构，`internal/api/build_agent_key.go`）——`build_agent_keys` 这张表不存在，v7 之前的文档写错了。备份签名公钥按同一个形状另起一条记录 `build.agent.backup-sign`，并多一个 `Previous []`：**换下来的旧公钥只增不删**，桶里的历史包是旧那把签的，删掉就等于把它们变成验不了签的废物（§4.3 第 3 条）。
+
+两把钥匙分两条记录而不是在一条上加字段：算法不同（X25519 封盒子 vs Ed25519 签备份包）、指纹形式不同（16 字符截断 vs 64 字符 DER SPKI）、生命周期也不同。
 
 **迁移必须幂等，三步全要**：`CREATE TABLE IF NOT EXISTS`、（若分步）`addColumnIfMissing`、建索引前查 `information_schema.STATISTICS`。模板在 `internal/store/migrations.go:1503-1518`。v5 只说了后两条，漏了 `CREATE TABLE` ——那正是 `build-concurrency-2026-09-15.md:225-247` 逐字测过的红线：`CREATE TABLE` 成功、建索引失败 → `INSERT INTO schema_migrations` 那一行不执行（`migrations.go:990-993`）→ `Migrate` 返回 error → `store.Open` 失败 → 进程退出 → `MYSQL_AUTO_MIGRATE` 默认 true，下次启动重跑、撞 `ERROR 1050 Table already exists` → **永久启动失败循环，下线的不是备份功能，是整个 wallet 后端。**
 
