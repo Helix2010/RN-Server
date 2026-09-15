@@ -69,6 +69,7 @@ var migrations = []migration{
 	{version: 50, name: "referral_indexes", apply: referralIndexesMigration},
 	{version: 51, name: "tenant_neutral_platform_brand_copy", apply: tenantNeutralPlatformBrandCopyMigration},
 	{version: 52, name: "drop_platform_app_name_copy", apply: dropPlatformAppNameCopyMigration},
+	{version: 53, name: "platform_backups", apply: platformBackupsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1826,6 +1827,54 @@ func referralIndexesMigration(ctx context.Context, db *sql.DB) error {
 			OR (inviter_user_id IS NOT NULL AND invited_at IS NOT NULL AND invite_source IS NOT NULL))`); err != nil {
 			return fmt.Errorf("referral indexes migration add check: %w", err)
 		}
+	}
+	return nil
+}
+
+// platformBackupsMigration 建打包服务故障恢复备份的运行记录表
+// （设计 platform-backup-recovery-2026-09-15 §8.4）。
+//
+// 为什么是新表而不是塞进 app_configs 或 audit_events：一次备份有生命周期
+// （pending → running → succeeded/failed）、有四个写方（控制台建、打包机认领与上报、
+// 服务端收尾、超时扫描）、条数随时间无界增长。app_configs 的一行 JSON 装不下多写方
+// 加无界增长，audit_events 只能追加、表达不了在途状态。
+//
+// **整张表一条 CREATE TABLE IF NOT EXISTS 建完**，生成列和三个索引全部写在里面。
+// 分步建的话，CREATE TABLE 成功、CREATE INDEX 失败会让 schema_migrations 那一行
+// 永远写不进去（migrations.go 的 apply 失败就不记账），下次启动重跑撞
+// ERROR 1050 Table already exists，然后**永久启动失败循环——倒下的不是备份功能，
+// 是整个 wallet 后端**。build-concurrency-2026-09-15.md 逐字测过这条红线。
+//
+// seq 用 AUTO_INCREMENT 而不是 COALESCE(MAX(seq),0)+1：后者在 REPEATABLE READ 下是
+// 一致性读，两个并发事务读到同一个值，第二个要**阻塞整个第一个事务的时长**才拿到
+// 1062，而且报的索引是 seq 那个不是 live 那个（MySQL 对同时违反两个唯一索引的
+// INSERT 报先建的那一个）。按契约只匹配 live 索引翻 409 的话，并发那条会掉进 500。
+// 自增锁不参与事务，换成它之后唯一能冲突的就剩 live_slot，错误映射唯一。
+func platformBackupsMigration(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS platform_backups (
+		id VARCHAR(80) NOT NULL COMMENT '主键，pbk_ 前缀',
+		seq INT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '编号，全局递增，进对象键；下载按它取，不接受外部传对象键。自增由数据库发号，回滚留下的号洞无害',
+		status ENUM('pending','running','succeeded','failed') NOT NULL COMMENT '状态：pending=已建待办等打包机认领，running=打包机已认领在产出，succeeded=三组包都已上传，failed=任一环节失败',
+		trigger_by ENUM('manual','schedule') NOT NULL COMMENT '触发来源：manual=控制台按钮，schedule=定时',
+		requested_by VARCHAR(120) NOT NULL COMMENT '发起人；定时触发时写 system-backup',
+		reason VARCHAR(500) NOT NULL COMMENT '发起原因，手动触发由人填；定时触发写固定常量 scheduled backup',
+		claimed_by VARCHAR(120) NULL COMMENT '认领的打包机自报标识，只用于排查，不作为鉴权依据；NULL=还没被认领',
+		claimed_at DATETIME(3) NULL COMMENT '认领时间 UTC；NULL=还没被认领',
+		payload_received_at DATETIME(3) NULL COMMENT '打包机两份内层密文**都**到齐的时间 UTC；NULL=还没到齐。产出超时据它和 claimed_at 分段判断，卡住时才分得清该去哪台机器看',
+		objects JSON NULL COMMENT '这一次产出的每一组包，固定三组：[{"pair":"AB","objectKey":"...","sha256":"...","sizeBytes":123}]。存成列表而不是三个固定列，是因为它要如实记下那一次实际产出了什么——换公钥、部分上传失败都会让某一次和别的不一样，控制台按这一列渲染而不是按当前配置。下载按 pair 从这里查键，不重新拼。NULL=还没上传成功',
+		tenant_count INT UNSIGNED NULL COMMENT '这次备了几个租户的签名密钥，突然变少要人看一眼；NULL=还没产出',
+		failure_reason VARCHAR(500) NULL COMMENT '失败原因一句话；NULL=没失败',
+		created_at DATETIME(3) NOT NULL COMMENT '创建时间 UTC',
+		updated_at DATETIME(3) NOT NULL COMMENT '更新时间 UTC',
+		live_slot TINYINT UNSIGNED GENERATED ALWAYS AS (CASE WHEN status IN ('pending','running') THEN 1 ELSE NULL END) STORED
+			COMMENT '未结束的备份占位：pending/running 时为 1，其余为 NULL。唯一索引建在它上面，保证同时只有一条在途；MySQL 唯一索引不比较 NULL，所以结束后可以立刻建下一条。由数据库生成，无人写入',
+		PRIMARY KEY (id),
+		UNIQUE KEY ux_platform_backups_seq (seq),
+		UNIQUE KEY ux_platform_backups_live (live_slot),
+		KEY ix_platform_backups_status (status, created_at)
+	) ENGINE=InnoDB COMMENT='平台备份运行记录：控制台或定时建待办，打包机认领并产出，服务端收尾。只记状态与结果，备份内容本身在对象存储里'`)
+	if err != nil {
+		return fmt.Errorf("platform backups migration: %w", err)
 	}
 	return nil
 }
