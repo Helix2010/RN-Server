@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"hash"
@@ -110,4 +111,20 @@ func rebuild(t *testing.T, members map[string][]byte) []byte {
 		t.Fatal(err)
 	}
 	return out.Bytes()
+}
+
+func decodeBase64(t *testing.T, encoded string) []byte {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// runAllowFail 跑一条预期会失败的命令，把退出码作为结果返回而不是让测试挂掉
+func runAllowFail(bin, dir string, args ...string) error {
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = dir
+	return cmd.Run()
 }
