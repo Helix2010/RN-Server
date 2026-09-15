@@ -3,12 +3,12 @@ package api
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/Helix2010/RN-Server/internal/referral"
 	"github.com/Helix2010/RN-Server/internal/siwe"
 	"github.com/gin-gonic/gin"
 )
@@ -99,12 +99,17 @@ func (s *server) listReferralRelations(c *gin.Context) {
 
 // referralRelationsFrom 关系列表的 FROM。平台级封禁用 LEFT JOIN 带出来，
 // 让管理端能一眼看出双方的封禁状态（关系本身不受封禁影响，设计 §3.4）。
+//
+// 两侧都比 address_key（小写存储列），不写 LOWER(address)：后者是函数表达式，
+// 会让 ix_platform_block_address 与 uq_wallet_user 双双失效，两个 LEFT JOIN
+// 各退化成全表扫描，把 ix_wallet_user_invited_at 的收益抵消掉
+// （AGENTS.md「地址统一小写 address_key」）。
 const referralRelationsFrom = `wallet_user invitee
 	JOIN wallet_user inviter ON inviter.id=invitee.inviter_user_id AND inviter.tenant_id=invitee.tenant_id
 	LEFT JOIN platform_wallet_block platform_block
-	       ON platform_block.address_key=LOWER(inviter.address) AND platform_block.revoked_at IS NULL
+	       ON platform_block.address_key=inviter.address_key AND platform_block.revoked_at IS NULL
 	LEFT JOIN platform_wallet_block invitee_block
-	       ON invitee_block.address_key=LOWER(invitee.address) AND invitee_block.revoked_at IS NULL`
+	       ON invitee_block.address_key=invitee.address_key AND invitee_block.revoked_at IS NULL`
 
 func parseReferralListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
 	where := sqlWhere{}
@@ -117,13 +122,13 @@ func parseReferralListFilter(c *gin.Context, tenant string) (sqlWhere, listPage,
 		if !addressPattern.MatchString(address) {
 			return where, listPage{}, "inviterAddress must be a 0x-prefixed 20-byte address"
 		}
-		where.add("LOWER(inviter.address)=?", strings.ToLower(address))
+		where.add("inviter.address_key=?", strings.ToLower(address))
 	}
 	if address := strings.TrimSpace(c.Query("inviteeAddress")); address != "" {
 		if !addressPattern.MatchString(address) {
 			return where, listPage{}, "inviteeAddress must be a 0x-prefixed 20-byte address"
 		}
-		where.add("LOWER(invitee.address)=?", strings.ToLower(address))
+		where.add("invitee.address_key=?", strings.ToLower(address))
 	}
 	if invalid := addEnumFilter(c, &where, "source", "invitee.invite_source", "code", "link", "admin"); invalid != "" {
 		return where, listPage{}, invalid
@@ -146,20 +151,19 @@ func (s *server) adminBindReferral(c *gin.Context) {
 			"Backfilling a referral requires an interactive admin session, not the automation key")
 		return
 	}
+	// 内嵌 adminActionBody 而不是重抄 reason/confirm 两个字段：确认与理由的规则
+	// 由 validateAdminAction 统一判（设计 §4.4 第 1 条"走 decodeAdminAction"）
 	var body struct {
+		adminActionBody
 		InviteeAddress string `json:"inviteeAddress"`
 		InviterCode    string `json:"inviterCode"`
 		InviterAddress string `json:"inviterAddress"`
-		Reason         string `json:"reason"`
-		Confirm        bool   `json:"confirm"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, 400, "INVALID_ACTION", "Invalid action payload")
 		return
 	}
-	body.Reason = strings.TrimSpace(body.Reason)
-	if !body.Confirm || len(body.Reason) < 3 {
-		problem(c, 422, "INVALID_ACTION", "reason (at least 3 characters) and confirm=true are required")
+	if !validateAdminAction(c, &body.adminActionBody) {
 		return
 	}
 	body.InviterCode = strings.TrimSpace(body.InviterCode)
@@ -176,7 +180,7 @@ func (s *server) adminBindReferral(c *gin.Context) {
 
 	tenant := tenantID(c)
 	now := time.Now().UTC()
-	if !s.referrals.allowAdminBind(tenant, now) {
+	if s.referrals.adminBindQuotaExhausted(tenant, now) {
 		slog.Error("referral admin backfill exceeded the tenant daily quota",
 			"tenant", tenant, "quota", referralAdminBindPerDay, "actor", actor(c), "requestId", requestID(c))
 		problem(c, http.StatusTooManyRequests, "REFERRAL_ADMIN_QUOTA",
@@ -253,11 +257,16 @@ func (s *server) adminBindReferral(c *gin.Context) {
 		problem(c, outcome.Status, outcome.Code, outcome.Detail)
 		return
 	}
+	// 配额记在这里而不是入口：限的是"今天改成了多少条关系"，不是按错几次键
+	s.referrals.recordAdminBind(tenant, now)
 	c.JSON(http.StatusOK, gin.H{
 		"inviteeUserId": inviteeID,
 		"inviterUserId": result.InviterUserID,
-		"inviterCode":   referral.Format(result.InviterCode),
-		"boundAt":       iso(result.BoundAt),
+		// 裸码，不 Format：同名字段在 listReferralRelations 与 referralOfWalletUser
+		// 里都是裸码，返回 ABCD-1234 会让管理端拿去比对或搜索时对不上。
+		// 分段是展示形态，该由客户端加
+		"inviterCode": result.InviterCode,
+		"boundAt":     iso(result.BoundAt),
 	})
 }
 
@@ -272,6 +281,13 @@ func (s *server) referralOfWalletUser(c *gin.Context, tenant string, userID uint
 		userID, tenant).Scan(&inviteCode, &inviterID, &invitedAt, &source); err != nil {
 		return nil, err
 	}
+	// 不变量：提交后的每一行都有码。读到 NULL 是事故，按正式场景开发原则报错而不是
+	// 返回空串——账号详情恰恰是最该把坏行显示出来的地方，"" 让人分不清"没有码"
+	// 和"码是空串"（同 referralMe）
+	if !inviteCode.Valid {
+		slog.Error("wallet user has no invite code", "tenant", tenant, "userId", userID, "requestId", requestID(c))
+		return nil, fmt.Errorf("wallet_user %d has no invite code", userID)
+	}
 	view := gin.H{"inviteCode": inviteCode.String, "inviter": nil}
 	if inviterID.Valid {
 		var address string
@@ -281,6 +297,10 @@ func (s *server) referralOfWalletUser(c *gin.Context, tenant string, userID uint
 			`SELECT address, status, invite_code FROM wallet_user WHERE id=? AND tenant_id=?`,
 			inviterID.Int64, tenant).Scan(&address, &status, &code); err != nil {
 			return nil, err
+		}
+		if !code.Valid {
+			slog.Error("inviter has no invite code", "tenant", tenant, "userId", inviterID.Int64, "requestId", requestID(c))
+			return nil, fmt.Errorf("wallet_user %d has no invite code", inviterID.Int64)
 		}
 		view["inviter"] = gin.H{
 			"userId": uint64(inviterID.Int64), "address": address, "status": status,

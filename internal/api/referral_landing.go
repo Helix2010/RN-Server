@@ -53,15 +53,15 @@ a.cta{display:block;background:#3157d5;color:#fff;text-decoration:none;border-ra
 </div></body></html>`))
 
 func (s *server) referralLandingPage(c *gin.Context) {
-	valid, outcome := s.lookupInviteCode(c, c.Param("code"))
-	if outcome != nil || !valid {
+	code, outcome := s.lookupInviteCode(c, c.Param("code"))
+	if outcome != nil {
 		// 码无效、格式不对、租户没开启邀请，一律同一个 404 页面：
 		// 不区分"这个租户没开"和"这个码不存在"，免得把租户状态透出去
 		s.referralLandingNotFound(c, outcome)
 		return
 	}
-	// 展示用分段形态，提高抄写正确率；归一化会去掉连字符，粘回输入框也认
-	code, _ := referral.Normalize(c.Param("code"))
+	// code 已经是归一化后的；Format 只加展示用的分段，提高抄写正确率，
+	// 归一化会去掉连字符，用户粘回输入框也认
 	c.Header("Cache-Control", "no-store")
 	c.Status(http.StatusOK)
 	c.Header("Content-Type", "text/html; charset=utf-8")

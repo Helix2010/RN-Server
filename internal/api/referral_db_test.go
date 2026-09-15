@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -418,40 +420,24 @@ func TestDBReferralInviteesPaginationIsExhaustive(t *testing.T) {
 	}
 }
 
-// inviteesPageForTest 直接跑下级列表的查询部分，绕开会话鉴权。
-// 它和 referralInvitees 共用同一套 where / 排序 / 游标，改一处两处都会动。
+// inviteesPageForTest 跑下级列表，绕开会话鉴权。
+//
+// 查询部分调 referralInviteesPage——和 handler 是同一个函数，不是抄一份：
+// 抄一份的话 handler 漏掉 invited_at IS NOT NULL 这条测试照样绿。
 func (s *server) inviteesPageForTest(t *testing.T, c *gin.Context, viewerID uint64, aliasKey []byte) ([]string, int, string) {
 	t.Helper()
-	tenant := tenantID(c)
 	page, invalid := parseListPage(c, sortKey{"invited_at", cursorTime}, sortKey{"id", cursorUint})
 	if invalid != "" {
 		t.Fatalf("parse page: %s", invalid)
 	}
-	where := sqlWhere{}
-	where.add("tenant_id=?", tenant)
-	where.add("inviter_user_id=?", viewerID)
-	where.add("invited_at IS NOT NULL")
-	total, err := s.countListRows(c.Request.Context(), "wallet_user", where)
+	rows, total, err := s.referralInviteesPage(c.Request.Context(), tenantID(c), viewerID, page)
 	if err != nil {
-		t.Fatalf("count: %v", err)
+		t.Fatalf("invitees page: %v", err)
 	}
-	query := where.and(page.after)
-	rows, err := s.db.QueryContext(c.Request.Context(),
-		`SELECT id, invited_at FROM wallet_user WHERE `+query.sql()+` ORDER BY invited_at DESC, id DESC LIMIT ?`,
-		append(query.args, page.limit+1)...)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	defer rows.Close()
 	aliases, cursors := []string{}, []string{}
-	for rows.Next() {
-		var id uint64
-		var at time.Time
-		if err := rows.Scan(&id, &at); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		aliases = append(aliases, referralAlias(aliasKey, viewerID, id))
-		cursors = append(cursors, encodeListCursor(at, id))
+	for _, row := range rows {
+		aliases = append(aliases, referralAlias(aliasKey, viewerID, row.ID))
+		cursors = append(cursors, encodeListCursor(row.JoinedAt, row.ID))
 	}
 	aliases, next := finishListPage(aliases, cursors, page.limit)
 	if next == nil {
@@ -515,5 +501,131 @@ func TestDBReferralRegistrationAssignsCodeWithoutTouchingOtherRows(t *testing.T)
 	}
 	if assigned != fresh {
 		t.Fatalf("assigned code = %q, want the second candidate %q", assigned, fresh)
+	}
+}
+
+// referralLookupContext 造一个解析邀请码的上下文，把来源 IP 钉死，这样限流计数落在同一个 key 上。
+func referralLookupContext(t *testing.T, tenant, ip string) *gin.Context {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/v1/mobile/referral/codes/ABCD1234", nil)
+	c.Request.RemoteAddr = ip + ":51000"
+	c.Set("tenantId", tenant)
+	c.Set("requestId", "req_test")
+	return c
+}
+
+// TestDBReferralLookupMissReturns429 是设计 §4.3 与契约都写明的那条：
+// 未命中另计更严的子配额，**超出则该窗口内全部拒绝**。
+//
+// 这条曾经只写日志、照旧返回 404，扫描器的有效配额因此是宽松的那条 30 次/小时，
+// 设计里"真实用户 vs 扫描器在这个阈值上干净分离"完全没有发生。
+func TestDBReferralLookupMissReturns429(t *testing.T) {
+	s := referralTestServer(t)
+	tenant := testTenant(52)
+	enableReferral(t, s.db, tenant, 168)
+	const ip = "203.0.113.44"
+
+	// 前 referralLookupMissPerHour 次未命中：404，码不存在
+	for i := 0; i < referralLookupMissPerHour; i++ {
+		code, outcome := s.lookupInviteCode(referralLookupContext(t, tenant, ip), "ZZZZ9999")
+		if code != "" {
+			t.Fatalf("miss %d returned a code %q", i+1, code)
+		}
+		if outcome == nil || outcome.Code != "REFERRAL_CODE_UNKNOWN" {
+			t.Fatalf("miss %d = %+v, want REFERRAL_CODE_UNKNOWN", i+1, outcome)
+		}
+	}
+	// 再来一次：这一次必须是 429，不是 404
+	_, outcome := s.lookupInviteCode(referralLookupContext(t, tenant, ip), "ZZZZ9999")
+	if outcome == nil || outcome.Status != http.StatusTooManyRequests {
+		t.Fatalf("after the miss quota is spent the lookup must be throttled, got %+v", outcome)
+	}
+	// 另一个 IP 不受影响：配额是按 IP 分的
+	_, outcome = s.lookupInviteCode(referralLookupContext(t, tenant, "203.0.113.45"), "ZZZZ9999")
+	if outcome == nil || outcome.Code != "REFERRAL_CODE_UNKNOWN" {
+		t.Fatalf("a different IP must still get the plain 404, got %+v", outcome)
+	}
+}
+
+// 命中的码不吃未命中配额，而且返回的是归一化后的码（落地页直接拿它展示，不再归一化第二遍）。
+func TestDBReferralLookupHitReturnsNormalizedCode(t *testing.T) {
+	s := referralTestServer(t)
+	tenant := testTenant(53)
+	enableReferral(t, s.db, tenant, 168)
+	_, code := makeWalletUser(t, s.db, tenant, time.Now().UTC())
+
+	// 用分段 + 小写形态查：归一化应当把它认回去
+	raw := strings.ToLower(referral.Format(code))
+	const ip = "203.0.113.46"
+	// 命中若干次。次数要留在每分钟的突发上限（referralLookupPerMinute）之内，
+	// 不然测到的是那条闸，不是这里要验的东西
+	for i := 0; i < referralLookupMissPerHour-5; i++ {
+		got, outcome := s.lookupInviteCode(referralLookupContext(t, tenant, ip), raw)
+		if outcome != nil {
+			t.Fatalf("hit %d was rejected: %+v", i+1, outcome)
+		}
+		if got != code {
+			t.Fatalf("lookup returned %q, want the normalized %q", got, code)
+		}
+	}
+	// 命中不吃未命中配额：这一次未命中应当还是普通的 404，不是 429
+	if _, outcome := s.lookupInviteCode(referralLookupContext(t, tenant, ip), "ZZZZ9999"); outcome == nil || outcome.Code != "REFERRAL_CODE_UNKNOWN" {
+		t.Fatalf("hits must not consume the miss quota, got %+v", outcome)
+	}
+}
+
+// 租户把邀请关掉之后，/me 的 bindWindow.open 必须是 false。
+// open 的语义是"现在提交会被接受吗"：报 true 而 /bind 返回 403，
+// 用户就会填完邀请码才被拒绝。
+func TestDBReferralWindowClosedWhenTenantDisabled(t *testing.T) {
+	s := referralTestServer(t)
+	tenant := testTenant(54)
+	// 未配置的租户默认就是关闭（声明式默认 enabled=false）
+	settings, err := s.referralSettingsOf(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if settings.Enabled {
+		t.Fatal("referral must default to disabled")
+	}
+	enableReferral(t, s.db, tenant, 24)
+	settings, err = s.referralSettingsOf(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if !settings.Enabled || settings.BindWindowHours != 24 {
+		t.Fatalf("settings = %+v, want enabled with a 24h window", settings)
+	}
+}
+
+// 租户配的窗口必须原样走完"库 -> 管理端回显 -> bootstrap 下发"这条链。
+// 中间任何一环把它换回默认的 168，App 显示的窗口和服务端判定的窗口就是两个值。
+func TestDBReferralConfiguredWindowReachesBootstrap(t *testing.T) {
+	s := referralTestServer(t)
+	tenant := testTenant(55)
+	enableReferral(t, s.db, tenant, 24)
+
+	view, err := s.appConfigView(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("app config view: %v", err)
+	}
+	cfg := view["config"].(map[string]any)
+	section := object(cfg["referral"])
+	if section["bindWindowHours"] != 24 {
+		t.Fatalf("the admin view shows %v hours, want the configured 24", section["bindWindowHours"])
+	}
+	// bootstrap 拿的就是这份已经归一化过的 config，会再归一化一遍
+	downlink := referralBootstrapSection(section, "https://api.example.com/app/invite/")
+	if downlink["bindWindowHours"] != 24 {
+		t.Fatalf("bootstrap sends %v hours, want the configured 24", downlink["bindWindowHours"])
+	}
+	// 绑定判定读的是库里的原始 JSON，必须和下发的是同一个值
+	settings, err := s.referralSettingsOf(context.Background(), tenant)
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if settings.BindWindowHours != 24 {
+		t.Fatalf("bindReferral would use %d hours while bootstrap sends %v", settings.BindWindowHours, downlink["bindWindowHours"])
 	}
 }

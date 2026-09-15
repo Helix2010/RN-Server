@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
@@ -122,7 +123,10 @@ func (s *server) referralMe(c *gin.Context) {
 		"inviteLink": referralInviteLinkBase(c) + inviteCode.String,
 		"inviter":    inviter,
 		"bindWindow": gin.H{
-			"open":     !inviterID.Valid && time.Now().UTC().Before(closesAt),
+			// settings.Enabled 必须算进 open：租户关掉邀请之后仍报 open=true，
+			// App 会照常显示输入框，用户填完拿到 403 REFERRAL_DISABLED。
+			// open 的语义是"现在提交会被接受吗"，不是"窗口期过了没有"
+			"open":     settings.Enabled && !inviterID.Valid && time.Now().UTC().Before(closesAt),
 			"closesAt": iso(closesAt),
 		},
 		"inviteeCount": inviteeCount,
@@ -198,54 +202,72 @@ func (s *server) referralInvitees(c *gin.Context) {
 		return
 	}
 
-	where := sqlWhere{}
-	where.add("tenant_id=?", tenant)
-	where.add("inviter_user_id=?", session.UserID)
-	// 显式排除 invited_at 为空的行：键集分页的游标条件里 NULL<? 不为真，这类行会被
-	// 翻页全部跳过，而 COUNT(*) 仍把它算进去，total 与可翻页数就对不上。CHECK 约束
-	// 已经挡住新数据，这一条是让查询自身也成立（设计 §4.2）。
-	where.add("invited_at IS NOT NULL")
-
-	total, err := s.countListRows(c.Request.Context(), "wallet_user", where)
-	if err != nil {
-		slog.Error("referral invitees count failed", "error", err, "requestId", requestID(c))
-		problem(c, 500, "REFERRAL_READ_FAILED", "Unable to read referral state")
-		return
-	}
-
-	query := where.and(page.after)
-	rows, err := s.db.QueryContext(c.Request.Context(),
-		`SELECT id, invited_at FROM wallet_user WHERE `+query.sql()+` ORDER BY invited_at DESC, id DESC LIMIT ?`,
-		append(query.args, page.limit+1)...)
+	rows, total, err := s.referralInviteesPage(c.Request.Context(), tenant, session.UserID, page)
 	if err != nil {
 		slog.Error("referral invitees query failed", "error", err, "requestId", requestID(c))
 		problem(c, 500, "REFERRAL_READ_FAILED", "Unable to read referral state")
 		return
 	}
-	defer rows.Close()
 
 	items, cursors := []gin.H{}, []string{}
-	for rows.Next() {
-		var id uint64
-		var at time.Time
-		if err := rows.Scan(&id, &at); err != nil {
-			slog.Error("referral invitees scan failed", "error", err, "requestId", requestID(c))
-			problem(c, 500, "REFERRAL_READ_FAILED", "Unable to read referral state")
-			return
-		}
+	for _, row := range rows {
 		items = append(items, gin.H{
-			"alias":    referralAlias(aliasKey, session.UserID, id),
-			"joinedAt": iso(at),
+			"alias":    referralAlias(aliasKey, session.UserID, row.ID),
+			"joinedAt": iso(row.JoinedAt),
 		})
-		cursors = append(cursors, encodeListCursor(at, id))
-	}
-	if err := rows.Err(); err != nil {
-		slog.Error("referral invitees rows failed", "error", err, "requestId", requestID(c))
-		problem(c, 500, "REFERRAL_READ_FAILED", "Unable to read referral state")
-		return
+		cursors = append(cursors, encodeListCursor(row.JoinedAt, row.ID))
 	}
 	items, next := finishListPage(items, cursors, page.limit)
 	c.JSON(http.StatusOK, listResponse(items, total, next, page.limit))
+}
+
+// inviteeRow 是下级列表的一行原始数据。地址与任何地址派生值都不出现在这里：
+// 别名由调用方按观察者算（referralAlias）。
+type inviteeRow struct {
+	ID       uint64
+	JoinedAt time.Time
+}
+
+// referralInviteesPage 是下级列表的查询部分：where、总数、键集翻页多取一行。
+//
+// handler 与库测共用它。测试如果自己抄一份 where，handler 哪天漏掉
+// invited_at IS NOT NULL，测试照样全绿——而那恰好是这条测试要守的东西
+// （设计 §8.1 点名"验证 inviter_user_id IS NOT NULL 这条"）。
+func (s *server) referralInviteesPage(ctx context.Context, tenant string, viewerID uint64, page listPage) ([]inviteeRow, int, error) {
+	where := sqlWhere{}
+	where.add("tenant_id=?", tenant)
+	where.add("inviter_user_id=?", viewerID)
+	// 显式排除 invited_at 为空的行：键集分页的游标条件里 NULL<? 不为真，这类行会被
+	// 翻页全部跳过，而 COUNT(*) 仍把它算进去，total 与可翻页数就对不上。CHECK 约束
+	// 已经挡住新数据，这一条是让查询自身也成立（设计 §4.2）。
+	where.add("invited_at IS NOT NULL")
+
+	total, err := s.countListRows(ctx, "wallet_user", where)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	query := where.and(page.after)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, invited_at FROM wallet_user WHERE `+query.sql()+` ORDER BY invited_at DESC, id DESC LIMIT ?`,
+		append(query.args, page.limit+1)...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	out := []inviteeRow{}
+	for rows.Next() {
+		var row inviteeRow
+		if err := rows.Scan(&row.ID, &row.JoinedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
 }
 
 // ---------- GET /v1/mobile/referral/codes/:code ----------
@@ -258,16 +280,19 @@ func (s *server) referralInvitees(c *gin.Context) {
 //
 // 落地页 GET /app/invite/:code 走同一个函数体，共用同一个限流计数器。
 func (s *server) referralCodeLookup(c *gin.Context) {
-	valid, outcome := s.lookupInviteCode(c, c.Param("code"))
-	if outcome != nil {
+	if _, outcome := s.lookupInviteCode(c, c.Param("code")); outcome != nil {
 		problem(c, outcome.Status, outcome.Code, outcome.Detail)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"valid": valid})
+	// 走到这里就是命中：无效的码在上面已经按 404 / 422 / 429 返回了，
+	// 200 只有 valid=true 一种取值
+	c.JSON(http.StatusOK, gin.H{"valid": true})
 }
 
 // lookupInviteCode 是解析邀请码的公共实现：限流、归一化、查库、留痕。
-func (s *server) lookupInviteCode(c *gin.Context, rawCode string) (bool, *referralBindOutcome) {
+// 第一个返回值是归一化后的码，调用方直接用，不要再 Normalize 一遍；
+// outcome 非 nil 即未命中，此时码为空串。
+func (s *server) lookupInviteCode(c *gin.Context, rawCode string) (string, *referralBindOutcome) {
 	now := time.Now().UTC()
 	ip := c.ClientIP()
 	if !s.referrals.allowLookup(ip, now) {
@@ -277,42 +302,48 @@ func (s *server) lookupInviteCode(c *gin.Context, rawCode string) (bool, *referr
 			Reason: "invite code lookup rate limit reached", RequestID: requestID(c), CreatedAt: iso(now),
 			Summary: map[string]any{"clientIp": ip},
 		})
-		return false, &referralBindOutcome{"REFERRAL_RATE_LIMITED", http.StatusTooManyRequests, "Too many lookups; try again later"}
+		return "", &referralErrLookupLimited
 	}
 
 	settings, err := s.referralSettingsOf(c.Request.Context(), tenantID(c))
 	if err != nil {
 		slog.Error("referral settings read failed", "error", err, "requestId", requestID(c))
-		return false, &referralBindOutcome{"REFERRAL_READ_FAILED", http.StatusInternalServerError, "Unable to read referral state"}
+		return "", &referralBindOutcome{"REFERRAL_READ_FAILED", http.StatusInternalServerError, "Unable to read referral state"}
 	}
 	// 租户没开启就当这个码不存在：不透露"这个租户存在但没开"
 	if !settings.Enabled {
-		return false, &referralErrUnknown
+		return "", &referralErrUnknown
 	}
 
 	code, ok := referral.Normalize(rawCode)
 	if !ok {
-		s.recordInviteCodeMiss(c, ip, now, "malformed")
-		return false, &referralErrMalformed
+		if !s.recordInviteCodeMiss(c, ip, now, "malformed") {
+			return "", &referralErrLookupLimited
+		}
+		return "", &referralErrMalformed
 	}
 	var exists int
 	if err := s.db.QueryRowContext(c.Request.Context(),
 		`SELECT COUNT(*) FROM wallet_user WHERE tenant_id=? AND invite_code=?`, tenantID(c), code).Scan(&exists); err != nil {
 		slog.Error("referral code lookup failed", "error", err, "requestId", requestID(c))
-		return false, &referralBindOutcome{"REFERRAL_READ_FAILED", http.StatusInternalServerError, "Unable to read referral state"}
+		return "", &referralBindOutcome{"REFERRAL_READ_FAILED", http.StatusInternalServerError, "Unable to read referral state"}
 	}
 	if exists == 0 {
-		s.recordInviteCodeMiss(c, ip, now, "unknown")
-		return false, &referralErrUnknown
+		if !s.recordInviteCodeMiss(c, ip, now, "unknown") {
+			return "", &referralErrLookupLimited
+		}
+		return "", &referralErrUnknown
 	}
-	return true, nil
+	return code, nil
 }
 
-// recordInviteCodeMiss 未命中的留痕与更严的子配额。
+// recordInviteCodeMiss 未命中的留痕与更严的子配额，返回 false 表示该 IP 的未命中
+// 配额已耗尽，调用方必须改回 429（设计 §4.3：**超出则该窗口内全部拒绝**）。
 //
-// 真实用户几乎不会未命中，扫描器 100% 未命中，两类人群在这个阈值上干净分离。
-// 租户级那条**只告警不阻断**：它用来发现"正在被扫"，不用来拦人。
-func (s *server) recordInviteCodeMiss(c *gin.Context, ip string, now time.Time, kind string) {
+// 真实用户几乎不会未命中，扫描器 100% 未命中，两类人群在这个阈值上干净分离——
+// 这条分离只有在返回值真被用来拒绝时才成立，只记日志等于闸门是假的。
+// 租户级那条不一样，**只告警不阻断**：它用来发现"正在被扫"，不用来拦人。
+func (s *server) recordInviteCodeMiss(c *gin.Context, ip string, now time.Time, kind string) bool {
 	slog.Warn("invite code lookup miss",
 		"tenant", tenantID(c), "kind", kind, "clientIp", ip, "requestId", requestID(c))
 	if !s.referrals.withinTenantUnknownBudget(tenantID(c), now) {
@@ -321,5 +352,7 @@ func (s *server) recordInviteCodeMiss(c *gin.Context, ip string, now time.Time, 
 	}
 	if !s.referrals.allowLookupMiss(ip, now) {
 		slog.Warn("invite code lookup miss quota exhausted", "tenant", tenantID(c), "clientIp", ip)
+		return false
 	}
+	return true
 }

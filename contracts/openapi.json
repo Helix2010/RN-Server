@@ -1554,6 +1554,9 @@
         "responses": {
           "200": {
             "description": "SIWE nonce and message"
+          },
+          "429": {
+            "description": "REGISTRATION_RATE_LIMITED：该来源地址的注册链路配额已耗尽"
           }
         }
       }
@@ -1580,6 +1583,9 @@
           },
           "401": {
             "description": "WALLET_CHALLENGE_* / WALLET_SIGNATURE_INVALID / INSTALLATION_CREDENTIAL_INVALID"
+          },
+          "429": {
+            "description": "REGISTRATION_RATE_LIMITED：该来源地址的注册链路配额已耗尽"
           }
         },
         "description": "可选带安装身份：X-Installation-ID + Authorization: Installation <installationCredential>（安装注册时下发）。带了就必须有效，无效返回 401 INSTALLATION_CREDENTIAL_INVALID（在核销 nonce 之前校验，App 可丢掉失效凭证后用同一挑战重试）；通过则会话记录 installation_id，钱包收款等用户级推送只发这台安装。",
@@ -1867,6 +1873,9 @@
         "responses": {
           "201": {
             "description": "Installation registered"
+          },
+          "429": {
+            "description": "REGISTRATION_RATE_LIMITED：该来源地址的注册链路配额已耗尽"
           }
         },
         "description": " The optional deviceIntegrity object carries self-reported signals (rooted, emulator, sideLoaded, devBundle). It is not a security control: a compromised client can lie, so it is stored for fleet visibility only and never allows or denies anything. Each field is true, false or absent; absent means the probe failed, which is deliberately kept apart from false so the counts are not silently wrong."
@@ -4013,7 +4022,7 @@
           },
           "inviterCode": {
             "type": "string",
-            "description": "分段展示形态 XXXX-XXXX"
+            "description": "裸码，不分段。同名字段在关系列表与账号详情里也是裸码，分段是展示形态，由客户端加"
           },
           "boundAt": {
             "type": "string",

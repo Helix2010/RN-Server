@@ -47,6 +47,18 @@ type windowEntry struct {
 	resetsAt time.Time
 }
 
+// exhausted 只看配额用完没有，**不记数**。给"先判断能不能做、做成了再计数"的
+// 调用方用（见 allowAdminBind / recordAdminBind）。
+func (w *windowCounter) exhausted(key string, limit int, now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	entry, ok := w.windows[key]
+	if !ok || now.After(entry.resetsAt) {
+		return false
+	}
+	return entry.count >= limit
+}
+
 // allow 记一次并返回是否还在配额内。超出配额时**不再累加**，避免持续攻击把窗口
 // 末尾的正常请求也算进去（窗口到点就自然放行）。
 func (w *windowCounter) allow(key string, limit int, window time.Duration, now time.Time) bool {
@@ -114,8 +126,17 @@ func (l *referralLimiter) withinTenantUnknownBudget(tenant string, now time.Time
 	return l.unknownDay.allow(tenant, referralUnknownPerDayTenant, 24*time.Hour, now)
 }
 
-// allowAdminBind 管理端补录的租户级日配额。补录豁免绑定窗口、不可回滚，
-// 而管理端除登录外全线无限流——这条是它自己的闸（设计 §4.4）。
-func (l *referralLimiter) allowAdminBind(tenant string, now time.Time) bool {
-	return l.adminBindDay.allow(tenant, referralAdminBindPerDay, 24*time.Hour, now)
+// adminBindQuotaExhausted 管理端补录的租户级日配额，**只看不记**。补录豁免绑定
+// 窗口、不可回滚，而管理端除登录外全线无限流——这条是它自己的闸（设计 §4.4）。
+//
+// 配额记在 recordAdminBind，也就是补录真的成功之后。这条闸限的是"今天改了多少条
+// 关系"，不是"今天按错几次键"：地址打错、人还没登录过这类失败不该吃配额，否则
+// 运营连打错 20 次，当天真正要补的那条就被自己挡在门外了。
+func (l *referralLimiter) adminBindQuotaExhausted(tenant string, now time.Time) bool {
+	return l.adminBindDay.exhausted(tenant, referralAdminBindPerDay, now)
+}
+
+// recordAdminBind 在补录成功之后记一次配额。
+func (l *referralLimiter) recordAdminBind(tenant string, now time.Time) {
+	l.adminBindDay.allow(tenant, referralAdminBindPerDay, 24*time.Hour, now)
 }

@@ -12,25 +12,32 @@ import (
 	"strings"
 )
 
-// Alphabet 是 Crockford Base32：0-9A-Z 去掉 I L O U。
+// alphabet 是 Crockford Base32：0-9A-Z 去掉 I L O U。
 // 去掉易混字符是为了让人能照着念、照着抄；U 被 Crockford 排除在字母表外，
 // 所以归一化不把它映射成别的字符，出现即输错。
-const Alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-// CodeLength 邀请码长度。空间 32^8 = 1.0995e12，见设计 §3.3 的碰撞估算。
-const CodeLength = 8
+// codeLength 邀请码长度。空间 32^8 = 1.0995e12，见设计 §3.3 的碰撞估算。
+const codeLength = 8
+
+// Attempts 是碰撞后的换码次数。空间 32^8=1.0995e12，单次失败率 N/1.1e12
+// （N=10 万时 9.1e-8），连续三次失败 7.5e-22。
+//
+// 迁移的回填（internal/store）与注册时的赋码（internal/api）必须用同一个值，
+// 否则"三次失败即整单失败"这条概率论证在两边说的不是同一件事。
+const Attempts = 3
 
 // Generate 取一个随机邀请码。
 //
 // 字母表恰好 32 个字符，256 % 32 == 0，所以按位取低 5 位是均匀的，不需要拒绝采样。
 func Generate() (string, error) {
-	buf := make([]byte, CodeLength)
+	buf := make([]byte, codeLength)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("referral: read random: %w", err)
 	}
-	out := make([]byte, CodeLength)
+	out := make([]byte, codeLength)
 	for i, b := range buf {
-		out[i] = Alphabet[b&0x1F]
+		out[i] = alphabet[b&0x1F]
 	}
 	return string(out), nil
 }
@@ -43,7 +50,7 @@ func Generate() (string, error) {
 //  3. 转大写；
 //  4. Crockford 易混字符映射 I L -> 1、O -> 0（去掉这两个字符的全部意义就在这一步，
 //     没有它，照着念的人输 O 会拿到"码不存在"，而正确行为是解码成 0）；
-//  5. 必须恰好 CodeLength 位且每一位都在字母表内。
+//  5. 必须恰好 codeLength 位且每一位都在字母表内。
 //
 // 调用方要把 false 映射成 REFERRAL_CODE_MALFORMED（422），与"码不存在"的
 // REFERRAL_CODE_UNKNOWN（404）分开：前者是用户输错，后者是码无效，文案不同。
@@ -65,10 +72,10 @@ func Normalize(raw string) (string, bool) {
 		b.WriteRune(r)
 	}
 	code := b.String()
-	if len(code) != CodeLength {
+	if len(code) != codeLength {
 		return "", false
 	}
-	if strings.ContainsFunc(code, func(r rune) bool { return !strings.ContainsRune(Alphabet, r) }) {
+	if strings.ContainsFunc(code, func(r rune) bool { return !strings.ContainsRune(alphabet, r) }) {
 		return "", false
 	}
 	return code, true
@@ -98,7 +105,7 @@ func upper(r rune) rune {
 // 存储、URL 与二维码内容一律用不分段的原值；Normalize 会去掉连字符，
 // 所以用户把分段形态粘回输入框也认。
 func Format(code string) string {
-	if len(code) != CodeLength {
+	if len(code) != codeLength {
 		return code
 	}
 	return code[:4] + "-" + code[4:]

@@ -6,16 +6,16 @@ import (
 )
 
 func TestAlphabetIsCrockford(t *testing.T) {
-	if len(Alphabet) != 32 {
-		t.Fatalf("alphabet must hold 32 symbols, got %d", len(Alphabet))
+	if len(alphabet) != 32 {
+		t.Fatalf("alphabet must hold 32 symbols, got %d", len(alphabet))
 	}
 	for _, excluded := range []rune{'I', 'L', 'O', 'U'} {
-		if strings.ContainsRune(Alphabet, excluded) {
+		if strings.ContainsRune(alphabet, excluded) {
 			t.Fatalf("alphabet must not contain the ambiguous symbol %q", excluded)
 		}
 	}
 	seen := map[rune]bool{}
-	for _, r := range Alphabet {
+	for _, r := range alphabet {
 		if seen[r] {
 			t.Fatalf("alphabet repeats %q", r)
 		}
@@ -29,11 +29,11 @@ func TestGenerateStaysInsideAlphabet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
-		if len(code) != CodeLength {
-			t.Fatalf("length = %d, want %d", len(code), CodeLength)
+		if len(code) != codeLength {
+			t.Fatalf("length = %d, want %d", len(code), codeLength)
 		}
 		for _, r := range code {
-			if !strings.ContainsRune(Alphabet, r) {
+			if !strings.ContainsRune(alphabet, r) {
 				t.Fatalf("generated %q contains %q which is outside the alphabet", code, r)
 			}
 		}
@@ -57,7 +57,7 @@ func TestGenerateCoversAlphabet(t *testing.T) {
 			counts[r]++
 		}
 	}
-	for _, r := range Alphabet {
+	for _, r := range alphabet {
 		if counts[r] == 0 {
 			t.Fatalf("symbol %q never appeared in 4000 draws", r)
 		}

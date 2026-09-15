@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -56,22 +57,69 @@ func TestValidateReferralSectionErrorsNameTheKey(t *testing.T) {
 
 // 未配置时用声明式默认，且默认是"关"——它会在 App 上多出一个入口，该由运营明确打开。
 func TestNormalizeReferralDefaults(t *testing.T) {
-	out := normalizeReferral(nil, "https://api.example.com/app/invite/")
+	out := normalizeReferral(nil)
 	if out["enabled"] != false {
 		t.Fatalf("referral must default to disabled, got %v", out["enabled"])
 	}
 	if out["bindWindowHours"] != referralDefaultBindWindowHours {
 		t.Fatalf("bindWindowHours = %v, want %d", out["bindWindowHours"], referralDefaultBindWindowHours)
 	}
-	if out["inviteLinkBase"] != "https://api.example.com/app/invite/" {
-		t.Fatalf("inviteLinkBase must come from the server, got %v", out["inviteLinkBase"])
-	}
 }
 
 func TestNormalizeReferralKeepsConfiguredValues(t *testing.T) {
-	out := normalizeReferral(map[string]any{"enabled": true, "bindWindowHours": float64(24)}, "https://x/app/invite/")
+	out := normalizeReferral(map[string]any{"enabled": true, "bindWindowHours": float64(24)})
 	if out["enabled"] != true || out["bindWindowHours"] != 24 {
 		t.Fatalf("configured values were not carried through: %v", out)
+	}
+}
+
+// 下发链路才带 inviteLinkBase，它由服务端按请求 Host 算（设计 §3.6）。
+func TestReferralBootstrapSectionCarriesLinkBase(t *testing.T) {
+	out := referralBootstrapSection(map[string]any{"enabled": true}, "https://api.example.com/app/invite/")
+	if out["inviteLinkBase"] != "https://api.example.com/app/invite/" {
+		t.Fatalf("inviteLinkBase must come from the server, got %v", out["inviteLinkBase"])
+	}
+	if out["enabled"] != true {
+		t.Fatalf("configured values were not carried through: %v", out)
+	}
+}
+
+// bootstrap 复用 appConfigView 归一化过的 config，referral 段因此会被归一化两遍。
+// 第二遍必须仍读得出租户配的窗口：只认 float64 的话，第一遍产出的 int 会断言失败、
+// 静默退回默认 168 小时，而 bindReferral 读的是库里的原始 JSON，判的还是 24。
+// 那正好是最难查的一类故障——App 显示"还能绑"，服务端返回 REFERRAL_WINDOW_CLOSED。
+func TestReferralSectionSurvivesDoubleNormalize(t *testing.T) {
+	stored := map[string]any{"enabled": true, "bindWindowHours": float64(24)}
+	view := normalizeReferral(stored)
+	again := referralBootstrapSection(view, "https://api.example.com/app/invite/")
+	if again["bindWindowHours"] != 24 {
+		t.Fatalf("second normalize lost the configured window: %v", again["bindWindowHours"])
+	}
+	if again["enabled"] != true {
+		t.Fatalf("second normalize lost the enabled flag: %v", again["enabled"])
+	}
+}
+
+// 配置中心是"整份配置 PATCH 回去"：管理端回显里出现的键会原样发回来。
+// 所以管理端视图给出的 referral 段必须能通过写入校验，否则管理员改任何一项
+// 配置（主题色、文案、更新策略）都会被 INVALID_REFERRAL_CONFIG 拒掉。
+// 走一遍 JSON 是为了忠实还原线上形态：int 过网线回来是 float64。
+func TestAdminReferralViewSavesBackUnchanged(t *testing.T) {
+	for _, stored := range []map[string]any{
+		nil,
+		{"enabled": true, "bindWindowHours": float64(24)},
+	} {
+		wire, err := json.Marshal(normalizeReferral(stored))
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var back any
+		if err := json.Unmarshal(wire, &back); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if err := validateReferralSection(back); err != nil {
+			t.Fatalf("管理端回显的 referral 段存不回去（%s）：%v", wire, err)
+		}
 	}
 }
 

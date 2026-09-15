@@ -52,6 +52,8 @@ type server struct {
 	diagnosticIPs diagnosticIPLimiter
 	// referrals 是邀请接口的窗口计数（解析码、绑定、租户级未知码底线）；零值可用
 	referrals referralLimiter
+	// registrations 注册链路三步的限流（设计 §6 第 2 条 / D13：与邀请关系同窗口上线）
+	registrations registrationLimiter
 }
 
 type attempt struct {
@@ -142,13 +144,18 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
 	r.POST("/v1/mobile/installations/heartbeat", s.domainTenantScope(), s.installationHeartbeat)
-	r.POST("/v1/mobile/installations/register", s.domainTenantScope(), s.registerInstallation)
+	r.POST("/v1/mobile/installations/register", s.domainTenantScope(),
+		throttleRegistration("installations/register", s.registrations.allowInstall), s.registerInstallation)
 	r.POST("/v1/mobile/push-tokens", s.domainTenantScope(), s.registerPushToken)
 	// 一键上报：先元数据拿参考号，再传日志正文（设计 diagnostic-report-2026-09-14）
 	r.POST("/v1/mobile/diagnostics/reports", s.domainTenantScope(), s.createDiagnosticReport)
 	r.PUT("/v1/mobile/diagnostics/reports/:reportId/log", s.domainTenantScope(), s.uploadDiagnosticLog)
-	r.POST("/v1/mobile/auth/nonce", s.domainTenantScope(), s.walletAuthNonce)
-	r.POST("/v1/mobile/auth/verify", s.domainTenantScope(), s.walletAuthVerify)
+	// 注册链路三步免鉴权，邀请关系上线后它就是 Sybil 关系树的入口，
+	// 而关系永久不可解绑——限流必须与邀请关系同窗口上线（设计 §6 第 2 条 / D13）
+	r.POST("/v1/mobile/auth/nonce", s.domainTenantScope(),
+		throttleRegistration("auth/nonce", s.registrations.allowNonce), s.walletAuthNonce)
+	r.POST("/v1/mobile/auth/verify", s.domainTenantScope(),
+		throttleRegistration("auth/verify", s.registrations.allowVerify), s.walletAuthVerify)
 	r.GET("/v1/mobile/auth/session", s.domainTenantScope(), s.walletAuthSession)
 	r.POST("/v1/mobile/auth/logout", s.domainTenantScope(), s.walletAuthLogout)
 	r.GET("/v1/mobile/wallet/transfers", s.domainTenantScope(), s.walletTransfers)
@@ -1135,9 +1142,9 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	value["modules"] = normalizeModules(object(value["modules"]))
 	value["wallet"] = normalizeWallet(object(value["wallet"]))
 	value["services"] = normalizeServices(value["services"])
-	// 管理端要看到实际生效值（含未配置时的声明式默认）。linkBase 在管理端不参与编辑，
-	// 给空串：它只在 bootstrap 下发时按请求 Host 算得出来
-	value["referral"] = normalizeReferral(object(value["referral"]), "")
+	// 管理端要看到实际生效值（含未配置时的声明式默认）。这里只放可编辑项：
+	// 配置中心整份 PATCH 回来，回显里多一个只读键就会让保存被写入校验拒掉
+	value["referral"] = normalizeReferral(object(value["referral"]))
 	return gin.H{"summary": configSummary(value), "config": value, "metadata": gin.H{"databaseVersion": version, "updatedBy": updatedBy, "updatedAt": iso(updated), "inherited": sourceTenant == "0", "walletCatalog": walletCatalog()}}, nil
 }
 func (s *server) updateAppConfig(c *gin.Context) {
@@ -1889,7 +1896,7 @@ func (s *server) bootstrap(c *gin.Context) {
 	// issuedAt 是给客户端做重放判定的：签名本身挡不住"把昨天那份合法响应再发一遍"
 	// 把更新策略或链配置回滚回去。客户端记住见过的最大值，拒绝更小的（安全评审 N3）。
 	issuedAt := time.Now()
-	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "referral": normalizeReferral(object(cfg["referral"]), referralInviteLinkBase(c)), "features": bootstrapFeatures(features, directUpdateEnabled), "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
+	s.writeSignedBootstrap(c, tenant.ID, gin.H{"schemaVersion": 1, "issuedAt": issuedAt.UnixMilli(), "configVersion": cfg["configVersion"], "generatedAt": iso(issuedAt), "ttlSeconds": cfg["ttlSeconds"], "requestId": requestID(c), "localization": gin.H{"selectedLocale": locale, "fallbackLocale": localization["fallbackLocale"], "supportedLocales": localization["supportedLocales"], "localeCatalog": localeCatalog, "messagesVersion": localization["messagesVersion"], "refreshIntervalSeconds": localization["refreshIntervalSeconds"], "messages": messages[locale], "resource": localization["resource"]}, "theme": theme, "modules": gin.H{"predict": truth(modules["predict"]), "dex": truth(modules["dex"])}, "wallet": wallet, "services": services, "referral": referralBootstrapSection(object(cfg["referral"]), referralInviteLinkBase(c)), "features": bootstrapFeatures(features, directUpdateEnabled), "branding": branding, "app": gin.H{"version": version, "buildNumber": buildNumber, "platform": platform, "distribution": distribution, "runtimeVersion": runtime}, "update": gin.H{"decision": decision, "minSupportedVersion": minimum, "latestVersion": latest, "releaseNotes": releaseNotes, "ota": ota, "full": gin.H{"channel": distribution, "actionUrl": nullableString(actionURL), "releaseId": releaseID, "sha256": artifactSHA, "size": artifactSize}, "canary": gin.H{"enrolled": canaryRelease, "otaToken": canaryOTAToken}}, "support": gin.H{"diagnosticId": requestID(c), "statusPageUrl": object(cfg["support"])["statusPageUrl"]}})
 }
 
 func enabledLanguageCodes(settings effectiveLanguagesConfig) []string {

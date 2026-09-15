@@ -68,10 +68,6 @@ var migrations = []migration{
 	{version: 49, name: "referral_indexes", apply: referralIndexesMigration},
 }
 
-// referralCodeAttempts 邀请码碰撞后的重试次数。空间 32^8=1.0995e12，
-// 单次失败率 N/1.1e12（N=10 万时 9.1e-8），连续三次失败的概率 7.5e-22。
-const referralCodeAttempts = 3
-
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
 // 白名单。灰度行只对名单里的安装可见，不参与"发布时收尾同平台其它 active"那条语句，
 // 所以 status='active' 仍然只有一条、仍然是"所有人该拿的那一个"。
@@ -1680,7 +1676,7 @@ func referralCodeBackfillMigration(ctx context.Context, db *sql.DB) error {
 
 // backfillOneInviteCode 给一行补码，撞上同租户已有的码就换一个再试。
 func backfillOneInviteCode(ctx context.Context, db *sql.DB, userID, tenantID uint64) error {
-	for attempt := 0; attempt < referralCodeAttempts; attempt++ {
+	for attempt := 0; attempt < referral.Attempts; attempt++ {
 		code, err := referral.Generate()
 		if err != nil {
 			return fmt.Errorf("referral backfill generate: %w", err)
@@ -1709,10 +1705,10 @@ func backfillOneInviteCode(ctx context.Context, db *sql.DB, userID, tenantID uin
 			return nil
 		}
 	}
-	return fmt.Errorf("referral backfill: could not find a free invite code for wallet_user %d after %d attempts", userID, referralCodeAttempts)
+	return fmt.Errorf("referral backfill: could not find a free invite code for wallet_user %d after %d attempts", userID, referral.Attempts)
 }
 
-// referralIndexesMigration 建两个新索引与 CHECK 约束。
+// referralIndexesMigration 建三个新索引与 CHECK 约束。
 //
 // 三个索引不是两个：管理端的关系列表没有 inviter_user_id 等值条件，
 // ix_wallet_user_inviter 的第二列断开，优化器会退回 filesort（实测 rows≈9918），

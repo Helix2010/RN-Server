@@ -31,10 +31,6 @@ import (
 */
 
 const (
-	// referralCodeAttempts 碰撞后的换码次数。空间 32^8=1.0995e12，
-	// 单次失败率 N/1.1e12（N=10 万时 9.1e-8），连续三次失败 7.5e-22。
-	referralCodeAttempts = 3
-
 	// referralMaxDepth 上溯上界。服务端常量而不是租户配置：本期没有任何功能
 	// 按层级分叉，做成旋钮运营也无从判断该填几（设计 D6）。取个位数还因为
 	// 绑定在 GET_LOCK 里串行执行，链路越短持锁越短。
@@ -42,6 +38,10 @@ const (
 
 	// referralBindLockSeconds 取绑定锁的等待上限。绑定一生一次，等不到就让客户端重试。
 	referralBindLockSeconds = 5
+
+	// referralLockReleaseTimeout 释放绑定锁的超时。请求已经结束了，这条 exec 不能
+	// 跟着请求的 context 被取消（锁会跟着连接回池），但也不能没有上限。
+	referralLockReleaseTimeout = 3 * time.Second
 
 	// referralAliasLength 下级列表里 per-viewer 别名的长度（hex 字符数）。
 	referralAliasLength = 6
@@ -79,27 +79,15 @@ func (s *server) referralSettingsOf(ctx context.Context, tenant string) (referra
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return settings, err
 	}
-	section := object(value["referral"])
-	if section == nil {
-		return settings, nil
-	}
-	if enabled, ok := section["enabled"].(bool); ok {
-		settings.Enabled = enabled
-	}
-	// JSON 数字解出来是 float64；越界值在写入时已被 validateReferralSection 拒绝，
-	// 这里不再兜一遍（读路径不修复坏数据）
-	if hours, ok := section["bindWindowHours"].(float64); ok {
-		settings.BindWindowHours = int(hours)
-	}
-	return settings, nil
+	return parseReferralSection(object(value["referral"])), nil
 }
 
 // ---------- 邀请码 ----------
 
 // referralCodeCandidates 预抽若干候选码，供注册事务按顺序试。
 func referralCodeCandidates() ([]string, error) {
-	codes := make([]string, 0, referralCodeAttempts)
-	for i := 0; i < referralCodeAttempts; i++ {
+	codes := make([]string, 0, referral.Attempts)
+	for i := 0; i < referral.Attempts; i++ {
 		code, err := referral.Generate()
 		if err != nil {
 			return nil, err
@@ -115,10 +103,21 @@ func referralCodeCandidates() ([]string, error) {
 // ON DUPLICATE KEY UPDATE 则不会抛，只会去更新撞上的那一行（设计 §3.3）。
 func assignInviteCode(c *gin.Context, tx *sql.Tx, tenant string, userID uint64, candidates []string) error {
 	for _, code := range candidates {
-		_, err := tx.ExecContext(c.Request.Context(),
+		result, err := tx.ExecContext(c.Request.Context(),
 			`UPDATE wallet_user SET invite_code=?, updated_at=? WHERE id=? AND tenant_id=? AND invite_code IS NULL`,
 			code, time.Now().UTC(), userID, tenant)
 		if err == nil {
+			// 显式断言影响了一行。当前调用点在事务里、行已被自己的 upsert 锁住，
+			// 0 行发生不了；但"人人有码"是整个设计的基石不变量（没有码就没有
+			// 邀请入口），不能靠"调用点恰好安全"来保证——将来换调用点时，
+			// err==nil 就返回成功会让它静默塌掉。
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected != 1 {
+				return fmt.Errorf("invite code assignment touched %d rows, want 1", affected)
+			}
 			return nil
 		}
 		if !isDuplicateEntry(err) {
@@ -150,7 +149,14 @@ func referralAlias(secret []byte, viewerID, inviteeID uint64) string {
 //
 // 这就是设计 §7 说的 ancestorsOf：返佣模块日后直接取前 N 级，不另写一份。
 //
-// 第二个返回值为 false 表示跳满上界仍未到根——链路超限，绑定要拒绝。
+// 第二个返回值为 false 表示跳满上界仍未到根——链路超限，绑定要拒绝。调用方把它
+// 和"成环"合并成 REFERRAL_CYCLE，这是设计 §4.1 条件 8 明写的合并（一条码在用户
+// 眼里只有"能绑/不能绑"，两种拒绝理由都不该让他改输入）。
+//
+// 循环跳满 referralMaxDepth 次就判 false，从不确认第 referralMaxDepth 跳是否是根，
+// 所以邀请人自身祖先数的实际上界是 referralMaxDepth-1、绑定后的总深度上界是
+// referralMaxDepth。这是有意的，别照字面读成"祖先可以有 referralMaxDepth 个"。
+//
 // 调用方必须已持有本租户的绑定锁，否则读到的是快照，结论不作数（见 bindReferral）。
 func referralAncestors(ctx context.Context, q rowQuerier, tenant string, userID uint64) ([]uint64, bool, error) {
 	chain := make([]uint64, 0, referralMaxDepth)
@@ -198,6 +204,7 @@ var (
 	referralErrCycle          = referralBindOutcome{"REFERRAL_CYCLE", http.StatusUnprocessableEntity, "This would create a cycle in the referral graph"}
 	referralErrInviteeUnknown = referralBindOutcome{"REFERRAL_INVITEE_UNKNOWN", http.StatusNotFound, "That address has never signed in on this tenant, so it has no account to bind"}
 	referralErrInviterUnknown = referralBindOutcome{"REFERRAL_INVITER_UNKNOWN", http.StatusNotFound, "No account with that address in this tenant"}
+	referralErrLookupLimited  = referralBindOutcome{"REFERRAL_RATE_LIMITED", http.StatusTooManyRequests, "Too many lookups; try again later"}
 )
 
 // bindRequest 一次绑定的输入。管理端补录与用户自助走同一条路径，只有 SkipWindow 不同。
@@ -263,7 +270,14 @@ func (s *server) bindReferral(c *gin.Context, req bindRequest) (bindResult, *ref
 		return bindResult{}, &referralBindOutcome{"REFERRAL_BIND_BUSY", http.StatusConflict, "Another bind is in progress; retry"}
 	}
 	defer func() {
-		if _, err := conn.ExecContext(context.WithoutCancel(ctx), `SELECT RELEASE_LOCK(?)`, lockName); err != nil {
+		// WithoutCancel 是必要的：请求被取消/超时后，如果 RELEASE_LOCK 跟着失败，
+		// defer conn.Close() 会把**仍然持着这把锁**的连接还回池子，下一个借到它的
+		// 请求就带着别人的锁，该租户后续绑定全部 REFERRAL_BIND_BUSY 直到连接被回收。
+		// 但不能连 deadline 一起丢掉——那样 MySQL 挂起时这条 exec 无限期阻塞请求
+		// goroutine，所以单独给它一个短超时。
+		release, cancel := context.WithTimeout(context.WithoutCancel(ctx), referralLockReleaseTimeout)
+		defer cancel()
+		if _, err := conn.ExecContext(release, `SELECT RELEASE_LOCK(?)`, lockName); err != nil {
 			slog.Error("referral bind lock release failed", "error", err, "lock", lockName)
 		}
 	}()
@@ -429,7 +443,11 @@ func (s *server) referralBindSummary(c *gin.Context, req bindRequest, inviterID 
 	return summary
 }
 
-// platformBlockedAddress 查平台级封禁。与登录路径同一张表、同一个判据。
+// platformBlockedAddress 是平台级封禁的唯一判据，登录路径（platformWalletBlocked）
+// 与绑定路径都走它。
+//
+// 收 rowQuerier 而不是写死 s.db：绑定要跑在钉住的 *sql.Conn 上（那条连接持着本租户
+// 的绑定锁，换一条连接读到的就不是同一个串行视图了）。
 func (s *server) platformBlockedAddress(ctx context.Context, q rowQuerier, address string) (bool, error) {
 	var count int
 	if err := q.QueryRowContext(ctx,
@@ -476,24 +494,53 @@ func validateReferralSection(raw any) error {
 	return nil
 }
 
-// normalizeReferral 下发给 App 的 referral 段。
+// parseReferralSection 把 referral 段读成 referralSettings。
 //
-// 只做"未配置时用声明式默认"，不修复非法值——非法值在写入时已被拒绝。
-// inviteLinkBase 由服务端算：落地页是服务端的，路径规则只该有一个来源（设计 §3.6）。
-func normalizeReferral(raw map[string]any, linkBase string) map[string]any {
-	settings := map[string]any{
-		"enabled":         referralDefaultEnabled,
-		"bindWindowHours": referralDefaultBindWindowHours,
-		"inviteLinkBase":  linkBase,
-	}
+// 解析只有这一处。绑定时判窗口（referralSettingsOf）、管理端回显（normalizeReferral）、
+// 下发给 App（referralBootstrapSection）走的必须是同一份解析，否则"App 以为还开着"
+// 和"服务端判定已关闭"会是两个值，用户看到的就是点了绑定却返回 409。
+//
+// 只做"未配置时用声明式默认"，不修复非法值——非法值在写入时已被
+// validateReferralSection 拒绝（AGENTS.md「正式场景开发原则」）。
+//
+// 数字两种类型都认：float64 来自 json.Unmarshal，int 来自本进程里已经归一化过一遍的
+// map——bootstrap 复用 appConfigView 的结果，referral 段会被归一化两遍。这不是
+// "读路径修复坏数据"，两种都是本进程自己产出的合法形态；只认 float64 的话，第二遍
+// 会静默丢掉租户配的窗口、退回默认 168 小时。
+func parseReferralSection(raw map[string]any) referralSettings {
+	settings := referralSettings{Enabled: referralDefaultEnabled, BindWindowHours: referralDefaultBindWindowHours}
 	if raw == nil {
 		return settings
 	}
 	if enabled, ok := raw["enabled"].(bool); ok {
-		settings["enabled"] = enabled
+		settings.Enabled = enabled
 	}
-	if hours, ok := raw["bindWindowHours"].(float64); ok {
-		settings["bindWindowHours"] = int(hours)
+	switch hours := raw["bindWindowHours"].(type) {
+	case float64:
+		settings.BindWindowHours = int(hours)
+	case int:
+		settings.BindWindowHours = hours
 	}
 	return settings
+}
+
+// normalizeReferral 是管理端配置中心回显的 referral 段：**只有可编辑项**。
+//
+// 配置中心是"整份配置 PATCH 回去"，回显里出现的键会被原样发回来。所以这里出现的
+// 每个键都必须能通过 validateReferralSection，否则管理员改任何一项配置都会 400
+// ——不止邀请功能，是整个配置中心存不下去。服务端算出来的 inviteLinkBase 因此
+// 不放在这里，它只属于下发链路（见 referralBootstrapSection）。
+func normalizeReferral(raw map[string]any) map[string]any {
+	settings := parseReferralSection(raw)
+	return map[string]any{"enabled": settings.Enabled, "bindWindowHours": settings.BindWindowHours}
+}
+
+// referralBootstrapSection 是下发给 App 的 referral 段：可编辑项 + 服务端算出的链接基址。
+//
+// inviteLinkBase 由服务端按请求 Host 算，App 不自己拼——落地页是服务端的，
+// 路径规则只该有一个来源（设计 §3.6）。它是只读的，不进管理端的可编辑视图。
+func referralBootstrapSection(raw map[string]any, linkBase string) map[string]any {
+	section := normalizeReferral(raw)
+	section["inviteLinkBase"] = linkBase
+	return section
 }

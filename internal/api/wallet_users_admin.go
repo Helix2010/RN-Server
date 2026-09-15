@@ -466,12 +466,22 @@ func decodeAdminAction(c *gin.Context) (adminActionBody, bool) {
 		problem(c, 400, "INVALID_ACTION", "Invalid action payload")
 		return body, false
 	}
-	body.Reason = strings.TrimSpace(body.Reason)
-	if !body.Confirm || len(body.Reason) < 3 {
-		problem(c, 422, "INVALID_ACTION", "reason (at least 3 characters) and confirm=true are required")
+	if !validateAdminAction(c, &body) {
 		return body, false
 	}
 	return body, true
+}
+
+// validateAdminAction 是"confirm=true + reason >= 3 字符"这条规则的唯一实现。
+// 带额外字段的管理端动作（如邀请补录）自己解码请求体，但必须走这里，
+// 否则同一条规则会有第二份实现，改文案时只会改到一处。
+func validateAdminAction(c *gin.Context, body *adminActionBody) bool {
+	body.Reason = strings.TrimSpace(body.Reason)
+	if !body.Confirm || len(body.Reason) < 3 {
+		problem(c, 422, "INVALID_ACTION", "reason (at least 3 characters) and confirm=true are required")
+		return false
+	}
+	return true
 }
 
 // blockWalletUser 租户级封禁 / 解封：封禁立即结束本租户该账号的有效会话（用户 2026-09-07 决定）。
@@ -570,12 +580,15 @@ func (s *server) revokeWalletSession(c *gin.Context) {
 
 // platformWalletBlocked 平台级封禁检查（设计 §4.5）：命中返回错误码，未命中返回空。
 // 查询失败按"不能确认未封禁"处理，返回 WALLET_BLOCK_CHECK_FAILED 让登录失败并可见。
+// platformWalletBlocked 是登录路径上的平台级封禁检查，返回空串表示放行。
+// 判据本身由 platformBlockedAddress 实现，这里只把它翻译成登录路径的错误码——
+// 同一个判据不能有两份 SQL，否则改封禁语义时只会改到一处。
 func (s *server) platformWalletBlocked(c *gin.Context, address string) string {
-	var count int
-	if err := s.db.QueryRowContext(c.Request.Context(), `SELECT COUNT(*) FROM platform_wallet_block WHERE address_key=? AND revoked_at IS NULL`, strings.ToLower(address)).Scan(&count); err != nil {
+	blocked, err := s.platformBlockedAddress(c.Request.Context(), s.db, address)
+	if err != nil {
 		return "WALLET_BLOCK_CHECK_FAILED"
 	}
-	if count > 0 {
+	if blocked {
 		return "WALLET_BLOCKED_PLATFORM"
 	}
 	return ""
