@@ -75,7 +75,7 @@
 
 - 不做两通道（撤回，见 §7）。
 - 不做多台打包机（见 §8）。
-- 不提高单次构建速度（见 §9）。
+- 不提高单次构建速度（见 §10）。
 - 不做 iOS 构建。
 
 ## 3. 方案
@@ -338,7 +338,17 @@ go build ./cmd/server ./cmd/build-agent
 
 人工重新上传严格更安全，用它。若将来非做转封不可，最低条件现在写死：目标集合里每一把公钥必须已由人工核对指纹接受过；转封任务携带完整目标指纹列表，代理拒绝任何没在已接受记录里见过的指纹；转封是独立的管理端动作、有自己的审计事件；且**不可能**用打包机令牌触发。
 
-## 9. 待实测（不进本次范围）
+## 9. 顺带修的既有问题（打包链路，与并发无关）
+
+这两条是 2026-09-15 做备份方案时查出来的，属于打包链路而不是备份，记在这里。
+
+- **`git_ref` 未校验 = 服务端能在打包机上执行命令。** `build_jobs.git_ref` 是从库里读出来下发的（`internal/api/build_jobs.go:713` → `buildJobView` 的 `"gitRef"`，`:111`），代理拿到直接 `git worktree add --detach <worktree> <job.GitRef>`，**零校验**（`cmd/build-agent/build.go:130`；同一个函数对 `TenantDirectory` 是校验了的，`:121-123`），而仓库是 `--mirror` 克隆、上游每个分支和 tag 都在本地可达。服务端 RCE 改掉 ref → 代理以 `builder` 身份执行那个提交的代码 → 直接读走 `agent-key`（属主就是 `builder`）。「服务端固定 main」这条保护只在**建任务**那一刻生效（`build_config.go:62`、`build_jobs.go:285`），下发时是从库里重新读的。
+
+  **「服务端能选检出哪个提交」就等于「服务端能在打包机上执行命令」**，只是叫构建——和 §8 否决「转封」是同一条边界。**修法**：把 main 的固定挪到代理侧,代理忽略 `job.GitRef`、硬编码只从 `refs/heads/main` 检出，服务端下发的 ref 只用于日志核对。这和 `cmd/build-agent/tenantfile.go` 顶部「两端分属不同信任域，各自把住自己那一侧」是同一条原则，只是这一项漏了。
+
+- **`putTo` 把 `x-build-agent-token` 附加到服务端指定的任意 URL 上**并 PUT 整个产物（`cmd/build-agent/client.go:283-295`）——服务端 RCE 可以把产物导向外部主机并顺带泄露令牌。而那把令牌的能力比 `deploy/build-agent/README.md:45` 写的大得多：`GET /v1/build-agent/keystore-checks` 会返回各租户的 sealed keystore，且 `sealedBuildKeystoreFor`（`internal/api/build_keystore.go:61-79`）在返回前就把外层 secretbox 剥掉了。README 那句「能做的事只有领构建任务这一件」要改。
+
+## 10. 待实测（不进本次范围）
 
 **Gradle build cache**。每次构建都是全新 worktree + `expo prebuild --clean`（`android/` 是 gitignore 的，每次从零生成），增量编译完全失效，现在复用的只有依赖缓存（那 6.3 GB）。`org.gradle.caching=true` 能跨目录复用任务产物，租户差异都在输入里（tenant.json、图标、google-services.json、app.config），缓存键天然区分。
 
