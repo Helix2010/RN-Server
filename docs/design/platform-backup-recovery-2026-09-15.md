@@ -66,7 +66,7 @@ openssl rsa -in my-recovery.key -pubout -outform DER | openssl dgst -sha256
 
 **这一步不能跳。** 配完立刻手动跑一次备份，然后甲乙两人一起按包里的说明把它打开一次。
 
-理由很实际：如果有人生成时弄错了、或者存错了地方，要在**今天**发现，而不是一年后真出事的时候。之后每月重复一次（几分钟），顺带确认两个人都还在、钥匙都还找得到（§9 第 2 级）。
+理由很实际：如果有人生成时弄错了、或者存错了地方，要在**今天**发现，而不是一年后真出事的时候。之后每月重复一次（几分钟），顺带确认两个人都还在、钥匙都还找得到（§12 第 2 级）。
 
 ### 2.5 人员变动与不可用
 
@@ -113,21 +113,151 @@ openssl rsa -in my-recovery.key -pubout -outform DER | openssl dgst -sha256
 
 代价是：换恢复密钥要有人上机器改配置。**这件事本来就应该需要一个人到场。**
 
-启动时要校验：两把公钥都能解析、**且互不相同**、**且都不等于打包机自己的公钥**。最后一条是运维最可能犯的粘错——那几把都是 base64、都在同一个页面上显示指纹，粘错的后果是打包机自己就能解开每一份备份。
+启动时要校验：两把公钥都能解析、**且互不相同**（相同就是 2-of-2 退化成 1）。具体校验规则见 §8.3。
 
-### 4.3 加密方式：必须能用 openssl 打开
+### 4.4 触发：打包机只出不进，所以「立即备份」是异步的
 
-恢复当天可能没有我们的仓库、没有 Go 工具链、甚至没有网络。所以格式**不能是项目自定义的**。每一层都是同样的三步：
+打包机每 10 秒轮询服务端要活干，**从不监听端口**（那台机器握着签名密钥，不开任何入站端口是设计的一部分）。所以服务端没有办法主动叫它干活，控制台那个按钮只能是：
 
 ```
-随机 32 字节数据密钥 K
-  → 用 K 做 AES-256-CBC 加密内容，再用从 K 派生的另一把密钥做 HMAC-SHA256（先加密后认证）
-  → K 本身用 RSA-OAEP 封给这一层的恢复公钥
+控制台点「立即备份」 → 服务端建一条待办（状态 pending）
+   → 打包机下一轮轮询看到 → 产出并上报（running）
+   → 服务端封外层、上传、写结果（succeeded / failed）
+   → 控制台刷新出结果
 ```
 
-对应的解开命令全是标准 openssl 子命令（`pkeyutl -decrypt`、`enc -d -aes-256-cbc`、`dgst -hmac`），两层就是把这三步做两遍。命令与参数值由产出时填进 §5 的说明里。Go 侧全部在标准库内，不引入依赖。
+**定时备份走的是同一条路**：到点了服务端自己建一条同样的待办。一套机制，两个触发口。
 
-**不碰现有的 `buildkeystore.SealTo`**：那是给签名密钥封盒子用的现役函数，动它会让库里已有的盒子全部打不开。
+三条必须写清楚的语义：
+
+- **不并发**：已有 pending 或 running 的待办时，再点「立即备份」返回 409 并带上那条的编号，不排第二条。
+- **认领超时**：pending 超过 15 分钟没被打包机取走 → 判 `failed`，原因写「打包机没有响应」。打包机挂了、或者 `BUILD_AGENT_RECOVERY_RECIPIENT` 没配（§8.2 要求它缺失时不领待办），都会落到这一条。
+- **产出超时**：running 超过 30 分钟没上报 → 判 `failed`。打包机重启后不续做，下一条待办重新来过。
+
+**不能挂在「空闲时顺带做」上。** 现有的密钥校验就是这么挂的——只在构建队列为空的那一轮才跑（`cmd/build-agent/main.go:84-91` 的 `if worked { continue }` 会跳过它）。照抄的话，只要有人连着排构建，备份就永远轮不上。
+
+正确的位置是**每轮循环开头看一眼**，在领构建之前：
+
+```go
+for {
+    if req, ok := api.pendingBackup(ctx); ok {
+        runBackup(ctx, cfg, api, req)     // 有待办就先做完
+    }
+    worked := pollOnce(ctx, cfg, api)     // 再领构建
+    ...
+}
+```
+
+这样备份最多等一条构建（那条构建正在 `pollOnce` 里面跑），而且不受队列长度影响。
+
+**这条路径顺带解掉一个坑**：`POST /platform/backup/run` 只是插一行待办，毫秒级返回，**不需要**加进数据库超时的豁免列表（全局中间件给每个请求 10 秒上限，`internal/api/server.go:136`）。真正耗时的活在打包机上，不占 HTTP 请求。
+
+### 4.5 包内结构
+
+云存储里并排两个对象：
+
+```
+<prefix>/<实例id>/<8位编号>.rnbk          备份包本体（加密）
+<prefix>/<实例id>/<8位编号>.README.txt    怎么解开（不加密，见 §5.1）
+```
+
+**外层**（封给乙）解开后是一个 tar：
+
+```
+manifest.json          这次备份的元数据，见下
+RECOVERY.md            恢复手册（明文，不含机密）
+recover.sh             交互式恢复脚本（明文，不含机密）
+agent.rnbk             打包机那部分，封给甲
+server.rnbk            服务端那部分，封给甲
+```
+
+`agent.rnbk` 解开后：
+
+```
+agent-key                                   打包机身份文件，恢复时放回 <StateDir>/agent-key，0600 builder:builder
+build-agent.env                             恢复时放回 /etc/rn-build-agent.env，0600 root:root
+keystores/<租户slug>/keystore.p12           签名密钥明文
+keystores/<租户slug>/store-password.txt     口令（单行，无换行）
+keystores/<租户slug>/key-alias.txt          别名
+keystores/<租户slug>/fingerprint.txt        证书 SHA-256，核对用
+```
+
+`server.rnbk` 解开后：
+
+```
+rn-foundation.env                           恢复时放回 /etc/rn-foundation.env，0600 root:root
+db/tenants.json                             租户主表（含 id，必须逐字保留，见 §8.4）
+db/tenant-domain.json                       域名映射
+db/build-config/<租户slug>.json             打包配置：应用身份、Firebase 配置
+db/build-icons/<租户slug>/<四张 png>        启动图标（缺了构建会失败在 ENOENT）
+db/release-identity/<租户slug>.json         发布身份：包名、签名指纹
+```
+
+`manifest.json` 的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `format` | 容器格式版本，当前 `1` |
+| `seq` | 编号，全局递增 |
+| `instanceId` | 产出它的那套系统的标识 |
+| `createdAt` | RFC 3339 |
+| `serverVersion` / `agentVersion` | 两侧的构建版本，恢复时要装匹配的 |
+| `schemaVersion` | 数据库迁移版本号 |
+| `tenants[]` | 每个租户：slug、域名、有没有签名密钥、证书指纹 |
+| `files[]` | 每个成员的路径、大小、sha256 |
+| `innerRecipient` / `outerRecipient` | 两把公钥的 SHA-256 指纹 |
+
+**服务端那部分也封给甲**（不是只封给乙）。否则只拿到乙的私钥就能读到 `rn-foundation.env` 里的 `STORAGE_MASTER_KEY`，2-of-2 就只剩一半。`RECOVERY.md` 与 `recover.sh` 不含机密，留在外层——只有乙的人能读到步骤但拿不到任何密钥，这是想要的。
+
+### 4.6 容器格式：一个 tar，四个文件
+
+每一层都是同样的结构，用 tar 装四个文件，**任何一台 Linux 机器用 `tar` + `openssl` 就能打开**：
+
+```
+meta.json      明文元数据
+key.bin        RSA-OAEP(公钥, 80 字节密钥材料)
+payload.enc    AES-256-CBC 密文
+payload.mac    HMAC-SHA256(payload.enc)，32 字节
+```
+
+`key.bin` 解出来是固定 80 字节：**前 32 字节是 AES 密钥，中间 32 字节是 HMAC 密钥，最后 16 字节是 IV**。三样一起封，省掉一次 KDF——恢复端不需要 `openssl kdf`（老版本 openssl 没有这个子命令）。
+
+`meta.json`：
+
+```json
+{
+  "format": 1,
+  "layer": "outer",
+  "alg": "RSA-OAEP-SHA256+AES-256-CBC+HMAC-SHA256",
+  "recipient": "<公钥 SHA-256 指纹>",
+  "createdAt": "2026-09-15T08:00:00Z"
+}
+```
+
+解开一层的完整命令（`README-FIRST.txt` 里会带着实际路径生成一遍）：
+
+```bash
+tar xf backup-00000042.rnbk                      # 得到 meta.json key.bin payload.enc payload.mac
+openssl pkeyutl -decrypt -inkey 乙.key \
+  -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+  -in key.bin -out k.bin                         # 会提示输入私钥密码
+ENC=$(dd if=k.bin bs=1 count=32 2>/dev/null | xxd -p -c64)
+MAC=$(dd if=k.bin bs=1 skip=32 count=32 2>/dev/null | xxd -p -c64)
+IV=$( dd if=k.bin bs=1 skip=64 count=16 2>/dev/null | xxd -p -c32)
+openssl dgst -sha256 -mac HMAC -macopt hexkey:$MAC -binary payload.enc | cmp - payload.mac \
+  || { echo "完整性校验失败，这个包被改过或损坏"; exit 1; }
+openssl enc -d -aes-256-cbc -K $ENC -iv $IV -in payload.enc -out inner.tar
+tar xf inner.tar
+```
+
+**先验 MAC 再解密**，顺序不能反——CBC 没有完整性，密文被改一位会解出「大部分正确、中间一段是垃圾」的内容，而那是会被照着执行的恢复步骤。
+
+要求与约束：
+
+- 公钥 **RSA ≥ 3072 位**（4096 推荐）。RSA-OAEP-SHA256 在 3072 位下能封 318 字节，80 字节远在范围内。
+- `payload.enc` 走流式加密与流式上传，不要整包进内存。
+- `xxd` 不是所有发行版都有，`README-FIRST.txt` 里同时给 `od -An -tx1 | tr -d ' \n'` 的写法。
+- **不碰现有的 `buildkeystore.SealTo`**：那是给签名密钥封盒子用的现役函数，动它会让库里已有的盒子全部打不开。这里是另一套格式、另一个用途。
 
 ## 5. 恢复说明必须跟着包走
 
@@ -187,14 +317,7 @@ openssl rsa -in my-recovery.key -pubout -outform DER | openssl dgst -sha256
 
 今天便宜的补偿：`run` 和 `download` 各要求重新输入一次管理员口令，并共用登录限速——会话 TTL 默认 8 小时，一个被偷走的 cookie 否则能拉走全部历史备份。
 
-### 6.1 实现上的四个坑
-
-- **`POST /platform/backup/run` 要加进数据库超时的豁免列表。** 全局中间件给每个请求的 context 上 10 秒上限（`server.go:136`），只豁免以 `/upload`、`/finalize`、`/release-storage/test`、`/download` 结尾的路径（`:363-368`）。产出一个包不可能在 10 秒内完成。
-- **下载按编号，不接受对象键。** 服务端用固定前缀 + 编号自己拼键；`s3Client.Get` 把 key 原样交给 `GetObject`，没有任何前缀约束（`internal/objectstore/s3.go:178-184`），接受外部传键等于开一个任意对象读。
-- **下载这条 GET 要补 Origin 检查。** `authenticate()` 的 Origin 闸只对非安全方法生效（`server.go:492`，`safeMethod` 含 GET），而 `originAllowed` 会回落去查 `tenant_domain` 表（`:448-467`）并回显 `Access-Control-Allow-Credentials: true`。于是「谁能读平台备份」实际由那张表的内容决定。修法：平台组关掉 tenant_domain 回退，只认 `CORS_ORIGINS` 里显式列出的控制台来源。
-- **「测试连接」不能用现成的 `objectstore.Test()`**：它 Put 一个固定探针键再 `HeadObject`（`s3.go:319-336`），既要 Get 权限，固定键在开了 versioning 的桶上还会永久留存。
-
-### 6.2 桶
+### 6.1 桶
 
 - 用**独立的桶和独立凭据**，不要复用产物桶——产物桶凭据泄露不该等于备份泄露。
 - **必须开 versioning**。只给 `PutObject` 不等于安全：`Put` 对已存在的键是覆盖（`s3.go:131-143`），没开 versioning 时覆盖就是删除。「测试连接」要顺带校验 versioning 已开，否则这条论证建在一个没人检查的属性上。
@@ -225,14 +348,157 @@ openssl rsa -in my-recovery.key -pubout -outform DER | openssl dgst -sha256
       打包机会静默生成一把新的（agentkey.go:42-55），日志里区分不出来
    —— 起打包机之前先跑 build-agent print-key 核对指纹
 8) DELETE FROM app_configs WHERE config_key='build.keystore.check'
-   —— 不删这一步，第 9 步看到的是灾难前写下的旧记录（见 §8）
+   —— 不删这一步，第 9 步看到的是灾难前写下的旧记录（见 §11）
 9) 起 build-agent，等每个租户出现 checkedAt 晚于第 1 步时刻的 ok
 10) 跑通一条真实的 APK 构建并入库，才算恢复完成
 ```
 
 **如果两把恢复私钥丢了任意一把**，备份包就是一堆打不开的字节，和没有备份一样。这就是 §2.1 要求每人各存两份的原因。
 
-## 8. 必须同时修的
+## 8. 接口、数据与配置
+
+### 8.1 打包机侧（`/v1/build-agent`，既有的共享令牌鉴权）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/backup-requests` | 有待办返回 `{id, seq, innerRecipient}`，没有返回 **204**。`innerRecipient` 只用于**核对**——打包机封给自己 env 里那一把，两者不一致就拒绝执行并上报原因（§4.2） |
+| GET | `/backup-keystores` | 返回**全部**租户的密封盒子 `[{tenant, version, sealedKeystore, keyAlias}]`。**不能复用现有的 `/keystore-checks`**：它 `LIMIT 20` 且跳过「这一版已验过」的租户（`internal/api/build_keystore_check.go:95-122`），拿它做备份会静默漏租户 |
+| POST | `/backup-requests/:id/payload` | 请求体是 `agent.rnbk` 的原始字节（`application/octet-stream`），上限 512 MiB。服务端只存不读。重复上传同一个 id → 409 |
+| POST | `/backup-requests/:id/fail` | `{reason}`。打包机自己失败时主动上报，不要让服务端干等到超时 |
+
+`/backup-keystores` 的值比现有接口更高（一次拿全量明文盒子），所以它要**单独记审计**（`actor_id='build-agent'`），并且只在有 pending 待办时才返回内容，其余时候返回 403。
+
+### 8.2 控制台侧（`/v1/admin/platform`，`requirePlatformAdmin()`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/backup` | 状态：当前待办（如有）、最近 N 条记录、两把公钥指纹、是否单钥模式、桶是否开了 versioning |
+| POST | `/backup/run` | 建一条待办。已有 pending/running → **409** 并带上那条的 seq。要 `{reason, confirm:true}`（`AGENTS.md:35`），并要求重新输入一次管理员口令（§6） |
+| GET | `/backup/:seq/download` | 下载。**路径以 `/download` 结尾是有意的**——既有的数据库超时中间件正好豁免这个后缀（`server.go:363-368`），不用再改豁免列表 |
+| GET / PUT | `/backup/storage` | 桶的**非机密**字段与状态；凭据和 endpoint 在 env，不落库（§8.3） |
+| POST | `/backup/storage/test` | 只 Put 一个随机探针键，并校验 versioning 已开。**不能用现成的 `objectstore.Test()`**：它 Put 固定键再 `HeadObject`（`internal/objectstore/s3.go:319-336`），既要 Get 权限，固定键在开了 versioning 的桶上还会永久留存 |
+
+`download` 用 `:seq` 而不是对象键：服务端按 §4.5 的规则自己拼键。`s3Client.Get` 把 key 原样交给 `GetObject`、没有任何前缀约束（`s3.go:178-184`），接受外部传键等于开一个任意对象读。
+
+**`download` 这条 GET 要补 Origin 检查**：`authenticate()` 的 Origin 闸只对非安全方法生效（`server.go:492`，`safeMethod` 含 GET），而 `originAllowed` 会回落去查 `tenant_domain` 表（`:448-467`）并回显 `Access-Control-Allow-Credentials: true`。不补的话，「谁能读平台备份」实际由那张表的内容决定。修法：平台组关掉 tenant_domain 回退，只认 `CORS_ORIGINS` 里显式列出的控制台来源；响应带 `Cache-Control: no-store`。
+
+### 8.3 新增配置
+
+**服务端** `/etc/rn-foundation.env`：
+
+| 键 | 校验 |
+|---|---|
+| `BACKUP_RECOVERY_RECIPIENT_INNER` | 甲的 RSA 公钥（PEM）。必须能解析、位数 ≥ 3072 |
+| `BACKUP_RECOVERY_RECIPIENT_OUTER` | 乙的 RSA 公钥（PEM）。同上，且**必须与 INNER 不同**——相同就是 2-of-2 退化成 1，直接拒绝启动 |
+| `BACKUP_BUCKET_ENDPOINT` / `_REGION` / `_BUCKET` / `_PREFIX` | 生产强制 https |
+| `BACKUP_BUCKET_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | 只需要 `s3:PutObject` + `s3:GetObject` + `s3:GetBucketVersioning` |
+| `BACKUP_INTERVAL_HOURS` | 0 = 关闭定时，只留手动。范围 1–168 |
+
+**打包机** `/etc/rn-build-agent.env`：
+
+| 键 | 校验 |
+|---|---|
+| `BUILD_AGENT_RECOVERY_RECIPIENT` | 甲的 RSA 公钥（PEM），≥ 3072 位 |
+
+**失败方向**：打包机侧这个键**缺失或非法时不 fail-closed 启动**——把备份做成构建的单点故障是负收益，而且第一次配置往往正好发生在恢复当天。但它必须**拒绝领备份待办并上报原因**，让控制台上看得见「打包机没配恢复公钥」，而不是静默不备份。服务端侧相反：两把公钥缺失或非法就**拒绝启动**（和 `production` 下那批必填项一起校验，`internal/config/config.go:179-189`）。
+
+三处联动一个都不能少（`AGENTS.md:14`：「少了第二处，这个键对运维就不存在」）：`internal/config/config.go` 读取与逐键校验、`docs/CONFIGURATION.md`、两边的 `.env.example`。**这些正是灾难当天要用的键。**
+
+### 8.4 数据：新建一张 `platform_backups`
+
+#### 复用映射表（`AGENTS.md:99-100`）
+
+| 拟新增 | 结论 | 理由 |
+|---|---|---|
+| 备份运行记录 | **新建表 `platform_backups`** | 它是**新实体**：一次备份运行有生命周期（pending → running → succeeded/failed）、有多个写方（控制台建、打包机认领与上报、服务端收尾）、条数随时间无界增长。`app_configs` 的一行 JSON 装不下多写方 + 无界增长，`audit_events` 只能追加、没法表达在途状态 |
+| 桶配置 | **进 `app_configs(tenant_id=0)`** | 平台级配置的既定去处，自带 `version` 乐观锁与 `updated_by`。只放非机密字段，凭据在 env |
+| 备份历史的审计 | **进 `audit_events`** | 既定去处，`actor_id='system-backup'`。表里那份是运行状态，审计那份是不可篡改的流水，两者用途不同不算重复事实源 |
+
+#### DDL
+
+```sql
+CREATE TABLE platform_backups (
+  id          VARCHAR(80)  NOT NULL          COMMENT '主键，pbk_ 前缀',
+  seq         INT UNSIGNED NOT NULL          COMMENT '编号，全局递增，对象键用它；下载接口按它取，不接受外部传对象键',
+  status      ENUM('pending','running','succeeded','failed') NOT NULL
+                                             COMMENT '状态：pending=已建待办等打包机认领，running=打包机已认领在产出，succeeded=已上传，failed=任一环节失败',
+  trigger_by  ENUM('manual','schedule') NOT NULL
+                                             COMMENT '触发来源：manual=控制台按钮，schedule=定时',
+  requested_by VARCHAR(120) NOT NULL         COMMENT '发起人；定时触发时写 system-backup',
+  reason      VARCHAR(500) NOT NULL          COMMENT '发起原因，手动触发必填，写进审计',
+  claimed_by  VARCHAR(120) NULL              COMMENT '认领的打包机自报标识，只用于排查，不作为鉴权依据；NULL=还没被认领',
+  claimed_at  DATETIME(3)  NULL              COMMENT '认领时间 UTC；NULL=还没被认领',
+  object_key  VARCHAR(512) CHARACTER SET ascii NULL
+                                             COMMENT '对象存储里的键；NULL=还没上传成功',
+  sha256      CHAR(64)     NULL              COMMENT '最终对象的 SHA-256，下载后核对用；NULL=还没上传成功',
+  size_bytes  BIGINT UNSIGNED NULL           COMMENT '最终对象字节数；NULL=还没上传成功',
+  tenant_count INT UNSIGNED NULL             COMMENT '这次备了几个租户的签名密钥，突然变少要人看一眼；NULL=还没产出',
+  failure_reason VARCHAR(500) NULL           COMMENT '失败原因一句话；NULL=没失败',
+  created_at  DATETIME(3)  NOT NULL          COMMENT '创建时间 UTC',
+  updated_at  DATETIME(3)  NOT NULL          COMMENT '更新时间 UTC',
+  PRIMARY KEY (id),
+  UNIQUE KEY ux_platform_backups_seq (seq),
+  KEY ix_platform_backups_status (status, created_at)
+) ENGINE=InnoDB COMMENT='平台备份运行记录：控制台或定时建待办，打包机认领并产出，服务端收尾。只记状态与结果，备份内容本身在对象存储里';
+```
+
+**「不并发」靠一条部分唯一索引不好写**（MySQL 没有 partial index），所以用生成列，和 `build_jobs.live_ota_slot` 同构：
+
+```sql
+ALTER TABLE platform_backups ADD COLUMN live_slot TINYINT UNSIGNED
+  GENERATED ALWAYS AS (CASE WHEN status IN ('pending','running') THEN 1 ELSE NULL END) STORED
+  COMMENT '未结束的备份占位：pending/running 时为 1，其余为 NULL。唯一索引建在它上面，保证同时只有一条在途；MySQL 唯一索引不比较 NULL，所以结束后可以立刻建下一条。由数据库生成，无人写入';
+CREATE UNIQUE INDEX ux_platform_backups_live ON platform_backups (live_slot);
+```
+
+迁移要**幂等**（`addColumnIfMissing` + 查 `information_schema.STATISTICS` 再建索引，模板在 `internal/store/migrations.go:1503-1518`），并且注意 `COMMENT` 里不能出现单引号——集成测试在这上面挡过一次。
+
+`seq` 取 `COALESCE(MAX(seq),0)+1`，和插入在同一个事务里，靠 `ux_platform_backups_seq` 兜并发。
+
+## 9. 测试
+
+**Go 侧**
+
+- 容器格式往返：产出 → 用测试私钥解开 → 逐文件比对内容与 sha256；两层嵌套各验一次。
+- **篡改必须被发现**：把 `payload.enc` 翻一位 → 解开时 MAC 校验失败并**在解密之前**中止。
+- 只有外层私钥时，`server.rnbk` 与 `agent.rnbk` **都打不开**（守住 2-of-2，防止将来有人「顺手」把服务端那部分只封给乙）。
+- `INNER` 与 `OUTER` 配成同一把 → **拒绝启动**。
+- 打包机拿到的 `innerRecipient` 与自己 env 里的不一致 → 拒绝执行并上报，**不产出**。
+- 打包机 env 缺 `BUILD_AGENT_RECOVERY_RECIPIENT` → 照常领构建，但拒绝领备份待办并上报原因。
+- 并发建待办：两个请求同时打 `/backup/run`，只成功一条，另一条 409。
+- 认领超时与产出超时各自把记录判 `failed`。
+- `/backup-keystores` 在没有 pending 待办时返回 403；有待办时返回**全部**租户（造 25 个租户，断言不是 20 条）。
+- `download` 用不存在的 `seq`、别人的 `seq`、带 `..` 的 `seq` → 400/404，且不产生任何对象读。
+- 非平台管理员访问全部备份路由 → 403；`PLATFORM_ADMIN_USERNAMES` 为空 → 403。
+
+**脚本与文档侧**
+
+- `recover.sh` 在一台干净容器里跑通（目标路径已存在时停下来问，不覆盖）。
+- `README-FIRST.txt` 里的命令**逐条复制粘贴能跑**——这条要在 CI 里跑，不能靠人看。
+
+门禁：
+
+```bash
+test -z "$(gofmt -l cmd internal)"
+go vet ./...
+go test -race ./...
+go build ./cmd/server ./cmd/build-agent
+```
+
+## 10. 兼容、发布与回滚
+
+**升级顺序：先服务端，后打包机。** 打包机的请求体过服务端的 `DisallowUnknownFields`，反过来会让新打包机的上报被 400 顶回来（`build-service-2026-09-11.md` 记过一次同样的事故）。
+
+**打包机不升级也不会坏**：它不认识 `/backup-requests` 就永远不会去调，备份待办会走认领超时判 `failed`，构建一切照常。所以服务端可以先上、观察几天。
+
+**回滚**：
+
+- 服务端回滚：待办停在 pending，超时后判 `failed`，无数据损坏。**但要先确认没有打包机已经上报了 payload 而服务端还没收尾**——那条记录会停在 `running`，回滚后没人处理它，需要人工置 `failed`。
+- 打包机回滚：同上，新待办不再被认领。
+- 迁移只增表、增列，没有 down migration（`AGENTS.md:26`：迁移只能向前新增）。真要退表，是手工 `DROP TABLE platform_backups` + `DELETE FROM schema_migrations WHERE version=<N>`，两步都做，漏了账本那一行会让服务端认为迁移已跑过、永远不再补。
+- **已经产出的备份包不受任何回滚影响**——它在对象存储里，格式自描述，用 openssl 就能开。
+
+## 11. 必须同时修的
 
 **服务端能让打包机执行任意代码**——这条不修，§4.2 的「公钥写死在配置里」是绕得开的：攻击者不用改收件人，直接让打包机检出一个带后门的提交，以 `builder` 身份读走 `agent-key` 就行。
 
@@ -246,7 +512,7 @@ openssl rsa -in my-recovery.key -pubout -outform DER | openssl dgst -sha256
 | 打包机公钥的 base64 值全系统没有出口（接口只回指纹，`build_agent_key.go:141-155`；`build-agent` 没有子命令） | 修好上面那条也还是卡住——重新封盒子需要这个值 |
 | 恢复后签名密钥不会重新校验：待验清单跳过「这一版已经验过」的租户（`build_keystore_check.go:95-122`），而恢复场景里数据库一个字没动 | 控制台显示「正常」，看的是灾难前那台机器写下的记录 |
 
-## 9. 怎么证明备份是有效的
+## 12. 怎么证明备份是有效的
 
 **服务端永远无法证明「那两把恢复私钥真的能开」**——它一把都没有。它能做的只有结构自检，而且这个自检比看上去弱得多：现有 `SealTo` 封完调的那次自解（`recipient.go:142`）在真正解密之前就返回了，只做了三个长度断言。
 
@@ -258,34 +524,25 @@ openssl rsa -in my-recovery.key -pubout -outform DER | openssl dgst -sha256
 
 **演练通过之前，不要对外说「已经有备份了」。**
 
-## 10. 落地顺序
+## 13. 落地顺序
 
-1. **修 §8 的四条**（`git_ref`、上传格式、公钥出口、重验）。前三条不修，备份做出来也用不上。
-2. **生成两对恢复密钥**，公钥进两边配置，两把私钥交给两个人、各自再存两份。**在此之前先手工抄一份 `agent-key` 存着**——这是过渡期的保险，十分钟的事。
-3. **打包机侧产出**：收集、解密、打 tar、封给甲的公钥、上报。
-4. **服务端侧**：合并自己那部分、封外层、生成 `README-FIRST.txt` / `RECOVERY.md` / `recover.sh`、上传、状态落库。
-5. **控制台**：配置页、手动按钮、下载、权限门（§6 的四个坑在这一步）。
-6. **定时**：最后上，先用手动按钮跑几天。
+1. **修 §11 的四条**（`git_ref`、上传格式、公钥出口、重验）。前三条不修，备份做出来也用不上。**这一步不依赖本方案其余任何部分，可以立刻开工。**
+2. **生成两对恢复密钥**（§2.2），公钥进两边配置，两把私钥交给两个人、各自再存两份。**在此之前先手工抄一份 `agent-key` 存着**——这是过渡期的保险，十分钟的事。
+3. **打包机侧产出**：轮询待办（§4.4）、拉全量密封盒子、解密、打 tar、封给甲的公钥、上报。接口契约见 §8.1。
+4. **服务端侧**：合并自己那部分、封外层（§4.5/§4.6）、生成 `README-FIRST.txt` / `RECOVERY.md` / `recover.sh`、上传、状态落库。
+5. **控制台**：配置页、手动按钮、下载、权限门。接口契约见 §8.2。
+6. **定时**（`BACKUP_INTERVAL_HOURS`）：最后上，先用手动按钮跑几天。
 7. **三级验证各跑一次**。
 
-门禁：
+门禁与测试清单见 §9，兼容与回滚见 §10。
 
-```bash
-test -z "$(gofmt -l cmd internal)"
-go vet ./...
-go test -race ./...
-go build ./cmd/server ./cmd/build-agent
-```
-
-新增的 env 键必须同时改三处：`internal/config/config.go`（读取 + 逐键校验）、`docs/CONFIGURATION.md`、两边的 `.env.example`。`AGENTS.md:14`：「少了第二处，这个键对运维就不存在」——而这些正是灾难当天要用的键。
-
-## 11. 不做什么
+## 14. 不做什么
 
 - **数据库备份**：不在范围内。
 - **产物文件**（APK / OTA 包）：它们在远端对象存储，不随打包机一起死，而且不是机密。防桶丢失靠桶自己的 versioning 与跨区复制。
 - **由打包机把密钥「转封」给服务端指定的新收件人**：谁能往收件人列表里写一行，谁就能让打包机把密钥交出来。这里的做法是把收件人写死在两边各自的 root 配置里（§4.2），不给服务端任何指定权。
 
-## 12. 已知遗留
+## 15. 已知遗留
 
 - **`STORAGE_MASTER_KEY` 没有轮换机制**（`OPERATIONS_AND_RELEASE.md:311` 明确要求先实现逐版本解密与重加密，至今未做）。它在备份包里，所以桶的保留期就是它历史影响范围的上限。
 - **恢复密钥轮换**：换任意一把都要改对应机器的配置、重新产出一份备份、并删掉旧备份（旧备份仍然对旧私钥有效）。要写进运维手册。
