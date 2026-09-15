@@ -117,6 +117,9 @@ type auditEvent struct {
 }
 
 func New(cfg config.Config, storage *store.Store) http.Handler {
+	// 清掉上一次进程留下的备份暂存。不清的话，SIGKILL 或崩溃之后那些内层密文会
+	// 一直留在磁盘上；而且残留会让「两份都到齐了吗」这个判断读到上一次的文件。
+	ResetBackupStaging()
 	if cfg.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -225,6 +228,12 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	agent.POST("/public-key", s.registerBuildAgentKey)
 	// 备份签名公钥。和上面那把 X25519 是两把不同算法、不同用途的钥匙（见 backup_signing_key.go）
 	agent.POST("/backup-signing-key", s.registerBackupSigningKey)
+	// 备份：认领是 POST 不是 GET——它会改状态，而 safeMethod 把 GET 当安全方法，
+	// Origin 闸对它完全不生效，何况任何客户端和代理都会对 GET 自动重试
+	agent.POST("/backup-requests/claim", s.claimBackupRequest)
+	agent.GET("/backup-keystores", s.backupKeystores)
+	agent.POST("/backup-requests/:id/payload", s.receiveBackupPayload)
+	agent.POST("/backup-requests/:id/fail", s.failBackupRequest)
 	agent.GET("/keystore-checks", s.pendingKeystoreChecks)
 	agent.POST("/keystore-checks", s.reportKeystoreCheck)
 	// 图标一张一张取，不塞进领取响应——那条响应在代理那边有 1 MiB 上限，
