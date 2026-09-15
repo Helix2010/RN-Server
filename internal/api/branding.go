@@ -347,6 +347,20 @@ func (s *server) prepareBrandingAssets(ctx context.Context, tenant string, value
 	return nil
 }
 
+// brandingCopy 取启动页文案，但"没翻译"不当文案用。compiledMessages 对没有内容的
+// 键返回**键名本身**——那是管理端列表里的缺失标记，把 "launch.title" 直接铺到
+// 启动页上比空着更糟。返回空串，App 侧会退到它自己那个包的名字
+// （appRuntime.appName，来源是 tenants/<slug>/tenant.json 的 appName）。
+//
+// 字段仍然下发（空串是合法值）：App 的 schema 里 launch.title 是 z.string() 非空，
+// 少一个字段会让现网所有安装解析失败。
+func brandingCopy(messages map[string]string, key string) string {
+	if value, ok := messages[key]; ok && value != key {
+		return value
+	}
+	return ""
+}
+
 func resolveBranding(config map[string]any, locale, fallback string, messages map[string]string) map[string]any {
 	launch := object(config["launch"])
 	defaultVisual := object(launch["defaultVisual"])
@@ -362,7 +376,7 @@ func resolveBranding(config map[string]any, locale, fallback string, messages ma
 	return map[string]any{
 		"schemaVersion": config["schemaVersion"], "version": config["version"], "enabled": config["enabled"],
 		"selectedLocale": locale, "fallbackLocale": fallback,
-		"launch":      map[string]any{"enabled": launch["enabled"], "minDisplayMs": launch["minDisplayMs"], "maxDisplayMs": legacyLaunchMaxDisplayMs, "animation": launch["animation"], "title": messages[titleKey], "subtitle": messages[subtitleKey], "visuals": visuals},
+		"launch":      map[string]any{"enabled": launch["enabled"], "minDisplayMs": launch["minDisplayMs"], "maxDisplayMs": legacyLaunchMaxDisplayMs, "animation": launch["animation"], "title": brandingCopy(messages, titleKey), "subtitle": brandingCopy(messages, subtitleKey), "visuals": visuals},
 		"cachePolicy": config["cachePolicy"],
 	}
 }

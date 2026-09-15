@@ -68,6 +68,7 @@ var migrations = []migration{
 	{version: 49, name: "referral_code_backfill", apply: referralCodeBackfillMigration},
 	{version: 50, name: "referral_indexes", apply: referralIndexesMigration},
 	{version: 51, name: "tenant_neutral_platform_brand_copy", apply: tenantNeutralPlatformBrandCopyMigration},
+	{version: 52, name: "drop_platform_app_name_copy", apply: dropPlatformAppNameCopyMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -978,20 +979,40 @@ func normalizeRNAppLocalizationKeysMigration(ctx context.Context, db *sql.DB) er
 // tenantNeutralPlatformBrandCopyMigration 把**平台全局**（tenant_id=0）文案里的
 // 租户品牌名清空。早期的文案迁移（13、15）把当时唯一那个租户的名字写成了平台默认值：
 // launch.title 与 app.name 全局行都是「AnyFun」。全局行是所有没自己配的租户继承的
-// 那一份，于是任何新租户的启动页和关于页都会显示别人的品牌。
+// 那一份，而 bootstrap 的 branding.launch.title 就是取 launch.title 这个键——任何
+// 新租户的启动页和关于页都会显示别人的品牌。
 //
-// 清成空串而不是删行：bootstrap 的 branding.launch.title 是
-// `messages[titleKey]`，键不存在就下发 null，而 App 侧 schema 是
-// `z.string()` 非空——现网所有安装会直接解析失败。空串是合法的 string，
-// App 拿到空值后退到自己这个包的名字（appRuntime.appName，来源是
-// tenants/<slug>/tenant.json 的 appName），那对每个包都必然是对的那个名字。
+// 清成空串而不是删行：键不存在会让 branding.launch.title 下发 null，而 App 侧
+// schema 是 z.string() 非空，现网所有安装会直接解析失败。
 //
 // 只动 tenant_id=0。租户自己写的覆盖是运营的选择，不碰。
+//
+// 后续：清成空串之后 compiledMessages 会把**键名本身**当缺失标记下发，界面上就是
+// 一行「launch.title」。launch.title 那一侧由 resolveBranding 的 brandingCopy 拦掉；
+// app.name 那一侧的行由迁移 52 删掉（见那里的说明）。
 func tenantNeutralPlatformBrandCopyMigration(ctx context.Context, db *sql.DB) error {
 	for _, key := range []string{"launch.title", "app.name"} {
 		if _, err := db.ExecContext(ctx, "UPDATE language_document SET content='',mtime=UTC_TIMESTAMP(3) WHERE tenant_id=0 AND `key`=? AND type=14 AND content<>''", key); err != nil {
 			return fmt.Errorf("clear platform brand copy %s: %w", key, err)
 		}
+	}
+	return nil
+}
+
+// dropPlatformAppNameCopyMigration 删掉 app.name 的全局行。
+//
+// 迁移 51 把它清成了空串，但 compiledMessages 对没有内容的键返回**键名本身**
+// （那是管理端列表里的缺失标记），于是 bootstrap 下发 messages["app.name"]="app.name"，
+// **已装机的旧版本包**还在 t("app.name") 上取值，界面上就显示字面量「app.name」。
+// 删掉之后服务端根本不下发这个键，旧包用自己内置的那份，对现有租户仍然是对的。
+//
+// 为什么 app.name 能删、launch.title 不能：已经没有代码读 app.name 了（App 侧的
+// 显示位置都改成读原生应用名，服务端只有邀请落地页读，而它读的是 app_configs
+// 那一份）；launch.title 还要留着让运营在管理端编辑，而且它要作为
+// branding.launch.title 下发，少一个字段会让现网安装解析失败。
+func dropPlatformAppNameCopyMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, "DELETE FROM language_document WHERE tenant_id=0 AND `key`='app.name' AND type=14"); err != nil {
+		return fmt.Errorf("drop platform app name copy: %w", err)
 	}
 	return nil
 }
