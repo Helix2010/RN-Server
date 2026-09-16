@@ -7,8 +7,8 @@ import (
 	"strings"
 )
 
-// 日志尾部要进数据库、进管理端界面，而 Gradle 在失败时很乐意把整条命令行打出来，
-// 里面就有 keystore 口令。上报前逐行过一遍。
+// 日志尾部要进数据库、进管理端界面。控制进程自己的环境里有本机令牌；执行进程的环境是白名单
+// 构造的、不含它，但构建输出是不可信文本，上报前仍逐行把控制进程知道的机密值替换掉。
 //
 // 这里挡的是**值**而不是键名：我们知道这台机器上哪些环境变量是机密，直接把它们的
 // 具体取值替换掉，比去猜"哪种写法算是口令"可靠得多。
@@ -17,7 +17,7 @@ const redacted = "***"
 
 var secretEnvPattern = regexp.MustCompile(`(?i)(PASSWORD|PASSPHRASE|SECRET|TOKEN|PRIVATE_KEY|KEYSTORE_PASS)`)
 
-// secretValues 收集本进程环境里所有机密变量的取值，长的排前面——先替换长的，
+// secretValues 收集环境里所有机密变量的取值，长的排前面——先替换长的，
 // 否则一个短值可能把长值切成两半而留下后半段。
 func secretValues(environ []string) []string {
 	values := []string{}
@@ -36,27 +36,9 @@ type redactor struct{ values []string }
 
 func newRedactor() *redactor { return &redactor{values: secretValues(os.Environ())} }
 
-// add 登记一个运行时才知道的机密。keystore 口令是从盒子里开出来的，不在进程
-// 环境里——不登记它，Gradle 一旦把命令行打出来，口令就直接进了数据库和管理端界面。
-func (r *redactor) add(value string) {
-	if len(value) < 6 {
-		return
-	}
-	r.values = append(r.values, value)
-	sort.Slice(r.values, func(i, j int) bool { return len(r.values[i]) > len(r.values[j]) })
-}
-
 func (r *redactor) line(text string) string {
 	for _, value := range r.values {
 		text = strings.ReplaceAll(text, value, redacted)
 	}
 	return text
-}
-
-func (r *redactor) lines(input []string) []string {
-	out := make([]string, len(input))
-	for i, line := range input {
-		out[i] = r.line(line)
-	}
-	return out
 }

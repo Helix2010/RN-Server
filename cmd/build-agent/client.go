@@ -4,110 +4,74 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/Helix2010/RN-Server/internal/buildkeystore"
+	"github.com/Helix2010/RN-Server/signing/provenance"
 )
 
-type claimedJob struct {
-	ID         string `json:"id"`
-	TenantSlug string `json:"tenantSlug"`
-	// TenantDirectory 是仓库里 tenants/ 下的目录名。它与 TenantSlug 是两套命名，
-	// 代理只用这一个去拼路径。
-	TenantDirectory string `json:"tenantDirectory"`
-	Platform        string `json:"platform"`
-	// Kind 是 "apk" 或 "ota"。热更新任务不带签名密钥——它不需要，也就不该拿到。
-	Kind          string `json:"kind"`
-	BaseReleaseID string `json:"baseReleaseId"`
-	Channel       string `json:"channel"`
-	ApplyStrategy string `json:"applyStrategy"`
-	// RuntimeVersion 是基线安装包的 runtime：热更新包必须对准它，否则一台设备都收不到。
-	RuntimeVersion       string `json:"runtimeVersion"`
-	GitRef               string `json:"gitRef"`
-	Version              string `json:"version"`
-	BuildNumber          int    `json:"buildNumber"`
-	OTACertificatePEM    string `json:"otaCertificatePem"`
-	OTACertificateSHA256 string `json:"otaCertificateSha256"`
-	// SealedKeystore 是运维用自己的口令封的盒子，服务端只是转交，打不开它。
-	SealedKeystore *buildkeystore.Sealed `json:"sealedKeystore"`
-	KeyAlias       string                `json:"keyAlias"`
-	// GoogleServicesJSON 不是机密（它原样编进每个 APK），但按租户不同，所以也随
-	// 任务下发——这样新加一台打包机仍然只需要一个封装口令。
-	GoogleServicesJSON string `json:"googleServicesJson"`
-	// Icons 是这个租户要用的启动图标**文件名**。内容不在这里——一张 2048 见方的
-	// PNG 将近 1MB，四张塞进这条响应会顶爆读取上限（见 downloadIcon）
-	Icons []string `json:"icons"`
-	// TenantFile 是服务端合成的 tenants/<目录>/tenant.json。它取代了仓库里那份
-	// 提交上去的文件——开一个新租户不该需要改代码。代理仍然校验字段（tenantfile.go）。
-	TenantFile json.RawMessage `json:"tenantFile"`
+// 服务端错误码（Problem Details 的 code）里构建机要分辨的几个。
+const (
+	codeAttemptStale        = "BUILD_ATTEMPT_STALE"
+	codeBuilderHasActiveJob = "BUILDER_HAS_ACTIVE_JOB"
+	codeKeyNotAccepted      = "MACHINE_KEY_NOT_ACCEPTED"
+	codeKeyRotationUnproven = "MACHINE_KEY_ROTATION_UNPROVEN"
+
+	headerMachineToken = "x-machine-token"
+	headerBuildAttempt = "x-build-attempt"
+
+	maxJSONResponseBytes      = 1 << 20
+	uploadRequestTimeout      = 30 * time.Minute
+	defaultHTTPRequestTimeout = 30 * time.Second
+)
+
+// apiError 是服务端给出的明确拒绝（或 5xx）。
+type apiError struct {
+	Path   string
+	Status int
+	Code   string
+	Detail string
 }
 
-// APIBaseURL / ApplicationID 从服务端合成的身份文件里取。代理不自己拼这些值：
-// 它们决定设备此后跟谁说话，唯一来源是服务端。
-func (j claimedJob) APIBaseURL() string    { return j.tenantField("apiBaseUrl") }
-func (j claimedJob) ApplicationID() string { return j.tenantField("applicationId") }
-
-func (j claimedJob) tenantField(name string) string {
-	var fields map[string]any
-	if json.Unmarshal(j.TenantFile, &fields) != nil {
-		return ""
+func (e *apiError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("%s returned %d %s: %s", e.Path, e.Status, e.Code, truncate(e.Detail, 300))
 	}
-	value, _ := fields[name].(string)
-	return value
+	return fmt.Sprintf("%s returned %d: %s", e.Path, e.Status, truncate(e.Detail, 300))
 }
 
-type client struct {
-	cfg  config
-	http *http.Client
+func errorCode(err error) string {
+	var api *apiError
+	if errors.As(err, &api) {
+		return api.Code
+	}
+	return ""
 }
 
-func newClient(cfg config) *client {
-	return &client{cfg: cfg, http: &http.Client{Timeout: 30 * time.Second}}
-}
+// isStale：服务端说这次认领已经不是这台机器的了（回收、取消、被重派）。立即中止，不再上报。
+func isStale(err error) bool { return errorCode(err) == codeAttemptStale }
 
-func (c *client) post(ctx context.Context, path string, body any, out any) (int, error) {
-	var reader io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return 0, err
-		}
-		reader = bytes.NewReader(raw)
+func newAPIError(path string, status int, payload []byte) error {
+	var problem struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.Server+path, reader)
-	if err != nil {
-		return 0, err
+	_ = json.Unmarshal(payload, &problem)
+	detail := problem.Detail
+	if detail == "" {
+		detail = string(payload)
 	}
-	request.Header.Set("content-type", "application/json")
-	request.Header.Set("x-build-agent-token", c.cfg.Token)
-	response, err := c.http.Do(request)
-	if err != nil {
-		return 0, retryLater{err}
-	}
-	defer response.Body.Close()
-	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if response.StatusCode >= 400 {
-		// 错误正文里不会有机密，但也不需要原样带出去——只留状态码和一小段
-		return response.StatusCode, classify(response.StatusCode,
-			fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300)))
-	}
-	if out != nil && len(payload) > 0 {
-		if err := json.Unmarshal(payload, out); err != nil {
-			// 半截正文多半是链路上出的事（反代截断、连接断在中途），下一次多半就好了
-			return response.StatusCode, retryLater{fmt.Errorf("%s returned a body we cannot read: %w", path, err)}
-		}
-	}
-	return response.StatusCode, nil
+	return classify(status, &apiError{Path: path, Status: status, Code: problem.Code, Detail: detail})
 }
 
 // classify 决定一个 HTTP 失败要不要再试：5xx 和 429 是"现在不行"，4xx 是"不行"。
@@ -118,70 +82,346 @@ func classify(status int, err error) error {
 	return err
 }
 
-// get 和 post 走同一套鉴权与错误处理，只是没有请求体。
-func (c *client) get(ctx context.Context, path string, out any) (int, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.Server+path, nil)
-	if err != nil {
-		return 0, err
+// claimedJob 是领取结果里构建机要用的字段。领取结果还带着任务视图的其它字段，这里不建模；
+// 但签名材料一类的字段出现就整条拒绝（见 forbiddenClaimField）。
+type claimedJob struct {
+	ID               string `json:"id"`
+	Attempt          int    `json:"attempt"`
+	ClaimedMachineID string `json:"claimedMachineId"`
+	TenantSlug       string `json:"tenantSlug"`
+	// TenantDirectory 是仓库里 tenants/ 下的目录名，与 TenantSlug 是两套命名，只用它拼路径。
+	TenantDirectory    string          `json:"tenantDirectory"`
+	Platform           string          `json:"platform"`
+	Kind               string          `json:"kind"`
+	BaseReleaseID      string          `json:"baseReleaseId"`
+	Channel            string          `json:"channel"`
+	ApplyStrategy      string          `json:"applyStrategy"`
+	RuntimeVersion     string          `json:"runtimeVersion"`
+	GitRef             string          `json:"gitRef"`
+	Version            string          `json:"version"`
+	BuildNumber        int             `json:"buildNumber"`
+	OTACertificatePEM  string          `json:"otaCertificatePem"`
+	GoogleServicesJSON string          `json:"googleServicesJson"`
+	Icons              []string        `json:"icons"`
+	TenantFile         json.RawMessage `json:"tenantFile"`
+}
+
+// APIBaseURL / ApplicationID / PackageName 从服务端合成的身份文件里取。
+func (j claimedJob) APIBaseURL() string    { return j.tenantField("apiBaseUrl") }
+func (j claimedJob) ApplicationID() string { return j.tenantField("applicationId") }
+func (j claimedJob) PackageName() string   { return j.tenantField("androidPackage") }
+
+func (j claimedJob) tenantField(name string) string {
+	var fields map[string]any
+	if json.Unmarshal(j.TenantFile, &fields) != nil {
+		return ""
 	}
-	request.Header.Set("x-build-agent-token", c.cfg.Token)
+	value, _ := fields[name].(string)
+	return value
+}
+
+// claimResult 是一次领取的结果：领到任务、领到但拒收的任务、本机已有在途任务，或者都没有（无活）。
+type claimResult struct {
+	Job *claimedJob
+	// Refused 是领到了、但领取结果本身不合规（带签名材料字段、字段类型不对）的任务
+	Refused *refusedClaim
+	// Active 是服务端说本机还有一条 claimed/running 的任务（409 BUILDER_HAS_ACTIVE_JOB）
+	Active *activeJobRef
+}
+
+type refusedClaim struct {
+	JobID   string
+	Attempt int
+	Reason  string
+}
+
+type activeJobRef struct {
+	JobID   string `json:"jobId"`
+	Attempt int    `json:"attempt"`
+}
+
+type client struct {
+	server string
+	token  string
+	http   *http.Client
+	upload *http.Client
+}
+
+func newClient(cfg config) *client {
+	return &client{
+		server: cfg.Server,
+		token:  cfg.MachineToken,
+		http:   &http.Client{Timeout: defaultHTTPRequestTimeout},
+		// 几十上百兆的 PUT 经过反代链路时 h2 的流错误比 1.1 常见得多，这条路径也没有
+		// 任何需要多路复用的理由，所以强制 HTTP/1.1。
+		upload: &http.Client{
+			Timeout:   uploadRequestTimeout,
+			Transport: &http.Transport{ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}},
+		},
+	}
+}
+
+// send 发一个带本机令牌（以及可选编号）的 JSON 请求，读回不超过 1 MiB 的正文。
+func (c *client) send(ctx context.Context, method, path string, attempt int, body any) (int, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
+		}
+		reader = bytes.NewReader(raw)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, c.server+path, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if body != nil {
+		request.Header.Set("content-type", "application/json")
+	}
+	c.authorize(request, attempt)
 	response, err := c.http.Do(request)
 	if err != nil {
-		return 0, retryLater{err}
+		return 0, nil, retryLater{err}
 	}
 	defer response.Body.Close()
-	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if response.StatusCode >= 400 {
-		return response.StatusCode, classify(response.StatusCode,
-			fmt.Errorf("%s returned %d: %s", path, response.StatusCode, truncate(string(payload), 300)))
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes+1))
+	if err != nil {
+		return response.StatusCode, nil, retryLater{fmt.Errorf("%s: reading the response failed: %w", path, err)}
 	}
-	if out != nil && len(payload) > 0 {
-		if err := json.Unmarshal(payload, out); err != nil {
-			return response.StatusCode, retryLater{fmt.Errorf("%s returned a body we cannot read: %w", path, err)}
+	if len(payload) > maxJSONResponseBytes {
+		return response.StatusCode, nil, fmt.Errorf("%s returned more than %d bytes", path, maxJSONResponseBytes)
+	}
+	if response.StatusCode >= 400 {
+		return response.StatusCode, payload, newAPIError(path, response.StatusCode, payload)
+	}
+	return response.StatusCode, payload, nil
+}
+
+func (c *client) authorize(request *http.Request, attempt int) {
+	request.Header.Set(headerMachineToken, c.token)
+	if attempt > 0 {
+		request.Header.Set(headerBuildAttempt, strconv.Itoa(attempt))
+	}
+}
+
+func decodeInto(path string, payload []byte, out any) error {
+	if err := json.Unmarshal(payload, out); err != nil {
+		// 半截正文多半是链路上出的事（反代截断、连接断在中途），下一次多半就好了
+		return retryLater{fmt.Errorf("%s returned a body we cannot read: %w", path, err)}
+	}
+	return nil
+}
+
+func jobPath(jobID, suffix string) string {
+	return "/v1/build-agent/jobs/" + url.PathEscape(jobID) + suffix
+}
+
+// keyRegistration 是 POST /v1/build-agent/public-key 的回答。MachineID 不在约定 5.2 的
+// 响应里：服务端带了才能换钥（换钥签名要签机器 id），没带时换钥会明确拒绝执行。
+type keyRegistration struct {
+	Status                 string `json:"status"`
+	PublicKeySHA256        string `json:"publicKeySha256"`
+	PendingPublicKeySHA256 string `json:"pendingPublicKeySha256"`
+	MachineID              string `json:"machineId"`
+}
+
+func (c *client) registerKey(ctx context.Context, publicKeyBase64 string, rotationSignature []byte) (keyRegistration, error) {
+	body := map[string]any{"publicKey": publicKeyBase64, "rotationSignature": nil}
+	if rotationSignature != nil {
+		body["rotationSignature"] = base64.StdEncoding.EncodeToString(rotationSignature)
+	}
+	const path = "/v1/build-agent/public-key"
+	var out keyRegistration
+	_, payload, err := c.send(ctx, http.MethodPost, path, 0, body)
+	if err != nil {
+		return out, err
+	}
+	return out, decodeInto(path, payload, &out)
+}
+
+// claim 领一条任务。队列空时服务端给 204。
+func (c *client) claim(ctx context.Context, platforms []string) (claimResult, error) {
+	const path = "/v1/build-agent/claim"
+	status, payload, err := c.send(ctx, http.MethodPost, path, 0, map[string]any{
+		"platforms": platforms, "kinds": []string{"apk", "ota"},
+	})
+	if errorCode(err) == codeBuilderHasActiveJob {
+		var active activeJobRef
+		if json.Unmarshal(payload, &active) != nil || active.JobID == "" || active.Attempt < 1 {
+			return claimResult{}, fmt.Errorf("%s said this machine has an active job but did not say which one", path)
+		}
+		return claimResult{Active: &active}, nil
+	}
+	if err != nil {
+		return claimResult{}, err
+	}
+	if status == http.StatusNoContent || len(bytes.TrimSpace(payload)) == 0 {
+		return claimResult{}, nil
+	}
+	return parseClaim(payload)
+}
+
+// parseClaim 解析领取结果。签名材料一类的字段出现，这条任务就不做——服务端按约定不会
+// 下发它们，出现了就是服务端被改过或者版本不对，照做等于把签名材料写进构建目录。
+func parseClaim(payload []byte) (claimResult, error) {
+	var raw any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return claimResult{}, retryLater{fmt.Errorf("the claim response is not JSON: %w", err)}
+	}
+	if _, ok := raw.(map[string]any); !ok {
+		return claimResult{}, errors.New("the claim response is not a JSON object")
+	}
+	var ids struct {
+		ID      string `json:"id"`
+		Attempt int    `json:"attempt"`
+	}
+	_ = json.Unmarshal(payload, &ids)
+	if field := forbiddenClaimField(raw, ""); field != "" {
+		return claimResult{Refused: &refusedClaim{JobID: ids.ID, Attempt: ids.Attempt,
+			Reason: "the claim response carries signing material (" + field + "); build machines never receive signing keys, so this job is refused"}}, nil
+	}
+	var job claimedJob
+	if err := json.Unmarshal(payload, &job); err != nil {
+		return claimResult{Refused: &refusedClaim{JobID: ids.ID, Attempt: ids.Attempt,
+			Reason: "the claim response has fields of the wrong type"}}, nil
+	}
+	return claimResult{Job: &job}, nil
+}
+
+// forbiddenClaimField 返回领取结果里第一个像签名材料的字段路径（递归）。
+func forbiddenClaimField(value any, prefix string) string {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			lower := strings.ToLower(key)
+			for _, word := range []string{"keystore", "keyalias", "password", "passphrase", "secret", "privatekey", "p12"} {
+				if strings.Contains(lower, word) {
+					return prefix + key
+				}
+			}
+			if found := forbiddenClaimField(child, prefix+key+"."); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if found := forbiddenClaimField(child, prefix); found != "" {
+				return found
+			}
 		}
 	}
-	return response.StatusCode, nil
+	return ""
 }
 
-// claim 返回 (任务, 有没有任务, 错误)。队列空时服务端给 204。
-func (c *client) claim(ctx context.Context) (claimedJob, bool, error) {
-	var job claimedJob
-	status, err := c.post(ctx, "/v1/build-agent/claim", map[string]any{
-		"agent": c.cfg.Name, "platforms": c.cfg.Platforms,
-	}, &job)
+func (c *client) heartbeat(ctx context.Context, job claimedJob, logTail []string) error {
+	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/heartbeat"), job.Attempt, map[string]any{"logTail": nonNil(logTail)})
+	return err
+}
+
+func (c *client) fail(ctx context.Context, jobID string, attempt int, reason, commit string, logTail []string) error {
+	_, _, err := c.send(ctx, http.MethodPost, jobPath(jobID, "/fail"), attempt, map[string]any{
+		"failureReason": truncate(reason, 1000), "commitSha": commit, "logTail": nonNil(logTail),
+	})
+	return err
+}
+
+// complete 只给热更新任务用：安装包任务以 /built 结束。
+func (c *client) complete(ctx context.Context, job claimedJob, commit, digest, releaseID string, logTail []string) error {
+	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/complete"), job.Attempt, map[string]any{
+		"commitSha": commit, "artifactSha256": digest, "releaseId": releaseID, "logTail": nonNil(logTail),
+	})
+	return err
+}
+
+// built 交付出处声明，安装包任务转「待签名」。
+func (c *client) built(ctx context.Context, job claimedJob, commit, nativeFingerprint string, envelope provenance.Envelope, logTail []string) error {
+	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/built"), job.Attempt, map[string]any{
+		"commitSha":         commit,
+		"nativeFingerprint": nativeFingerprint,
+		"provenance":        map[string]string{"statement": envelope.Statement, "signature": envelope.Signature},
+		"logTail":           nonNil(logTail),
+	})
+	return err
+}
+
+func nonNil(lines []string) []string {
+	if lines == nil {
+		return []string{}
+	}
+	return lines
+}
+
+// uploadStream 把控制进程自己的副本以 octet-stream 流式 PUT 到服务端，核对服务端算出的 sha256 与大小。
+func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path, wantSHA256 string, wantSize int64) error {
+	apiPath := jobPath(job.ID, suffix)
+	file, err := os.Open(path)
 	if err != nil {
-		return job, false, err
+		return err
 	}
-	if status == http.StatusNoContent || job.ID == "" {
-		return job, false, nil
+	defer file.Close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.server+apiPath, file)
+	if err != nil {
+		return err
 	}
-	return job, true, nil
-}
-
-func (c *client) heartbeat(ctx context.Context, id string, logTail []string) error {
-	_, err := c.post(ctx, "/v1/build-agent/jobs/"+id+"/heartbeat", map[string]any{"logTail": logTail}, nil)
-	return err
-}
-
-func (c *client) complete(ctx context.Context, id, commit, digest, releaseID string, logTail []string) error {
-	_, err := c.post(ctx, "/v1/build-agent/jobs/"+id+"/complete", map[string]any{
-		"commitSha": commit, "artifactSha256": digest, "releaseId": releaseID, "logTail": logTail,
-	}, nil)
-	return err
-}
-
-func (c *client) fail(ctx context.Context, id, reason, commit string, logTail []string) error {
-	_, err := c.post(ctx, "/v1/build-agent/jobs/"+id+"/fail", map[string]any{
-		"failureReason": reason, "commitSha": commit, "logTail": logTail,
-	}, nil)
-	return err
-}
-
-func truncate(text string, max int) string {
-	if len(text) <= max {
-		return text
+	request.ContentLength = wantSize
+	// GetBody 让传输层需要重发时能从头再读一遍
+	request.GetBody = func() (io.ReadCloser, error) { return os.Open(path) }
+	request.Header.Set("content-type", "application/octet-stream")
+	c.authorize(request, job.Attempt)
+	response, err := c.upload.Do(request)
+	if err != nil {
+		return retryLater{err}
 	}
-	return text[:max] + "…"
+	defer response.Body.Close()
+	payload, _ := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes))
+	if response.StatusCode >= 400 {
+		return newAPIError(apiPath, response.StatusCode, payload)
+	}
+	var stored struct {
+		SHA256 string `json:"sha256"`
+		Size   int64  `json:"size"`
+	}
+	if err := decodeInto(apiPath, payload, &stored); err != nil {
+		return err
+	}
+	if stored.SHA256 != wantSHA256 || stored.Size != wantSize {
+		// 传的就是这份字节：对不上是链路或服务端的问题，重传一次
+		return retryLater{fmt.Errorf("%s stored %d bytes with sha256 %s, but %d bytes with sha256 %s were sent",
+			apiPath, stored.Size, truncate(stored.SHA256, 64), wantSize, wantSHA256)}
+	}
+	return nil
+}
+
+// downloadIcon 取一张图标，直接写进检出，不经过内存里的字符串。
+func (c *client) downloadIcon(ctx context.Context, job claimedJob, name, target string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.server+jobPath(job.ID, "/icons/"+url.PathEscape(name)), nil)
+	if err != nil {
+		return err
+	}
+	c.authorize(request, job.Attempt)
+	response, err := c.http.Do(request)
+	if err != nil {
+		return retryLater{err}
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
+		return newAPIError("icon "+name, response.StatusCode, payload)
+	}
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
+	written, err := io.Copy(file, io.LimitReader(response.Body, 12<<20+1))
+	if err != nil {
+		return err
+	}
+	if written > 12<<20 {
+		return fmt.Errorf("icon %s is larger than 12 MiB", name)
+	}
+	return nil
 }
 
 type uploadTicket struct {
@@ -195,215 +435,24 @@ type uploadTicket struct {
 	} `json:"upload"`
 }
 
-// uploadArtifact 把产物和它的 SBOM 传回服务端，返回落成的发布记录 id。
-//
-// 走的是与人工上传**完全相同**的入库路径——APK 身份解析、ETag 固定、签名指纹
-// 比对都在服务端那一侧，代理不复制其中任何一条。
-//
-// SBOM 必须在建发布记录**之前**传完：那条记录上要写它的对象键，不然产物入了库而
-// 清单没有归属，等于回到"扫过但没人知道扫的是哪个包"。
-// 三步各自重试，而不是整段重来：包已经传上去了却卡在建记录那一步时，重来一遍要把
-// 几十兆再传一次，还会在对象存储里多留一份没人引用的副本。
-//
-// 仍然可能多留一份：PUT 落了地而响应丢在回来的路上，重试就是第二次上传。这一侧无
-// 解——票据是一次性的，服务端也没法凭空知道那次传成没传成——只是把窗口收到最小。
-func (c *client) uploadArtifact(ctx context.Context, jobID, path, sbomPath, fingerprint string, buf *logBuffer) (string, error) {
-	artifactToken := ""
-	err := withRetry(ctx, buf, "artifact upload", 6, func(ctx context.Context) error {
-		token, err := c.putFile(ctx, jobID, path, "application/vnd.android.package-archive")
-		artifactToken = token
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-	sbomToken := ""
-	if sbomPath != "" {
-		err := withRetry(ctx, buf, "SBOM upload", 6, func(ctx context.Context) error {
-			token, err := c.putFile(ctx, jobID, sbomPath, "application/vnd.cyclonedx+json")
-			sbomToken = token
-			return err
+// uploadOTAPackage 把热更新包传回服务端，返回落成的修订 id。base、channel、生效方式都取
+// 任务行上的值——构建机只送它确实知道的东西（包本身和这次检出的提交）。
+func (c *client) uploadOTAPackage(ctx context.Context, job claimedJob, path string, size int64, commit string, buf *logBuffer) (string, error) {
+	token := ""
+	if err := withRetry(ctx, buf, "OTA upload", 6, func(ctx context.Context) error {
+		var ticket uploadTicket
+		ticketPath := jobPath(job.ID, "/ota-uploads")
+		_, payload, err := c.send(ctx, http.MethodPost, ticketPath, job.Attempt, map[string]any{
+			"fileName": filepath.Base(path), "size": size,
 		})
 		if err != nil {
-			return "", fmt.Errorf("the SBOM could not be uploaded: %w", err)
+			return err
 		}
-	}
-	// 只送 token：平台、版本、build 号和发布说明都取任务行上的值，代理没有理由
-	// 知道该写什么
-	var release struct {
-		Release struct {
-			ID string `json:"id"`
-		} `json:"release"`
-	}
-	if err := withRetry(ctx, buf, "release creation", 6, func(ctx context.Context) error {
-		_, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/release", map[string]any{
-			"artifactToken":     artifactToken,
-			"sbomToken":         sbomToken,
-			"nativeFingerprint": fingerprint,
-		}, &release)
-		return err
-	}); err != nil {
-		return "", err
-	}
-	if release.Release.ID == "" {
-		return "", errors.New("the server created a release but did not say which one")
-	}
-	return release.Release.ID, nil
-}
-
-// putFile 领一张上传票据把一个文件传上去，返回可以用来建发布记录的 artifact token。
-func (c *client) putFile(ctx context.Context, jobID, path, contentType string) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-	var ticket uploadTicket
-	if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/artifact-uploads", map[string]any{
-		"fileName": filepath.Base(path), "contentType": contentType, "size": info.Size(),
-	}, &ticket); err != nil {
-		return "", err
-	}
-	if err := c.putTo(ctx, ticket, path); err != nil {
-		return "", err
-	}
-	return ticket.Artifact.Token, nil
-}
-
-// putTo 按票据把一个文件 PUT 上去。内容类型跟着票据走（服务端在 headers 里给了），
-// 这里不再自己拼。票据和 PUT 分开是因为热更新那条链路重试时要连票据一起重领——
-// 票据是一次性的。
-func (c *client) putTo(ctx context.Context, ticket uploadTicket, path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	request, err := http.NewRequestWithContext(ctx, http.MethodPut, ticket.Upload.URL, file)
-	if err != nil {
-		return err
-	}
-	request.ContentLength = info.Size()
-	// GetBody 让传输层在需要重试时能把请求体从头再读一遍。没有它，一次 h2 流错误
-	// 就直接失败在 "cannot retry ... after Request.Body was written"——2026-09-11
-	// 第一次真实回传就是这么挂的，包已经构建出来了却传不上去。
-	request.GetBody = func() (io.ReadCloser, error) { return os.Open(path) }
-	for key, value := range ticket.Upload.Headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("x-build-agent-token", c.cfg.Token)
-	// 传一个几十上百兆的包，30 秒的默认超时肯定不够。
-	// 强制 HTTP/1.1：几十兆的 PUT 经过反代链路时 h2 的流错误比 1.1 常见得多，
-	// 而这条路径没有任何需要多路复用的理由。
-	uploader := &http.Client{
-		Timeout:   30 * time.Minute,
-		Transport: &http.Transport{ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}},
-	}
-	response, err := uploader.Do(request)
-	if err != nil {
-		return retryLater{err}
-	}
-	defer response.Body.Close()
-	payload, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if response.StatusCode >= 400 {
-		return classify(response.StatusCode,
-			fmt.Errorf("upload of %s returned %d: %s", filepath.Base(path), response.StatusCode, truncate(string(payload), 300)))
-	}
-	return nil
-}
-
-type pendingKeystoreCheck struct {
-	Tenant         string          `json:"tenant"`
-	Version        int             `json:"version"`
-	SealedKeystore json.RawMessage `json:"sealedKeystore"`
-}
-
-func (c *client) pendingKeystoreChecks(ctx context.Context) ([]pendingKeystoreCheck, error) {
-	var out struct {
-		Items []pendingKeystoreCheck `json:"items"`
-	}
-	if _, err := c.get(ctx, "/v1/build-agent/keystore-checks", &out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
-}
-
-func (c *client) reportKeystoreCheck(ctx context.Context, tenant string, version int, ok bool, reason, agent string) error {
-	_, err := c.post(ctx, "/v1/build-agent/keystore-checks", map[string]any{
-		"tenant": tenant, "version": version, "ok": ok, "error": reason, "agent": agent,
-	}, nil)
-	return err
-}
-
-func (c *client) registerPublicKey(ctx context.Context, publicKey, agent string) (string, error) {
-	var out struct {
-		Status             string `json:"status"`
-		Fingerprint        string `json:"fingerprint"`
-		CurrentFingerprint string `json:"currentFingerprint"`
-	}
-	if _, err := c.post(ctx, "/v1/build-agent/public-key", map[string]any{
-		"publicKey": publicKey, "agent": agent,
-	}, &out); err != nil {
-		return "", err
-	}
-	return out.Status, nil
-}
-
-// downloadIcon 取一张图标，直接写进 worktree，不经过内存里的字符串。
-//
-// 图标原来是 base64 塞在领取任务的响应里的，而那条响应有 1 MiB 的读取上限。
-// 2026-09-13 真图标传上来之后响应被截断成半截 JSON，代理解不开就把整条任务丢了，
-// 而服务端那边已经标成 claimed——任务从此卡死。
-func (c *client) downloadIcon(ctx context.Context, jobID, name, target string) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		c.cfg.Server+"/v1/build-agent/jobs/"+jobID+"/icons/"+url.PathEscape(name), nil)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("x-build-agent-token", c.cfg.Token)
-	response, err := c.http.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
-		return fmt.Errorf("icon %s returned %d: %s", name, response.StatusCode, truncate(string(payload), 200))
-	}
-	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
-	if _, err := io.Copy(file, io.LimitReader(response.Body, 12<<20)); err != nil {
-		return err
-	}
-	return nil
-}
-
-// uploadOTAPackage 把热更新包传回服务端，返回落成的修订 id。
-//
-// base、channel、生效方式和发布说明都取任务行上的值——代理只送它确实知道的东西
-// （包本身和这次构建的提交）。和 APK 那条同一个原则。
-func (c *client) uploadOTAPackage(ctx context.Context, jobID, path, commit string, buf *logBuffer) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-	token := ""
-	if err := withRetry(ctx, buf, "OTA upload ticket", 6, func(ctx context.Context) error {
-		var ticket uploadTicket
-		if _, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/ota-uploads", map[string]any{
-			"fileName": filepath.Base(path), "size": info.Size(),
-		}, &ticket); err != nil {
+		if err := decodeInto(ticketPath, payload, &ticket); err != nil {
 			return err
 		}
 		token = ticket.Artifact.Token
-		return c.putTo(ctx, ticket, path)
+		return c.putTicket(ctx, job, ticket, path, size)
 	}); err != nil {
 		return "", err
 	}
@@ -413,10 +462,14 @@ func (c *client) uploadOTAPackage(ctx context.Context, jobID, path, commit strin
 		} `json:"release"`
 	}
 	if err := withRetry(ctx, buf, "OTA revision", 6, func(ctx context.Context) error {
-		_, err := c.post(ctx, "/v1/build-agent/jobs/"+jobID+"/ota-release", map[string]any{
+		releasePath := jobPath(job.ID, "/ota-release")
+		_, payload, err := c.send(ctx, http.MethodPost, releasePath, job.Attempt, map[string]any{
 			"artifactToken": token, "sourceCommitSha": commit,
-		}, &created)
-		return err
+		})
+		if err != nil {
+			return err
+		}
+		return decodeInto(releasePath, payload, &created)
 	}); err != nil {
 		return "", err
 	}
@@ -426,122 +479,53 @@ func (c *client) uploadOTAPackage(ctx context.Context, jobID, path, commit strin
 	return created.Release.ID, nil
 }
 
-// ---- 备份（设计 platform-backup-recovery-2026-09-15 §8.1）----
-
-// pendingBackup 认领一条备份待办。没有待办返回 (_, false, nil)。
-//
-// 用 POST 不是 GET：它会改状态，而服务端把 GET 当安全方法——Origin 闸对它完全
-// 不生效，何况任何 HTTP 客户端和代理都会对 GET 自动重试。
-func (c *client) pendingBackup(ctx context.Context) (backupRequest, bool, error) {
-	var out backupRequest
-	status, err := c.post(ctx, "/v1/build-agent/backup-requests/claim",
-		map[string]string{"agent": c.cfg.Name}, &out)
+// putTicket 按票据把文件 PUT 上去。本机令牌与编号只发给服务端自己：票据可以是对象存储的
+// 预签名地址（ARTIFACT_UPLOAD_MODE=direct），把令牌发给第三方就是泄露。
+func (c *client) putTicket(ctx context.Context, job claimedJob, ticket uploadTicket, path string, size int64) error {
+	target, err := url.Parse(ticket.Upload.URL)
+	if err != nil || (target.Scheme != "https" && target.Scheme != "http") || target.Host == "" {
+		return errors.New("the upload ticket has no usable URL")
+	}
+	file, err := os.Open(path)
 	if err != nil {
-		return backupRequest{}, false, err
+		return err
 	}
-	if status == http.StatusNoContent || out.ID == "" {
-		return backupRequest{}, false, nil
-	}
-	return out, true, nil
-}
-
-func (c *client) backupKeystores(ctx context.Context, requestID string) ([]sealedKeystoreItem, error) {
-	var out struct {
-		Items []sealedKeystoreItem `json:"items"`
-	}
-	if _, err := c.get(ctx, "/v1/build-agent/backup-keystores?request="+url.QueryEscape(requestID), &out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
-}
-
-func (c *client) failBackup(ctx context.Context, requestID, reason string) error {
-	_, err := c.post(ctx, "/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/fail",
-		map[string]string{"reason": truncate(reason, 480)}, nil)
-	return err
-}
-
-func (c *client) registerBackupSigningKey(ctx context.Context, publicKey string) (string, error) {
-	var out struct {
-		Status string `json:"status"`
-	}
-	_, err := c.post(ctx, "/v1/build-agent/backup-signing-key",
-		map[string]string{"publicKey": publicKey, "agent": c.cfg.Name}, &out)
-	return out.Status, err
-}
-
-// uploadBackupPayload 上报一份内层密文（multipart：meta / payload / sig，见 §4.7）。
-//
-// **meta 必须排在 payload 之前**：服务端靠这个顺序先解析元数据、校验通过再决定
-// 要不要收那几十 MB。顺序反了服务端会直接拒。
-// backupUploadResult 是服务端对一次上报的回答。
-//
-// **StillExpecting 必须看。** 服务端在两份没到齐时回 202 加一个「还缺哪几份」，
-// 而只判 >=400 的话，打包机会把它当成功、打出「备份产出成功」然后走人——
-// 而记录停在 running 干等 30 分钟产出超时。这个时序不是假想：服务端在两份之间
-// 重启就会发生（启动时会清掉上一次的暂存）。
-type backupUploadResult struct {
-	StillExpecting []string `json:"stillExpecting"`
-	Status         string   `json:"status"`
-}
-
-func (c *client) uploadBackupPayload(ctx context.Context, requestID string,
-	meta backupbundle.PayloadMeta, payload, signature []byte) (backupUploadResult, error) {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-
-	encoded, err := json.Marshal(meta)
+	defer file.Close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, target.String(), file)
 	if err != nil {
-		return backupUploadResult{}, err
+		return err
 	}
-	metaPart, err := writer.CreateFormField("meta")
+	request.ContentLength = size
+	request.GetBody = func() (io.ReadCloser, error) { return os.Open(path) }
+	for key, value := range ticket.Upload.Headers {
+		if strings.EqualFold(key, headerMachineToken) || strings.EqualFold(key, headerBuildAttempt) {
+			continue
+		}
+		request.Header.Set(key, value)
+	}
+	if sameOrigin(c.server, target) {
+		c.authorize(request, job.Attempt)
+	}
+	response, err := c.upload.Do(request)
 	if err != nil {
-		return backupUploadResult{}, err
-	}
-	if _, err := metaPart.Write(encoded); err != nil {
-		return backupUploadResult{}, err
-	}
-	payloadPart, err := writer.CreateFormFile("payload", "inner.rnbk")
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	if _, err := payloadPart.Write(payload); err != nil {
-		return backupUploadResult{}, err
-	}
-	sigPart, err := writer.CreateFormFile("sig", "inner.rnbk.sig")
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	if _, err := sigPart.Write(signature); err != nil {
-		return backupUploadResult{}, err
-	}
-	if err := writer.Close(); err != nil {
-		return backupUploadResult{}, err
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.cfg.Server+"/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/payload", &body)
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	request.Header.Set("content-type", writer.FormDataContentType())
-	request.Header.Set("x-build-agent-token", c.cfg.Token)
-
-	// 上传和收尾都可能要几分钟，而 client.http 的默认超时是 30 秒。
-	// 用调用方的 ctx 兜底（runBackup 给了 25 分钟，小于服务端 30 分钟的产出超时）
-	uploader := &http.Client{}
-	response, err := uploader.Do(request)
-	if err != nil {
-		return backupUploadResult{}, retryLater{err}
+		return retryLater{err}
 	}
 	defer response.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	payload, _ := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes))
 	if response.StatusCode >= 400 {
-		return backupUploadResult{}, classify(response.StatusCode,
-			fmt.Errorf("uploading the backup payload returned %d: %s",
-				response.StatusCode, truncate(string(raw), 300)))
+		return newAPIError("upload of "+filepath.Base(path), response.StatusCode, payload)
 	}
-	var out backupUploadResult
-	_ = json.Unmarshal(raw, &out)
-	return out, nil
+	return nil
+}
+
+func sameOrigin(server string, target *url.URL) bool {
+	base, err := url.Parse(server)
+	return err == nil && strings.EqualFold(base.Scheme, target.Scheme) && strings.EqualFold(base.Host, target.Host)
+}
+
+func truncate(text string, max int) string {
+	if len(text) <= max {
+		return text
+	}
+	return text[:max] + "…"
 }

@@ -52,7 +52,7 @@ func writeTenantFile(worktree, directory string, raw json.RawMessage) (string, e
 		return "", err
 	}
 	dir := filepath.Join(worktree, "tenants", directory)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", fmt.Errorf("create tenant directory: %w", err)
 	}
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
@@ -60,7 +60,7 @@ func writeTenantFile(worktree, directory string, raw json.RawMessage) (string, e
 		return "", err
 	}
 	path := filepath.Join(dir, "tenant.json")
-	if err := os.WriteFile(path, append(encoded, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(path, append(encoded, '\n'), 0o640); err != nil {
 		return "", fmt.Errorf("write tenant file: %w", err)
 	}
 	return path, nil

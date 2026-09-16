@@ -1,0 +1,12 @@
+# /etc/sudoers.d/rn-build-agent（root:root 0440；安装前 `visudo -cf` 校验）
+#
+# 构建控制进程（rn-build-agent）只能以 builder 身份执行构建执行进程这一个程序，别的都不行。
+# 规则不限参数：参数由 build-runner 自己校验（任务目录只能是 <任务根目录>/<任务 id>，属主必须是
+# 调用 sudo 的用户）。
+#
+# - NOPASSWD：常驻进程没有终端可输口令
+# - NOSETENV：不许 `sudo VAR=… ` / `-E` 把控制进程的环境带过去（执行进程本来也不读自己的环境）
+# - env_reset 是默认值，这里对这个程序再写一遍，防止全局 Defaults 被改成 !env_reset
+# - 不设 NOEXEC：执行进程要启动 pnpm、node、java
+Defaults!/opt/rn-build-agent/build-runner env_reset, !setenv
+rn-build-agent ALL=(builder) NOPASSWD:NOSETENV: /opt/rn-build-agent/build-runner

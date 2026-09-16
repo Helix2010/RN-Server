@@ -3,84 +3,51 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log/slog"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	"crypto/ed25519"
-	"crypto/rsa"
-
-	"github.com/Helix2010/RN-Server/internal/backupcontainer"
-	"github.com/Helix2010/RN-Server/internal/buildkeystore"
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
 )
 
-// 配置全部来自**构建机本地**。服务端下发的只有租户 slug、git ref、version、
-// buildNumber 和 OTA 证书——它说不出仓库在哪、密钥在哪、用什么命令构建。
+// 配置全部来自**构建机本地**，只放启动项与这台机器的拓扑。服务端下发的只有任务本身——
+// 它说不出仓库在哪、状态目录在哪、执行进程是谁。
 type config struct {
-	Server    string
-	Token     string
-	Name      string
-	Repo      string
+	Server string
+	// MachineToken 是控制台新建机器时发的本机令牌（请求头 x-machine-token）。
+	// 它只在控制进程里：执行进程的环境是白名单构造的，不含它。
+	MachineToken string
+	Repo         string
+	// Workspace 是任务根目录：每个任务一个 <Workspace>/<jobId>/，执行进程能进（组 rn-build-jobs），
+	// 控制进程的状态目录不在它下面。
 	Workspace string
+	// StateDir 放 Ed25519 出处密钥与上传前的产物副本，只有控制进程用户能读（0700）。
+	StateDir  string
 	Platforms []string
 	Timeout   time.Duration
 	PollEvery time.Duration
-	// KeystorePassphrase 开**旧格式**（v1，口令封）的盒子。留着是为了让已经存在的
-	// 密钥继续能用；新写的一律加密给本机公钥（见 agentkey.go），不需要它。
-	KeystorePassphrase string
-	// StateDir 放本机私钥等需要长期保留的东西。默认是 workspace 的上一级，和
-	// unit 文件里的 /var/lib/rn-build-agent 对齐：缓存删了只是慢一点，这里删了
-	// 要重新配。
-	StateDir string
-	// AgentPrivateKey 是本机 X25519 私钥，永不外发
-	AgentPrivateKey []byte
-	// AgentPublicKey 登记给服务端，签名密钥加密给它
-	AgentPublicKey buildkeystore.Recipient
-
-	// BackupRecipients 是三把恢复公钥（槽位 A / B / C）。
-	//
-	// **只封给这里的公钥，不接受服务端下发的收件人。** 否则服务端被攻破之后，
-	// 攻击者只要改一下收件人，就能让打包机把全部租户的签名密钥封给他自己——
-	// 那等于把「服务端读不到签名密钥」这条论证直接作废。
-	//
-	// 服务端认领时会下发三个**指纹**供核对，对不上就拒绝执行并上报。
-	BackupRecipients [backupcontainer.SlotCount]*rsa.PublicKey
-	// BackupFingerprints 和上面一一对应，用来和服务端下发的比对
-	BackupFingerprints [backupcontainer.SlotCount]string
-	// backupRecipientMisnamed 记下哪几个槽位没配、却配了服务端那一侧的键名
-	// （BACKUP_RECOVERY_RECIPIENT_*）。两台机器的 env 长得几乎一样，照着服务端那段
-	// 抄过来是最容易犯的错，而它的表现只是一句「没配」——人盯着文件里明明有值的三行
-	// 找不出原因。报错时点破它
-	backupRecipientMisnamed [backupcontainer.SlotCount]bool
-	// BackupSigningKey 给内层密文签名；BackupSigningPublicKey 登记给服务端
-	BackupSigningKey       ed25519.PrivateKey
-	BackupSigningPublicKey string
+	// Runner 是执行进程二进制的绝对路径；RunnerUser 是经 sudo 切换到的用户。
+	// RunnerUser 为 "-" 表示不经 sudo 直接执行——执行进程与控制进程同一个用户，只用于本地测试。
+	Runner     string
+	RunnerUser string
+	// MachineEnv 是交给执行进程的机器级变量（PATH、JAVA_HOME 等），只取 jobspec 白名单里的键。
+	MachineEnv map[string]string
 }
 
-// backupReady 说明这台机器能不能产出备份。
-//
-// **缺配置不 fail-closed 启动**：把备份做成构建的单点故障是负收益，而且第一次
-// 配置往往正好发生在恢复当天。但它必须拒绝认领待办并上报原因，让控制台上看得见
-// 「打包机没配恢复公钥」，而不是静默不备份。
-func (c config) backupReady() error {
-	for i, slot := range backupcontainer.SlotNames {
-		if c.BackupRecipients[i] == nil && c.backupRecipientMisnamed[i] {
-			return fmt.Errorf("BUILD_AGENT_RECOVERY_RECIPIENT_%s is not configured on this build machine: "+
-				"its env has BACKUP_RECOVERY_RECIPIENT_%s instead, which is the server's name for the key. "+
-				"Rename it to BUILD_AGENT_RECOVERY_RECIPIENT_%s and restart build-agent", slot, slot, slot)
-		}
-		if c.BackupRecipients[i] == nil {
-			return fmt.Errorf("BUILD_AGENT_RECOVERY_RECIPIENT_%s is not configured on this build machine", slot)
-		}
-	}
-	if len(c.BackupSigningKey) == 0 {
-		return fmt.Errorf("this build machine has no backup signing key")
-	}
-	return nil
-}
+// directRunner 是 BUILD_AGENT_RUNNER_USER 的特殊值：不经 sudo。
+const directRunner = "-"
+
+func (c config) runnerSeparated() bool { return c.RunnerUser != directRunner }
+
+var (
+	machineTokenPattern = regexp.MustCompile(`^rnm_[A-Za-z0-9_-]{43}$`)
+	unixUserPattern     = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+)
 
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -90,95 +57,127 @@ func envOr(key, fallback string) string {
 }
 
 func loadConfig() (config, error) {
-	host, _ := os.Hostname()
 	cfg := config{
-		Server:             strings.TrimRight(envOr("BUILD_AGENT_SERVER", ""), "/"),
-		Token:              envOr("BUILD_AGENT_TOKEN", ""),
-		Name:               envOr("BUILD_AGENT_NAME", host),
-		Repo:               envOr("BUILD_AGENT_REPO", ""),
-		Workspace:          envOr("BUILD_AGENT_WORKSPACE", ""),
-		PollEvery:          10 * time.Second,
-		KeystorePassphrase: envOr("BUILD_KEYSTORE_PASSPHRASE", ""),
-		StateDir:           envOr("BUILD_AGENT_STATE_DIR", ""),
+		Server:       strings.TrimRight(envOr("BUILD_AGENT_SERVER", ""), "/"),
+		MachineToken: envOr("BUILD_AGENT_MACHINE_TOKEN", ""),
+		Repo:         envOr("BUILD_AGENT_REPO", ""),
+		Workspace:    envOr("BUILD_AGENT_WORKSPACE", ""),
+		StateDir:     envOr("BUILD_AGENT_STATE_DIR", ""),
+		PollEvery:    10 * time.Second,
+		Runner:       envOr("BUILD_AGENT_RUNNER", "/opt/rn-build-agent/build-runner"),
+		RunnerUser:   envOr("BUILD_AGENT_RUNNER_USER", "builder"),
+		MachineEnv:   map[string]string{},
 	}
-	// 服务端那一侧的键名只用来在报错时点破「抄错了键名」，**不当作公钥读**：打包机只认自己那组键
-	for i, raw := range []string{
-		envOr("BACKUP_RECOVERY_RECIPIENT_A", ""),
-		envOr("BACKUP_RECOVERY_RECIPIENT_B", ""),
-		envOr("BACKUP_RECOVERY_RECIPIENT_C", ""),
-	} {
-		cfg.backupRecipientMisnamed[i] = raw != ""
+	// 作废的机密先挡：它们留在 env 文件里就是一份没人管的秘密
+	if os.Getenv("BUILD_KEYSTORE_PASSPHRASE") != "" {
+		return cfg, errors.New("BUILD_KEYSTORE_PASSPHRASE is no longer used: build machines never see signing keys; delete it from the env file")
 	}
-	// 三把恢复公钥。值是 PEM 的 base64 单行——PEM 带换行，直接写进 systemd 的
-	// EnvironmentFile 极易写坏，而这个键要用的那一天正好最不该出意外。
-	//
-	// 键名写成字面量而不是拼出来：拼出来之后 grep 找不到「槽位 A 对应哪个环境变量」，
-	// 而灾难当天要看的正是这个。
-	for i, raw := range []string{
-		envOr("BUILD_AGENT_RECOVERY_RECIPIENT_A", ""),
-		envOr("BUILD_AGENT_RECOVERY_RECIPIENT_B", ""),
-		envOr("BUILD_AGENT_RECOVERY_RECIPIENT_C", ""),
-	} {
-		if raw == "" {
-			continue
-		}
-		pub, err := backupcontainer.ParsePublicKey(raw)
-		if err != nil {
-			// 不 fail-closed：把备份做成构建的单点故障是负收益。但要吵一声，
-			// 否则「配了就以为有」——而这正是这套东西最不能出的错
-			slog.Error("a recovery public key is unusable; this build machine will refuse to produce backups",
-				"slot", backupcontainer.SlotNames[i], "error", err)
-			continue
-		}
-		fingerprint, err := backupcontainer.Fingerprint(pub)
-		if err != nil {
-			slog.Error("a recovery public key could not be fingerprinted",
-				"slot", backupcontainer.SlotNames[i], "error", err)
-			continue
-		}
-		cfg.BackupRecipients[i] = pub
-		cfg.BackupFingerprints[i] = fingerprint
+	if os.Getenv("BUILD_AGENT_TOKEN") != "" {
+		return cfg, errors.New("BUILD_AGENT_TOKEN was replaced by BUILD_AGENT_MACHINE_TOKEN (a per-machine token created in the console); delete the old key from the env file")
 	}
-
-	for _, p := range strings.Split(envOr("BUILD_AGENT_PLATFORMS", "android"), ",") {
-		if p = strings.ToLower(strings.TrimSpace(p)); p == "android" || p == "ios" {
-			cfg.Platforms = append(cfg.Platforms, p)
-		}
-	}
-	minutes, err := strconv.Atoi(envOr("BUILD_AGENT_TIMEOUT_MINUTES", "45"))
-	if err != nil || minutes < 1 || minutes > 480 {
-		return cfg, errors.New("BUILD_AGENT_TIMEOUT_MINUTES must be between 1 and 480")
-	}
-	cfg.Timeout = time.Duration(minutes) * time.Minute
-
 	for key, value := range map[string]string{
-		"BUILD_AGENT_SERVER":    cfg.Server,
-		"BUILD_AGENT_TOKEN":     cfg.Token,
-		"BUILD_AGENT_REPO":      cfg.Repo,
-		"BUILD_AGENT_WORKSPACE": cfg.Workspace,
+		"BUILD_AGENT_SERVER":        cfg.Server,
+		"BUILD_AGENT_MACHINE_TOKEN": cfg.MachineToken,
+		"BUILD_AGENT_REPO":          cfg.Repo,
+		"BUILD_AGENT_WORKSPACE":     cfg.Workspace,
+		"BUILD_AGENT_STATE_DIR":     cfg.StateDir,
 	} {
 		if value == "" {
 			return cfg, fmt.Errorf("%s is required", key)
 		}
 	}
-	if len(cfg.Platforms) == 0 {
-		return cfg, errors.New("BUILD_AGENT_PLATFORMS must name android or ios")
+	// 不回显令牌：报错会进 journal
+	if !machineTokenPattern.MatchString(cfg.MachineToken) {
+		return cfg, fmt.Errorf("BUILD_AGENT_MACHINE_TOKEN must look like rnm_ followed by 43 base64url characters (got %d characters)", len(cfg.MachineToken))
 	}
-	// 生产里用 http 等于把 token 明文发出去，而这个 token 能领走构建任务
+	// 生产里用 http 等于把令牌明文发出去
 	if !strings.HasPrefix(cfg.Server, "https://") && !strings.HasPrefix(cfg.Server, "http://127.0.0.1") && !strings.HasPrefix(cfg.Server, "http://localhost") {
-		return cfg, errors.New("BUILD_AGENT_SERVER must be https, except for a loopback address in development")
+		return cfg, fmt.Errorf("BUILD_AGENT_SERVER must be https, except for a loopback address in development (got %q)", cfg.Server)
 	}
-	if !filepath.IsAbs(cfg.Workspace) {
-		return cfg, errors.New("BUILD_AGENT_WORKSPACE must be an absolute path")
+	for key, value := range map[string]string{
+		"BUILD_AGENT_REPO":      cfg.Repo,
+		"BUILD_AGENT_WORKSPACE": cfg.Workspace,
+		"BUILD_AGENT_STATE_DIR": cfg.StateDir,
+		"BUILD_AGENT_RUNNER":    cfg.Runner,
+	} {
+		if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+			return cfg, fmt.Errorf("%s must be a clean absolute path (got %q)", key, value)
+		}
 	}
-	if cfg.StateDir == "" {
-		// workspace 是 /var/lib/rn-build-agent/workspace，状态放它的上一级
-		cfg.StateDir = filepath.Dir(strings.TrimRight(cfg.Workspace, "/"))
+	if err := jobspec.ValidRoot(cfg.Workspace); err != nil {
+		return cfg, fmt.Errorf("BUILD_AGENT_WORKSPACE: %w", err)
 	}
-	if !filepath.IsAbs(cfg.StateDir) {
-		return cfg, errors.New("BUILD_AGENT_STATE_DIR must be an absolute path")
+	// 状态目录与任务根目录互不包含：执行进程能进任务根目录，出处密钥绝不能在它下面
+	for _, pair := range [][2]string{
+		{cfg.StateDir, cfg.Workspace}, {cfg.Workspace, cfg.StateDir}, {cfg.Repo, cfg.Workspace}, {cfg.Workspace, cfg.Repo},
+	} {
+		if within(pair[0], pair[1]) {
+			return cfg, fmt.Errorf("BUILD_AGENT_STATE_DIR, BUILD_AGENT_REPO and BUILD_AGENT_WORKSPACE must not contain one another (%s is inside %s)", pair[0], pair[1])
+		}
 	}
-	// 私钥不在这里读：loadConfig 只该解析配置，不该在磁盘上留下东西。落盘那一步
-	// 在 main 里做，那样这个函数也能在测试里随便调
+	if cfg.RunnerUser != directRunner && !unixUserPattern.MatchString(cfg.RunnerUser) {
+		return cfg, fmt.Errorf("BUILD_AGENT_RUNNER_USER must be a user name, or - for local testing without sudo (got %q)", cfg.RunnerUser)
+	}
+
+	for _, p := range strings.Split(envOr("BUILD_AGENT_PLATFORMS", "android"), ",") {
+		if p = strings.ToLower(strings.TrimSpace(p)); p == "android" {
+			cfg.Platforms = append(cfg.Platforms, p)
+		} else if p != "" {
+			return cfg, fmt.Errorf("BUILD_AGENT_PLATFORMS: this build machine only builds android (got %q)", p)
+		}
+	}
+	if len(cfg.Platforms) == 0 {
+		return cfg, errors.New("BUILD_AGENT_PLATFORMS must name android")
+	}
+	raw := envOr("BUILD_AGENT_TIMEOUT_MINUTES", "45")
+	minutes, err := strconv.Atoi(raw)
+	if err != nil || minutes < 1 || minutes > 480 {
+		return cfg, fmt.Errorf("BUILD_AGENT_TIMEOUT_MINUTES must be between 1 and 480 (got %q)", raw)
+	}
+	cfg.Timeout = time.Duration(minutes) * time.Minute
+
+	// 机器级工具变量：只取白名单里的，逐个校验。执行进程还会再校验一次。
+	for _, key := range jobspec.MachineEnvKeys() {
+		if value := os.Getenv(key); value != "" {
+			cfg.MachineEnv[key] = value
+		}
+	}
+	if cfg.MachineEnv["PATH"] == "" {
+		return cfg, errors.New("PATH is required: it is handed to the build runner so it can find node, pnpm and java")
+	}
+	if cache := cfg.MachineEnv["GRADLE_RO_DEP_CACHE"]; cache != "" {
+		if err := checkReadOnlyCache(cache); err != nil {
+			return cfg, fmt.Errorf("GRADLE_RO_DEP_CACHE: %w", err)
+		}
+	}
 	return cfg, nil
+}
+
+// within 判断 path 是否等于 parent 或在 parent 之下。
+func within(path, parent string) bool {
+	rel, err := filepath.Rel(parent, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// checkReadOnlyCache 校验交给执行进程的只读 Gradle 依赖缓存：真实目录、属于控制进程用户、
+// 组和其他人不可写。执行进程能改写它，就等于能给之后每个任务的依赖下毒。
+func checkReadOnlyCache(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("must be a clean absolute path (got %q)", path)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%s must be a real directory", path)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s must belong to the build agent user", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s must not be writable by group or others", path)
+	}
+	return nil
 }

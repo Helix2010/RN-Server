@@ -1,46 +1,57 @@
-# 打包机代理。**这台机器不跑任何对外服务**，也不和 wallet 后端同机——它持有
-# Android keystore，而整套设计的安全论证（服务端不下发密钥、不执行命令）在两者
-# 同机的那一刻就作废了。
+# 构建控制进程 build-agent（用户 rn-build-agent）。第三方代码只在它经 sudo 启动的执行进程
+# build-runner（用户 builder）里跑；执行进程是这个 unit 的子进程，共用下面的沙箱。
 #
-# 目录约定（FHS）：
-#   /opt/rn-build-agent/build-agent   程序本体
-#   /etc/rn-build-agent.env           配置，0600 root
-#   /var/lib/rn-build-agent/          状态：仓库镜像、工作区、部署密钥；同时是 builder 的 HOME
-#   /var/cache/rn-build-agent/        可重建的缓存：Gradle 与 pnpm 的 store
+# 目录（见 README「目录与权限」）：
+#   /opt/rn-build-agent/build-agent、build-runner   root:root 0755
+#   /etc/rn-build-agent.env                         root:root 0600（systemd 以 root 读，进程里才有令牌）
+#   /var/lib/rn-build-agent/                        rn-build-agent 0700：state/（出处密钥）、repos/、.ssh/
+#   /var/lib/rn-build-jobs/                         rn-build-agent:rn-build-jobs 2750：每个任务一个目录
+#   /var/cache/rn-build-agent/gradle-ro/            可选的只读 Gradle 依赖缓存
 #
-# 状态与缓存分开不是形式：缓存整个删掉只会让下一次构建慢一点，而 /var/lib 下的
-# 东西删了要重新配密钥、重新拉仓库。备份和清理策略完全不同。
+# **不能开 NoNewPrivileges**：执行进程靠 sudo（setuid）切到 builder，NoNewPrivileges 会让 sudo
+# 失效。同理，systemd 在非 root 服务上遇到下列任何一项都会隐式打开 NoNewPrivileges，所以
+# 这里一项都不用：SystemCallFilter、SystemCallArchitectures、RestrictAddressFamilies、
+# RestrictNamespaces、PrivateDevices、ProtectKernelTunables、ProtectKernelModules、
+# ProtectKernelLogs、ProtectClock、MemoryDenyWriteExecute、RestrictRealtime、RestrictSUIDSGID、
+# LockPersonality、DynamicUser。MemoryDenyWriteExecute 还会直接打死 JVM 与 Node 的 JIT。
+# 分用户这道边界靠 uid 与文件权限，不靠这些选项。
 [Unit]
-Description=RN build agent
+Description=RN build agent (controller)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=builder
-Group=builder
+User=rn-build-agent
+Group=rn-build-agent
+# 读执行进程交回的产物（out/ 带 setgid，文件属 rn-build-jobs 组）
+SupplementaryGroups=rn-build-jobs
 EnvironmentFile=/etc/rn-build-agent.env
+# 交给执行进程的 PATH 就是这一个：node、pnpm、java 必须在里面
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/rn-build-agent/build-agent
 Restart=always
 RestartSec=10
-# 停机时先做完手上那一条构建，再退出（代理收到 SIGTERM 只是不再领新活）。所以这个
-# 值必须比 BUILD_AGENT_TIMEOUT_MINUTES 长，否则 systemd 会在构建中途补一刀 SIGKILL
-# ——那正是留下孤儿 worktree 和一份解开的 keystore 的那条路径。
-#
-# 代价是 systemctl stop / 换二进制最长要等一轮构建（默认 45 分钟）。急着换就
-# `systemctl kill -s SIGKILL rn-build-agent`：任务会在服务端那边由心跳超时回收，
-# 留下的检出下次启动时自动清掉。
+# 停机时先做完手上那一条构建（控制进程收到 SIGTERM 只是不再领新活），所以这个值必须比
+# BUILD_AGENT_TIMEOUT_MINUTES 长，否则 systemd 会在构建中途补一刀 SIGKILL。
+# 急着换就 `systemctl kill -s SIGKILL rn-build-agent`：任务由服务端回收，残留的任务目录与
+# builder 进程在下次启动时清掉。
 TimeoutStopSec=3600
-# 代理只出不进，不需要任何监听端口
+KillMode=control-group
+UMask=0027
+LimitCORE=0
+
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-NoNewPrivileges=true
-# ProtectHome=true 之后 /home 整个不可见。builder 的家目录就设在 /var/lib 下的
-# 状态目录，OpenSSH 按 passwd 里的 home 找 ~/.ssh（不看 $HOME），两者必须一致。
-Environment=GRADLE_USER_HOME=/var/cache/rn-build-agent/gradle
-Environment=npm_config_store_dir=/var/cache/rn-build-agent/pnpm-store
-ReadWritePaths=/var/lib/rn-build-agent /var/cache/rn-build-agent
+ProtectControlGroups=true
+# 同一个 unit 里的 builder 进程看不见 rn-build-agent 的进程（/proc 按 uid 隐藏）；
+# 不用 ProcSubset=pid——JVM 与 Node 要读 /proc/cpuinfo、/proc/meminfo。
+ProtectProc=invisible
+# 控制进程与执行进程能写的只有这些
+ReadWritePaths=/var/lib/rn-build-agent /var/lib/rn-build-jobs
+ReadWritePaths=-/run/sudo
+# Android SDK、JDK 以只读方式可见（ProtectSystem=strict 已经让它们只读）
 
 [Install]
 WantedBy=multi-user.target
