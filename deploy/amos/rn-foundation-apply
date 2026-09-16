@@ -224,7 +224,8 @@ apply_build_agent() {
 }
 
 case "${1:-}" in
-server) apply_server ;;
-admin)  apply_admin "${2:-}" ;;
-*) die "用法: $0 server | $0 admin <租户 slug>" ;;
+server)      apply_server ;;
+admin)       apply_admin "${2:-}" ;;
+build-agent) apply_build_agent ;;
+*) die "用法: $0 server | $0 admin <租户 slug> | $0 build-agent" ;;
 esac
