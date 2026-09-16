@@ -1,0 +1,21 @@
+# 签名闸 A 的检查进程入口。签名闸主进程（rn-signer-a）连上来，写"策略输入 JSON 一行 + APK"，
+# 半关写端后读回一行结论。每个连接由 systemd 启动一个 rn-signer-a-check@.service 实例
+# （Accept=yes），实例是 DynamicUser、无网络：解析不可信 APK 的进程碰不到私钥、令牌与状态目录。
+#
+# 只有 rn-signer-a 能连（SocketUser + 0600）；主进程配置 SIGNER_CHECK_SOCKET=/run/rn-signer-a-check.sock。
+[Unit]
+Description=RN signing gate A checker socket
+PartOf=rn-signer-a.service
+
+[Socket]
+ListenStream=/run/rn-signer-a-check.sock
+SocketUser=rn-signer-a
+SocketGroup=rn-signer-a
+SocketMode=0600
+Accept=yes
+# 签名闸一次只检查一个包；多给一个余量
+MaxConnections=2
+MaxConnectionsPerSource=2
+
+[Install]
+WantedBy=sockets.target

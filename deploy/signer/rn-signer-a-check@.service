@@ -1,0 +1,52 @@
+# 签名闸 A 的检查进程：一个连接一个实例。对不可信的未签名 APK 做全部解析与签名前检查。
+#
+# 它什么机密都不持有：没有 EnvironmentFile，DynamicUser（每次一个临时 uid），无网络，
+# 看不到任何签名闸与构建机的状态目录。stdin/stdout 就是那条连接；崩溃或超时只会让主进程
+# 拿不到结论（按临时错误上报），不影响主进程。
+[Unit]
+Description=RN signing gate A checker (one instance per connection)
+
+[Service]
+Type=simple
+ExecStart=/opt/rn-signer/bin/signer-check
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+DynamicUser=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+LimitCORE=0
+# 资源上限：一个有毒的包不能拖垮机器（APK ≤ 512 MiB，解析只解压 manifest 与配置）
+RuntimeMaxSec=300
+MemoryMax=1G
+TasksMax=64
+LimitFSIZE=600M
+InaccessiblePaths=-/var/lib/rn-signer-a -/var/lib/rn-signer-b -/run/rn-signer-a -/run/rn-signer-b
+InaccessiblePaths=-/etc/rn-signer-a.env -/etc/rn-signer-b.env
+InaccessiblePaths=-/var/lib/rn-build-agent -/etc/rn-build-agent.env -/etc/rn-foundation.env

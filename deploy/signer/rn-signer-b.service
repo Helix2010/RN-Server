@@ -1,0 +1,59 @@
+# 签名闸 B。与 rn-signer-a.service 相同，只换了用户、目录与另一台的不可见路径。
+# 说明见 rn-signer-a.service 与 README.md。
+[Unit]
+Description=RN Android signing gate B
+Documentation=file:///opt/rn-signer/README.md
+Wants=network-online.target
+After=network-online.target rn-signer-b-check.socket
+Requires=rn-signer-b-check.socket
+
+[Service]
+Type=exec
+User=rn-signer-b
+Group=rn-signer-b
+EnvironmentFile=/etc/rn-signer-b.env
+ExecStart=/opt/rn-signer/bin/signer run
+Restart=on-failure
+RestartSec=60s
+TimeoutStopSec=90s
+KillMode=mixed
+
+StateDirectory=rn-signer-b
+StateDirectoryMode=0700
+RuntimeDirectory=rn-signer-b
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+InaccessiblePaths=-/var/lib/rn-signer-a -/run/rn-signer-a -/etc/rn-signer-a.env
+InaccessiblePaths=-/var/lib/rn-build-agent -/etc/rn-build-agent.env -/etc/rn-foundation.env
+
+[Install]
+WantedBy=multi-user.target
