@@ -23,6 +23,7 @@ build-runner（builder）       ──出──→ npm / Maven / Gradle（拉依
 | 构建执行进程 `build-runner` | `builder` | 只有当前任务的一次性目录 | 令牌、出处密钥、仓库镜像、控制进程的 `/proc/<pid>/environ` |
 
 - 控制进程经一条收窄的 sudoers 规则启动执行进程（`rn-build-agent.sudoers`）：`rn-build-agent ALL=(builder) NOPASSWD:NOSETENV: /opt/rn-build-agent/build-runner`。规则不限参数，参数由 `build-runner` 自己校验。
+- **生产环境禁止 `BUILD_AGENT_RUNNER_USER=-`。** 这个值让执行进程不经 sudo、与控制进程同一个用户运行，第三方构建代码读得到本机令牌和出处私钥，这台机器交付的出处声明就不可信。它是给开发机本地测试的显式配置，代码不拒绝它，但会让它无处藏身：启动日志与每个任务的日志告警，`show-key` 的 `build runner:` 一行标出 `SAME USER AS THE BUILD AGENT`（状态由常驻进程启动时写进状态目录的 `runner-mode.json`）。在签名闸上 `trust-builder` 之前必须确认这一行是 `separate user builder via sudo`。
 - 执行进程的环境不继承任何东西：sudo 本来就重置环境，执行进程也不读自己的环境，给子进程的环境全部来自任务说明里的白名单。
 - 控制进程负责 fetch 与检出，检出固定 `refs/heads/main`（任务里的 `gitRef` 只核对，不是 `main` 就拒绝），过程中不跑任何 hook、不读系统与全局 git 配置。
 - 控制进程给出处声明签名：jobId、attempt、租户 slug、包名、versionCode、versionName、commit、未签名包 sha256 与大小、SBOM sha256、原生指纹、构建机 id、时间。commit 与原生指纹是构建机自报，签名闸复核原生指纹。
@@ -164,7 +165,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now rn-build-agent
    ```bash
    sudo -u rn-build-agent /opt/rn-build-agent/build-agent show-key --state-dir /var/lib/rn-build-agent/state
    ```
-   输出公钥 base64 与**完整 sha256（64 个十六进制字符）**。
+   输出公钥 base64、**完整 sha256（64 个十六进制字符）**，以及 `build runner:` 一行——必须是 `separate user builder via sudo`；是 `SAME USER AS THE BUILD AGENT` 就不要继续，先改配置。
 3. 平台管理员在控制台「平台维护 → 打包机与签名闸」核对完整 sha256 后接受。控制台接受只影响服务端路由。
 4. 运维分别登上主、备签名闸执行 `signer trust-builder`，粘贴第 2 步的完整 sha256。**签名闸只认这里 pin 过的构建机**；没做这一步，这台构建机交付的包会被拒签。
 
@@ -209,6 +210,7 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 | 执行进程留下的进程握着输出管道 | 执行进程退出后最多等 20 秒就强制关管道，残留进程由清理回收 |
 | 领取结果里出现 `sealedKeystore`、`keyAlias`、口令一类字段 | 整条任务拒收并报失败，不写盘 |
 | 服务端重启 / 5xx | 心跳失败只打 WARN；上传、交付、失败上报退避重试 |
+| API 源或反代回 3xx 重定向 | 不跟随（否则令牌与包体会被带到重定向目标），按错误处理、不重试，任务判失败 |
 | 服务端说"等会儿再来" | 409 `BUILDER_CLAIM_IN_PROGRESS`（上一次领取还在处理）下一轮再领；400 `UPLOAD_INTERRUPTED`、424 `UPLOAD_STORAGE_FAILED` 退避重传 |
 | 服务端明确拒绝（其余 4xx） | 不重试，带错误码按失败上报：`UPLOAD_CONTENT_TYPE_INVALID`、`UPLOAD_TOO_LARGE`、`UPLOAD_EMPTY`、`INVALID_BUILD_ATTEMPT`、`BUILD_SBOM_INVALID`、`BUILD_KIND_MISMATCH`、`BUILD_PROVENANCE_INVALID` 等 |
 | 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 中止执行进程，按超时上报 |
