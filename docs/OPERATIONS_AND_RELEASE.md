@@ -144,7 +144,12 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
 
 ### Android direct APK
 
-- CI 使用受控 signing service 签名，构建节点不持有可导出的长期私钥。
+- **构建与签名分在两台机器（2026-09-16，ADR-0019）**：构建机（`/v1/build-agent`）只出未签名包、CycloneDX SBOM 与 Ed25519 出处声明，领取结果里没有任何密钥密文或口令，交付后任务停在 `built`（待签名）。签名闸（`/v1/signer`）领 `built` 的任务，自己跑签名前检查、用只在本机解得开的 v3 密钥签名、上传已签名包后调 `complete`；服务端用 `apkinspect` 复核（签名者 = 登记证书、包名、版本、非 debug、非作废指纹），在**一个事务里**写 `app_releases`（`verified`，即「待发布」）并把任务改为 `succeeded`，`complete` 重试是幂等的。发布记录的 `file_metadata` 额外记 `unsignedSha256`、`sbom`、`nativeFingerprint`、`commitSha`（`commitSelfReported: true`，构建机自报、没人验证过）、`buildJobId`、`builderId`、`signerMachineId`。流程与状态见 `docs/database/RELEASE_SCHEMA.md` 的 `build_jobs` 一节。
+  - 每台机器有自己的令牌（控制台「打包机与签名闸」新建时只显示一次），`BUILD_AGENT_TOKEN` 已删除。吊销下一个请求就生效；只带旧头 `x-build-agent-token` 的旧打包机得到 426 `MACHINE_AUTH_UPGRADE_REQUIRED`。
+  - **排队门禁**：Android 安装包排队要求该租户已上传 v3 签名密钥、主签名闸对当前密钥版本试解成功、本机确认过当前信任根、试签成功，否则 409 `SIGNER_NOT_READY`，detail 逐条写缺什么。租户改了 `apiBaseUrl` 或 OTA 证书，信任根摘要就变，要在主签名闸上重新 `signer confirm` 才能继续排队。
+  - 签名闸只领同租户同平台在途任务里 build 号最小的那条；该租户有 `built`/`signing` 任务时手工上传 Android 发布记录 409 `RELEASE_SIGNING_IN_FLIGHT`。
+  - 服务端每分钟回收一次：构建 10 分钟无心跳重排（第三次判失败），签名 5 分钟无心跳回 `built`；签名"临时错误"与心跳超时累计 2 次判失败，"违规"直接失败，"暂不能签"（例如本机还没确认）不计数、任务留在 `built`。卡在 `signing` 的任务可以在控制台带原因强制判失败，`built` 的任务可以取消。
+  - 签名密钥只在离线工具里生成、加密给每台签名闸，服务端打不开内层；控制台不再能生成密钥，旧格式（v1 口令封装、v2 打包机公钥）记录显示为 legacy、不就绪，重新上传 v3 覆盖。2026-09 重置作废的两张证书在登记身份、登记密钥、上传门禁、签名完成四处永久拒绝（`RELEASE_SIGNER_RETIRED`）。
 - 上传后验证 applicationId、versionCode、signer certificate fingerprint、minSdk、SHA-256。
 - **签名者与包名按租户 pin（2026-09-10）**：每个租户在 `app_configs` 的 `release.android`（`GET/PUT /v1/admin/release-identity/android`，JSON `{"packageName":"com.anyfun.wallet","signerSha256":"<证书 SHA-256，64 位小写十六进制>","expectedVersion":0,"reason":"…","confirm":true}`）登记正式包身份。入库时 APK 的包名与签名者证书指纹必须与之相等（`RELEASE_PACKAGE_MISMATCH` / `RELEASE_SIGNER_MISMATCH`）；`APP_ENV=production` 下未登记即拒绝（`RELEASE_SIGNER_UNPINNED`）；React Native 模板公开 debug 密钥（`fac61745…1033b9c`）在任何环境都拒绝入库也不允许被 pin（`RELEASE_DEBUG_SIGNER`）。pin 只读租户自己那一行，不从平台级继承。每次拒绝写 `audit_events`（`release_rejected`）。 管理端入口：RN-Admin「发布基础设施 → Android 发布身份」页（查看、设置、乐观锁冲突提示；客户端把带冒号/大写的指纹规范化为 64 位小写十六进制，debug 指纹在客户端即被拒绝）。
 - APK 必须内嵌 Expo 配置 `extra.applicationId`（RN-App 构建脚本已保证），入库记入 `file_metadata.applicationId`，缺失拒绝（`RELEASE_APPLICATION_ID_MISSING`）；内嵌配置存在但不是合法 JSON 拒绝（`RELEASE_EMBEDDED_CONFIG_INVALID`）。所有入库拒绝（身份、applicationId、版本不符）都写 `audit_events`（`release_rejected`）。
@@ -173,17 +178,18 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
   几处必须知道的行为：ETag 把 keyid 算进去（否则装/换密钥时 manifest 字节没变，带 `if-none-match` 的客户端一直拿 304、永远收不到签名）；写入时校验证书与私钥是一对（不匹配的话服务端签得出来而客户端一定验不过，症状是所有设备静默停在内置 bundle）；租户没配密钥时照常下发未签名响应，要验签的客户端自己拒绝并回落内置 bundle，同时服务端按 (租户, 运行时) 去重记一条 warning——这个故障在设备上完全静默，只能从服务端看见。
 
   **上线顺序**：先装服务端密钥，再发带 `codeSigningCertificate` 的原生包。反过来的话，新包的所有设备都收不到 OTA。App 侧的 `EXPO_REQUIRE_OTA_SIGNING` 开关（RN-App runbook §3.2.1）用来保证带证书这件事不被忘记。
-- manifest 签名密钥与 native signing key 分离；私钥由 signing service 保管。
+- OTA manifest 签名密钥（服务端 `ota.signing`）与 Android 正式签名密钥分离：后者只在签名闸上解开，服务端连密文内层都打不开。
+- 热更新包只能来自 `kind=ota` 的构建任务：管理端直接上传热更新包的接口与 upload-sessions 的 `uploadType=ota` 已删除（2026-09-16）。
 - runtimeVersion 必须严格匹配；资源 URL 内容寻址并不可变。
 - 更新上传后跑静态检查、启动 smoke 和真机 staging；生产先 canary。
 - 应用身份（App 请求头 `X-Application-ID`，即租户配置的 `applicationId`）由 OTA 包自己带上（`extra.applicationId`），服务端只校验不改写；缺失即拒绝上传（`OTA_MANIFEST_INVALID`）。基线 APK 的包名是 `package_id`，不是应用身份，不能拿来顶替，否则装了 OTA 的设备会以另一个身份上报，`app_installations` 里出现同一台设备的两条记录，安装凭证也对不上。
 - **应用身份绑定基线（2026-09-10）**：Android 基线的 OTA，其 `extra.applicationId` 必须等于基线 APK 内嵌的 `extra.applicationId`（`OTA_APPLICATION_ID_MISMATCH`）。基线在 `file_metadata` 里没有该值时，服务端从对象存储重新解析 APK 并回填（系统写入，审计 `release_applicationid_backfilled`，actor `system-ota`，在 OTA 事务之外，OTA 随后失败也不撤回）。回填前先核对下载到的对象与入库记录的 `sha256` / `file_size` 一致：不一致返回 502 `OTA_BASE_RELEASE_CHANGED` 并记审计（`ota_base_release_changed`），绝不把替换件的身份写进数据库；记录里没有 sha256 / 大小、对象读不到或超过 `ARTIFACT_MAX_SIZE_MB` 返回 502 `OTA_BASE_RELEASE_UNREADABLE`（不截断解析）；解析出来为空的基线不能再挂 OTA（`OTA_BASE_APPLICATION_ID_UNKNOWN`）。服务端没有租户级 applicationId 配置，所以只绑基线 APK，不与租户配置比对。**已知缺口**：iOS 基线（IPA）服务端不解析，iOS OTA 不做该绑定，只记 warning。
 - **资源对象校验**：OTA 入库时用 `objectstore.Stat` 记录每个资源对象的大小与 ETag（`ota_releases.object_metadata`，迁移 37；不含 `manifest.json`，manifest 由 `manifest_sha256` 全文校验）；入库时任一资源对象没有 ETag 即拒绝（502 `OTA_OBJECT_ETAG_MISSING`）；`GET /v1/ota/assets/{id}/*` 下发前 `Stat` 比对，不符返回 502 `OTA_OBJECT_CHANGED` 并记审计（`ota_object_changed`，同一 (租户, OTA, 维度, 路径) 每 10 分钟最多一次，进程内去重）；对象表里的条目缺 ETag 视为损坏（500）；对象存储不可达返回 502 `OTA_ASSET_UNAVAILABLE`；对象表里没有这条路径返回 404（包里没有这个文件，不拿前缀下的其它对象顶上）；对象表损坏返回 500 `OTA_OBJECT_METADATA_INVALID`。迁移 37 之前的 OTA 记录为 NULL，只受 manifest 内容 hash（服务端）与资源 hash（expo-updates 客户端）保护。
-- **原生指纹绑定基线（2026-09-13）**：热更新只能承载纯 JS / 样式 / 随包资源的改动。判据是 `@expo/fingerprint`——它只看自动链接的原生模块、原生配置和 expo config，不看 JS 源码。打包机编 APK 时算一次存进 `file_metadata.nativeFingerprint`，构建热更新包时在同一套环境再算一次写进 manifest 的 `extra.nativeFingerprint`，两者不等就拒绝上传。`runtimeVersion` 不能替代它：`app.config.ts` 用的是 `runtimeVersion: appVersion`，同一个版本号下加一个原生模块它一个字都不变。
+- **原生指纹绑定基线（2026-09-13）**：热更新只能承载纯 JS / 样式 / 随包资源的改动。判据是 `@expo/fingerprint`——它只看自动链接的原生模块、原生配置和 expo config，不看 JS 源码。构建机编 APK 时算一次写进出处声明，签名闸复核后经 `complete` 存进 `file_metadata.nativeFingerprint`，构建热更新包时在同一套环境再算一次写进 manifest 的 `extra.nativeFingerprint`，两者不等就拒绝上传。`runtimeVersion` 不能替代它：`app.config.ts` 用的是 `runtimeVersion: appVersion`，同一个版本号下加一个原生模块它一个字都不变。
 
   这道闸在**排队时**和**上传时**各判一次，判据是同一个函数（`baseNativeFingerprint`）。排队时只能判"基线有没有这个值"，上传时才能判"两个值等不等"——更新包的指纹要构建完才知道。基线没有值时排队就 422 `OTA_BASE_RELEASE_INVALID`，管理端的基线下拉框也会把这种版本标成「不能做基线」。2026-09-14 补上排队那一道之前，这种任务会先跑完一整趟构建（装依赖、Metro 打包、产出 zip），在最后一步才被拒。
 
-  **指纹功能上线（2026-09-13 09:00 UTC）之前构建的包一个都没有这个值**，因此永远不能作为热更新基线。补法只有一条：在那个 APK 对应的提交上、用打包机构建热更新时的同一套环境把指纹重算一遍，然后在服务器上跑
+  **指纹功能上线（2026-09-13 09:00 UTC）之前构建的包一个都没有这个值**，因此永远不能作为热更新基线。补法只有一条：在那个 APK 对应的提交上、用构建机构建热更新时的同一套环境把指纹重算一遍，然后在服务器上跑
 
   ```bash
   sudo systemd-run --pipe --quiet --property=EnvironmentFile=/etc/rn-foundation.env \
@@ -246,7 +252,7 @@ active 版本；带有效安装凭证且在名单里的设备才会拿到它自�
 - 队列积压/dead-letter；
 - 登录供应商故障；
 - 错误 OTA 导致启动崩溃；
-- Android APK 签名/下载/安装失败；
+- Android APK 签名/下载/安装失败（含排队 409 `SIGNER_NOT_READY`、主签名闸不可用，见下文「签名闸不就绪与主备切换」）；
 - iOS 企业证书/profile 到期或撤销；
 - 错误 minSupported 导致全量阻断；
 - 凭证/签名密钥疑似泄露。
@@ -267,6 +273,14 @@ WHERE bad.application_id = bad.package_id
 ```
 
 推送 Token、钱包会话都只按 `installation_id` 关联，不受删除影响。
+
+### 签名闸不就绪与主备切换
+
+1. 排队 409 `SIGNER_NOT_READY`：照 detail 逐条处理。常见的是"没有 v3 密钥"（离线工具生成后在控制台上传）、"主签名闸还没确认当前信任根"（改过 `apiBaseUrl` 或 OTA 证书之后，登上主签名闸执行 `signer confirm --tenant <slug>`）、"试签没通过"（看签名闸日志）。控制台「签名密钥」页的每台签名闸一栏显示同样的检查状态。
+2. 任务停在 `built` 不动：看任务的 `signOutcome`。`deferred` 是签名闸暂不能签（本机未确认等），修好后它自己会再领；没有 `signOutcome` 且没有签名心跳，说明主签名闸没在领任务——检查它的进程与令牌是否被吊销。
+3. 主签名闸坏了：在备用签名闸上按设计文档「机器挂了怎么办」导入主的本机记录并确认，然后在控制台把它设为 primary（原 primary 同一次写降为 standby）。控制台上的主备只决定服务端把活派给谁，签名闸自己的本机记录才决定签不签。
+4. 卡在 `signing` 的任务：签名心跳 5 分钟没更新会自动回到 `built`；明确不想再签的，控制台带原因强制判失败。强制判失败不撤回签名闸已经上传的对象，它没有入库就不会被下发。
+5. 机器令牌疑似泄露：控制台吊销该机器（下一个请求即 401），新建一台同名机器拿新令牌；构建机与签名闸的公钥要重新上报、核对完整指纹后接受。
 
 ### 签名密钥切换日（测试阶段用的是公开 debug 密钥，正式包换密钥时执行）
 
