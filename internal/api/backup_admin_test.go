@@ -62,11 +62,15 @@ func TestDBForceFailRefusesAFinishedBackup(t *testing.T) {
 // 409 必须带上占着闸那条的 seq——运维没有别的出口去看是哪一条
 func TestDBRunNowTellsYouWhichBackupIsHoldingTheSlot(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = config.Config{Backup: config.Backup{Bucket: config.BackupBucket{Bucket: "b"}}}
+	s.cfg = config.Config{
+		AdminPasswordHash: testAdminPasswordHash,
+		Backup:            config.Backup{Bucket: config.BackupBucket{Bucket: "b"}},
+	}
 	first := mustCreate(t, s, "already running")
 
 	c, recorder := testContext(t, platformTenantID, "POST", "/v1/admin/platform/backup/run",
-		map[string]any{"reason": "please run one now", "confirm": true})
+		map[string]any{"reason": "please run one now", "confirm": true,
+			"password": testAdminPassword})
 	s.runBackupNow(c)
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("应当 409，得到 %d %s", recorder.Code, recorder.Body.String())
@@ -83,9 +87,10 @@ func TestDBRunNowTellsYouWhichBackupIsHoldingTheSlot(t *testing.T) {
 // 备份没配就不该能点。返回 412 而不是建一条注定失败的待办
 func TestDBRunNowRefusesWhenBackupsAreNotConfigured(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = config.Config{}
+	s.cfg = config.Config{AdminPasswordHash: testAdminPasswordHash}
 	c, recorder := testContext(t, platformTenantID, "POST", "/x",
-		map[string]any{"reason": "try it anyway", "confirm": true})
+		map[string]any{"reason": "try it anyway", "confirm": true,
+			"password": testAdminPassword})
 	s.runBackupNow(c)
 	if recorder.Code != http.StatusPreconditionFailed {
 		t.Fatalf("没配备份时应当 412，得到 %d", recorder.Code)

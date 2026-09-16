@@ -37,13 +37,15 @@ type server struct {
 	// 备份桶的 versioning 状态，「测试连接」那一刻缓存下来。nil = 从没测过
 	backupBucketVersioningMu sync.RWMutex
 	backupBucketVersioningOK *bool
-	cfg                      config.Config
-	db                       *sql.DB
-	mu                       sync.Mutex
-	attempts                 map[string]attempt
-	objects                  objectstore.Factory
-	tenant                   *tenantResolver
-	secrets                  *secretbox.Box
+	// 「跑一次」和「下载」的二次口令闸与一次性下载票据
+	backupReauth backupReauth
+	cfg          config.Config
+	db           *sql.DB
+	mu           sync.Mutex
+	attempts     map[string]attempt
+	objects      objectstore.Factory
+	tenant       *tenantResolver
+	secrets      *secretbox.Box
 	// tokens 只从平台默认端点读代币元数据；测试用假实现替换
 	tokens tokenMetadataReader
 	// verifyFCM 真去 Google 换一次访问令牌。做成字段是因为保存推送凭据这条路
@@ -211,6 +213,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	backup.PUT("/holders", s.updateBackupHolders)
 	backup.POST("/storage/test", s.testBackupBucket)
 	backup.POST("/:seq/force-fail", s.forceFailBackup)
+	// 口令换票、票换文件。下载必须走普通链接（包有几十 MB，让浏览器流式落盘），
+	// 而链接带不了请求体——所以二次口令只能拆成这两步
+	backup.POST("/:seq/:pair/download-ticket", s.issueBackupDownloadTicket)
 	backup.GET("/:seq/:pair/download", s.downloadBackup)
 	// 恢复之后让打包机把每个租户重验一遍。不做这一步，控制台显示的是灾难前
 	// 那台机器写下的记录（设计 §11）

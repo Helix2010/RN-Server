@@ -167,9 +167,15 @@ func (s *server) runBackupNow(c *gin.Context) {
 	var body struct {
 		Reason  string `json:"reason"`
 		Confirm bool   `json:"confirm"`
+		// 重新输一次管理员口令。理由见 backup_reauth.go 开头：会话 TTL 8 小时，
+		// 一个被偷走的 cookie 否则能直接触发并拉走全平台每个租户的签名密钥
+		Password string `json:"password"`
 	}
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, http.StatusBadRequest, "INVALID_BACKUP_RUN", "reason and confirm=true are required")
+		return
+	}
+	if !s.requireBackupPassword(c, body.Password) {
 		return
 	}
 	if !s.cfg.Backup.Enabled() {
@@ -250,27 +256,15 @@ func (s *server) forceFailBackup(c *gin.Context) {
 // 在新机器上恢复之后前缀就变了，历史备份会全部 404。:pair 只当查表的键用，
 // 匹配不到就 404，绝不参与拼字符串。
 func (s *server) downloadBackup(c *gin.Context) {
-	seq, ok := parseSeq(c.Param("seq"))
+	run, found, ok := s.backupObjectFor(c)
 	if !ok {
-		problem(c, http.StatusBadRequest, "INVALID_BACKUP_SEQ", "seq must be a positive integer")
 		return
 	}
-	run, err := s.backupRunBySeq(c.Request.Context(), seq)
-	if err != nil {
-		problem(c, http.StatusNotFound, "BACKUP_NOT_FOUND", "No such backup")
-		return
-	}
-	pair := strings.TrimSpace(c.Param("pair"))
-	var found *backupObject
-	for i := range run.Objects {
-		if run.Objects[i].Pair == pair {
-			found = &run.Objects[i]
-			break
-		}
-	}
-	if found == nil {
-		problem(c, http.StatusNotFound, "BACKUP_PAIR_NOT_FOUND",
-			"this backup has no package for that pair of key holders")
+	// 票据换文件。口令在换票那一步验过，这里只认票——链接带不了请求体，
+	// 而下载必须走普通链接：包有几十 MB，让浏览器流式落盘比在内存里攒 blob 靠谱
+	if !s.backupReauth.redeem(strings.TrimSpace(c.Query("ticket")), run.Seq, found.Pair, actor(c)) {
+		problem(c, http.StatusForbidden, "BACKUP_TICKET_INVALID",
+			"this download link needs a fresh ticket; enter the administrator password again")
 		return
 	}
 
@@ -300,13 +294,13 @@ func (s *server) downloadBackup(c *gin.Context) {
 
 	s.auditNow(newAudit(platformTenantID, actor(c), "backup_downloaded", "platform-backup", run.ID,
 		"a platform administrator downloaded a backup package", requestID(c),
-		map[string]any{"seq": run.Seq, "pair": pair}))
+		map[string]any{"seq": run.Seq, "pair": found.Pair}))
 
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", "attachment; filename=\"backup-"+c.Param("seq")+"-"+pair+".rnbk\"")
+	c.Header("Content-Disposition", "attachment; filename=\"backup-"+c.Param("seq")+"-"+found.Pair+".rnbk\"")
 	c.Header("X-Backup-Sha256", found.SHA256)
 	if _, err := io.Copy(c.Writer, body); err != nil {
-		slog.Error("streaming a backup download failed", "seq", run.Seq, "pair", pair, "error", err)
+		slog.Error("streaming a backup download failed", "seq", run.Seq, "pair", found.Pair, "error", err)
 	}
 }
 
@@ -450,4 +444,29 @@ func (s *server) backupBucketVersioning() any {
 		return nil
 	}
 	return *s.backupBucketVersioningOK
+}
+
+// backupObjectFor 解析 :seq/:pair 并查到那一个包。发票据和下载都要做这件事。
+//
+// :pair 只当查表的键用，匹配不到就 404，**绝不参与拼字符串**——它来自 URL。
+func (s *server) backupObjectFor(c *gin.Context) (backupRun, *backupObject, bool) {
+	seq, ok := parseSeq(c.Param("seq"))
+	if !ok {
+		problem(c, http.StatusBadRequest, "INVALID_BACKUP_SEQ", "seq must be a positive integer")
+		return backupRun{}, nil, false
+	}
+	run, err := s.backupRunBySeq(c.Request.Context(), seq)
+	if err != nil {
+		problem(c, http.StatusNotFound, "BACKUP_NOT_FOUND", "No such backup")
+		return backupRun{}, nil, false
+	}
+	pair := strings.TrimSpace(c.Param("pair"))
+	for i := range run.Objects {
+		if run.Objects[i].Pair == pair {
+			return run, &run.Objects[i], true
+		}
+	}
+	problem(c, http.StatusNotFound, "BACKUP_PAIR_NOT_FOUND",
+		"this backup has no package for that pair of key holders")
+	return backupRun{}, nil, false
 }
