@@ -7713,6 +7713,7 @@
                 "status": {
                   "type": "string",
                   "enum": [
+                    "pending_enrollment",
                     "pending_key",
                     "active"
                   ]
