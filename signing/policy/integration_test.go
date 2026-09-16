@@ -20,9 +20,9 @@ import (
 )
 
 // TestRealReleaseAgainstPolicy 用线上 anyfun 包（剥掉签名后当未签名包）跑完整策略，确认值取
-// anyfun 的真实信任根。检查按规则顺序执行、第一处不过即返回；线上包没有 assets/fingerprint，
-// 所以期望的唯一拒签是最后一条 NATIVE_FINGERPRINT_MISSING——它说明第 2–15 条（出处、结构、
-// 对齐、身份、属性、34 个权限、内嵌配置、OTA 证书、App Links、scheme）对真实包全部通过。
+// anyfun 的真实信任根，期望第 2–16 条（出处、结构、对齐、身份、属性、34 个权限、内嵌配置、
+// OTA 证书、App Links、scheme、原生指纹）全部通过。线上包没有 assets/fingerprint，原生指纹以
+// 出处声明为准。
 func TestRealReleaseAgainstPolicy(t *testing.T) {
 	path := os.Getenv("RN_SIGNING_TEST_APK")
 	if path == "" {
@@ -88,10 +88,13 @@ func TestRealReleaseAgainstPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	v := EvaluateFile(in, file, apk.DefaultLimits())
-	if v.OK || v.Code != "NATIVE_FINGERPRINT_MISSING" {
-		t.Fatalf("real release: got ok=%v %s (%s); want only NATIVE_FINGERPRINT_MISSING", v.OK, v.Code, v.Detail)
+	if !v.OK {
+		t.Fatalf("real release rejected: %s (%s)", v.Code, v.Detail)
 	}
-	t.Logf("real release passes rules 2-15; OTA certificate sha256 %s", roots.OTACertificateSHA256)
+	if v.Facts.NativeFingerprint != fp || v.Facts.NativeFingerprintSource != NativeFingerprintSourceProvenance || v.Facts.VersionCode != 46 {
+		t.Fatalf("real release facts: %+v", v.Facts)
+	}
+	t.Logf("real release passes rules 2-16; OTA certificate sha256 %s; native fingerprint from %s", roots.OTACertificateSHA256, v.Facts.NativeFingerprintSource)
 
 	// 对照：确认值改一项，就在对应规则上拒签
 	for name, tc := range map[string]struct {

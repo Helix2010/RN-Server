@@ -76,6 +76,17 @@ func TestHappyPathSignsDeliversAndRecords(t *testing.T) {
 	h.assertRuntimeEmpty()
 }
 
+// 包里没有 assets/fingerprint（runtimeVersion 走 appVersion 策略）：原生指纹以出处声明为准，complete 原样上报。
+func TestNativeFingerprintFromProvenance(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	b := h.build("bld_nofpJOB000000001", 46, func(s *apktest.Spec) { s.NativeFingerprint = "" })
+	h.enqueue(b, 1, nil)
+	h.runOnce()
+	if len(h.server.completes) != 1 || h.server.completes[0].NativeFingerprint != apktest.DefaultNativeFingerprint {
+		t.Fatalf("completes %+v rejects %+v", h.server.completes, h.server.rejects)
+	}
+}
+
 func TestDeferredIsNotAViolation(t *testing.T) {
 	t.Run("certificate not confirmed", func(t *testing.T) {
 		h := newHarness(t, harnessOptions{noConfirm: true})
