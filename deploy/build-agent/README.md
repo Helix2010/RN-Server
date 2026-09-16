@@ -1,195 +1,222 @@
-# 打包机部署
+# 构建机部署
 
-**这台机器不和 wallet 后端同机。** 它持有 Android keystore，而"服务端不下发密钥、不执行命令"那套论证在两者同机的那一刻就作废了：后端的一个 RCE 直接读到磁盘上的密钥。amos 现在两者同机，那是开发环境的临时状态，不是可以照抄的样板（见 `deploy/amos/README.md`）。
+设计见 `docs/design/android-signing-gate-2026-09-16.md`「构建机」「部署与运维」。
 
-设计见 `docs/design/build-service-2026-09-11.md`。
+**构建机没有签名能力。** 它执行 pnpm、Gradle 和几千个第三方依赖的代码，按不可信处理：手上没有任何签名密钥，只交付**未签名包**、SBOM 和一份用本机出处密钥签名的出处声明；正式签名由签名闸做，签名闸只认在它本机 pin 过的构建机公钥。
 
 ## 一句话拓扑
 
 ```
-打包机  ──出──→  API（领任务 / 回传产物）
-        ──出──→  GitHub（拉代码）
-        ──出──→  npm / Maven / Gradle（拉依赖）
-        ←─入──   什么都没有，不监听任何端口
+build-agent（rn-build-agent） ──出──→ API（领任务 / 心跳 / 传未签名包与 SBOM / 交出处声明）
+                              ──出──→ GitHub（fetch 仓库镜像，只读 deploy key）
+        │ sudo -n -u builder
+        ▼
+build-runner（builder）       ──出──→ npm / Maven / Gradle（拉依赖）
+                               ←─入── 什么都没有，不监听任何端口
 ```
 
-代理只出不进：轮询服务端要活，服务端从不连它。所以这台机器可以关掉全部入站端口（除了你自己要用的 SSH）。反过来做就要在握着签名密钥的机器上开一个监听端口，那个端口的每一个 bug 都直接通向 keystore。
+## 两个进程，两个用户
 
-## 依赖的软件
-
-| 软件 | amos 上的版本 | 为什么要 | 装漏了会怎样 |
+| 进程 | 用户 | 持有 | 碰不到 |
 | --- | --- | --- | --- |
-| JDK 17 | `openjdk 17.0.20` | Gradle / Android 构建 | Gradle 起不来 |
-| Node.js 22 | `v22.23.2` | Expo prebuild、`pnpm android:release`、SBOM 脚本 | 第一步就失败 |
-| pnpm 12 | `12.4.1` | 仓库用 pnpm lockfile | `--frozen-lockfile` 不认别的包管理器 |
-| git ≥ 2.30 | `2.34.1` | 裸库 + 每任务一个 worktree | 需要 `worktree` 子命令 |
-| Android SDK | platform-tools / platforms;android-36 / build-tools 36.0.0、35.0.0 / cmake 3.22.1 | 编译与签名 | 构建到一半才报缺组件 |
-| Android NDK | `27.0.12077973`、`27.1.12297006` | RN 的原生模块 | 见下面那条"SDK 只读" |
-| syft | `1.51.1`（固定版本+校验和） | 生成 SBOM，构建的必经步骤 | **构建直接失败**，不是警告 |
-| zip | 系统包 | 打热更新包（`build-ota.mjs` 调它） | 热更新任务失败在 `spawnSync zip ENOENT`；APK 那条不受影响 |
+| 构建控制进程 `build-agent` | `rn-build-agent` | 本机令牌 `BUILD_AGENT_MACHINE_TOKEN`、Ed25519 出处签名密钥、仓库镜像、只读依赖缓存 | 不执行仓库与依赖里的任何代码；执行进程的产物只当字节读 |
+| 构建执行进程 `build-runner` | `builder` | 只有当前任务的一次性目录 | 令牌、出处密钥、仓库镜像、控制进程的 `/proc/<pid>/environ` |
 
-syft 用 `deploy/amos/install-syft.sh` 装，版本和 sha256 都写死在脚本里：SBOM 是要被别人当证据读的东西，同一个 commit 在两台机器上扫出不同组件数的话，没人分得清是依赖变了还是工具变了。
+- 控制进程经一条收窄的 sudoers 规则启动执行进程（`rn-build-agent.sudoers`）：`rn-build-agent ALL=(builder) NOPASSWD:NOSETENV: /opt/rn-build-agent/build-runner`。规则不限参数，参数由 `build-runner` 自己校验。
+- 执行进程的环境不继承任何东西：sudo 本来就重置环境，执行进程也不读自己的环境，给子进程的环境全部来自任务说明里的白名单。
+- 控制进程负责 fetch 与检出，检出固定 `refs/heads/main`（任务里的 `gitRef` 只核对，不是 `main` 就拒绝），过程中不跑任何 hook、不读系统与全局 git 配置。
+- 控制进程给出处声明签名：jobId、attempt、租户 slug、包名、versionCode、versionName、commit、未签名包 sha256 与大小、SBOM sha256、原生指纹、构建机 id、时间。commit 与原生指纹是构建机自报，签名闸复核原生指纹。
 
-**SDK 目录对构建用户只读是有意的**，所以 NDK 版本必须预装齐。Gradle 想自己补一个缺失的 NDK 时会失败在 "SDK directory is not writable"，而不是去装它。版本号以 expo-updates / react-native 当前要求的为准。
+## 执行进程调用协议
 
-## 依赖的服务
+```
+sudo -n -u builder -- /opt/rn-build-agent/build-runner build      --jobs-root /var/lib/rn-build-jobs --job <jobId> --kind apk|ota
+sudo -n -u builder -- /opt/rn-build-agent/build-runner cleanup    --jobs-root /var/lib/rn-build-jobs --job <jobId>
+sudo -n -u builder -- /opt/rn-build-agent/build-runner self-check --jobs-root /var/lib/rn-build-jobs --protocol 1 --expect-separated
+```
 
-| 出口 | 给谁 | 没有会怎样 |
+- 退出码：0 成功；1 构建失败；2 参数、身份或任务目录不合规。空参数退出 2。失败原因是标准输出最后一行 `build-runner: error: …`。
+- 执行进程自己校验：以 root 运行一律拒绝；`--jobs-root` 是规范的绝对路径、没有 `..`；`--job` 按服务端 id 规则（天然不含 `/`、`..`）；`--kind` 只能 `apk`/`ota`；同一个参数不许出现两次、不许多余的位置参数。经 sudo 运行时，任务根目录、任务目录、`src/`、`spec.json` 必须属于调用 sudo 的用户且执行进程改不了，`spec.json` 不能是符号链接。
+- `self-check` 在控制进程启动时跑一次：确认 sudo 规则装好了、执行进程确实是另一个 uid、两个二进制的任务协议版本一致（只换了其中一个就启动失败）。
+
+任务目录 `<jobs-root>/<jobId>/`：
+
+| 路径 | 谁写 | 内容 |
 | --- | --- | --- |
-| `https://<API 域名>` | 领任务、取图标、报心跳、传产物 | 领不到活；日志里是 claim 报错 |
-| `github.com:22`（SSH） | `git fetch` 拉代码 | 构建第一步失败 |
-| npm registry | `pnpm install` | 同上 |
-| Maven Central / Google Maven / `services.gradle.org` | Gradle 依赖与 wrapper | 同上 |
-| 对象存储 | 只在 `ARTIFACT_UPLOAD_MODE=direct` 时需要；`proxy` 模式下产物经 API 转发 | direct 模式下传不上去 |
+| `spec.json` | 控制进程 | 任务说明：kind、租户目录、版本、build 号、commit、热更新参数、子进程环境。执行进程严格解析（未知字段拒收）并逐项校验环境白名单 |
+| `src/` | 控制进程 | 从仓库镜像浅取的单提交仓库（`.git` 是自包含的真目录），加上服务端下发的 `tenant.json`、图标、`ota-certificate.pem`、`google-services.json` |
+| `work/` | 执行进程 | `app/`（`src/` 的副本，全部属于 builder）、`home/`、`gradle-home/`、`pnpm-store/`、`tmp/` |
+| `out/` | 执行进程 | 固定文件名交回：`app-release-unsigned.apk`、`sbom.cdx.json`、`ota.zip`、`result.json`（原生指纹） |
 
-不需要数据库、不需要 Redis、不需要对象存储凭证——代理手上没有任何一个能直连数据面的凭据。它只有一个 `BUILD_AGENT_TOKEN`，那把令牌能做的事只有"领构建任务"这一件；管理端的 admin key 不在这台机器上。
+控制进程读 `out/` 时把内容当不可信数据：`O_NOFOLLOW` 打开，拒绝符号链接、硬链接、FIFO 与超限文件（未签名包、热更新包 2 GiB，SBOM 16 MiB，结果 64 KiB），先复制进自己状态目录里的 `spool/` 再算 sha256、上传、签出处，之后执行进程残留的进程再改原文件也影响不到。SBOM 只当 JSON 读，核对它绑定的是这个未签名包（`metadata.component` 的 SHA-256、属性 `rn-app:artifact` 与 `rn-app:artifact-signing=unsigned`）。
 
-## 权限
+## 每个任务的隔离
 
-### 账号
+- **子进程环境白名单**（`cmd/build-agent/internal/jobspec`，控制进程在 `prepareWorktree` 里构造，安装包与热更新共用，测试断言两边一致）：
+  - 机器级：`PATH`（unit 里设）、`LANG`、`JAVA_HOME`、`ANDROID_HOME`、`ANDROID_SDK_ROOT`、`GRADLE_RO_DEP_CACHE`，取自控制进程环境
+  - 每任务目录：`HOME`、`GRADLE_USER_HOME`、`npm_config_store_dir`、`TMPDIR`、`ANDROID_USER_HOME`，都在 `work/` 下、用完删除
+  - 任务专用：`EXPO_PUBLIC_TENANT`、`EXPO_PUBLIC_API_BASE_URL`、`EXPO_UPDATES_CODE_SIGNING_CERTIFICATE=./ota-certificate.pem`、`EXPO_REQUIRE_OTA_SIGNING=1`、`GOOGLE_SERVICES_JSON=./google-services.json`（相对路径：它们进 expo config，也就进原生指纹）
+  - 不再有 `GRADLE_DEPENDENCY_VERIFICATION`（RN-App 的 release 构建强制依赖校验）与四个 `ANDROID_RELEASE_*` 签名变量
+- **跨任务不留东西**：执行进程在每个任务开始时和清理时回收 builder 的一切——`kill(-1)` 杀掉 builder 的全部进程（Gradle daemon、自己 setsid 出去的后台进程），删掉 `/tmp`、`/var/tmp`、`/dev/shm` 顶层属于 builder 的条目（例如 Metro 缓存）。builder 在这台机器上只能给执行进程用。
+- **builder 没有能落脚的家目录**：passwd 里的 home 是 `/nonexistent`、shell 是 `nologin`，放进 `/etc/cron.deny` 与 `/etc/at.deny`。Java 按 passwd 取 `user.home`，所以 `ANDROID_USER_HOME` 显式指到任务目录。
+- 未签名包按 RN-App `scripts/build-android-release.mjs` 的产物名 `artifacts/<租户目录>-<版本>-build<号>-release-unsigned.apk` 查找；原生指纹算不出来安装包任务直接失败（出处声明要它）。
 
-```
-builder:x:998:998::/var/lib/rn-build-agent:/bin/bash     系统账号
-```
+## 依赖缓存
 
-- **builder 没有任何 sudo 权限**（`sudo -l -U builder` → not allowed）。构建过程跑的是仓库里的 `pnpm android:release`，那条链路上的任何一步都不该能提权。
-- 家目录就是状态目录：OpenSSH 按 passwd 里的 home 找 `~/.ssh`，不看 `$HOME`，两者必须一致。
-- 服务以 `User=builder` 跑，配上 `NoNewPrivileges=true`、`ProtectSystem=strict`、`ProtectHome=true`，可写路径只有两条（见 unit 里的 `ReadWritePaths`）。
+### pnpm：每个任务一个独立 store（已实测，选定）
 
-### 文件
+设计让先验证"只读 store 下 `pnpm install --frozen-lockfile --offline` 是否可行"。2026-09-16 在开发机上用 RN-App（1197 个包，store 736 MB）实测：
+
+| 做法 | 结果 |
+| --- | --- |
+| `pnpm fetch` 填 store 后 `chmod -R a-w`，再 `--offline` 安装 | **失败**：pnpm 10.32.1 在 `getContext` 里无条件把项目登记进 `<store>/v10/projects/`（symlink），只读 store 直接 EACCES；`packageManager` 与已装版本不同时还会先往 `$HOME` 装另一个 pnpm 并同样登记进 store |
+| 只放开 `v10/projects/` 可写，关掉版本切换 | 可行：离线 2–3 秒；以另一个 uid（`sudo -u nobody`）安装时硬链接被 `protected_hardlinks` 拒绝，pnpm 自动改为复制（链接数 1，属安装用户） |
+| 每任务新 store、在线 `pnpm install --frozen-lockfile` | 可行：4.7 秒（含每任务把 `packageManager` 指定的 pnpm 10.28.1 装进任务 `HOME`），store 随任务删除 |
+
+选**每任务独立 store**。只读 store 在技术上能凑出来，但维护它绕不开两件事：控制进程在仓库检出上跑 pnpm（`.pnpmfile.cjs`、`configDependencies`、`packageManager` 版本切换都会执行仓库指定的代码），或者由执行进程填充后交给控制进程——而 store 的 `index/` 文件把 tarball 完整性映射到文件哈希，没有原 tarball 就无法验证，被下过毒的 store 会在之后每个任务里被信任。两种做法换来的只是每个任务省几秒到几分钟。每任务独立 store 时，tarball 完整性由 lockfile 保证，任务之间不共享任何 pnpm 状态。代价：每个任务都要访问 npm registry，registry 不可用时构建失败。
+
+### Gradle：只读依赖缓存 `GRADLE_RO_DEP_CACHE`（可选，方案）
+
+控制进程只负责把 `GRADLE_RO_DEP_CACHE` 交给执行进程，并在启动时核对它是真实目录、属于 rn-build-agent、组与其他人不可写；unit 的 `ProtectSystem=strict` 让它在运行时对控制进程和执行进程都是只读的。不设就是每个任务在自己的 `GRADLE_USER_HOME` 里从零下载依赖（慢，另外每个任务还会下载一次 Gradle 发行包）。
+
+维护方案（尚未实现，按这个顺序做，控制进程全程不执行第三方代码）：
+
+1. **填充**：挑一条成功的安装包任务，由执行进程在交回产物时把 `gradle-home/caches/modules-2` 硬链接进 `out/gradle-cache/`（自己的文件，零拷贝）。
+2. **复制并校验**：由 root 或控制进程把它**逐字节复制**（不是硬链接，硬链接保留 builder 的 inode）进 `/var/cache/rn-build-agent/gradle-ro.<时间>.tmp/`，只接受普通文件与目录，丢掉 `*.lock` 与 `gc.properties`；`files-2.1/<group>/<module>/<version>/<sha1>/<file>` 逐个核对文件 SHA-1 等于所在目录名，且 SHA-256 出现在**控制进程自己检出的** `main` 的 `gradle/verification-metadata.xml` 里——对不上整份作废。
+3. **原子切换**：权限收成 rn-build-agent:rn-build-jobs 0750/0640，`rename` 成新版本目录，改 `GRADLE_RO_DEP_CACHE` 指向它，重启服务；旧版本保留一份以便回退。`verification-metadata.xml` 变了就重做一次。
+
+残余风险：`metadata-2.*` 里是 Gradle 的二进制元数据缓存，无法独立校验，被下毒时能影响依赖解析结果（例如在清单里都登记过的版本之间替换）；但 RN-App 在 release 构建里强制 Gradle 依赖校验，**任何不在 `verification-metadata.xml` 里的产物都会让构建失败**，这是这道缓存真正的防线。清单本身在仓库 `main` 里，谁能改 `main` 谁就能改它——那已经在"能改代码"的威胁里。填充用的那个任务如果被攻破，它能放进缓存的也只有清单里登记过的产物。
+
+## 目录与权限
 
 | 路径 | 属主 | 模式 | 说明 |
 | --- | --- | --- | --- |
-| `/etc/rn-build-agent.env` | root:root | `0600` | 含 `BUILD_AGENT_TOKEN`。**builder 读不到**——systemd 以 root 读它再注入进程环境 |
-| `/opt/rn-build-agent/build-agent` | root:root | `0755` | builder 不能改自己的程序 |
-| `/var/lib/rn-build-agent/` | builder:builder | `0755` | 状态 |
-| `/var/lib/rn-build-agent/.ssh/` | builder:builder | `0700` | GitHub 部署密钥（**只读权限的 deploy key**） |
-| `/var/lib/rn-build-agent/agent-key` | builder:builder | `0600` | 本机私钥，服务端把签名密钥加密给它的那把 |
-| `/var/cache/rn-build-agent/` | builder:builder | `0755` | Gradle 与 pnpm 缓存，可随便删 |
-| `/opt/android-sdk` | root:root | `0755`（builder 只读） | 见上 |
+| `/opt/rn-build-agent/build-agent` | root:root | 0755 | 控制进程 |
+| `/opt/rn-build-agent/build-runner` | root:root | 0755 | 执行进程；控制进程启动时拒绝一个组或其他人可写、或不属于 root 的执行进程二进制 |
+| `/etc/rn-build-agent.env` | root:root | 0600 | 含本机令牌；systemd 以 root 读 |
+| `/etc/sudoers.d/rn-build-agent` | root:root | 0440 | 那一条规则 |
+| `/var/lib/rn-build-agent/` | rn-build-agent:rn-build-agent | 0700 | rn-build-agent 的 HOME；builder 连进都进不去 |
+| `/var/lib/rn-build-agent/.ssh/` | rn-build-agent | 0700 | GitHub 只读 deploy key |
+| `/var/lib/rn-build-agent/state/` | rn-build-agent | 0700 | `provenance-ed25519.key`（0600）、`spool/`。权限不对控制进程拒绝启动 |
+| `/var/lib/rn-build-agent/repos/rn-app.git` | rn-build-agent | 0700 | 仓库镜像 |
+| `/var/lib/rn-build-jobs/` | rn-build-agent:rn-build-jobs | 2750 | 任务根目录。builder 在组里：进得去、读得到，**建不了东西** |
+| `/var/lib/rn-build-jobs/<jobId>/work`、`out` | rn-build-agent:rn-build-jobs | 2770 | builder 可写；setgid 让它建的文件属 rn-build-jobs 组，控制进程读得回来 |
+| `/var/cache/rn-build-agent/gradle-ro*/` | rn-build-agent:rn-build-jobs | 0750 / 文件 0640 | 可选的只读 Gradle 依赖缓存 |
+| `/opt/android-sdk` | root:root | 0755 | builder 只读，所以 NDK 版本要预装齐 |
 
-### 外部凭据
+builder 能写的地方只有当前任务的 `work/`、`out/` 与 `/tmp` 一类公共临时目录（后者每个任务开始时清掉属于它的条目）。
 
-| 凭据 | 放哪 | 权限范围 |
+## unit 硬化
+
+`rn-build-agent.service`：`User=rn-build-agent`、`SupplementaryGroups=rn-build-jobs`、`UMask=0027`、`PrivateTmp`、`ProtectSystem=strict`（可写只有 `/var/lib/rn-build-agent`、`/var/lib/rn-build-jobs`）、`ProtectHome`、`ProtectControlGroups`、`ProtectProc=invisible`（同一个 unit 里的 builder 进程看不见 rn-build-agent 的进程）、`KillMode=control-group`、`LimitCORE=0`。
+
+**没有 `NoNewPrivileges`**，也没有任何会被 systemd 隐式换成 `NoNewPrivileges` 的选项（`SystemCallFilter`、`SystemCallArchitectures`、`RestrictAddressFamilies`、`PrivateDevices`、`ProtectKernel*`、`MemoryDenyWriteExecute`、`RestrictSUIDSGID`、`LockPersonality` 等）：执行进程靠 sudo 切用户，那些选项会让 sudo 直接失败。2026-09-16 在开发机上用 `systemd-run` 按这份 unit 的选项实测过：sudo 切到另一个用户可行，`build-runner` 在沙箱里完整跑通一次安装包构建，控制进程靠组权限读回产物，构建用户读不到控制进程状态目录、看不到控制进程的 `/proc`；加上 `PrivateDevices=yes` 或 `SystemCallArchitectures=native` 后 sudo 报 "no new privileges flag is set"。分用户这道边界靠 uid 与文件权限，不靠这些选项。
+
+## 依赖的软件
+
+| 软件 | 为什么要 | 装漏了会怎样 |
 | --- | --- | --- |
-| `BUILD_AGENT_TOKEN` | `/etc/rn-build-agent.env` | 只能访问 `/v1/build-agent/*`。丢了泄的是构建队列，不是管理端 |
-| GitHub deploy key | `/var/lib/rn-build-agent/.ssh/` | **只读**，单仓库 |
-| 本机 X25519 私钥 | `/var/lib/rn-build-agent/agent-key` | 服务端按公钥指纹加密 keystore；换机器要平台管理员核对指纹后接受 |
-| `BUILD_KEYSTORE_PASSPHRASE` | `/etc/rn-build-agent.env` | **遗留项**。v2 的盒子加密给本机公钥，不需要任何口令；这一条只为还没重新生成的老租户留着，全部迁完就删掉 |
-
-服务端**从不**给这台机器下发可执行的东西：任务里只有版本号、租户配置、证书和一个加密的 keystore 盒子。构建跑的是仓库里那份提交过的脚本。这条边界是整套设计的地基，加功能时不要跨过去。
-
-## 目录约定
-
-| 路径 | 内容 | 删了会怎样 |
-| --- | --- | --- |
-| `/opt/rn-build-agent/build-agent` | 程序本体 | 重新 scp 一个 |
-| `/etc/rn-build-agent.env` | 配置，0600 root 所有 | 要重新填 |
-| `/var/lib/rn-build-agent/` | 状态，同时是 builder 的 HOME | 要重新配部署密钥、重新拉仓库 |
-| `/var/lib/rn-build-agent/repos/rn-app.git` | 仓库镜像（裸库） | 重新 clone |
-| `/var/lib/rn-build-agent/workspace/` | 每个任务一份检出 | 无所谓，任务结束就删 |
-| `/var/lib/rn-build-agent/agent-key` | 本机私钥 | **已存的盒子全部打不开**，每个租户都要重新生成签名密钥 |
-| `/var/lib/rn-build-agent/.ssh/` | GitHub 部署密钥 | 要重新生成并加回仓库 |
-| `/var/cache/rn-build-agent/` | Gradle 与 pnpm 的缓存 | 只是下一次构建慢一点 |
-| `/opt/android-sdk` | Android SDK，root 所有、全局可读 | 重新装 |
-
-状态与缓存分开不是形式：清理策略和备份策略完全不同。缓存整个删掉只会让下一次构建慢几分钟，`/var/lib` 下的东西删了要重新配密钥、重新拉仓库，而 `agent-key` 删了连已有的签名密钥都救不回来。
+| JDK 17 | Gradle / Android 构建 | Gradle 起不来 |
+| Node.js 22 | Expo prebuild、`pnpm android:release`、SBOM 脚本 | 第一步就失败 |
+| pnpm | 仓库用 pnpm lockfile；`packageManager` 指定的版本会被装进每个任务的 HOME | `--frozen-lockfile` 不认别的包管理器 |
+| git ≥ 2.30 | 控制进程的仓库镜像与每任务检出；执行进程的副本里 `build-ota.mjs` 要用 | 检出失败 |
+| sudo | 控制进程启动执行进程 | 启动自检失败，控制进程以 2 退出 |
+| Android SDK / NDK | 编译 | 构建到一半才报缺组件 |
+| syft（固定版本+校验和，`deploy/amos/install-syft.sh`） | 生成 SBOM，构建的必经步骤 | 安装包任务失败 |
+| zip | `build-ota.mjs` 打热更新包 | 热更新任务失败 |
 
 ## 装一台新的
 
 ```bash
-# 1. 工具链
-sudo apt-get install -y openjdk-17-jdk-headless zip
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs
-sudo corepack enable && sudo corepack prepare pnpm@latest --activate
+# 1. 工具链、SDK、syft：同上一节，SDK 放 /opt/android-sdk，root 所有、全局可读
 
-# 2. Android SDK 到 /opt，root 所有、全局可读（构建用户不需要写它）
-sudo mkdir -p /opt/android-sdk/cmdline-tools && cd /tmp
-curl -sSLo cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-sudo unzip -qo cmdline-tools.zip -d /opt/android-sdk/cmdline-tools
-sudo mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest
-yes | sudo /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
-sudo /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --install \
-  "platform-tools" "platforms;android-36" "build-tools;36.0.0" "build-tools;35.0.0" \
-  "ndk;27.0.12077973" "ndk;27.1.12297006" "cmake;3.22.1"
-sudo chmod -R a+rX /opt/android-sdk
+# 2. 用户、组
+sudo groupadd --system rn-build-jobs
+sudo useradd --system --home-dir /var/lib/rn-build-agent --create-home --shell /usr/sbin/nologin \
+  --user-group --groups rn-build-jobs rn-build-agent
+sudo useradd --system --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin \
+  --user-group --groups rn-build-jobs builder
+echo builder | sudo tee -a /etc/cron.deny /etc/at.deny >/dev/null
 
-# 3. SBOM 工具（固定版本 + 校验和，别用官网那条 curl | sh）
-#    脚本在仓库的 deploy/amos/install-syft.sh，scp 上来再跑
-sudo bash install-syft.sh
+# 3. 目录
+sudo install -d -o rn-build-agent -g rn-build-agent -m 0700 /var/lib/rn-build-agent /var/lib/rn-build-agent/.ssh /var/lib/rn-build-agent/state /var/lib/rn-build-agent/repos
+sudo install -d -o rn-build-agent -g rn-build-jobs -m 2750 /var/lib/rn-build-jobs
+sudo install -d -o root -g root -m 0755 /opt/rn-build-agent
 
-# 4. 用户与目录
-sudo useradd --system --create-home --home-dir /var/lib/rn-build-agent --shell /bin/bash builder
-sudo mkdir -p /var/lib/rn-build-agent/{repos,workspace} /var/cache/rn-build-agent/{gradle,pnpm-store} /opt/rn-build-agent
-sudo chown -R builder:builder /var/lib/rn-build-agent /var/cache/rn-build-agent
+# 4. GitHub 只读 deploy key 与仓库镜像
+sudo -u rn-build-agent ssh-keygen -t ed25519 -N "" -C "rn-build-agent@$(hostname)" -f /var/lib/rn-build-agent/.ssh/id_ed25519
+sudo -u rn-build-agent sh -c 'ssh-keyscan -t ed25519 github.com > /var/lib/rn-build-agent/.ssh/known_hosts'
+sudo cat /var/lib/rn-build-agent/.ssh/id_ed25519.pub   # 公钥加到仓库 Deploy keys（只读）
+sudo -u rn-build-agent git clone --mirror git@github.com:Helix2010/RN-App.git /var/lib/rn-build-agent/repos/rn-app.git
 
-# 5. 部署密钥，公钥加到仓库的 Deploy keys（**只读**）
-sudo -u builder ssh-keygen -t ed25519 -N "" -C "rn-build-agent@$(hostname)" -f /var/lib/rn-build-agent/.ssh/id_ed25519
-sudo -u builder ssh-keyscan -t ed25519 github.com | sudo -u builder tee /var/lib/rn-build-agent/.ssh/known_hosts
-sudo cat /var/lib/rn-build-agent/.ssh/id_ed25519.pub
-
-# 6. 仓库镜像
-sudo -u builder git clone --mirror git@github.com:Helix2010/RN-App.git /var/lib/rn-build-agent/repos/rn-app.git
-
-# 7. 程序、配置、服务
-sudo install -m 0755 build-agent /opt/rn-build-agent/build-agent
-sudo install -m 0600 rn-build-agent.env.example /etc/rn-build-agent.env   # 然后填
-sudo install -m 0644 rn-build-agent.service /etc/systemd/system/
-sudo systemctl enable --now rn-build-agent
+# 5. 两个二进制（手工部署，见「换二进制」）、sudoers、配置、unit
+sudo install -o root -g root -m 0755 build-agent build-runner /opt/rn-build-agent/
+sudo visudo -cf rn-build-agent.sudoers && sudo install -o root -g root -m 0440 rn-build-agent.sudoers /etc/sudoers.d/rn-build-agent
+sudo install -o root -g root -m 0600 rn-build-agent.env.example /etc/rn-build-agent.env   # 然后填，令牌手输
+sudo install -o root -g root -m 0644 rn-build-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now rn-build-agent
 ```
 
-启动后 journal 里会打出本机公钥指纹。**第一台**登记即固定；之后换机器或重装会变成 `pending_acceptance`，要平台管理员在管理端把指纹敲一遍才接受——不这样做的话，偷到令牌的人登记自己的公钥就能收下以后每一把新密钥。
+## 身份登记
 
-## 换二进制 / 重启
+1. 控制进程第一次启动时在状态目录生成出处密钥并登记公钥（`POST /v1/build-agent/public-key`），状态 `pending_key`，**接受之前不领任务**，journal 里会反复提示在等什么。
+2. 在构建机上只读查看身份（不会创建任何东西）：
+   ```bash
+   sudo -u rn-build-agent /opt/rn-build-agent/build-agent show-key --state-dir /var/lib/rn-build-agent/state
+   ```
+   输出公钥 base64 与**完整 sha256（64 个十六进制字符）**。
+3. 平台管理员在控制台「平台维护 → 打包机与签名闸」核对完整 sha256 后接受。控制台接受只影响服务端路由。
+4. 运维分别登上主、备签名闸执行 `signer trust-builder`，粘贴第 2 步的完整 sha256。**签名闸只认这里 pin 过的构建机**；没做这一步，这台构建机交付的包会被拒签。
 
-两条路，默认走手工那条。
+**换出处密钥**（旧私钥还在）：`sudo -u rn-build-agent /opt/rn-build-agent/build-agent rotate-key --state-dir /var/lib/rn-build-agent/state` 生成下一把并打印 sha256 → 重启服务，控制进程用当前私钥签换钥证明登记它 → **先**在每台签名闸上 `trust-builder` 新 sha256 → **再**在控制台接受 → 控制进程发现服务端已接受（每次签出处声明之前都会先问一次），换上新密钥并删掉旧私钥。顺序反过来的话，中间交付的包会被签名闸拒签。换钥证明要签机器 id，服务端的登记响应需要带 `machineId`。
 
-**手工（默认）**
+**私钥丢了**（状态目录没了）：不恢复，按新机器处理——控制台新建机器发新令牌、吊销旧机器，签名闸上撤销旧构建机、`trust-builder` 新的。
+
+## 换二进制
+
+**签名闸与 amos 同机期间，`AMOS_DEPLOY_BUILD_AGENT` 必须关着，构建机手工部署**（`deploy/amos/README.md`「签名闸同机期间，打包机不走 CI」）。另外 CI 那条路（`rn-foundation-apply build-agent`）只换 `build-agent`，不换 `build-runner`；两个二进制必须同一个提交一起换，版本不一致时控制进程启动自检失败（`--protocol`）。
 
 ```bash
-GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-  go build -trimpath -ldflags="-s -w" -o build-agent ./cmd/build-agent
-scp build-agent amos:~/build-agent.new
-ssh amos 'sudo install -m 0755 ~/build-agent.new /opt/rn-build-agent/build-agent && sudo systemctl restart rn-build-agent'
+GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-agent  ./cmd/build-agent
+GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-runner ./cmd/build-agent/build-runner
+sha256sum build-agent build-runner                        # 记下来
+scp build-agent build-runner <构建机>:~/
+ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runner /opt/rn-build-agent/ && sudo systemctl restart rn-build-agent'
 ```
 
-**CI（要显式开）**：在 RN-Server 仓库的 Variables 里把 `AMOS_DEPLOY_BUILD_AGENT`
-设成 `true`，此后每次 push 到 main，代理和服务端**同一个 commit 一起发**——两边共用
-`internal/backupcontainer`、`internal/backupbundle` 和 `/v1/build-agent` 那套契约，
-分开发的那天对不上的是备份容器格式，而发现它的时机是灾难当天。
+冒烟：`env -i /opt/rn-build-agent/build-agent` 必须以 2 退出（配置不全），什么都不写；`build-runner` 不带参数也以 2 退出。
 
-**开之前先认下这个交换。** 服务端那个二进制以 `rnfoundation` 身份跑，读不到
-`/etc/rn-build-agent.env` 里 Android keystore 的封装口令，也读不到 `agent-key`；
-代理这个读得到。把它交给 CI，等于「能往 main 推代码的人 = 能在握着全平台签名密钥的
-机器上执行任意代码」，而**「服务端读不到签名密钥」是整套备份方案的前提**
-（`docs/design/platform-backup-recovery-2026-09-15.md` §1）。这个开关默认关着就是这个原因。
+控制进程收到 SIGTERM 后**不再领新任务，但把手上那一条做完**，所以 `systemctl restart` 可能等一轮构建（最长 `BUILD_AGENT_TIMEOUT_MINUTES`，unit 的 `TimeoutStopSec=3600`）。急着换就 `systemctl kill -s SIGKILL rn-build-agent`：服务端回收任务，下次启动时清掉残留任务目录与 builder 进程。
 
-CI 那条不会阻塞等构建排空：新二进制就位后发一个不阻塞的 restart，代理手上有活就先
-把它做完再起新版（最长 `BUILD_AGENT_TIMEOUT_MINUTES`）。日志里会说是「已起来」还是
-「排空中」。
+## 从旧结构迁移（旧打包机以 builder 跑 build-agent）
 
-代理收到 SIGTERM 后**不再领新任务，但会把手上那一条做完**再退出，所以 `systemctl restart` 可能挂着等一轮构建（最长 `BUILD_AGENT_TIMEOUT_MINUTES`，默认 45 分钟；unit 里 `TimeoutStopSec=3600` 就是为它留的）。日志里会有一行 `stop requested: not claiming any more builds`。
-
-急着换就 `sudo systemctl kill -s SIGKILL rn-build-agent`：那条任务会在服务端由心跳超时回收，**build 号会放出来，但不会自动续跑**，需要在管理端重新排一个。
+1. `sudo systemctl stop rn-build-agent`，`sudo pkill -KILL -u builder`（Gradle daemon 等）。
+2. 按「装一台新的」第 2、3 步建 rn-build-agent、rn-build-jobs 与目录；`sudo usermod -d /nonexistent -s /usr/sbin/nologin -aG rn-build-jobs builder`；builder 进 cron/at deny。
+3. 仓库镜像与 deploy key 交给 rn-build-agent：`sudo mv /var/lib/rn-build-agent/repos/rn-app.git …` 后 `sudo chown -R rn-build-agent:rn-build-agent /var/lib/rn-build-agent && sudo chmod 0700 /var/lib/rn-build-agent`（`.ssh` 同理）。
+4. **删掉旧状态与缓存**：旧 `workspace/`、`/var/cache/rn-build-agent/{gradle,pnpm-store}`（builder 可写过，按被下毒处理）、`/tmp` 里属于 builder 的文件；`agent-key`、`backup-signing.key` 按设计「清理」一步销毁。
+5. `/etc/rn-build-agent.env` 按新示例重写：删 `BUILD_AGENT_TOKEN`、`BUILD_KEYSTORE_PASSPHRASE`、`BUILD_AGENT_RECOVERY_RECIPIENT_*`、`BUILD_AGENT_NAME`（这两个机密键留着控制进程会拒绝启动），填 `BUILD_AGENT_MACHINE_TOKEN`、`BUILD_AGENT_STATE_DIR`、`BUILD_AGENT_WORKSPACE=/var/lib/rn-build-jobs`。
+6. 装两个二进制、sudoers、新 unit，启动，走「身份登记」。
 
 ## 异常恢复
 
 | 情况 | 会发生什么 |
 | --- | --- |
-| 代理进程崩了 | systemd `Restart=always` / `RestartSec=10` 拉起来 |
-| 构建中途被硬杀（OOM / 断电 / SIGKILL） | 下次启动时自动清掉遗留的检出、裸库里的登记，以及那个目录里解开的 keystore；任务由服务端心跳超时回收 |
-| 服务端重启 | 构建照常跑；心跳失败只打 WARN；产物回传与结果上报都会退避重试 |
-| 产物上传遇到 5xx / 网络抖动 | 分三步各自重试（传包 / 传 SBOM / 建发布记录），最多 6 次，退避到分钟级 |
-| 服务端明确拒绝（4xx，比如版本号没涨） | **不重试**，直接判失败——重试一百次也是同一个答案 |
-| 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 杀掉进程组，按超时上报失败 |
-| 代理超过 10 分钟没报心跳 | 服务端把任务判失败、放出 build 号（心跳 30 秒一次，容得下 20 次连续失败） |
-
-**中断的构建一律不续跑**，这是有意的：半截的依赖安装和编译状态续下去比重来更危险，而重来只要几分钟。
+| 控制进程崩了 | systemd `Restart=always` 拉起；启动时先让执行进程清空残留任务目录、回收 builder 进程，再删 spool |
+| 构建中途被硬杀 | 服务端还记着这台机器的任务，领取时回 409 `BUILDER_HAS_ACTIVE_JOB`：控制进程带那条任务的编号报失败（中断的构建不续跑），然后继续领 |
+| 服务端回收、取消或重派了任务 | 心跳或任何上报收到 409 `BUILD_ATTEMPT_STALE`：立即中止执行进程、清理，**不再上报** |
+| 执行进程留下的进程握着输出管道 | 执行进程退出后最多等 20 秒就强制关管道，残留进程由清理回收 |
+| 领取结果里出现 `sealedKeystore`、`keyAlias`、口令一类字段 | 整条任务拒收并报失败，不写盘 |
+| 服务端重启 / 5xx | 心跳失败只打 WARN；上传、交付、失败上报退避重试 |
+| 服务端明确拒绝（4xx） | 不重试；出处声明被拒（422 `BUILD_PROVENANCE_INVALID`）按失败上报 |
+| 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 中止执行进程，按超时上报 |
+| 公钥未被接受 / 令牌被吊销 | 不领任务，journal 里说清楚在等什么 |
+| 状态目录或密钥权限不对 | 控制进程以 2 退出，不把密钥留在别人读得到的地方 |
 
 ## 排查
 
 ```bash
 sudo journalctl -u rn-build-agent -f
+sudo -u rn-build-agent /opt/rn-build-agent/build-agent show-key --state-dir /var/lib/rn-build-agent/state
 ```
 
-构建失败的原因和日志尾部也会回到服务端，在管理端的构建记录里能看到——不必登到这台机器上才知道出了什么事。日志里的机密会被脱敏：进程环境里的值自动登记，keystore 口令是运行时从盒子里开出来的，在 `build.go` 里显式登记进脱敏器（Gradle 失败时很乐意把命令行整行打出来）。
+构建失败的原因和执行进程输出的尾部会随心跳与失败上报回到服务端，管理端的构建记录里能看到。执行进程的输出按不可信文本处理：控制字符替换、超长行截断，控制进程环境里的机密值替换成 `***`。
