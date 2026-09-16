@@ -119,6 +119,11 @@ type buildMachine struct {
 	RevokedBy              optString          `json:"revokedBy"`
 	RevokedAt              optString          `json:"revokedAt"`
 	RevokeReason           optString          `json:"revokeReason"`
+	// 仅签名闸：它自己在 POST /v1/signer/keystore-checks 里报的本机角色（primary|standby，本机记录说了算）
+	// 与报告时间。控制台切了主备而那台签名闸本机没有 promote 时，两边对不上，就绪判断据此报出来。
+	// 只在值变化时写。null = 从未上报
+	ReportedLocalRole   optString `json:"reportedLocalRole"`
+	ReportedLocalRoleAt optString `json:"reportedLocalRoleAt"`
 }
 
 type buildMachinesDoc struct {
@@ -198,6 +203,8 @@ func (d buildMachinesDoc) validate() error {
 		case m.Role == machineRoleSigner && m.SignerRole != signerRolePrimary && m.SignerRole != signerRoleStandby &&
 			!(m.Status == machineStatusRevoked && m.SignerRole == ""):
 			return fmt.Errorf("signer %s has no valid signer role", m.ID)
+		case m.ReportedLocalRole != "" && (m.Role != machineRoleSigner || (m.ReportedLocalRole != signerRolePrimary && m.ReportedLocalRole != signerRoleStandby)):
+			return fmt.Errorf("machine %s has an invalid reported local role", m.ID)
 		case m.Status == machineStatusActive && (m.PublicKey == "" || !fingerprint.Valid(string(m.PublicKeySHA256))):
 			return fmt.Errorf("active machine %s has no accepted key", m.ID)
 		case m.Status == machineStatusActive && m.Role == machineRoleSigner && (m.Ed25519PublicKey == "" || !fingerprint.Valid(string(m.Ed25519PublicKeySHA256))):
@@ -441,6 +448,8 @@ func machineView(m buildMachine) gin.H {
 		"revokedBy":                     nullableString(string(m.RevokedBy)),
 		"revokedAt":                     nullableString(string(m.RevokedAt)),
 		"revokeReason":                  nullableString(string(m.RevokeReason)),
+		"reportedLocalRole":             nullableString(string(m.ReportedLocalRole)),
+		"reportedLocalRoleAt":           nullableString(string(m.ReportedLocalRoleAt)),
 	}
 	if m.Pending != nil {
 		view["pendingPublicKeySha256"] = m.Pending.PublicKeySHA256

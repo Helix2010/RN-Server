@@ -3076,7 +3076,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE / APP_IDENTITY_DRIFT. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs."
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE. APP_IDENTITY_DRIFT: this build would change the Android package name or signing certificate of the active release, so installed devices cannot upgrade in place; the detail is written for people - after the operator confirms, resend the same request with acknowledgeIdentityChange=true. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs."
           },
           "422": {
             "description": "OTA_BASE_RELEASE_INVALID: this release cannot be used as an OTA base - it is not verified/active, it has no runtimeVersion, or it has no recorded native fingerprint (built before the fingerprint was recorded, so there is no way to tell whether the update is JS-only). INVALID_OTA_APPLY_STRATEGY: applyStrategy must be next_launch or immediate."
@@ -4440,7 +4440,7 @@
             "description": "Stored"
           },
           "400": {
-            "description": "INVALID_KEYSTORE_CHECK"
+            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole)"
           },
           "401": {
             "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
@@ -6028,6 +6028,11 @@
               }
             },
             "description": "Release notes by language code, one array entry per line. Carried on the job because the release record is created by the build agent and there is no endpoint to edit notes afterwards."
+          },
+          "acknowledgeIdentityChange": {
+            "type": "boolean",
+            "default": false,
+            "description": "Set to true only after a person confirmed the identity change reported by 409 APP_IDENTITY_DRIFT: the build would change the Android package name or signing certificate of the active release, so installed devices cannot upgrade in place and must uninstall and reinstall."
           }
         }
       },
@@ -7124,7 +7129,9 @@
           "createdAt",
           "revokedBy",
           "revokedAt",
-          "revokeReason"
+          "revokeReason",
+          "reportedLocalRole",
+          "reportedLocalRoleAt"
         ],
         "properties": {
           "id": {
@@ -7203,6 +7210,22 @@
           "revokeReason": {
             "type": "string",
             "nullable": true
+          },
+          "reportedLocalRole": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "primary",
+              "standby",
+              null
+            ],
+            "description": "Signers only: the role this signer last reported from its own local record (POST /v1/signer/keystore-checks localRole). null = never reported. The console's signerRole only routes; when they differ on the primary, tenants are not ready."
+          },
+          "reportedLocalRoleAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When reportedLocalRole last changed; null = never reported"
           }
         }
       },
@@ -7537,10 +7560,19 @@
       "SignerCheckReport": {
         "type": "object",
         "required": [
+          "localRole",
           "items"
         ],
         "additionalProperties": false,
         "properties": {
+          "localRole": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "standby"
+            ],
+            "description": "This signer's role according to its own local record (signer promote/abandon). Required on every report. Stored on the machine as reportedLocalRole/reportedLocalRoleAt, written only when it changes; a routed primary whose reportedLocalRole is not primary makes tenants not ready (PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH)."
+          },
           "items": {
             "type": "array",
             "maxItems": 1000,
@@ -7681,7 +7713,7 @@
           "detail"
         ],
         "additionalProperties": false,
-        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed.",
+        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH: the primary signer in the console has never reported its local role or its local record still says standby (it was not promoted on the machine), so it will not claim jobs; promote it on the machine or switch the console back. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed.",
         "properties": {
           "code": {
             "type": "string",
@@ -7693,6 +7725,7 @@
               "RELEASE_IDENTITY_MISMATCH",
               "PRIMARY_SIGNER_MISSING",
               "PRIMARY_SIGNER_NOT_RECIPIENT",
+              "PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH",
               "APP_IDENTITY_INCOMPLETE",
               "OTA_CERTIFICATE_NOT_CONFIGURED",
               "API_BASE_URL_INVALID",

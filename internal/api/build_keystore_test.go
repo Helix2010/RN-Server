@@ -245,7 +245,7 @@ func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 		for k, v := range item {
 			base[k] = v
 		}
-		if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"items": []any{base}}); r.Code != http.StatusNoContent {
+		if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": f.localRoleOf(f.primary), "items": []any{base}}); r.Code != http.StatusNoContent {
 			t.Fatalf("report: %d %s", r.Code, r.Body.String())
 		}
 	}
@@ -337,6 +337,14 @@ func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 		f.tenant, releaseAndroidIdentityConfigKey, rawIdentity); err != nil {
 		t.Fatal(err)
 	}
+	expectReady()
+
+	// 控制台上的主签名闸本机记录不是主
+	notPromoted := f.primary.record(signerRolePrimary)
+	notPromoted.ReportedLocalRole = signerRoleStandby
+	f.writeMachines(f.builder.record(""), notPromoted, f.standby.record(signerRoleStandby))
+	expect(readinessPrimaryLocalRole)
+	f.writeMachines(f.builder.record(""), f.primary.record(signerRolePrimary), f.standby.record(signerRoleStandby))
 	expectReady()
 
 	// 主签名闸没检查过当前版本、没有收到密文、没有主签名闸

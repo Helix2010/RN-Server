@@ -69,7 +69,8 @@ func (m gateMachine) ed25519Public() []byte { return m.Ed25519.Public().(ed25519
 
 func (m gateMachine) recipient() string { return fingerprint.SHA256Hex(m.X25519.PublicKey().Bytes()) }
 
-// record 是这台机器在 build.machines 里 active 状态的样子。
+// record 是这台机器在 build.machines 里 active 状态的样子。签名闸的本机角色默认与登记的主备一致
+// （本机已经 promote 过）；要测两边对不上时直接改返回值。
 func (m gateMachine) record(signerRole string) buildMachine {
 	record := buildMachine{
 		ID: m.ID, Role: m.Role, Name: m.Name, Status: machineStatusActive, TokenSHA256: sha256Hex(m.Token),
@@ -82,6 +83,7 @@ func (m gateMachine) record(signerRole string) buildMachine {
 		return record
 	}
 	record.SignerRole = optString(signerRole)
+	record.ReportedLocalRole, record.ReportedLocalRoleAt = optString(signerRole), optString(iso(time.Now().UTC()))
 	record.PublicKey = optString(base64.StdEncoding.EncodeToString(m.X25519.PublicKey().Bytes()))
 	record.PublicKeySHA256 = optString(m.recipient())
 	record.Ed25519PublicKey = optString(base64.StdEncoding.EncodeToString(m.ed25519Public()))
@@ -254,10 +256,31 @@ func (f *gateFixture) reportCheck(machine gateMachine, confirmed bool, trialSign
 	if confirmed {
 		item["confirmedTrustRootsDigest"] = digest
 	}
-	recorder := f.do(http.MethodPost, "/v1/signer/keystore-checks", machine.Token, nil, map[string]any{"items": []any{item}})
+	recorder := f.do(http.MethodPost, "/v1/signer/keystore-checks", machine.Token, nil, map[string]any{"localRole": f.localRoleOf(machine), "items": []any{item}})
 	if recorder.Code != http.StatusNoContent {
 		f.t.Fatalf("report check: %d %s", recorder.Code, recorder.Body.String())
 	}
+}
+
+// localRoleOf 是这台签名闸现在登记里记的本机角色（没有记过就用登记的主备），上报时原样带回，不改变它。
+func (f *gateFixture) localRoleOf(machine gateMachine) string {
+	f.t.Helper()
+	snapshot, err := readMachineRegistry(context.Background(), f.db, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	index, found := snapshot.Doc.find(machine.ID)
+	if !found {
+		f.t.Fatalf("machine %s is not registered", machine.ID)
+	}
+	m := snapshot.Doc.Machines[index]
+	if m.ReportedLocalRole != "" {
+		return string(m.ReportedLocalRole)
+	}
+	if m.SignerRole != "" {
+		return string(m.SignerRole)
+	}
+	return signerRoleStandby
 }
 
 func (f *gateFixture) readyItem() map[string]any {

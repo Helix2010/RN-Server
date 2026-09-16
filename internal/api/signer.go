@@ -126,10 +126,16 @@ type signerCheckReport struct {
 func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	machine, _ := machineFromContext(c)
 	var body struct {
-		Items []signerCheckReport `json:"items"`
+		// LocalRole 是签名闸本机记录里的角色，每轮都带；签名闸与服务端同一次发布，缺了就是 400
+		LocalRole *string             `json:"localRole"`
+		Items     []signerCheckReport `json:"items"`
 	}
 	if decode(c, &body) != nil || len(body.Items) > maxSignerListItems {
 		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", fmt.Sprintf("items must be an array of at most %d check results", maxSignerListItems))
+		return
+	}
+	if body.LocalRole == nil || (*body.LocalRole != signerRolePrimary && *body.LocalRole != signerRoleStandby) {
+		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "localRole (primary or standby, from this signer's local record) is required")
 		return
 	}
 	for _, item := range body.Items {
@@ -143,6 +149,11 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
+	if err := s.recordSignerLocalRole(c, machine, *body.LocalRole, now); err != nil {
+		slog.Error("cannot record a signer's local role", "machineId", machine.ID, "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_SAVE_FAILED", "Unable to store the reported local role")
+		return
+	}
 	for _, item := range body.Items {
 		var tenant string
 		switch err := s.db.QueryRowContext(ctx, `SELECT id FROM tenants WHERE slug=? LIMIT 1`, item.TenantSlug).Scan(&tenant); {
@@ -200,6 +211,51 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 				"trialSign": check.TrialSign, "error": nullableString(string(check.Error))}))
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// recordSignerLocalRole 把签名闸报的本机角色记进 build.machines 它自己那一项。值没变不写（每轮轮询都会报，
+// 写一次加一次 version，控制台上正在编辑的机器登记就会不停地版本冲突）；并发写冲突时重读重试。
+func (s *server) recordSignerLocalRole(c *gin.Context, machine buildMachine, role string, now time.Time) error {
+	ctx := c.Request.Context()
+	for attempt := 0; attempt < machineWriteRetries; attempt++ {
+		snapshot, err := readMachineRegistry(ctx, s.db, false)
+		if err != nil {
+			return err
+		}
+		index, found := snapshot.Doc.find(machine.ID)
+		if !found {
+			return errors.New("the signer is no longer registered")
+		}
+		m := &snapshot.Doc.Machines[index]
+		if string(m.ReportedLocalRole) == role {
+			return nil
+		}
+		previous := string(m.ReportedLocalRole)
+		m.ReportedLocalRole, m.ReportedLocalRoleAt = optString(role), optString(iso(now))
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		applied, err := writeMachineRegistry(ctx, tx, snapshot.Doc, snapshot.Version, signerActor, now)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if !applied {
+			_ = tx.Rollback()
+			continue
+		}
+		event := newAudit(platformTenantID, signerActor, "build_machine_local_role_report", machineAuditTargetType, machine.ID,
+			"a signer reported a change of its local role", requestID(c),
+			map[string]any{"machineId": machine.ID, "name": machine.Name, "reportedLocalRole": role, "previousReportedLocalRole": nullableString(previous),
+				"signerRole": nullableString(string(m.SignerRole))})
+		if err := insertAudit(ctx, tx, event); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit()
+	}
+	return errors.New("the machine registry kept changing while recording the local role")
 }
 
 // ---- 认领 ----

@@ -21,7 +21,8 @@
   "publicKey":"<base64|null>","publicKeySha256":"<64hex|null>",
   "ed25519PublicKey":"<base64|null>","ed25519PublicKeySha256":"<64hex|null>",
   "pending":{"publicKey","publicKeySha256","ed25519PublicKey","ed25519PublicKeySha256","reportedAt"} | null,
-  "acceptedBy":null,"acceptedAt":null,"createdBy":"…","createdAt":"…","revokedBy":null,"revokedAt":null,"revokeReason":null
+  "acceptedBy":null,"acceptedAt":null,"createdBy":"…","createdAt":"…","revokedBy":null,"revokedAt":null,"revokeReason":null,
+  "reportedLocalRole":"primary|standby|null","reportedLocalRoleAt":"…|null"
 }]}
 ```
 
@@ -33,6 +34,7 @@
 | `tokenSha256` | 机器令牌（`rnm_` + 32 字节 base64url）的 sha256。令牌原文只出现在新建接口的响应里，不进审计、不进日志 |
 | `publicKey` / `publicKeySha256` | 已接受的主公钥。构建机：Ed25519 出处公钥；签名闸：X25519 收件人公钥（sha256 就是密文的 `recipientSha256`） |
 | `ed25519PublicKey` / `ed25519PublicKeySha256` | 仅签名闸：记录签名与换钥证明用的 Ed25519 公钥 |
+| `reportedLocalRole` / `reportedLocalRoleAt` | 仅签名闸：它在 `POST /v1/signer/keystore-checks` 里报的本机角色（本机记录说了算）与这个值最近一次变化的时间；只在值变化时写（写审计 `build_machine_local_role_report`）。null = 从未上报。控制台的 `signerRole` 是 primary 而这里不是 primary 时，就绪问题 `PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH` |
 | `pending` | 机器报上来、等平台管理员核对完整指纹后接受的公钥（签名闸的 accept-key 可同时带 `ed25519PublicKeySha256`，带了就必须一致）。已 active 的机器换钥必须带用当前私钥对 `machinekey.RotationMessage` 的签名；旧公钥在接受之前一直有效 |
 
 所有 sha256 都按 base64 解码后的 32 字节原始公钥计算，完整 64 位小写十六进制。

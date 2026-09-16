@@ -33,7 +33,7 @@
 - 鉴权中间件按令牌 sha256 找机器，校验角色（构建机令牌调签名闸接口 403，反之亦然），`revoked` 401 `MACHINE_REVOKED`（令牌查无是 401 `MACHINE_AUTH_REQUIRED`；分开说，机器认出吊销就退出而不是一直重连）。每个请求主键查一次 `version, updated_at`，没变用缓存——吊销即时生效，又不必每次解析整份 JSON。只带旧头 `x-build-agent-token` 返回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`，旧打包机升级前看到的是"要升级"而不是"令牌错"。
 - 公钥由机器自己上报为待接受，平台管理员核对完整 64 位指纹后接受；接受签名闸时**必须**同时带从本机抄来的 Ed25519 指纹（缺了 400 `INVALID_MACHINE`，对不上 409 `MACHINE_KEY_MISMATCH`），否则偷到令牌的人能在待接受期间把真机的 X25519 与自己的 Ed25519 配成一对，此后的换钥证明就归他（安全评审 R2）。已 active 的机器换钥必须带当前私钥对 `machinekey.RotationMessage` 的签名，否则 403——偷到令牌不等于能换掉出处密钥。
 - 签名闸有两把钥：X25519 解密钥密文（其 sha256 是收件人指纹），Ed25519 签本机记录与换钥证明。构建机一把 Ed25519 出处密钥。
-- **主备只影响路由**。签名闸与离线工具不采信这份登记：签名闸只信本机记录，离线工具只加密给离线 pin 文件里的签名闸。服务端被攻破能做到的是"不派活、派给错的机器"，做不到"让签名闸签一个它不认的包"。
+- **主备只影响路由**。签名闸与离线工具不采信这份登记：签名闸只信本机记录，离线工具只加密给离线 pin 文件里的签名闸。服务端被攻破能做到的是"不派活、派给错的机器"，做不到"让签名闸签一个它不认的包"。签名闸每轮检查上报都带本机记录里的角色（`localRole`），服务端记进登记的 `reportedLocalRole`（只在变化时写）；控制台上的主签名闸本机不是主（没在那台机器上 promote、或从未上报）时，就绪问题 `PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH`——否则切了主之后任务会默默停在待签名。
 
 ### 4. 签名密钥 v3
 
@@ -45,7 +45,7 @@
 
 ### 5. 就绪判断
 
-排队与签名认领用同一个函数：有 v3 密钥且与发布身份一致；有 active primary 签名闸且密钥发给了它；服务端算得出信任根；primary 对当前密钥版本报告了试解成功、本机确认、确认时的信任根摘要等于服务端当前摘要、试签成功。不满足时排队 409 `SIGNER_NOT_READY`，detail 逐条列出缺什么，问题体里另带 `readinessProblems`；控制台签名密钥页 `GET /v1/admin/build-keystore` 带同样的 `readinessProblems`（就绪时为空数组）。每条原因有固定 code（OpenAPI `SignerReadinessProblem`，测试保证服务端全集与契约枚举一致）：`KEYSTORE_NOT_CONFIGURED`、`KEYSTORE_LEGACY_FORMAT`、`KEYSTORE_RECORD_INVALID`、`RELEASE_IDENTITY_NOT_CONFIGURED`、`RELEASE_IDENTITY_MISMATCH`、`PRIMARY_SIGNER_MISSING`、`PRIMARY_SIGNER_NOT_RECIPIENT`、`APP_IDENTITY_INCOMPLETE`、`OTA_CERTIFICATE_NOT_CONFIGURED`、`API_BASE_URL_INVALID`、`TRUST_ROOTS_INVALID`、`PRIMARY_SIGNER_NOT_CHECKED`、`PRIMARY_SIGNER_DECRYPT_FAILED`、`PRIMARY_SIGNER_NOT_CONFIRMED`、`TRUST_ROOTS_CHANGED`、`PRIMARY_SIGNER_TRIAL_SIGN_PENDING`、`PRIMARY_SIGNER_TRIAL_SIGN_FAILED`。
+排队与签名认领用同一个函数：有 v3 密钥且与发布身份一致；有 active primary 签名闸且密钥发给了它；服务端算得出信任根；primary 对当前密钥版本报告了试解成功、本机确认、确认时的信任根摘要等于服务端当前摘要、试签成功。不满足时排队 409 `SIGNER_NOT_READY`，detail 逐条列出缺什么，问题体里另带 `readinessProblems`；控制台签名密钥页 `GET /v1/admin/build-keystore` 带同样的 `readinessProblems`（就绪时为空数组）。每条原因有固定 code（OpenAPI `SignerReadinessProblem`，测试保证服务端全集与契约枚举一致）：`KEYSTORE_NOT_CONFIGURED`、`KEYSTORE_LEGACY_FORMAT`、`KEYSTORE_RECORD_INVALID`、`RELEASE_IDENTITY_NOT_CONFIGURED`、`RELEASE_IDENTITY_MISMATCH`、`PRIMARY_SIGNER_MISSING`、`PRIMARY_SIGNER_NOT_RECIPIENT`、`PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH`、`APP_IDENTITY_INCOMPLETE`、`OTA_CERTIFICATE_NOT_CONFIGURED`、`API_BASE_URL_INVALID`、`TRUST_ROOTS_INVALID`、`PRIMARY_SIGNER_NOT_CHECKED`、`PRIMARY_SIGNER_DECRYPT_FAILED`、`PRIMARY_SIGNER_NOT_CONFIRMED`、`TRUST_ROOTS_CHANGED`、`PRIMARY_SIGNER_TRIAL_SIGN_PENDING`、`PRIMARY_SIGNER_TRIAL_SIGN_FAILED`。
 
 信任根摘要由 `signing/trustroots` 计算，服务端与签名闸共用：租户改了 `apiBaseUrl` 或 OTA 证书，摘要就变，在主签名闸重新 `confirm` 之前不能排队。App Links host 按 RN-App `app.config.ts` 的规则（`new URL(apiBaseUrl).host`）派生，有测试钉住。`apiBaseUrl` 在**保存打包配置时**就用 `trustroots.ValidateAPIBaseURL` 校验（去掉首尾空白与结尾 `/` 之后）：显式写默认端口 `:443`、大写域名、IP、带路径一律 400——WHATWG URL 会去掉 `:443`，同一个源两种写法会让服务端与签名闸对 host 与摘要得出不同结论，所以要求配置本身是唯一写法，而不是存进去再判不就绪。校验收紧之前存下的旧值在就绪判断里报 `API_BASE_URL_INVALID`。
 

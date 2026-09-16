@@ -436,7 +436,7 @@ func (s *server) createBuildJob(c *gin.Context) {
 	}
 	if drift := tenantIdentityDrift(manifest, activePackage, activeSigner); len(drift) > 0 && !body.AcknowledgeIdentityChange {
 		problem(c, http.StatusConflict, "APP_IDENTITY_DRIFT",
-			"This build would change "+strings.Join(drift, "；")+"，装着当前版本的设备升不上去。确认要这么做就带 acknowledgeIdentityChange=true 重发。")
+			"这次构建会改变 App 身份（"+strings.Join(drift, "；")+"）：装着当前版本的设备无法覆盖升级，只能卸载重装。确认确实要换身份后再排队。")
 		return
 	}
 	// 主签名闸没有就绪，这个包出得来也签不了——别让它占构建机，停在「待签名」里。

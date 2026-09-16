@@ -418,3 +418,105 @@ func TestDBRevokedMachinesAreToldTheyAreRevoked(t *testing.T) {
 		t.Fatalf("%d machines are listed as primary after revoking the old primary and promoting the standby", primaries)
 	}
 }
+
+// 签名闸每轮检查上报都带本机角色：服务端记进登记（只在变化时写），控制台上的主签名闸本机不是主
+// （从未上报、仍是备）时不就绪，是主时就绪。缺了 localRole 是 400。
+func TestDBSignerLocalRoleIsRecordedAndChecked(t *testing.T) {
+	f := newGateFixture(t, 109)
+	keystoreVersion, _ := f.keystoreVersions()
+	item := map[string]any{"tenantSlug": f.slug, "keystoreVersion": keystoreVersion, "decrypt": "ok", "confirmed": true,
+		"confirmedTrustRootsDigest": f.currentDigest(), "trialSign": "ok", "error": nil}
+	report := func(body map[string]any) *httptest.ResponseRecorder {
+		return f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, body)
+	}
+	for name, body := range map[string]map[string]any{
+		"missing":  {"items": []any{item}},
+		"null":     {"localRole": nil, "items": []any{item}},
+		"unknown":  {"localRole": "leader", "items": []any{item}},
+		"no items": {"items": []any{}},
+	} {
+		if r := report(body); r.Code != http.StatusBadRequest || problemCode(t, r) != "INVALID_KEYSTORE_CHECK" {
+			t.Fatalf("localRole %s: %d %s", name, r.Code, r.Body.String())
+		}
+	}
+	codes := func() []string {
+		t.Helper()
+		r, err := f.s.signerReadinessFor(t.Context(), f.tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := []string{}
+		for _, p := range r.Problems {
+			out = append(out, p.Code)
+		}
+		return out
+	}
+	primaryView := func() map[string]any {
+		t.Helper()
+		for _, entry := range decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil))["items"].([]any) {
+			if view := entry.(map[string]any); view["id"] == f.primary.ID {
+				return view
+			}
+		}
+		t.Fatal("the primary is not listed")
+		return nil
+	}
+
+	// 从未上报
+	unreported := f.primary.record(signerRolePrimary)
+	unreported.ReportedLocalRole, unreported.ReportedLocalRoleAt = "", ""
+	f.writeMachines(f.builder.record(""), unreported, f.standby.record(signerRoleStandby))
+	if got := codes(); strings.Join(got, ",") != readinessPrimaryLocalRole {
+		t.Fatalf("a primary that never reported its local role: %v", got)
+	}
+	if view := primaryView(); view["reportedLocalRole"] != nil || view["reportedLocalRoleAt"] != nil {
+		t.Fatalf("view of an unreported local role: %v", view)
+	}
+	// 本机仍是备
+	if r := report(map[string]any{"localRole": "standby", "items": []any{item}}); r.Code != http.StatusNoContent {
+		t.Fatalf("report standby: %d %s", r.Code, r.Body.String())
+	}
+	if got := codes(); strings.Join(got, ",") != readinessPrimaryLocalRole {
+		t.Fatalf("a primary whose local record says standby: %v", got)
+	}
+	view := primaryView()
+	if view["reportedLocalRole"] != "standby" || view["reportedLocalRoleAt"] == nil {
+		t.Fatalf("view after a standby report: %v", view)
+	}
+	c, recorder := testContext(t, f.tenant, http.MethodPost, "/v1/admin/builds", map[string]any{
+		"platform": "android", "gitRef": "main", "version": "15.0.0", "buildNumber": 1500, "reason": "local role", "confirm": true,
+		"releaseNotes": map[string]any{"zh-CN": []string{"测试"}},
+	})
+	f.s.createBuildJob(c)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), readinessPrimaryLocalRole) {
+		t.Fatalf("queueing while the primary is locally a standby: %d %s", recorder.Code, recorder.Body.String())
+	}
+	// 同一个值再报不写库
+	version := registryVersion(t, f)
+	for i := 0; i < 3; i++ {
+		if r := report(map[string]any{"localRole": "standby", "items": []any{item}}); r.Code != http.StatusNoContent {
+			t.Fatalf("repeat report: %d %s", r.Code, r.Body.String())
+		}
+	}
+	if after := registryVersion(t, f); after != version {
+		t.Fatalf("an unchanged local role bumped the registry version %d -> %d", version, after)
+	}
+	// 本机 promote 之后是主：就绪
+	if r := report(map[string]any{"localRole": "primary", "items": []any{item}}); r.Code != http.StatusNoContent {
+		t.Fatalf("report primary: %d %s", r.Code, r.Body.String())
+	}
+	if after := registryVersion(t, f); after != version+1 {
+		t.Fatalf("a changed local role must be written once: version %d -> %d", version, after)
+	}
+	if got := codes(); len(got) != 0 {
+		t.Fatalf("a primary that reports primary locally: %v", got)
+	}
+	if view := primaryView(); view["reportedLocalRole"] != "primary" {
+		t.Fatalf("view after a primary report: %v", view)
+	}
+	var audits int
+	_ = f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=0 AND action='build_machine_local_role_report' AND target_id=?`, f.primary.ID).Scan(&audits)
+	if audits != 2 {
+		t.Fatalf("local role changes audited %d times, want 2", audits)
+	}
+}

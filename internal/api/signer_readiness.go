@@ -157,6 +157,7 @@ const (
 	readinessReleaseIdentityMismatch = "RELEASE_IDENTITY_MISMATCH"
 	readinessPrimarySignerMissing    = "PRIMARY_SIGNER_MISSING"
 	readinessPrimarySignerNoBox      = "PRIMARY_SIGNER_NOT_RECIPIENT"
+	readinessPrimaryLocalRole        = "PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH"
 	readinessAppIdentityIncomplete   = "APP_IDENTITY_INCOMPLETE"
 	readinessOTACertificateMissing   = "OTA_CERTIFICATE_NOT_CONFIGURED"
 	readinessAPIBaseURLInvalid       = "API_BASE_URL_INVALID"
@@ -172,7 +173,7 @@ const (
 // readinessProblemCodes 按判断顺序列出全部枚举值（测试与 OpenAPI 对照用）。
 var readinessProblemCodes = []string{
 	readinessKeystoreNotConfigured, readinessKeystoreLegacyFormat, readinessKeystoreRecordInvalid, readinessReleaseIdentityMissing, readinessReleaseIdentityMismatch,
-	readinessPrimarySignerMissing, readinessPrimarySignerNoBox, readinessAppIdentityIncomplete, readinessOTACertificateMissing,
+	readinessPrimarySignerMissing, readinessPrimarySignerNoBox, readinessPrimaryLocalRole, readinessAppIdentityIncomplete, readinessOTACertificateMissing,
 	readinessAPIBaseURLInvalid, readinessTrustRootsInvalid, readinessPrimaryCheckMissing, readinessPrimaryDecryptFailed,
 	readinessPrimaryNotConfirmed, readinessTrustRootsChanged, readinessPrimaryTrialSignPending, readinessPrimaryTrialSignFailed,
 }
@@ -243,6 +244,15 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 				add(readinessPrimarySignerNoBox, "签名密钥没有加密给主签名闸 "+primary.Name+"：把它加进离线 pin 文件，用离线工具重新 seal 并上传")
 			}
 		}
+	}
+	// 控制台上的主备只管路由，签名闸按本机记录决定自己是不是主。控制台切了主而那台签名闸本机仍是备
+	// （没在它上面 promote），它不会领任务，任务就默默停在待签名
+	if hasPrimary && primary.ReportedLocalRole != signerRolePrimary {
+		reported := "从未报告本机角色"
+		if primary.ReportedLocalRole != "" {
+			reported = "本机记录仍是 " + string(primary.ReportedLocalRole)
+		}
+		add(readinessPrimaryLocalRole, "控制台上的主签名闸 "+primary.Name+" "+reported+"：在那台签名闸上执行 signer promote，或者把控制台的主备切回本机是主的那一台")
 	}
 	roots, digest, rootProblems, err := s.trustRootsFor(ctx, tenant)
 	if err != nil {

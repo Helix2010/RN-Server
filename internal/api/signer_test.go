@@ -422,7 +422,7 @@ func TestDBSignerKeystoreChecksAreScopedPerMachine(t *testing.T) {
 	// 旧版本的结论不写：密钥在检查期间被重新上传
 	stale := map[string]any{"tenantSlug": f.slug, "keystoreVersion": keystoreVersion - 1, "decrypt": "failed", "confirmed": false,
 		"confirmedTrustRootsDigest": nil, "trialSign": "failed", "error": "old"}
-	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"items": []any{stale,
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": "primary", "items": []any{stale,
 		map[string]any{"tenantSlug": "no-such-tenant-" + uniqueSuffix(), "keystoreVersion": 1, "decrypt": "ok", "confirmed": false, "confirmedTrustRootsDigest": nil, "trialSign": "pending", "error": nil}}}); r.Code != http.StatusNoContent {
 		t.Fatalf("stale check: %d %s", r.Code, r.Body.String())
 	}
