@@ -57,23 +57,46 @@ func TestBackupDisabledDoesNotGateStartup(t *testing.T) {
 	}
 }
 
-// 配了桶就是宣告「这套东西要跑了」，三把钥匙从那一刻起是硬前置
+// 配了桶就是宣告「这套东西要跑了」，三把钥匙从那一刻起是硬前置。
+//
+// 缺 A、缺 B、缺 C 各测一条：只测一个的话，一个「只看槽位 A」的实现也能绿，
+// 而那正是「以为配了三把其实只有两把」那种错的形状
 func TestBackupEnabledRequiresAllThreeSlots(t *testing.T) {
-	keys := recoveryKeys(t, 2)
+	for _, missing := range backupcontainer.SlotNames {
+		t.Run("缺"+missing, func(t *testing.T) {
+			keys := recoveryKeys(t, backupcontainer.SlotCount)
+			baseEnv(t)
+			enableBucket(t)
+			for i, slot := range backupcontainer.SlotNames {
+				if slot == missing {
+					continue
+				}
+				t.Setenv("BACKUP_RECOVERY_RECIPIENT_"+slot, keys[i])
+			}
+			_, err := Load()
+			if err == nil {
+				t.Fatalf("缺了槽位 %s 还能启动：门限是 2-of-3，没有降级模式", missing)
+			}
+			if !strings.Contains(err.Error(), "BACKUP_RECOVERY_RECIPIENT_"+missing) {
+				t.Fatalf("错误必须指名少的是哪个槽位，得到: %v", err)
+			}
+			if !strings.Contains(err.Error(), "no reduced mode") {
+				t.Fatalf("错误必须说清没有降级模式，得到: %v", err)
+			}
+		})
+	}
+}
+
+// 跳过中间那个槽位（只配 A+C）同样拒绝。它和「缺 B」是同一件事，单列是因为
+// 它看起来像「我有意只用两个人」——而那个选项不存在
+func TestBackupRefusesASkippedSlot(t *testing.T) {
+	keys := recoveryKeys(t, 3)
 	baseEnv(t)
 	enableBucket(t)
 	t.Setenv("BACKUP_RECOVERY_RECIPIENT_A", keys[0])
-	t.Setenv("BACKUP_RECOVERY_RECIPIENT_B", keys[1])
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("two keys is not a valid configuration: the threshold is 2-of-3 with no reduced mode")
-	}
-	if !strings.Contains(err.Error(), "BACKUP_RECOVERY_RECIPIENT_C") {
-		t.Fatalf("the error must name the missing slot, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "no reduced mode") {
-		t.Fatalf("the error must say there is no reduced mode, got: %v", err)
+	t.Setenv("BACKUP_RECOVERY_RECIPIENT_C", keys[2])
+	if _, err := Load(); err == nil {
+		t.Fatal("A+C 跳过 B 应当被拒绝")
 	}
 }
 

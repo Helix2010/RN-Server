@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -664,5 +667,80 @@ func TestValidateGitRef(t *testing.T) {
 		if err := validateGitRef(bad); err == nil {
 			t.Fatalf("%q 应当被拒绝", bad)
 		}
+	}
+}
+
+// 打包机缺恢复公钥时**照常领构建**，但拒绝产出备份并说清原因。
+//
+// 反过来做（缺配置就 fail-closed 启动）是负收益：那把备份做成了构建的单点故障，
+// 而第一次配置往往正好发生在恢复当天。但它不能静默不备份——控制台上要看得见
+// 「打包机没配恢复公钥」。
+func TestBackupReadyRefusesWhenRecoveryKeysAreMissing(t *testing.T) {
+	var cfg config
+	if err := cfg.backupReady(); err == nil {
+		t.Fatal("一把公钥都没有还说自己能备份")
+	} else if !strings.Contains(err.Error(), "BUILD_AGENT_RECOVERY_RECIPIENT_A") {
+		t.Fatalf("错误要指名是哪个键，运维才知道去哪台机器改: %v", err)
+	}
+
+	// 配齐三把但没有签名私钥：同样不能产出——没有签名的包，持有人无法判断
+	// 它是不是我们那台机器产出的
+	key, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range cfg.BackupRecipients {
+		cfg.BackupRecipients[i] = &key.PublicKey
+	}
+	if err := cfg.backupReady(); err == nil {
+		t.Fatal("没有备份签名私钥还说自己能备份")
+	} else if !strings.Contains(err.Error(), "signing key") {
+		t.Fatalf("错误要说清缺的是签名密钥: %v", err)
+	}
+
+	_, signer, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.BackupSigningKey = signer
+	if err := cfg.backupReady(); err != nil {
+		t.Fatalf("三把公钥加签名私钥齐了就该能备份: %v", err)
+	}
+}
+
+// 服务端下发的三个指纹要和本机 env 逐一比对。
+//
+// 不接受下发的收件人**本体**：服务端被攻破之后，攻击者只要改一下收件人，
+// 就能让打包机把全部租户的签名密钥封给他自己
+func TestCheckBackupRecipientsRefusesAMismatch(t *testing.T) {
+	var cfg config
+	cfg.BackupFingerprints = [3]string{"aaa", "bbb", "ccc"}
+	good := backupRequest{Recipients: []struct {
+		Slot        string `json:"slot"`
+		Fingerprint string `json:"fingerprint"`
+	}{{"A", "aaa"}, {"B", "bbb"}, {"C", "ccc"}}}
+	if err := checkBackupRecipients(cfg, good); err != nil {
+		t.Fatalf("三个都对上了不该拒: %v", err)
+	}
+
+	bad := good
+	bad.Recipients = append([]struct {
+		Slot        string `json:"slot"`
+		Fingerprint string `json:"fingerprint"`
+	}{}, good.Recipients...)
+	bad.Recipients[1].Fingerprint = "the attacker's own key"
+	err := checkBackupRecipients(cfg, bad)
+	if err == nil {
+		t.Fatal("服务端下发了一把本机不认识的公钥，打包机竟然照做了")
+	}
+	if !strings.Contains(err.Error(), "slot B") {
+		t.Fatalf("错误要指名是哪个槽位对不上，运维才查得动: %v", err)
+	}
+
+	// 数量不对同样拒：少一个槽位就是「悄悄降级成两个人」
+	short := good
+	short.Recipients = good.Recipients[:2]
+	if err := checkBackupRecipients(cfg, short); err == nil {
+		t.Fatal("服务端只下发两个槽位，打包机应当拒绝")
 	}
 }
