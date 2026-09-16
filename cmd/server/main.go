@@ -67,12 +67,6 @@ func main() {
 		}
 		return
 	}
-	// 在持有凭据的这台机器上分别测备份桶的三项权限，凭据不离开这台机器
-	if len(os.Args) == 2 && os.Args[1] == "backup-bucket-test" {
-		code := runBackupBucketTest(cfg, database)
-		database.Close()
-		os.Exit(code)
-	}
 	if len(os.Args) == 2 && os.Args[1] == "indexer" {
 		runIndexer(cfg, database)
 		return
@@ -93,11 +87,6 @@ func main() {
 		}
 		go dispatcher.Run(workerCtx)
 	}
-
-	// 备份的后台节拍：回收超时记录 + 到点建定时待办。两件事都必须跑在服务端
-	// 自己的定时器上——认领超时的触发条件恰恰是「打包机不轮询了」，挂在轮询
-	// 路径上就永远不会触发（见 BackupScheduler 的注释）
-	go api.NewBackupScheduler(cfg, database.DB).Run(workerCtx)
 
 	httpServer := &http.Server{
 		Addr:              cfg.BindAddress + ":" + cfg.Port,

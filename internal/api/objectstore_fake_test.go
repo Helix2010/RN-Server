@@ -15,15 +15,11 @@ import (
 
 // fakeObjectStore 是测试用对象存储：按 key 保存字节与 ETag，Stat/Get 可被替换成失败。
 type fakeObjectStore struct {
-	versioningEnabled bool
-	versioningErr     error
-	putErr            error
-	getErr            error
-	corsErr           error
-	objects           map[string]fakeObject
-	statErr           error
-	listErr           error
-	deleteErr         error
+	corsErr   error
+	objects   map[string]fakeObject
+	statErr   error
+	listErr   error
+	deleteErr error
 }
 
 type fakeObject struct {
@@ -38,7 +34,7 @@ func (f *fakeObjectStore) put(key string, body []byte, etag string) {
 	f.objects[key] = fakeObject{body: body, etag: etag, contentType: "application/octet-stream"}
 }
 
-// 和真的客户端一样包着 objectstore.ErrObjectNotFound：备份上传前靠它区分「不存在」和「读不了」
+// 和真的客户端一样包着 objectstore.ErrObjectNotFound，调用方靠它区分「不存在」和「读不了」
 var errFakeObjectMissing = fmt.Errorf("fake object store: no such key: %w", objectstore.ErrObjectNotFound)
 
 func (f *fakeObjectStore) Stat(_ context.Context, key string) (objectstore.ObjectInfo, error) {
@@ -58,9 +54,6 @@ func (f *fakeObjectStore) Head(ctx context.Context, key string) (int64, string, 
 }
 
 func (f *fakeObjectStore) Get(_ context.Context, key string) (io.ReadCloser, error) {
-	if f.getErr != nil {
-		return nil, f.getErr
-	}
 	object, ok := f.objects[key]
 	if !ok {
 		return nil, errFakeObjectMissing
@@ -77,9 +70,6 @@ func (f *fakeObjectStore) GetRange(_ context.Context, key string, start, end int
 }
 
 func (f *fakeObjectStore) Put(_ context.Context, key string, body io.Reader, _ int64, contentType string) error {
-	if f.putErr != nil {
-		return f.putErr
-	}
 	raw, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -140,9 +130,3 @@ func (f *fakeObjectStore) AbortMultipartUpload(context.Context, string, string) 
 func (f *fakeObjectStore) Test(context.Context) error { return nil }
 
 var _ objectstore.Client = (*fakeObjectStore)(nil)
-
-// versioningEnabled 默认 false：假桶不该让「versioning 开着吗」这个问题
-// 默认得到一个乐观的答案。要测开着的路径就显式设成 true
-func (f *fakeObjectStore) BucketVersioning(context.Context) (bool, error) {
-	return f.versioningEnabled, f.versioningErr
-}

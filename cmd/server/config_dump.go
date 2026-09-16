@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"os"
 	"sort"
 	"strconv"
@@ -78,25 +77,6 @@ func printConfig(cfg config.Config) {
 		num("ARTIFACT_MULTIPART_TTL_SECONDS", cfg.ArtifactMultipartTTL),
 		num("ARTIFACT_VERIFY_TIMEOUT_SECONDS", cfg.ArtifactVerifyTimeout),
 	})
-
-	// 灾难当天要在一台起不来的机器上回答「这台机器认的是哪三把钥匙」。
-	// 没有这一节，唯一的办法是自己 base64 解 env
-	section("备份与恢复", []entry{
-		yesNo("BACKUP_ENABLED", cfg.Backup.Enabled()),
-		text("BACKUP_INSTANCE_ID", cfg.Backup.InstanceID),
-		num("BACKUP_INTERVAL_HOURS", cfg.Backup.IntervalHours),
-		text("BACKUP_BUCKET", cfg.Backup.Bucket.Bucket),
-		text("BACKUP_BUCKET_REGION", cfg.Backup.Bucket.Region),
-	})
-	for i, slot := range backupcontainer.SlotNames {
-		fingerprint := cfg.Backup.Recipients[i].Fingerprint
-		if fingerprint == "" {
-			fingerprint = "(未配置)"
-		}
-		fmt.Printf("  恢复公钥 %s 指纹: %s\n", slot, fingerprint)
-	}
-	fmt.Println("  （上面是 DER SPKI 的 SHA-256，64 字符。打包机公钥那个 16 字符的指纹")
-	fmt.Println("   是另一回事，用 build-agent show-key 看，两者不要混。）")
 
 	section("推送", []entry{
 		yesNo("PUSH_DISPATCH_ENABLED", cfg.PushDispatchEnabled),

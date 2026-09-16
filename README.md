@@ -43,7 +43,6 @@ go run ./cmd/server
 - [API、数据与安全规范](docs/API_STANDARD.md)
 - [配置参考](docs/CONFIGURATION.md)
 - [可观测、升级与运行规范](docs/OPERATIONS_AND_RELEASE.md)
-- [打包服务备份与恢复：全流程与分工](docs/BACKUP_RECOVERY_RUNBOOK.md)
 - [独立管理前端与插件模块决策](docs/decisions/0002-independent-admin-and-plugin-modules.md)
 - [MySQL 持久化决策](docs/decisions/0003-mysql-persistence.md)
 - [管理端浏览器会话门禁决策](docs/decisions/0004-admin-browser-session.md)

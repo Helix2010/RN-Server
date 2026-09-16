@@ -26,8 +26,8 @@ const (
 // envKeysReadByCode 把 config.go 里真正读取的键名抠出来。
 func envKeysReadByCode(t *testing.T) []string {
 	t.Helper()
-	// 扫**整个包**而不是只扫 config.go。备份那组键住在 backup.go 里，只读一个
-	// 文件的话它们会从这道门禁底下整组溜过去——而它们恰恰是灾难当天要用的键。
+	// 扫**整个包**而不是只扫 config.go：哪天有一组键拆进了别的文件，只读一个
+	// 文件的话它们会从这道门禁底下整组溜过去。
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)

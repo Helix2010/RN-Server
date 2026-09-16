@@ -147,63 +147,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 
 对象存储的 endpoint / 桶 / 凭据**不在 env**：按租户存在 `app_configs.release.storage`，用 `STORAGE_MASTER_KEY` 加密，由管理端写入。
 
-### 4.4 打包服务的故障恢复备份
-
-打包机硬盘坏了，数据库里的签名密钥全在但没有任何东西能打开它们——能解开的只有打包机上那个 `agent-key`。这组键配的就是防这件事的备份（设计 `docs/design/platform-backup-recovery-2026-09-15.md`）。
-
-**三把恢复公钥只从这里读，控制台上只显示不编辑。** 能写数据库的人不该能改掉「外层封给谁」——外层里装着 `rn-foundation.env`（`STORAGE_MASTER_KEY`、`ADMIN_PASSWORD_HASH`、TLS 私钥）。换持有人要运维上两台机器改配置再重启，这件事本来就应该需要一个人到场。
-
-**三把要么全填、要么全空。** 填了一半是打字错误或者复制粘贴漏了一行，服务端**拒绝启动**并指名缺哪几个键。三把全空时服务端照常跑，但点「立刻备份」会被拒并告诉你差哪几把——没有降级模式，两把不会凑合着跑。
-
-指纹不配：它是公钥的函数（DER SPKI 的 SHA-256，64 位小写 hex），由服务端算出来显示在控制台上，三个持有人各自核对自己那一行。
-
-打包机那一侧是**另外三个键**（`BUILD_AGENT_RECOVERY_RECIPIENT_A/_B/_C`，见 `deploy/build-agent/rn-build-agent.env.example`），值一模一样。它只认自己 env 里那三把，服务端下发的只是指纹、只用于比对——服务端被攻破也改不了签名密钥最终封给谁。
-
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `BACKUP_RECOVERY_RECIPIENT_A` | 空 | 槽位 A 的恢复公钥，**PEM 的 base64，单行**。RSA ≥ 3072 位（4096 推荐） |
-| `BACKUP_RECOVERY_RECIPIENT_B` | 空 | 槽位 B，同上 |
-| `BACKUP_RECOVERY_RECIPIENT_C` | 空 | 槽位 C，同上。三把**必须两两不同**——两把相同就是那一组的两层封给同一个人，他一个人就能开 |
-| `BACKUP_RECOVERY_HOLDER_A` | 空 | 槽位 A 由谁保管，一行人名。印进 `README-FIRST.txt`：拿到包的人得知道该去找谁。不填只是恢复说明里少一句，不影响产出 |
-| `BACKUP_RECOVERY_HOLDER_B` | 空 | 槽位 B，同上 |
-| `BACKUP_RECOVERY_HOLDER_C` | 空 | 槽位 C，同上 |
-| `BACKUP_INSTANCE_ID` | 空 | **可选**。配了就作为对象键里的一层目录（`<前缀>/<实例 ID>/backup-…`），一个桶里放几套系统时用来分开；`^[a-z0-9-]{1,32}$`。对象名里已经带了产出时间（`backup-20260916T102405Z-00000001-AB.rnbk`），不靠它防重名；上传前还会确认键不存在、存在就拒绝覆盖。不要从主机名推导 |
-| `BACKUP_INTERVAL_HOURS` | `0` | `0` = 关闭定时只留手动；否则 **6–168**，建议 `24` |
-| `BACKUP_RETENTION_DAYS` | `0` | 桶上生命周期规则配的保留天数，**抄一份给控制台看**。服务端不删任何对象。`0` = 未设置，控制台显示「未设置」而不是按一个猜出来的天数把下载按钮置灰 |
-| `BACKUP_BUCKET_PROVIDER` | `s3` | `s3` / `r2` / `minio` / `obs`，和发布存储认同一份清单（`objectstore.Providers`）。`obs` 是华为云，没有默认地址，`BACKUP_BUCKET_ENDPOINT` 必填。留空按老配置处理（见下一行） |
-| `BACKUP_BUCKET_FORCE_PATH_STYLE` | `false` | MinIO 必须 `true`，S3 / R2 不用。**以前是猜的**（填了 endpoint 就开），猜错的表现是连不上桶而没人在现场——`BACKUP_BUCKET_PROVIDER` 留空时仍按那条旧推断走 |
-| `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露。也可以只在控制台「平台备份 → 备份桶」里配，那份优先；env 和控制台都没有时「立刻备份」和定时都会被拒绝 |
-| `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域。env 里填了 `BACKUP_BUCKET_BUCKET` 就必填 |
-| `BACKUP_BUCKET_ENDPOINT` | 空 | 自定义 endpoint（兼容 S3 的对象存储）。生产强制 https |
-| `BACKUP_BUCKET_PREFIX` | 空 | 对象键前缀 |
-| `BACKUP_BUCKET_ACCESS_KEY_ID` | 空 | 只要三项：写对象、读对象、读版本控制状态（S3 / MinIO 是 `s3:PutObject` + `s3:GetObject` + `s3:GetBucketVersioning`；华为云是 `obs:object:PutObject` + `obs:object:GetObject` + `obs:bucket:GetBucketVersioning`）。**不要给**删除对象、删除版本、改版本控制、改生命周期——给了就能先关版本控制再覆盖真包。在机器上测：`rn-server backup-bucket-test` |
-| `BACKUP_BUCKET_SECRET_ACCESS_KEY` | 空 | 同上 |
-
-**为什么公钥要再套一层 base64**：PEM 带换行，直接写进 systemd 的 `EnvironmentFile` 极易写坏，而这个键要用的那一天正好是最不该出意外的那一天。生成方式：
-
-```bash
-openssl rsa -in my-recovery.key -pubout | base64 -w0
-```
-
-**门限是 2-of-3**：三个人各持一把私钥，任意两个人凑齐就能打开备份包，一个人单独拿到什么都读不到。
-
-**打包机那一侧**（`/etc/rn-build-agent.env`，不是服务端的 env）：
-
-| 键 | 默认 | 说明 |
-|---|---|---|
-| `BUILD_AGENT_RECOVERY_RECIPIENT_A` / `_B` / `_C` | 空 | 和服务端**同样那三把**，逐指纹一致。对不上打包机拒绝产出备份并上报原因 |
-| `BUILD_AGENT_ENV_PATH` | `/etc/rn-build-agent.env` | 收进备份包的那份配置在哪 |
-| `BUILD_AGENT_UNIT_PATH` | `/etc/systemd/system/rn-build-agent.service` | systemd unit 在哪 |
-| `BUILD_AGENT_SSH_KEY_PATH` | 空 | 拉 RN-App 用的 deploy key。不配的话恢复时要重新配一把 |
-| `BUILD_AGENT_SSH_CONFIG_PATH` | 空 | 走 ssh host alias 时那段 `~/.ssh/config` |
-
-打包机侧**缺配置不会拒绝启动**——把备份做成构建的单点故障是负收益，而且第一次配置往往正好发生在恢复当天。但它会拒绝认领备份待办并上报原因，控制台上看得见。
-
-**服务端那一侧另有四个可选路径键**，用途同上：`BACKUP_SERVER_ENV_PATH`、`BACKUP_SERVER_UNIT_PATH`、`BACKUP_SERVER_NGINX_PATH`、`BACKUP_SERVER_TLS_CERT_PATH` / `BACKUP_SERVER_TLS_KEY_PATH`。前两项读不到直接判这次备份失败——安静地产出一个装不回去的包，比没有备份更糟，因为你以为自己有。`BACKUP_SERVER_ENV_PATH` 不配时，优先读 systemd 交给本服务的那份（`$CREDENTIALS_DIRECTORY/rn-foundation.env`，unit 里的 `LoadCredential=` 提供），其次才是 `/etc/rn-foundation.env`——服务端以 `rnfoundation` 跑，读不到 root 独读的原文件。
-
-**核对身份**：恢复时用 `build-agent show-key` 打印本机的 agent-key 指纹（16 字符）和备份签名公钥指纹（64 字符），和包里 `manifest.json` 的对应字段比对。
-
-### 4.5 推送
+### 4.4 推送
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -217,7 +161,7 @@ openssl rsa -in my-recovery.key -pubout | base64 -w0
 
 APNs（`APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_PRIVATE_KEY` / `APNS_BUNDLE_ID` / `APNS_ENVIRONMENT`）和 HMS（`HMS_APP_ID` / `HMS_CLIENT_ID` / `HMS_CLIENT_SECRET`）目前**仍是全局的**，没有租户在用。谁把它们改成按租户，必须同时把 `Dispatcher.apns` 和 `Dispatcher.hmsToken` 这两个全局字段改成 `map[tenant]`，否则两个租户会互相拿到对方的令牌。
 
-### 4.6 扫链
+### 4.5 扫链
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -227,7 +171,7 @@ APNs（`APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_PRIVATE_KEY` / `APNS_BUNDLE_ID` / 
 
 扫链端点按链存在 `app_configs.chain-scan.<chain>`（tenant 0），用 `STORAGE_MASTER_KEY` 加密，由平台管理员在管理端维护。
 
-### 4.7 其它
+### 4.6 其它
 
 | 键 | 默认 | 说明 |
 |---|---|---|

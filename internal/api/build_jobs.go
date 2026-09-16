@@ -715,14 +715,12 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
 		return
 	}
-	// 下发的分支必须是我们自己那一个，不认库里那一列（`build-concurrency-2026-09-15.md` §9，
-	// 平台备份设计 §11 把这条列为「必须同时修的」）。
+	// 下发的分支必须是我们自己那一个，不认库里那一列（`build-concurrency-2026-09-15.md` §9）。
 	//
 	// 写入路径上每一条用的都是 buildGitRef 这个常量，所以这一列出现别的值只有
 	// 两种可能：常量上线之前的历史脏数据，或者**有人直接写了库**。后者是一条
-	// 完整的提权路径，而且绕开了整个备份方案的前提：不用改任何收件人配置，
-	// 让打包机检出一个带后门的提交、以 builder 身份读走 agent-key 就行——
-	// 而 agent-key 能解开每一个租户的签名密钥。
+	// 完整的提权路径：让打包机检出一个带后门的提交，构建时就以 builder 身份
+	// 执行了攻击者的代码。
 	//
 	// 打包机侧的 validateGitRef 只挡形状（选项注入、路径穿越），挡不住一个
 	// 形状完全合法的分支名。真正的闸必须在这里：服务端不把它下发出去。

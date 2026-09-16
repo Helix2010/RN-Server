@@ -8,17 +8,20 @@ import (
 	"time"
 )
 
-// 服务端不把库里那一列的 git_ref 下发出去（平台备份设计 §11、
-// build-concurrency-2026-09-15.md §9）。
+// buildJobDBServer 给认领测试一个连着测试库的服务端；没有 RN_TEST_MYSQL_DSN 时跳过。
+// 认领路径只用到 db，配置留零值。
+func buildJobDBServer(t *testing.T) *server {
+	t.Helper()
+	return &server{db: openTestDB(t)}
+}
+
+// 服务端不把库里那一列的 git_ref 下发出去（build-concurrency-2026-09-15.md §9）。
 //
-// 这是备份方案唯一一条能被整体绕开的路径：不用改任何收件人配置，只要让打包机
-// 检出一个带后门的提交，以 builder 身份读走 agent-key 就行——而 agent-key 能
-// 解开每一个租户的签名密钥，那正是整套备份要保护的东西。
-//
-// 打包机侧的 validateGitRef 只挡形状（选项注入、路径穿越），一个形状完全合法的
-// 分支名它拦不住。所以闸必须在服务端：不下发就不会被检出。
+// 只要让打包机检出一个带后门的提交，构建时执行的就是攻击者的代码。打包机侧的
+// validateGitRef 只挡形状（选项注入、路径穿越），一个形状完全合法的分支名它拦不住。
+// 所以闸必须在服务端：不下发就不会被检出。
 func TestDBClaimRefusesAJobWhoseGitRefWasTamperedWith(t *testing.T) {
-	s := backupServer(t)
+	s := buildJobDBServer(t)
 	ctx := context.Background()
 	tenant := testTenant(51)
 	now := time.Now().UTC()
@@ -78,7 +81,7 @@ func TestDBClaimRefusesAJobWhoseGitRefWasTamperedWith(t *testing.T) {
 // 正常的任务（git_ref 就是固定分支）当然要能被认领。
 // 没有这一条，上面那个闸可以靠「谁都不下发」通过，而那会让构建整个停摆
 func TestDBClaimStillDispatchesAJobOnTheFixedBranch(t *testing.T) {
-	s := backupServer(t)
+	s := buildJobDBServer(t)
 	ctx := context.Background()
 	tenant := testTenant(52)
 	now := time.Now().UTC()

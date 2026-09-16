@@ -68,10 +68,6 @@ type Client interface {
 	CompleteMultipartUpload(context.Context, string, string, []CompletedPart) error
 	AbortMultipartUpload(context.Context, string, string) error
 	Test(context.Context) error
-	// BucketVersioning 说明桶开没开版本控制。备份桶必须开：Put 对一个已存在的
-	// 键在没开 versioning 时**就是删除**，于是拿到桶写权限的人覆盖掉真包之后，
-	// 原件再也取不回来——控制台上那行 sha256 只能告诉你完了，不能让你取回真的。
-	BucketVersioning(context.Context) (bool, error)
 }
 
 type Factory interface {
@@ -174,8 +170,8 @@ func (c *s3Client) Head(ctx context.Context, key string) (int64, string, error) 
 func (c *s3Client) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 	output, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	if err != nil {
-		// 和 Get 一样把「不存在」和「读不了」分开：备份上传前靠它判断「这个键能不能写」，
-		// 把 403 当成不存在的话，就会去覆盖一个其实存在、只是看不见的对象
+		// 和 Get 一样把「不存在」和「读不了」分开：把 403 当成不存在的话，
+		// 调用方会以为这个键可以写，而它其实存在、只是看不见
 		var missing *types.NoSuchKey
 		var notFound *types.NotFound
 		if errors.As(err, &missing) || errors.As(err, &notFound) {
@@ -356,14 +352,4 @@ func (c *s3Client) Test(ctx context.Context) error {
 		return fmt.Errorf("storage read test failed: %w", err)
 	}
 	return nil
-}
-
-func (c *s3Client) BucketVersioning(ctx context.Context) (bool, error) {
-	out, err := c.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
-		Bucket: aws.String(c.bucket),
-	})
-	if err != nil {
-		return false, fmt.Errorf("read bucket versioning: %w", err)
-	}
-	return out.Status == types.BucketVersioningStatusEnabled, nil
 }
