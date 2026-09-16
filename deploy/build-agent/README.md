@@ -185,7 +185,7 @@ scp build-agent build-runner <构建机>:~/
 ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runner /opt/rn-build-agent/ && sudo systemctl restart rn-build-agent'
 ```
 
-冒烟：`env -i /opt/rn-build-agent/build-agent` 必须以 2 退出（配置不全），什么都不写；`build-runner` 不带参数也以 2 退出。
+冒烟：`env -i /opt/rn-build-agent/build-agent` 必须以 2 退出（配置不全），什么都不写；`build-runner` 不带参数也以 2 退出。退出码 77 专指"机器被吊销"，与 2 不混用。
 
 **停机是排空，不是中止。** 控制进程收到 SIGTERM 后不再发起新的领取；手上那一条（包括 SIGTERM 到达时已经发出、服务端已经派出的那次领取）照常构建、上传、交付，或者按失败上报，然后以 0 退出。unit 用 `KillMode=mixed`：SIGTERM 只发给控制进程，执行进程与它的子进程不会收到（`control-group` 会把 SIGTERM 发给整个 cgroup，sudo 转给执行进程，构建当场被打断——2026-09-16 用 `systemd-run` 对照实测过两种模式）。所以 `systemctl restart` 可能等一轮构建（最长 `BUILD_AGENT_TIMEOUT_MINUTES`）；超过 `TimeoutStopSec=3600` systemd 对整个 cgroup 补 SIGKILL。
 
@@ -214,7 +214,8 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 | 服务端说"等会儿再来" | 409 `BUILDER_CLAIM_IN_PROGRESS`（上一次领取还在处理）下一轮再领；400 `UPLOAD_INTERRUPTED`、424 `UPLOAD_STORAGE_FAILED` 退避重传 |
 | 服务端明确拒绝（其余 4xx） | 不重试，带错误码按失败上报：`UPLOAD_CONTENT_TYPE_INVALID`、`UPLOAD_TOO_LARGE`、`UPLOAD_EMPTY`、`INVALID_BUILD_ATTEMPT`、`BUILD_SBOM_INVALID`、`BUILD_KIND_MISMATCH`、`BUILD_PROVENANCE_INVALID` 等 |
 | 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 中止执行进程，按超时上报 |
-| 公钥未被接受 / 令牌被吊销 | 不领任务，journal 里说清楚在等什么 |
+| 公钥未被接受 | 不领任务，journal 里说清楚在等什么 |
+| 机器在控制台被吊销 | 任何一条请求收到 401 `MACHINE_REVOKED`，或者公钥登记成功过之后收到 401 `MACHINE_AUTH_REQUIRED`（令牌不再被认）：立刻停止领取，在跑的构建中止并清理、**不再上报**，记错误日志，以退出码 **77** 退出。unit 的 `RestartPreventExitStatus=77` 让 systemd 不再重启它（`systemctl status` 显示 failed）。要恢复就在控制台新建机器、把新令牌写进 env 文件、按「身份登记」重新走一遍，再 `systemctl restart`。登记之前就收到 `MACHINE_AUTH_REQUIRED`（多半是令牌抄错）不算吊销：照常重试并报错 |
 | 状态目录或密钥权限不对 | 控制进程以 2 退出，不把密钥留在别人读得到的地方 |
 
 ## 排查

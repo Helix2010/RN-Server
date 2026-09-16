@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/provenance"
@@ -27,6 +28,8 @@ const (
 	codeKeyNotAccepted      = "MACHINE_KEY_NOT_ACCEPTED"
 	codeKeyRotationUnproven = "MACHINE_KEY_ROTATION_UNPROVEN"
 	codeClaimInProgress     = "BUILDER_CLAIM_IN_PROGRESS"
+	codeMachineRevoked      = "MACHINE_REVOKED"
+	codeMachineAuthRequired = "MACHINE_AUTH_REQUIRED"
 
 	headerMachineToken = "x-machine-token"
 	headerBuildAttempt = "x-build-attempt"
@@ -179,13 +182,26 @@ type client struct {
 	token  string
 	http   *http.Client
 	upload *http.Client
+
+	// registered 在公钥登记第一次成功之后为真：从那以后令牌被认不出来，只能是机器被删了或令牌被换了
+	registered atomic.Bool
+	// revoked 在服务端说这台机器已吊销时取消（原因 errMachineRevoked）。任何一条请求都可能先撞上它，
+	// 包括心跳 goroutine，所以用 context 广播给主循环与在跑的任务。
+	revoked context.Context
+	revoke  context.CancelCauseFunc
 }
 
+// errMachineRevoked 是吊销的取消原因。
+var errMachineRevoked = errors.New("this build machine was revoked or its token is no longer recognised by the server")
+
 func newClient(cfg config) *client {
+	revoked, revoke := context.WithCancelCause(context.Background())
 	return &client{
-		server: cfg.Server,
-		token:  cfg.MachineToken,
-		http:   &http.Client{Timeout: defaultHTTPRequestTimeout, CheckRedirect: refuseRedirects},
+		revoked: revoked,
+		revoke:  revoke,
+		server:  cfg.Server,
+		token:   cfg.MachineToken,
+		http:    &http.Client{Timeout: defaultHTTPRequestTimeout, CheckRedirect: refuseRedirects},
 		// 几十上百兆的 PUT 经过反代链路时 h2 的流错误比 1.1 常见得多，这条路径也没有
 		// 任何需要多路复用的理由，所以强制 HTTP/1.1。
 		upload: &http.Client{
@@ -227,10 +243,30 @@ func (c *client) send(ctx context.Context, method, path string, attempt int, bod
 		return response.StatusCode, nil, fmt.Errorf("%s returned more than %d bytes", path, maxJSONResponseBytes)
 	}
 	if failedStatus(response.StatusCode) {
-		return response.StatusCode, payload, newAPIError(path, response.StatusCode, payload)
+		return response.StatusCode, payload, c.rejection(path, response.StatusCode, payload)
 	}
 	return response.StatusCode, payload, nil
 }
+
+// rejection 把一个失败响应变成错误，顺带认出吊销：401 MACHINE_REVOKED，或者公钥登记成功过之后的
+// 401 MACHINE_AUTH_REQUIRED（登记之前的 401 多半是令牌抄错了，那种情况照常重试、报错）。
+func (c *client) rejection(path string, status int, payload []byte) error {
+	err := newAPIError(path, status, payload)
+	if status == http.StatusUnauthorized {
+		switch errorCode(err) {
+		case codeMachineRevoked:
+			c.revoke(errMachineRevoked)
+		case codeMachineAuthRequired:
+			if c.registered.Load() {
+				c.revoke(errMachineRevoked)
+			}
+		}
+	}
+	return err
+}
+
+// isRevoked 报告服务端是否已经说过这台机器被吊销。
+func (c *client) isRevoked() bool { return c.revoked.Err() != nil }
 
 func (c *client) authorize(request *http.Request, attempt int) {
 	request.Header.Set(headerMachineToken, c.token)
@@ -271,7 +307,11 @@ func (c *client) registerKey(ctx context.Context, publicKeyBase64 string, rotati
 	if err != nil {
 		return out, err
 	}
-	return out, decodeInto(path, payload, &out)
+	if err := decodeInto(path, payload, &out); err != nil {
+		return out, err
+	}
+	c.registered.Store(true)
+	return out, nil
 }
 
 // claim 领一条任务。队列空时服务端给 204。
@@ -410,7 +450,7 @@ func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path,
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes))
 	if failedStatus(response.StatusCode) {
-		return newAPIError(apiPath, response.StatusCode, payload)
+		return c.rejection(apiPath, response.StatusCode, payload)
 	}
 	var stored struct {
 		SHA256 string `json:"sha256"`
@@ -441,7 +481,7 @@ func (c *client) downloadIcon(ctx context.Context, job claimedJob, name string, 
 	defer response.Body.Close()
 	if failedStatus(response.StatusCode) {
 		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
-		return newAPIError("icon "+name, response.StatusCode, payload)
+		return c.rejection("icon "+name, response.StatusCode, payload)
 	}
 	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
 	written, err := io.Copy(w, io.LimitReader(response.Body, 12<<20+1))
@@ -543,7 +583,7 @@ func (c *client) putTicket(ctx context.Context, job claimedJob, ticket uploadTic
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes))
 	if failedStatus(response.StatusCode) {
-		return newAPIError("upload of "+filepath.Base(path), response.StatusCode, payload)
+		return c.rejection("upload of "+filepath.Base(path), response.StatusCode, payload)
 	}
 	return nil
 }

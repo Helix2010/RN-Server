@@ -32,6 +32,10 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/rn-build-agent/build-agent
 Restart=always
 RestartSec=10
+# 机器在控制台被吊销（服务端回 401 MACHINE_REVOKED，或登记成功过之后令牌不再被认）时
+# build-agent 以 77 退出：令牌已经没用了，不要每 10 秒重启一次去撞服务端。
+# 配置不全是 2，照常重启（改完 env 文件就能起来）。
+RestartPreventExitStatus=77
 # 停机时先做完手上那一条构建：控制进程收到 SIGTERM 只是不再领新活，手上的构建照常跑完、
 # 交付或上报失败，然后退出。
 #

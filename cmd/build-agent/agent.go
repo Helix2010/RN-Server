@@ -146,6 +146,9 @@ func (a *agent) say(message string, args ...any) {
 
 // pollOnce 领一个任务并把它做完，返回是否真的做了事。
 func (a *agent) pollOnce(ctx context.Context) bool {
+	if a.api.isRevoked() {
+		return false
+	}
 	if !a.ensureKeyAccepted(ctx) {
 		return false
 	}
@@ -212,6 +215,9 @@ func (a *agent) runJob(ctx context.Context, job claimedJob) {
 	// 心跳收到 409 BUILD_ATTEMPT_STALE 则立刻取消。
 	jobCtx, cancelJob := context.WithCancelCause(context.WithoutCancel(ctx))
 	defer cancelJob(nil)
+	// 机器被吊销（任何一条请求先撞上都算）：立刻中止
+	stopWatchingRevocation := context.AfterFunc(a.api.revoked, func() { cancelJob(errMachineRevoked) })
+	defer stopWatchingRevocation()
 	buildCtx, cancelTimeout := context.WithTimeoutCause(jobCtx, a.cfg.Timeout, errTimedOut)
 	defer cancelTimeout()
 
@@ -252,6 +258,10 @@ func (a *agent) runJob(ctx context.Context, job claimedJob) {
 	}
 	_ = os.RemoveAll(a.spoolDir(job.ID))
 
+	if a.api.isRevoked() {
+		a.log.Error("build aborted: this machine was revoked; nothing more is reported", "job", job.ID, "attempt", job.Attempt)
+		return
+	}
 	if errors.Is(context.Cause(jobCtx), errAttemptStale) || isStale(err) {
 		a.log.Warn("build aborted: the server no longer counts this attempt; nothing more is reported", "job", job.ID, "attempt", job.Attempt)
 		return
@@ -384,6 +394,34 @@ func (a *agent) deliverOTA(ctx context.Context, job claimedJob, prepared prepare
 		return fmt.Errorf("the OTA revision was created but the job could not be completed: %w", err)
 	}
 	return nil
+}
+
+// serve 是常驻循环：领任务、做完、再领。停机信号到来时排空后返回 0；机器被吊销时返回
+// exitMachineRevoked——令牌已经没用了，systemd 不该把它无限重启（unit 的 RestartPreventExitStatus）。
+func (a *agent) serve(ctx context.Context) int {
+	for {
+		worked := a.pollOnce(ctx)
+		if a.api.isRevoked() {
+			a.log.Error("this build machine was revoked in the console (or its token is no longer recognised); stopping. "+
+				"Create a new machine in the console and put its token in the env file to build again",
+				"exitStatus", exitMachineRevoked)
+			return exitMachineRevoked
+		}
+		if ctx.Err() != nil {
+			a.log.Info("build agent stopped")
+			return 0
+		}
+		if worked {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			a.log.Info("build agent stopped")
+			return 0
+		case <-a.api.revoked.Done():
+		case <-time.After(a.cfg.PollEvery):
+		}
+	}
 }
 
 // report 反复重试最后那一次上报（失败原因）。这一步失败的代价是任务停在 claimed、

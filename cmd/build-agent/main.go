@@ -9,7 +9,7 @@
 //
 // 子命令：
 //
-//	build-agent                 常驻（配置来自环境变量；配置不全以退出码 2 退出）
+//	build-agent                 常驻（配置来自环境变量；配置不全以退出码 2 退出，机器被吊销以 77 退出）
 //	build-agent show-key        只读打印出处公钥 base64 与完整 sha256
 //	build-agent rotate-key      生成下一把出处密钥，常驻进程用当前密钥签换钥证明登记它
 //
@@ -29,6 +29,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// exitMachineRevoked 是机器被吊销时的退出码（EX_NOPERM）。不能是 2：2 是"配置不全"，
+// rn-foundation-apply 的冒烟靠它。unit 用 RestartPreventExitStatus 阻止对它重启。
+const exitMachineRevoked = 77
 
 func main() {
 	if len(os.Args) >= 2 {
@@ -91,22 +95,7 @@ func runAgent() int {
 		"jobsRoot", cfg.Workspace, "runner", cfg.Runner, "runnerUser", cfg.RunnerUser,
 		"runnerSeparated", cfg.runnerSeparated(), "provenancePublicKeySha256", keys.current.sha256)
 
-	for {
-		worked := a.pollOnce(ctx)
-		if ctx.Err() != nil {
-			slog.Info("build agent stopped")
-			return 0
-		}
-		if worked {
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			slog.Info("build agent stopped")
-			return 0
-		case <-time.After(cfg.PollEvery):
-		}
-	}
+	return a.serve(ctx)
 }
 
 // stateDirFlag 取 --state-dir，没有就用 BUILD_AGENT_STATE_DIR。
