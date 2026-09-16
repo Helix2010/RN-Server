@@ -41,17 +41,16 @@ var builderPub, builderPriv, _ = ed25519.GenerateKey(rand.Reader)
 
 // scenario 描述一次检查：先按 spec 合成包、按包的真实摘要签出处声明，再允许逐项篡改。
 type scenario struct {
-	spec          func(*apktest.Spec)
-	manifest      func(*axml.Node)               // 改清单树
-	zip           *apktest.ZipOptions            // 用自定义 ZIP 选项写包
-	extraFiles    []apktest.File                 // 追加条目（走 zip 选项路径）
-	statement     func(*provenance.Statement)    // 签名前改声明
-	input         func(*Input)                   // 改策略输入
-	replaceAPK    func(spec apktest.Spec) []byte // 出处签完之后换掉包（摘要对不上）
-	rawAPK        []byte                         // 出处签的就是这些字节（构建机本身出了问题）
-	signWith      ed25519.PrivateKey
-	expectCode    string
-	expectDetails string
+	spec       func(*apktest.Spec)
+	manifest   func(*axml.Node)               // 改清单树
+	zip        *apktest.ZipOptions            // 用自定义 ZIP 选项写包
+	extraFiles []apktest.File                 // 追加条目（走 zip 选项路径）
+	statement  func(*provenance.Statement)    // 签名前改声明
+	input      func(*Input)                   // 改策略输入
+	replaceAPK func(spec apktest.Spec) []byte // 出处签完之后换掉包（摘要对不上）
+	rawAPK     []byte                         // 出处签的就是这些字节（构建机本身出了问题）
+	signWith   ed25519.PrivateKey
+	expectCode string
 }
 
 func buildAPK(t *testing.T, spec apktest.Spec, sc scenario) []byte {
