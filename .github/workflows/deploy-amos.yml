@@ -30,10 +30,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: test -z "$(gofmt -l cmd internal)"
+      - run: test -z "$(gofmt -l cmd internal signing)"
       - run: go vet ./...
       - run: go test -race ./...
       - run: go build ./cmd/server
+      # signing/ 是独立 module（签名闸与离线工具只依赖标准库），根目录的 ./... 不含它
+      - name: signing module
+        working-directory: signing
+        run: |
+          go vet ./...
+          go test -race ./...
       - run: jq empty contracts/openapi.json
 
       # 部署被跳过时整个 run 仍然是绿的，没有任何地方说"其实没发出去"。真踩过：

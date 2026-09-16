@@ -1,6 +1,8 @@
 FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
+# replace 指向 ./signing：go mod download 之前这个目录就得在
+COPY signing ./signing
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
