@@ -79,17 +79,32 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		return
 	}
 	// 打包机公钥指纹。它和上面三把恢复公钥的指纹算法不同（16 字符 vs 64 字符），
-	// 设计 §2.2 特意要求分开显示——混在一起显示会让核对仪式失效
-	agentKeyView := gin.H{"registered": false, "fingerprint": nil, "algorithm": "X25519 公钥 sha256 前 16 字符"}
-	if record, err := s.buildAgentKey(ctx); err == nil && record != nil &&
-		record.Current.Fingerprint() != "" {
-		agentKeyView = gin.H{"registered": true, "fingerprint": record.Current.Fingerprint(),
-			"algorithm": "X25519 公钥 sha256 前 16 字符"}
+	// 设计 §2.2 特意要求分开显示——混在一起显示会让核对仪式失效。
+	//
+	// pending 一定要回：换过机器之后打包机会报上来一把新的，而 current 不动。
+	// 控制台上不显示 pending 的话，人看到的是一切正常的旧指纹，而每一次备份都在
+	// 失败——「register it first」里的 register，在控制台上根本没有入口
+	agentKeyView := gin.H{"registered": false, "fingerprint": nil, "pending": nil,
+		"algorithm": "X25519 公钥 sha256 前 16 字符"}
+	if record, err := s.buildAgentKey(ctx); err == nil && record != nil {
+		if record.Current.Fingerprint() != "" {
+			agentKeyView["registered"] = true
+			agentKeyView["fingerprint"] = record.Current.Fingerprint()
+		}
+		if record.Pending != nil {
+			agentKeyView["pending"] = gin.H{"fingerprint": record.Pending.Fingerprint(),
+				"agent": nullableString(record.PendingAgent), "reportedAt": nullableString(record.PendingAt)}
+		}
 	}
 
-	signing := gin.H{"registered": false, "fingerprint": nil}
+	signing := gin.H{"registered": false, "fingerprint": nil, "pending": nil}
 	if record, err := s.backupSigningKeyRecord(ctx); err == nil && record != nil {
-		signing = gin.H{"registered": true, "fingerprint": record.Current.Fingerprint}
+		signing["registered"] = true
+		signing["fingerprint"] = record.Current.Fingerprint
+		if record.Pending != nil {
+			signing["pending"] = gin.H{"fingerprint": record.Pending.Fingerprint,
+				"agent": nullableString(record.Pending.Agent), "reportedAt": nullableString(record.Pending.At)}
+		}
 	}
 
 	items := make([]gin.H, 0, len(runs))

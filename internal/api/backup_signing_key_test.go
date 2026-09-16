@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
@@ -145,5 +147,46 @@ func TestDBRegisterRefusesAKeyItCannotUse(t *testing.T) {
 	}
 	if record != nil {
 		t.Fatal("被拒绝的值不该留下任何记录")
+	}
+}
+
+// 换过机器之后，打包机会报上来一把新的签名公钥，而 current 不动——控制台必须
+// 看得见这件事。看不见的话，人看到的是一切正常的旧指纹，而每一次备份都在失败，
+// 报「register it first」，而控制台上根本没有 register 的入口。
+func TestDBBackupStatusShowsAPendingKeyWaitingToBeAccepted(t *testing.T) {
+	s := backupServer(t)
+	if err := s.saveBackupSigningKey(context.Background(), backupSigningKeyRecord{
+		Current: backupSigningKey{PublicKey: "old", Fingerprint: strings.Repeat("a", 64)},
+		Pending: &backupSigningKey{PublicKey: "new", Fingerprint: strings.Repeat("b", 64),
+			Agent: "amos-builder-1", At: "2026-09-16T00:00:00Z"},
+	}, "tester"); err != nil {
+		t.Fatal(err)
+	}
+
+	c, recorder := testContext(t, platformTenantID, "GET", "/x", nil)
+	s.getBackupStatus(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("读状态应当成功: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var view struct {
+		SigningKey struct {
+			Fingerprint string `json:"fingerprint"`
+			Pending     *struct {
+				Fingerprint string  `json:"fingerprint"`
+				Agent       *string `json:"agent"`
+			} `json:"pending"`
+		} `json:"signingKey"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.SigningKey.Fingerprint != strings.Repeat("a", 64) {
+		t.Errorf("current 不该被 pending 顶掉: %+v", view.SigningKey)
+	}
+	if view.SigningKey.Pending == nil || view.SigningKey.Pending.Fingerprint != strings.Repeat("b", 64) {
+		t.Fatalf("待接受的那把没有回给控制台: %+v", view.SigningKey.Pending)
+	}
+	if view.SigningKey.Pending.Agent == nil || *view.SigningKey.Pending.Agent != "amos-builder-1" {
+		t.Errorf("没说是哪台机器报上来的，人不知道该去哪核对: %+v", view.SigningKey.Pending)
 	}
 }
