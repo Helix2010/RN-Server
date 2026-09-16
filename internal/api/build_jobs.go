@@ -219,10 +219,9 @@ func clampLogTail(lines []string) []byte {
 	if len(lines) > buildJobLogTailMax {
 		lines = lines[len(lines)-buildJobLogTailMax:]
 	}
+	// 日志尾部来自构建机，按不可信文本清洗（控制字符、双向覆盖字符），再按字节截断
 	for i, line := range lines {
-		if len(line) > 2000 {
-			lines[i] = line[:2000]
-		}
+		lines[i] = clipBytes(sanitizeReportedText(line), 2000)
 	}
 	if lines == nil {
 		lines = []string{}

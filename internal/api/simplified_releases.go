@@ -280,7 +280,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	} else if sbom != nil {
 		metadata["sbom"] = sbom
 	}
-	runtimeVersion := ""
+	runtimeVersion, apkCertificate := "", ""
 	if body.Platform == "android" {
 		verified, rejection, err := s.verifyAndroidArtifact(verifyCtx, tenantID(c), stored.Path, body.Version, body.BuildNumber)
 		if err != nil {
@@ -294,6 +294,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 			return
 		}
 		runtimeVersion = verified.RuntimeVersion
+		apkCertificate = normalizeFingerprint(verified.APK.SignerSHA256)
 		for key, value := range verified.Metadata {
 			metadata[key] = value
 		}
@@ -318,6 +319,9 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 				return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_SIGNING_IN_FLIGHT",
 					Detail: "A build for this platform is waiting for or being signed by the signer; wait for it to finish, or cancel it, before uploading a release by hand"}, nil
 			}
+			if rejection, err := manualAndroidReleaseGate(ctx, tx, tenantID(c), apkCertificate); err != nil || rejection != nil {
+				return rejection, err
+			}
 		}
 		return insertReleaseInTx(ctx, tx, insert, now)
 	})
@@ -326,6 +330,11 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		return
 	}
 	if rejection != nil {
+		if rejection.Summary != nil {
+			// 手工上传闸的拒绝（签名证书没有在签名闸上确认过）要留痕：这正是账号被盗时会出现的请求
+			rejection.Summary["platform"], rejection.Summary["version"], rejection.Summary["buildNumber"] = body.Platform, body.Version, body.BuildNumber
+			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, rejection.Detail, requestID(c), rejection.Summary))
+		}
 		problem(c, rejection.Status, rejection.Code, rejection.Detail)
 		return
 	}
@@ -444,6 +453,77 @@ func withCode(summary map[string]any, code string) map[string]any {
 	}
 	out["code"] = code
 	return out
+}
+
+// manualAndroidReleaseGate 是 Android 手工上传独有的一道闸（签名闸 complete 不走这里）。
+//
+// 只和登记的发布身份比对是不够的：租户管理员（或拿到 x-admin-key 的人）能改登记的证书，
+// 也能用签名闸公开的 X25519 公钥封一份自己的 v3 密文上传，然后手工上传一个自签的包——
+// 签名闸从头到尾没见过那把密钥。所以手工上传还要求：
+//   - 租户有 v3 签名密钥，且包的签名证书就是密钥记录里的证书；
+//   - **主签名闸**对当前密钥版本试解成功（decrypt=ok）并在本机确认过（confirmed=true）。
+//     确认是运维在签名闸上对照离线指纹做的，服务端改不了它。
+//
+// 结果：租户管理员账号被攻破时，手工上传只能发"签名闸本机确认过的证书"签的包。
+// 在发布序列锁的事务里调用，带共享锁读密钥与检查记录，挡住并发的换密钥提交。
+func manualAndroidReleaseGate(ctx context.Context, tx *sql.Tx, tenant, apkCertificate string) (*releaseRejection, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT config_key,config_value,version FROM app_configs WHERE tenant_id=? AND config_key IN (?,?) FOR SHARE`,
+		tenant, buildKeystoreConfigKey, buildKeystoreCheckConfigKey)
+	if err != nil {
+		return nil, err
+	}
+	values, versions := map[string][]byte{}, map[string]int{}
+	for rows.Next() {
+		var key string
+		var raw []byte
+		var version int
+		if err := rows.Scan(&key, &raw, &version); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		values[key], versions[key] = raw, version
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	reject := func(code, detail string) (*releaseRejection, error) {
+		return &releaseRejection{Status: http.StatusConflict, Code: code, Detail: detail,
+			Summary: map[string]any{"code": code, "signerSha256": apkCertificate}}, nil
+	}
+	keystoreRaw, exists := values[buildKeystoreConfigKey]
+	if !exists {
+		return reject("RELEASE_KEYSTORE_NOT_CONFIGURED", "Android releases uploaded by hand require the tenant's v3 signing keystore to be registered and confirmed on the primary signer")
+	}
+	record, legacy, err := parseBuildKeystoreValue(keystoreRaw)
+	if err != nil {
+		return nil, err
+	}
+	if legacy {
+		return reject("RELEASE_KEYSTORE_NOT_CONFIGURED", "The stored signing keystore is in a retired format; upload the v3 keystore before uploading releases by hand")
+	}
+	if record.CertificateSHA256 != apkCertificate {
+		return reject("RELEASE_SIGNER_KEYSTORE_MISMATCH", "The package is not signed with the certificate of the tenant's registered v3 signing keystore")
+	}
+	registry, err := readMachineRegistry(ctx, tx, false)
+	if err != nil {
+		return nil, err
+	}
+	primary, hasPrimary := registry.Doc.activePrimary()
+	if !hasPrimary {
+		return reject("RELEASE_SIGNER_NOT_CONFIRMED", "No active primary signer is registered, so no signer has confirmed this signing certificate")
+	}
+	checks := map[string]keystoreMachineCheck{}
+	if raw, ok := values[buildKeystoreCheckConfigKey]; ok {
+		if checks, err = parseKeystoreChecks(raw); err != nil {
+			return nil, err
+		}
+	}
+	check, ok := checks[primary.ID]
+	if !ok || check.KeystoreVersion != versions[buildKeystoreConfigKey] || check.Decrypt != "ok" || !check.Confirmed {
+		return reject("RELEASE_SIGNER_NOT_CONFIRMED", "The primary signer has not decrypted and confirmed the current signing keystore on the machine itself; only packages signed with a certificate confirmed there can be uploaded by hand")
+	}
+	return nil, nil
 }
 
 // releaseSigningInFlight：该租户该平台有 built 或 signing 的安装包任务。

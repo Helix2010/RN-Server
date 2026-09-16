@@ -641,7 +641,8 @@ func (s *server) acceptMachineKey(c *gin.Context) {
 		return
 	}
 	// 签名闸的第二把钥（Ed25519）决定以后谁能证明换钥。只核对 X25519 时，偷到令牌的人可以在
-	// 待接受期间报上"真机的 X25519 + 自己的 Ed25519"。带了就必须一致；不带时保持约定 5.4 的行为
+	// 待接受期间报上"真机的 X25519 + 自己的 Ed25519"。所以签名闸必须同时带上从本机抄来的
+	// Ed25519 指纹（下面按角色判）；构建机只有一把钥，带了就必须一致
 	typedEd25519 := ""
 	if body.Ed25519PublicKeySHA256 != nil {
 		if typedEd25519, valid = fingerprint.Normalize(strings.TrimSpace(*body.Ed25519PublicKeySHA256)); !valid {
@@ -666,6 +667,9 @@ func (s *server) acceptMachineKey(c *gin.Context) {
 		}
 		if typed != m.Pending.PublicKeySHA256 {
 			return http.StatusConflict, "MACHINE_KEY_MISMATCH", "The fingerprint does not match the key waiting to be accepted; read it on the machine itself", nil
+		}
+		if m.Role == machineRoleSigner && typedEd25519 == "" {
+			return http.StatusBadRequest, "INVALID_MACHINE", "Accepting a signer's keys requires ed25519PublicKeySha256 as well, read on the signer itself", nil
 		}
 		if typedEd25519 != "" && (m.Role != machineRoleSigner || typedEd25519 != string(m.Pending.Ed25519PublicKeySHA256)) {
 			return http.StatusConflict, "MACHINE_KEY_MISMATCH", "The ed25519 fingerprint does not match the key waiting to be accepted; read it on the signer itself", nil

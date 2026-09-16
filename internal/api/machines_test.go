@@ -232,8 +232,11 @@ func TestDBMachineKeyRotationAndSignerRoles(t *testing.T) {
 	if r := accept(f.standby.ID, f.standby.recipient()); r.Code != http.StatusConflict || problemCode(t, r) != "MACHINE_KEY_NOT_PENDING" {
 		t.Fatalf("accepting on a machine with nothing pending: %d %s", r.Code, r.Body.String())
 	}
-	// 签名闸的 Ed25519 指纹带了就必须一致：只核对 X25519 时，偷到令牌的人可以报上"真机的 X25519 +
+	// 签名闸的 Ed25519 指纹必填且必须一致：只核对 X25519 时，偷到令牌的人可以报上"真机的 X25519 +
 	// 自己的 Ed25519"，之后的换钥证明就归他了
+	if r := accept(f.primary.ID, fingerprint.SHA256Hex(newX)); r.Code != http.StatusBadRequest || problemCode(t, r) != "INVALID_MACHINE" {
+		t.Fatalf("accepting a signer without its ed25519 fingerprint: %d %s", r.Code, r.Body.String())
+	}
 	wrongEd := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+f.primary.ID+"/accept-key", map[string]any{
 		"publicKeySha256": fingerprint.SHA256Hex(newX), "ed25519PublicKeySha256": strings.Repeat("1", 64),
 		"expectedVersion": registryVersion(t, f), "reason": "verified on the machine", "confirm": true,

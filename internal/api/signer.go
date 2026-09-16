@@ -41,15 +41,9 @@ const (
 
 var signerCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{2,63}$`)
 
-// sanitizeSignerText 把签名闸送来的说明收成一行可打印文字：它会显示在控制台上、写进审计。
+// sanitizeSignerText 清洗签名闸送来的说明（见 sanitizeReportedText）并截断：它会显示在控制台上、写进审计。
 func sanitizeSignerText(text string, max int) string {
-	cleaned := strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
-			return ' '
-		}
-		return r
-	}, text)
-	return clipRunes(strings.TrimSpace(cleaned), max)
+	return clipRunes(strings.TrimSpace(sanitizeReportedText(text)), max)
 }
 
 // ---- 签名密钥检查 ----

@@ -250,6 +250,28 @@ func (s *server) updateAndroidReleaseIdentity(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+	// 租户已经有 v3 签名密钥时，登记的身份只能是密钥记录里的包名与证书：密钥与身份在
+	// PUT /build-keystore 里同一个事务写入，这里不许单独把证书改成别的——否则改完就能手工
+	// 上传一个签名闸从没见过的密钥签的包。带共享锁读，挡住并发的换密钥提交
+	var keystoreRaw []byte
+	switch err := tx.QueryRowContext(c.Request.Context(), `SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=? FOR SHARE`,
+		tenantID(c), buildKeystoreConfigKey).Scan(&keystoreRaw); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_SAVE_FAILED", "Unable to save release identity")
+		return
+	default:
+		record, legacy, err := parseBuildKeystoreValue(keystoreRaw)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
+			return
+		}
+		if !legacy && (record.PackageName != value.PackageName || record.CertificateSHA256 != value.SignerSHA256) {
+			problem(c, http.StatusConflict, "RELEASE_IDENTITY_KEYSTORE_MISMATCH",
+				"This tenant has a v3 signing keystore; the Android release identity must be its package name and certificate. Upload a new keystore (which sets both) instead of changing the identity alone")
+			return
+		}
+	}
 	var result sql.Result
 	newVersion := 1
 	if current != nil {

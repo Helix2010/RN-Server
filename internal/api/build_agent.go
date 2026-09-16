@@ -400,7 +400,7 @@ func (s *server) failBuildJob(c *gin.Context) {
 	reason := ""
 	commit := ""
 	if decode(c, &body) == nil {
-		reason = strings.TrimSpace(body.FailureReason)
+		reason = strings.TrimSpace(sanitizeReportedText(body.FailureReason))
 		commit = strings.ToLower(strings.TrimSpace(body.CommitSHA))
 	}
 	if reason == "" {

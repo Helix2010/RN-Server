@@ -43,6 +43,11 @@ func (s *server) keystoreChecksFor(ctx context.Context, q rowQuerier, tenant str
 	if err != nil {
 		return nil, err
 	}
+	return parseKeystoreChecks(raw)
+}
+
+// parseKeystoreChecks 解析 build.keystore.check 这一行的值；旧格式当作空。
+func parseKeystoreChecks(raw []byte) (map[string]keystoreMachineCheck, error) {
 	var probe struct {
 		Format int `json:"format"`
 	}
