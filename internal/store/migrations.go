@@ -70,6 +70,8 @@ var migrations = []migration{
 	{version: 51, name: "tenant_neutral_platform_brand_copy", apply: tenantNeutralPlatformBrandCopyMigration},
 	{version: 52, name: "drop_platform_app_name_copy", apply: dropPlatformAppNameCopyMigration},
 	{version: 53, name: "platform_backups", apply: platformBackupsMigration},
+	// Android 签名闸（设计 android-signing-gate-2026-09-16、ADR 0019）：构建与签名拆成两段
+	{version: 54, name: "build_jobs_signing_gate", apply: buildJobsSigningGateMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1875,6 +1877,109 @@ func platformBackupsMigration(ctx context.Context, db *sql.DB) error {
 	) ENGINE=InnoDB COMMENT='平台备份运行记录：控制台或定时建待办，打包机认领并产出，服务端收尾。只记状态与结果，备份内容本身在对象存储里'`)
 	if err != nil {
 		return fmt.Errorf("platform backups migration: %w", err)
+	}
+	return nil
+}
+
+// buildJobsSigningGateMigration 把安装包任务拆成"构建"与"签名"两段
+// （设计 android-signing-gate-2026-09-16「构建任务的状态与字段」、ADR 0019）。
+//
+// 复用 build_jobs 而不是新建签名任务表：签名是同一个打包任务的后半程，状态、编号、
+// 心跳都挂在同一行上，写方明确（构建段由构建机写、签名段由签名闸写），见设计的复用映射表。
+//
+// **状态枚举、live_build_number 表达式、唯一索引在同一条 ALTER 里改**：
+//
+//   - 生成列的表达式改不了，只能删了重建，而删列会把它从 (tenant_id, platform,
+//     live_build_number) 那个唯一索引里摘掉，剩下 UNIQUE(tenant_id, platform)——
+//     分两条语句执行时，中间那一刻索引是错的，有存量数据时直接 1062 失败；
+//   - 一条 ALTER 是原子的，失败了表结构不变，重跑就是从头再来。
+//
+// 新表达式把 built、signing 算作"活着"：否则签名期间同一个 build 号能再排一条，两条
+// 都签出来，装到设备上哪个赢取决于谁后装。新值追加在 ENUM 末尾，旧值序号不变。
+//
+// 新列逐列 addColumnIfMissing，可以重复执行。全部可空或有默认值：回滚到旧二进制时
+// 旧代码的 INSERT 不带这些列照样能写，旧代码读不到 built/signing 这两个状态值也不会
+// 写坏它们（旧代码只按具体状态值做条件更新）。
+func buildJobsSigningGateMigration(ctx context.Context, db *sql.DB) error {
+	var expression sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT GENERATION_EXPRESSION FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='build_jobs' AND COLUMN_NAME='live_build_number'`).Scan(&expression)
+	if err != nil {
+		// 迁移 45 之后这一列一定存在；查不到说明表结构被人改过，不猜
+		return fmt.Errorf("build jobs signing gate migration inspect generated column: %w", err)
+	}
+	if !strings.Contains(expression.String, "signing") {
+		// 注释里不能出现单引号：它会提前终止 SQL 字符串字面量
+		if _, err := db.ExecContext(ctx, `ALTER TABLE build_jobs
+			MODIFY COLUMN status ENUM('queued','claimed','running','succeeded','failed','canceled','built','signing') NOT NULL
+				COMMENT '任务状态：queued=待构建机认领；claimed=已认领未开工；running=构建中；built=安装包任务已交付未签名包与出处签名，待签名闸认领；signing=签名闸已认领在签；succeeded=有产物（apk 为已签名包落进 app_releases，ota 为落进 ota_releases）；failed=有失败原因；canceled=人工取消。built 与 signing 只出现在 apk 任务上',
+			MODIFY COLUMN claimed_by VARCHAR(120) NULL
+				COMMENT '认领这个任务的构建机名称，取自 build.machines（由机器令牌鉴权得出，不是自报）；签名闸上线前的历史任务里是代理自报标识。只用于排查与搜索；NULL=还没被认领',
+			MODIFY COLUMN heartbeat_at DATETIME(3) NULL
+				COMMENT '构建机最近一次心跳 UTC；claimed/running 超过 10 分钟没有更新时由服务端回收定时器处理（apk 退回排队或判失败，ota 判失败）',
+			MODIFY COLUMN release_id VARCHAR(80) NULL
+				COMMENT 'apk 任务签名完成后落到 app_releases 的那条记录，与任务改为 succeeded 在同一个事务里写；NULL=还没产物。ota 任务用 ota_release_id',
+			MODIFY COLUMN artifact_sha256 CHAR(64) NULL
+				COMMENT '产物 sha256：apk 为签名闸交回的已签名包（服务端下载后复核），ota 为构建机回报的热更新包；NULL=还没产物',
+			DROP INDEX ux_build_jobs_live_build_number,
+			DROP COLUMN live_build_number,
+			ADD COLUMN live_build_number INT UNSIGNED
+				GENERATED ALWAYS AS (CASE WHEN kind='apk' AND status IN ('queued','claimed','running','built','signing','succeeded') THEN build_number ELSE NULL END) STORED
+				COMMENT '还活着的 APK 任务的 build 号：待签名、签名中也算活着；失败/取消/以及全部 OTA 任务为 NULL。唯一索引建在它上面。由数据库生成，无人写入',
+			ADD UNIQUE KEY ux_build_jobs_live_build_number (tenant_id, platform, live_build_number),
+			COMMENT='打包任务：管理端写入；构建机认领、交付未签名包与出处签名；签名闸认领、签名、落发布记录。只记参数与结果，不记命令——服务端不在构建机或签名闸上执行任意命令'`); err != nil {
+			return fmt.Errorf("build jobs signing gate migration status and live build number: %w", err)
+		}
+	}
+	columns := []struct{ name, ddl string }{
+		{"attempt", `ALTER TABLE build_jobs ADD COLUMN attempt INT NOT NULL DEFAULT 0
+			COMMENT '构建认领编号：构建机每认领一次加一，构建机的每个上报都带上它（请求头 x-build-attempt），与本行不符一律 409；回收时 apk 任务 attempt>=3 判失败，否则退回 queued。0=从未被认领'`},
+		{"claimed_machine_id", `ALTER TABLE build_jobs ADD COLUMN claimed_machine_id VARCHAR(40) NULL
+			COMMENT '认领这个任务的构建机 id（app_configs 平台级 build.machines，mch_ 前缀），由机器令牌鉴权得出；构建机的每个上报都要与它一致。退回排队后保留为最近一次认领者。NULL=从未被机器令牌鉴权的构建机认领'`},
+		{"unsigned_object_key", `ALTER TABLE build_jobs ADD COLUMN unsigned_object_key VARCHAR(512) NULL
+			COMMENT '未签名安装包在租户发布存储里的对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/app-release-unsigned.apk。键带认领编号，与校验编号写在同一条 UPDATE 里，过期的认领写不进来。每次认领清空。NULL=还没上传（ota 任务恒为 NULL）'`},
+		{"unsigned_size", `ALTER TABLE build_jobs ADD COLUMN unsigned_size BIGINT NULL
+			COMMENT '未签名安装包大小，单位字节，服务端收流时计数；NULL=还没上传'`},
+		{"unsigned_sha256", `ALTER TABLE build_jobs ADD COLUMN unsigned_sha256 CHAR(64) NULL
+			COMMENT '未签名安装包 sha256（小写十六进制），服务端收流时自己算，不采信构建机；签名闸下载后再复核。NULL=还没上传'`},
+		{"sbom_object_key", `ALTER TABLE build_jobs ADD COLUMN sbom_object_key VARCHAR(512) NULL
+			COMMENT 'SBOM（CycloneDX JSON）对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/sbom.cdx.json，与同一认领编号下的未签名包配对。每次认领清空。NULL=还没上传'`},
+		{"sbom_size", `ALTER TABLE build_jobs ADD COLUMN sbom_size BIGINT NULL
+			COMMENT 'SBOM 大小，单位字节，服务端收流时计数；NULL=还没上传'`},
+		{"sbom_sha256", `ALTER TABLE build_jobs ADD COLUMN sbom_sha256 CHAR(64) NULL
+			COMMENT 'SBOM sha256（小写十六进制），服务端收流时自己算；NULL=还没上传'`},
+		{"native_fingerprint", `ALTER TABLE build_jobs ADD COLUMN native_fingerprint VARCHAR(128) NULL
+			COMMENT '构建机交付时上报的原生面指纹（@expo/fingerprint，小写十六进制），与出处声明里的值一致；签名闸从包里读出后复核。NULL=还没交付'`},
+		{"provenance", `ALTER TABLE build_jobs ADD COLUMN provenance JSON NULL
+			COMMENT '构建出处：{"statement":base64 声明原始字节,"signature":base64 Ed25519 签名,"builderId":构建机 id,"builderPublicKey":base64 出处公钥,"builderPublicKeySha256":出处公钥 sha256}。服务端交付时已用登记的 active 公钥验过并逐项比对任务行；签名闸不采信这份登记，只认本机 pin 的构建机。每次认领清空。NULL=还没交付'`},
+		{"sign_attempt", `ALTER TABLE build_jobs ADD COLUMN sign_attempt INT NOT NULL DEFAULT 0
+			COMMENT '签名认领编号：签名闸每认领一次加一，签名闸的每个上报都带上它（请求头 x-sign-attempt）并且要与 signing_machine_id 一致，否则 409。只做编号防护，不计失败次数。0=从未被签名闸认领'`},
+		{"sign_failures", `ALTER TABLE build_jobs ADD COLUMN sign_failures INT NOT NULL DEFAULT 0
+			COMMENT '签名失败次数：签名心跳超时与签名闸报临时错误各加一，到 2 判失败；暂不能签不计。0=没有失败过'`},
+		{"signing_machine_id", `ALTER TABLE build_jobs ADD COLUMN signing_machine_id VARCHAR(40) NULL
+			COMMENT '当前或最近一次认领签名的签名闸 id（build.machines，mch_ 前缀）。NULL=从未被签名闸认领'`},
+		{"signing_claimed_at", `ALTER TABLE build_jobs ADD COLUMN signing_claimed_at DATETIME(3) NULL
+			COMMENT '最近一次签名认领时间 UTC；NULL=从未被签名闸认领'`},
+		{"signing_heartbeat_at", `ALTER TABLE build_jobs ADD COLUMN signing_heartbeat_at DATETIME(3) NULL
+			COMMENT '签名闸最近一次心跳 UTC；signing 超过 5 分钟没有更新时由回收定时器退回 built 并计一次签名失败。NULL=从未被签名闸认领'`},
+		{"sign_outcome", `ALTER TABLE build_jobs ADD COLUMN sign_outcome JSON NULL
+			COMMENT '最近一次没签成的原因：{"kind":"deferred|violation|transient","code":错误码,"detail":说明,"machineId":签名闸 id,"at":UTC 时间}。deferred=暂不能签，退回 built 不计次；violation=违规，任务判失败；transient=临时错误或签名心跳超时，计入 sign_failures。签成之后保留作历史。NULL=没有过'`},
+	}
+	for _, column := range columns {
+		if err := addColumnIfMissing(ctx, db, "build_jobs", column.name, column.ddl); err != nil {
+			return fmt.Errorf("build jobs signing gate migration add %s: %w", column.name, err)
+		}
+	}
+	var exists int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='build_jobs' AND INDEX_NAME='ix_build_jobs_claimed_machine'`).Scan(&exists); err != nil {
+		return fmt.Errorf("build jobs signing gate migration inspect machine index: %w", err)
+	}
+	if exists == 0 {
+		if _, err := db.ExecContext(ctx, `CREATE INDEX ix_build_jobs_claimed_machine ON build_jobs (claimed_machine_id, status)
+			COMMENT '每台构建机同时只派一条：认领前查本机有没有 claimed/running 的任务'`); err != nil {
+			return fmt.Errorf("build jobs signing gate migration create machine index: %w", err)
+		}
 	}
 	return nil
 }
