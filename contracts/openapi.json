@@ -789,31 +789,6 @@
         }
       }
     },
-    "/v1/admin/ota/artifacts/upload": {
-      "put": {
-        "responses": {
-          "200": {
-            "description": "Temporary OTA package stored"
-          }
-        }
-      },
-      "delete": {
-        "responses": {
-          "200": {
-            "description": "Temporary OTA package removed"
-          }
-        }
-      }
-    },
-    "/v1/admin/ota/artifacts/uploads": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Temporary OTA upload ticket"
-          }
-        }
-      }
-    },
     "/v1/admin/ota/base-releases": {
       "get": {
         "parameters": [
@@ -910,35 +885,6 @@
           },
           "422": {
             "description": "Invalid filter, limit or cursor"
-          }
-        }
-      },
-      "post": {
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OTAReleaseRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Verified OTA release created"
-          },
-          "422": {
-            "description": "Base release or apply strategy invalid; OTA_APPLICATION_ID_MISMATCH (extra.applicationId differs from the base APK), OTA_BASE_APPLICATION_ID_UNKNOWN (base APK carries no embedded application id)"
-          },
-          "500": {
-            "description": "RELEASE_METADATA_INVALID (base release file_metadata is invalid)"
-          },
-          "424": {
-            "description": "OTA_BASE_RELEASE_UNREADABLE (base APK unreadable, oversized, or without stored sha256/size), OTA_BASE_RELEASE_CHANGED (stored base APK no longer matches its verified sha256/size), OTA_RESOURCE_SAVE_FAILED, OTA_OBJECT_ETAG_MISSING (object storage returned no ETag for a resource)"
-          },
-          "503": {
-            "description": "STORAGE_UNAVAILABLE"
           }
         }
       }
@@ -3490,42 +3436,6 @@
         }
       }
     },
-    "/v1/admin/build-keystore/generate": {
-      "post": {
-        "summary": "Generate the Android signing keystore on the server",
-        "description": "Generates an Android signing key on the server and encrypts it to the build machine's registered public key, in the same transaction that pins the certificate fingerprint as the tenant's release identity. No sealing passphrase is involved: the server holds only the public key, so it cannot open what it just stored, and nobody has to type a secret. Fails with 424 NO_BUILD_AGENT_KEY when no build agent has registered a key yet — there would be nothing to encrypt to. The plaintext keystore and its store password are returned exactly once and are never logged or audited.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BuildKeystoreGenerate"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Generated. Body carries keystoreBase64, fileName, storePassword, keyAlias, keystoreSha256, signerSha256, packageName, certificateNotAfter, version and releaseIdentityVersion. keystoreBase64 and storePassword appear only here."
-          },
-          "400": {
-            "description": "INVALID_BUILD_KEYSTORE, INVALID_KEYSTORE_PARAMETERS, INVALID_RELEASE_IDENTITY or WEAK_SEAL_PASSPHRASE"
-          },
-          "401": {
-            "description": "Admin authentication required"
-          },
-          "409": {
-            "description": "STALE_BUILD_KEYSTORE or STALE_RELEASE_IDENTITY"
-          },
-          "500": {
-            "description": "BUILD_KEYSTORE_SAVE_FAILED"
-          },
-          "424": {
-            "description": "NO_BUILD_AGENT_KEY: no build agent has registered a public key"
-          }
-        }
-      }
-    },
     "/v1/build-agent/public-key": {
       "post": {
         "summary": "Register this build machine's public key",
@@ -4062,48 +3972,6 @@
             "minItems": 1,
             "items": {
               "$ref": "#/components/schemas/LocalizationDocumentChange"
-            }
-          }
-        }
-      },
-      "OTAReleaseRequest": {
-        "type": "object",
-        "required": [
-          "artifactToken",
-          "baseReleaseId",
-          "channel"
-        ],
-        "properties": {
-          "artifactToken": {
-            "type": "string"
-          },
-          "baseReleaseId": {
-            "type": "string"
-          },
-          "channel": {
-            "type": "string"
-          },
-          "applyStrategy": {
-            "type": "string",
-            "enum": [
-              "next_launch",
-              "immediate"
-            ],
-            "default": "next_launch"
-          },
-          "sourceCommitSha": {
-            "type": "string"
-          },
-          "releaseNotes": {
-            "type": "object",
-            "description": "Release notes keyed by language code; each value is one line per array entry. Language codes and lines are stored trimmed. Any other shape, a blank-after-trim line, an empty array, or two keys that collide once trimmed is rejected with 422 INVALID_RELEASE_NOTES. POST /v1/admin/releases validates the same field the same way.",
-            "additionalProperties": {
-              "type": "array",
-              "minItems": 1,
-              "items": {
-                "type": "string",
-                "minLength": 1
-              }
             }
           }
         }
@@ -5128,83 +4996,6 @@
             "type": "integer",
             "minimum": 0,
             "description": "Optimistic lock for release.android. Required whenever packageName or signerSha256 is present; supplying only some of the three is refused rather than silently ignored."
-          }
-        }
-      },
-      "BuildKeystoreGenerate": {
-        "type": "object",
-        "description": "Generate an Android signing key on the server. This does NOT weaken the property that the server cannot open a stored keystore: the generated key is sealed with sealPassphrase before it is stored, and the server keeps only that sealed box. The difference is confined to the moment of generation, when the plaintext private key exists in the server process. The plaintext keystore and its store password are returned exactly once, in this response, and are never persisted or logged. Operators who do not accept the transient exposure use `build-keystore create` instead.",
-        "required": [
-          "packageName",
-          "commonName",
-          "keyAlias",
-          "keySize",
-          "validityYears",
-          "sealPassphrase",
-          "expectedVersion",
-          "releaseIdentityExpectedVersion",
-          "reason",
-          "confirm"
-        ],
-        "properties": {
-          "packageName": {
-            "type": "string",
-            "description": "Android applicationId. Pinned as release.android in the same transaction."
-          },
-          "commonName": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64,
-            "description": "Certificate CN. Android never validates it; it is what apksigner and keytool print."
-          },
-          "organization": {
-            "type": "string",
-            "maxLength": 64
-          },
-          "country": {
-            "type": "string",
-            "minLength": 2,
-            "maxLength": 2
-          },
-          "keyAlias": {
-            "type": "string",
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-            "description": "Passed to Gradle as ANDROID_RELEASE_KEY_ALIAS, and written as the PKCS#12 friendlyName so keytool reports the same alias."
-          },
-          "keySize": {
-            "type": "integer",
-            "enum": [
-              2048,
-              4096
-            ]
-          },
-          "validityYears": {
-            "type": "integer",
-            "minimum": 25,
-            "maximum": 60,
-            "description": "Once the certificate expires this key can no longer sign an upgrade that installs over the existing app, and direct distribution has no store to warn about it."
-          },
-          "sealPassphrase": {
-            "type": "string",
-            "minLength": 12,
-            "description": "Seals the generated key. The build machine must carry the same value in BUILD_KEYSTORE_PASSPHRASE."
-          },
-          "expectedVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Optimistic lock for build.keystore."
-          },
-          "releaseIdentityExpectedVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Optimistic lock for release.android."
-          },
-          "reason": {
-            "type": "string",
-            "minLength": 3
-          },
-          "confirm": {
-            "type": "boolean"
           }
         }
       },

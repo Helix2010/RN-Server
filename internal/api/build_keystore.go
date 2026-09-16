@@ -296,3 +296,27 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, response)
 }
+
+// upsertAppConfig 写一行 app_configs 并带上乐观锁。expectedVersion 为 0 表示这一行
+// 还不存在——INSERT 的 WHERE NOT EXISTS 挡住并发插入，返回 0 行让调用方报冲突。
+func upsertAppConfig(c *gin.Context, tx *sql.Tx, key string, value []byte, expectedVersion int, now time.Time) (int64, error) {
+	var result sql.Result
+	var err error
+	if expectedVersion == 0 {
+		result, err = tx.ExecContext(c.Request.Context(),
+			`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) SELECT ?,?,?,1,?,? WHERE NOT EXISTS (SELECT 1 FROM app_configs WHERE tenant_id=? AND config_key=?)`,
+			tenantID(c), key, value, actor(c), now, tenantID(c), key)
+	} else {
+		result, err = tx.ExecContext(c.Request.Context(),
+			`UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key=? AND version=?`,
+			value, actor(c), now, tenantID(c), key, expectedVersion)
+	}
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, errors.New("cannot tell whether the write applied")
+	}
+	return affected, nil
+}

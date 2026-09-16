@@ -287,7 +287,7 @@ func TestSaveOTAReleaseRejectsStringReleaseNotes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	context.Request = httptest.NewRequest(http.MethodPost, "/v1/admin/ota/releases", strings.NewReader(
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/build-agent/jobs/bj_1/ota-release", strings.NewReader(
 		`{"artifactToken":"t","baseReleaseId":"rel_1","channel":"production","applyStrategy":"immediate","releaseNotes":{"zh-CN":"写成了字符串"}}`,
 	))
 

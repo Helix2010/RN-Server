@@ -120,19 +120,3 @@ func TestDBAcceptingAnAgentKeyInvalidatesEveryVerification(t *testing.T) {
 		t.Fatalf("旧的验证结果还在，界面会拿它给新公钥背书：%+v", check)
 	}
 }
-
-// 没有登记过公钥时不能生成密钥：没有地方可以加密给，而退回去问人要一个口令正是
-// 这次要消灭的东西
-func TestDBGenerateRefusesWhenNoBuildAgentKeyIsRegistered(t *testing.T) {
-	s := agentKeyServer(t)
-	tenant := testTenant(21)
-	c, recorder := testContext(t, tenant, "POST", "/v1/admin/build-keystore/generate", generateRequest("com.example.app"))
-	c.Set("actorId", "tester")
-	s.generateBuildKeystore(c)
-	if recorder.Code != http.StatusFailedDependency {
-		t.Fatalf("没有公钥却生成了：%d %s", recorder.Code, recorder.Body.String())
-	}
-	if out := decodeBody(t, recorder); out["code"] != "NO_BUILD_AGENT_KEY" {
-		t.Fatalf("错误码不对：%v", out)
-	}
-}

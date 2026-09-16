@@ -341,19 +341,15 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/push/credentials/fcm/test", s.testPushCredentialsFCM)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	group.PUT("/build-keystore", s.saveBuildKeystore)
-	// 在服务端生成签名密钥。它不削弱"服务端打不开已存密钥"这条性质——生成出来
-	// 立刻用管理员的封装口令封盒，明文只在这一次响应里回给浏览器。
-	group.POST("/build-keystore/generate", s.generateBuildKeystore)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
 	group.GET("/ota/base-releases", s.listOTABaseReleases)
 	group.GET("/ota/releases", s.listOTAReleases)
 	group.GET("/ota/releases/:id", s.otaReleaseDetail)
-	group.POST("/ota/artifacts/uploads", s.createOTAUploader)
-	group.PUT("/ota/artifacts/upload", s.uploadOTAArtifact)
-	group.DELETE("/ota/artifacts/upload", s.deleteOTAArtifact)
-	group.POST("/ota/releases", s.saveOTARelease)
+	// 热更新修订只能由 kind=ota 的构建任务产出：管理端不再能直接上传热更新包
+	// （设计 android-signing-gate-2026-09-16「热更新」），票据、回传与落修订只在
+	// /v1/build-agent/jobs/:id/ota-* 上
 	group.POST("/ota/releases/:id/:action", s.otaAction)
 	group.DELETE("/ota/releases/:id", s.purgeOTARelease)
 	group.POST("/upload-sessions", s.createUploadSession)

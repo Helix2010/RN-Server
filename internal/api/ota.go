@@ -309,12 +309,8 @@ func (s *server) createOTAUploader(c *gin.Context) {
 		problem(c, 503, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	// 代理走自己那条回传地址：它没有管理端凭据，拿到管理端的 URL 只会 401
-	uploadPath := "/v1/admin/ota/artifacts/upload"
-	if buildAgentUploadsArtifact(c) {
-		uploadPath = "/v1/build-agent/jobs/" + c.Param("id") + "/ota-artifact"
-	}
-	url := s.absoluteURL(c, uploadPath)
+	// 只有构建任务会走到这里（buildJobOTAUpload），回传地址是代理通道那一条
+	url := s.absoluteURL(c, "/v1/build-agent/jobs/"+c.Param("id")+"/ota-artifact")
 	headers := map[string]string{"content-type": body.ContentType, "x-ota-artifact-token": tok}
 	requires := true
 	if s.cfg.ArtifactUploadMode == "direct" {
@@ -349,16 +345,6 @@ func (s *server) uploadOTAArtifact(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"artifact": gin.H{"id": v.ID, "fileSize": size, "objectKey": v.ObjectKey}})
-}
-
-func (s *server) deleteOTAArtifact(c *gin.Context) {
-	v, err := s.decodeOTAUploadToken(tenantID(c), otaTokenFromRequest(c))
-	if err == nil {
-		if client, _, e := s.storageClientForTenant(c.Request.Context(), tenantID(c)); e == nil {
-			_ = client.Delete(c.Request.Context(), v.ObjectKey)
-		}
-	}
-	c.JSON(200, gin.H{"deleted": true})
 }
 
 func (s *server) saveOTARelease(c *gin.Context) {
