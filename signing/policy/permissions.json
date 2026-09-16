@@ -1,0 +1,49 @@
+{
+  "comment": "签名闸内置的 Android 权限允许列表。必须与 RN-App scripts/lib/android-release-identity.js 的 ALLOWED_PERMISSIONS、DIRECT_ONLY_PERMISSIONS 在同一次变更里一起改，变更记录里写明哪个依赖带来的、为什么需要。只改这里不改 RN-App，本地早期检查会放过、签名闸拒签；只改 RN-App 不改这里，签名闸拒签。改完要人工重新构建并部署签名闸（签名闸不经 CI 部署）。{package} 是本机确认的包名。",
+  "format": "rn-signer-permissions/v1",
+  "allowed": [
+    "android.permission.ACCESS_NETWORK_STATE",
+    "android.permission.ACCESS_WIFI_STATE",
+    "android.permission.INTERNET",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.WAKE_LOCK",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.VIBRATE",
+    "com.google.android.c2dm.permission.RECEIVE",
+    "com.google.android.finsky.permission.BIND_GET_INSTALL_REFERRER_SERVICE",
+    "android.permission.USE_BIOMETRIC",
+    "android.permission.USE_FINGERPRINT",
+    "android.permission.CAMERA",
+    "android.permission.DETECT_SCREEN_CAPTURE",
+    "android.permission.READ_MEDIA_IMAGES",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.READ_APP_BADGE",
+    "com.anddoes.launcher.permission.UPDATE_COUNT",
+    "com.htc.launcher.permission.READ_SETTINGS",
+    "com.htc.launcher.permission.UPDATE_SHORTCUT",
+    "com.huawei.android.launcher.permission.CHANGE_BADGE",
+    "com.huawei.android.launcher.permission.READ_SETTINGS",
+    "com.huawei.android.launcher.permission.WRITE_SETTINGS",
+    "com.majeur.launcher.permission.UPDATE_BADGE",
+    "com.oppo.launcher.permission.READ_SETTINGS",
+    "com.oppo.launcher.permission.WRITE_SETTINGS",
+    "com.sec.android.provider.badge.permission.READ",
+    "com.sec.android.provider.badge.permission.WRITE",
+    "com.sonyericsson.home.permission.BROADCAST_BADGE",
+    "com.sonymobile.home.permission.PROVIDER_INSERT_BADGE",
+    "me.everything.badger.permission.BADGE_COUNT_READ",
+    "me.everything.badger.permission.BADGE_COUNT_WRITE"
+  ],
+  "byChannel": {
+    "direct": [
+      "android.permission.REQUEST_INSTALL_PACKAGES"
+    ]
+  },
+  "packageScoped": [
+    "{package}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+  ],
+  "definitions": [
+    "{package}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+  ]
+}
