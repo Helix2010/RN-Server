@@ -9,7 +9,8 @@
 #   --code rne_…            控制台新建机器时发的一次性注册码（必填，60 分钟内有效，只能用一次）
 #   --recovery-sha256 HEX   签名闸必填：离线恢复公钥的完整 sha256，从密码管理器粘贴，不取控制台的值
 #   --expect-sha256 HEX     可选：安装包归档的 sha256（与 CI 构建日志核对过的值），不符即拒绝
-#   --instance NAME         签名闸可选：实例名，默认取机器名；系统用户 rn-signer-<实例>，最长 22 个字符
+#   --instance NAME         签名闸可选：实例名，默认取机器名，2–22 个字符（系统用户 rn-signer-<实例> 受 Linux 32 字符上限）；
+#                           系统用户、env 文件、unit、状态目录都用它：rn-signer-<实例>、/etc/rn-signer-<实例>.env、/var/lib/rn-signer-<实例>
 #   --apksigner-jar PATH    签名闸可选：Android build-tools 35.0.0 的 apksigner.jar（默认在常见 SDK 位置找）
 #
 # 步骤（设计 docs/design/android-signing-gate-automation-2026-09-16.md「2. 新机器」）：
@@ -31,6 +32,9 @@ set -euo pipefail
 umask 022
 
 readonly SETUP_ROOT=/var/lib/rn-machine-setup
+# 签名闸实例名：系统用户 rn-signer-<实例> 受 Linux 用户名 32 字符上限，所以最多 22 个字符（与服务端对签名闸机器名的限制一致）
+readonly INSTANCE_PATTERN='^[a-z0-9][a-z0-9-]{1,21}$'
+
 readonly SERVICE_PATH=/usr/local/bin:/usr/bin:/bin
 # Android build-tools 35.0.0（build-tools_r35_linux.zip，sha1 2cfaa0bbb2336e9ec18ed3ecea84fa2e2af607bc，
 # 与 dl.google.com 的 repository2-3.xml 一致）里 android-15/lib/apksigner.jar 的 sha256
@@ -120,8 +124,8 @@ parse_args() {
     printf 'install.sh: --expect-sha256 must be the full 64-character sha256\n' >&2
     usage
   fi
-  if [ -n "$INSTANCE" ] && ! [[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,21}$ ]]; then
-    printf 'install.sh: --instance must be 1–22 characters of a-z, 0-9 and -, starting with a letter or digit\n' >&2
+  if [ -n "$INSTANCE" ] && ! [[ "$INSTANCE" =~ $INSTANCE_PATTERN ]]; then
+    printf 'install.sh: --instance must be 2–22 characters of a-z, 0-9 and -, starting with a letter or digit (the user rn-signer-<instance> must fit in 32 characters)\n' >&2
     usage
   fi
   if [ -n "$APKSIGNER_JAR" ] && [[ "$APKSIGNER_JAR" != /* ]]; then
@@ -401,7 +405,9 @@ preflight_role() {
     else
       MISSING+=("Android build-tools 35.0.0 的 apksigner.jar（sha256 $APKSIGNER_JAR_SHA256）：从 https://dl.google.com/android/repository/build-tools_r35_linux.zip（sha1 2cfaa0bbb2336e9ec18ed3ecea84fa2e2af607bc）取 android-15/lib/apksigner.jar，用 --apksigner-jar <路径> 指定")
     fi
-    [[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,21}$ ]] || MISSING+=("实例名：机器名 $MACHINE_NAME 超过 22 个字符，用 --instance <短名> 指定")
+    # 系统用户 rn-signer-<实例> 不能超过 32 个字符
+    [[ "$INSTANCE" =~ $INSTANCE_PATTERN ]] ||
+      MISSING+=("实例名：rn-signer-$INSTANCE 超过 Linux 用户名的 32 个字符上限，用 --instance <2–22 个字符的短名> 指定")
   else
     need_commands visudo setpriv ssh ssh-keygen zip pgrep pkill
     local java_home android_home git_version node_version

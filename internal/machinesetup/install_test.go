@@ -77,6 +77,7 @@ func TestInstallScriptRejectsBadArguments(t *testing.T) {
 		"short recovery sha":    {"--server", "https://api.example.com", "--code", validCode, "--recovery-sha256", "abcd"},
 		"bad expect sha":        {"--server", "https://api.example.com", "--code", validCode, "--expect-sha256", strings.Repeat("g", 64)},
 		"long instance":         {"--server", "https://api.example.com", "--code", validCode, "--instance", strings.Repeat("a", 23)},
+		"one-letter instance":   {"--server", "https://api.example.com", "--code", validCode, "--instance", "a"},
 		"relative jar":          {"--server", "https://api.example.com", "--code", validCode, "--apksigner-jar", "apksigner.jar"},
 		"unknown flag":          {"--server", "https://api.example.com", "--code", validCode, "--token", secretCode},
 		"flag without value":    {"--server", "https://api.example.com", "--code"},
