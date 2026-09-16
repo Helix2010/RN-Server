@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 )
@@ -151,5 +152,36 @@ func TestRotateKeyCreatesTheNextKeyOnce(t *testing.T) {
 	info, err := os.Stat(filepath.Join(dir, provenanceNextKeyFile))
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("rotation key file mode: %v %v", info, err)
+	}
+}
+
+// show-key 把执行进程是不是另一个用户打出来：运维 trust-builder 之前要看得见
+func TestShowKeyReportsTheRunnerMode(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	if _, err := loadOrCreateKeyring(dir); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := showKey([]string{"--state-dir", dir}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "build runner: unknown") {
+		t.Fatalf("before the first start: exit %d\n%s", code, stdout.String())
+	}
+	if err := recordRunnerMode(dir, config{RunnerUser: directRunner}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	showKey([]string{"--state-dir", dir}, &stdout, &stderr)
+	if !strings.Contains(stdout.String(), "SAME USER AS THE BUILD AGENT") || !strings.Contains(stdout.String(), "never trust this machine") {
+		t.Fatalf("same-user mode is not shouted:\n%s", stdout.String())
+	}
+	if err := recordRunnerMode(dir, config{RunnerUser: "builder"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	showKey([]string{"--state-dir", dir}, &stdout, &stderr)
+	if !strings.Contains(stdout.String(), "build runner: separate user builder") {
+		t.Fatalf("separated mode not shown:\n%s", stdout.String())
+	}
+	if info, err := os.Stat(filepath.Join(dir, runnerModeFile)); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("runner mode file: %v %v", info, err)
 	}
 }

@@ -201,7 +201,11 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 // runJob 做完一个任务：准备目录、让执行进程构建、交付、上报，最后清理。
 func (a *agent) runJob(ctx context.Context, job claimedJob) {
 	a.log.Info("claimed a build", "job", job.ID, "attempt", job.Attempt, "kind", job.Kind,
-		"tenant", job.TenantSlug, "version", job.Version, "buildNumber", job.BuildNumber)
+		"tenant", job.TenantSlug, "version", job.Version, "buildNumber", job.BuildNumber,
+		"runnerSeparated", a.cfg.runnerSeparated())
+	if !a.cfg.runnerSeparated() {
+		a.log.Warn("this build runs with BUILD_AGENT_RUNNER_USER=-: the runner shares the build agent's user; local testing only, never in production", "job", job.ID)
+	}
 	buf := newLogBuffer(a.red)
 
 	// 构建不挂在进程的停机信号上：收到 SIGTERM 只是不再领新活，这一条做完为止。

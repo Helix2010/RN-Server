@@ -68,7 +68,11 @@ func runAgent() int {
 	a := newAgent(cfg, keys)
 	if !cfg.runnerSeparated() {
 		slog.Warn("!!! BUILD_AGENT_RUNNER_USER is '-': the build runner runs as the SAME user as the build agent, " +
-			"so third-party build code can read the machine token and the provenance key. LOCAL TESTING ONLY !!!")
+			"so third-party build code can read the machine token and the provenance key. LOCAL TESTING ONLY, NEVER IN PRODUCTION !!!")
+	}
+	if err := recordRunnerMode(cfg.StateDir, cfg, time.Now()); err != nil {
+		slog.Error("cannot record the runner mode for show-key", "stateDir", cfg.StateDir, "error", err)
+		return 2
 	}
 	if err := a.checkRunner(ctx); err != nil {
 		slog.Error("the build runner is not usable", "runner", cfg.Runner, "runnerUser", cfg.RunnerUser, "error", err)
@@ -85,7 +89,7 @@ func runAgent() int {
 
 	slog.Info("build agent started", "server", cfg.Server, "platforms", cfg.Platforms,
 		"jobsRoot", cfg.Workspace, "runner", cfg.Runner, "runnerUser", cfg.RunnerUser,
-		"provenancePublicKeySha256", keys.current.sha256)
+		"runnerSeparated", cfg.runnerSeparated(), "provenancePublicKeySha256", keys.current.sha256)
 
 	for {
 		worked := a.pollOnce(ctx)
@@ -142,6 +146,7 @@ func showKey(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "rotation key (ed25519, base64):          %s\n", ring.next.publicBase64())
 		fmt.Fprintf(stdout, "rotation key sha256:                     %s\n", ring.next.sha256)
 	}
+	fmt.Fprintf(stdout, "build runner: %s\n", describeRunnerMode(dir))
 	fmt.Fprintf(stdout, "state dir: %s\n", dir)
 	return 0
 }
