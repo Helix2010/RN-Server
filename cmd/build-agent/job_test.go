@@ -171,6 +171,43 @@ func TestStaleHeartbeatAbortsTheBuildAndCleansUp(t *testing.T) {
 	}
 }
 
+// 停机信号（systemd 以 KillMode=mixed 只发给控制进程）：手上的构建做完、交付，然后才停
+func TestStopSignalDrainsTheBuildInFlight(t *testing.T) {
+	rig := newRig(t)
+	if err := os.WriteFile(rig.tools.Sleep, []byte("2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rig.server.queueClaim(claimBody("bld_drainJOB0001", "apk"))
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan bool, 1)
+	go func() { done <- rig.agent.pollOnce(ctx) }()
+	deadline := time.Now().Add(20 * time.Second)
+	for len(rig.server.callsTo("/claim")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	stop()
+	select {
+	case worked := <-done:
+		if !worked {
+			t.Fatal("the claimed job was not worked on")
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the build did not finish")
+	}
+	if fails := rig.server.callsTo("/fail"); len(fails) != 0 {
+		t.Fatalf("the stop signal failed the build: %s", fails[0].Body)
+	}
+	if len(rig.server.callsTo("/built")) != 1 {
+		t.Fatal("the build in flight was not delivered after the stop signal")
+	}
+	rig.server.queueClaim(claimBody("bld_drainJOB0002", "apk"))
+	claims := len(rig.server.callsTo("/claim"))
+	if rig.agent.pollOnce(ctx) || len(rig.server.callsTo("/claim")) != claims {
+		t.Fatal("a new job was claimed after the stop signal")
+	}
+}
+
 // 执行进程留下的后台进程握着输出管道不放：控制进程不能一直卡在读输出上
 func TestLingeringProcessHoldingTheOutputDoesNotHangTheAgent(t *testing.T) {
 	rig := newRig(t)

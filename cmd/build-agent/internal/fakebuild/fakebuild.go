@@ -30,7 +30,7 @@ type Tools struct {
 	Bin string
 	// Record 下每一步子进程的环境：<Record>/<step>.env
 	Record string
-	// Sleep 存在时，假 pnpm install 会睡很久（用来测中止）
+	// Sleep 存在时，假 pnpm install 睡文件里写的秒数（空文件是 120 秒，用来测中止）
 	Sleep string
 	// Linger 存在时，假 pnpm install 留下一个握着标准输出的后台进程，PID 写进 <Record>/linger.pid
 	Linger string
@@ -69,7 +69,7 @@ record() { env > %[1]q/"$1".env; id -u > %[1]q/"$1".uid; }
 case "$1" in
 install)
   record install
-  if [ -e %[2]q ]; then sleep 120; fi
+  if [ -e %[2]q ]; then seconds=$(cat %[2]q); sleep "${seconds:-120}"; fi
   if [ -e %[6]q ]; then sleep 300 & echo $! > %[1]q/linger.pid; fi
   mkdir -p node_modules
   ;;
