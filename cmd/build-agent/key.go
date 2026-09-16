@@ -58,6 +58,12 @@ func ensureStateDir(dir string, create bool) error {
 }
 
 func checkPrivate(path string, info fs.FileInfo, wantDir bool) error {
+	return checkPrivateFor(path, info, wantDir, os.Geteuid())
+}
+
+// checkPrivateFor 同 checkPrivate，属主换成 uid。enroll 以 root 运行时，密钥属于状态目录的属主
+// （rn-build-agent），而不是 root。
+func checkPrivateFor(path string, info fs.FileInfo, wantDir bool, uid int) error {
 	if info.Mode()&fs.ModeSymlink != 0 {
 		return fmt.Errorf("%s must not be a symlink", path)
 	}
@@ -68,8 +74,8 @@ func checkPrivate(path string, info fs.FileInfo, wantDir bool) error {
 		return fmt.Errorf("%s must be a regular file", path)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int(st.Uid) != os.Geteuid() {
-		return fmt.Errorf("%s must belong to the user running build-agent", path)
+	if !ok || int(st.Uid) != uid {
+		return fmt.Errorf("%s must belong to the user running build-agent (uid %d)", path, uid)
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		return fmt.Errorf("%s has mode %04o; group and others must have no access (chmod %s)", path, perm, map[bool]string{true: "700", false: "600"}[wantDir])
@@ -78,7 +84,10 @@ func checkPrivate(path string, info fs.FileInfo, wantDir bool) error {
 }
 
 // readKeyFile 读一把私钥（base64 的 32 字节种子），核对文件权限。文件不在返回 fs.ErrNotExist。
-func readKeyFile(path string) (machineKey, error) {
+func readKeyFile(path string) (machineKey, error) { return readKeyFileFor(path, os.Geteuid()) }
+
+// readKeyFileFor 同 readKeyFile，文件必须属于 uid。
+func readKeyFileFor(path string, uid int) (machineKey, error) {
 	if _, err := os.Lstat(path); err != nil {
 		return machineKey{}, err
 	}
@@ -92,7 +101,7 @@ func readKeyFile(path string) (machineKey, error) {
 	if err != nil {
 		return machineKey{}, err
 	}
-	if err := checkPrivate(path, info, false); err != nil {
+	if err := checkPrivateFor(path, info, false, uid); err != nil {
 		return machineKey{}, err
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, 4096))
@@ -107,14 +116,25 @@ func readKeyFile(path string) (machineKey, error) {
 }
 
 // createKeyFile 生成一把新私钥，O_EXCL 一次定下 0600，不存在先宽后紧的窗口。
-func createKeyFile(path string) (machineKey, error) {
+func createKeyFile(path string) (machineKey, error) { return createKeyFileFor(path, -1, -1) }
+
+// createKeyFileFor 同 createKeyFile；uid 不小于 0 时在写入之前把文件交给 uid:gid（enroll 以 root 运行时用）。
+// O_EXCL 不跟随符号链接，状态目录的属主事先放在那里的任何东西都会让它失败，而不是被 root 写穿。
+func createKeyFileFor(path string, uid, gid int) (machineKey, error) {
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {
 		return machineKey{}, err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return machineKey{}, err
+	}
+	if uid >= 0 {
+		if err := file.Chown(uid, gid); err != nil {
+			file.Close()
+			_ = os.Remove(path)
+			return machineKey{}, err
+		}
 	}
 	if _, err := file.WriteString(base64.StdEncoding.EncodeToString(seed) + "\n"); err != nil {
 		file.Close()
