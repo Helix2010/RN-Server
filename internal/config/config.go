@@ -24,10 +24,9 @@ type Config struct {
 	HTTPWriteTimeout int
 	// CORSOrigins 是**额外**放行的来源。租户自己的域名由 tenant_domain 表推导
 	// （见 originAllowed），不需要写在这里；生产上这一项通常是空的。
-	CORSOrigins     []string
-	AdminAPIKey     string
-	BuildAgentToken string
-	AdminAPIActor   string
+	CORSOrigins   []string
+	AdminAPIKey   string
+	AdminAPIActor string
 	// AdminAPIAllowedIPs limits the x-admin-key automation channel to these
 	// networks (CIDR or bare IP). Empty means no restriction — see N17.
 	AdminAPIAllowedIPs []string
@@ -136,7 +135,6 @@ func Load() (Config, error) {
 		MySQLInitRetryDelay:        l.integer("MYSQL_INIT_RETRY_DELAY_SECONDS", 5),
 		MySQLAutoMigrate:           l.boolean("MYSQL_AUTO_MIGRATE", true),
 		StorageMasterKey:           strings.TrimSpace(os.Getenv("STORAGE_MASTER_KEY")),
-		BuildAgentToken:            strings.TrimSpace(os.Getenv("BUILD_AGENT_TOKEN")),
 		DeviceIdentityKey:          strings.TrimSpace(os.Getenv("DEVICE_IDENTITY_HMAC_KEY")),
 		ArtifactMaxSizeBytes:       int64(l.integer("ARTIFACT_MAX_SIZE_MB", 512)) * 1024 * 1024,
 		ArtifactUploadMode:         l.value("ARTIFACT_UPLOAD_MODE", "direct"),
@@ -534,7 +532,6 @@ func (c Config) safeSummary() string {
 		{"STORAGE_MASTER_KEY", c.StorageMasterKey},
 		{"ADMIN_PASSWORD_HASH", c.AdminPasswordHash},
 		{"ADMIN_API_KEY", c.AdminAPIKey},
-		{"BUILD_AGENT_TOKEN", c.BuildAgentToken},
 		{"DEVICE_IDENTITY_HMAC_KEY", c.DeviceIdentityKey},
 		{"FCM_SERVICE_ACCOUNT_JSON", c.FCMServiceAccountJSON},
 		{"APNS_PRIVATE_KEY", c.APNsPrivateKey},

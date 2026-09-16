@@ -101,10 +101,7 @@ func TestDBOTAClaimCarriesNoKeystore(t *testing.T) {
 		t.Fatalf("排队失败：%d %s", recorder.Code, recorder.Body.String())
 	}
 
-	c, recorder = testContext(t, tenant, "POST", "/v1/build-agent/claim", map[string]any{
-		"agent": "test-builder", "platforms": []string{"android"},
-	})
-	s.claimBuildJob(c)
+	_, recorder = claimAsBuilder(t, s, newGateMachine(t, machineRoleBuilder, "test-builder"), "android")
 	if recorder.Code != 200 {
 		t.Fatalf("认领失败：%d %s", recorder.Code, recorder.Body.String())
 	}
@@ -115,8 +112,10 @@ func TestDBOTAClaimCarriesNoKeystore(t *testing.T) {
 	if payload["kind"] != "ota" || payload["runtimeVersion"] != "2.0.0" || payload["applyStrategy"] != "immediate" {
 		t.Fatalf("下发的参数不对：%v", payload)
 	}
-	if payload["sealedKeystore"] != nil || payload["keyAlias"] != nil {
-		t.Fatal("热更新任务拿到了签名密钥")
+	for _, key := range []string{"sealedKeystore", "keyAlias", "box", "keystore"} {
+		if _, present := payload[key]; present {
+			t.Fatalf("热更新任务的领取结果里出现了 %s", key)
+		}
 	}
 	// 身份仍然要下发：热更新包会把它烧进 manifest
 	if payload["tenantFile"] == nil {

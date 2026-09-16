@@ -267,8 +267,8 @@ func otaJobFromContext(c *gin.Context) (buildJob, bool) {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read the build job")
 		return job, false
 	}
-	if job.Kind != "ota" || !job.BaseReleaseID.Valid || !job.Channel.Valid {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_OTA", "This build job is not an OTA build")
+	if job.Kind != jobKindOTA || !job.BaseReleaseID.Valid || !job.Channel.Valid {
+		problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH", "This build job is not an OTA build")
 		return job, false
 	}
 	return job, true

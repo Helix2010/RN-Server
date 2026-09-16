@@ -73,6 +73,13 @@ func main() {
 	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
+	// 打包任务回收是服务端自己的定时器（每分钟），不挂在构建机认领上：签名闸挂了，
+	// signing 的任务要退回待签名，而这和有没有构建机在轮询无关（见 api/build_reaper.go）
+	reaperDone := make(chan struct{})
+	go func() {
+		defer close(reaperDone)
+		api.RunBuildJobReaper(workerCtx, cfg, database)
+	}()
 	if cfg.PushDispatchEnabled {
 		// 推送凭据按租户存在库里，用主密钥封着；派发器要能解开它们才能发出去
 		box, boxErr := secretbox.New(cfg.StorageMasterKey)
@@ -112,6 +119,9 @@ func main() {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		slog.Error("graceful shutdown failed", "error", err)
 	}
+	// 回收循环随服务关闭退出；等它把手上这一轮做完，不在事务中途断开连接
+	workerCancel()
+	<-reaperDone
 }
 
 func healthcheck() error {

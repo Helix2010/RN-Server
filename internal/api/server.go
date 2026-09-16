@@ -54,6 +54,10 @@ type server struct {
 	referrals referralLimiter
 	// registrations 注册链路三步的限流（设计 §6 第 2 条 / D13：与邀请关系同窗口上线）
 	registrations registrationLimiter
+	// machines 是 build.machines 按版本缓存的解析结果（构建机与签名闸鉴权），零值可用
+	machines machineRegistryCache
+	// signCompleteFault 是签名完成事务的故障注入点，只给测试用；生产为 nil
+	signCompleteFault func(point string) error
 }
 
 type attempt struct {
@@ -131,6 +135,13 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 		panic(err)
 	}
 	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify}
+	return s.routes()
+}
+
+// routes 挂中间件与全部路由。和 New 分开，是为了让库测能在换掉对象存储等依赖之后
+// 走一遍真实的路由表（鉴权中间件、任务作用域、超时豁免都在路由上）。
+func (s *server) routes() *gin.Engine {
+	cfg := s.cfg
 	r := gin.New()
 	// 不配就谁都不信：ClientIP 取直连对端，而不是任何人都能写的 X-Forwarded-For。
 	// 这同时让下面的登录限流按真实来源计数（在此之前它也是可绕过的）。
@@ -191,9 +202,13 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin())
-	// 打包机公钥是平台级的一把，不属于任何租户；换它要人核对指纹后接受
-	platform.GET("/build-agent/public-key", s.getBuildAgentKey)
-	platform.POST("/build-agent/public-key/accept", s.acceptBuildAgentKey)
+	// 构建机与签名闸的登记（build.machines）：新建发令牌、吊销、接受公钥、切换主备路由。
+	// 控制台接受只影响路由；签名闸与离线工具以本机记录和离线 pin 文件为准
+	platform.GET("/machines", s.listMachines)
+	platform.POST("/machines", s.createMachine)
+	platform.POST("/machines/:id/revoke", s.revokeMachine)
+	platform.POST("/machines/:id/accept-key", s.acceptMachineKey)
+	platform.POST("/machines/:id/signer-role", s.setSignerRole)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
@@ -211,33 +226,47 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	platform.GET("/wallet/blocks", s.listPlatformWalletBlocks)
 	platform.POST("/wallet/blocks", s.createPlatformWalletBlock)
 	platform.POST("/wallet/blocks/:id/revoke", s.revokePlatformWalletBlock)
-	// 打包机代理通道：与管理端**完全分开**的一条凭据，也不按域名解析租户——
-	// 任务里带着租户，代理本来就跨租户工作。一台构建机被拿下时，拿到的应该只是
-	// 构建队列，不是整个管理面。
+	// 构建机通道：本机令牌（x-machine-token），与管理端完全分开，也不按域名解析租户——
+	// 任务里带着租户，构建机本来就跨租户工作。构建机执行第三方代码，拿不到任何签名密钥；
+	// 每个上报都带认领编号 x-build-attempt（见 build_agent.go）。
 	agent := r.Group("/v1/build-agent")
-	agent.Use(s.buildAgentAuth())
-	agent.POST("/claim", s.claimBuildJob)
-	// 封装口令只在打包机上，所以只有它能回答"这个盒子开不开得了"（见
-	// build_keystore_check.go）
-	// 打包机启动时登记自己的公钥；签名密钥从此加密给它，没有人需要敲封装口令
-	agent.POST("/public-key", s.registerBuildAgentKey)
-	agent.GET("/keystore-checks", s.pendingKeystoreChecks)
-	agent.POST("/keystore-checks", s.reportKeystoreCheck)
-	// 图标一张一张取，不塞进领取响应——那条响应在代理那边有 1 MiB 上限，
-	// 真图标（2048 见方，四张 3.8MB）会把它截断成半截 JSON
-	agent.GET("/jobs/:id/icons/:name", s.buildAgentJobScope(s.buildJobIcon))
-	agent.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
-	// 走任务作用域是为了拿到 kind：热更新任务的产物 id 要落到 ota_release_id
-	agent.POST("/jobs/:id/complete", s.buildAgentJobScope(s.completeBuildJob))
-	agent.POST("/jobs/:id/fail", s.failBuildJob)
-	// 产物回传：三条都先用任务把租户定下来，再交给与人工上传完全相同的处理函数
-	agent.POST("/jobs/:id/artifact-uploads", s.buildAgentJobScope(s.createReleaseArtifactUpload))
-	agent.PUT("/jobs/:id/artifact", s.buildAgentJobScope(s.uploadReleaseArtifact))
-	agent.POST("/jobs/:id/release", s.buildAgentJobScope(s.buildAgentReleaseFromArtifact))
-	// 热更新包：票据与修订都取任务行上的参数，代理不带 base / channel / 生效方式
-	agent.POST("/jobs/:id/ota-uploads", s.buildAgentJobScope(s.buildJobOTAUpload))
-	agent.PUT("/jobs/:id/ota-artifact", s.buildAgentJobScope(s.uploadOTAArtifact))
-	agent.POST("/jobs/:id/ota-release", s.buildAgentJobScope(s.buildJobOTARelease))
+	// 公钥还没被接受的机器只能调这一条
+	agent.POST("/public-key", s.machineAuth(machineRoleBuilder, true), s.registerBuilderKey)
+	builder := agent.Group("")
+	builder.Use(s.machineAuth(machineRoleBuilder, false))
+	builder.POST("/claim", s.claimBuildJob)
+	// 图标一张一张取，不塞进领取响应——那条响应在构建机那边有 1 MiB 上限
+	builder.GET("/jobs/:id/icons/:name", s.builderJobScope(s.buildJobIcon))
+	builder.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
+	builder.POST("/jobs/:id/fail", s.failBuildJob)
+	// 安装包：未签名包与 SBOM 流式上传（路径以 /upload 结尾，走数据库超时豁免），再交付出处
+	builder.PUT("/jobs/:id/unsigned/upload", s.builderJobScope(s.uploadUnsignedArtifact))
+	builder.PUT("/jobs/:id/sbom/upload", s.builderJobScope(s.uploadBuildSBOM))
+	builder.POST("/jobs/:id/built", s.builderJobScope(s.markBuildJobBuilt))
+	// 安装包旧的交付路径：构建机不再能落发布记录
+	builder.POST("/jobs/:id/artifact-uploads", s.builderJobScope(s.retiredAPKArtifactRoute))
+	builder.PUT("/jobs/:id/artifact", s.builderJobScope(s.retiredAPKArtifactRoute))
+	builder.POST("/jobs/:id/release", s.builderJobScope(s.retiredAPKArtifactRoute))
+	// 热更新任务：票据与修订都取任务行上的参数，构建机不带 base / channel / 生效方式
+	builder.POST("/jobs/:id/complete", s.builderJobScope(s.completeOTABuildJob))
+	builder.POST("/jobs/:id/ota-uploads", s.builderJobScope(s.buildJobOTAUpload))
+	builder.PUT("/jobs/:id/ota-artifact", s.builderJobScope(s.uploadOTAArtifact))
+	builder.POST("/jobs/:id/ota-release", s.builderJobScope(s.buildJobOTARelease))
+	// 签名闸通道：本机令牌，角色与构建机隔离（构建机令牌调这里一律 403，反之亦然）。
+	// 每个上报都带签名编号 x-sign-attempt（见 signer.go）。
+	signerGroup := r.Group("/v1/signer")
+	signerGroup.POST("/public-key", s.machineAuth(machineRoleSigner, true), s.registerSignerKey)
+	gate := signerGroup.Group("")
+	gate.Use(s.machineAuth(machineRoleSigner, false))
+	gate.GET("/keystore-checks", s.signerKeystoreChecks)
+	gate.POST("/keystore-checks", s.reportSignerKeystoreChecks)
+	gate.POST("/claim", s.claimSigningJob)
+	gate.POST("/jobs/:id/heartbeat", s.signingHeartbeat)
+	gate.GET("/jobs/:id/unsigned/download", s.signerJobScope(s.downloadUnsignedForSigning))
+	gate.PUT("/jobs/:id/signed/upload", s.signerJobScope(s.uploadSignedArtifact))
+	gate.POST("/jobs/:id/complete", s.completeSigning)
+	gate.POST("/jobs/:id/release", s.releaseSigningJob)
+	gate.POST("/jobs/:id/reject", s.rejectSigningJob)
 	current := protected.Group("")
 	current.Use(s.domainTenantScope())
 	current.GET("/tenant", s.currentTenant)
@@ -321,6 +350,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/builds", s.createBuildJob)
 	group.GET("/builds/:id", s.buildJobDetail)
 	group.POST("/builds/:id/cancel", s.cancelBuildJob)
+	// 「签名中」不能取消（签名闸可能正在签），只能带原因强制判失败
+	group.POST("/builds/:id/force-fail", s.forceFailBuildJob)
 	// 服务端合成的 tenant.json：打包任务下发的是同一份。构建 OTA 的人要拿它，
 	// 仓库里那份早就不是权威来源了（见 app_identity.go）
 	group.GET("/app-identity", s.getAppIdentity)
@@ -381,7 +412,7 @@ func (s *server) domainTenantScope() gin.HandlerFunc {
 func (s *server) databaseTimeout() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		multipartPartUpload := c.Request.Method == http.MethodPut && strings.Contains(c.Request.URL.Path, "/v1/admin/upload-sessions/") && strings.Contains(c.Request.URL.Path, "/parts/")
-		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") || readsTokenChain(c.Request) {
+		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") || readsTokenChain(c.Request) || exemptRouteFromDatabaseTimeout(c) {
 			c.Next()
 			return
 		}
@@ -390,6 +421,21 @@ func (s *server) databaseTimeout() gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+// exemptRouteFromDatabaseTimeout 按**已匹配的路由**精确豁免两条不以 /upload、/download 结尾、
+// 却要等对象存储的接口，不放宽上面的后缀规则：
+//
+//   - PUT /v1/build-agent/jobs/:id/ota-artifact：构建机经服务端代理上传热更新包（十几 MB），
+//     一直被 10 秒的数据库超时截断；
+//   - POST /v1/signer/jobs/:id/complete：服务端要从对象存储整份取回已签名包、解析与验签之后
+//     才开事务落发布记录，大包在 10 秒内做不完。
+//
+// 用 c.FullPath()（路由模板）而不是 URL 后缀：只有这两条路由本身被豁免，路径参数里塞什么都不影响。
+func exemptRouteFromDatabaseTimeout(c *gin.Context) bool {
+	route := c.FullPath()
+	return (c.Request.Method == http.MethodPut && route == "/v1/build-agent/jobs/:id/ota-artifact") ||
+		(c.Request.Method == http.MethodPost && route == "/v1/signer/jobs/:id/complete")
 }
 
 // readsTokenChain 识别要去链上读元数据的三个代币接口。它们跟 /release-storage/test
@@ -431,7 +477,7 @@ func (s *server) cors() gin.HandlerFunc {
 			c.Header("Access-Control-Expose-Headers", "ETag,X-Request-Id")
 			c.Header("Vary", "Origin")
 			c.Header("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-ota-artifact-token,x-branding-asset-token,x-upload-session-token,x-part-sha256,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
+			c.Header("Access-Control-Allow-Headers", "content-type,x-admin-key,x-admin-id,x-request-id,x-release-artifact-token,x-branding-asset-token,x-upload-session-token,x-part-sha256,expo-platform,expo-runtime-version,expo-channel-name,expo-protocol-version,expo-expect-signature")
 		}
 		if c.Request.Method == http.MethodOptions {
 			c.Status(http.StatusNoContent)

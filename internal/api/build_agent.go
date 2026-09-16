@@ -1,0 +1,760 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"mime"
+	"net/http"
+	"os"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Helix2010/RN-Server/internal/objectstore"
+	"github.com/Helix2010/RN-Server/signing/fingerprint"
+	"github.com/Helix2010/RN-Server/signing/provenance"
+	"github.com/gin-gonic/gin"
+)
+
+// 构建机通道 /v1/build-agent（设计 android-signing-gate-2026-09-16「接口」、约定 5.2）。
+//
+// 构建机执行第三方代码，按不可信处理。它拿到的只有任务参数、公开的 OTA 证书与图标，
+// **没有任何签名密钥密文**；交付的是未签名包、SBOM 与出处签名，任务转为 built，由签名闸
+// 接着签。它的每个上报都带认领编号（x-build-attempt），与任务行的 attempt、
+// claimed_machine_id 对不上一律 409 BUILD_ATTEMPT_STALE：任务被回收重排之后，挂掉又回来的
+// 那台机器不能再改这条任务。
+
+const (
+	buildAttemptHeader = "x-build-attempt"
+	// maxBuildAttempts：apk 任务最多被认领 3 次（重排 2 次），回收时到了就判失败
+	maxBuildAttempts = 3
+	// SBOM 实测约 2.3 MB，超过 1 MiB 的 JSON 请求体上限，所以走流式上传
+	buildSBOMMaxBytes     = 16 << 20
+	unsignedAPKObjectName = "app-release-unsigned.apk"
+	sbomObjectName        = "sbom.cdx.json"
+	octetStream           = "application/octet-stream"
+)
+
+var (
+	commitSHAPattern         = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+	nativeFingerprintPattern = regexp.MustCompile(`^[0-9a-f]{32,128}$`)
+)
+
+// attemptFromHeader 读认领编号头。缺失或不是正整数返回 false。
+func attemptFromHeader(c *gin.Context, header string) (int, bool) {
+	raw := strings.TrimSpace(c.GetHeader(header))
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || strconv.Itoa(value) != raw {
+		return 0, false
+	}
+	return value, true
+}
+
+// buildJobObjectKey 是构建与签名产物的对象键：<prefix>/tenants/<tenant>/build-jobs/<job>/<segment>/<name>。
+// segment 是 a<attempt>（构建机交付）或 s<signAttempt>（签名闸交回），键里带编号，
+// 过期的认领写不到新认领的键上。
+func buildJobObjectKey(prefix, tenant, jobID, segment, name string) string {
+	return strings.TrimLeft(path.Join(prefix, "tenants", tenant, "build-jobs", jobID, segment, name), "/")
+}
+
+// ---- 认领 ----
+
+// claimBuildJob 原子地领走一条排队中的任务。
+//
+// 每台构建机同时只派一条：本机已有 claimed/running 的任务时回 409，带上那条任务的 id 与
+// 编号，构建机据此决定续报还是放弃。检查与认领在同一把按机器的命名锁里做，同一个令牌
+// 并发来两次认领也只会拿到一条。
+func (s *server) claimBuildJob(c *gin.Context) {
+	machine, ok := machineFromContext(c)
+	if !ok {
+		problem(c, http.StatusUnauthorized, "MACHINE_AUTH_REQUIRED", "Machine authentication required")
+		return
+	}
+	var body struct {
+		Platforms []string `json:"platforms"`
+		Kinds     []string `json:"kinds"`
+	}
+	if decode(c, &body) != nil || len(body.Platforms) == 0 || len(body.Kinds) == 0 {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
+		return
+	}
+	args := []any{}
+	for _, p := range body.Platforms {
+		if p != "android" && p != "ios" {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms must be android or ios")
+			return
+		}
+		args = append(args, p)
+	}
+	platformPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(body.Platforms)), ",")
+	for _, k := range body.Kinds {
+		if k != jobKindAPK && k != jobKindOTA {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "kinds must be apk or ota")
+			return
+		}
+		args = append(args, k)
+	}
+	kindPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(body.Kinds)), ",")
+	ctx := c.Request.Context()
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		return
+	}
+	defer conn.Close()
+	lockName := "rn_build_claim_" + machine.ID
+	var locked sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?,5)`, lockName).Scan(&locked); err != nil || !locked.Valid || locked.Int64 != 1 {
+		problem(c, http.StatusConflict, "BUILDER_CLAIM_IN_PROGRESS", "Another claim from this machine is in progress")
+		return
+	}
+	defer conn.ExecContext(context.Background(), `SELECT RELEASE_LOCK(?)`, lockName)
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		return
+	}
+	defer tx.Rollback()
+	var activeID string
+	var activeAttempt int
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT id,attempt FROM build_jobs WHERE claimed_machine_id=? AND status IN (`+sqlBuilderActive+`) ORDER BY claimed_at LIMIT 1`,
+		machine.ID).Scan(&activeID, &activeAttempt); {
+	case err == nil:
+		problemWith(c, http.StatusConflict, "BUILDER_HAS_ACTIVE_JOB",
+			"This machine already has a claimed or running build; finish or fail it before claiming another",
+			gin.H{"jobId": activeID, "attempt": activeAttempt})
+		return
+	case !errors.Is(err, sql.ErrNoRows):
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		return
+	}
+
+	var id string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM build_jobs WHERE status='queued' AND platform IN (`+platformPlaceholders+`) AND kind IN (`+kindPlaceholders+`)
+		  ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`, args...).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.Status(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		return
+	}
+	now := time.Now().UTC()
+	// 每次认领清掉上一次认领交付的东西：未签名包、SBOM、出处与提交都属于那一次认领，
+	// 这一次的交付必须完整重来，/built 才能要求"本次认领下都已上传"
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE build_jobs SET status='claimed',claimed_by=?,claimed_machine_id=?,claimed_at=?,heartbeat_at=?,attempt=attempt+1,
+		        commit_sha=NULL,unsigned_object_key=NULL,unsigned_size=NULL,unsigned_sha256=NULL,
+		        sbom_object_key=NULL,sbom_size=NULL,sbom_sha256=NULL,native_fingerprint=NULL,provenance=NULL,updated_at=?
+		  WHERE id=? AND status='queued'`,
+		machine.Name, machine.ID, now, now, now, id); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+		return
+	}
+	job, err := scanBuildJob(tx.QueryRowContext(ctx, `SELECT `+buildJobColumns+` FROM build_jobs WHERE id=? LIMIT 1`, id))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		return
+	}
+	// 下发的分支必须是我们自己那一个，不认库里那一列（`build-concurrency-2026-09-15.md` §9）。
+	//
+	// 写入路径上每一条用的都是 buildGitRef 这个常量，所以这一列出现别的值只有
+	// 两种可能：常量上线之前的历史脏数据，或者**有人直接写了库**。后者是一条
+	// 完整的提权路径：让构建机检出一个带后门的提交，构建时就执行了攻击者的代码。
+	//
+	// 判死而不是改写成 main：改写会让这条任务构建出和记录不符的东西，
+	// 而记录是事后追查唯一的依据。判死并写明原因，让人看得见发生过什么。
+	if job.GitRef != buildGitRef {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
+			"refusing to build a git ref that is not "+buildGitRef, now, id); err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+			return
+		}
+		slog.Error("refused to dispatch a build job whose git ref is not the fixed branch",
+			"jobId", id, "tenant", job.TenantID, "machineId", machine.ID)
+		s.auditNow(newAudit(platformTenantID, builderSystemActor, "build_job_ref_refused", "build-job", id,
+			"a build job carried a git ref that is not the fixed branch", requestID(c),
+			map[string]any{"expected": buildGitRef, "jobId": id, "machineId": machine.ID}))
+		c.Status(http.StatusNoContent)
+		return
+	}
+	// 解析不出租户（租户被删了、任务是脏数据）时不能把这条任务留在队列里报 500：
+	// 认领总是取最早那条，一条解析不了的任务会把**整个队列**堵死，而队列是跨租户的。
+	var slug string
+	switch err := tx.QueryRowContext(ctx, `SELECT slug FROM tenants WHERE id=? LIMIT 1`, job.TenantID).Scan(&slug); {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.ExecContext(ctx, `UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
+			"tenant no longer exists", now, id); err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+			return
+		}
+		c.Status(http.StatusNoContent)
+		return
+	case err != nil:
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to resolve the tenant of this build")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+		return
+	}
+
+	// 仓库里的租户目录名与本平台 slug 是两套命名，必须显式配置
+	buildCfg, _, err := s.buildConfigFor(ctx, job.TenantID, slug)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_INVALID", "Stored build.android configuration is invalid")
+		return
+	}
+	view := buildJobView(job)
+	view["tenantSlug"] = slug
+	view["tenantDirectory"] = buildCfg.RepoDirectory
+	view["googleServicesJson"] = nullableString(buildCfg.GoogleServicesJSON)
+	// 图标只给文件名，构建机逐张去 GET /jobs/:id/icons/:name 取（见 build_icons.go）
+	icons, err := s.buildIconsForJob(ctx, job.TenantID, buildCfg.Identity)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_ICONS_INVALID", "Stored build.icons configuration is invalid")
+		return
+	}
+	view["icons"] = icons
+	// tenant.json 由服务端合成随任务下发。合成不出来就让这条任务当场失败
+	manifest, err := s.tenantManifestFor(ctx, job.TenantID, buildCfg, job.Version, job.BuildNumber)
+	if err != nil {
+		var missing *missingIdentity
+		if errors.As(err, &missing) {
+			s.markBuildJobFailed(ctx, job.ID, missing.Error())
+			problem(c, http.StatusConflict, "APP_IDENTITY_INCOMPLETE", missing.Error())
+			return
+		}
+		problem(c, http.StatusInternalServerError, "APP_IDENTITY_INVALID", "Unable to compose the tenant app identity")
+		return
+	}
+	view["tenantFile"] = manifest
+	// OTA 证书两种任务都要：它编进包里的 expo-updates 配置，也因此进原生指纹。
+	// 证书是公开材料，私钥不下发
+	record, err := s.otaSigningRecord(ctx, job.TenantID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "OTA_SIGNING_CONFIG_INVALID", "Stored ota.signing configuration is invalid")
+		return
+	}
+	if record == nil {
+		view["otaCertificatePem"] = nil
+		view["otaCertificateSha256"] = nil
+	} else {
+		certificateSHA256, _ := certificateFingerprint(record.Value.Certificate)
+		view["otaCertificatePem"] = nullableString(record.Value.Certificate)
+		view["otaCertificateSha256"] = nullableString(certificateSHA256)
+	}
+	// runtimeVersion 取基线那一版：热更新包必须对准它，否则一台设备都收不到
+	if job.Kind == jobKindOTA {
+		base, baseErr := s.otaJobBaseFor(ctx, job.TenantID, job.BaseReleaseID.String)
+		if baseErr != nil {
+			detail := "这条热更新任务的基线安装包已经不可用了：" + baseErr.Error()
+			s.markBuildJobFailed(ctx, job.ID, detail)
+			problem(c, http.StatusConflict, "OTA_BASE_RELEASE_INVALID", detail)
+			return
+		}
+		view["runtimeVersion"] = base.RuntimeVersion
+	}
+	// 安装包任务不下发任何签名密钥材料：签名在签名闸上做，构建机从头到尾碰不到
+	c.JSON(http.StatusOK, view)
+}
+
+// markBuildJobFailed 在认领那一刻就发现缺配置时判一条任务失败。队列是跨租户的，
+// 一条卡住的任务占着 build 号，拖的是所有人。
+func (s *server) markBuildJobFailed(ctx context.Context, id, reason string) {
+	now := time.Now().UTC()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE build_jobs SET status='failed',failure_reason=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN (`+sqlDispatchFailure+`)`,
+		clipRunes(reason, 500), now, now, id); err != nil {
+		slog.Error("unable to fail a build job that cannot be dispatched", "jobId", id, "error", err)
+	}
+}
+
+// ---- 任务作用域 ----
+
+// builderJobScope 校验"这台机器、这次认领、这条任务还在构建中"，并把任务的租户装进上下文。
+// 热更新那几条复用管理端处理函数，它们靠上下文里的 tenantId 定位租户。
+func (s *server) builderJobScope(next gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		machine, ok := machineFromContext(c)
+		if !ok {
+			problem(c, http.StatusUnauthorized, "MACHINE_AUTH_REQUIRED", "Machine authentication required")
+			return
+		}
+		attempt, ok := attemptFromHeader(c, buildAttemptHeader)
+		if !ok {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_ATTEMPT", "x-build-attempt must carry the attempt number returned by claim")
+			return
+		}
+		job, err := s.loadBuildJob(c, "", c.Param("id"))
+		if err != nil {
+			return
+		}
+		if !buildJobTransitionAllowed(eventBuilderHeartbeat, job.Kind, job.Status) || job.Attempt != attempt || job.ClaimedMachineID.String != machine.ID {
+			problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+			return
+		}
+		c.Set("tenantId", job.TenantID)
+		c.Set("actorId", buildAgentActor)
+		c.Set("buildAgent", true)
+		c.Set("buildJob", job)
+		next(c)
+	}
+}
+
+func builderJobFromContext(c *gin.Context) (buildJob, bool) {
+	item, _ := c.Get("buildJob")
+	job, ok := item.(buildJob)
+	if !ok {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read the build job")
+	}
+	return job, ok
+}
+
+// retiredAPKArtifactRoute 接住安装包旧的交付路径（/artifact-uploads、/artifact、/release）。
+// 那条路径由构建机直接落发布记录，而构建机现在没有签名能力，交出来的只能是未签名包。
+func (s *server) retiredAPKArtifactRoute(c *gin.Context) {
+	problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH",
+		"Installable packages are delivered unsigned through /unsigned/upload, /sbom/upload and /built; the signer creates the release")
+}
+
+// ---- 心跳与失败 ----
+
+func (s *server) buildJobHeartbeat(c *gin.Context) {
+	machine, _ := machineFromContext(c)
+	attempt, ok := attemptFromHeader(c, buildAttemptHeader)
+	if !ok {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_ATTEMPT", "x-build-attempt must carry the attempt number returned by claim")
+		return
+	}
+	var body struct {
+		LogTail []string `json:"logTail"`
+	}
+	if decode(c, &body) != nil {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_PROGRESS", "logTail must be an array of strings")
+		return
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(c.Request.Context(),
+		`UPDATE build_jobs SET status='running',heartbeat_at=?,log_tail=?,updated_at=?
+		  WHERE id=? AND status IN (`+sqlBuilderActive+`) AND attempt=? AND claimed_machine_id=?`,
+		now, clampLogTail(body.LogTail), now, c.Param("id"), attempt, machine.ID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record build progress")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *server) failBuildJob(c *gin.Context) {
+	machine, _ := machineFromContext(c)
+	attempt, ok := attemptFromHeader(c, buildAttemptHeader)
+	if !ok {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_ATTEMPT", "x-build-attempt must carry the attempt number returned by claim")
+		return
+	}
+	var body struct {
+		FailureReason string   `json:"failureReason"`
+		CommitSHA     string   `json:"commitSha"`
+		LogTail       []string `json:"logTail"`
+	}
+	reason := ""
+	commit := ""
+	if decode(c, &body) == nil {
+		reason = strings.TrimSpace(body.FailureReason)
+		commit = strings.ToLower(strings.TrimSpace(body.CommitSHA))
+	}
+	if reason == "" {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "failureReason is required")
+		return
+	}
+	// 失败的构建也要记下它到底检出了哪个提交；解析提交之前就失败的任务没有这个值
+	if !commitSHAPattern.MatchString(commit) {
+		commit = ""
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(c.Request.Context(),
+		`UPDATE build_jobs SET status='failed',failure_reason=?,commit_sha=COALESCE(?,commit_sha),log_tail=?,heartbeat_at=?,updated_at=?
+		  WHERE id=? AND status IN (`+sqlBuilderActive+`) AND attempt=? AND claimed_machine_id=?`,
+		clipRunes(reason, 500), sqlNullableString(commit), clampLogTail(body.LogTail), now, now, c.Param("id"), attempt, machine.ID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build failure")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// completeOTABuildJob 收热更新任务的结果。安装包任务不走这里（它们交付到 built 为止）。
+func (s *server) completeOTABuildJob(c *gin.Context) {
+	job, ok := builderJobFromContext(c)
+	if !ok {
+		return
+	}
+	if job.Kind != jobKindOTA {
+		s.retiredAPKArtifactRoute(c)
+		return
+	}
+	machine, _ := machineFromContext(c)
+	var body struct {
+		CommitSHA      string   `json:"commitSha"`
+		ArtifactSHA256 string   `json:"artifactSha256"`
+		ReleaseID      string   `json:"releaseId"`
+		LogTail        []string `json:"logTail"`
+	}
+	commit, digest := "", ""
+	if decode(c, &body) == nil {
+		commit = strings.ToLower(strings.TrimSpace(body.CommitSHA))
+		digest = strings.ToLower(strings.TrimSpace(body.ArtifactSHA256))
+	}
+	if !commitSHAPattern.MatchString(commit) || !fingerprint.Valid(digest) {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "commitSha and artifactSha256 must be hex digests")
+		return
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(c.Request.Context(),
+		`UPDATE build_jobs SET status='succeeded',commit_sha=?,artifact_sha256=?,ota_release_id=?,log_tail=?,heartbeat_at=?,updated_at=?
+		  WHERE id=? AND kind='ota' AND status IN (`+sqlStatusList(buildJobEventFrom(eventBuilderComplete, jobKindOTA))+`) AND attempt=? AND claimed_machine_id=?`,
+		commit, digest, sqlNullableString(strings.TrimSpace(body.ReleaseID)), clampLogTail(body.LogTail), now, now, job.ID, job.Attempt, machine.ID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build result")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---- 未签名包与 SBOM ----
+
+func (s *server) uploadUnsignedArtifact(c *gin.Context) {
+	s.receiveBuildDelivery(c, "unsigned", unsignedAPKObjectName, s.cfg.ArtifactMaxSizeBytes)
+}
+
+func (s *server) uploadBuildSBOM(c *gin.Context) {
+	s.receiveBuildDelivery(c, "sbom", sbomObjectName, buildSBOMMaxBytes)
+}
+
+// receiveBuildDelivery 流式收下未签名包或 SBOM，写进租户发布存储，然后在**同一条 UPDATE** 里
+// 校验认领编号并记下对象键、大小与 sha256。编号在收流期间过期（任务被回收、被取消）时
+// 这条 UPDATE 改不到任何行，刚写的对象删掉，回 409。
+func (s *server) receiveBuildDelivery(c *gin.Context, what, objectName string, limit int64) {
+	job, ok := builderJobFromContext(c)
+	if !ok {
+		return
+	}
+	if job.Kind != jobKindAPK {
+		problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH", "Only installable-package builds deliver an unsigned package or SBOM")
+		return
+	}
+	machine, _ := machineFromContext(c)
+	client, prefix, err := s.storageClientForTenant(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
+		return
+	}
+	key := buildJobObjectKey(prefix, job.TenantID, job.ID, "a"+strconv.Itoa(job.Attempt), objectName)
+	received, status, code, detail := s.receiveStreamToObject(c, client, key, limit)
+	if status != 0 {
+		problem(c, status, code, detail)
+		return
+	}
+	if what == "sbom" {
+		if detail := received.cycloneDXProblem(); detail != "" {
+			_ = client.Delete(context.Background(), key)
+			problem(c, http.StatusUnprocessableEntity, "BUILD_SBOM_INVALID", detail)
+			return
+		}
+	}
+	received.cleanup()
+	column := "unsigned"
+	if what == "sbom" {
+		column = "sbom"
+	}
+	// 列名来自上面两个常量之一，不是输入
+	result, err := s.db.ExecContext(context.Background(),
+		`UPDATE build_jobs SET `+column+`_object_key=?,`+column+`_size=?,`+column+`_sha256=?,updated_at=?
+		  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventBuilderUpload, jobKindAPK))+`) AND attempt=? AND claimed_machine_id=?`,
+		key, received.size, received.sha256, time.Now().UTC(), job.ID, job.Attempt, machine.ID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the delivered file")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		_ = client.Delete(context.Background(), key)
+		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"sha256": received.sha256, "size": received.size})
+}
+
+// receivedStream 是收下来的一个流：临时文件、大小、sha256。
+type receivedStream struct {
+	path   string
+	size   int64
+	sha256 string
+}
+
+func (r receivedStream) cleanup() {
+	if r.path != "" {
+		_ = os.Remove(r.path)
+	}
+}
+
+// cycloneDXProblem 只看形状：是一个 bomFormat=CycloneDX 的 JSON 对象。内容由构建机自报，
+// 服务端不据此做任何判定，记进发布记录只为以后回答"线上那个版本用了哪些依赖"。
+func (r receivedStream) cycloneDXProblem() string {
+	defer r.cleanup()
+	file, err := os.Open(r.path)
+	if err != nil {
+		return "the SBOM could not be read back"
+	}
+	defer file.Close()
+	var head struct {
+		BOMFormat string `json:"bomFormat"`
+	}
+	if err := json.NewDecoder(file).Decode(&head); err != nil || head.BOMFormat != "CycloneDX" {
+		return "the SBOM must be a CycloneDX JSON document"
+	}
+	return ""
+}
+
+// receiveStreamToObject 把请求体按上限收进临时文件、边收边算 sha256，再写进对象存储并
+// 核对落盘大小。返回的临时文件由调用方清理。status 非 0 表示失败，临时文件已清理。
+func (s *server) receiveStreamToObject(c *gin.Context, client objectstore.Client, key string, limit int64) (receivedStream, int, string, string) {
+	if mediaType, _, err := mime.ParseMediaType(c.GetHeader("content-type")); err != nil || mediaType != octetStream {
+		return receivedStream{}, http.StatusUnsupportedMediaType, "UPLOAD_CONTENT_TYPE_INVALID", "The body must be sent as application/octet-stream"
+	}
+	if c.Request.ContentLength > limit {
+		return receivedStream{}, http.StatusRequestEntityTooLarge, "UPLOAD_TOO_LARGE", fmt.Sprintf("The body exceeds the %d byte limit", limit)
+	}
+	temporary, err := os.CreateTemp("", "rn-build-delivery-*")
+	if err != nil {
+		return receivedStream{}, http.StatusInternalServerError, "UPLOAD_FAILED", "Unable to prepare the upload"
+	}
+	received := receivedStream{path: temporary.Name()}
+	hash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(temporary, hash), http.MaxBytesReader(c.Writer, c.Request.Body, limit))
+	closeErr := temporary.Close()
+	if copyErr != nil {
+		received.cleanup()
+		if requestTooLarge(copyErr) {
+			return receivedStream{}, http.StatusRequestEntityTooLarge, "UPLOAD_TOO_LARGE", fmt.Sprintf("The body exceeds the %d byte limit", limit)
+		}
+		return receivedStream{}, http.StatusBadRequest, "UPLOAD_INTERRUPTED", "The upload body could not be read completely"
+	}
+	if closeErr != nil {
+		received.cleanup()
+		return receivedStream{}, http.StatusInternalServerError, "UPLOAD_FAILED", "Unable to store the upload"
+	}
+	if written == 0 {
+		received.cleanup()
+		return receivedStream{}, http.StatusBadRequest, "UPLOAD_EMPTY", "The upload body is empty"
+	}
+	if c.Request.ContentLength >= 0 && c.Request.ContentLength != written {
+		received.cleanup()
+		return receivedStream{}, http.StatusBadRequest, "UPLOAD_INTERRUPTED", "The upload body is shorter than Content-Length"
+	}
+	received.size, received.sha256 = written, hex.EncodeToString(hash.Sum(nil))
+	file, err := os.Open(received.path)
+	if err != nil {
+		received.cleanup()
+		return receivedStream{}, http.StatusInternalServerError, "UPLOAD_FAILED", "Unable to store the upload"
+	}
+	defer file.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
+	defer cancel()
+	if err := client.Put(ctx, key, file, written, octetStream); err != nil {
+		received.cleanup()
+		slog.Error("cannot write a build delivery to object storage", "objectKey", key, "error", err)
+		return receivedStream{}, http.StatusFailedDependency, "UPLOAD_STORAGE_FAILED", "Unable to write the upload to object storage"
+	}
+	stored, err := client.Stat(ctx, key)
+	if err != nil || stored.Size != written {
+		received.cleanup()
+		return receivedStream{}, http.StatusFailedDependency, "UPLOAD_STORAGE_FAILED", "Object storage does not hold the complete upload"
+	}
+	return received, 0, "", ""
+}
+
+// ---- 交付 ----
+
+type buildProvenanceRecord struct {
+	Statement              string `json:"statement"`
+	Signature              string `json:"signature"`
+	BuilderID              string `json:"builderId"`
+	BuilderPublicKey       string `json:"builderPublicKey"`
+	BuilderPublicKeySHA256 string `json:"builderPublicKeySha256"`
+}
+
+// markBuildJobBuilt 收下出处声明，任务转为 built（待签名）。
+//
+// 服务端也验一遍出处：签名用这台机器登记的 active 公钥验过，声明里的每个字段与任务行、
+// 请求、已上传的文件一致。签名闸会独立再验一次（只认本机 pin 的构建机）——服务端这一道
+// 是为了让伪造或错配的交付在控制台上就能看见，而不是等签名闸拒签。
+func (s *server) markBuildJobBuilt(c *gin.Context) {
+	job, ok := builderJobFromContext(c)
+	if !ok {
+		return
+	}
+	if job.Kind != jobKindAPK {
+		problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH", "Only installable-package builds are delivered to the signer")
+		return
+	}
+	machine, _ := machineFromContext(c)
+	var body struct {
+		CommitSHA         string              `json:"commitSha"`
+		NativeFingerprint string              `json:"nativeFingerprint"`
+		Provenance        provenance.Envelope `json:"provenance"`
+		LogTail           []string            `json:"logTail"`
+	}
+	if err := decode(c, &body); err != nil {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "commitSha, nativeFingerprint, provenance {statement, signature} and logTail are required")
+		return
+	}
+	commit := strings.TrimSpace(body.CommitSHA)
+	native := strings.TrimSpace(body.NativeFingerprint)
+	if !commitSHAPattern.MatchString(commit) || !nativeFingerprintPattern.MatchString(native) {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "commitSha must be a lowercase git object id and nativeFingerprint lowercase hex")
+		return
+	}
+	invalid := func(detail string) {
+		problem(c, http.StatusUnprocessableEntity, "BUILD_PROVENANCE_INVALID", detail)
+	}
+	if !job.UnsignedSHA256.Valid || !job.UnsignedSize.Valid || !job.SBOMSHA256.Valid {
+		invalid("the unsigned package and the SBOM must both be uploaded under this claim before delivery")
+		return
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(string(machine.PublicKey))
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		invalid("this machine has no usable accepted provenance key")
+		return
+	}
+	statement, err := provenance.Verify(body.Provenance, ed25519.PublicKey(publicKey))
+	if err != nil {
+		invalid("the provenance signature does not verify with this machine's accepted key, or the statement is malformed")
+		return
+	}
+	slug, err := s.tenantSlug(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to resolve the tenant of this build")
+		return
+	}
+	identity, err := s.androidReleaseIdentityRecord(c.Request.Context(), job.TenantID)
+	if err != nil || identity == nil {
+		invalid("the tenant has no registered Android release identity to compare the package name with")
+		return
+	}
+	mismatches := []string{}
+	check := func(field string, equal bool) {
+		if !equal {
+			mismatches = append(mismatches, field)
+		}
+	}
+	check("jobId", statement.JobID == job.ID)
+	check("attempt", statement.Attempt == job.Attempt)
+	check("tenantSlug", statement.TenantSlug == slug)
+	check("packageName", statement.PackageName == identity.Value.PackageName)
+	check("versionCode", statement.VersionCode == int64(job.BuildNumber))
+	check("versionName", statement.VersionName == job.Version)
+	check("commitSha", statement.CommitSHA == commit)
+	check("unsignedSha256", statement.UnsignedSHA256 == job.UnsignedSHA256.String)
+	check("unsignedSize", statement.UnsignedSize == job.UnsignedSize.Int64)
+	check("sbomSha256", statement.SBOMSHA256 == job.SBOMSHA256.String)
+	check("nativeFingerprint", statement.NativeFingerprint == native)
+	check("builderId", statement.BuilderID == machine.ID)
+	if len(mismatches) > 0 {
+		invalid("the provenance statement does not match this build: " + strings.Join(mismatches, ", "))
+		return
+	}
+	record, _ := json.Marshal(buildProvenanceRecord{
+		Statement: body.Provenance.Statement, Signature: body.Provenance.Signature, BuilderID: machine.ID,
+		BuilderPublicKey: string(machine.PublicKey), BuilderPublicKeySHA256: string(machine.PublicKeySHA256),
+	})
+	ctx := c.Request.Context()
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the delivery")
+		return
+	}
+	defer tx.Rollback()
+	// 交付物在这条 UPDATE 里再比一次：收流与交付之间不能被同一次认领的另一次上传换掉
+	result, err := tx.ExecContext(ctx,
+		`UPDATE build_jobs SET status='built',commit_sha=?,native_fingerprint=?,provenance=?,log_tail=?,heartbeat_at=?,updated_at=?
+		  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventBuilderBuilt, jobKindAPK))+`) AND attempt=? AND claimed_machine_id=?
+		    AND unsigned_sha256=? AND unsigned_size=? AND sbom_sha256=?`,
+		commit, native, record, clampLogTail(body.LogTail), now, now,
+		job.ID, job.Attempt, machine.ID, job.UnsignedSHA256.String, job.UnsignedSize.Int64, job.SBOMSHA256.String)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the delivery")
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+		return
+	}
+	event := newAudit(job.TenantID, builderSystemActor, "build_job_built", "build-job", job.ID, "a builder delivered an unsigned package with provenance", requestID(c),
+		map[string]any{"jobId": job.ID, "attempt": job.Attempt, "builderId": machine.ID, "builderPublicKeySha256": string(machine.PublicKeySHA256),
+			"commitSha": commit, "unsignedSha256": job.UnsignedSHA256.String, "sbomSha256": job.SBOMSHA256.String, "nativeFingerprint": native})
+	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the delivery")
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// rewriteJSONBody 把请求体换成服务端自己拼的那一份，供内部转调的处理器读。
+// 构建机只送它确实知道的东西（票据、提交）；决定产物发给谁的参数一律来自任务行。
+func rewriteJSONBody(c *gin.Context, payload map[string]any) {
+	raw, _ := json.Marshal(payload)
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	c.Request.ContentLength = int64(len(raw))
+}
+
+// problemWith 是带额外字段的 Problem Details（例如 409 BUILDER_HAS_ACTIVE_JOB 带上任务 id）。
+func problemWith(c *gin.Context, status int, code, detail string, extra gin.H) {
+	c.Header("Content-Type", "application/problem+json")
+	body := gin.H{"type": "about:blank", "title": http.StatusText(status), "status": status, "code": code, "detail": detail, "requestId": requestID(c)}
+	for key, value := range extra {
+		if _, reserved := body[key]; !reserved {
+			body[key] = value
+		}
+	}
+	c.JSON(status, body)
+}

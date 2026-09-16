@@ -31,6 +31,27 @@ const releaseAndroidIdentityConfigKey = "release.android"
 // 永远匹配不上。
 const reactNativeDebugSignerSHA256 = androidkeystore.PublicDebugSignerSHA256
 
+// retiredAndroidSigners 是作废的租户签名证书指纹（设计「现有租户的签名密钥重置 → 旧指纹永久拒绝」、约定 5.5）。
+//
+// 与公开 debug 签名同级：登记接口（PUT /release-identity/android、PUT /build-keystore）、
+// 上传门禁（checkAndroidReleaseIdentity）与签名闸交回的已签名包（signer complete）都永久拒绝。
+// **不提供重新登记旧指纹的回退**：旧密钥每次构建都以明文出现在构建目录里，无法证明没有泄露，
+// 而一个带旧签名、versionCode 更高的包能让还没重装的老用户原地升级、保留钱包数据。
+var retiredAndroidSigners = map[string]string{
+	"1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694": "anyfun（2026-09 重置作废）",
+	"9ab5fbe6e2052bbd8ce502a8d442b3e5d4769de8d5fa939cec480bc2d1ffcf37": "predict-kim（2026-09 重置作废）",
+}
+
+// androidSignerRetirement 判断一个证书指纹是否已作废；空码表示没有作废。
+// 只用在写入与入库的门禁上，不用在读登记的路径上：库里还留着旧指纹的租户（重置之前）
+// 读 bootstrap、assetlinks 照常工作，只是再也登记不上、传不上旧签名的包。
+func androidSignerRetirement(digest string) (code, detail string) {
+	if label, retired := retiredAndroidSigners[normalizeFingerprint(digest)]; retired {
+		return "RELEASE_SIGNER_RETIRED", "This signing certificate was retired and can never be registered or released again: " + label
+	}
+	return "", ""
+}
+
 var (
 	androidPackagePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$`)
 	sha256HexPattern      = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -90,11 +111,14 @@ func parseAndroidReleaseIdentity(raw []byte) (androidReleaseIdentity, error) {
 }
 
 // checkAndroidReleaseIdentity 决定一个已解析的 APK 能否入库；空码表示通过。
-// 顺序：公开 debug 密钥 → 生产环境未 pin → 包名 → 签名者。
+// 顺序：公开 debug 密钥 → 作废的旧指纹 → 生产环境未 pin → 包名 → 签名者。
 func checkAndroidReleaseIdentity(apk apkinspect.Metadata, pin *androidReleaseIdentity, production bool) (code, detail string) {
 	signer := normalizeFingerprint(apk.SignerSHA256)
 	if signer == reactNativeDebugSignerSHA256 {
 		return "RELEASE_DEBUG_SIGNER", "APK is signed with the public React Native debug key"
+	}
+	if code, detail := androidSignerRetirement(signer); code != "" {
+		return code, detail
 	}
 	if pin == nil {
 		if production {
@@ -199,6 +223,10 @@ func (s *server) updateAndroidReleaseIdentity(c *gin.Context) {
 	value := normalizeAndroidReleaseIdentity(androidReleaseIdentity{PackageName: body.PackageName, SignerSHA256: body.SignerSHA256})
 	if err := validateAndroidReleaseIdentity(value); err != nil {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE_IDENTITY", err.Error())
+		return
+	}
+	if code, detail := androidSignerRetirement(value.SignerSHA256); code != "" {
+		problem(c, http.StatusUnprocessableEntity, code, detail)
 		return
 	}
 	current, err := s.androidReleaseIdentityRecord(c.Request.Context(), tenantID(c))

@@ -117,7 +117,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BIND_ADDRESS` | 空（所有网卡） | 裸机部署**要显式填 `127.0.0.1`**，否则应用端口会绕过反向代理直接对外，TLS 和它上面的一切都白设。Docker 部署靠端口映射兜底 |
 | `PORT` | `3000` | |
 | `TRUSTED_PROXIES` | 空 | 允许设置 `X-Forwarded-For` 的上跳。**空 = 谁都不信**，`ClientIP` 取直连对端。不填时 `ADMIN_API_ALLOWED_IPS` 只是摆设（安全评审 N17） |
-| `PLATFORM_ADMIN_USERNAMES` | 空 | 能进平台级页面（扫链管理、打包机公钥、平台推送默认）的管理员，逗号分隔。**空 = 平台路由一律 403** |
+| `PLATFORM_ADMIN_USERNAMES` | 空 | 能进平台级页面（扫链管理、打包机与签名闸、平台推送默认）的管理员，逗号分隔。**空 = 平台路由一律 403** |
 | `CORS_ORIGINS` | 开发 `*`，生产空 | **额外**放行的来源。租户自己的域名由 `tenant_domain` 表推导（见 `originAllowed`），通常不需要写。生产显式写 `*` 会拒绝启动 |
 | `HTTP_READ_TIMEOUT_SECONDS` | `3600` | 大产物上传要靠它，别调小 |
 | `HTTP_WRITE_TIMEOUT_SECONDS` | `3600` | |
@@ -138,7 +138,6 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `BUILD_AGENT_TOKEN` | 空 | 打包机代理的凭据，与管理端密钥**完全分开**：管理端密钥能改配置、发版、读安装明细，打包机只需要领任务和回报结果。空 = `/v1/build-agent` 整条通道关闭 |
 | `ARTIFACT_UPLOAD_MODE` | `direct` | `direct` 是浏览器直传对象存储，**要求桶上有 CORS 规则**；`proxy` 由服务端流式中转，不要求浏览器访问桶。桶配不了跨域就用 `proxy` |
 | `ARTIFACT_MAX_SIZE_MB` | `512` | 1–2048 |
 | `ARTIFACT_UPLOAD_TTL_SECONDS` | `900` | 60–3600 |
@@ -146,6 +145,8 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `ARTIFACT_VERIFY_TIMEOUT_SECONDS` | `300` | 30–1800 |
 
 对象存储的 endpoint / 桶 / 凭据**不在 env**：按租户存在 `app_configs.release.storage`，用 `STORAGE_MASTER_KEY` 加密，由管理端写入。
+
+**构建机与签名闸的令牌不在服务端 env**：原来全局共用的 `BUILD_AGENT_TOKEN` 已删除。每台构建机、每台签名闸在控制台「打包机与签名闸」新建时签发自己的令牌（`rnm_` 开头，只显示一次），放进那台机器自己的 env（构建机 `BUILD_AGENT_MACHINE_TOKEN`、签名闸 `SIGNER_MACHINE_TOKEN`）；服务端只在 `app_configs` 平台级 `build.machines` 里存令牌的 sha256，吊销即时生效。旧构建机还带着 `x-build-agent-token` 来请求时回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`。见 [ADR-0019](decisions/0019-android-signing-gate.md)。
 
 ### 4.4 推送
 
@@ -220,7 +221,6 @@ MYSQL_DSN=user:password@tcp(host:13306)/db?parseTime=true&loc=UTC&charset=utf8mb
 ADMIN_USERNAME=
 ADMIN_PASSWORD_HASH=
 ADMIN_API_KEY=
-BUILD_AGENT_TOKEN=
 
 # ---- 这台机器 ----
 APP_ENV=production

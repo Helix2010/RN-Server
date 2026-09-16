@@ -72,7 +72,8 @@ cat <<'NEXT'
 装好了。接下来按顺序：
 
   1. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*（MYSQL_DSN 一行、STORAGE_MASTER_KEY、
-     两个管理端凭据、BUILD_AGENT_TOKEN；ADMIN_API_KEY 用 openssl rand -hex 32 生成）
+     两个管理端凭据；ADMIN_API_KEY 用 openssl rand -hex 32 生成。构建机与签名闸的令牌
+     不在这里，在控制台「打包机与签名闸」新建机器时签发）
      填完跑 `rn-server config` 核对一遍——它打印实际生效的值，机密只显示长度
   2. 从开发机跑 deploy.sh，把二进制和两份控制台产物送上来
   3. sudo systemctl enable --now rn-foundation-server rn-foundation-indexer

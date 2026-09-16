@@ -1,14 +1,12 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -32,7 +30,14 @@ import (
 // 数据目录（含钱包）完整保留，补救只能换包名，也就是让每个用户手动卸载重装。
 //
 // 所以接口的语义被压到最窄：任务带的是参数（租户、提交、版本号），不是 shell。
-// 怎么构建由打包机自己决定，密钥由它自己持有，服务端知道的是产物指纹。
+// 怎么构建由打包机自己决定，服务端知道的是产物指纹。
+//
+// ## 构建机没有签名能力（签名闸，设计 android-signing-gate-2026-09-16）
+//
+// 构建机执行几千个依赖包的代码，按不可信处理：它只交付未签名包、SBOM 与出处签名，
+// 任务转为 built；主签名闸领走、在本机核对后签名，同一个事务里落发布记录并把任务改为
+// succeeded。签名密钥只以加密给签名闸的密文存在库里，构建机与服务端都打不开。
+// 状态机见 build_job_states.go，构建机接口见 build_agent.go，签名闸接口见 signer.go。
 //
 // ## 什么能从数据库来，什么不能
 //
@@ -77,20 +82,60 @@ type buildJob struct {
 	CreatedBy      string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	// 构建段（迁移 54）：认领编号、认领的构建机、未签名包与 SBOM、原生指纹、出处
+	Attempt           int
+	ClaimedMachineID  sql.NullString
+	UnsignedObjectKey sql.NullString
+	UnsignedSize      sql.NullInt64
+	UnsignedSHA256    sql.NullString
+	SBOMObjectKey     sql.NullString
+	SBOMSize          sql.NullInt64
+	SBOMSHA256        sql.NullString
+	NativeFingerprint sql.NullString
+	Provenance        []byte
+	// 签名段（迁移 54）
+	SignAttempt        int
+	SignFailures       int
+	SigningMachineID   sql.NullString
+	SigningClaimedAt   sql.NullTime
+	SigningHeartbeatAt sql.NullTime
+	SignOutcome        []byte
 }
 
-const buildJobColumns = `id,tenant_id,platform,kind,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at`
+const buildJobColumns = `id,tenant_id,platform,kind,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at,` +
+	`attempt,claimed_machine_id,unsigned_object_key,unsigned_size,unsigned_sha256,sbom_object_key,sbom_size,sbom_sha256,native_fingerprint,provenance,` +
+	`sign_attempt,sign_failures,signing_machine_id,signing_claimed_at,signing_heartbeat_at,sign_outcome`
 
 func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 	var j buildJob
 	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.Kind, &j.BaseReleaseID, &j.Channel, &j.ApplyStrategy,
 		&j.OTAReleaseID, &j.GitRef, &j.CommitSHA, &j.Version, &j.BuildNumber,
 		&j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.HeartbeatAt, &j.ReleaseID, &j.ArtifactSHA256, &j.LogTail,
-		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt)
+		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt,
+		&j.Attempt, &j.ClaimedMachineID, &j.UnsignedObjectKey, &j.UnsignedSize, &j.UnsignedSHA256,
+		&j.SBOMObjectKey, &j.SBOMSize, &j.SBOMSHA256, &j.NativeFingerprint, &j.Provenance,
+		&j.SignAttempt, &j.SignFailures, &j.SigningMachineID, &j.SigningClaimedAt, &j.SigningHeartbeatAt, &j.SignOutcome)
 	return j, err
 }
 
+// buildJobSignOutcome 是 sign_outcome 列的形状（约定 5.4）。
+type buildJobSignOutcome struct {
+	Kind      string `json:"kind"`
+	Code      string `json:"code"`
+	Detail    string `json:"detail"`
+	MachineID string `json:"machineId"`
+	At        string `json:"at"`
+}
+
+// buildJobView 是没有机器名称可查时的视图（刚建好的任务还没有被任何机器碰过）。
 func buildJobView(j buildJob) map[string]any {
+	return buildJobViewWithMachines(j, nil)
+}
+
+// buildJobViewWithMachines 带上签名闸名称。名称取自机器登记，查不到（被删、未登记）就是 null。
+//
+// 视图里**没有**出处签名、对象键与任何密文：列表是给租户管理员看的。
+func buildJobViewWithMachines(j buildJob, machineNames map[string]string) map[string]any {
 	// 初值是空切片而不是 nil：nil 的 []string 序列化出来是 null，不是 []。刚排进
 	// 队列的任务还没有任何日志，于是新建任务的那个响应里 logTail 是 null——控制台
 	// 按契约（数组）解，整个响应校验失败，界面上显示"排队失败"，而任务其实已经建好
@@ -125,7 +170,46 @@ func buildJobView(j buildJob) map[string]any {
 		"createdBy":      j.CreatedBy,
 		"createdAt":      iso(j.CreatedAt),
 		"updatedAt":      iso(j.UpdatedAt),
+		// 签名闸（迁移 54）
+		"attempt":            j.Attempt,
+		"claimedMachineId":   nullableString(j.ClaimedMachineID.String),
+		"unsignedSha256":     nullableString(j.UnsignedSHA256.String),
+		"unsignedSize":       nullableInt64(j.UnsignedSize),
+		"sbomSha256":         nullableString(j.SBOMSHA256.String),
+		"nativeFingerprint":  nullableString(j.NativeFingerprint.String),
+		"signAttempt":        j.SignAttempt,
+		"signFailures":       j.SignFailures,
+		"signingMachineId":   nullableString(j.SigningMachineID.String),
+		"signingMachineName": nullableString(machineNames[j.SigningMachineID.String]),
+		"signingClaimedAt":   nullableTime(j.SigningClaimedAt.Time),
+		"signingHeartbeatAt": nullableTime(j.SigningHeartbeatAt.Time),
+		"signOutcome":        buildJobSignOutcomeView(j.SignOutcome),
+		// commit 由构建机自报，服务端没有 GitHub 凭据去核对（设计「构建机 → 每个任务的隔离」）
+		"commitSelfReported": true,
 	}
+}
+
+func buildJobSignOutcomeView(raw []byte) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var outcome buildJobSignOutcome
+	if err := json.Unmarshal(raw, &outcome); err != nil || outcome.Kind == "" {
+		return nil
+	}
+	return gin.H{"kind": outcome.Kind, "code": outcome.Code, "detail": outcome.Detail, "machineId": nullableString(outcome.MachineID), "at": outcome.At}
+}
+
+// clipRunes 按**字符**截断，不是按字节。
+//
+// 按字节切会把一个多字节字符切成两半，JSON 编码时那半个字符变成 U+FFFD——三个字节，
+// 比切掉的还长，结果是"限长 300"的字段存进去 304 字节。这段文字几乎一定是中文。
+func clipRunes(text string, max int) string {
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	return string(runes[:max])
 }
 
 // clampLogTail 只留尾部若干行。日志是代理送上来的，不设上限的话一次失败就能把这一行
@@ -193,7 +277,7 @@ func (s *server) buildFloorFor(ctx context.Context, tenant, platform string) (bu
 	rows, err := s.db.QueryContext(ctx, `
 		(SELECT version,build_number FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 50)
 		UNION ALL
-		(SELECT version,build_number FROM build_jobs WHERE tenant_id=? AND platform=? AND status NOT IN ('canceled','failed') ORDER BY build_number DESC LIMIT 50)`,
+		(SELECT version,build_number FROM build_jobs WHERE tenant_id=? AND platform=? AND status IN (`+sqlInFlight+`,'succeeded') ORDER BY build_number DESC LIMIT 50)`,
 		tenant, platform, tenant, platform)
 	if err != nil {
 		return floor, err
@@ -321,29 +405,6 @@ func (s *server) createBuildJob(c *gin.Context) {
 			fmt.Sprintf("version must be greater than %s, the highest already used for %s (the build would be rejected on upload)", floor.Version, platform))
 		return
 	}
-	// 打包机已经说过这把密钥它打不开的话，这个构建是注定失败的——别让它占机器。
-	//
-	// 2026-09-13 实测过这条路：00:37:44 代理报了 failed，00:38:53 还是排进了一个任务，
-	// 它 git fetch、建 worktree、写完身份文件，然后在解盒那一步倒下。整条链路上这是
-	// **唯一**一处在花掉任何时间之前就知道结论的地方。
-	//
-	// 只挡 failed，不挡 pending：pending 是"还没验"，代理没跑或刚存完密钥都会落在
-	// 这个态上，拿它挡构建等于把一个正常状态当成故障。
-	if check, err := s.keystoreCheckFor(c.Request.Context(), tenantID(c)); err == nil && check != nil && !check.OK {
-		if current, _, _, _, err := s.buildKeystoreRecord(c.Request.Context(), tenantID(c)); err == nil && current != nil {
-			var keystoreVersion int
-			_ = s.db.QueryRowContext(c.Request.Context(),
-				`SELECT version FROM app_configs WHERE tenant_id=? AND config_key=? LIMIT 1`,
-				tenantID(c), buildKeystoreConfigKey).Scan(&keystoreVersion)
-			if keystoreVersion == check.Version {
-				problem(c, http.StatusConflict, "BUILD_KEYSTORE_UNUSABLE",
-					"打包机打不开这个租户的签名密钥，构建一定会失败，所以没有排进队列。"+
-						check.Error+"（打包机 "+check.Agent+" 于 "+check.CheckedAt+" 验过）")
-				return
-			}
-		}
-	}
-
 	// 身份在排队这一刻就要能合成出来。留到代理认领才发现，运维已经等了一轮队列，
 	// 而缺的往往是"签名密钥没配"这种在控制台点两下就好的事
 	slug, err := s.tenantSlug(c.Request.Context(), tenantID(c))
@@ -377,6 +438,22 @@ func (s *server) createBuildJob(c *gin.Context) {
 		problem(c, http.StatusConflict, "APP_IDENTITY_DRIFT",
 			"This build would change "+strings.Join(drift, "；")+"，装着当前版本的设备升不上去。确认要这么做就带 acknowledgeIdentityChange=true 重发。")
 		return
+	}
+	// 主签名闸没有就绪，这个包出得来也签不了——别让它占构建机，停在「待签名」里。
+	// 判据与签名认领用的是同一个函数（signerReadinessFor）：两边说法不一致时，
+	// 排进去的任务会永远等不到签名闸。租户改了 apiBaseUrl 或 OTA 密钥之后，在主签名闸
+	// 重新确认之前这里同样挡住。
+	if platform == "android" {
+		readiness, err := s.signerReadinessFor(c.Request.Context(), tenantID(c))
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to check whether the primary signer is ready")
+			return
+		}
+		if !readiness.Ready {
+			problem(c, http.StatusConflict, "SIGNER_NOT_READY",
+				"主签名闸还不能为这个租户签名，构建出来也签不了，所以没有排进队列："+strings.Join(readiness.Problems, "；"))
+			return
+		}
 	}
 
 	now := time.Now().UTC()
@@ -453,9 +530,10 @@ func (s *server) listBuildJobs(c *gin.Context) {
 	if hasMore {
 		jobs = jobs[:filter.limit]
 	}
+	names := s.machineNamesForView(c.Request.Context())
 	items := make([]map[string]any, 0, len(jobs))
 	for _, job := range jobs {
-		items = append(items, buildJobView(job))
+		items = append(items, buildJobViewWithMachines(job, names))
 	}
 	// 下一个包该填什么，由服务端算——控制台不该自己去推。它要看的两张表里有一张
 	// （build_jobs 里排队中的任务）根本不在列表这一页上，而且 semver 的比较规则
@@ -505,10 +583,8 @@ func parseBuildJobListFilter(c *gin.Context) (buildJobListFilter, string) {
 	if f.platform != "" && f.platform != "android" && f.platform != "ios" {
 		return f, "platform must be android or ios"
 	}
-	switch f.status {
-	case "", "queued", "claimed", "running", "succeeded", "failed", "canceled":
-	default:
-		return f, "status is invalid"
+	if f.status != "" && !containsString(buildJobStatuses, f.status) {
+		return f, "status must be one of " + strings.Join(buildJobStatuses, ", ")
 	}
 	if len(f.version) > 128 || len(f.query) > 200 {
 		return f, "version and q are too long"
@@ -571,8 +647,9 @@ func (f buildJobListFilter) where(tenant string) (string, []any) {
 	}
 	if f.query != "" {
 		pattern := "%" + f.query + "%"
-		clauses = append(clauses, "(id LIKE ? OR version LIKE ? OR git_ref LIKE ? OR commit_sha LIKE ? OR claimed_by LIKE ?)")
-		args = append(args, pattern, pattern, pattern, pattern, pattern)
+		// claimed_by 是构建机名称，两个 *_machine_id 是登记 id：按哪一个搜都要搜得到
+		clauses = append(clauses, "(id LIKE ? OR version LIKE ? OR git_ref LIKE ? OR commit_sha LIKE ? OR claimed_by LIKE ? OR claimed_machine_id LIKE ? OR signing_machine_id LIKE ?)")
+		args = append(args, pattern, pattern, pattern, pattern, pattern, pattern, pattern)
 	}
 	return strings.Join(clauses, " AND "), args
 }
@@ -582,7 +659,18 @@ func (s *server) buildJobDetail(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	c.JSON(http.StatusOK, buildJobView(job))
+	c.JSON(http.StatusOK, buildJobViewWithMachines(job, s.machineNamesForView(c.Request.Context())))
+}
+
+// machineNamesForView 给任务视图补签名闸名称。读不到登记不影响列表：名称只是显示用的，
+// id 仍然在视图里。
+func (s *server) machineNamesForView(ctx context.Context) map[string]string {
+	registry, err := s.machineRegistry(ctx)
+	if err != nil {
+		slog.Warn("build job view has no machine names: the machine registry cannot be read", "error", err)
+		return nil
+	}
+	return registry.names()
 }
 
 // loadBuildJob 读一条任务并在失败时自己写好响应。tenant 为空表示不按租户过滤——
@@ -615,414 +703,92 @@ func (s *server) cancelBuildJob(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_JOB", "reason and confirm=true are required")
 		return
 	}
+	reason := clipRunes(strings.TrimSpace(body.Reason), 500)
+	ctx := c.Request.Context()
 	now := time.Now().UTC()
-	// 只取消还没开工的。running 的任务取消了也停不下打包机上那个进程，状态会骗人。
-	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='canceled',failure_reason=?,updated_at=? WHERE id=? AND tenant_id=? AND status IN ('queued','claimed')`,
-		strings.TrimSpace(body.Reason), now, c.Param("id"), tenantID(c))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to cancel the build")
+		return
+	}
+	defer tx.Rollback()
+	// 只取消还没开工的、或者已经构建完还没开始签的。running 的任务取消了也停不下
+	// 构建机上那个进程，状态会骗人；signing 的签名闸可能正在签，要放弃走 force-fail。
+	// 被取消的 claimed 任务，构建机下一次心跳就拿到 409 BUILD_ATTEMPT_STALE 并中止。
+	result, err := tx.ExecContext(ctx,
+		`UPDATE build_jobs SET status='canceled',failure_reason=?,updated_at=?
+		  WHERE id=? AND tenant_id=? AND ((kind='apk' AND status IN (`+sqlCancelableAPK+`)) OR (kind='ota' AND status IN (`+sqlCancelableOTA+`)))`,
+		reason, now, c.Param("id"), tenantID(c))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to cancel the build")
 		return
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_CANCELABLE", "Only queued or claimed builds can be canceled")
+		problem(c, http.StatusConflict, "BUILD_JOB_NOT_CANCELABLE", "Only queued, claimed or built builds can be canceled")
+		return
+	}
+	event := newAudit(tenantID(c), actor(c), "build_job_cancel", "build-job", c.Param("id"), reason, requestID(c), map[string]any{"jobId": c.Param("id")})
+	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to cancel the build")
 		return
 	}
 	job, err := s.loadBuildJob(c, tenantID(c), c.Param("id"))
 	if err != nil {
 		return
 	}
-	c.JSON(http.StatusOK, buildJobView(job))
+	c.JSON(http.StatusOK, buildJobViewWithMachines(job, s.machineNamesForView(ctx)))
 }
 
-// ---- 打包机代理通道 ----
-
-// buildAgentAuth 是与管理端**完全分开**的一条凭据。不复用 x-admin-key：管理端密钥
-// 能改配置、能发版、能读安装明细，而打包机只需要认领任务和回报结果。一台构建机被
-// 拿下时，拿到的应该只是构建队列，不是整个管理面。
-func (s *server) buildAgentAuth() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		token := c.GetHeader("x-build-agent-token")
-		if s.cfg.BuildAgentToken == "" || !constantEqual(token, s.cfg.BuildAgentToken) {
-			problem(c, http.StatusUnauthorized, "BUILD_AGENT_AUTH_REQUIRED", "Build agent authentication required")
-			c.Abort()
-			return
-		}
-		c.Next()
-	}
-}
-
-// claimBuildJob 原子地领走一条排队中的任务。用 FOR UPDATE SKIP LOCKED：两台构建机
-// 同时轮询时，第二台跳过被锁住的行去拿下一条，而不是等锁或者拿到同一条。
-func (s *server) claimBuildJob(c *gin.Context) {
+// forceFailBuildJob 放弃一条卡在「签名中」的任务（设计「机器挂了怎么办」最后一行）。
+//
+// signing 不能直接取消：签名闸可能正在签，取消之后它照样会交回一个已签名包。强制判失败
+// 之后，签名闸的迟到上报（心跳、上传、完成）都按状态与签名编号拒绝，不会落成发布记录。
+func (s *server) forceFailBuildJob(c *gin.Context) {
 	var body struct {
-		Agent     string   `json:"agent"`
-		Platforms []string `json:"platforms"`
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
 	}
-	if decode(c, &body) != nil || strings.TrimSpace(body.Agent) == "" {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "agent is required")
+	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_JOB", "reason and confirm=true are required")
 		return
 	}
-	platforms := []string{}
-	for _, p := range body.Platforms {
-		p = strings.ToLower(strings.TrimSpace(p))
-		if p == "android" || p == "ios" {
-			platforms = append(platforms, p)
-		}
-	}
-	if len(platforms) == 0 {
-		platforms = []string{"android", "ios"}
-	}
-	// 按字符截，不是按字节：切坏一个多字节字符，JSON 编码时会变成更长的 U+FFFD
-	agent := clipRunes(strings.TrimSpace(body.Agent), 120)
-
-	// 发新活之前先把心跳停了的旧任务收掉。挂在这条路径上而不是另起一个后台循环：
-	// 打包机每 10 秒问一次活，回收就有了节拍；而没有任何打包机在问活的时候，本来
-	// 也没有什么需要回收。
-	s.reapStaleBuildJobs(c.Request.Context())
-
-	tx, err := s.db.BeginTx(c.Request.Context(), nil)
+	reason := clipRunes(strings.TrimSpace(body.Reason), 400)
+	ctx := c.Request.Context()
+	now := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
 		return
 	}
 	defer tx.Rollback()
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(platforms)), ",")
-	args := []any{}
-	for _, p := range platforms {
-		args = append(args, p)
-	}
-	var id string
-	err = tx.QueryRowContext(c.Request.Context(),
-		`SELECT id FROM build_jobs WHERE status='queued' AND platform IN (`+placeholders+`) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`, args...).Scan(&id)
+	var signingMachine sql.NullString
+	var signAttempt int
+	err = tx.QueryRowContext(ctx, `SELECT signing_machine_id,sign_attempt FROM build_jobs WHERE id=? AND tenant_id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventAdminForceFail, jobKindAPK))+`) FOR UPDATE`,
+		c.Param("id"), tenantID(c)).Scan(&signingMachine, &signAttempt)
 	if errors.Is(err, sql.ErrNoRows) {
-		c.Status(http.StatusNoContent)
+		problem(c, http.StatusConflict, "BUILD_JOB_NOT_FORCE_FAILABLE", "Only builds that are being signed can be force-failed; cancel queued, claimed or built builds instead")
 		return
 	}
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
 		return
 	}
-	now := time.Now().UTC()
-	if _, err := tx.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='claimed',claimed_by=?,claimed_at=?,heartbeat_at=?,updated_at=? WHERE id=?`,
-		agent, now, now, now, id); err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+	if _, err := tx.ExecContext(ctx, `UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
+		clipRunes("管理员强制判失败："+reason, 500), now, c.Param("id")); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
 		return
 	}
-	job, err := scanBuildJob(tx.QueryRowContext(c.Request.Context(), `SELECT `+buildJobColumns+` FROM build_jobs WHERE id=? LIMIT 1`, id))
+	event := newAudit(tenantID(c), actor(c), "build_job_force_fail", "build-job", c.Param("id"), reason, requestID(c),
+		map[string]any{"jobId": c.Param("id"), "signingMachineId": nullableString(signingMachine.String), "signAttempt": signAttempt})
+	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
+		return
+	}
+	job, err := s.loadBuildJob(c, tenantID(c), c.Param("id"))
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
 		return
 	}
-	// 下发的分支必须是我们自己那一个，不认库里那一列（`build-concurrency-2026-09-15.md` §9）。
-	//
-	// 写入路径上每一条用的都是 buildGitRef 这个常量，所以这一列出现别的值只有
-	// 两种可能：常量上线之前的历史脏数据，或者**有人直接写了库**。后者是一条
-	// 完整的提权路径：让打包机检出一个带后门的提交，构建时就以 builder 身份
-	// 执行了攻击者的代码。
-	//
-	// 打包机侧的 validateGitRef 只挡形状（选项注入、路径穿越），挡不住一个
-	// 形状完全合法的分支名。真正的闸必须在这里：服务端不把它下发出去。
-	//
-	// 判死而不是改写成 main：改写会让这条任务构建出和记录不符的东西，
-	// 而记录是事后追查唯一的依据。判死并写明原因，让人看得见发生过什么。
-	if job.GitRef != buildGitRef {
-		if _, err := tx.ExecContext(c.Request.Context(),
-			`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
-			"refusing to build a git ref that is not "+buildGitRef, now, id); err != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
-			return
-		}
-		// 这是「有人写了库」的信号，不是日常噪音。审计要能查到
-		slog.Error("refused to dispatch a build job whose git ref is not the fixed branch",
-			"jobId", id, "tenant", job.TenantID, "agent", agent)
-		s.auditNow(newAudit(platformTenantID, "system-build", "build_job_ref_refused", "build-job", id,
-			"a build job carried a git ref that is not the fixed branch", requestID(c),
-			map[string]any{"expected": buildGitRef, "jobId": id}))
-		c.Status(http.StatusNoContent)
-		return
-	}
-
-	// 解析不出租户（租户被删了、任务是脏数据）时不能把这条任务留在队列里报 500：
-	// 认领总是取最早那条，一条解析不了的任务会把**整个队列**堵死，而队列是跨租户的。
-	// 直接判它失败，让代理立刻去拿下一条。
-	var slug string
-	switch err := tx.QueryRowContext(c.Request.Context(), `SELECT slug FROM tenants WHERE id=? LIMIT 1`, job.TenantID).Scan(&slug); {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.ExecContext(c.Request.Context(),
-			`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
-			"tenant no longer exists", now, id); err != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
-			return
-		}
-		c.Status(http.StatusNoContent)
-		return
-	case err != nil:
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to resolve the tenant of this build")
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
-		return
-	}
-
-	// 证书随任务一起下发：代理不该去猜哪张证书该编进包里。这样"包里的证书"与
-	// "服务端当前签名用的密钥"由同一条记录保证一致——今天这个一致性靠人拷文件，
-	// 而不一致的症状是所有设备静默停在内置 bundle。私钥当然不下发。
-	// 仓库里的租户目录名与本平台 slug 是两套命名，必须显式配置：线上 slug 是
-	// Predict.Kim，而仓库里的目录叫 anyfun，拿 slug 去找文件必然找不到。
-	buildCfg, _, err := s.buildConfigFor(c.Request.Context(), job.TenantID, slug)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_INVALID", "Stored build.android configuration is invalid")
-		return
-	}
-	view := buildJobView(job)
-	view["tenantSlug"] = slug
-	view["tenantDirectory"] = buildCfg.RepoDirectory
-	view["googleServicesJson"] = nullableString(buildCfg.GoogleServicesJSON)
-	// 启动图标随任务下发。它们是最后一个还留在 App 仓库里的按租户资源，而"加一个
-	// 租户要往仓库提交四个 png"这件事本身就把租户自助堵死了（见 build_icons.go）
-	icons, err := s.buildIconsForJob(c.Request.Context(), job.TenantID, buildCfg.Identity)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_ICONS_INVALID", "Stored build.icons configuration is invalid")
-		return
-	}
-	view["icons"] = icons
-	// tenant.json 由服务端合成随任务下发，仓库里不再有这个文件。合成不出来就让
-	// 这条任务当场失败：缺的是签名密钥或发布身份这类东西，硬打出来的包装上去也
-	// 起不来，而那时候报的是"配置连接失败"，看不出根因（见 tenant_manifest.go）
-	manifest, err := s.tenantManifestFor(c.Request.Context(), job.TenantID, buildCfg, job.Version, job.BuildNumber)
-	if err != nil {
-		var missing *missingIdentity
-		if errors.As(err, &missing) {
-			s.markBuildJobFailed(c.Request.Context(), job.ID, missing.Error())
-			problem(c, http.StatusConflict, "APP_IDENTITY_INCOMPLETE", missing.Error())
-			return
-		}
-		problem(c, http.StatusInternalServerError, "APP_IDENTITY_INVALID", "Unable to compose the tenant app identity")
-		return
-	}
-	view["tenantFile"] = manifest
-	// 证书两种任务都要：它编进包里的 expo-updates 配置，也因此进原生指纹——热更新那条
-	// 少了它就会算出另一个指纹，永远和基线对不上（见 cmd/build-agent/build.go）。
-	record, err := s.otaSigningRecord(c.Request.Context(), job.TenantID)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "OTA_SIGNING_CONFIG_INVALID", "Stored ota.signing configuration is invalid")
-		return
-	}
-	if record == nil {
-		view["otaCertificatePem"] = nil
-		view["otaCertificateSha256"] = nil
-	} else {
-		fingerprint, _ := certificateFingerprint(record.Value.Certificate)
-		view["otaCertificatePem"] = nullableString(record.Value.Certificate)
-		view["otaCertificateSha256"] = nullableString(fingerprint)
-	}
-
-	// 热更新任务到此为止：它不需要签名密钥，也就不该拿到。这不是省事——最小权限在
-	// 这条链路上是可执行的，一个不需要 keystore 的任务拿到 keystore 只会扩大爆炸半径。
-	// runtimeVersion 取基线那一版：热更新包必须对准它，否则一台设备都收不到。
-	if job.Kind == "ota" {
-		base, baseErr := s.otaJobBaseFor(c.Request.Context(), job.TenantID, job.BaseReleaseID.String)
-		if baseErr != nil {
-			detail := "这条热更新任务的基线安装包已经不可用了：" + baseErr.Error()
-			s.markBuildJobFailed(c.Request.Context(), job.ID, detail)
-			problem(c, http.StatusConflict, "OTA_BASE_RELEASE_INVALID", detail)
-			return
-		}
-		view["runtimeVersion"] = base.RuntimeVersion
-		view["sealedKeystore"] = nil
-		view["keyAlias"] = nil
-		c.JSON(http.StatusOK, view)
-		return
-	}
-	// 签名密钥以**服务端打不开的盒子**下发。打包机本地持有封装口令，自己开。
-	// 没配就留 null，代理会当场失败并说清楚缺什么。
-	sealedKeystore, keyAlias, err := s.sealedBuildKeystoreFor(c.Request.Context(), job.TenantID)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
-		return
-	}
-	if len(sealedKeystore) == 0 {
-		view["sealedKeystore"] = nil
-		view["keyAlias"] = nil
-	} else {
-		view["sealedKeystore"] = sealedKeystore
-		view["keyAlias"] = nullableString(keyAlias)
-	}
-	c.JSON(http.StatusOK, view)
-}
-
-func (s *server) buildJobHeartbeat(c *gin.Context) {
-	var body struct {
-		LogTail []string `json:"logTail"`
-	}
-	if decode(c, &body) != nil {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_PROGRESS", "logTail must be an array of strings")
-		return
-	}
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='running',heartbeat_at=?,log_tail=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
-		now, clampLogTail(body.LogTail), now, c.Param("id"))
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record build progress")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_RUNNING", "This build is not claimed or running")
-		return
-	}
-	c.Status(http.StatusNoContent)
-}
-
-func (s *server) completeBuildJob(c *gin.Context) {
-	var body struct {
-		CommitSHA      string   `json:"commitSha"`
-		ArtifactSHA256 string   `json:"artifactSha256"`
-		ReleaseID      string   `json:"releaseId"`
-		LogTail        []string `json:"logTail"`
-	}
-	commit := ""
-	digest := ""
-	if decode(c, &body) == nil {
-		commit = strings.ToLower(strings.TrimSpace(body.CommitSHA))
-		digest = strings.ToLower(strings.TrimSpace(body.ArtifactSHA256))
-	}
-	if !isHex(commit, 40, 64) || !isHex(digest, 64, 64) {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "commitSha and artifactSha256 must be hex digests")
-		return
-	}
-	now := time.Now().UTC()
-	// 热更新任务产出的是 ota_releases 里的一条修订，不是 app_releases。两者共用
-	// 代理那一个 releaseId 字段，落库时按 kind 分开——一列里混两种外键，读的人早晚
-	// 会拿它去 JOIN 错的表。
-	releaseColumn := "release_id"
-	if job, ok := c.Get("buildJob"); ok {
-		if item, ok := job.(buildJob); ok && item.Kind == "ota" {
-			releaseColumn = "ota_release_id"
-		}
-	}
-	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='succeeded',commit_sha=?,artifact_sha256=?,`+releaseColumn+`=?,log_tail=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
-		commit, digest, sqlNullableString(strings.TrimSpace(body.ReleaseID)), clampLogTail(body.LogTail), now, now, c.Param("id"))
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build result")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_RUNNING", "This build is not claimed or running")
-		return
-	}
-	c.Status(http.StatusNoContent)
-}
-
-// 心跳停了太久的任务判成失败。
-//
-// 那句"留在 claimed 会被心跳超时慢慢回收"写在 markBuildJobFailed 上面，但**回收这件
-// 事根本没人做**——2026-09-13 两条任务因为代理解不开领取响应而卡在 claimed，13 分钟
-// 之后还在那儿，而且占着各自的 build 号（buildFloorFor 只排除 canceled/failed）。
-//
-// 代理每 30 秒报一次心跳，构建再慢也不会停。所以超过这个时限没有动静，只有两种可能：
-// 那台机器挂了，或者它压根不知道自己领了这条任务。两种都该判失败——号放出来，人能
-// 重排。
-const buildJobHeartbeatTimeout = 10 * time.Minute
-
-func (s *server) reapStaleBuildJobs(ctx context.Context) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, tenant_id, status, claimed_by FROM build_jobs
-		  WHERE status IN ('claimed','running')
-		    AND COALESCE(heartbeat_at, claimed_at, created_at) < ?`,
-		time.Now().UTC().Add(-buildJobHeartbeatTimeout))
-	if err != nil {
-		slog.Error("cannot look for stale build jobs", "error", err)
-		return
-	}
-	type stale struct{ id, tenant, status, agent string }
-	var found []stale
-	for rows.Next() {
-		var item stale
-		var agent sql.NullString
-		if err := rows.Scan(&item.id, &item.tenant, &item.status, &agent); err != nil {
-			continue
-		}
-		item.agent = agent.String
-		found = append(found, item)
-	}
-	rows.Close()
-	for _, item := range found {
-		reason := fmt.Sprintf("打包机 %s 超过 %s 没有回报进度，任务按失败处理。"+
-			"多半是那台机器挂了、网断了，或者它没能读完领取任务的响应。"+
-			"中断的构建不会自动续跑（半截的依赖安装和编译状态续下去比重来更危险），"+
-			"build 号已经释放，重新排一个任务即可。",
-			item.agent, buildJobHeartbeatTimeout)
-		s.markBuildJobFailed(ctx, item.id, reason)
-		slog.Warn("reaped a build job whose agent stopped reporting",
-			"job", item.id, "tenant", item.tenant, "was", item.status, "agent", item.agent)
-	}
-}
-
-// markBuildJobFailed 在没有代理上报的情况下判一条任务失败。认领时就发现缺配置的
-// 任务必须落到 failed：队列是跨租户的，一条卡住的任务占着 build 号，拖的是所有人。
-// 真卡住的（代理领了却没动静）由 reapStaleBuildJobs 兜底。
-func (s *server) markBuildJobFailed(ctx context.Context, id, reason string) {
-	if len(reason) > 500 {
-		reason = reason[:500]
-	}
-	now := time.Now().UTC()
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE build_jobs SET status='failed',failure_reason=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('pending','claimed','running')`,
-		reason, now, now, id); err != nil {
-		slog.Error("unable to fail a build job with an incomplete tenant identity", "jobId", id, "error", err)
-	}
-}
-
-func (s *server) failBuildJob(c *gin.Context) {
-	var body struct {
-		FailureReason string   `json:"failureReason"`
-		CommitSHA     string   `json:"commitSha"`
-		LogTail       []string `json:"logTail"`
-	}
-	reason := ""
-	commit := ""
-	if decode(c, &body) == nil {
-		reason = strings.TrimSpace(body.FailureReason)
-		commit = strings.ToLower(strings.TrimSpace(body.CommitSHA))
-	}
-	if reason == "" {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "failureReason is required")
-		return
-	}
-	if len(reason) > 500 {
-		reason = reason[:500]
-	}
-	// 失败的构建也要记下它到底检出了哪个提交——没有这一条，排查只能靠猜分支当时
-	// 指向哪里。解析提交之前就失败的任务没有这个值，那时保留 NULL。
-	if !isHex(commit, 40, 64) {
-		commit = ""
-	}
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='failed',failure_reason=?,commit_sha=COALESCE(?,commit_sha),log_tail=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN ('claimed','running')`,
-		reason, sqlNullableString(commit), clampLogTail(body.LogTail), now, now, c.Param("id"))
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build failure")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_RUNNING", "This build is not claimed or running")
-		return
-	}
-	c.Status(http.StatusNoContent)
+	c.JSON(http.StatusOK, buildJobViewWithMachines(job, s.machineNamesForView(ctx)))
 }
 
 func isHex(value string, min, max int) bool {
@@ -1042,92 +808,4 @@ func sqlNullableString(v string) any {
 		return nil
 	}
 	return v
-}
-
-// ---- 产物回传 ----
-//
-// 代理不自己拼一条入库路径，而是**复用人工上传的那条**：APK 身份解析、ETag 固定、
-// 签名指纹比对、权限清单核对，一条都不少。复制一份出来迟早会漏掉其中一条，而漏掉
-// 的那条正是门禁存在的理由。
-//
-// 做法是把任务的租户放进上下文，然后交给现成的处理函数。代理通道的身份是固定的
-// `build-agent`，不采用它自报的机器名——自报身份任何持钥者都能随便写，写进审计
-// 就成了攻击者可控的字段（与 x-admin-id 同一条教训）。哪台机器干的，看任务行的
-// claimed_by。
-
-const buildAgentActor = "build-agent"
-
-// buildAgentJobScope 校验任务还在进行中，并把它的租户装进上下文。
-func (s *server) buildAgentJobScope(next gin.HandlerFunc) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		job, err := s.loadBuildJob(c, "", c.Param("id"))
-		if err != nil {
-			return
-		}
-		if job.Status != "claimed" && job.Status != "running" {
-			problem(c, http.StatusConflict, "BUILD_JOB_NOT_RUNNING", "This build is not claimed or running")
-			return
-		}
-		c.Set("tenantId", job.TenantID)
-		c.Set("actorId", buildAgentActor)
-		c.Set("buildAgent", true)
-		c.Set("buildJob", job)
-		next(c)
-	}
-}
-
-// buildAgentUploadsArtifact 告诉产物上传票据：回传地址要给代理通道的那一条，
-// 不是管理端那条——代理没有管理端凭据。
-func buildAgentUploadsArtifact(c *gin.Context) bool {
-	_, ok := c.Get("buildAgent")
-	return ok
-}
-
-// buildAgentReleaseFromArtifact 让代理用任务参数落一条发布记录。平台、版本、
-// build 号一律取**任务行上的值**，不采信请求体——那三个字段决定产物身份，而任务
-// 行上的那份是管理端排队时就定下、并且过了递增校验的。
-func (s *server) buildAgentReleaseFromArtifact(c *gin.Context) {
-	item, _ := c.Get("buildJob")
-	job, ok := item.(buildJob)
-	if !ok {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read the build job")
-		return
-	}
-	var body struct {
-		ArtifactToken string `json:"artifactToken"`
-		// SBOM 与产物一起传上来，同一张票据机制，不同的对象。代理生成不出来时
-		// 整个任务就失败了，所以走到这里它一般是有值的——留空只为兼容手工重放。
-		SBOMToken string `json:"sbomToken"`
-		// 原生面指纹：决定这个包以后能不能收热更新（见 ota_fingerprint.go）
-		NativeFingerprint string `json:"nativeFingerprint"`
-	}
-	if decode(c, &body) != nil || strings.TrimSpace(body.ArtifactToken) == "" {
-		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "artifactToken is required")
-		return
-	}
-	// 说明和平台、版本、build 号一样取任务行上的值：它在排队时就过了校验，
-	// 而代理没有理由知道该写什么说明
-	notes := map[string]any{}
-	for language, lines := range buildJobReleaseNotes(job) {
-		notes[language] = lines
-	}
-	rewriteJSONBody(c, map[string]any{
-		"artifactToken":     body.ArtifactToken,
-		"sbomToken":         body.SBOMToken,
-		"nativeFingerprint": body.NativeFingerprint,
-		"platform":          job.Platform,
-		"version":           job.Version,
-		"buildNumber":       job.BuildNumber,
-		"releaseNotes":      notes,
-		"mandatory":         false,
-	})
-	s.createReleaseFromArtifact(c)
-}
-
-// rewriteJSONBody 把请求体换成服务端自己拼的那一份，供内部转调的处理器读。
-// 代理只送它确实知道的东西（票据、提交）；决定产物发给谁的参数一律来自任务行。
-func rewriteJSONBody(c *gin.Context, payload map[string]any) {
-	raw, _ := json.Marshal(payload)
-	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
-	c.Request.ContentLength = int64(len(raw))
 }

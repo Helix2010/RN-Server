@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // buildJobDBServer 给认领测试一个连着测试库的服务端；没有 RN_TEST_MYSQL_DSN 时跳过。
@@ -13,6 +16,17 @@ import (
 func buildJobDBServer(t *testing.T) *server {
 	t.Helper()
 	return &server{db: openTestDB(t)}
+}
+
+// claimAsBuilder 以一台已登记的构建机身份直接调认领处理函数（鉴权中间件放在路由上，
+// 这里把它会放进上下文的机器记录放进去）。
+func claimAsBuilder(t *testing.T, s *server, machine gateMachine, platforms ...string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	c, recorder := testContext(t, platformTenantID, "POST", "/v1/build-agent/claim",
+		map[string]any{"platforms": platforms, "kinds": []string{"apk", "ota"}})
+	c.Set(machineContextKey, machine.record(""))
+	s.claimBuildJob(c)
+	return c, recorder
 }
 
 // 服务端不把库里那一列的 git_ref 下发出去（build-concurrency-2026-09-15.md §9）。
@@ -32,8 +46,8 @@ func TestDBClaimRefusesAJobWhoseGitRefWasTamperedWith(t *testing.T) {
 		tenant, "refgate-"+uniqueSuffix()); err != nil {
 		t.Fatal(err)
 	}
-	// 队列是跨租户的，而且 claim 里的 reapStaleBuildJobs 会把心跳停了的旧任务
-	// 重新入队——只删 queued 的不够。照 build_jobs_test.go 的做法清掉别人的
+	// 队列是跨租户的，而且回收定时器会把心跳停了的旧任务重新入队——只删 queued 的不够。
+	// 照 build_jobs_test.go 的做法清掉别人的
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM build_jobs WHERE tenant_id<>?`, tenant); err != nil {
 		t.Fatal(err)
 	}
@@ -48,9 +62,7 @@ func TestDBClaimRefusesAJobWhoseGitRefWasTamperedWith(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = s.db.Exec(`DELETE FROM build_jobs WHERE id=?`, jobID) })
 
-	c, recorder := testContext(t, platformTenantID, "POST", "/v1/build-agent/build-jobs/claim",
-		map[string]any{"agent": "builder-1", "platforms": []string{"android"}})
-	s.claimBuildJob(c)
+	c, recorder := claimAsBuilder(t, s, newGateMachine(t, machineRoleBuilder, "builder-1"), "android")
 	// gin 的 c.Status() 是惰性写入的：直接调 handler（不过路由）时不 flush 就
 	// 留在 recorder 默认的 200。仓库里其它 204 断言也是这么做的
 	c.Writer.WriteHeaderNow()
@@ -104,9 +116,7 @@ func TestDBClaimStillDispatchesAJobOnTheFixedBranch(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = s.db.Exec(`DELETE FROM build_jobs WHERE id=?`, jobID) })
 
-	c, recorder := testContext(t, platformTenantID, "POST", "/v1/build-agent/build-jobs/claim",
-		map[string]any{"agent": "builder-1", "platforms": []string{"android"}})
-	s.claimBuildJob(c)
+	_, recorder := claimAsBuilder(t, s, newGateMachine(t, machineRoleBuilder, "builder-1"), "android")
 
 	// 这里不把租户的 App 身份配全（那是另一条链路的事），所以认领可能停在
 	// 409 APP_IDENTITY_INCOMPLETE。要证明的只有一件事：**它不是被 ref 闸挡下的**。

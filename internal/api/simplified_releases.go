@@ -103,12 +103,7 @@ func (s *server) createReleaseArtifactUpload(c *gin.Context) {
 		problem(c, http.StatusServiceUnavailable, "ARTIFACT_TOKEN_UNAVAILABLE", "Artifact upload signing is not configured")
 		return
 	}
-	// 代理走自己那条回传地址：它没有管理端凭据，拿到管理端的 URL 只会 401
-	uploadPath := "/v1/admin/release-artifacts/upload"
-	if buildAgentUploadsArtifact(c) {
-		uploadPath = "/v1/build-agent/jobs/" + c.Param("id") + "/artifact"
-	}
-	uploadURL := s.absoluteURL(c, uploadPath)
+	uploadURL := s.absoluteURL(c, "/v1/admin/release-artifacts/upload")
 	headers := map[string]string{"content-type": body.ContentType, "x-release-artifact-token": token}
 	requiresCredentials := true
 	if s.cfg.ArtifactUploadMode == "direct" {
@@ -205,7 +200,7 @@ func (s *server) deleteReleaseArtifact(c *gin.Context) {
 func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	var body struct {
 		ArtifactToken string `json:"artifactToken"`
-		// SBOM 的上传票据，可选。打包机会带上；人工上传的包没有。
+		// SBOM 的上传票据，可选。人工上传的包一般没有。
 		SBOMToken    string         `json:"sbomToken"`
 		Platform     string         `json:"platform"`
 		Version      string         `json:"version"`
@@ -215,16 +210,15 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		// 按 docs/RELIABILITY_AND_RELEASE.md 只用于严重安全漏洞、协议不兼容、
 		// 法律合规阻断；为什么强制走审计 reason 留痕。
 		Mandatory bool `json:"mandatory"`
-		// NativeFingerprint 是打包机用 @expo/fingerprint 算出来的"原生面"指纹：
-		// 自动链接的原生模块、权限、原生配置变了它就变，纯 JS/样式改动不变。
-		// 热更新包能不能发给这个安装包，靠它判（见 ota_fingerprint.go）。
-		// 人工上传的包没有，那样的基线不能发热更新。
+		// NativeFingerprint 是 @expo/fingerprint 算出来的"原生面"指纹：热更新包能不能发给
+		// 这个安装包，靠它判（见 ota_fingerprint.go）。人工上传的包一般没有，那样的基线不能发热更新。
 		NativeFingerprint string `json:"nativeFingerprint"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "Invalid release payload")
 		return
 	}
+	ctx := c.Request.Context()
 	body.NativeFingerprint = strings.ToLower(strings.TrimSpace(body.NativeFingerprint))
 	if body.NativeFingerprint != "" && !isHex(body.NativeFingerprint, 32, 128) {
 		problem(c, http.StatusBadRequest, "INVALID_RELEASE", "nativeFingerprint must be a hex digest")
@@ -241,60 +235,46 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 		problem(c, http.StatusUnprocessableEntity, notesCode, notesDetail)
 		return
 	}
-	if enabled, err := s.platformEnabled(c.Request.Context(), tenantID(c), body.Platform); err != nil || !enabled {
+	if enabled, err := s.platformEnabled(ctx, tenantID(c), body.Platform); err != nil || !enabled {
 		problem(c, http.StatusUnprocessableEntity, "PLATFORM_DISABLED", "The requested platform is not enabled for this tenant")
 		return
+	}
+	// 签名闸正在给这个租户签的时候不能手工插一个包进来：手工那条会抢走签名闸要用的
+	// build 号与版本号，签名闸签完那一刻在版本递增上失败，而签过的号在签名闸本机记录里
+	// 永远占着。入库事务里还会再查一次，这里先查是为了在下载与解析整个包之前就说清楚
+	if body.Platform == "android" {
+		if blocked, err := s.releaseSigningInFlight(ctx, s.db, tenantID(c), body.Platform); err != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to inspect builds in flight")
+			return
+		} else if blocked {
+			problem(c, http.StatusConflict, "RELEASE_SIGNING_IN_FLIGHT", "A build for this platform is waiting for or being signed by the signer; wait for it to finish, or cancel it, before uploading a release by hand")
+			return
+		}
 	}
 	artifact, err := s.decodeReleaseArtifactToken(tenantID(c), body.ArtifactToken)
 	if err != nil {
 		problem(c, http.StatusUnauthorized, "INVALID_ARTIFACT_TOKEN", err.Error())
 		return
 	}
-	client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))
+	client, _, err := s.storageClientForTenant(ctx, tenantID(c))
 	if err != nil {
 		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
+	verifyCtx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
-	stored, err := client.Stat(ctx, artifact.ObjectKey)
-	if err != nil || stored.Size != artifact.Size {
-		problem(c, http.StatusUnprocessableEntity, "RELEASE_FILE_INVALID", "Uploaded file is missing or has an unexpected size")
+	stored, rejection := s.downloadStoredArtifact(verifyCtx, client, artifact.ObjectKey, artifact.Size)
+	if rejection != nil {
+		problem(c, rejection.Status, rejection.Code, rejection.Detail)
 		return
 	}
-	if strings.TrimSpace(stored.ETag) == "" {
-		// 没有 ETag 就没有"对象被替换"的可检测性：不能带着空值入库，否则下载时只剩大小比对
-		problem(c, http.StatusFailedDependency, "RELEASE_OBJECT_ETAG_MISSING", "Object storage returned no ETag for the uploaded artifact; the release cannot be pinned")
-		return
-	}
-	size := stored.Size
-	temporary, err := os.CreateTemp("", "rn-release-*")
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "RELEASE_VERIFY_FAILED", "Unable to prepare release verification")
-		return
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	objectBody, err := client.Get(ctx, artifact.ObjectKey)
-	if err != nil {
-		_ = temporary.Close()
-		problem(c, http.StatusFailedDependency, "RELEASE_READ_FAILED", "Unable to read uploaded release")
-		return
-	}
-	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(temporary, hash), io.LimitReader(objectBody, s.cfg.ArtifactMaxSizeBytes+1))
-	_ = objectBody.Close()
-	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil || written != size {
-		problem(c, http.StatusFailedDependency, "RELEASE_READ_FAILED", "Unable to read the complete release")
-		return
-	}
+	defer os.Remove(stored.Path)
 	// objectEtag 是校验时对象存储给的 ETag（objectstore.Stat，已去引号）；公开下载前再 Stat 一次比对，
 	// 发布后对象被换掉即拒绝下发。CopyObject / 存储类变更会改 ETag，此时必须重新入库
-	metadata := map[string]any{"fileName": artifact.FileName, "size": size, "sha256": hex.EncodeToString(hash.Sum(nil)), "objectEtag": stored.ETag}
+	metadata := map[string]any{"fileName": artifact.FileName, "size": stored.Size, "sha256": stored.SHA256, "objectEtag": stored.ETag}
 	// SBOM 记在发布记录上，而不是只落在对象存储里：等某个依赖明天爆 CVE，要回答
 	// "线上那个 1.3.12 受不受影响"，得先能从发布记录找到对应的那一份清单。
-	if sbom, err := s.storedSBOM(ctx, client, tenantID(c), strings.TrimSpace(body.SBOMToken)); err != nil {
+	if sbom, err := s.storedSBOM(verifyCtx, client, tenantID(c), strings.TrimSpace(body.SBOMToken)); err != nil {
 		problem(c, http.StatusUnprocessableEntity, "RELEASE_SBOM_INVALID", err.Error())
 		return
 	} else if sbom != nil {
@@ -302,102 +282,255 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 	}
 	runtimeVersion := ""
 	if body.Platform == "android" {
-		apk, inspectErr := apkinspect.Inspect(temporaryPath)
-		// 解析阶段的拒绝还拿不到包名/签名者，审计只记代码与错误摘要；文档承诺每次入库拒绝都留痕
-		rejectBeforeInspect := func(code, detail string) {
-			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, detail, requestID(c), map[string]any{"code": code, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "error": inspectErr.Error()}))
-			problem(c, http.StatusUnprocessableEntity, code, detail)
-		}
-		if errors.Is(inspectErr, apkinspect.ErrEmbeddedConfigInvalid) {
-			// 有内嵌配置但不是合法 JSON：这是构建产物损坏，不能当成"没有 applicationId"报缺失
-			rejectBeforeInspect("RELEASE_EMBEDDED_CONFIG_INVALID", "APK embedded Expo config is not valid JSON")
-			return
-		}
-		if inspectErr != nil {
-			rejectBeforeInspect("RELEASE_VERIFY_FAILED", "Android package or signature verification failed")
-			return
-		}
-		// 先看身份再看版本：公开 debug 密钥、未 pin、包名或签名者不符的包不该走到版本比对
-		pin, pinErr := s.androidReleaseIdentityRecord(ctx, tenantID(c))
-		if pinErr != nil {
+		verified, rejection, err := s.verifyAndroidArtifact(verifyCtx, tenantID(c), stored.Path, body.Version, body.BuildNumber)
+		if err != nil {
 			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.android configuration is invalid")
 			return
 		}
-		var pinned *androidReleaseIdentity
-		if pin != nil {
-			pinned = &pin.Value
-		}
-		if code, detail := checkAndroidReleaseIdentity(apk, pinned, s.cfg.Environment == "production"); code != "" {
-			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, detail, requestID(c), map[string]any{"code": code, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "packageName": apk.PackageName, "signerSha256": normalizeFingerprint(apk.SignerSHA256)}))
-			problem(c, http.StatusUnprocessableEntity, code, detail)
+		if rejection != nil {
+			rejection.Summary["platform"] = body.Platform
+			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, rejection.Detail, requestID(c), rejection.Summary))
+			problem(c, rejection.Status, rejection.Code, rejection.Detail)
 			return
 		}
-		rejectRelease := func(code, detail string) {
-			s.auditNow(newAudit(tenantID(c), actor(c), "release_rejected", "release-artifact", artifact.ID, detail, requestID(c), map[string]any{"code": code, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "packageName": apk.PackageName, "signerSha256": normalizeFingerprint(apk.SignerSHA256)}))
-			problem(c, http.StatusUnprocessableEntity, code, detail)
+		runtimeVersion = verified.RuntimeVersion
+		for key, value := range verified.Metadata {
+			metadata[key] = value
 		}
-		if apk.ApplicationID == "" {
-			rejectRelease("RELEASE_APPLICATION_ID_MISSING", "APK does not embed extra.applicationId; OTA identity cannot be bound to it")
-			return
-		}
-		runtimeVersion = apk.RuntimeVersion
-		metadata["packageName"], metadata["versionName"], metadata["versionCode"], metadata["runtimeVersion"] = apk.PackageName, apk.VersionName, apk.VersionCode, runtimeVersion
-		metadata["minSdk"], metadata["signerSha256"], metadata["signingScheme"] = apk.MinSDK, normalizeFingerprint(apk.SignerSHA256), apk.SigningScheme
-		metadata["applicationId"] = apk.ApplicationID
 		if body.NativeFingerprint != "" {
 			metadata["nativeFingerprint"] = body.NativeFingerprint
 		}
-		if apk.VersionName != body.Version || apk.VersionCode != int64(body.BuildNumber) {
-			rejectRelease("RELEASE_IDENTITY_MISMATCH", "APK versionName/versionCode does not match the release version and build number")
-			return
-		}
-	}
-	conn, err := s.db.Conn(c.Request.Context())
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to create release")
-		return
-	}
-	defer conn.Close()
-	lockName := "rn_release_" + tenantID(c) + "_" + body.Platform
-	var locked int
-	if err = conn.QueryRowContext(c.Request.Context(), `SELECT GET_LOCK(?,5)`, lockName).Scan(&locked); err != nil || locked != 1 {
-		problem(c, http.StatusConflict, "RELEASE_SEQUENCE_BUSY", "Another release is being created for this platform")
-		return
-	}
-	defer conn.ExecContext(context.Background(), `SELECT RELEASE_LOCK(?)`, lockName)
-	tx, err := conn.BeginTx(c.Request.Context(), nil)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to create release")
-		return
-	}
-	defer tx.Rollback()
-	var latestBuild int
-	var latestVersion sql.NullString
-	err = tx.QueryRowContext(c.Request.Context(), `SELECT version,build_number FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 1`, tenantID(c), body.Platform).Scan(&latestVersion, &latestBuild)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to read release sequence")
-		return
-	}
-	if body.BuildNumber <= latestBuild || (latestVersion.Valid && compareVersion(body.Version, latestVersion.String) <= 0) {
-		problem(c, http.StatusConflict, "RELEASE_VERSION_NOT_INCREASING", "Version and build number must both be greater than the latest release for this platform")
-		return
 	}
 	now := time.Now().UTC()
-	id := "rel_" + randomID(16)
-	// map[string][]string 一定能序列化，没有需要处理的错误分支
-	notes, _ := json.Marshal(releaseNotes)
-	rawMetadata, _ := json.Marshal(metadata)
-	_, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, tenantID(c), body.Platform, body.Version, body.BuildNumber, runtimeVersion, "verified", notes, artifact.ObjectKey, artifact.FileName, artifact.ContentType, artifact.Size, size, metadata["sha256"], rawMetadata, body.Mandatory, now, actor(c), now, now)
+	insert := releaseInsert{
+		ID: "rel_" + randomID(16), Tenant: tenantID(c), Platform: body.Platform, Version: body.Version, BuildNumber: body.BuildNumber,
+		RuntimeVersion: runtimeVersion, ObjectKey: artifact.ObjectKey, FileName: artifact.FileName, ContentType: artifact.ContentType,
+		ExpectedSize: artifact.Size, FileSize: stored.Size, SHA256: stored.SHA256, Metadata: metadata, Notes: releaseNotes,
+		Mandatory: body.Mandatory, Actor: actor(c), RequestID: requestID(c), AuditReason: "Uploaded artifact verified and saved",
+	}
+	rejection, err = s.withReleaseSequence(ctx, tenantID(c), body.Platform, func(tx *sql.Tx) (*releaseRejection, error) {
+		if body.Platform == "android" {
+			blocked, err := s.releaseSigningInFlight(ctx, tx, tenantID(c), body.Platform)
+			if err != nil {
+				return nil, err
+			}
+			if blocked {
+				return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_SIGNING_IN_FLIGHT",
+					Detail: "A build for this platform is waiting for or being signed by the signer; wait for it to finish, or cancel it, before uploading a release by hand"}, nil
+			}
+		}
+		return insertReleaseInTx(ctx, tx, insert, now)
+	})
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "release_create", "release", id, "Uploaded artifact verified and saved", requestID(c), map[string]any{"platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "mandatory": body.Mandatory})
-	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
-		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to save release audit")
+	if rejection != nil {
+		problem(c, rejection.Status, rejection.Code, rejection.Detail)
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": id, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": releaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": size, "sha256": metadata["sha256"], "fileMetadata": metadata, "mandatory": body.Mandatory, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
+	c.JSON(http.StatusCreated, gin.H{"release": gin.H{"id": insert.ID, "platform": body.Platform, "version": body.Version, "buildNumber": body.BuildNumber, "runtimeVersion": runtimeVersion, "status": "verified", "releaseNotes": releaseNotes, "fileName": artifact.FileName, "contentType": artifact.ContentType, "expectedSize": artifact.Size, "fileSize": stored.Size, "sha256": stored.SHA256, "fileMetadata": metadata, "mandatory": body.Mandatory, "verifiedAt": iso(now), "createdAt": iso(now), "updatedAt": iso(now), "lastAction": nil}})
+}
+
+// ---- 入库校验（手工上传与签名闸共用） ----
+
+// releaseRejection 是入库校验的拒绝：状态码、错误码、说明，以及写审计用的摘要。
+type releaseRejection struct {
+	Status  int
+	Code    string
+	Detail  string
+	Summary map[string]any
+}
+
+// storedArtifact 是从对象存储取回、落在本地临时文件里的产物。调用方负责删掉 Path。
+type storedArtifact struct {
+	Path   string
+	Size   int64
+	SHA256 string
+	ETag   string
+}
+
+// downloadStoredArtifact 核对对象存在、大小与声明一致、带 ETag，再整份取回算 sha256。
+func (s *server) downloadStoredArtifact(ctx context.Context, client objectstore.Client, key string, expectedSize int64) (storedArtifact, *releaseRejection) {
+	stat, err := client.Stat(ctx, key)
+	if err != nil || stat.Size != expectedSize {
+		return storedArtifact{}, &releaseRejection{Status: http.StatusUnprocessableEntity, Code: "RELEASE_FILE_INVALID", Detail: "Uploaded file is missing or has an unexpected size"}
+	}
+	if strings.TrimSpace(stat.ETag) == "" {
+		// 没有 ETag 就没有"对象被替换"的可检测性：不能带着空值入库，否则下载时只剩大小比对
+		return storedArtifact{}, &releaseRejection{Status: http.StatusFailedDependency, Code: "RELEASE_OBJECT_ETAG_MISSING", Detail: "Object storage returned no ETag for the uploaded artifact; the release cannot be pinned"}
+	}
+	temporary, err := os.CreateTemp("", "rn-release-*")
+	if err != nil {
+		return storedArtifact{}, &releaseRejection{Status: http.StatusInternalServerError, Code: "RELEASE_VERIFY_FAILED", Detail: "Unable to prepare release verification"}
+	}
+	objectBody, err := client.Get(ctx, key)
+	if err != nil {
+		_ = temporary.Close()
+		_ = os.Remove(temporary.Name())
+		return storedArtifact{}, &releaseRejection{Status: http.StatusFailedDependency, Code: "RELEASE_READ_FAILED", Detail: "Unable to read uploaded release"}
+	}
+	hash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(temporary, hash), io.LimitReader(objectBody, s.cfg.ArtifactMaxSizeBytes+1))
+	_ = objectBody.Close()
+	closeErr := temporary.Close()
+	if copyErr != nil || closeErr != nil || written != stat.Size {
+		_ = os.Remove(temporary.Name())
+		return storedArtifact{}, &releaseRejection{Status: http.StatusFailedDependency, Code: "RELEASE_READ_FAILED", Detail: "Unable to read the complete release"}
+	}
+	return storedArtifact{Path: temporary.Name(), Size: stat.Size, SHA256: hex.EncodeToString(hash.Sum(nil)), ETag: stat.ETag}, nil
+}
+
+// verifiedAndroidArtifact 是通过了入库校验的 Android 包。
+type verifiedAndroidArtifact struct {
+	APK            apkinspect.Metadata
+	RuntimeVersion string
+	Metadata       map[string]any
+}
+
+// verifyAndroidArtifact 在事务外做完一个 Android 包入库前的全部校验：解析与签名校验、
+// 公开 debug 密钥、作废的旧指纹、发布身份（包名 + 签名者）、内嵌 applicationId、
+// versionName/versionCode 与发布记录一致。手工上传与签名闸完成共用这一个函数，
+// 复制一份出来迟早会漏掉其中一条，而漏掉的那条正是门禁存在的理由。
+func (s *server) verifyAndroidArtifact(ctx context.Context, tenant, path, version string, buildNumber int) (verifiedAndroidArtifact, *releaseRejection, error) {
+	var verified verifiedAndroidArtifact
+	apk, inspectErr := apkinspect.Inspect(path)
+	summary := map[string]any{"version": version, "buildNumber": buildNumber}
+	if inspectErr != nil {
+		// 解析阶段的拒绝还拿不到包名/签名者，审计只记代码与错误摘要
+		summary["error"] = inspectErr.Error()
+		if errors.Is(inspectErr, apkinspect.ErrEmbeddedConfigInvalid) {
+			// 有内嵌配置但不是合法 JSON：这是构建产物损坏，不能当成"没有 applicationId"报缺失
+			return verified, &releaseRejection{Status: http.StatusUnprocessableEntity, Code: "RELEASE_EMBEDDED_CONFIG_INVALID", Detail: "APK embedded Expo config is not valid JSON", Summary: withCode(summary, "RELEASE_EMBEDDED_CONFIG_INVALID")}, nil
+		}
+		return verified, &releaseRejection{Status: http.StatusUnprocessableEntity, Code: "RELEASE_VERIFY_FAILED", Detail: "Android package or signature verification failed", Summary: withCode(summary, "RELEASE_VERIFY_FAILED")}, nil
+	}
+	summary["packageName"], summary["signerSha256"] = apk.PackageName, normalizeFingerprint(apk.SignerSHA256)
+	// 先看身份再看版本：公开 debug 密钥、作废指纹、未 pin、包名或签名者不符的包不该走到版本比对
+	pin, err := s.androidReleaseIdentityRecord(ctx, tenant)
+	if err != nil {
+		return verified, nil, err
+	}
+	var pinned *androidReleaseIdentity
+	if pin != nil {
+		pinned = &pin.Value
+	}
+	reject := func(code, detail string) (verifiedAndroidArtifact, *releaseRejection, error) {
+		return verified, &releaseRejection{Status: http.StatusUnprocessableEntity, Code: code, Detail: detail, Summary: withCode(summary, code)}, nil
+	}
+	if code, detail := checkAndroidReleaseIdentity(apk, pinned, s.cfg.Environment == "production"); code != "" {
+		return reject(code, detail)
+	}
+	if apk.ApplicationID == "" {
+		return reject("RELEASE_APPLICATION_ID_MISSING", "APK does not embed extra.applicationId; OTA identity cannot be bound to it")
+	}
+	if apk.VersionName != version || apk.VersionCode != int64(buildNumber) {
+		return reject("RELEASE_IDENTITY_MISMATCH", "APK versionName/versionCode does not match the release version and build number")
+	}
+	verified.APK = apk
+	verified.RuntimeVersion = apk.RuntimeVersion
+	verified.Metadata = map[string]any{
+		"packageName": apk.PackageName, "versionName": apk.VersionName, "versionCode": apk.VersionCode, "runtimeVersion": apk.RuntimeVersion,
+		"minSdk": apk.MinSDK, "signerSha256": normalizeFingerprint(apk.SignerSHA256), "signingScheme": apk.SigningScheme,
+		"applicationId": apk.ApplicationID,
+	}
+	return verified, nil, nil
+}
+
+func withCode(summary map[string]any, code string) map[string]any {
+	out := make(map[string]any, len(summary)+1)
+	for key, value := range summary {
+		out[key] = value
+	}
+	out["code"] = code
+	return out
+}
+
+// releaseSigningInFlight：该租户该平台有 built 或 signing 的安装包任务。
+func (s *server) releaseSigningInFlight(ctx context.Context, q rowQuerier, tenant, platform string) (bool, error) {
+	var exists int
+	err := q.QueryRowContext(ctx, `SELECT 1 FROM build_jobs WHERE tenant_id=? AND platform=? AND kind='apk' AND status IN ('built','signing') LIMIT 1`, tenant, platform).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// withReleaseSequence 在"该租户该平台的发布序列锁"里开一个事务执行 fn。
+//
+// 锁是 GET_LOCK 命名锁，拿不到（另一个入库正在进行）回 409 RELEASE_SEQUENCE_BUSY——签名闸把它
+// 当作临时错误重试。fn 返回拒绝或错误时事务回滚。
+func (s *server) withReleaseSequence(ctx context.Context, tenant, platform string, fn func(tx *sql.Tx) (*releaseRejection, error)) (*releaseRejection, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	lockName := "rn_release_" + tenant + "_" + platform
+	var locked sql.NullInt64
+	if err := conn.QueryRowContext(ctx, `SELECT GET_LOCK(?,5)`, lockName).Scan(&locked); err != nil || !locked.Valid || locked.Int64 != 1 {
+		return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_SEQUENCE_BUSY", Detail: "Another release is being created for this platform"}, nil
+	}
+	defer conn.ExecContext(context.Background(), `SELECT RELEASE_LOCK(?)`, lockName)
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rejection, err := fn(tx)
+	if err != nil || rejection != nil {
+		return rejection, err
+	}
+	return nil, tx.Commit()
+}
+
+// releaseInsert 是一条要写进 app_releases 的发布记录。
+type releaseInsert struct {
+	ID, Tenant, Platform, Version string
+	BuildNumber                   int
+	RuntimeVersion                string
+	ObjectKey, FileName           string
+	ContentType                   string
+	ExpectedSize, FileSize        int64
+	SHA256                        string
+	Metadata                      map[string]any
+	Notes                         map[string][]string
+	Mandatory                     bool
+	Actor, RequestID, AuditReason string
+	AuditSummary                  map[string]any
+}
+
+// insertReleaseInTx 在调用方的事务里做版本递增校验、写发布记录与 release_create 审计。
+// 调用方必须已经拿着 withReleaseSequence 的锁：递增校验读的是"该平台最新一条"，没有锁时
+// 两个并发入库都会读到同一个最大值。
+func insertReleaseInTx(ctx context.Context, tx *sql.Tx, r releaseInsert, now time.Time) (*releaseRejection, error) {
+	var latestBuild int
+	var latestVersion sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT version,build_number FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 1`, r.Tenant, r.Platform).Scan(&latestVersion, &latestBuild)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if r.BuildNumber <= latestBuild || (latestVersion.Valid && compareVersion(r.Version, latestVersion.String) <= 0) {
+		return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_VERSION_NOT_INCREASING", Detail: "Version and build number must both be greater than the latest release for this platform"}, nil
+	}
+	// map[string][]string 一定能序列化，没有需要处理的错误分支
+	notes, _ := json.Marshal(r.Notes)
+	rawMetadata, err := json.Marshal(r.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Tenant, r.Platform, r.Version, r.BuildNumber, r.RuntimeVersion, "verified", notes, r.ObjectKey, r.FileName, r.ContentType, r.ExpectedSize, r.FileSize, r.SHA256, rawMetadata, r.Mandatory, now, r.Actor, now, now); err != nil {
+		return nil, err
+	}
+	summary := map[string]any{"platform": r.Platform, "version": r.Version, "buildNumber": r.BuildNumber, "mandatory": r.Mandatory}
+	for key, value := range r.AuditSummary {
+		summary[key] = value
+	}
+	if err := insertAudit(ctx, tx, newAudit(r.Tenant, r.Actor, "release_create", "release", r.ID, r.AuditReason, r.RequestID, summary)); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // visibleSimplifiedRelease 取这台设备现在该拿的那一个全量版本：active，或者

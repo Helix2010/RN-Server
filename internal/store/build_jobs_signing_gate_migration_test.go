@@ -106,7 +106,9 @@ func TestDBLiveBuildNumberHoldsTheNumberWhileSigning(t *testing.T) {
 			VALUES(?,?,'android',?,'main','1.0.0',?,?,JSON_ARRAY(),'migration test','tester',?,?)`, id, tenant, kind, buildNumber, status, now, now)
 		return err
 	}
-	isDuplicate := func(err error) bool { return err != nil && strings.Contains(err.Error(), "ux_build_jobs_live_build_number") }
+	isDuplicate := func(err error) bool {
+		return err != nil && strings.Contains(err.Error(), "ux_build_jobs_live_build_number")
+	}
 
 	for i, state := range []string{"built", "signing"} {
 		number := 10 + i

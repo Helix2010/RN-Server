@@ -106,7 +106,8 @@ ssh amos 'cd ~/rn-foundation-deploy && ./install.sh'
 
 # 3. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*
 #    MYSQL_DSN 一行（user:password@tcp(host:port)/database?params）、STORAGE_MASTER_KEY、
-#    ADMIN_* 与 BUILD_AGENT_TOKEN。ADMIN_API_KEY 另生成：openssl rand -hex 32
+#    与 ADMIN_*。ADMIN_API_KEY 另生成：openssl rand -hex 32。构建机与签名闸的令牌不在这里，
+#    在控制台「打包机与签名闸」新建机器时签发（只显示一次）
 #    填完 `rn-server config` 核对：它打印实际生效的值并标出哪些来自 env
 
 # 4. 回开发机，编译并推送二进制与两份控制台

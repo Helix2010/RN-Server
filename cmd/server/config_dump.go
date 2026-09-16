@@ -64,9 +64,8 @@ func printConfig(cfg config.Config) {
 		num("ADMIN_LOGIN_WINDOW_SECONDS", cfg.AdminLoginWindow),
 	})
 
-	section("机密与打包", []entry{
+	section("机密", []entry{
 		secret("STORAGE_MASTER_KEY", cfg.StorageMasterKey),
-		secret("BUILD_AGENT_TOKEN", cfg.BuildAgentToken),
 		secret("DEVICE_IDENTITY_HMAC_KEY", os.Getenv("DEVICE_IDENTITY_HMAC_KEY")),
 	})
 

@@ -79,7 +79,7 @@ func (s *server) decodeUploadSessionToken(tenant, encoded string) (uploadSession
 }
 
 func uploadSessionTokenFromRequest(c *gin.Context) string {
-	for _, name := range []string{"x-upload-session-token", "x-release-artifact-token", "x-ota-artifact-token"} {
+	for _, name := range []string{"x-upload-session-token", "x-release-artifact-token"} {
 		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
 			return value
 		}
@@ -102,8 +102,11 @@ func (s *server) createUploadSession(c *gin.Context) {
 	body.UploadType = strings.ToLower(strings.TrimSpace(body.UploadType))
 	body.FileName = path.Base(strings.TrimSpace(body.FileName))
 	body.ContentType = strings.ToLower(strings.TrimSpace(body.ContentType))
-	if body.UploadType != "apk" && body.UploadType != "ota" || body.FileName == "" || body.FileName == "." || body.Size < 1 || body.Size > s.cfg.ArtifactMaxSizeBytes {
-		problem(c, 422, "INVALID_UPLOAD_SESSION", "uploadType, fileName and size are invalid")
+	// 只剩安装包。uploadType=ota 的会话唯一的去处是 POST /ota/releases，而热更新修订现在
+	// 只能由 kind=ota 的构建任务产出（设计 android-signing-gate-2026-09-16「热更新」），
+	// 留着它就是一条走不通、却能往桶里塞大文件的路
+	if body.UploadType != "apk" || body.FileName == "" || body.FileName == "." || body.Size < 1 || body.Size > s.cfg.ArtifactMaxSizeBytes {
+		problem(c, 422, "INVALID_UPLOAD_SESSION", "uploadType must be apk; fileName and size are required")
 		return
 	}
 	if body.PartSize == 0 {
@@ -339,11 +342,12 @@ func (s *server) emitCompletedUpload(c *gin.Context, session uploadSessionView) 
 	var artifactToken string
 	var err error
 	expiresAt := time.Now().UTC().Add(time.Duration(s.cfg.ArtifactUploadTTL) * time.Second)
-	if session.UploadType == "apk" {
-		artifactToken, err = s.encodeReleaseArtifactToken(releaseArtifactToken{ID: session.ID, TenantID: tenantID(c), ObjectKey: session.ObjectKey, FileName: session.FileName, ContentType: session.ContentType, Size: session.ExpectedSize, ExpiresAt: expiresAt.Unix()})
-	} else {
-		artifactToken, err = s.encodeOTAUploadToken(otaUploadToken{ID: session.ID, TenantID: tenantID(c), ObjectKey: session.ObjectKey, FileName: session.FileName, ContentType: session.ContentType, Size: session.ExpectedSize, ExpiresAt: expiresAt.Unix()})
+	if session.UploadType != "apk" {
+		// 迁移之前建的 ota 会话：它能换到的票据已经没有接口收了
+		problem(c, 409, "UPLOAD_SESSION_TYPE_RETIRED", "OTA packages are produced by OTA build jobs only; this upload session can no longer be completed")
+		return
 	}
+	artifactToken, err = s.encodeReleaseArtifactToken(releaseArtifactToken{ID: session.ID, TenantID: tenantID(c), ObjectKey: session.ObjectKey, FileName: session.FileName, ContentType: session.ContentType, Size: session.ExpectedSize, ExpiresAt: expiresAt.Unix()})
 	if err != nil {
 		problem(c, 503, "UPLOAD_ARTIFACT_TOKEN_UNAVAILABLE", "Unable to create artifact token")
 		return
