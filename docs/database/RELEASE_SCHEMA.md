@@ -10,7 +10,7 @@
 | `objectEtag` | 入库时 `objectstore.Stat` | 对象存储 ETag，去引号；分段上传形如 `<md5>-<n>` | **键不存在**：2026-09-10 前的旧记录，下载只比大小并 warning 一次；**键存在但为空/非字串**：500 `RELEASE_METADATA_INVALID`。入库时 ETag 为空直接拒绝（`RELEASE_OBJECT_ETAG_MISSING`） |
 | `packageName`、`versionName`、`versionCode`、`minSdk`、`signerSha256`、`signingScheme`、`runtimeVersion` | `apkinspect`（仅 Android） | 包身份；`signerSha256` 小写 hex | 入库必写（Android） |
 | `applicationId` | `apkinspect` 读内嵌 `extra.applicationId`（仅 Android） | App 身份（`X-Application-ID`），OTA 的 `extra.applicationId` 必须与之相等 | 旧记录缺失时由 OTA 创建路径回填（先核对对象 sha256/大小，见 OPERATIONS §5） |
-| `nativeFingerprint` | 签名闸交回时为签名闸从包里读出、与构建机上报一致的值；手工上传时为请求里带的值 | 原生面指纹，热更新能不能挂在这个包上靠它判 | 键不存在 = 不能做热更新基线 |
+| `nativeFingerprint` | 签名闸交回时为任务行上构建机上报、经出处声明核对过的值（包里读不出来），签名闸 `complete` 带的值必须与它相等；手工上传时为请求里带的值 | 原生面指纹，热更新能不能挂在这个包上靠它判 | 键不存在 = 不能做热更新基线 |
 | `unsignedSha256` | 签名闸完成（`POST /v1/signer/jobs/:id/complete`） | 构建机交付的未签名包 sha256；已签名包的 sha256 就是上面的 `sha256` | 手工上传的记录没有这个键 |
 | `sbom` | 签名闸完成：`{"fileName","objectKey","size","sha256","format":"cyclonedx-json"}`；手工上传带 `sbomToken` 时：`{"fileName","objectKey","size","format"}` | 这个包的依赖清单在对象存储里的位置 | 键不存在 = 没有 SBOM |
 | `commitSha`、`commitSelfReported` | 签名闸完成 | 构建机检出的提交；`commitSelfReported` 恒为 `true`——提交由构建机自报，服务端没有 GitHub 凭据去核对 | 手工上传的记录没有 |
@@ -75,7 +75,7 @@ ota：queued → claimed → running → succeeded
 | signing → built | 签名闸 `/release`（暂不能签） | 不计 `sign_failures` |
 | signing → built / failed | 签名闸 `/reject` transient；回收定时器：5 分钟无签名心跳 | `sign_failures+1`，到 2 判失败 |
 | signing → failed | 签名闸 `/reject` violation；管理端 force-fail | — |
-| signing → succeeded | 签名闸 `/complete` | 与写 `app_releases` 同一事务；已 succeeded 且已签名包 sha256 相同按幂等返回 |
+| signing → succeeded | 签名闸 `/complete` | 先刷新签名心跳再复核；与写 `app_releases` 同一事务，事务里带共享锁重读发布身份与签名密钥，变了 409 `RELEASE_IDENTITY_CHANGED`；已 succeeded 且同一签名闸、同一签名编号、同一 sha256 按幂等返回 |
 | queued/claimed/built → canceled | 管理端取消 | built 只对 apk |
 
 ### 列（迁移 54 新增）
@@ -104,6 +104,7 @@ ota：queued → claimed → running → succeeded
 - `ix_build_jobs_claimed_machine (claimed_machine_id, status)`：每台构建机同时只派一条。
 - 排队时就要求严格递增（`app_releases` 与在途任务一起算），android apk 还要求主签名闸就绪（409 `SIGNER_NOT_READY`）。
 - 手工上传 Android 发布记录时，该租户该平台有 `built`/`signing` 任务就 409 `RELEASE_SIGNING_IN_FLIGHT`：手工那条会抢走签名闸要用的版本号。
+- 交付对象随任务放弃或重新认领删除：状态变化与键列置空同一个事务，提交后删对象，删不掉只记日志。退回待签名只删已签名包；签成的任务的未签名包与 SBOM 随发布记录删除。
 - `log_tail` 最多 200 行、每行最多 2000 字节。
 - 认领是**跨租户**的，取最早那条。解析不出租户、`git_ref` 不是固定分支的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。
 - 回收是服务端独立的定时器（每分钟），条件更新，多实例并发安全。

@@ -16,14 +16,14 @@
 
 - 转移规则写成一张表（`internal/api/build_job_states.go`），每个写状态的 SQL 用同一张表导出的状态集合拼条件，测试逐项断言非法转移返回 409。
 - 构建机（`/v1/build-agent`）只拿到构建参数，**领取结果里没有任何密钥密文或口令**；它交付未签名包、CycloneDX SBOM 与 Ed25519 出处声明（`signing/provenance`），服务端验签并逐项比对声明与任务行后置为 `built`。
-- 签名闸（`/v1/signer`）领 `built` 的任务、下载未签名包、自己签名、上传已签名包，再调 `complete`。服务端在 `complete` 里用 `internal/apkinspect` 复核已签名包（签名者 = 登记证书 = 请求值、包名、版本、非 debug、非作废指纹），然后**一个事务**：锁任务行 → 校验状态、`sign_attempt`、签名机器 → 版本递增校验 → 写 `app_releases` → 任务 `succeeded`。已经 `succeeded` 且已签名包 sha256 相同，按幂等返回同一个 `releaseId`。崩溃点注入测试覆盖事务内三处与提交后一处。
-- 签名认领只派同租户同平台在途任务里 build 号最小的那条，只派给登记为 `primary` 且 `active` 的签名闸，且该租户就绪（见 5）、签名闸报的就绪项与服务端当前值完全一致。
+- 签名闸（`/v1/signer`）领 `built` 的任务、下载未签名包、自己签名、上传已签名包，再调 `complete`。服务端在 `complete` 里用 `internal/apkinspect` 复核已签名包（签名者 = 登记证书 = 请求值、包名、版本、非 debug、非作废指纹），然后**一个事务**：锁任务行 → 校验状态、`sign_attempt`、签名机器 → 核对复核过的对象键没被重传替换、签名闸没被吊销、带共享锁重读 `release.android` 与 `build.keystore` 仍与复核时一致（否则 409 `RELEASE_IDENTITY_CHANGED`）→ 版本递增校验 → 写 `app_releases` → 任务 `succeeded`。复核开始前先刷新签名心跳，大包复核期间不会被回收。已经 `succeeded` 且是同一台签名闸、同一个签名编号交回的同一个包，按幂等返回同一个 `releaseId`；别的签名闸或编号 409。崩溃点注入测试覆盖事务内三处与提交后一处。
+- 签名认领只派同租户同平台在途任务里 build 号最小的那条，只派给登记为 `primary` 且 `active` 的签名闸，且该租户就绪（见 5）、签名闸报的就绪项与服务端当前值完全一致。候选按租户各取一条（该租户在途 build 号最小且已构建完的那条），不截前 N 条：长期不就绪的租户不会饿死后面的租户。
 
 ### 2. 编号防护与独立回收
 
 - 每次构建认领 `attempt+1`，每次签名认领 `sign_attempt+1`；机器的所有任务级请求带 `x-build-attempt` / `x-sign-attempt`，写入 SQL 条件带编号与机器 id，不匹配 409 `BUILD_ATTEMPT_STALE` / `SIGN_ATTEMPT_STALE`。未签名包、SBOM、已签名包的对象键含编号与每次上传一个的随机段，写键与校验编号在锁住任务行的同一个事务里；迟到或过期的上传只删自己写的对象，碰不到已被任务行或发布记录引用的键。`complete` 只从任务行记下的键取包，事务里再核对键没被重传替换、签名闸没在复核期间被吊销。
 - 回收是服务端独立定时器（每分钟，`RunBuildJobReaper`，随进程退出），不再挂在打包机认领上：`claimed/running` 10 分钟无心跳，安装包回 `queued`（`attempt` 到 3 判失败），热更新判失败；`signing` 5 分钟无心跳回 `built` 并 `sign_failures+1`。
-- `sign_failures` 单独一列：签名闸"暂不能签"（`release`，例如本机还没确认）不计数；心跳超时与"临时错误放弃"（`reject transient`）各加一，到 2 判失败；"违规"（`reject violation`）直接失败。三种结论都写 `sign_outcome` 与审计（actor `system-signer`）。
+- `sign_failures` 单独一列：签名闸"暂不能签"（`release`，例如本机还没确认）不计数；心跳超时与"临时错误放弃"（`reject transient`）各加一，到 2 判失败；"违规"（`reject violation`）直接失败。三种结论都写进 `sign_outcome`（只保留最近一次）；**审计只写判失败的那一次**（违规 `build_job_sign_rejected`，临时错误或心跳超时到上限 `build_job_sign_failed`，actor `system-signer`）。暂不能签与没到上限的临时错误不写审计：签名闸每一轮轮询都可能报一次，写审计会刷屏，而 `sign_outcome` 已经说清楚最近一次为什么没签成。这里改的是文档（原先写成"三种结论都写审计"与实现不符），没有改实现。
 - `live_build_number` 生成列把 `built`、`signing` 算作占号，签名期间同一个 build 号不能再排一条。
 - 手工上传 Android 发布记录时，该租户该平台有 `built`/`signing` 任务就 409 `RELEASE_SIGNING_IN_FLIGHT`，免得手工包抢走签名闸正要用的版本号。任务还在排队或构建时手工上传照常放行；签名认领在同一把发布序列锁里比对已有发布，被超过的任务当场判失败、不派（签名闸会在本机记录里占掉派出去的 versionCode）。
 
@@ -44,15 +44,23 @@
 
 ### 5. 就绪判断
 
-排队与签名认领用同一个函数：有 v3 密钥且与发布身份一致；有 active primary 签名闸且密钥发给了它；服务端算得出信任根；primary 对当前密钥版本报告了试解成功、本机确认、确认时的信任根摘要等于服务端当前摘要、试签成功。不满足时排队 409 `SIGNER_NOT_READY`，detail 逐条列出缺什么。
+排队与签名认领用同一个函数：有 v3 密钥且与发布身份一致；有 active primary 签名闸且密钥发给了它；服务端算得出信任根；primary 对当前密钥版本报告了试解成功、本机确认、确认时的信任根摘要等于服务端当前摘要、试签成功。不满足时排队 409 `SIGNER_NOT_READY`，detail 逐条列出缺什么，问题体里另带 `readinessProblems`；控制台签名密钥页 `GET /v1/admin/build-keystore` 带同样的 `readinessProblems`（就绪时为空数组）。每条原因有固定 code（OpenAPI `SignerReadinessProblem`，测试保证服务端全集与契约枚举一致）：`KEYSTORE_NOT_CONFIGURED`、`KEYSTORE_LEGACY_FORMAT`、`RELEASE_IDENTITY_NOT_CONFIGURED`、`RELEASE_IDENTITY_MISMATCH`、`PRIMARY_SIGNER_MISSING`、`PRIMARY_SIGNER_NOT_RECIPIENT`、`APP_IDENTITY_INCOMPLETE`、`OTA_CERTIFICATE_NOT_CONFIGURED`、`API_BASE_URL_INVALID`、`TRUST_ROOTS_INVALID`、`PRIMARY_SIGNER_NOT_CHECKED`、`PRIMARY_SIGNER_DECRYPT_FAILED`、`PRIMARY_SIGNER_NOT_CONFIRMED`、`TRUST_ROOTS_CHANGED`、`PRIMARY_SIGNER_TRIAL_SIGN_PENDING`、`PRIMARY_SIGNER_TRIAL_SIGN_FAILED`。
 
-信任根摘要由 `signing/trustroots` 计算，服务端与签名闸共用：租户改了 `apiBaseUrl` 或 OTA 证书，摘要就变，在主签名闸重新 `confirm` 之前不能排队。App Links host 按 RN-App `app.config.ts` 的规则（`new URL(apiBaseUrl).host`）派生，有测试钉住；`apiBaseUrl` 显式写了 `:443` 的判为不就绪（`trustroots.AppLinksHostFor` 保留端口，与 WHATWG URL 去默认端口的结果不同，要求改掉而不是替它猜）。
+信任根摘要由 `signing/trustroots` 计算，服务端与签名闸共用：租户改了 `apiBaseUrl` 或 OTA 证书，摘要就变，在主签名闸重新 `confirm` 之前不能排队。App Links host 按 RN-App `app.config.ts` 的规则（`new URL(apiBaseUrl).host`）派生，有测试钉住。`apiBaseUrl` 在**保存打包配置时**就用 `trustroots.ValidateAPIBaseURL` 校验（去掉首尾空白与结尾 `/` 之后）：显式写默认端口 `:443`、大写域名、IP、带路径一律 400——WHATWG URL 会去掉 `:443`，同一个源两种写法会让服务端与签名闸对 host 与摘要得出不同结论，所以要求配置本身是唯一写法，而不是存进去再判不就绪。校验收紧之前存下的旧值在就绪判断里报 `API_BASE_URL_INVALID`。
 
 ### 6. 作废指纹永久拒绝
 
 2026-09 重置作废的两张证书（anyfun `1a5d9fb4…e694`、predict-kim `9ab5fbe6…cf37`）写成服务端常量，在登记发布身份、登记签名密钥、上传门禁、签名闸完成四处拒绝（`RELEASE_SIGNER_RETIRED`）。只挡写入与入库路径，不影响读出历史发布记录。
 
-### 7. 热更新包只能来自构建任务
+### 7. 交付对象的清理
+
+未签名包、SBOM、已签名包每次上传一个带随机段的新键，任务行只记最新那一个。任务被放弃（构建机报失败、回收、取消、强制判失败、签名闸拒签）或者被重新认领（构建、签名）时，行上不再有人引用的键在同一个事务里置空，**提交之后**删对象；删不掉只记日志，不挡状态变化。退回待签名（暂不能签、没到上限的临时错误、签名心跳超时）只删已签名包，未签名包与 SBOM 留给下一次签名。签成的任务，未签名包与 SBOM 随发布记录一起删（`DELETE /v1/admin/releases/{id}`，`keepObjects` 时保留）。
+
+### 8. 原生指纹的来源
+
+真实的已签名包里没有 `assets/fingerprint`，签名闸读不出原生指纹（设计「签名前检查」第 16 条的前提不成立，负责人决定）。发布记录的 `file_metadata.nativeFingerprint` 取任务行上构建机上报、经出处声明核对过的值，并记 `nativeFingerprintSource: "builder-provenance"`；签名闸 `complete` 带来的 `nativeFingerprint` 必须与它相等，否则 422 `SIGN_RESULT_MISMATCH`。热更新基线闸（`baseNativeFingerprint`）照旧用这个值。
+
+### 9. 热更新包只能来自构建任务
 
 管理端直接上传热更新包的接口（`/ota/artifacts/uploads`、`/ota/artifacts/upload`、`/ota/releases`）与 upload-sessions 的 `uploadType=ota` 删除。热更新包的代理上传（`PUT /v1/build-agent/jobs/:id/ota-artifact`）与签名闸完成按路由模板精确豁免 10 秒数据库超时。
 

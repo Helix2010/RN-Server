@@ -3076,7 +3076,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE / APP_IDENTITY_DRIFT. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing. Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs."
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE / APP_IDENTITY_DRIFT. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs."
           },
           "422": {
             "description": "OTA_BASE_RELEASE_INVALID: this release cannot be used as an OTA base - it is not verified/active, it has no runtimeVersion, or it has no recorded native fingerprint (built before the fingerprint was recorded, so there is no way to tell whether the update is JS-only). INVALID_OTA_APPLY_STRATEGY: applyStrategy must be next_launch or immediate."
@@ -3104,7 +3104,7 @@
     "/v1/admin/builds/{id}/cancel": {
       "post": {
         "summary": "Cancel a queued, claimed or built build",
-        "description": "Only queued or claimed jobs, and apk jobs that are built (delivered, waiting for the signer), can be canceled. Canceling a running build would make the status lie: the process on the builder does not stop. A signing job cannot be canceled because the signer may be signing it - use force-fail. A canceled claimed job makes the builder's next report fail with 409 BUILD_ATTEMPT_STALE. Audited as build_job_cancel.",
+        "description": "Only queued or claimed jobs, and apk jobs that are built (delivered, waiting for the signer), can be canceled. Canceling a running build would make the status lie: the process on the builder does not stop. A signing job cannot be canceled because the signer may be signing it - use force-fail. A canceled claimed job makes the builder's next report fail with 409 BUILD_ATTEMPT_STALE. Audited as build_job_cancel. Delivered objects (unsigned package, SBOM) are deleted from storage after the cancel is committed; a failed delete is only logged.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3146,7 +3146,7 @@
       },
       "put": {
         "summary": "Set the tenant build configuration",
-        "description": "repoDirectory must be a plain directory name; it is joined into a path by the build agent, so anything that could escape tenants/ is refused on both sides.",
+        "description": "repoDirectory must be a plain directory name; it is joined into a path by the build agent, so anything that could escape tenants/ is refused on both sides. identity.apiBaseUrl is trimmed (whitespace, trailing /) and then validated with the signer's rule (signing/trustroots.ValidateAPIBaseURL): an https origin with a lowercase DNS host, no path or query, and no explicit default port - https://host:443 is refused with 400 INVALID_APP_IDENTITY because RN-App derives the App Links host with the WHATWG URL parser, which drops :443.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3266,7 +3266,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BuildJob"
+                  "$ref": "#/components/schemas/BuilderClaimResponse"
                 }
               }
             }
@@ -3389,7 +3389,7 @@
     "/v1/build-agent/jobs/{id}/fail": {
       "post": {
         "summary": "Report a build failure",
-        "description": "The commit is recorded when the builder got that far.",
+        "description": "The commit is recorded when the builder got that far. Anything this claim delivered (unsigned package, SBOM) is deleted from storage.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -3799,7 +3799,7 @@
     "/v1/admin/builds/{id}/force-fail": {
       "post": {
         "summary": "Force-fail a build that is being signed",
-        "description": "Only apk jobs in signing. Use when the signer is stuck or gone; the signer's late reports (heartbeat, download, upload, complete, release, reject) are refused by status and sign attempt, so no release is created. Audited as build_job_force_fail.",
+        "description": "Only apk jobs in signing. Use when the signer is stuck or gone; the signer's late reports (heartbeat, download, upload, complete, release, reject) are refused by status and sign attempt, so no release is created. Audited as build_job_force_fail. The unsigned package, SBOM and any signed package of this job are deleted from storage after the change is committed; a failed delete is only logged.",
         "parameters": [
           {
             "$ref": "#/components/parameters/JobId"
@@ -4419,7 +4419,7 @@
       },
       "post": {
         "summary": "Report decrypt, confirmation and trial-signing status",
-        "description": "Stored per machine id under build.keystore.check (format 2) with JSON_SET, so primary and standby never overwrite each other. Items for an unknown tenant slug or a keystore version that is no longer current are ignored. Changes are audited as build_keystore_check_update by system-signer.",
+        "description": "Stored per machine id under build.keystore.check (format 2) with JSON_SET, so primary and standby never overwrite each other. Items for an unknown tenant slug or a keystore version that is no longer current are ignored. An item whose conclusion (keystoreVersion, decrypt, confirmed, confirmedTrustRootsDigest, trialSign, error) is unchanged is not written at all: the row version and checkedAt do not move. Changes are written and audited as build_keystore_check_update by system-signer.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4457,7 +4457,7 @@
     "/v1/signer/claim": {
       "post": {
         "summary": "Claim a build to sign",
-        "description": "Only the active primary signer gets jobs (anyone else: 204). Dispatches an apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform, whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming happens under the release sequence lock (the same lock as manual uploads and completions): if the platform already has a release whose version or build number is not lower than the job's (a manual upload while the job was still queued or building), the job is failed on the spot instead (failure_reason explains it, audit build_job_sign_overtaken) and not dispatched. Otherwise claiming increments signAttempt, clears any previous signed object key and moves the job to signing. keyAlias and trustRoots are for comparison only.",
+        "description": "Only the active primary signer gets jobs (anyone else: 204). Candidates are, for every tenant named in the ready list, its apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform (at most one per tenant, no page limit, so tenants that cannot be dispatched never starve the others); a candidate is dispatched when whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming happens under the release sequence lock (the same lock as manual uploads and completions): if the platform already has a release whose version or build number is not lower than the job's (a manual upload while the job was still queued or building), the job is failed on the spot instead (failure_reason explains it, audit build_job_sign_overtaken) and not dispatched. Otherwise claiming increments signAttempt, deletes any signed package left by a previous sign attempt and moves the job to signing. keyAlias and trustRoots are for comparison only.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4656,7 +4656,7 @@
     "/v1/signer/jobs/{id}/complete": {
       "post": {
         "summary": "Complete signing: create the release and finish the job atomically",
-        "description": "Outside the transaction the server reads the signed package back from storage (the key recorded by the last signed upload of this claim) and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 and nativeFingerprint must match the builder delivery. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that the signed object key is still the one that was verified (409 SIGNED_ARTIFACT_REPLACED when the package was uploaded again meanwhile: call complete again) and that the signer has not been revoked meanwhile (401 MACHINE_REVOKED), checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256 returns the same releaseId. Exempt from the database timeout by exact route match.",
+        "description": "Outside the transaction the server reads the signed package back from storage (the key recorded by the last signed upload of this claim) and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 must match the builder delivery and nativeFingerprint must equal the value from the builder's verified provenance (422 SIGN_RESULT_MISMATCH otherwise; the package does not carry it, so the release records the job's value with file_metadata.nativeFingerprintSource = builder-provenance). The signing heartbeat is refreshed before the download so a long verification is not reaped. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that the signed object key is still the one that was verified (409 SIGNED_ARTIFACT_REPLACED when the package was uploaded again meanwhile: call complete again) that the signer has not been revoked meanwhile (401 MACHINE_REVOKED), and re-reads release.android and build.keystore with a shared lock: if the registered package name, certificate or keystore changed after the verification the completion is refused (409 RELEASE_IDENTITY_CHANGED, audited as release_rejected; call complete again), checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, nativeFingerprintSource, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256, the same signAttempt and the same signer machine returns the same releaseId; any other signer or attempt gets 409 SIGN_ATTEMPT_STALE. Exempt from the database timeout by exact route match.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4698,7 +4698,7 @@
             "description": "INVALID_SIGN_RESULT, INVALID_SIGN_ATTEMPT"
           },
           "409": {
-            "description": "SIGN_ATTEMPT_STALE, BUILD_KIND_MISMATCH, SIGNED_ARTIFACT_MISSING (no signed upload for this claim yet), SIGNED_ARTIFACT_REPLACED (uploaded again during verification; call complete again), RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
+            "description": "SIGN_ATTEMPT_STALE, BUILD_KIND_MISMATCH, SIGNED_ARTIFACT_MISSING (no signed upload for this claim yet), SIGNED_ARTIFACT_REPLACED (uploaded again during verification; call complete again), RELEASE_IDENTITY_CHANGED (release identity or keystore changed during verification; call complete again), RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
           },
           "422": {
             "description": "SIGN_RESULT_MISMATCH, SIGNED_ARTIFACT_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_SIGNER_RETIRED, RELEASE_FILE_INVALID and the manual upload verification codes; audited as release_rejected"
@@ -4727,7 +4727,7 @@
     "/v1/signer/jobs/{id}/release": {
       "post": {
         "summary": "Cannot sign yet",
-        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred.",
+        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred. The signed package uploaded under this sign attempt, if any, is deleted from storage.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4774,7 +4774,7 @@
     "/v1/signer/jobs/{id}/reject": {
       "post": {
         "summary": "Refuse to sign",
-        "description": "violation: a policy check failed; the job fails and is audited as build_job_sign_rejected. transient: a temporary error the signer gave up on; signFailures increases, at 2 the job fails (build_job_sign_failed), otherwise it returns to built.",
+        "description": "violation: a policy check failed; the job fails and is audited as build_job_sign_rejected. transient: a temporary error the signer gave up on; signFailures increases, at 2 the job fails (build_job_sign_failed), otherwise it returns to built. The signed package uploaded under this sign attempt is deleted; when the job fails the unsigned package and SBOM are deleted too. Non-final transient rejections and deferrals are recorded in signOutcome only (not audited).",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -6955,6 +6955,7 @@
           "missingSigners",
           "signers",
           "ready",
+          "readinessProblems",
           "trustRoots",
           "trustRootsDigest"
         ],
@@ -7093,6 +7094,13 @@
           "releaseIdentityVersion": {
             "type": "integer",
             "description": "PUT only"
+          },
+          "readinessProblems": {
+            "type": "array",
+            "description": "Why the tenant is not ready, in check order; an empty array when ready is true",
+            "items": {
+              "$ref": "#/components/schemas/SignerReadinessProblem"
+            }
           }
         }
       },
@@ -7618,7 +7626,8 @@
           },
           "nativeFingerprint": {
             "type": "string",
-            "pattern": "^[0-9a-f]{32,128}$"
+            "pattern": "^[0-9a-f]{32,128}$",
+            "description": "Must equal the nativeFingerprint of the builder's verified provenance recorded on the job"
           }
         }
       },
@@ -7663,6 +7672,112 @@
             "type": "string"
           }
         }
+      },
+      "SignerReadinessProblem": {
+        "type": "object",
+        "required": [
+          "code",
+          "detail"
+        ],
+        "additionalProperties": false,
+        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed.",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "KEYSTORE_NOT_CONFIGURED",
+              "KEYSTORE_LEGACY_FORMAT",
+              "RELEASE_IDENTITY_NOT_CONFIGURED",
+              "RELEASE_IDENTITY_MISMATCH",
+              "PRIMARY_SIGNER_MISSING",
+              "PRIMARY_SIGNER_NOT_RECIPIENT",
+              "APP_IDENTITY_INCOMPLETE",
+              "OTA_CERTIFICATE_NOT_CONFIGURED",
+              "API_BASE_URL_INVALID",
+              "TRUST_ROOTS_INVALID",
+              "PRIMARY_SIGNER_NOT_CHECKED",
+              "PRIMARY_SIGNER_DECRYPT_FAILED",
+              "PRIMARY_SIGNER_NOT_CONFIRMED",
+              "TRUST_ROOTS_CHANGED",
+              "PRIMARY_SIGNER_TRIAL_SIGN_PENDING",
+              "PRIMARY_SIGNER_TRIAL_SIGN_FAILED"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "BuilderClaimResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BuildJob"
+          },
+          {
+            "type": "object",
+            "required": [
+              "tenantSlug",
+              "tenantDirectory",
+              "tenantFile",
+              "icons",
+              "googleServicesJson",
+              "otaCertificatePem",
+              "otaCertificateSha256",
+              "claimedMachineId",
+              "attempt"
+            ],
+            "properties": {
+              "tenantSlug": {
+                "type": "string",
+                "description": "The tenant's slug (provenance statement tenantSlug)"
+              },
+              "tenantDirectory": {
+                "type": "string",
+                "description": "Directory under RN-App tenants/ (build.android repoDirectory, defaults to the slug)"
+              },
+              "tenantFile": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "tenant.json composed by the server for this job: slug, appName, scheme, androidPackage, iosBundleId, apiBaseUrl, bootstrapSignerAddress, applicationId, distributionChannel, otaChannel, version, androidVersionCode, iosBuildNumber, iconBackgroundColor, icon{icon,androidForeground,androidBackground,androidMonochrome}, signerSha256"
+              },
+              "icons": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Icon file names to fetch one by one with GET /v1/build-agent/jobs/{id}/icons/{name}"
+              },
+              "googleServicesJson": {
+                "type": "string",
+                "nullable": true,
+                "description": "base64 google-services.json, or null when not configured"
+              },
+              "otaCertificatePem": {
+                "type": "string",
+                "nullable": true,
+                "description": "Public OTA code-signing certificate compiled into the package (null when ota.signing is not configured); the private key is never sent"
+              },
+              "otaCertificateSha256": {
+                "type": "string",
+                "nullable": true
+              },
+              "runtimeVersion": {
+                "type": "string",
+                "description": "OTA jobs only: the base release's runtimeVersion"
+              },
+              "claimedMachineId": {
+                "type": "string",
+                "description": "This builder's machine id; use it as the provenance builderId"
+              },
+              "attempt": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Send it as x-build-attempt on every /jobs/{id}/* request"
+              }
+            }
+          }
+        ],
+        "description": "A claimed job. No keystore material of any kind is included."
       }
     }
   }

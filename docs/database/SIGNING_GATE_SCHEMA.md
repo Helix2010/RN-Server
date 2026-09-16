@@ -73,9 +73,11 @@
 | `trialSign` | 主签名闸试签一个测试包并复核指纹 |
 | `error` | 签名闸给的一句说明，截断到 300 字符、去掉控制字符 |
 
-- 按机器 id 用 `JSON_SET` 只改自己那个键，主备并发上报互不覆盖；只收当前密钥版本的结论。状态真的变了才写审计 `build_keystore_check_update`。
+- 按机器 id 用 `JSON_SET` 只改自己那个键，主备并发上报互不覆盖；只收当前密钥版本的结论。结论（`keystoreVersion`、`decrypt`、`confirmed`、`confirmedTrustRootsDigest`、`trialSign`、`error`）没变的项**不写库**：不加 `version`、不动 `checkedAt`（它是"结论最近一次变化的时间"）；变了才写库并写审计 `build_keystore_check_update`。
 - 没有 `format:2` 的旧行（打包机时代的单机记录 `{"version","ok","agent",…}`）读出来当作空，第一次上报时整行覆盖成 format 2。
 
 ## 就绪（排队门禁与签名认领共用 `signerReadinessFor`）
 
 该租户有 v3 `build.keystore` 且与 `release.android` 一致；登记里有 active 的 primary 签名闸且密钥加密给了它；服务端算得出信任根（合成的 tenant manifest + 当前 OTA 证书；App Links host 按 RN-App `new URL(apiBaseUrl).host`）；primary 的检查记录 `keystoreVersion` 等于当前版本、`decrypt=ok`、`confirmed`、`confirmedTrustRootsDigest` 等于服务端当前摘要、`trialSign=ok`。任何一项不满足：排队 409 `SIGNER_NOT_READY`（detail 逐条列出），签名认领不派。
+
+不就绪原因带固定 code，排队 409 的问题体与 `GET /v1/admin/build-keystore` 都以 `readinessProblems: [{"code","detail"}]` 给出（就绪时为空数组），枚举见 OpenAPI `SignerReadinessProblem` 与 ADR-0019 第 5 节。
