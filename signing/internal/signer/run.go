@@ -673,7 +673,7 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 	}
 	f := verdict.Facts
 	if verdict.CheckedSHA256 != dl.SHA256 || f == nil || f.PackageName != conf.PackageName || f.VersionCode != job.BuildNumber ||
-		f.VersionName != job.Version || f.NativeFingerprint != job.NativeFingerprint {
+		f.VersionName != job.Version || f.NativeFingerprint != job.NativeFingerprint || f.NativeFingerprintSource != policy.NativeFingerprintSourceProvenance {
 		return transient("CHECKER_FAILED", "the checker's verdict does not describe the downloaded package")
 	}
 

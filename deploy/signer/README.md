@@ -130,7 +130,8 @@ sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-builder --builder-id mch_…
 ## 7. 租户密钥：离线生成 → 上传 → confirm → 试签
 
 1. 离线机器：`build-keystore create --pins pins.json --tenant AnyFun --package com.anyfun.foundation --alias anyfun-release`，
-   证书 SHA-256 记进密码管理器，原件按设计「原件与配置机密的保管」打包。
+   证书 SHA-256 记进密码管理器，原件按设计「原件与配置机密的保管」打包。已有原件（例如之前在 Android Studio 里生成的）
+   用 `build-keystore seal`，先看下面「已有原件的格式要求」。
 2. 控制台上传 `keystore-upload.json`，登记包名与证书指纹。
 3. 分别在 A、B 上确认（交互终端，stdin 必须是 TTY）：
 
@@ -153,6 +154,66 @@ sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-builder --builder-id mch_…
 
 租户改了 `apiBaseUrl` 或 OTA 证书后，主签名闸会对该租户的任务报「暂不能签」（`TRUST_ROOTS_NOT_CONFIRMED`），
 直到重新 `confirm`。
+
+### 已有原件的格式要求（seal 之前）
+
+`build-keystore` 与签名闸用的 PKCS#12 实现只依赖 Go 标准库，**只接受**：
+
+- 文件是 PKCS#12（不是 JKS）；恰好一把私钥，带别名（friendlyName），别名匹配 `^[A-Za-z0-9._-]{1,64}$`；
+- 私钥与证书的加密是 PBES2（PBKDF2-HMAC-SHA1/SHA-2 + AES-128/192/256-CBC）；
+- 有 MAC（HMAC-SHA1/SHA-256/384/512，PKCS#12 KDF），不接受 PBMAC1；
+- 仓库口令与私钥口令相同（PKCS#12 在 Java 里只有一个口令）。
+
+JDK 12 及以上的 keytool、OpenSSL 3 的默认输出满足这些。**JDK 11 及更早的 keytool、OpenSSL 1.x、老版本 Android Studio**
+生成的 `.p12` 用 RC2-40 / 3DES（`pbeWithSHAAnd40BitRC2-CBC`、`pbeWithSHAAnd3-KeyTripleDES-CBC`），`seal` 会报
+「原件用的是老式加密」；`.jks` 更是直接读不了。这两种都在离线机器上**重新导出**一份 AES 的 PKCS#12，原件保持不动。
+
+口令一律放在文件里（第一行是口令），不进命令行参数、不进 shell 历史。文件放在 tmpfs 上，用完删除：
+
+```bash
+umask 077
+d=$(mktemp -d /dev/shm/rekey.XXXXXX)
+( read -rsp '原件口令: ' P; echo; printf '%s\n' "$P" > "$d/src.pass" )        # printf 是 shell 内建，不产生进程参数
+( read -rsp '新文件口令: ' P; echo; printf '%s\n' "$P" > "$d/dest.pass" )
+```
+
+用 keytool（JDK 17，原件是 `.jks` 或老式 `.p12` 都行；JKS 的私钥口令与仓库口令不同时再加一个 `-srckeypass:file`）：
+
+```bash
+keytool -importkeystore \
+  -srckeystore anyfun-release-old.jks -srcstoretype JKS -srcstorepass:file "$d/src.pass" \
+  -srcalias anyfun-release \
+  -destkeystore anyfun-release-aes.p12 -deststoretype PKCS12 -deststorepass:file "$d/dest.pass" \
+  -destalias anyfun-release \
+  -J-Dkeystore.pkcs12.keyProtectionAlgorithm=PBEWithHmacSHA256AndAES_256 \
+  -J-Dkeystore.pkcs12.certProtectionAlgorithm=PBEWithHmacSHA256AndAES_256 \
+  -J-Dkeystore.pkcs12.macAlgorithm=HmacPBESHA256
+```
+
+（原件是 `.p12` 时把 `-srcstoretype JKS` 换成 `PKCS12`。三个 `-J-D` 在 JDK 12+ 上本来就是默认值，写出来是为了防止
+`java.security` 被改过。）
+
+或者用 OpenSSL 3（只适用于原件是 `.p12`；私钥经管道传递，不落盘）：
+
+```bash
+openssl pkcs12 -legacy -in anyfun-release-old.p12 -passin "file:$d/src.pass" -nodes \
+  | openssl pkcs12 -export -name anyfun-release \
+      -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 -iter 210000 \
+      -passout "file:$d/dest.pass" -out anyfun-release-aes.p12
+```
+
+`-name` 必须给：它就是别名，签名闸按别名找条目。然后核对证书没变、加密上传：
+
+```bash
+keytool -list -v -storetype PKCS12 -keystore anyfun-release-aes.p12 -storepass:file "$d/dest.pass" | grep 'SHA256:'
+# 与密码管理器里记的证书 SHA-256 逐位核对（keytool 的写法带冒号、大写）
+build-keystore seal --pins pins.json --p12 anyfun-release-aes.p12 --password-file "$d/dest.pass" \
+  --tenant AnyFun --package com.anyfun.foundation --alias anyfun-release
+rm -rf "$d"
+```
+
+`seal` 打印的证书 SHA-256 也要与离线记录一致。新导出的 `anyfun-release-aes.p12` 与它的口令按「原件与配置机密的保管」
+和原件一起保管。
 
 ## 8. 日常
 
@@ -196,11 +257,48 @@ systemctl start rn-signer-a.service
 
 `signed` 的预留永远占着那个 versionCode：同一任务再派下来会续签续传；换一个包就用更高的 versionCode 重新构建。
 
-### 记录文件的行数与末行哈希
+### 离线记录：记录文件的行数与末行哈希
 
-`signer list` 开头打印 `trust.jsonl`、`signed.jsonl` 的行数与最后一行的 sha256（启动日志里也有）。每次发布后把
-`signed.jsonl` 这两项抄进离线发布记录：哈希链只能证明"每一行都没被改"，证明不了"文件末尾没被整行截掉"，
-提升备用导入旧主记录时要拿它来核对。
+哈希链只能证明"每一行都没被改、没被插入"，证明不了"文件末尾没被整行截掉"或"整个状态目录被换回了旧快照"：
+截短后的文件照样逐行验得过。签名闸自己发现不了这件事，所以靠离线记录。
+
+**何时抄**（主、备都抄；备没有签名记录，只有 `trust.jsonl` 会变）：
+
+1. 首次 `promote --first` 并重新启动服务之后；
+2. **每次发布完成之后**（控制台任务变成已签名，`signer list` 里对应预留是 `completed`）；
+3. 每次 `confirm`、`trust-builder`（含 `--revoke`）、`abandon`、`promote` 之后；
+4. 计划停机、迁移、提升备用演练之前。
+
+**抄什么**：执行 `signer list`（不用停服务），抄开头五行：
+
+```bash
+sudo -u rn-signer-a /opt/rn-signer/bin/signer list --env-file /etc/rn-signer-a.env | head -5
+# machine amos-signer-a
+#   x25519 sha256  <64 hex>
+#   ed25519 sha256 <64 hex>
+#   trust.jsonl  12 lines, last line sha256 <64 hex>
+#   signed.jsonl 57 lines, last line sha256 <64 hex>
+```
+
+离线发布记录里每次追加一条（只追加，不改旧条目）：UTC 时间、机器名、`ed25519 sha256`、两个文件各自的**行数与完整
+64 位末行 sha256**、这次对应的操作（发布就写任务 id、versionCode、发布 id）、抄录人。
+
+**怎么比对**（`promote --import` 导入旧主记录时必做；怀疑状态目录被恢复过时也做）：
+
+取离线记录里这台机器**最近一条**的 `signed.jsonl` 行数 M 与末行哈希 H，和程序显示的导入文件行数 N、末行 sha256 比：
+
+1. 机器名与 `ed25519 sha256` 必须与记录一致（程序已经按 pin 文件验过公钥，这里再对一眼）。
+2. **N < M**：文件被截短或是旧快照。不要导入，改用 `promote --manual`，按离线发布记录逐包输入最大 versionCode。
+3. **N = M**：程序显示的末行 sha256 必须等于 H，否则同上处理。
+4. **N > M**（最后一次抄录之后还有操作）：第 M 行的哈希必须等于 H——
+
+   ```bash
+   head -n M /run/rn-signer-b-import-a.jsonl | tail -n 1 | tr -d '\n' | sha256sum   # M 换成记录里的行数
+   ```
+
+   行哈希是那一行完整字节（不含换行）的 sha256。相等之后，再把多出来的 N−M 行对应的发布在控制台发布记录里逐条找到；
+   找不到的说明记录来路不明，停下来查。
+5. 程序显示的每个包的最大 versionCode 不能低于离线发布记录里该包已发布的最大 versionCode。
 
 权限允许列表（`signing/policy/permissions.json`）与 RN-App `ALLOWED_PERMISSIONS` 必须在同一次变更里一起改；
 改了要重新构建并按本文人工部署。RN-App 提高 compileSdk 时同时重新生成 `signing/apk/axml/framework_attrs.txt`。
@@ -208,19 +306,22 @@ systemctl start rn-signer-a.service
 ## 9. 提升备用（演练与实操）
 
 1. 停旧主：`systemctl disable --now rn-signer-a.service rn-signer-a-check.socket`；在控制台吊销 `amos-signer-a`。
-2. 导入旧主的签名记录（状态目录还在时）：
+2. 导入旧主的签名记录（状态目录还在时）。promote 需要运行锁，先停 B 的服务：
 
    ```bash
+   systemctl stop rn-signer-b.service
    install -o rn-signer-b -g rn-signer-b -m 0600 /var/lib/rn-signer-a/signed.jsonl /run/rn-signer-b-import-a.jsonl
    sudo -u rn-signer-b /opt/rn-signer/bin/signer promote --import /run/rn-signer-b-import-a.jsonl --env-file /etc/rn-signer-b.env
    rm /run/rn-signer-b-import-a.jsonl
+   systemctl start rn-signer-b.service
    ```
 
-   先停 B 的服务（`systemctl stop rn-signer-b.service`，promote 需要运行锁）。粘贴 pin 文件里**旧主的 Ed25519 sha256**，
-   程序逐行验链与签名，显示文件的行数、最后一行 sha256、每个包的预留数（其中未完成的条数）与最大 versionCode——
-   **与离线发布记录里抄下的行数与末行哈希、最大 versionCode 核对**，对不上就说明文件被截短，改用 `--manual`。
-   原样输入本机机器名后写入，再 `systemctl start rn-signer-b.service`。旧主的状态目录也没了：`promote --manual`，逐包输入离线发布记录或已安装设备上的
-   最大 versionCode（不取服务端的值）。
+   粘贴 pin 文件里**旧主的 Ed25519 sha256**，程序逐行验链与签名，显示文件的行数、最后一行 sha256、每个包的预留数
+   （其中未完成的条数）与最大 versionCode。**按第 8 节「离线记录：记录文件的行数与末行哈希」的比对步骤核对**，
+   通过后原样输入本机机器名写入；对不上就不导入，改用 `--manual`。
+
+   旧主的状态目录也没了：同样先停 B 的服务，`promote --manual`，逐包输入离线发布记录或已安装设备上的最大 versionCode
+   （不取服务端的值）。
 3. 控制台把 `amos-signer-b` 切成 primary。之后按「密钥生成与上传」补一台新的备（新机器、新 id、加进 pin 文件、
    用原件 `build-keystore seal` 重新加密上传、两台重新 confirm）。
 

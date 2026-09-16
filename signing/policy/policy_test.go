@@ -162,8 +162,14 @@ func TestDefaultPackagePasses(t *testing.T) {
 	f := v.Facts
 	roots, _ := apktest.DefaultRoots().Normalize()
 	if f.PackageName != "com.anyfun.foundation" || f.VersionCode != 46 || f.VersionName != "1.3.16" || f.MinSDK != 24 || f.TargetSDK != 36 ||
-		f.NativeFingerprint != apktest.DefaultNativeFingerprint || f.BuilderID != builderID || f.CommitSHA != commitSHA {
+		f.NativeFingerprint != apktest.DefaultNativeFingerprint || f.NativeFingerprintSource != NativeFingerprintSourceProvenance ||
+		f.BuilderID != builderID || f.CommitSHA != commitSHA {
 		t.Fatalf("facts: %+v", f)
+	}
+	// 包里没有 assets/fingerprint：以出处声明为准照常通过
+	if v := run(t, scenario{spec: func(s *apktest.Spec) { s.NativeFingerprint = "" }}); !v.OK || v.Facts.NativeFingerprint != apktest.DefaultNativeFingerprint ||
+		v.Facts.NativeFingerprintSource != NativeFingerprintSourceProvenance {
+		t.Fatalf("package without assets/fingerprint: %+v", v)
 	}
 	if !trustroots.Equal(f.TrustRoots, roots) {
 		t.Fatalf("facts trust roots %+v, want %+v", f.TrustRoots, roots)
@@ -407,7 +413,6 @@ func TestEveryRuleRejects(t *testing.T) {
 		"expo no embedded update":        expoMeta("expo.modules.updates.HAS_EMBEDDED_UPDATE", axml.BoolValue(false)),
 
 		// ---- 原生指纹（第 16 条）----
-		"native fingerprint missing": {spec: func(s *apktest.Spec) { s.NativeFingerprint = "" }, expectCode: "NATIVE_FINGERPRINT_MISSING"},
 		"native fingerprint differs": {spec: func(s *apktest.Spec) { s.NativeFingerprint = strings.Repeat("b", 40) }, expectCode: "NATIVE_FINGERPRINT_MISMATCH"},
 		"native fingerprint not hex": {spec: func(s *apktest.Spec) { s.NativeFingerprint = "not-a-fingerprint" }, expectCode: "NATIVE_FINGERPRINT_INVALID"},
 

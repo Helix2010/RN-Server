@@ -42,6 +42,9 @@ const (
 	TargetSDKFloor = 28
 )
 
+// NativeFingerprintSourceProvenance：Facts.NativeFingerprint 来自构建机出处声明。
+const NativeFingerprintSourceProvenance = "builder-provenance"
+
 // KindViolation 是检查结论唯一的拒签类型。检查进程不产生"暂不能签"：那由主进程按本机记录
 // 判断；让检查进程能报 deferred，等于让一个被不可信 APK 打穿的检查进程把违规降级成无限重试。
 const KindViolation = "violation"
@@ -197,9 +200,13 @@ type Facts struct {
 	Permissions           []string         `json:"permissions"`
 	PermissionDefinitions []string         `json:"permissionDefinitions"`
 	TrustRoots            trustroots.Roots `json:"trustRoots"`
-	NativeFingerprint     string           `json:"nativeFingerprint"`
-	BuilderID             string           `json:"builderId"`
-	CommitSHA             string           `json:"commitSha"`
+	// NativeFingerprint 取自构建机出处声明（Ed25519 签名、已与任务行比对），complete 时原样上报。
+	// 包里不一定有 assets/fingerprint（runtimeVersion 走 appVersion 策略时就没有），签名闸无法
+	// 从 APK 独立算出原生指纹；包里有的话必须与出处值一致。
+	NativeFingerprint       string `json:"nativeFingerprint"`
+	NativeFingerprintSource string `json:"nativeFingerprintSource"`
+	BuilderID               string `json:"builderId"`
+	CommitSHA               string `json:"commitSha"`
 }
 
 func violation(code, format string, args ...any) Verdict {
@@ -272,7 +279,8 @@ func evaluate(in Input, sum string, size int64, pkg *apk.Package, parseErr error
 	if pkg == nil || pkg.Manifest == nil {
 		return violation("MANIFEST_MISSING", "the package has no AndroidManifest.xml")
 	}
-	facts := &Facts{Size: size, BuilderID: statement.BuilderID, CommitSHA: statement.CommitSHA}
+	facts := &Facts{Size: size, BuilderID: statement.BuilderID, CommitSHA: statement.CommitSHA,
+		NativeFingerprint: statement.NativeFingerprint, NativeFingerprintSource: NativeFingerprintSourceProvenance}
 	for _, check := range []func(Input, *apk.Package, *Facts) Verdict{
 		checkStructure,         // 4、6
 		checkIdentity,          // 7、8
@@ -788,19 +796,22 @@ func checkLinks(in Input, pkg *apk.Package, facts *Facts) Verdict {
 }
 
 // ---- 第 16 条：原生指纹 ----
+//
+// 以出处声明为准（facts 在 evaluate 里已经填好）。设计原本要求从 assets/fingerprint 读出并复核，
+// 但 runtimeVersion 走 appVersion 策略的包里没有这个文件，签名闸无法从 APK 独立算出原生指纹。
+// 不再要求文件存在；存在时仍必须与出处值一致，不一致说明构建机上报的值和包的实际内容对不上。
 
-func checkNativeFingerprint(in Input, pkg *apk.Package, facts *Facts) Verdict {
+func checkNativeFingerprint(_ Input, pkg *apk.Package, facts *Facts) Verdict {
 	if pkg.NativeFingerprint == nil {
-		return violation("NATIVE_FINGERPRINT_MISSING", "the package has no assets/fingerprint")
+		return pass
 	}
 	got := *pkg.NativeFingerprint
 	if !nativeFingerprintPattern.MatchString(got) {
 		return violation("NATIVE_FINGERPRINT_INVALID", "assets/fingerprint is not a 32-128 character lowercase hex digest")
 	}
-	if got != in.Job.NativeFingerprint {
-		return violation("NATIVE_FINGERPRINT_MISMATCH", "assets/fingerprint %s is not the native fingerprint reported by the builder %s", got, quote(in.Job.NativeFingerprint))
+	if got != facts.NativeFingerprint {
+		return violation("NATIVE_FINGERPRINT_MISMATCH", "assets/fingerprint %s is not the native fingerprint in the builder's provenance statement %s", got, quote(facts.NativeFingerprint))
 	}
-	facts.NativeFingerprint = got
 	return pass
 }
 
