@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -381,6 +382,12 @@ func (f *gateFixture) deliverBuild(job map[string]any) deliveredBuild {
 		f.t.Fatalf("built: %d %s", r.Code, r.Body.String())
 	}
 	return d
+}
+
+// matchesDeliveryKey：对象键形如 …/tenants/<租户>/build-jobs/<任务>/<a或s编号>/<每次上传的随机段>/<文件名>。
+func matchesDeliveryKey(key, tenant, jobID, segment, name string) bool {
+	return regexp.MustCompile(`(^|/)tenants/` + regexp.QuoteMeta(tenant) + `/build-jobs/` + regexp.QuoteMeta(jobID) + `/` +
+		regexp.QuoteMeta(segment) + `/[A-Za-z0-9_-]{12}/` + regexp.QuoteMeta(name) + `$`).MatchString(key)
 }
 
 func sha256HexBytes(b []byte) string {

@@ -33,7 +33,7 @@
 | `tokenSha256` | 机器令牌（`rnm_` + 32 字节 base64url）的 sha256。令牌原文只出现在新建接口的响应里，不进审计、不进日志 |
 | `publicKey` / `publicKeySha256` | 已接受的主公钥。构建机：Ed25519 出处公钥；签名闸：X25519 收件人公钥（sha256 就是密文的 `recipientSha256`） |
 | `ed25519PublicKey` / `ed25519PublicKeySha256` | 仅签名闸：记录签名与换钥证明用的 Ed25519 公钥 |
-| `pending` | 机器报上来、等平台管理员核对完整指纹后接受的公钥。已 active 的机器换钥必须带用当前私钥对 `machinekey.RotationMessage` 的签名；旧公钥在接受之前一直有效 |
+| `pending` | 机器报上来、等平台管理员核对完整指纹后接受的公钥（签名闸的 accept-key 可同时带 `ed25519PublicKeySha256`，带了就必须一致）。已 active 的机器换钥必须带用当前私钥对 `machinekey.RotationMessage` 的签名；旧公钥在接受之前一直有效 |
 
 所有 sha256 都按 base64 解码后的 32 字节原始公钥计算，完整 64 位小写十六进制。
 

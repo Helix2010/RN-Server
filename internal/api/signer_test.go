@@ -23,8 +23,8 @@ func TestDBSigningGateEndToEnd(t *testing.T) {
 	}
 	delivered := f.deliverBuild(job)
 	built := f.jobStatus(jobID)
-	if built.Status != jobBuilt || !strings.Contains(built.UnsignedObjectKey.String, "/build-jobs/"+jobID+"/a1/app-release-unsigned.apk") ||
-		!strings.Contains(built.SBOMObjectKey.String, "/a1/sbom.cdx.json") || built.NativeFingerprint.String != gateNativeFingerprint {
+	if built.Status != jobBuilt || !matchesDeliveryKey(built.UnsignedObjectKey.String, f.tenant, jobID, "a1", unsignedAPKObjectName) ||
+		!matchesDeliveryKey(built.SBOMObjectKey.String, f.tenant, jobID, "a1", sbomObjectName) || built.NativeFingerprint.String != gateNativeFingerprint {
 		t.Fatalf("after delivery: %+v", built)
 	}
 
@@ -92,7 +92,7 @@ func TestDBSigningGateEndToEnd(t *testing.T) {
 		Scan(&status, &objectKey, &sha, &createdBy, &rawMetadata); err != nil {
 		t.Fatal(err)
 	}
-	if status != "verified" || !strings.HasSuffix(objectKey, "/build-jobs/"+jobID+"/s1/app-release.apk") || sha != sha256HexBytes(signed) || createdBy != signerActor {
+	if status != "verified" || !matchesDeliveryKey(objectKey, f.tenant, jobID, "s1", signedAPKObjectName) || objectKey != done.SignedObjectKey.String || sha != sha256HexBytes(signed) || createdBy != signerActor {
 		t.Fatalf("release row: %s %s %s %s", status, objectKey, sha, createdBy)
 	}
 	var metadata map[string]any

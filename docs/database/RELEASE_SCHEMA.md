@@ -70,7 +70,8 @@ ota：queued → claimed → running → succeeded
 | claimed/running → succeeded | 构建机 `/complete`（仅 ota） | 编号对得上 |
 | claimed/running → failed | 构建机 `/fail`；认领时缺配置 | 编号对得上 |
 | claimed/running → queued / failed | 回收定时器：10 分钟无构建心跳 | apk 且 `attempt < 3` 退回排队，否则判失败；ota 直接判失败 |
-| built → signing | 签名闸认领 | 只派 active 主签名闸；同租户同平台在途任务里 build 号最小；租户就绪且就绪项完全一致；`sign_attempt+1` |
+| built → signing | 签名闸认领 | 只派 active 主签名闸；同租户同平台在途任务里 build 号最小；租户就绪且就绪项完全一致；`sign_attempt+1`、清空 `signed_object_key`。在发布序列锁里做 |
+| built → failed | 签名认领时发现被已有发布超过 | 构建期间手工上传了不低于它的版本：签出来也入不了库，不派，写 `failure_reason` 与审计 `build_job_sign_overtaken` |
 | signing → built | 签名闸 `/release`（暂不能签） | 不计 `sign_failures` |
 | signing → built / failed | 签名闸 `/reject` transient；回收定时器：5 分钟无签名心跳 | `sign_failures+1`，到 2 判失败 |
 | signing → failed | 签名闸 `/reject` violation；管理端 force-fail | — |
@@ -83,8 +84,8 @@ ota：queued → claimed → running → succeeded
 | --- | --- | --- |
 | `attempt` | INT NOT NULL DEFAULT 0 | 构建认领编号，每次认领 +1；构建机所有上报带 `x-build-attempt`，对不上 409 `BUILD_ATTEMPT_STALE` |
 | `claimed_machine_id` | VARCHAR(40) NULL | 认领的构建机 id（`build.machines`），由令牌鉴权得出；退回排队后保留为最近一次认领者。NULL = 从未被机器令牌认领 |
-| `unsigned_object_key` / `unsigned_size` / `unsigned_sha256` | VARCHAR(512) / BIGINT / CHAR(64) NULL | 未签名包：`<prefix>/tenants/<tenant>/build-jobs/<job>/a<attempt>/app-release-unsigned.apk`；大小与 sha256 由服务端收流时计算。写键与校验编号同一条 UPDATE；每次认领清空 |
-| `sbom_object_key` / `sbom_size` / `sbom_sha256` | 同上 | CycloneDX SBOM：`…/a<attempt>/sbom.cdx.json` |
+| `unsigned_object_key` / `unsigned_size` / `unsigned_sha256` | VARCHAR(512) / BIGINT / CHAR(64) NULL | 未签名包：`<prefix>/tenants/<tenant>/build-jobs/<job>/a<attempt>/<随机段>/app-release-unsigned.apk`，每次上传一个新键；大小与 sha256 由服务端收流时计算。写键与校验编号在锁住本行的同一个事务里；同一次认领重传时替换本列、提交后删旧对象；每次认领清空 |
+| `sbom_object_key` / `sbom_size` / `sbom_sha256` | 同上 | CycloneDX SBOM：`…/a<attempt>/<随机段>/sbom.cdx.json`，写入规则同上 |
 | `native_fingerprint` | VARCHAR(128) NULL | 构建机交付时上报的原生指纹，与出处声明一致，签名闸复核 |
 | `provenance` | JSON NULL | `{"statement","signature","builderId","builderPublicKey","builderPublicKeySha256"}`：出处声明原始字节与 Ed25519 签名（base64），以及验签用的登记公钥 |
 | `sign_attempt` | INT NOT NULL DEFAULT 0 | 签名认领编号，每次签名认领 +1；签名闸所有上报带 `x-sign-attempt` 且机器一致，否则 409 `SIGN_ATTEMPT_STALE` |
@@ -92,8 +93,9 @@ ota：queued → claimed → running → succeeded
 | `signing_machine_id` | VARCHAR(40) NULL | 当前或最近一次认领签名的签名闸 |
 | `signing_claimed_at` / `signing_heartbeat_at` | DATETIME(3) NULL | 签名认领时间与签名心跳 UTC |
 | `sign_outcome` | JSON NULL | 最近一次没签成的原因：`{"kind":"deferred|violation|transient","code","detail","machineId","at"}`；签成之后保留作历史 |
+| `signed_object_key` | VARCHAR(512) NULL | 签名闸交回的已签名包：`…/build-jobs/<job>/s<signAttempt>/<随机段>/app-release.apk`，写入规则同 `unsigned_object_key`（校验签名编号与签名闸）。`complete` 只从这个键取包复核，事务里再核对键没变（变了 409 `SIGNED_ARTIFACT_REPLACED`），发布记录的 `object_key` 就是它。每次签名认领清空 |
 
-签名后已签名包的对象键为 `…/build-jobs/<job>/s<signAttempt>/app-release.apk`，写在 `app_releases.object_key` 上，任务行不重复记。
+**为什么每次上传一个新键**：键只由编号决定时，同一次认领里一个在反向代理那里超时、被客户端重传顶替的请求，会在任务已经往前走（`/built`、`complete`）之后才写完——覆盖已被引用的对象，又因为状态变了、改不到行而把它删掉，发布记录指向一个不存在的包。每次一个新键之后，迟到或过期的上传只能删掉自己写的那个对象。
 
 ### 不变量
 

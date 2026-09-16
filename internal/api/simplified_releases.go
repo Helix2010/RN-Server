@@ -500,17 +500,44 @@ type releaseInsert struct {
 	AuditSummary                  map[string]any
 }
 
+// latestRelease 是某租户某平台 build 号最大的那条发布记录的版本；Exists=false 表示还没有发布。
+type latestRelease struct {
+	Exists      bool
+	Version     sql.NullString
+	BuildNumber int
+}
+
+func latestReleaseFor(ctx context.Context, q rowQuerier, tenant, platform string) (latestRelease, error) {
+	var latest latestRelease
+	err := q.QueryRowContext(ctx, `SELECT version,build_number FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 1`, tenant, platform).
+		Scan(&latest.Version, &latest.BuildNumber)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return latestRelease{}, nil
+	case err != nil:
+		return latestRelease{}, err
+	}
+	latest.Exists = true
+	return latest, nil
+}
+
+// increasedBy：版本号与 build 号都要比最新一条发布大，入库才收。
+func (l latestRelease) increasedBy(version string, buildNumber int) bool {
+	if !l.Exists {
+		return true
+	}
+	return buildNumber > l.BuildNumber && (!l.Version.Valid || compareVersion(version, l.Version.String) > 0)
+}
+
 // insertReleaseInTx 在调用方的事务里做版本递增校验、写发布记录与 release_create 审计。
 // 调用方必须已经拿着 withReleaseSequence 的锁：递增校验读的是"该平台最新一条"，没有锁时
 // 两个并发入库都会读到同一个最大值。
 func insertReleaseInTx(ctx context.Context, tx *sql.Tx, r releaseInsert, now time.Time) (*releaseRejection, error) {
-	var latestBuild int
-	var latestVersion sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT version,build_number FROM app_releases WHERE tenant_id=? AND platform=? ORDER BY build_number DESC LIMIT 1`, r.Tenant, r.Platform).Scan(&latestVersion, &latestBuild)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	latest, err := latestReleaseFor(ctx, tx, r.Tenant, r.Platform)
+	if err != nil {
 		return nil, err
 	}
-	if r.BuildNumber <= latestBuild || (latestVersion.Valid && compareVersion(r.Version, latestVersion.String) <= 0) {
+	if !latest.increasedBy(r.Version, r.BuildNumber) {
 		return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_VERSION_NOT_INCREASING", Detail: "Version and build number must both be greater than the latest release for this platform"}, nil
 	}
 	// map[string][]string 一定能序列化，没有需要处理的错误分支

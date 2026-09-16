@@ -4095,7 +4095,7 @@
     "/v1/build-agent/jobs/{id}/unsigned/upload": {
       "put": {
         "summary": "Upload the unsigned package",
-        "description": "apk jobs only; limit ARTIFACT_MAX_SIZE_MB. The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/ and records key, size and sha256 in the same UPDATE that checks the attempt. The path ends in /upload so it is exempt from the database timeout.",
+        "description": "apk jobs only; limit ARTIFACT_MAX_SIZE_MB. The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/<random>/ (a new key for every upload) and records key, size and sha256 in one transaction that locks the job row and checks the attempt. A re-upload in the same claim replaces the recorded key and deletes the replaced object; a stale or late upload (job reaped, canceled or already built) only deletes the object it just wrote. The path ends in /upload so it is exempt from the database timeout.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4162,7 +4162,7 @@
     "/v1/build-agent/jobs/{id}/sbom/upload": {
       "put": {
         "summary": "Upload the CycloneDX SBOM",
-        "description": "apk jobs only; limit 16 MiB; must be a CycloneDX JSON document (422 BUILD_SBOM_INVALID). The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/ and records key, size and sha256 in the same UPDATE that checks the attempt. The path ends in /upload so it is exempt from the database timeout.",
+        "description": "apk jobs only; limit 16 MiB; must be a CycloneDX JSON document (422 BUILD_SBOM_INVALID). The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/<random>/ (a new key for every upload) and records key, size and sha256 in one transaction that locks the job row and checks the attempt. A re-upload in the same claim replaces the recorded key and deletes the replaced object; a stale or late upload (job reaped, canceled or already built) only deletes the object it just wrote. The path ends in /upload so it is exempt from the database timeout.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4457,7 +4457,7 @@
     "/v1/signer/claim": {
       "post": {
         "summary": "Claim a build to sign",
-        "description": "Only the active primary signer gets jobs (anyone else: 204). Dispatches an apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform, whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming increments signAttempt and moves the job to signing. keyAlias and trustRoots are for comparison only.",
+        "description": "Only the active primary signer gets jobs (anyone else: 204). Dispatches an apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform, whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming happens under the release sequence lock (the same lock as manual uploads and completions): if the platform already has a release whose version or build number is not lower than the job's (a manual upload while the job was still queued or building), the job is failed on the spot instead (failure_reason explains it, audit build_job_sign_overtaken) and not dispatched. Otherwise claiming increments signAttempt, clears any previous signed object key and moves the job to signing. keyAlias and trustRoots are for comparison only.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4589,7 +4589,7 @@
     "/v1/signer/jobs/{id}/signed/upload": {
       "put": {
         "summary": "Upload the signed package",
-        "description": "Streamed to tenants/<tenant>/build-jobs/<job>/s<signAttempt>/app-release.apk; the attempt is checked again after the stream and a stale upload is deleted.",
+        "description": "Streamed to tenants/<tenant>/build-jobs/<job>/s<signAttempt>/<random>/app-release.apk: every upload gets a new key. After the stream, one transaction locks the job row, checks status/signAttempt/machine and records the key; a re-upload in the same claim replaces the recorded key and the replaced object is deleted. A stale or late upload (job already reaped, force-failed or completed) only deletes the object it just wrote, so it can never overwrite or delete a package that a job or release refers to.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4656,7 +4656,7 @@
     "/v1/signer/jobs/{id}/complete": {
       "post": {
         "summary": "Complete signing: create the release and finish the job atomically",
-        "description": "Outside the transaction the server reads the signed package back from storage and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 and nativeFingerprint must match the builder delivery. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256 returns the same releaseId. Exempt from the database timeout by exact route match.",
+        "description": "Outside the transaction the server reads the signed package back from storage (the key recorded by the last signed upload of this claim) and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 and nativeFingerprint must match the builder delivery. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that the signed object key is still the one that was verified (409 SIGNED_ARTIFACT_REPLACED when the package was uploaded again meanwhile: call complete again) and that the signer has not been revoked meanwhile (401 MACHINE_REVOKED), checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256 returns the same releaseId. Exempt from the database timeout by exact route match.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4698,7 +4698,7 @@
             "description": "INVALID_SIGN_RESULT, INVALID_SIGN_ATTEMPT"
           },
           "409": {
-            "description": "SIGN_ATTEMPT_STALE, BUILD_KIND_MISMATCH, RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
+            "description": "SIGN_ATTEMPT_STALE, BUILD_KIND_MISMATCH, SIGNED_ARTIFACT_MISSING (no signed upload for this claim yet), SIGNED_ARTIFACT_REPLACED (uploaded again during verification; call complete again), RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
           },
           "422": {
             "description": "SIGN_RESULT_MISMATCH, SIGNED_ARTIFACT_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_SIGNER_RETIRED, RELEASE_FILE_INVALID and the manual upload verification codes; audited as release_rejected"
@@ -4713,7 +4713,7 @@
             "description": "STORAGE_UNAVAILABLE"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token; MACHINE_REVOKED: the signer was revoked while its package was being verified"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -7288,6 +7288,10 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "ed25519PublicKeySha256": {
+            "type": "string",
+            "description": "Signers only, optional but recommended: the full 64-hex sha256 of the signer's Ed25519 key read on the signer itself. When present it must equal the pending Ed25519 key (409 MACHINE_KEY_MISMATCH); without it only the X25519 fingerprint is checked, and a stolen token could pair the real X25519 key with a foreign Ed25519 key while the machine is pending."
           }
         }
       },

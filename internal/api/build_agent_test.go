@@ -78,7 +78,7 @@ func TestDBBuilderDeliveryUploads(t *testing.T) {
 		t.Fatalf("unsigned upload response: %v", body)
 	}
 	job := f.jobStatus(jobID)
-	if !strings.HasSuffix(job.UnsignedObjectKey.String, "tenants/"+f.tenant+"/build-jobs/"+jobID+"/a1/app-release-unsigned.apk") || job.UnsignedSHA256.String != sha256HexBytes(unsigned) {
+	if !matchesDeliveryKey(job.UnsignedObjectKey.String, f.tenant, jobID, "a1", unsignedAPKObjectName) || job.UnsignedSHA256.String != sha256HexBytes(unsigned) {
 		t.Fatalf("unsigned columns: %+v", job)
 	}
 	if stored, ok := f.store.objects[job.UnsignedObjectKey.String]; !ok || sha256HexBytes(stored.body) != sha256HexBytes(unsigned) {
@@ -101,7 +101,7 @@ func TestDBBuilderDeliveryUploads(t *testing.T) {
 	if code := request(octetStream, []byte(`{"bomFormat":"CycloneDX","components":[]}`)); code != http.StatusOK {
 		t.Fatalf("a CycloneDX SBOM was refused: %d", code)
 	}
-	if !strings.Contains(f.jobStatus(jobID).SBOMObjectKey.String, "/a1/sbom.cdx.json") {
+	if !matchesDeliveryKey(f.jobStatus(jobID).SBOMObjectKey.String, f.tenant, jobID, "a1", sbomObjectName) {
 		t.Fatal("the SBOM key does not carry the attempt")
 	}
 	f.s.cfg.ArtifactMaxSizeBytes = int64(len(unsigned) - 1)

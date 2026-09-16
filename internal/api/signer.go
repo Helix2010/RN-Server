@@ -272,16 +272,13 @@ func (s *server) claimSigningJob(c *gin.Context) {
 		if !ok {
 			continue
 		}
-		now := time.Now().UTC()
-		result, err := s.db.ExecContext(ctx,
-			`UPDATE build_jobs SET status='signing',sign_attempt=sign_attempt+1,signing_machine_id=?,signing_claimed_at=?,signing_heartbeat_at=?,updated_at=?
-			  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignerClaim, jobKindAPK))+`) AND sign_attempt=?`,
-			machine.ID, now, now, now, job.ID, job.SignAttempt)
+		claimed, err := s.claimForSigning(ctx, c, job, machine)
 		if err != nil {
+			slog.Error("cannot claim a build to sign", "job", job.ID, "error", err)
 			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build to sign")
 			return
 		}
-		if affected, _ := result.RowsAffected(); affected != 1 {
+		if !claimed {
 			continue
 		}
 		response["job"].(gin.H)["signAttempt"] = job.SignAttempt + 1
@@ -289,6 +286,67 @@ func (s *server) claimSigningJob(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// claimForSigning 在发布序列锁（与手工上传、签名完成同一把）里认领一条签名任务：先比对已有
+// 发布，再把任务改为 signing。claimed=false 表示这一轮没派出去（被别人抢先、锁忙或已判失败）。
+//
+// 手工上传只在该租户有 built/signing 任务时被挡（RELEASE_SIGNING_IN_FLIGHT），任务还在排队或
+// 构建时照常放行。放进来的版本不低于这条任务时，任务签出来也入不了库（完成时
+// RELEASE_VERSION_NOT_INCREASING），而签名闸已经在本机记录里占掉了这个 versionCode。所以这种
+// 任务不派，当场判失败并写明原因。比对与认领在同一把锁里：手工上传的在途检查和入库也在这把锁
+// 里，两边谁先谁后都不会漏。
+func (s *server) claimForSigning(ctx context.Context, c *gin.Context, job buildJob, machine buildMachine) (bool, error) {
+	claimed := false
+	var overtaken *latestRelease
+	reason := ""
+	now := time.Now().UTC()
+	rejection, err := s.withReleaseSequence(ctx, job.TenantID, job.Platform, func(tx *sql.Tx) (*releaseRejection, error) {
+		latest, err := latestReleaseFor(ctx, tx, job.TenantID, job.Platform)
+		if err != nil {
+			return nil, err
+		}
+		if !latest.increasedBy(job.Version, job.BuildNumber) {
+			reason = clipRunes(fmt.Sprintf("构建期间该平台已经发布了版本 %s（build %d），这个任务的版本 %s（build %d）不再递增，签出来也入不了库，没有派给签名闸。用更高的版本号与 build 号重新排一个任务。",
+				latest.Version.String, latest.BuildNumber, job.Version, job.BuildNumber), 500)
+			result, err := tx.ExecContext(ctx,
+				`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=?
+				  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignOvertaken, jobKindAPK))+`) AND sign_attempt=?`,
+				reason, now, job.ID, job.SignAttempt)
+			if err != nil {
+				return nil, err
+			}
+			if affected, _ := result.RowsAffected(); affected == 1 {
+				overtaken = &latest
+			}
+			return nil, nil
+		}
+		result, err := tx.ExecContext(ctx,
+			`UPDATE build_jobs SET status='signing',sign_attempt=sign_attempt+1,signing_machine_id=?,signing_claimed_at=?,signing_heartbeat_at=?,signed_object_key=NULL,updated_at=?
+			  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignerClaim, jobKindAPK))+`) AND sign_attempt=?`,
+			machine.ID, now, now, now, job.ID, job.SignAttempt)
+		if err != nil {
+			return nil, err
+		}
+		affected, _ := result.RowsAffected()
+		claimed = affected == 1
+		return nil, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if rejection != nil {
+		// 发布序列锁忙（正在入库）：这一轮不派，签名闸下一轮再来
+		return false, nil
+	}
+	if overtaken != nil {
+		slog.Warn("failed a build overtaken by a newer release before signing", "job", job.ID, "tenant", job.TenantID,
+			"version", job.Version, "buildNumber", job.BuildNumber, "latestVersion", overtaken.Version.String, "latestBuildNumber", overtaken.BuildNumber)
+		s.auditNow(newAudit(job.TenantID, builderSystemActor, "build_job_sign_overtaken", "build-job", job.ID, reason, requestID(c),
+			map[string]any{"jobId": job.ID, "version": job.Version, "buildNumber": job.BuildNumber,
+				"latestVersion": overtaken.Version.String, "latestBuildNumber": overtaken.BuildNumber}))
+	}
+	return claimed, nil
 }
 
 // signingDispatch 判断一条候选任务能不能派给这台签名闸，能的话把响应拼好（认领之前拼，
@@ -442,7 +500,8 @@ func (s *server) uploadSignedArtifact(c *gin.Context) {
 		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	key := buildJobObjectKey(prefix, job.TenantID, job.ID, "s"+strconv.Itoa(job.SignAttempt), signedAPKObjectName)
+	// 每次上传一个新键（见 deliveryObjectSegment）：迟到的上传覆盖不了、也删不掉已经落进发布记录的包
+	key := buildJobObjectKey(prefix, job.TenantID, job.ID, deliveryObjectSegment("s", job.SignAttempt), signedAPKObjectName)
 	received, status, code, detail := s.receiveStreamToObject(c, client, key, s.cfg.ArtifactMaxSizeBytes)
 	if status != 0 {
 		problem(c, status, code, detail)
@@ -450,18 +509,22 @@ func (s *server) uploadSignedArtifact(c *gin.Context) {
 	}
 	received.cleanup()
 	now := time.Now().UTC()
-	// 收流期间任务被回收或强制判失败时，这条 UPDATE 改不到任何行：刚写的对象删掉
-	result, err := s.db.ExecContext(context.Background(), `UPDATE build_jobs SET signing_heartbeat_at=?,updated_at=?`+signingGuard,
-		now, now, job.ID, job.SignAttempt, machine.ID)
+	// 收流期间任务被回收、强制判失败或已经完成时认领不再有效：只删自己刚写的对象
+	replaced, current, err := s.recordDeliveredObject(context.Background(),
+		`SELECT signed_object_key FROM build_jobs`+signingGuard, []any{job.ID, job.SignAttempt, machine.ID},
+		`UPDATE build_jobs SET signed_object_key=?,signing_heartbeat_at=?,updated_at=? WHERE id=?`, []any{key, now, now, job.ID})
 	if err != nil {
+		slog.Error("cannot record a signed package", "job", job.ID, "error", err)
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the signed package")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if !current {
 		_ = client.Delete(context.Background(), key)
 		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
 	}
+	// 替换下来的旧包还没落进发布记录：complete 在事务里核对键没变，正在复核旧包的那次 complete 会被 409
+	deleteReplacedObject(client, replaced, key, job.ID)
 	c.JSON(http.StatusOK, gin.H{"sha256": received.sha256, "size": received.size})
 }
 
@@ -528,6 +591,10 @@ func (s *server) completeSigning(c *gin.Context) {
 		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
 	}
+	if !job.SignedObjectKey.Valid || job.SignedObjectKey.String == "" {
+		problem(c, http.StatusConflict, "SIGNED_ARTIFACT_MISSING", "Upload the signed package for this signing claim before completing it")
+		return
+	}
 	rejectedBySigner := func(status int, code, detail string, summary map[string]any) {
 		audit := map[string]any{"code": code, "jobId": job.ID, "signAttempt": attempt, "signerMachineId": machine.ID, "signedSha256": body.SignedSHA256}
 		for key, value := range summary {
@@ -553,12 +620,13 @@ func (s *server) completeSigning(c *gin.Context) {
 		rejectedBySigner(http.StatusUnprocessableEntity, "RELEASE_SIGNER_MISMATCH", "certificateSha256 is not the certificate of this tenant's registered signing keystore", nil)
 		return
 	}
-	client, prefix, err := s.storageClientForTenant(ctx, job.TenantID)
+	client, _, err := s.storageClientForTenant(ctx, job.TenantID)
 	if err != nil {
 		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	key := buildJobObjectKey(prefix, job.TenantID, job.ID, "s"+strconv.Itoa(attempt), signedAPKObjectName)
+	// 只从任务行记下的键取包：键由上传时写入，不按编号现拼（同一次认领可能重传过）
+	key := job.SignedObjectKey.String
 	verifyCtx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
 	stored, rejection := s.downloadStoredArtifact(verifyCtx, client, key, body.SignedSize)
@@ -618,9 +686,9 @@ func (s *server) completeSigning(c *gin.Context) {
 	rejection, err = s.withReleaseSequence(ctx, job.TenantID, job.Platform, func(tx *sql.Tx) (*releaseRejection, error) {
 		var status string
 		var lockedAttempt int
-		var lockedMachine, lockedArtifact, lockedRelease sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT status,sign_attempt,signing_machine_id,artifact_sha256,release_id FROM build_jobs WHERE id=? FOR UPDATE`, job.ID).
-			Scan(&status, &lockedAttempt, &lockedMachine, &lockedArtifact, &lockedRelease); err != nil {
+		var lockedMachine, lockedArtifact, lockedRelease, lockedKey sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT status,sign_attempt,signing_machine_id,artifact_sha256,release_id,signed_object_key FROM build_jobs WHERE id=? FOR UPDATE`, job.ID).
+			Scan(&status, &lockedAttempt, &lockedMachine, &lockedArtifact, &lockedRelease, &lockedKey); err != nil {
 			return nil, err
 		}
 		if status == jobSucceeded && lockedArtifact.String == body.SignedSHA256 && lockedRelease.Valid {
@@ -629,6 +697,19 @@ func (s *server) completeSigning(c *gin.Context) {
 		}
 		if status != jobSigning || lockedAttempt != attempt || lockedMachine.String != machine.ID {
 			return &releaseRejection{Status: http.StatusConflict, Code: "SIGN_ATTEMPT_STALE", Detail: "This signing claim is no longer current for this signer; stop working on the job"}, nil
+		}
+		// 复核期间签名闸又传了一次：复核的那个对象已经被替换删除，按新键重来
+		if lockedKey.String != key {
+			return &releaseRejection{Status: http.StatusConflict, Code: "SIGNED_ARTIFACT_REPLACED", Detail: "The signed package was uploaded again while this completion was being verified; call complete again"}, nil
+		}
+		// 鉴权只在请求开始时做过一次，而事务外的下载与复核可能要几分钟：落库前再看一眼这台
+		// 签名闸有没有在这期间被吊销
+		registry, err := readMachineRegistry(ctx, tx, false)
+		if err != nil {
+			return nil, err
+		}
+		if index, found := registry.Doc.find(machine.ID); !found || registry.Doc.Machines[index].Status != machineStatusActive || registry.Doc.Machines[index].Role != machineRoleSigner {
+			return &releaseRejection{Status: http.StatusUnauthorized, Code: "MACHINE_REVOKED", Detail: "This signer was revoked while its package was being verified"}, nil
 		}
 		if err := s.injectSignFault(faultBeforeReleaseInsert); err != nil {
 			return nil, err

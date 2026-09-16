@@ -177,7 +177,7 @@ func (s *server) reapStaleSignings(ctx context.Context, now time.Time, result *r
 				"签名闸已经 %d 次没签成（最近一次是签名心跳超过 %s 没有更新），不再派给签名闸。检查签名闸的日志与本机记录后重新排一个任务。",
 				item.failures+1, signJobHeartbeatTimeout), 500)}
 		}
-		// sign_failures 放在最后赋值：MySQL 的多列 SET 从左到右求值，前面的 CASE 要读更新前的值
+		// 状态在 Go 里按读到的 sign_failures 算好；WHERE 带 sign_failures=?，读到之后有人改过就改不到行
 		res, err := s.db.ExecContext(ctx,
 			`UPDATE build_jobs SET status=?,failure_reason=COALESCE(?,failure_reason),sign_outcome=?,updated_at=?,sign_failures=sign_failures+1
 			  WHERE id=? AND status IN (`+sqlSignerActive+`) AND sign_attempt=? AND sign_failures=? AND COALESCE(signing_heartbeat_at,signing_claimed_at,updated_at) < ?`,

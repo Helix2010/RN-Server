@@ -48,6 +48,7 @@ const (
 	eventSignerTransient   = "signer.reject-transient"
 	eventSignerComplete    = "signer.complete"
 	eventReapSign          = "reaper.sign-timeout"
+	eventSignOvertaken     = "server.sign-overtaken"
 	eventSignerUpload      = "signer.upload"
 	eventSignerDownload    = "signer.download"
 	eventBuilderUpload     = "builder.upload"
@@ -90,6 +91,8 @@ var buildJobTransitions = []buildJobTransition{
 	{eventSignerTransient, []string{jobKindAPK}, []string{jobSigning}, []string{jobBuilt, jobFailed}},
 	{eventSignerComplete, []string{jobKindAPK}, []string{jobSigning}, []string{jobSucceeded}},
 	{eventReapSign, []string{jobKindAPK}, []string{jobSigning}, []string{jobBuilt, jobFailed}},
+	// 构建期间该平台已经有了不低于它的发布（手工上传）：签出来也落不了库，派活前当场判失败
+	{eventSignOvertaken, []string{jobKindAPK}, []string{jobBuilt}, []string{jobFailed}},
 }
 
 // buildJobEventFrom 返回某个事件在某种任务上允许的起始状态；kind 为空时取所有类型的并集。

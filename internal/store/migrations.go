@@ -1937,13 +1937,13 @@ func buildJobsSigningGateMigration(ctx context.Context, db *sql.DB) error {
 		{"claimed_machine_id", `ALTER TABLE build_jobs ADD COLUMN claimed_machine_id VARCHAR(40) NULL
 			COMMENT '认领这个任务的构建机 id（app_configs 平台级 build.machines，mch_ 前缀），由机器令牌鉴权得出；构建机的每个上报都要与它一致。退回排队后保留为最近一次认领者。NULL=从未被机器令牌鉴权的构建机认领'`},
 		{"unsigned_object_key", `ALTER TABLE build_jobs ADD COLUMN unsigned_object_key VARCHAR(512) NULL
-			COMMENT '未签名安装包在租户发布存储里的对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/app-release-unsigned.apk。键带认领编号，与校验编号写在同一条 UPDATE 里，过期的认领写不进来。每次认领清空。NULL=还没上传（ota 任务恒为 NULL）'`},
+			COMMENT '未签名安装包在租户发布存储里的对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/每次上传的随机段/app-release-unsigned.apk。每次上传一个新键，在锁住本行、校验认领编号的同一个事务里写入，被替换的旧对象提交后删除；过期或迟到的上传写不进来，只删自己刚写的对象，碰不到已被引用的键。每次认领清空。NULL=还没上传（ota 任务恒为 NULL）'`},
 		{"unsigned_size", `ALTER TABLE build_jobs ADD COLUMN unsigned_size BIGINT NULL
 			COMMENT '未签名安装包大小，单位字节，服务端收流时计数；NULL=还没上传'`},
 		{"unsigned_sha256", `ALTER TABLE build_jobs ADD COLUMN unsigned_sha256 CHAR(64) NULL
 			COMMENT '未签名安装包 sha256（小写十六进制），服务端收流时自己算，不采信构建机；签名闸下载后再复核。NULL=还没上传'`},
 		{"sbom_object_key", `ALTER TABLE build_jobs ADD COLUMN sbom_object_key VARCHAR(512) NULL
-			COMMENT 'SBOM（CycloneDX JSON）对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/sbom.cdx.json，与同一认领编号下的未签名包配对。每次认领清空。NULL=还没上传'`},
+			COMMENT 'SBOM（CycloneDX JSON）对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/每次上传的随机段/sbom.cdx.json，写入规则同 unsigned_object_key。每次认领清空。NULL=还没上传'`},
 		{"sbom_size", `ALTER TABLE build_jobs ADD COLUMN sbom_size BIGINT NULL
 			COMMENT 'SBOM 大小，单位字节，服务端收流时计数；NULL=还没上传'`},
 		{"sbom_sha256", `ALTER TABLE build_jobs ADD COLUMN sbom_sha256 CHAR(64) NULL
@@ -1964,6 +1964,8 @@ func buildJobsSigningGateMigration(ctx context.Context, db *sql.DB) error {
 			COMMENT '签名闸最近一次心跳 UTC；signing 超过 5 分钟没有更新时由回收定时器退回 built 并计一次签名失败。NULL=从未被签名闸认领'`},
 		{"sign_outcome", `ALTER TABLE build_jobs ADD COLUMN sign_outcome JSON NULL
 			COMMENT '最近一次没签成的原因：{"kind":"deferred|violation|transient","code":错误码,"detail":说明,"machineId":签名闸 id,"at":UTC 时间}。deferred=暂不能签，退回 built 不计次；violation=违规，任务判失败；transient=临时错误或签名心跳超时，计入 sign_failures。签成之后保留作历史。NULL=没有过'`},
+		{"signed_object_key", `ALTER TABLE build_jobs ADD COLUMN signed_object_key VARCHAR(512) NULL
+			COMMENT '签名闸交回的已签名安装包对象键：前缀/tenants/租户/build-jobs/任务/s签名认领编号/每次上传的随机段/app-release.apk。写入规则同 unsigned_object_key（校验的是签名认领编号与签名闸）；完成时只从这个键取包复核，发布记录的 object_key 就是它。每次签名认领清空。NULL=本次签名认领还没交回'`},
 	}
 	for _, column := range columns {
 		if err := addColumnIfMissing(ctx, db, "build_jobs", column.name, column.ddl); err != nil {

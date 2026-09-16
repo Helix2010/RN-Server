@@ -21,17 +21,17 @@
 
 ### 2. 编号防护与独立回收
 
-- 每次构建认领 `attempt+1`，每次签名认领 `sign_attempt+1`；机器的所有任务级请求带 `x-build-attempt` / `x-sign-attempt`，写入 SQL 条件带编号与机器 id，不匹配 409 `BUILD_ATTEMPT_STALE` / `SIGN_ATTEMPT_STALE`。未签名包、SBOM、已签名包的对象键含编号，写键与校验编号在同一条 UPDATE 里。
+- 每次构建认领 `attempt+1`，每次签名认领 `sign_attempt+1`；机器的所有任务级请求带 `x-build-attempt` / `x-sign-attempt`，写入 SQL 条件带编号与机器 id，不匹配 409 `BUILD_ATTEMPT_STALE` / `SIGN_ATTEMPT_STALE`。未签名包、SBOM、已签名包的对象键含编号与每次上传一个的随机段，写键与校验编号在锁住任务行的同一个事务里；迟到或过期的上传只删自己写的对象，碰不到已被任务行或发布记录引用的键。`complete` 只从任务行记下的键取包，事务里再核对键没被重传替换、签名闸没在复核期间被吊销。
 - 回收是服务端独立定时器（每分钟，`RunBuildJobReaper`，随进程退出），不再挂在打包机认领上：`claimed/running` 10 分钟无心跳，安装包回 `queued`（`attempt` 到 3 判失败），热更新判失败；`signing` 5 分钟无心跳回 `built` 并 `sign_failures+1`。
 - `sign_failures` 单独一列：签名闸"暂不能签"（`release`，例如本机还没确认）不计数；心跳超时与"临时错误放弃"（`reject transient`）各加一，到 2 判失败；"违规"（`reject violation`）直接失败。三种结论都写 `sign_outcome` 与审计（actor `system-signer`）。
 - `live_build_number` 生成列把 `built`、`signing` 算作占号，签名期间同一个 build 号不能再排一条。
-- 手工上传 Android 发布记录时，该租户该平台有 `built`/`signing` 任务就 409 `RELEASE_SIGNING_IN_FLIGHT`，免得手工包抢走签名闸正要用的版本号。
+- 手工上传 Android 发布记录时，该租户该平台有 `built`/`signing` 任务就 409 `RELEASE_SIGNING_IN_FLIGHT`，免得手工包抢走签名闸正要用的版本号。任务还在排队或构建时手工上传照常放行；签名认领在同一把发布序列锁里比对已有发布，被超过的任务当场判失败、不派（签名闸会在本机记录里占掉派出去的 versionCode）。
 
 ### 3. 机器登记取代全局令牌
 
 - 平台级 `app_configs` 键 `build.machines`：每台机器一个令牌（`rnm_` + 32 字节 base64url，只存 sha256，原文只在新建响应里出现一次）、角色、主备、公钥与状态。`BUILD_AGENT_TOKEN` 删除。
 - 鉴权中间件按令牌 sha256 找机器，校验角色（构建机令牌调签名闸接口 403，反之亦然），`revoked` 401。每个请求主键查一次 `version, updated_at`，没变用缓存——吊销即时生效，又不必每次解析整份 JSON。只带旧头 `x-build-agent-token` 返回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`，旧打包机升级前看到的是"要升级"而不是"令牌错"。
-- 公钥由机器自己上报为待接受，平台管理员核对完整 64 位指纹后接受。已 active 的机器换钥必须带当前私钥对 `machinekey.RotationMessage` 的签名，否则 403——偷到令牌不等于能换掉出处密钥。
+- 公钥由机器自己上报为待接受，平台管理员核对完整 64 位指纹后接受；签名闸接受时可以（建议）同时核对 Ed25519 指纹，带了就必须一致，否则偷到令牌的人能在待接受期间把真机的 X25519 与自己的 Ed25519 配成一对。已 active 的机器换钥必须带当前私钥对 `machinekey.RotationMessage` 的签名，否则 403——偷到令牌不等于能换掉出处密钥。
 - 签名闸有两把钥：X25519 解密钥密文（其 sha256 是收件人指纹），Ed25519 签本机记录与换钥证明。构建机一把 Ed25519 出处密钥。
 - **主备只影响路由**。签名闸与离线工具不采信这份登记：签名闸只信本机记录，离线工具只加密给离线 pin 文件里的签名闸。服务端被攻破能做到的是"不派活、派给错的机器"，做不到"让签名闸签一个它不认的包"。
 

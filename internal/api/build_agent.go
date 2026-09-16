@@ -63,8 +63,9 @@ func attemptFromHeader(c *gin.Context, header string) (int, bool) {
 }
 
 // buildJobObjectKey 是构建与签名产物的对象键：<prefix>/tenants/<tenant>/build-jobs/<job>/<segment>/<name>。
-// segment 是 a<attempt>（构建机交付）或 s<signAttempt>（签名闸交回），键里带编号，
-// 过期的认领写不到新认领的键上。
+// segment 是 a<attempt>/<随机段>（构建机交付）或 s<signAttempt>/<随机段>（签名闸交回），见
+// deliveryObjectSegment：键里带编号，过期的认领写不到新认领的键上；每次上传一个新键，迟到的
+// 上传碰不到已被引用的对象。
 func buildJobObjectKey(prefix, tenant, jobID, segment, name string) string {
 	return strings.TrimLeft(path.Join(prefix, "tenants", tenant, "build-jobs", jobID, segment, name), "/")
 }
@@ -247,7 +248,7 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	if err != nil {
 		var missing *missingIdentity
 		if errors.As(err, &missing) {
-			s.markBuildJobFailed(ctx, job.ID, missing.Error())
+			s.markBuildJobFailed(ctx, job, missing.Error())
 			problem(c, http.StatusConflict, "APP_IDENTITY_INCOMPLETE", missing.Error())
 			return
 		}
@@ -275,7 +276,7 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		base, baseErr := s.otaJobBaseFor(ctx, job.TenantID, job.BaseReleaseID.String)
 		if baseErr != nil {
 			detail := "这条热更新任务的基线安装包已经不可用了：" + baseErr.Error()
-			s.markBuildJobFailed(ctx, job.ID, detail)
+			s.markBuildJobFailed(ctx, job, detail)
 			problem(c, http.StatusConflict, "OTA_BASE_RELEASE_INVALID", detail)
 			return
 		}
@@ -287,12 +288,13 @@ func (s *server) claimBuildJob(c *gin.Context) {
 
 // markBuildJobFailed 在认领那一刻就发现缺配置时判一条任务失败。队列是跨租户的，
 // 一条卡住的任务占着 build 号，拖的是所有人。
-func (s *server) markBuildJobFailed(ctx context.Context, id, reason string) {
+func (s *server) markBuildJobFailed(ctx context.Context, job buildJob, reason string) {
 	now := time.Now().UTC()
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE build_jobs SET status='failed',failure_reason=?,heartbeat_at=?,updated_at=? WHERE id=? AND status IN (`+sqlDispatchFailure+`)`,
-		clipRunes(reason, 500), now, now, id); err != nil {
-		slog.Error("unable to fail a build job that cannot be dispatched", "jobId", id, "error", err)
+		`UPDATE build_jobs SET status='failed',failure_reason=?,heartbeat_at=?,updated_at=?
+		  WHERE id=? AND status IN (`+sqlDispatchFailure+`) AND attempt=? AND claimed_machine_id=?`,
+		clipRunes(reason, 500), now, now, job.ID, job.Attempt, job.ClaimedMachineID.String); err != nil {
+		slog.Error("unable to fail a build job that cannot be dispatched", "jobId", job.ID, "error", err)
 	}
 }
 
@@ -470,9 +472,54 @@ func (s *server) uploadBuildSBOM(c *gin.Context) {
 	s.receiveBuildDelivery(c, "sbom", sbomObjectName, buildSBOMMaxBytes)
 }
 
-// receiveBuildDelivery 流式收下未签名包或 SBOM，写进租户发布存储，然后在**同一条 UPDATE** 里
-// 校验认领编号并记下对象键、大小与 sha256。编号在收流期间过期（任务被回收、被取消）时
-// 这条 UPDATE 改不到任何行，刚写的对象删掉，回 409。
+// deliveryObjectSegment 是一次上传的对象键中间段：编号 + 随机段。
+//
+// 随机段不能省。键只由编号决定时，同一次认领里的两次上传写的是同一个键：前一次请求在
+// 反向代理那里超时、客户端重传成功并往下走了（/built、complete），前一次这才写完，
+// 既覆盖了已经被任务行或发布记录引用的对象，又因为状态已经往前走、改不到行而把它删掉。
+// 每次上传一个新键之后，迟到的上传只可能删掉自己写的那个对象。
+func deliveryObjectSegment(prefix string, attempt int) string {
+	return prefix + strconv.Itoa(attempt) + "/" + randomID(9)
+}
+
+// recordDeliveredObject 锁住任务行、确认认领仍然有效（lockQuery 带编号与机器条件，只选出
+// 本列当前的对象键），再执行 update 记下新对象，一个事务。认领已经无效时 current=false，
+// 调用方删掉自己刚写的对象。返回被替换下来的旧键，调用方在提交之后删除。
+func (s *server) recordDeliveredObject(ctx context.Context, lockQuery string, lockArgs []any, update string, updateArgs []any) (replaced sql.NullString, current bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return sql.NullString{}, false, err
+	}
+	defer tx.Rollback()
+	switch err := tx.QueryRowContext(ctx, lockQuery+` FOR UPDATE`, lockArgs...).Scan(&replaced); {
+	case errors.Is(err, sql.ErrNoRows):
+		return sql.NullString{}, false, nil
+	case err != nil:
+		return sql.NullString{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, update, updateArgs...); err != nil {
+		return sql.NullString{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return sql.NullString{}, false, err
+	}
+	return replaced, true, nil
+}
+
+// deleteReplacedObject 删掉同一次认领里被重传替换下来的旧对象。尽力而为：删不掉只留一个
+// 没人引用的孤儿对象，不影响任务。
+func deleteReplacedObject(client objectstore.Client, replaced sql.NullString, key, jobID string) {
+	if !replaced.Valid || replaced.String == "" || replaced.String == key {
+		return
+	}
+	if err := client.Delete(context.Background(), replaced.String); err != nil {
+		slog.Warn("cannot delete an object replaced by a re-upload", "job", jobID, "key", replaced.String, "error", err)
+	}
+}
+
+// receiveBuildDelivery 流式收下未签名包或 SBOM，写进租户发布存储（每次上传一个新键），然后在
+// 锁住任务行的同一个事务里校验认领编号并记下对象键、大小与 sha256。编号在收流期间过期
+// （任务被回收、被取消、已经交付）时改不到行，刚写的对象删掉，回 409。
 func (s *server) receiveBuildDelivery(c *gin.Context, what, objectName string, limit int64) {
 	job, ok := builderJobFromContext(c)
 	if !ok {
@@ -488,7 +535,7 @@ func (s *server) receiveBuildDelivery(c *gin.Context, what, objectName string, l
 		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
 		return
 	}
-	key := buildJobObjectKey(prefix, job.TenantID, job.ID, "a"+strconv.Itoa(job.Attempt), objectName)
+	key := buildJobObjectKey(prefix, job.TenantID, job.ID, deliveryObjectSegment("a", job.Attempt), objectName)
 	received, status, code, detail := s.receiveStreamToObject(c, client, key, limit)
 	if status != 0 {
 		problem(c, status, code, detail)
@@ -506,20 +553,25 @@ func (s *server) receiveBuildDelivery(c *gin.Context, what, objectName string, l
 	if what == "sbom" {
 		column = "sbom"
 	}
-	// 列名来自上面两个常量之一，不是输入
-	result, err := s.db.ExecContext(context.Background(),
-		`UPDATE build_jobs SET `+column+`_object_key=?,`+column+`_size=?,`+column+`_sha256=?,updated_at=?
+	// 列名来自上面两个常量之一，不是输入。请求可能已经断开，落库不跟着请求取消
+	replaced, current, err := s.recordDeliveredObject(context.Background(),
+		`SELECT `+column+`_object_key FROM build_jobs
 		  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventBuilderUpload, jobKindAPK))+`) AND attempt=? AND claimed_machine_id=?`,
-		key, received.size, received.sha256, time.Now().UTC(), job.ID, job.Attempt, machine.ID)
+		[]any{job.ID, job.Attempt, machine.ID},
+		`UPDATE build_jobs SET `+column+`_object_key=?,`+column+`_size=?,`+column+`_sha256=?,updated_at=? WHERE id=?`,
+		[]any{key, received.size, received.sha256, time.Now().UTC(), job.ID})
 	if err != nil {
+		// 不删对象：提交报错时事务可能其实已经提交，删了就是删一个被引用的键
+		slog.Error("cannot record a delivered build file", "job", job.ID, "what", what, "error", err)
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the delivered file")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if !current {
 		_ = client.Delete(context.Background(), key)
 		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
 		return
 	}
+	deleteReplacedObject(client, replaced, key, job.ID)
 	c.JSON(http.StatusOK, gin.H{"sha256": received.sha256, "size": received.size})
 }
 

@@ -626,7 +626,8 @@ func (s *server) revokeMachine(c *gin.Context) {
 
 func (s *server) acceptMachineKey(c *gin.Context) {
 	var body struct {
-		PublicKeySHA256 string `json:"publicKeySha256"`
+		PublicKeySHA256        string  `json:"publicKeySha256"`
+		Ed25519PublicKeySHA256 *string `json:"ed25519PublicKeySha256"`
 		machineWriteCommon
 	}
 	if decode(c, &body) != nil || !body.valid() {
@@ -638,6 +639,15 @@ func (s *server) acceptMachineKey(c *gin.Context) {
 	if !valid {
 		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "publicKeySha256 must be the full 64-character sha256")
 		return
+	}
+	// 签名闸的第二把钥（Ed25519）决定以后谁能证明换钥。只核对 X25519 时，偷到令牌的人可以在
+	// 待接受期间报上"真机的 X25519 + 自己的 Ed25519"。带了就必须一致；不带时保持约定 5.4 的行为
+	typedEd25519 := ""
+	if body.Ed25519PublicKeySHA256 != nil {
+		if typedEd25519, valid = fingerprint.Normalize(strings.TrimSpace(*body.Ed25519PublicKeySHA256)); !valid {
+			problem(c, http.StatusBadRequest, "INVALID_MACHINE", "ed25519PublicKeySha256 must be the full 64-character sha256")
+			return
+		}
 	}
 	id := strings.TrimSpace(c.Param("id"))
 	reason := strings.TrimSpace(body.Reason)
@@ -656,6 +666,9 @@ func (s *server) acceptMachineKey(c *gin.Context) {
 		}
 		if typed != m.Pending.PublicKeySHA256 {
 			return http.StatusConflict, "MACHINE_KEY_MISMATCH", "The fingerprint does not match the key waiting to be accepted; read it on the machine itself", nil
+		}
+		if typedEd25519 != "" && (m.Role != machineRoleSigner || typedEd25519 != string(m.Pending.Ed25519PublicKeySHA256)) {
+			return http.StatusConflict, "MACHINE_KEY_MISMATCH", "The ed25519 fingerprint does not match the key waiting to be accepted; read it on the signer itself", nil
 		}
 		if other, taken := doc.keyInUse(m.ID, m.Pending.PublicKeySHA256, string(m.Pending.Ed25519PublicKeySHA256)); taken {
 			return http.StatusConflict, "MACHINE_KEY_IN_USE", "Machine " + other + " already uses this key", nil

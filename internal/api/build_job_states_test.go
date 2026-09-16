@@ -182,7 +182,7 @@ func TestDBStatusDrivenQueriesKnowTheSigningStates(t *testing.T) {
 		t.Fatalf("a signing job with a fresh signing heartbeat was reaped: %+v", result)
 	}
 	// markBuildJobFailed 只改认领那一刻的任务
-	f.s.markBuildJobFailed(context.Background(), jobID, "should not apply")
+	f.s.markBuildJobFailed(context.Background(), f.jobStatus(jobID), "should not apply")
 	if f.jobStatus(jobID).Status != jobSigning {
 		t.Fatal("markBuildJobFailed touched a signing job")
 	}

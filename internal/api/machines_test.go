@@ -232,9 +232,22 @@ func TestDBMachineKeyRotationAndSignerRoles(t *testing.T) {
 	if r := accept(f.standby.ID, f.standby.recipient()); r.Code != http.StatusConflict || problemCode(t, r) != "MACHINE_KEY_NOT_PENDING" {
 		t.Fatalf("accepting on a machine with nothing pending: %d %s", r.Code, r.Body.String())
 	}
+	// 签名闸的 Ed25519 指纹带了就必须一致：只核对 X25519 时，偷到令牌的人可以报上"真机的 X25519 +
+	// 自己的 Ed25519"，之后的换钥证明就归他了
+	wrongEd := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+f.primary.ID+"/accept-key", map[string]any{
+		"publicKeySha256": fingerprint.SHA256Hex(newX), "ed25519PublicKeySha256": strings.Repeat("1", 64),
+		"expectedVersion": registryVersion(t, f), "reason": "verified on the machine", "confirm": true,
+	})
+	if wrongEd.Code != http.StatusConflict || problemCode(t, wrongEd) != "MACHINE_KEY_MISMATCH" {
+		t.Fatalf("accepting with the wrong ed25519 fingerprint: %d %s", wrongEd.Code, wrongEd.Body.String())
+	}
 	// keytool 风格（大写带冒号）的指纹也认
 	colon, _ := colonFingerprint(fingerprint.SHA256Hex(newX))
-	accepted := accept(f.primary.ID, colon)
+	colonEd, _ := colonFingerprint(fingerprint.SHA256Hex(newEd))
+	accepted := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+f.primary.ID+"/accept-key", map[string]any{
+		"publicKeySha256": colon, "ed25519PublicKeySha256": colonEd,
+		"expectedVersion": registryVersion(t, f), "reason": "verified on the machine", "confirm": true,
+	})
 	if accepted.Code != http.StatusOK {
 		t.Fatalf("accept: %d %s", accepted.Code, accepted.Body.String())
 	}
