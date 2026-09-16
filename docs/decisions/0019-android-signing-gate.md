@@ -78,8 +78,8 @@
 
 ## 两次发布
 
-- **第一次**（迁移 54 与删备份代码、本 ADR 的全部接口改动同发）：无破坏性表变更。旧二进制回滚时面对的表还在。
-- **第二次**（新链路稳定后单独发）：迁移 55 删除 `platform_backups` 表与 `app_configs` 的 `backup.bucket`、`backup.recipients`、`build.agent.backup-sign`、`build.agent.recipient`，以及旧格式（不是 format 2）的 `build.keystore.check`（新代码读到它本来就当作空）。它在分支上是最后一个单独提交，部署时不要与第一次一起上：第一次发布失败回滚到旧二进制时，旧代码还要用这些表和配置。
+- **第一次**（本分支）：只含迁移 54，与删备份代码、本 ADR 的全部接口改动同发，无破坏性表变更。合并即部署，失败自动回滚到旧二进制时，旧代码面对的表和配置行都还在。
+- **第二次**（新链路稳定之后，对应设计「落地顺序」第 8 步，另开分支单独发布）：一条新迁移删除 `platform_backups` 表，`app_configs` 的 `backup.bucket`、`backup.recipients`、`build.agent.backup-sign`、`build.agent.recipient`，以及旧格式（不是 format 2）的 `build.keystore.check` 行。**不在本分支里**：放进来的话合并即部署会把 54 和它一起跑掉，第一次发布就没有回滚余地。
 
 ## 代价
 
