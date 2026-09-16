@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 【已被取代】新机器用服务端下发的 internal/machinesetup/install.sh（安装包由 deploy/setup/build-bundles.sh 构建），
+# 手册见 deploy/amos/SIGNING_GATE_ROLLOUT.md。这个脚本只为 amos 的首次手工上线保留，amos 迁移完成后删除，不要再用于新机器。
 # 签名闸上线 · 第 2 步（amos，root，**在你自己的终端里跑**，不要经过会把输出送进对话记录的通道）
 #   sudo bash 2-configure.sh                 逐个提示粘贴令牌
 # 前提：控制台「平台维护 → 打包机与签名闸」已新建 amos-builder（构建机）、amos-signer-a（签名闸，主）、

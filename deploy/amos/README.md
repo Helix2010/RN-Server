@@ -3,7 +3,9 @@
 和 web4 不同，amos 上**没有 Docker**，也不打算装。这里沿用打包机代理那一套：
 交叉编译出二进制，scp 过去，systemd 拉起，配置放 `/etc` 下 0600。
 
-**签名闸上线（2026-09-16）按 [`SIGNING_GATE_ROLLOUT.md`](SIGNING_GATE_ROLLOUT.md) 一步步做**，脚本在 `signing-gate-rollout/`。
+**签名闸与构建机**（新机器一条安装命令、换密钥控制台一键、amos 现有部署的迁移）按 [`SIGNING_GATE_ROLLOUT.md`](SIGNING_GATE_ROLLOUT.md) 做。
+新机器的安装包由 CI 随服务端发布（`rn-foundation-apply bundles`，放在 `/opt/rn-foundation/machine-bundles/current/`）；
+`signing-gate-rollout/` 里是首次手工上线的旧脚本，已被安装命令取代，amos 迁移完成后删除。
 
 配置项本身（每个键是什么、默认值、必填哪些、报错怎么读）在
 [`../../docs/CONFIGURATION.md`](../../docs/CONFIGURATION.md)；这份文档只讲**这台

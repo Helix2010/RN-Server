@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 【已被取代】新机器用服务端下发的 internal/machinesetup/install.sh（安装包由 deploy/setup/build-bundles.sh 构建），
+# 手册见 deploy/amos/SIGNING_GATE_ROLLOUT.md。这个脚本只为 amos 的首次手工上线保留，amos 迁移完成后删除，不要再用于新机器。
 # 签名闸上线 · 第 3 步（amos，root）：换上服务端、扫链、迁移三个 unit（去掉备份用的 LoadCredential，
 # 加上挡签名闸路径的 InaccessiblePaths）并重启服务端与扫链。
 # 必须在签名闸启动之后跑：/run 下的签名闸目录与 socket 只有在服务启动时已经存在才会被遮住。

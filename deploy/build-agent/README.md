@@ -1,6 +1,6 @@
 # 构建机部署
 
-设计见 `docs/design/android-signing-gate-2026-09-16.md`「构建机」「部署与运维」。
+设计见 `docs/design/android-signing-gate-2026-09-16.md`「构建机」「部署与运维」，装机与注册见 `docs/design/android-signing-gate-automation-2026-09-16.md`「2. 新机器」。
 
 **构建机没有签名能力。** 它执行 pnpm、Gradle 和几千个第三方依赖的代码，按不可信处理：手上没有任何签名密钥，只交付**未签名包**、SBOM 和一份用本机出处密钥签名的出处声明；正式签名由签名闸做，签名闸只认在它本机 pin 过的构建机公钥。
 
@@ -94,7 +94,8 @@ sudo -n -u builder -- /opt/rn-build-agent/build-runner self-check --jobs-root /v
 | --- | --- | --- | --- |
 | `/opt/rn-build-agent/build-agent` | root:root | 0755 | 控制进程 |
 | `/opt/rn-build-agent/build-runner` | root:root | 0755 | 执行进程；控制进程启动时拒绝一个组或其他人可写、或不属于 root 的执行进程二进制 |
-| `/etc/rn-build-agent.env` | root:root | 0600 | 含本机令牌；systemd 以 root 读 |
+| `/etc/rn-build-agent.env` | root:root | 0600 | 含本机令牌（`build-agent enroll` 写入）；systemd 以 root 读 |
+| `/var/lib/rn-machine-setup/` | root:root | 0700 | install.sh 按注册码留下的查询结果与安装包（重复执行用，没有机密，装好后可删） |
 | `/etc/sudoers.d/rn-build-agent` | root:root | 0440 | 那一条规则 |
 | `/var/lib/rn-build-agent/` | rn-build-agent:rn-build-agent | 0700 | rn-build-agent 的 HOME；builder 连进都进不去 |
 | `/var/lib/rn-build-agent/.ssh/` | rn-build-agent | 0700 | GitHub 只读 deploy key |
@@ -128,54 +129,75 @@ builder 能写的地方只有当前任务的 `work/`、`out/` 与 `/tmp` 一类�
 
 ## 装一台新的
 
-```bash
-# 1. 工具链、SDK、syft：同上一节，SDK 放 /opt/android-sdk，root 所有、全局可读
+一条命令（自动化设计「2. 新机器」，完整步骤见 `deploy/amos/SIGNING_GATE_ROLLOUT.md` 第 2 节）：
 
-# 2. 用户、组
-sudo groupadd --system rn-build-jobs
-sudo useradd --system --home-dir /var/lib/rn-build-agent --create-home --shell /usr/sbin/nologin \
-  --user-group --groups rn-build-jobs rn-build-agent
-sudo useradd --system --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin \
-  --user-group --groups rn-build-jobs builder
-echo builder | sudo tee -a /etc/cron.deny /etc/at.deny >/dev/null
+1. 平台管理员在控制台「平台维护 → 打包机与签名闸 → 新建机器」选构建机，得到一次性安装命令（注册码 60 分钟有效、只能用一次）。
+2. 在构建机本机执行：
+   ```bash
+   curl -fsSL https://api.anyfun.win/v1/machine-setup/install.sh | sudo bash -s -- --server https://api.anyfun.win --code rne_…
+   ```
+3. 按输出的“下一步”：把 deploy key 加到 GitHub（只读）后重新执行同一条命令克隆仓库镜像；在控制台核对出处公钥 sha256 后接受；在每台签名闸上 `trust-builder --builder <机器名>`。
 
-# 3. 目录
-sudo install -d -o rn-build-agent -g rn-build-agent -m 0700 /var/lib/rn-build-agent /var/lib/rn-build-agent/.ssh /var/lib/rn-build-agent/state /var/lib/rn-build-agent/repos
-sudo install -d -o rn-build-agent -g rn-build-jobs -m 2750 /var/lib/rn-build-jobs
-sudo install -d -o root -g root -m 0755 /opt/rn-build-agent
+安装脚本（`internal/machinesetup/install.sh`，服务端下发）对构建机做的事：
 
-# 4. GitHub 只读 deploy key 与仓库镜像
-sudo -u rn-build-agent ssh-keygen -t ed25519 -N "" -C "rn-build-agent@$(hostname)" -f /var/lib/rn-build-agent/.ssh/id_ed25519
-sudo -u rn-build-agent sh -c 'ssh-keyscan -t ed25519 github.com > /var/lib/rn-build-agent/.ssh/known_hosts'
-sudo cat /var/lib/rn-build-agent/.ssh/id_ed25519.pub   # 公钥加到仓库 Deploy keys（只读）
-sudo -u rn-build-agent git clone --mirror git@github.com:Helix2010/RN-App.git /var/lib/rn-build-agent/repos/rn-app.git
+- **检查前提**：JDK 17、`/opt/android-sdk`、Node 22、pnpm、syft、zip、git ≥ 2.30、sudo、openssh-client。缺什么列出来退出，注册码不会被用掉。
+- **下载安装包**：服务端的 `builder.tar.gz`，核对归档与每个文件的 sha256，内容是 `bin/build-agent`、`bin/build-runner`、unit、sudoers、env 示例、本 README。
+- **安装**：
+  - 建 `rn-build-jobs` 组、`rn-build-agent` 与 `builder` 用户（builder 家目录 `/nonexistent`、nologin、进 cron/at deny）；
+  - 建「目录与权限」一节的目录；
+  - 装两个程序、sudoers（visudo 校验）、unit；
+  - 冒烟：以 builder、空环境跑两个程序，都必须以 2 退出。
+- **仓库镜像**：
+  - GitHub 只读 deploy key 没有就生成；known_hosts 写入 GitHub 公布的 ed25519 主机公钥（固定在脚本里，不用 ssh-keyscan）；
+  - 已有 deploy key 且还没有镜像时，以 rn-build-agent 身份 `git clone --mirror`。
+- **注册**：`build-agent enroll`（见「身份登记」）。
+- **启动**：`systemctl enable` 并重启 `rn-build-agent`，等常驻进程写出 `runner-mode.json` 后打印 `show-key`。
 
-# 5. 两个二进制（手工部署，见「换二进制」）、sudoers、配置、unit
-sudo install -o root -g root -m 0755 build-agent build-runner /opt/rn-build-agent/
-sudo visudo -cf rn-build-agent.sudoers && sudo install -o root -g root -m 0440 rn-build-agent.sudoers /etc/sudoers.d/rn-build-agent
-sudo install -o root -g root -m 0600 rn-build-agent.env.example /etc/rn-build-agent.env   # 然后填，令牌手输
-sudo install -o root -g root -m 0644 rn-build-agent.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now rn-build-agent
-```
+可以重复执行：已注册（env 里有机器令牌）的机器不重新注册、不替换已装的文件，只报告与安装包不同的地方、确保服务在跑。
+一台主机只跑一个构建机：已注册的主机上拿另一台机器的注册码执行会被拒绝，注册码不会被用掉。
+
+手工安装（没有服务端安装包时）按 `install.sh` 里 `install_builder` 的步骤做，env 文件从 `rn-build-agent.env.example` 抄，令牌仍用 `build-agent enroll` 写入。
 
 ## 身份登记
 
-1. 控制进程第一次启动时在状态目录生成出处密钥并登记公钥（`POST /v1/build-agent/public-key`），状态 `pending_key`，**接受之前不领任务**，journal 里会反复提示在等什么。
-2. 在构建机上只读查看身份（不会创建任何东西）：
+1. **注册**：`build-agent enroll --server <API 源> --code rne_… --env-file /etc/rn-build-agent.env --state-dir /var/lib/rn-build-agent/state`，由 install.sh 以 root 调用。
+   1. describe：注册码必须属于一台构建机，这一步不消耗注册码。
+   2. 出处密钥：已有就复用（核对属主与权限），没有就生成。以 root 运行时密钥交给状态目录的属主 rn-build-agent；状态目录属于 root 时拒绝。
+   3. 先在 `/etc` 建好临时文件。
+   4. enroll：交出出处公钥，换回机器令牌。
+   5. 令牌**直接写进 env 文件**（root 0600，原子替换），不经过屏幕、日志与报错。已有 env 文件的其它键原样保留，`BUILD_AGENT_SERVER` 与令牌换成这次的，缺的键按 `rn-build-agent.env.example` 的默认值补上（测试守着两边一致）。
+   6. 打印机器名、机器 id 与出处公钥完整 sha256，机器状态变成 `pending_key`。
+   - env 里已有令牌、状态目录里已有密钥时什么都不做，退出 0，不连服务端。
+   - 改造前带机密的旧 env（`BUILD_AGENT_TOKEN`、`BUILD_KEYSTORE_PASSPHRASE`）拒绝合并。
+   - 服务端回的机器 id 与 describe 不符、令牌形状不对时丢弃令牌、不写盘。
+2. 控制进程启动后登记同一把公钥（`POST /v1/build-agent/public-key`）。**接受之前不领任务**，journal 里会反复提示在等什么。
+3. 在构建机上只读查看身份（不会创建任何东西）：
    ```bash
    sudo -u rn-build-agent /opt/rn-build-agent/build-agent show-key --state-dir /var/lib/rn-build-agent/state
    ```
    输出公钥 base64、**完整 sha256（64 个十六进制字符）**，以及 `build runner:` 一行——必须是 `separate user builder via sudo`；是 `SAME USER AS THE BUILD AGENT` 就不要继续，先改配置。
-3. 平台管理员在控制台「平台维护 → 打包机与签名闸」核对完整 sha256 后接受。控制台接受只影响服务端路由。
-4. 运维分别登上主、备签名闸执行 `signer trust-builder`，粘贴第 2 步的完整 sha256。**签名闸只认这里 pin 过的构建机**；没做这一步，这台构建机交付的包会被拒签。
+4. 平台管理员在控制台「平台维护 → 打包机与签名闸」核对完整 sha256 后点「接受」。控制台接受只影响服务端路由。
+5. 运维分别登上每台签名闸执行 `signer trust-builder --builder <构建机机器名>`，粘贴第 3 步的完整 sha256。**签名闸只认这里 pin 过的构建机**；没做这一步，这台构建机交付的包会被拒签。
 
-**换出处密钥**（旧私钥还在）：`sudo -u rn-build-agent /opt/rn-build-agent/build-agent rotate-key --state-dir /var/lib/rn-build-agent/state` 生成下一把并打印 sha256 → 重启服务，控制进程用当前私钥签换钥证明登记它 → **先**在每台签名闸上 `trust-builder` 新 sha256 → **再**在控制台接受 → 控制进程发现服务端已接受（每次签出处声明之前都会先问一次），换上新密钥并删掉旧私钥。顺序反过来的话，中间交付的包会被签名闸拒签。换钥证明要签机器 id，服务端的登记响应需要带 `machineId`。
+**换出处密钥**（旧私钥还在）：
+1. `sudo -u rn-build-agent /opt/rn-build-agent/build-agent rotate-key --state-dir /var/lib/rn-build-agent/state` 生成下一把并打印 sha256。
+2. 重启服务，控制进程用当前私钥签换钥证明登记它。
+3. **先**在每台签名闸上 `trust-builder` 新 sha256。
+4. **再**在控制台接受。
+5. 控制进程发现服务端已接受（每次签出处声明之前都会先问一次），换上新密钥并删掉旧私钥。
 
-**私钥丢了**（状态目录没了）：不恢复，按新机器处理——控制台新建机器发新令牌、吊销旧机器，签名闸上撤销旧构建机、`trust-builder` 新的。
+顺序反过来的话，中间交付的包会被签名闸拒签。换钥证明要签机器 id，服务端的登记响应需要带 `machineId`。
+
+**私钥丢了**（状态目录没了）：不恢复，按新机器处理。
+1. 控制台吊销旧机器、新建一台；
+2. 清空 `/etc/rn-build-agent.env` 里 `BUILD_AGENT_MACHINE_TOKEN` 的值，执行新的安装命令；
+3. 签名闸上撤销旧构建机，`trust-builder` 新的。
 
 ## 换二进制
 
-**签名闸与 amos 同机期间，`AMOS_DEPLOY_BUILD_AGENT` 必须关着，构建机手工部署**（`deploy/amos/README.md`「签名闸同机期间，打包机不走 CI」）。另外 CI 那条路（`rn-foundation-apply build-agent`）只换 `build-agent`，不换 `build-runner`；两个二进制必须同一个提交一起换，版本不一致时控制进程启动自检失败（`--protocol`）。
+**签名闸与 amos 同机期间，`AMOS_DEPLOY_BUILD_AGENT` 必须关着，构建机手工换二进制**（`deploy/amos/README.md`「签名闸同机期间，打包机不走 CI」）。另外 CI 那条路（`rn-foundation-apply build-agent`）只换 `build-agent`，不换 `build-runner`；两个二进制必须同一个提交一起换，版本不一致时控制进程启动自检失败（`--protocol`）。
+
+CI 部署服务端时会把同一提交构建的安装包放到服务端机器的 `/opt/rn-foundation/machine-bundles/current/builder.tar.gz`，归档与其中每个程序的 sha256 打印在 CI 日志「Build machine bundles」一步。可以从那里取（与 CI 日志核对后安装，步骤见 `deploy/amos/SIGNING_GATE_ROLLOUT.md` 5.1），也可以自己编：
 
 ```bash
 GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-agent  ./cmd/build-agent
@@ -193,12 +215,28 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 
 ## 从旧结构迁移（旧打包机以 builder 跑 build-agent）
 
-1. `sudo systemctl stop rn-build-agent`，`sudo pkill -KILL -u builder`（Gradle daemon 等）。
-2. 按「装一台新的」第 2、3 步建 rn-build-agent、rn-build-jobs 与目录；`sudo usermod -d /nonexistent -s /usr/sbin/nologin -aG rn-build-jobs builder`；builder 进 cron/at deny。
-3. 仓库镜像与 deploy key 交给 rn-build-agent：`sudo mv /var/lib/rn-build-agent/repos/rn-app.git …` 后 `sudo chown -R rn-build-agent:rn-build-agent /var/lib/rn-build-agent && sudo chmod 0700 /var/lib/rn-build-agent`（`.ssh` 同理）。
-4. **删掉旧状态与缓存**：旧 `workspace/`、`/var/cache/rn-build-agent/{gradle,pnpm-store}`（builder 可写过，按被下毒处理）、`/tmp` 里属于 builder 的文件；`agent-key`、`backup-signing.key` 按设计「清理」一步销毁。
-5. `/etc/rn-build-agent.env` 按新示例重写：删 `BUILD_AGENT_TOKEN`、`BUILD_KEYSTORE_PASSPHRASE`、`BUILD_AGENT_RECOVERY_RECIPIENT_*`、`BUILD_AGENT_NAME`（这两个机密键留着控制进程会拒绝启动），填 `BUILD_AGENT_MACHINE_TOKEN`、`BUILD_AGENT_STATE_DIR`、`BUILD_AGENT_WORKSPACE=/var/lib/rn-build-jobs`。
-6. 装两个二进制、sudoers、新 unit，启动，走「身份登记」。
+`install.sh` 发现下列任一迹象就先迁移，再照新机器安装：
+
+- env 里有 `BUILD_AGENT_TOKEN` 或 `BUILD_KEYSTORE_PASSPHRASE`；
+- unit 以 `User=builder` 运行；
+- `/var/lib/rn-build-agent` 属于 builder；
+- 家目录里有 `agent-key` 或 `backup-signing.key`。
+
+迁移时依次做（逻辑沿用 `deploy/amos/signing-gate-rollout/1-install.sh`）：
+
+1. 停 `rn-build-agent`，`pkill -KILL -u builder`，等 builder 的进程全部退出。
+2. 在 `/root/rn-build-agent-legacy-<日期>/`（root 0700）留存旧东西，新链路稳定后按上线手册销毁：
+   - 旧 env 整个**移进**去（含旧令牌，从此不再使用）；
+   - 旧 unit、旧 `build-agent` 各复制一份；
+   - `agent-key`、`backup-signing.key`、`.gitconfig` 移进去。
+3. 删掉 builder 写过的缓存与工作区（按被下毒处理）：
+   - 家目录里的 `.android`、`.cache`、`.expo`、`.kotlin`、`.local`、`.npm`、`workspace/`；
+   - `/var/cache/rn-build-agent/{gradle,pnpm-store}`；
+   - `/tmp`、`/var/tmp`、`/dev/shm` 顶层属于 builder 的条目。
+4. 建 rn-build-agent 与 rn-build-jobs，builder 改成家目录 `/nonexistent`、nologin、加入 rn-build-jobs 组；`chown -R rn-build-agent:rn-build-agent /var/lib/rn-build-agent`，已有的仓库镜像与 deploy key 随之交给 rn-build-agent。
+5. 装程序、sudoers、unit，`build-agent enroll` 写出新的 env，启动。
+
+amos 上的构建机已经按 `1-install.sh` 迁移并注册过，不需要再执行安装命令。
 
 ## 异常恢复
 
@@ -215,7 +253,7 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 | 服务端明确拒绝（其余 4xx） | 不重试，带错误码按失败上报：`UPLOAD_CONTENT_TYPE_INVALID`、`UPLOAD_TOO_LARGE`、`UPLOAD_EMPTY`、`INVALID_BUILD_ATTEMPT`、`BUILD_SBOM_INVALID`、`BUILD_KIND_MISMATCH`、`BUILD_PROVENANCE_INVALID` 等 |
 | 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 中止执行进程，按超时上报 |
 | 公钥未被接受 | 不领任务，journal 里说清楚在等什么 |
-| 机器在控制台被吊销 | 任何一条请求收到 401 `MACHINE_REVOKED`，或者公钥登记成功过之后收到 401 `MACHINE_AUTH_REQUIRED`（令牌不再被认）：立刻停止领取，在跑的构建中止并清理、**不再上报**，记错误日志，以退出码 **77** 退出。unit 的 `RestartPreventExitStatus=77` 让 systemd 不再重启它（`systemctl status` 显示 failed）。要恢复就在控制台新建机器、把新令牌写进 env 文件、按「身份登记」重新走一遍，再 `systemctl restart`。登记之前就收到 `MACHINE_AUTH_REQUIRED`（多半是令牌抄错）不算吊销：照常重试并报错 |
+| 机器在控制台被吊销 | 任何一条请求收到 401 `MACHINE_REVOKED`，或者公钥登记成功过之后收到 401 `MACHINE_AUTH_REQUIRED`（令牌不再被认）：立刻停止领取，在跑的构建中止并清理、**不再上报**，记错误日志，以退出码 **77** 退出。unit 的 `RestartPreventExitStatus=77` 让 systemd 不再重启它（`systemctl status` 显示 failed）。要恢复就在控制台新建机器，清空 env 里 `BUILD_AGENT_MACHINE_TOKEN` 的值，执行新的安装命令（重新注册并启动），再按「身份登记」走完接受与 trust-builder。登记之前就收到 `MACHINE_AUTH_REQUIRED`（多半是令牌抄错）不算吊销：照常重试并报错 |
 | 状态目录或密钥权限不对 | 控制进程以 2 退出，不把密钥留在别人读得到的地方 |
 
 ## 排查
