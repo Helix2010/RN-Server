@@ -136,27 +136,39 @@ func (s *server) collectServerPart(ctx context.Context) (map[string][]byte, []ba
 func (s *server) exportBackupDatabaseConfig(ctx context.Context) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	tenants, err := dumpQueryAsJSON(ctx, s.db,
-		`SELECT id, slug, name, status, valid_from, valid_until, created_at, updated_at FROM tenants ORDER BY id`)
+		`SELECT id, slug, status, start_date, expiry_date, deleted, created_at, updated_at
+		   FROM tenants ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("export tenants: %w", err)
 	}
 	out["db/tenants.json"] = tenants
 
+	// deleted 和 is_primary 都要带上：少了它们，一个已软删的域名会在恢复后变回
+	// 生效状态，而租户解析恰恰卡在「域名 active、未软删」上
 	domains, err := dumpQueryAsJSON(ctx, s.db,
-		`SELECT tenant_id, domain, status, created_at, updated_at FROM tenant_domain ORDER BY tenant_id, domain`)
+		`SELECT tenant_id, domain, is_primary, status, deleted, created_at, updated_at
+		   FROM tenant_domain ORDER BY tenant_id, domain`)
 	if err != nil {
 		return nil, fmt.Errorf("export tenant_domain: %w", err)
 	}
 	out["db/tenant-domain.json"] = domains
 
-	// 打包必需的库内配置：应用身份、图标、Firebase、发布身份。
-	// build.keystore 那一项**不导**——它是密文，明文已经在内层里了
+	// 打包必需的库内配置：应用身份、图标、发布身份。
+	//
+	// 键名一律用各自模块的常量，不写字面量——写错一个字符的代价不是报错而是
+	// **静默导出 0 行**：备份照样 succeeded、控制台照样绿，直到恢复那天才发现
+	// 包里没有包名和签名指纹。这里已经这么栽过一次。
+	//
+	// build.keystore 不导：它是密文，明文已经在内层里了。
+	// push.fcm 也不导：secretbox 密文，没有 STORAGE_MASTER_KEY 也没用，
+	// 而构建要的 Firebase 配置在 build.android 的 googleServicesJson 里。
 	configs, err := dumpQueryAsJSON(ctx, s.db,
 		`SELECT tenant_id, config_key, config_value, version, updated_by, updated_at
 		   FROM app_configs
-		  WHERE config_key IN ('build.android','build.icons','push.credentials.fcm',
-		                       'release.identity.android','release.identity.ios')
-		  ORDER BY tenant_id, config_key`)
+		  WHERE config_key IN (?,?,?,?)
+		  ORDER BY tenant_id, config_key`,
+		buildConfigKey, buildIconsConfigKey,
+		releaseAndroidIdentityConfigKey, releaseIOSIdentityConfigKey)
 	if err != nil {
 		return nil, fmt.Errorf("export build configs: %w", err)
 	}
@@ -168,8 +180,8 @@ func (s *server) exportBackupDatabaseConfig(ctx context.Context) (map[string][]b
 //
 // 表结构会变，而这份导出的用途是「在一台新机器上把打包配置补回去」——按列名原样
 // 出比手写一堆 struct 更抗变化，少一列也不会静默丢数据。
-func dumpQueryAsJSON(ctx context.Context, db *sql.DB, query string) ([]byte, error) {
-	rows, err := db.QueryContext(ctx, query)
+func dumpQueryAsJSON(ctx context.Context, db *sql.DB, query string, args ...any) ([]byte, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
