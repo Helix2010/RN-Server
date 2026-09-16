@@ -161,3 +161,34 @@ func Open(sealed Sealed, passphrase string) (Bundle, error) {
 	}
 	return bundle, nil
 }
+
+// ValidateShape 检查一个盒子的**形状**对不对。服务端打不开它，但可以看它长得像不像。
+//
+// 两种格式都要认：v1 是口令封的（scrypt + salt），v2 是加密给打包机公钥的
+// （alg + epk）。只认 v1 的后果不是「少支持一种格式」——今天 CLI 产出的全是 v2，
+// 所以那等于**手上有明文 .p12 也装不回去**，而「把密钥装回一个新库」正是
+// 灾难恢复里绕不过去的一步。
+//
+// 在这里拦住一个形状不对的盒子，比在第一次构建时才发现便宜得多。
+func (s Sealed) ValidateShape() error {
+	if s.Ciphertext == "" || s.Nonce == "" {
+		return fmt.Errorf("sealed must carry nonce and ciphertext")
+	}
+	switch s.Version {
+	case formatV1:
+		if s.KDF != "scrypt" || s.Salt == "" {
+			return fmt.Errorf("a v1 sealed keystore must use scrypt and carry a salt")
+		}
+		if s.N < 1<<16 || s.R < 8 || s.P < 1 {
+			return fmt.Errorf("a v1 sealed keystore must use scrypt with at least N=65536, r=8, p=1")
+		}
+		return nil
+	case formatV2:
+		if s.Algorithm == "" || s.EphemeralPublicKey == "" {
+			return fmt.Errorf("a v2 sealed keystore must carry alg and epk")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported sealed keystore format %d", s.Version)
+	}
+}

@@ -162,14 +162,14 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", "keyAlias is required and keystoreSha256 must be a sha256 digest")
 		return
 	}
-	// 服务端打不开盒子，但可以看它的形状对不对。一个格式不对的盒子在这里拦住，
-	// 比在第一次构建时才发现便宜得多。
-	if body.Sealed.Version == 0 || body.Sealed.KDF == "" || body.Sealed.Ciphertext == "" || body.Sealed.Salt == "" || body.Sealed.Nonce == "" {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", "sealed must carry v, kdf, salt, nonce and ciphertext")
-		return
-	}
-	if body.Sealed.KDF != "scrypt" || body.Sealed.N < 1<<16 || body.Sealed.R < 8 || body.Sealed.P < 1 {
-		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", "sealed must use scrypt with at least N=65536, r=8, p=1")
+	// 服务端打不开盒子，但可以看它的形状对不对。
+	//
+	// **v1 和 v2 都要认。** 这里原来只认 v1（scrypt + salt），而 build-keystore
+	// 今天产出的全是 v2（加密给打包机公钥）——那等于手上有明文 .p12 也装不回去，
+	// 而「把密钥装回一个新库」正是灾难恢复里绕不过去的一步
+	// （platform-backup-recovery-2026-09-15 §11）。
+	if err := body.Sealed.ValidateShape(); err != nil {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE", err.Error())
 		return
 	}
 	if s.secrets == nil {

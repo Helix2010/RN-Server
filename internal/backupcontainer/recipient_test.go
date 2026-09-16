@@ -121,3 +121,19 @@ func TestParsePublicKeyRejections(t *testing.T) {
 		})
 	}
 }
+
+// 槽位名的合法集合（A/B/C）和**内层收件人**的集合（A/B）不一样。
+// 只校验「是个合法槽位」的话，一份封给 C 的内层会被静默收下、占掉磁盘，
+// 然后这次备份干等到产出超时——而运维看到的是「打包机半路没了」，
+// 不是「它传错了槽位」
+func TestInnerSlotIsNarrowerThanSlotName(t *testing.T) {
+	if !IsInnerSlot("A") || !IsInnerSlot("B") {
+		t.Fatal("A 和 B 是内层收件人")
+	}
+	if IsInnerSlot("C") {
+		t.Fatal("C 只开外层，不该被当成内层收件人")
+	}
+	if IsInnerSlot("D") || IsInnerSlot("") {
+		t.Fatal("不认识的槽位不该通过")
+	}
+}

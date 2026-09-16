@@ -103,3 +103,47 @@ func TestSealedFormatIsRejectedWhenUnknown(t *testing.T) {
 		t.Fatal("an unknown format version was opened anyway")
 	}
 }
+
+// 上传接口原来只认 v1（scrypt + salt），而 CLI 今天产出的全是 v2。
+// 那不是「少支持一种格式」——那等于手上有明文 .p12 也装不回一个新库，
+// 而那正是灾难恢复里绕不过去的一步
+func TestValidateShapeAcceptsBothFormats(t *testing.T) {
+	v1 := Sealed{Version: 1, KDF: "scrypt", N: 1 << 16, R: 8, P: 1,
+		Salt: "c2FsdA==", Nonce: "bm9uY2U=", Ciphertext: "Y3Q="}
+	if err := v1.ValidateShape(); err != nil {
+		t.Fatalf("v1 应当被接受: %v", err)
+	}
+	v2 := Sealed{Version: 2, Algorithm: "x25519-hkdf-sha256+secretbox",
+		EphemeralPublicKey: "ZXBr", RecipientKeyID: "kid", Nonce: "bm9uY2U=", Ciphertext: "Y3Q="}
+	if err := v2.ValidateShape(); err != nil {
+		t.Fatalf("v2 应当被接受——不接受就等于密钥装不回去: %v", err)
+	}
+}
+
+func TestValidateShapeRejectsMalformedBoxes(t *testing.T) {
+	cases := []struct {
+		name   string
+		sealed Sealed
+		want   string
+	}{
+		{"没有密文", Sealed{Version: 2, Algorithm: "a", EphemeralPublicKey: "e", Nonce: "n"}, "nonce and ciphertext"},
+		{"没有 nonce", Sealed{Version: 1, KDF: "scrypt", Salt: "s", Ciphertext: "c"}, "nonce and ciphertext"},
+		{"v1 缺 salt", Sealed{Version: 1, KDF: "scrypt", Nonce: "n", Ciphertext: "c"}, "carry a salt"},
+		{"v1 参数太弱", Sealed{Version: 1, KDF: "scrypt", Salt: "s", N: 1024, R: 8, P: 1,
+			Nonce: "n", Ciphertext: "c"}, "at least N=65536"},
+		{"v2 缺 epk", Sealed{Version: 2, Algorithm: "a", Nonce: "n", Ciphertext: "c"}, "alg and epk"},
+		{"版本不认识", Sealed{Version: 3, Nonce: "n", Ciphertext: "c"}, "unsupported"},
+		{"版本为零", Sealed{Nonce: "n", Ciphertext: "c"}, "unsupported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.sealed.ValidateShape()
+			if err == nil {
+				t.Fatal("应当被拒绝")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("错误应当提到 %q，得到: %v", tc.want, err)
+			}
+		})
+	}
+}

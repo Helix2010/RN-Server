@@ -234,6 +234,16 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 				problem(c, http.StatusBadRequest, "BACKUP_META_INVALID", err.Error())
 				return
 			}
+			// 槽位名合法不等于**该收**：合法集合是 A/B/C，而内层收件人只有 A/B
+			// （AB 与 AC 共用封给 A 的那份）。不在这里拒掉的话，一份封给 C 的内层
+			// 会被静默收下、占掉磁盘，然后这次备份干等到产出超时——运维看到的是
+			// 「打包机半路没了」，而不是「它传错了槽位」
+			if !backupcontainer.IsInnerSlot(parsed.RecipientSlot) {
+				problem(c, http.StatusBadRequest, "BACKUP_SLOT_NOT_AN_INNER_RECIPIENT",
+					"slot "+parsed.RecipientSlot+" is not an inner recipient for this threshold; expected one of "+
+						strings.Join(backupcontainer.InnerSlots(), ", "))
+				return
+			}
 			meta, haveMeta = parsed, true
 		case "sig":
 			signature, err = io.ReadAll(io.LimitReader(part, 1024))

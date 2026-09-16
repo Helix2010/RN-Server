@@ -73,7 +73,14 @@ func sealInnerFor(t *testing.T, pub *rsa.PublicKey, signer ed25519.PrivateKey, p
 
 func testInput(t *testing.T, holders []holder) Input {
 	t.Helper()
-	_, signer, err := ed25519.GenerateKey(rand.Reader)
+	in, _ := testInputWithSigner(t, holders)
+	return in
+}
+
+// testInputWithSigner 额外返回签名公钥，给要跑验签的测试用
+func testInputWithSigner(t *testing.T, holders []holder) (Input, ed25519.PublicKey) {
+	t.Helper()
+	signingPub, signer, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +88,17 @@ func testInput(t *testing.T, holders []holder) Input {
 	for _, h := range holders {
 		byslot[h.slot] = &h.key.PublicKey
 	}
-	agentPlain := []byte("agent-key + every tenant's signing key in the clear")
+	// 内层明文必须是一个 tar——生产里 produceBackup 就是先打 tar 再封。
+	// 封一个裸字符串的话，恢复脚本最后那步 `tar xf plain.tar` 会报
+	// 「不是 tar」，而那是夹具不真实，不是代码的问题
+	agentPlain, err := tarFiles(map[string][]byte{
+		"agent-key":                         []byte("the build machine identity"),
+		"keystores/acme/keystore.p12":       []byte("a signing key in the clear"),
+		"keystores/acme/store-password.txt": []byte("the password for it"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	inner := map[string]InnerPart{}
 	for _, slot := range backupcontainer.InnerSlots() {
 		inner[slot] = sealInnerFor(t, byslot[slot], signer, agentPlain)
@@ -114,7 +131,7 @@ func testInput(t *testing.T, holders []holder) Input {
 		SchemaVersion:            53,
 		AgentKeyFingerprint:      strings.Repeat("e", 16),
 		BackupSigningFingerprint: strings.Repeat("f", 64),
-	}
+	}, signingPub
 }
 
 func openOuter(t *testing.T, body []byte, key *rsa.PrivateKey) map[string][]byte {

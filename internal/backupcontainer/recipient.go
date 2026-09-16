@@ -53,6 +53,20 @@ func Pairs() []Pair {
 	return out
 }
 
+// IsInnerSlot 说明这个槽位是不是需要产出内层密文的那几个。
+//
+// 存在的理由：槽位名的合法集合（A/B/C）和**内层收件人**的集合（A/B）不一样。
+// 只校验「是个合法槽位」的话，一份封给 C 的内层会被静默收下、占掉磁盘、然后这次
+// 备份干等到产出超时——而运维看到的是「打包机半路没了」，不是「它传错了槽位」。
+func IsInnerSlot(slot string) bool {
+	for _, name := range InnerSlots() {
+		if name == slot {
+			return true
+		}
+	}
+	return false
+}
+
 // InnerSlots 是需要产出内层密文的槽位——三组配对里的内层收件人去重之后的结果。
 //
 // 结果是 {A, B} 两个，不是三个：AB 和 AC 共用封给 A 的那一份。打包机解密全部租户
