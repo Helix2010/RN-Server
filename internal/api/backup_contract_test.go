@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Helix2010/RN-Server/internal/backupbundle"
+	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/gin-gonic/gin"
 )
 
@@ -182,5 +183,57 @@ func TestDBRotatingARecoveryKeyLeavesOldRecordsUntouched(t *testing.T) {
 	view := backupRunView(after)
 	if len(view["objects"].([]gin.H)) != 3 {
 		t.Fatal("控制台应当按这条记录自己产出的那几组渲染")
+	}
+}
+
+// 备份路由必须挂在平台管理员那道门后面。
+//
+// 「租户管理员」这个身份在这套代码里**不存在**——控制台只有一个登录账号，
+// 租户是靠打开哪个域名区分的。所以这道门的实际语义是「白名单里有没有那个唯一
+// 账号」：有，凡是能登录的人都看得见；没有，整组关闭。两种都要测，因为
+// 「白名单为空」是最容易被当成「还没配所以先放行」的那一种。
+func TestBackupRoutesSitBehindThePlatformAdminGate(t *testing.T) {
+	cases := []struct {
+		name      string
+		whitelist []string
+		actor     string
+		want      int
+	}{
+		{"白名单为空 → 整组关闭", nil, "ops", http.StatusForbidden},
+		{"账号不在白名单里", []string{"platform-ops"}, "someone-else", http.StatusForbidden},
+		{"账号在白名单里", []string{"platform-ops"}, "platform-ops", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &server{cfg: config.Config{PlatformAdminUsernames: tc.whitelist}}
+			c, recorder := testContext(t, platformTenantID, "GET", "/v1/admin/platform/backup", nil)
+			c.Set("actorId", tc.actor)
+			gate := s.requirePlatformAdmin()
+			gate(c)
+			if tc.want == http.StatusOK {
+				if c.IsAborted() {
+					t.Fatalf("白名单里的账号被挡下了: %d %s", recorder.Code, recorder.Body.String())
+				}
+				return
+			}
+			if recorder.Code != tc.want {
+				t.Fatalf("期望 %d，得到 %d %s", tc.want, recorder.Code, recorder.Body.String())
+			}
+			if !c.IsAborted() {
+				t.Fatal("没通过门禁却没有 abort——后面的 handler 还是会跑")
+			}
+		})
+	}
+}
+
+// 下载响应必须 no-store。备份包是全平台签名密钥，进任何缓存都是事故——
+// 浏览器缓存、反向代理缓存、CDN 都算
+func TestBackupDownloadIsNeverCached(t *testing.T) {
+	s := &server{cfg: config.Config{}}
+	c, recorder := testContext(t, platformTenantID, "GET", "/v1/admin/platform/backup/1/AB/download", nil)
+	gate := s.requireBackupSameOrigin()
+	gate(c)
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("备份响应必须 no-store，得到 %q", got)
 	}
 }

@@ -592,7 +592,7 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
 
 租户管理员看不到：插件声明 `platformOnly`，前端按会话里的 `platformAdmin` 过滤掉整个菜单；后端路由挂 `platform.*` 组，由 `requirePlatformAdmin()` 按 `PLATFORM_ADMIN_USERNAMES` 白名单卡住，白名单为空时整组 403。
 
-**要知道这道门今天挡不住谁**：控制台只有一个登录账号（`internal/api/server.go:543` 比对唯一的 `ADMIN_USERNAME`），租户是靠打开哪个域名区分的，「租户管理员」这个身份不存在。所以白名单要么包含那个唯一账号（凡是能登录的人都看得见），要么不包含（整组关闭）。多账号登录是另一件事（`OPERATIONS_AND_RELEASE.md:233` 记录了「当前阶段不加入 RBAC」）。
+**要知道这道门今天挡不住谁**：控制台只有一个登录账号（`internal/api/server.go:591` 比对唯一的 `ADMIN_USERNAME`），租户是靠打开哪个域名区分的，「租户管理员」这个身份不存在。所以白名单要么包含那个唯一账号（凡是能登录的人都看得见），要么不包含（整组关闭）。多账号登录是另一件事（`OPERATIONS_AND_RELEASE.md:233` 记录了「当前阶段不加入 RBAC」）。
 
 今天便宜的补偿：`run` 和 `download` 各要求重新输入一次管理员口令，并共用登录限速——会话 TTL 默认 8 小时，一个被偷走的 cookie 否则能拉走全部历史备份。
 
@@ -650,8 +650,8 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
      build-agent.env                → /etc/rn-build-agent.env，0600 root:root
      ssh/id_deploy, ssh/config      → builder 的 ~/.ssh/，0600 builder:builder
    —— BUILD_AGENT_STATE_DIR 必须显式写死。它默认从 workspace 推导
-      （cmd/build-agent/config.go:89-92），路径差一点就找不到恢复的私钥，
-      打包机会静默生成一把新的（agentkey.go:42-55），日志里区分不出来
+      （`cmd/build-agent/config.go` 的 `loadConfig`），路径差一点就找不到恢复的私钥，
+      打包机会**静默生成一把新的**（`cmd/build-agent/agentkey.go` 的 `loadOrCreateAgentKey`），日志里区分不出来
 3) 按 source-remote.txt 把 RN-App 检出到 workspace（ssh/config 里的 host alias 要一起放好）
 4) 起服务之前先核对身份：
      build-agent show-key            （这个子命令今天不存在，§11 要补）
@@ -690,16 +690,16 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
    —— 不要用 GET /ota/signing-key 代替：那个只读明文证书字段、从不解密，
       钥匙错了它照样返回 200
    —— 三件必须填对的事：端口是 13080（amos 上应用只听 127.0.0.1，443 在 nginx），
-      鉴权走 x-admin-key（server.go:504-507），Host 头决定解析到哪个租户
+      鉴权走 `x-admin-key`（`internal/api/server.go` 的 `authenticate`），Host 头决定解析到哪个租户
    —— 403 先查 ADMIN_API_ALLOWED_IPS：它限制这条自动化通道的来源
-      （config.go:31-33，server.go:122），127.0.0.1 不在名单里就会被挡
+      （`ADMIN_API_ALLOWED_IPS`，见 `validateAdminIPConfiguration`），127.0.0.1 不在名单里就会被挡
    —— 不要指望用管理员口令登录控制台来做这一步：包里有 ADMIN_PASSWORD_HASH，
       没有明文口令，那是有意的
 5) 验证租户解析与配置可读：
      curl -sS -H "Host: <租户域名>" http://127.0.0.1:13080/v1/mobile/bootstrap
    期望 200
    —— 租户必须域名 active、未软删、当前日期在有效期内
-      （internal/api/tenant_resolver.go:64-78，演练时特别容易撞有效期）
+      （`internal/api/tenant_resolver.go` 的 `resolve`，演练时特别容易撞有效期）
 6) 回到 §7.2
 ```
 
@@ -721,8 +721,8 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
 
 **认领必须是 POST 而且必须原子。** v5 写的是 `GET /backup-requests`，两个问题：
 
-- **原子性**：v5 没说怎么把 `pending` 翻成 `running`。两个进程同时读到同一条并各自 UPDATE，两边都会去解开全部租户的签名密钥、打完 tar、上传，第二个才在 `/payload` 吃 409——损害发生在 409 之前。而且第二个大概率把 409 当硬失败去调 `/fail`，把第一条**已经成功**的记录翻成 `failed`。现成做法在隔壁：`internal/api/build_jobs.go:697` 的 `SELECT ... WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`，再 `UPDATE ... SET status='running', claimed_by=?, claimed_at=? WHERE id=? AND status='pending'`，检查 RowsAffected。
-- **方法**：一个会改状态的 GET 在这套代码里特别危险——`safeMethod`（`server.go:2017`）含 GET，`authenticate()` 的 Origin 闸（`:492`）因此对它完全不生效；而任何 HTTP 客户端和代理都会对 GET 自动重试。既有的 `agent.POST("/claim", ...)`（`server.go:201`）就是对的样子。
+- **原子性**：v5 没说怎么把 `pending` 翻成 `running`。两个进程同时读到同一条并各自 UPDATE，两边都会去解开全部租户的签名密钥、打完 tar、上传，第二个才在 `/payload` 吃 409——损害发生在 409 之前。而且第二个大概率把 409 当硬失败去调 `/fail`，把第一条**已经成功**的记录翻成 `failed`。现成做法在隔壁：`internal/api/build_jobs.go:655` 的 `SELECT ... WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`，再 `UPDATE ... SET status='running', claimed_by=?, claimed_at=? WHERE id=? AND status='pending'`，检查 RowsAffected。
+- **方法**：一个会改状态的 GET 在这套代码里特别危险——`safeMethod`（`server.go:2104`）含 GET，`authenticate()` 的 Origin 闸（`:540`）因此对它完全不生效；而任何 HTTP 客户端和代理都会对 GET 自动重试。既有的 `agent.POST("/claim", ...)`（`server.go:237`）就是对的样子。
 
 **`/backup-keystores` 的门禁判据是「这个令牌名下有一条 `running` 的待办，且 id 匹配」。** v5 写的是「只在有 **pending** 待办时才返回内容」——那和状态机自相矛盾：认领那一刻状态就变 `running` 了，库里没有 pending，于是**每一次备份都拿不到盒子**。更糟的是 v5 的测试用例（「有待办时返回全部租户」）会直接造一条 `pending` 行再调接口、从不经过认领，**测试绿而生产必挂**。测试必须先走一遍 `claim`。
 
@@ -732,7 +732,7 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
 
 **`/payload` 有两条实现约束，漏了就是必然失败：**
 
-1. **它落在 10 秒数据库超时里。** 豁免名单（`internal/api/server.go:363-370`）是 `/upload` 后缀、multipart part、`/finalize`、`/release-storage/test`、`/download`、`readsTokenChain`——`…/payload` 一个都不沾。body 本身读得完（HTTP 读超时 3600 秒），但接完之后的**封外层 → 上传 S3 → `UPDATE status='succeeded'`** 全部用一个早就过期的 ctx，逐个 `context deadline exceeded`，记录停在 `running`，30 分钟后判 `failed`。**每一次都是。** 修法照 `internal/api/simplified_releases.go:173` 的现成先例：`context.WithTimeout(context.Background(), ...)` 另起一条 ctx 做 Put 和收尾，**不要去改豁免名单**（改名单会顺带放开 DB 超时，不是想要的）。
+1. **它落在 10 秒数据库超时里。** 豁免名单（`internal/api/server.go:414`）是 `/upload` 后缀、multipart part、`/finalize`、`/release-storage/test`、`/download`、`readsTokenChain`——`…/payload` 一个都不沾。body 本身读得完（HTTP 读超时 3600 秒），但接完之后的**封外层 → 上传 S3 → `UPDATE status='succeeded'`** 全部用一个早就过期的 ctx，逐个 `context deadline exceeded`，记录停在 `running`，30 分钟后判 `failed`。**每一次都是。** 修法照 `internal/api/simplified_releases.go:173` 的现成先例：`context.WithTimeout(context.Background(), ...)` 另起一条 ctx 做 Put 和收尾，**不要去改豁免名单**（改名单会顺带放开 DB 超时，不是想要的）。
 2. **先比 `ContentLength` 再收 body**，不符直接 411；落盘用 `os.CreateTemp` + `defer os.Remove` + `http.MaxBytesReader`（同一个文件 `:135`、`:153-159`）。这台机器同时跑着构建和 wallet 后端，磁盘被一次失控的上报写满，倒下的不止备份。
 
 **备份签名公钥的登记为什么要单独一条路**：它和既有的打包机 X25519 公钥用途完全不同（一个签备份包、一个封签名密钥盒子），算法不同、指纹形式不同（§2.2 的四个指纹表），生命周期也不同——恢复出来的机器会生成一把**新的**签名密钥并登记，而旧的必须在库里留档，否则历史包再也验不了签（§4.3 第 3 条）。所以是新接口 + `build_agent_keys` 里的新一行，不是复用同一行改个值。
@@ -746,7 +746,7 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
 | GET | `/backup` | 状态：当前待办（如有）、最近 N 条记录、四个指纹（三个槽位 + 备份签名公钥）、桶是否开了 versioning（缓存值，§6.1） |
 | POST | `/backup/run` | 建一条待办。已有 pending/running → **409** 并带上那条的 `seq` 与 `status`。要 `{reason, confirm:true}`（`AGENTS.md:35`），并要求重新输入一次管理员口令（§6） |
 | POST | `/backup/:seq/force-fail` | `{reason, confirm:true}`。`UPDATE ... SET status='failed' WHERE seq=? AND status IN ('pending','running')`，写审计。**这条是逃生口，不是可选项**，见下 |
-| GET | `/backup/:seq/:pair/download` | 下载某一组的包，`:pair` 是 `AB` / `AC` / `BC`。**路径以 `/download` 结尾是有意的**——既有的数据库超时中间件正好豁免这个后缀（`server.go:363-370`），不用再改豁免列表 |
+| GET | `/backup/:seq/:pair/download` | 下载某一组的包，`:pair` 是 `AB` / `AC` / `BC`。**路径以 `/download` 结尾是有意的**——既有的数据库超时中间件正好豁免这个后缀（`server.go:414`），不用再改豁免列表 |
 | GET / PUT | `/backup/storage` | 桶的**非机密**字段与状态；凭据和 endpoint 在 env，不落库（§8.3） |
 | POST | `/backup/storage/test` | 只 Put 一个随机探针键，并校验 versioning 已开。**不能用现成的 `objectstore.Test()`**：它 Put 固定键再 `HeadObject`（`internal/objectstore/s3.go:319-336`），既要 Get 权限，固定键在开了 versioning 的桶上还会永久留存 |
 
@@ -754,7 +754,7 @@ bash open-layer.sh ./L1/server.rnbk        ~/A.key ./L2-server
 
 **`download` 用 `:seq` + `:pair` 但对象键从行上读，不重新拼。** v5 写的是「服务端按 §4.5 的规则自己拼键」——那依赖 `instanceId`，而主机改名、或者恰好在新机器上恢复之后，前缀就换了，历史备份全部 404。`platform_backups.objects` 这一列就是答案：上传成功时把三组的键和 sha256 写进去，下载时按 `:pair` 从里面挑。`:pair` 只当**查表的键**用，匹配不到就 404，**绝不参与拼字符串**——「不接受外部传对象键」这条安全约束（`s3Client.Get` 把 key 原样交给 `GetObject`，`s3.go:178-184`）靠「键来自我们自己写的那一行」同样成立，而且更强。
 
-**`download` 这条 GET 要补 Origin 检查**：`authenticate()` 的 Origin 闸只对非安全方法生效（`server.go:492`，`safeMethod` 含 GET），而 `originAllowed` 末尾会回落去查 `tenant_domain` 表（`:444` → `originIsTenantDomain` `:446-467`），`cors()` 对任何通过 `originAllowed` 的来源发 `Access-Control-Allow-Credentials: true`（`:412`）。不补的话，「谁能读平台备份」实际由那张表的内容决定。修法：平台组关掉 tenant_domain 回退，只认 `CORS_ORIGINS` 里显式列出的控制台来源；响应带 `Cache-Control: no-store`。
+**`download` 这条 GET 要补 Origin 检查**：`authenticate()` 的 Origin 闸只对非安全方法生效（`server.go:540`，`safeMethod` 含 GET），而 `originAllowed` 末尾会回落去查 `tenant_domain` 表（`:492` → `originIsTenantDomain` `:495`），`cors()` 对任何通过 `originAllowed` 的来源发 `Access-Control-Allow-Credentials: true`（`:460`）。不补的话，「谁能读平台备份」实际由那张表的内容决定。修法：平台组关掉 tenant_domain 回退，只认 `CORS_ORIGINS` 里显式列出的控制台来源；响应带 `Cache-Control: no-store`。
 
 **行比对象活得久**：90 天生命周期删掉对象之后，表里那条 `succeeded` 还带着 sha256 和 object_key。按保留期在列表里标「已过保留期」，并把 S3 的 `NoSuchKey` 映射成明确文案。
 

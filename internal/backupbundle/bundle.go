@@ -390,3 +390,5 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	w.n += int64(len(p))
 	return len(p), nil
 }
+
+func marshalIndent(value any) ([]byte, error) { return json.MarshalIndent(value, "", "  ") }
