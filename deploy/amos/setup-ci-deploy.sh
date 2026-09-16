@@ -7,8 +7,9 @@
 # root 交给 GitHub，而签名闸开发阶段也在这台机器上。
 #
 # 这个账号只能跑 /usr/local/sbin/rn-foundation-apply，换上去的程序以 rnfoundation /
-# builder 身份运行而不是 root，脚本自己也不以 root 执行 CI 传来的二进制。但 CI 密钥
-# 被偷不只是"发了一版坏代码"：坏代码以那两个身份跑，读得到各自进程的配置与状态。
+# rn-build-agent（构建机控制进程）身份运行而不是 root，脚本自己也不以 root 执行 CI 传来的
+# 二进制。但 CI 密钥被偷不只是"发了一版坏代码"：坏代码以那两个身份跑，读得到各自进程的
+# 配置与状态，包括构建机的机器令牌与出处密钥。
 # 签名闸同机期间打包机那一路必须关着，见 README.md。
 set -euo pipefail
 

@@ -29,6 +29,10 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 InaccessiblePaths=/etc/rn-build-agent.env /var/lib/rn-build-agent /opt/rn-build-agent /var/cache/rn-build-agent
+# 签名闸（deploy/signer/）的配置、状态、运行时目录、检查进程 socket 与程序对这个进程同样不可见。
+# 带 - 的路径不存在时跳过：/run 下的目录与 socket 只有在本服务启动时已经存在才会被遮住，
+# 它们自身的属主与 0700/0600 权限仍是主防线，这里是纵深防御
+InaccessiblePaths=-/etc/rn-signer-a.env -/etc/rn-signer-b.env -/var/lib/rn-signer-a -/var/lib/rn-signer-b -/run/rn-signer-a -/run/rn-signer-b -/run/rn-signer-a-check.sock -/run/rn-signer-b-check.sock -/opt/rn-signer
 ReadWritePaths=/var/lib/rn-foundation
 
 [Install]

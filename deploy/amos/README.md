@@ -9,22 +9,25 @@
 
 ## 先说一件必须知道的事
 
-**这台机器同时是打包机。这是开发环境的取舍，生产环境要把两者分开。**
+**开发阶段这台机器同时是构建机和签名闸（主、备）所在的机器。这是开发环境的取舍，生产环境要把它们分开。**
 
-签名闸方案（ADR-0019）之前的边界是：Android keystore 由运维口令或打包机公钥封成
-盒子，服务端只存盒子、没有钥匙，钥匙在打包机上。两半分在两台机器上，任何一台被拿下
-都还不够开盒。签名闸方案把钥匙挪到签名闸（打包机只出未签名包），但开发阶段签名闸
-同样与 API 同机，下面这段话对它照样成立。
+签名闸方案（ADR-0019）下，Android 签名密钥的边界是这样划的：库里的 `build.keystore` 只有
+加密给各台签名闸的密文，服务端打不开；解开它的私钥在签名闸的状态目录
+（`/var/lib/rn-signer-a`、`/var/lib/rn-signer-b`）里，明文 keystore 只在签名时出现在
+`/run/rn-signer-a|b`。构建机只出未签名包，拿不到任何密钥材料，但它持有自己的机器令牌与
+出处密钥（`/etc/rn-build-agent.env`、`/var/lib/rn-build-agent`）。服务端、构建机、签名闸各在
+一台机器上时，拿下任何一台都不够签出一个正式包。
 
-把 API 搬到 amos 之后，两半在同一台机器上：这个进程能读到库里的密文盒子，而钥匙
-就在同机的状态目录与 env 文件里。unit 里的 `InaccessiblePaths` 挡住了同机
-非 root 的那条路径，但挡不住提权。而 keystore 泄露在 direct 分发下没有补救办法
-——Android 按「包名 + 签名证书」认身份，对方能签一个同签名的 APK 在用户设备上原地
-覆盖安装，钱包数据目录原样留着，补救只能换包名让每个用户手动卸载重装。
+开发阶段三者在同一台机器上：API 进程读得到库里的密文，签名闸的私钥就在同机的状态目录里。
+服务端、扫链、迁移三个 unit 用 `InaccessiblePaths` 把构建机与签名闸的配置、状态、运行时目录
+和程序都遮掉了，签名闸目录本身也是 0700、属各自的系统用户——这挡得住同机非 root 的读取，
+挡不住提权。而签名密钥泄露在 direct 分发下没有补救办法——Android 按「包名 + 签名证书」认
+身份，对方能签一个同签名的 APK 在用户设备上原地覆盖安装，钱包数据目录原样留着，补救只能
+换包名让每个用户手动卸载重装。
 
-所以这套部署只适用于开发/联调环境。**上生产时必须把打包机代理挪到另一台机器**，
-那条边界才重新成立。下面的 unit 里该加的隔离都加了（`InaccessiblePaths` 挡掉打包机
-的配置与状态目录），但那只挡同机非 root，挡不住提权——不要把它当成边界本身。
+所以这套部署只适用于开发/联调环境。**上生产时必须把签名闸挪到独立虚拟机（没有免密 sudo
+账号、不给任何自动化会话登录），构建机也挪走**，那条边界才重新成立。不要把 unit 里的
+`InaccessiblePaths` 当成边界本身。
 
 ## 结构
 
@@ -182,12 +185,14 @@ rndeploy ALL=(root) NOPASSWD: /usr/local/sbin/rn-foundation-apply
 不给 `ubuntu` 的密钥，是因为 `ubuntu` 是 `NOPASSWD: ALL`——把它交给 GitHub 等于把
 这台机器的 root 交出去。实测过边界：`rndeploy` 读不到 `/etc/rn-build-agent.env`，也读不到
 `/etc/rn-foundation.env`，`sudo` 跑任何别的命令都要密码。换上去的程序以非 root 身份运行
-（服务端 `rnfoundation`、打包机 `builder`），`rn-foundation-apply` 自己也不以 root 执行
-CI 传来的二进制——打包机的冒烟降到 `builder`，不继承附加组、`no_new_privs`。
+（服务端 `rnfoundation`；构建机控制进程 `rn-build-agent`），`rn-foundation-apply` 自己也不以
+root 执行 CI 传来的二进制——构建机的冒烟降到权限更小的执行用户 `builder`，不继承附加组、
+`no_new_privs`。
 
 但别把它说成"CI 密钥被偷最多发一版坏代码"：坏代码以 `rnfoundation` 跑，读得到服务端
-进程的全部配置机密；以 `builder` 跑，拿得到打包机上的一切。所以打包机那一路在签名闸
-同机期间必须关着，见下面「签名闸同机期间，打包机不走 CI」。
+进程的全部配置机密；换上去的构建机控制进程以 `rn-build-agent` 跑，拿得到构建机的机器令牌与
+出处密钥，能以这台构建机的名义交付任意未签名包与出处声明。所以构建机那一路在签名闸同机
+期间必须关着，见下面「签名闸同机期间，打包机不走 CI」。
 
 `sudoers` 里故意不限制参数——参数校验在脚本里。把 `install`/`mv`/`rm`/`systemctl`
 逐条写进 sudoers，任何一条带通配符的规则写松一点就等于给了 root。
@@ -227,10 +232,11 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 在 RN-Server 仓库 Settings → Secrets and variables → Actions → Variables 里删掉它，或者
 把值改成 `true` 以外的任何东西。打包机改为手工部署（`deploy/build-agent/README.md`）。
 
-原因：开着它，每次 push 到 main 工作流都会把新的 build-agent 送上来，由
-`rn-foundation-apply build-agent` 换上并以 `builder` 身份运行。于是能往 main 推代码、
-或者拿到 `AMOS_SSH_KEY` 的人，就能以 `builder` 在签名闸所在的机器上执行任意代码，离
-签名闸只差一次本地提权。冒烟不再以 root 跑只去掉了"直接拿到 root"那一步，不改变这一条。
+原因：开着它，每次 push 到 main 工作流都会把新的 build-agent（构建机控制进程）送上来，由
+`rn-foundation-apply build-agent` 换上并以 `rn-build-agent` 身份运行。于是能往 main 推代码、
+或者拿到 `AMOS_SSH_KEY` 的人，就能换掉持有机器令牌与出处密钥的那个进程：以受信构建机的
+名义给签名闸送包，并在签名闸所在的机器上执行任意代码，离签名闸只差一次本地提权。冒烟不再
+以 root 跑只去掉了"直接拿到 root"那一步，不改变这一条。
 
 这个开关在 GitHub 上，仓库里的改动关不掉它，要有人去关。签名闸挪到独立机器之前不要再打开。
 
@@ -258,10 +264,12 @@ Android 签名密钥按设计
 - **控制台上生成签名密钥**（`POST /v1/admin/build-keystore/generate`）：服务端进程里不再
   出现明文私钥。
 
-切换完成之前，打包机仍用 `/var/lib/rn-build-agent/agent-key` 开现有租户的密文；切换完成后
-`agent-key` 与 `BUILD_KEYSTORE_PASSPHRASE` 一起作废（设计「落地顺序」第 8 步）。**在那之前
-不要图省事用 `ssh amos 'sudo grep BUILD_KEYSTORE_PASSPHRASE ...'` 去读口令**——那会把它打印到
-终端和任何记录着那次会话的地方。
+新版服务端与构建机已经不再读旧格式的密文：库里 v1（口令封装）、v2（加密给打包机公钥）的
+`build.keystore` 在控制台上显示为 legacy、不就绪，该租户的 Android 安装包排不了队，直到用
+离线工具重新生成、加密给签名闸并上传 v3。打包机状态目录里的 `agent-key` 与
+`BUILD_KEYSTORE_PASSPHRASE` 从此没有任何代码使用，按设计「落地顺序」第 8 步从机器上删掉；
+删之前**不要**图省事用 `ssh amos 'sudo grep BUILD_KEYSTORE_PASSPHRASE ...'` 去读它——那会把它
+打印到终端和任何记录着那次会话的地方。
 
 ### `ARTIFACT_UPLOAD_MODE` 必须是 `proxy`
 

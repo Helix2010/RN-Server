@@ -11,13 +11,13 @@
 # 收口成一个脚本，攻击面就只剩这段代码。
 #
 # 部署账号除了这个脚本没有任何 sudo 权限；脚本换上去的程序以非 root 身份运行
-# （服务端 rnfoundation、打包机 builder），脚本自己也**不以 root 执行**任何 CI 传来的
-# 二进制——打包机的冒烟同样降到 builder。改脚本或 sudoers 之前先想清楚会不会把这几条
-# 破坏掉。
+# （服务端 rnfoundation；构建机控制进程 rn-build-agent），脚本自己也**不以 root 执行**任何
+# CI 传来的二进制——构建机的冒烟降到权限更小的执行用户 builder。改脚本或 sudoers 之前先
+# 想清楚会不会把这几条破坏掉。
 #
 # 别把它理解成"拿到 CI 密钥就什么都碰不到"：换得了服务端二进制，就拿得到服务端进程的
-# 全部环境（数据库口令、STORAGE_MASTER_KEY）；换得了打包机二进制，就能以 builder 身份
-# 在这台机器上执行任意代码。
+# 全部环境（数据库口令、STORAGE_MASTER_KEY）；换得了构建机控制进程，就以 rn-build-agent
+# 身份运行，拿得到这台构建机的机器令牌与出处密钥，能以受信构建机的名义交付任意包。
 #
 # **build-agent 那条因此单独说清楚。** 这台机器开发阶段还和签名闸同机
 # （docs/design/android-signing-gate-2026-09-16.md「开发阶段的部署」），同机期间工作流里的
@@ -30,7 +30,8 @@ BINARY=/opt/rn-foundation/rn-server
 PREVIOUS=/opt/rn-foundation/rn-server.prev
 AGENT_BINARY=/opt/rn-build-agent/build-agent
 AGENT_PREVIOUS=/opt/rn-build-agent/build-agent.prev
-# 打包机正式运行时的身份，冒烟也用它，不用 root
+# 构建机冒烟用的身份：执行用户 builder，比正式运行控制进程的 rn-build-agent 权限更小
+# （读不到令牌与出处密钥），也不是 root。冒烟只验"跑得起来"，不需要控制进程的任何东西
 AGENT_USER=builder
 ENV_FILE=/etc/rn-foundation.env
 # 打包机冒烟用的临时目录；非空时退出前删掉
@@ -183,9 +184,9 @@ apply_build_agent() {
   # 而不是换上去之后由 systemd 反复重启。
   #
   # **不以 root 跑。** 这是 CI 传来的、还没审过的二进制，root 执行它等于能推 main 或
-  # 拿到 AMOS_SSH_KEY 的人拿到这台机器的 root。以它正式运行时的 builder 身份跑，
-  # 不继承附加组、不许再提权。先拷进 root 的目录再跑：暂存目录属 rndeploy，builder
-  # 未必进得去；换上去的也就是跑过冒烟的这一份
+  # 拿到 AMOS_SSH_KEY 的人拿到这台机器的 root。以执行用户 builder 跑（比控制进程的
+  # rn-build-agent 权限更小），不继承附加组、不许再提权。先拷进 root 的目录再跑：暂存目录
+  # 属 rndeploy，builder 未必进得去；换上去的也就是跑过冒烟的这一份
   SMOKE_DIR="$(mktemp -d "$(dirname "$AGENT_BINARY")/.build-agent-smoke.XXXXXX")" \
     || die "建不了冒烟用的临时目录"
   chmod 0711 "$SMOKE_DIR"
