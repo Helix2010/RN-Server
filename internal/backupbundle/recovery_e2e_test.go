@@ -302,7 +302,9 @@ func TestRecoverScriptRunsAgainstTheLayoutTheReadmeCreates(t *testing.T) {
 	out, _ := cmd.CombinedOutput()
 	got := string(out)
 
-	for _, want := range []string{"核对文件完整性", "核对备份签名公钥", "签名 OK", "核对两层是不是同一次备份"} {
+	// 断言的必须是校验**跑完**才打印的东西。只断言 say 打的小标题会让测试空过：
+	// say 在读文件之前，脚本在那之后静默死掉一样是绿的——这里已经踩过一次
+	for _, want := range []string{"核对文件完整性", "核对备份签名公钥", "签名 OK", "两层同属备份 #7"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("脚本没走到「%s」这一步。输出:\n%s", want, got)
 		}
