@@ -188,7 +188,14 @@ describe() {
       if [ -f "$CACHE/describe.json" ]; then
         note "注册码已经无效（这台机器上次执行时用过它，或已过期），按上次的查询结果继续：$CACHE"
       else
-        die "注册码无效：它 60 分钟后过期、只能用一次，也可能抄错了。在控制台重发注册码后重新执行。（${SERVER}，$(problem_code "$body")）"
+        local enrolled_here="" f
+        for f in "$AGENT_ENV" /etc/rn-signer-*.env; do
+          if has_machine_token "$f" BUILD_AGENT_MACHINE_TOKEN || has_machine_token "$f" SIGNER_MACHINE_TOKEN; then
+            enrolled_here="$enrolled_here $f"
+          fi
+        done
+        die "注册码无效：它 60 分钟后过期、只能用一次，也可能抄错了。在控制台重发注册码后重新执行。（${SERVER}，$(problem_code "$body")）${enrolled_here:+
+这台机器上已经有注册过的实例（${enrolled_here# }）：如果就是这台机器用过这个注册码，它已经装好了，不需要再执行。}"
       fi
       ;;
     503) die "服务端暂时没有安装包（$(problem_code "$body")）：等服务端部署完成后重新执行" ;;
@@ -308,6 +315,32 @@ for k, v in out.items():
 PY
 }
 
+# ---- 2b. 装到哪里 ---------------------------------------------------------------------------
+
+# 签名闸定下实例名；注册码还没用过（describe 真的查到了）而目标已经注册过时拒绝：那是另一台机器的码，
+# 继续下去会用新机器的身份覆盖一台在跑的机器。
+resolve_target() {
+  if [ "$ROLE" = signer ]; then
+    local cached_instance=""
+    if [ -f "$CACHE/instance" ]; then
+      cached_instance="$(cat "$CACHE/instance")"
+    fi
+    if [ -z "$INSTANCE" ]; then
+      INSTANCE="${cached_instance:-$MACHINE_NAME}"
+    elif [ -n "$cached_instance" ] && [ "$cached_instance" != "$INSTANCE" ]; then
+      die "这个注册码上次装成了实例 $cached_instance，这次 --instance 是 $INSTANCE；去掉 --instance 或写成 $cached_instance"
+    fi
+    if [[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,21}$ ]]; then
+      printf '%s\n' "$INSTANCE" >"$CACHE/instance"
+    fi
+    if [ "$DESCRIBED_LIVE" = yes ] && has_machine_token "/etc/rn-signer-$INSTANCE.env" SIGNER_MACHINE_TOKEN; then
+      die "实例 $INSTANCE 已经注册过（/etc/rn-signer-$INSTANCE.env 里有机器令牌），而这个注册码还没用过：它属于另一台机器。给新机器换一个 --instance；注册码没有使用"
+    fi
+  elif [ "$DESCRIBED_LIVE" = yes ] && has_machine_token "$AGENT_ENV" BUILD_AGENT_MACHINE_TOKEN; then
+    die "这台主机已经注册了构建机（$AGENT_ENV 里有机器令牌），而这个注册码还没用过：一台主机只跑一个构建机。注册码没有使用"
+  fi
+}
+
 # ---- 1b. 按角色检查前提 ----------------------------------------------------------------------
 
 java_is_17() { # $1 = JAVA_HOME
@@ -317,11 +350,15 @@ java_is_17() { # $1 = JAVA_HOME
   [[ "$version" == *'version "17'* ]]
 }
 
+# 找一份 sha256 对得上的 apksigner.jar：指定了 --apksigner-jar 就只认它，否则依次看已装的副本与常见 SDK 位置
 find_apksigner_jar() {
-  local candidate
-  for candidate in "$APKSIGNER_JAR" "$SIGNER_BUILD_TOOLS/lib/apksigner.jar" \
-    /opt/android-sdk/build-tools/35.0.0/lib/apksigner.jar /usr/lib/android-sdk/build-tools/35.0.0/lib/apksigner.jar; do
-    if [ -n "$candidate" ] && [ -f "$candidate" ] && [ "$(sha256_of "$candidate")" = "$APKSIGNER_JAR_SHA256" ]; then
+  local candidate candidates=("$APKSIGNER_JAR")
+  if [ -z "$APKSIGNER_JAR" ]; then
+    candidates=("$SIGNER_BUILD_TOOLS/lib/apksigner.jar" /opt/android-sdk/build-tools/35.0.0/lib/apksigner.jar
+      /usr/lib/android-sdk/build-tools/35.0.0/lib/apksigner.jar)
+  fi
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ] && [ "$(sha256_of "$candidate")" = "$APKSIGNER_JAR_SHA256" ]; then
       APKSIGNER_JAR="$candidate"
       return 0
     fi
@@ -359,9 +396,14 @@ preflight_role() {
       MISSING+=("与 --recovery-sha256 一致的恢复公钥：服务端登记的恢复公钥里没有它（核对密码管理器里的指纹；平台没登记恢复公钥时先在控制台登记）")
     fi
     java_is_17 "$SIGNER_JAVA_HOME" || MISSING+=("JDK 17：$SIGNER_JAVA_HOME（apt install openjdk-17-jre-headless）")
-    find_apksigner_jar || MISSING+=("Android build-tools 35.0.0 的 apksigner.jar（sha256 $APKSIGNER_JAR_SHA256）：从 https://dl.google.com/android/repository/build-tools_r35_linux.zip 取 android-15/lib/apksigner.jar，用 --apksigner-jar <路径> 指定")
-    local instance="${INSTANCE:-$MACHINE_NAME}"
-    [[ "$instance" =~ ^[a-z0-9][a-z0-9-]{0,21}$ ]] || MISSING+=("实例名：机器名 $MACHINE_NAME 超过 22 个字符，用 --instance <短名> 指定")
+    if find_apksigner_jar; then
+      :
+    elif [ -n "$APKSIGNER_JAR" ]; then
+      MISSING+=("--apksigner-jar 指定的 $APKSIGNER_JAR 不是 Android build-tools 35.0.0 的 apksigner.jar（sha256 应为 $APKSIGNER_JAR_SHA256）")
+    else
+      MISSING+=("Android build-tools 35.0.0 的 apksigner.jar（sha256 $APKSIGNER_JAR_SHA256）：从 https://dl.google.com/android/repository/build-tools_r35_linux.zip（sha1 2cfaa0bbb2336e9ec18ed3ecea84fa2e2af607bc）取 android-15/lib/apksigner.jar，用 --apksigner-jar <路径> 指定")
+    fi
+    [[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,21}$ ]] || MISSING+=("实例名：机器名 $MACHINE_NAME 超过 22 个字符，用 --instance <短名> 指定")
   else
     need_commands visudo setpriv ssh ssh-keygen zip pgrep pkill
     local java_home android_home git_version node_version
@@ -481,22 +523,10 @@ wait_active() { # $1 unit
 # ---- 4–6. 签名闸 ----------------------------------------------------------------------------
 
 install_signer() {
-  local cached_instance=""
-  [ -f "$CACHE/instance" ] && cached_instance="$(cat "$CACHE/instance")"
-  if [ -z "$INSTANCE" ]; then
-    INSTANCE="${cached_instance:-$MACHINE_NAME}"
-  elif [ -n "$cached_instance" ] && [ "$cached_instance" != "$INSTANCE" ]; then
-    die "这个注册码上次装成了实例 $cached_instance，这次 --instance 是 $INSTANCE；去掉 --instance 或写成 $cached_instance"
-  fi
-  printf '%s\n' "$INSTANCE" >"$CACHE/instance"
-
   local user="rn-signer-$INSTANCE" env="/etc/rn-signer-$INSTANCE.env" unit="rn-signer-$INSTANCE"
   local templates="$BUNDLE/templates" rendered="$CACHE/rendered" name enrolled=no
   local -a units=("$unit.service" "$unit-check.socket" "$unit-check@.service")
   has_machine_token "$env" SIGNER_MACHINE_TOKEN && enrolled=yes
-  if [ "$enrolled" = yes ] && [ "$DESCRIBED_LIVE" = yes ]; then
-    die "实例 $INSTANCE 已经注册过（$env 里有机器令牌），而这个注册码还没用过：它属于另一台机器。给新机器换一个 --instance；注册码没有使用"
-  fi
 
   step "渲染签名闸模板（实例 $INSTANCE）"
   rm -rf "$rendered"
@@ -677,9 +707,6 @@ migrate_legacy_builder() {
 install_builder() {
   local enrolled=no had_deploy_key=no name
   has_machine_token "$AGENT_ENV" BUILD_AGENT_MACHINE_TOKEN && enrolled=yes
-  if [ "$enrolled" = yes ] && [ "$DESCRIBED_LIVE" = yes ]; then
-    die "这台主机已经注册了构建机（$AGENT_ENV 里有机器令牌），而这个注册码还没用过：一台主机只跑一个构建机。注册码没有使用"
-  fi
 
   step "安装构建机"
   if [ "$enrolled" = yes ]; then
@@ -832,6 +859,7 @@ main() {
   WORK="$(mktemp -d /tmp/rn-machine-setup.XXXXXX)"
   trap 'rm -rf "$WORK"' EXIT
   describe
+  resolve_target
   preflight_role
   fetch_bundle
   if [ "$ROLE" = signer ]; then
