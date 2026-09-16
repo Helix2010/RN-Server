@@ -168,6 +168,8 @@ func backupRunView(run backupRun) gin.H {
 		"createdAt": iso(run.CreatedAt), "updatedAt": iso(run.UpdatedAt),
 		"objects": objects, "failureReason": nullableString(run.FailureReason),
 		"claimedBy": nullableString(run.ClaimedBy),
+		// 控制台拿它算耗时：从打包机领走算起，排队的那几秒不算
+		"claimedAt": nullableTimePointer(run.ClaimedAt),
 	}
 	if run.TenantCount != nil {
 		view["tenantCount"] = *run.TenantCount

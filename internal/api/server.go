@@ -425,7 +425,11 @@ func (s *server) domainTenantScope() gin.HandlerFunc {
 func (s *server) databaseTimeout() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		multipartPartUpload := c.Request.Method == http.MethodPut && strings.Contains(c.Request.URL.Path, "/v1/admin/upload-sessions/") && strings.Contains(c.Request.URL.Path, "/parts/")
-		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") || readsTokenChain(c.Request) {
+		// 打包机上传备份内层密文：body 最大 512 MiB，传完之后还要查库。套上这 10 秒的话，
+		// body 传得比 10 秒久，后面每一次查库都是 context deadline exceeded。那个处理函数
+		// 自己给每次查库单独限时
+		backupPayloadUpload := strings.HasPrefix(c.Request.URL.Path, "/v1/build-agent/backup-requests/") && strings.HasSuffix(c.Request.URL.Path, "/payload")
+		if strings.HasSuffix(c.Request.URL.Path, "/upload") || multipartPartUpload || backupPayloadUpload || strings.HasSuffix(c.Request.URL.Path, "/finalize") || strings.HasSuffix(c.Request.URL.Path, "/release-storage/test") || strings.HasSuffix(c.Request.URL.Path, "/download") || readsTokenChain(c.Request) {
 			c.Next()
 			return
 		}

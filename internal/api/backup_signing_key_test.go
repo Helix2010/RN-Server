@@ -5,11 +5,15 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
+	"github.com/gin-gonic/gin"
 )
 
 func signingKeyServer(t *testing.T) *server {
@@ -188,5 +192,53 @@ func TestDBBackupStatusShowsAPendingKeyWaitingToBeAccepted(t *testing.T) {
 	}
 	if view.SigningKey.Pending.Agent == nil || *view.SigningKey.Pending.Agent != "amos-builder-1" {
 		t.Errorf("没说是哪台机器报上来的，人不知道该去哪核对: %+v", view.SigningKey.Pending)
+	}
+}
+
+// 读不到登记记录不是「指纹不对」。
+//
+// 2026-09-16 第一次真实备份：打包机传 body 用了 18 秒，请求上那 10 秒的数据库超时早过了，
+// 查登记记录拿到 context deadline exceeded，却回了 409「签名指纹不是登记的那把」——
+// 人会去核对一把根本没换过的钥匙
+func TestDBSigningKeyLookupFailureIsNotReportedAsAMismatch(t *testing.T) {
+	s := backupServer(t)
+	run := mustCreate(t, s, "lookup fails")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c, recorder := testContext(t, platformTenantID, "POST", "/x", nil)
+	meta := backupbundle.PayloadMeta{BackupSigningFingerprint: strings.Repeat("a", 64)}
+	if err := s.checkBackupSigningFingerprint(ctx, c, run, meta); err == nil {
+		t.Fatal("查库失败时不能放行")
+	}
+	body := decodeBody(t, recorder)
+	if recorder.Code != http.StatusInternalServerError || body["code"] != "BACKUP_SIGNING_KEY_QUERY_FAILED" {
+		t.Fatalf("查库失败要如实报，不能冒充指纹不匹配: %d %v", recorder.Code, body)
+	}
+	if again, err := s.backupRunByID(context.Background(), run.ID); err != nil || again.Status != run.Status {
+		t.Fatalf("查库失败不该判死记录: %+v %v", again, err)
+	}
+}
+
+// 上传备份内层的那条路由不能套请求级的数据库超时：body 传得比它久，后面每次查库都失败
+func TestDatabaseTimeoutDoesNotWrapTheBackupPayloadUpload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := &server{}
+	s.cfg.MySQLQueryTimeout = 1
+	for path, wantDeadline := range map[string]bool{
+		"/v1/build-agent/backup-requests/pbk_1/payload": false,
+		"/v1/build-agent/backup-requests/claim":         true,
+	} {
+		router := gin.New()
+		router.Use(s.databaseTimeout())
+		router.POST(path, func(c *gin.Context) {
+			_, hasDeadline := c.Request.Context().Deadline()
+			c.JSON(http.StatusOK, gin.H{"hasDeadline": hasDeadline})
+		})
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if want := fmt.Sprintf(`{"hasDeadline":%t}`, wantDeadline); response.Body.String() != want {
+			t.Errorf("%s: 想要 %s，得到 %s", path, want, response.Body.String())
+		}
 	}
 }

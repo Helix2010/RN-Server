@@ -397,3 +397,23 @@ func TestDBResetKeystoreChecksNeedsConfirmAndReason(t *testing.T) {
 		}
 	}
 }
+
+// 控制台的「耗时」从打包机领走算起，所以记录里要带上领走的时间；还没领走时是 null
+func TestDBBackupRunViewCarriesWhenTheAgentClaimedIt(t *testing.T) {
+	s := backupServer(t)
+	run := mustCreate(t, s, "timing")
+	if view := backupRunView(run); view["claimedAt"] != nil {
+		t.Fatalf("还没领走就不该有 claimedAt: %v", view["claimedAt"])
+	}
+	if _, _, err := s.claimBackupRun(context.Background(), "builder"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.backupRunByID(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at, ok := backupRunView(claimed)["claimedAt"].(string)
+	if !ok || !strings.HasSuffix(at, "Z") {
+		t.Fatalf("领走之后要带 ISO 时间: %v", backupRunView(claimed)["claimedAt"])
+	}
+}

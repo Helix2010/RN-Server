@@ -230,7 +230,17 @@ func (s *server) backupKeystores(c *gin.Context) {
 // 一次备份要传两次（槽位 A 一份、B 一份）。两份都到齐时，服务端在**这一次请求里**
 // 合并自己那部分、封三个外层、上传、落库。
 func (s *server) receiveBackupPayload(c *gin.Context) {
-	run, err := s.backupRunByID(c.Request.Context(), c.Param("id"))
+	// 这条路由不套 databaseTimeout（body 可能传很久，见 server.go），每次查库在这里单独限时
+	queryTimeout := time.Duration(s.cfg.MySQLQueryTimeout) * time.Second
+	if queryTimeout <= 0 {
+		queryTimeout = 10 * time.Second // 和 MYSQL_QUERY_TIMEOUT_SECONDS 的默认值一致
+	}
+	dbContext := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(c.Request.Context(), queryTimeout)
+	}
+	lookupCtx, cancelLookup := dbContext()
+	run, err := s.backupRunByID(lookupCtx, c.Param("id"))
+	cancelLookup()
 	if err != nil {
 		problem(c, http.StatusNotFound, "BACKUP_REQUEST_NOT_FOUND", "No such backup request")
 		return
@@ -374,7 +384,10 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 	}
 
 	// 打包机换了签名密钥而没走登记流程，是个必须让人看见的信号
-	if err := s.checkBackupSigningFingerprint(c, run, meta); err != nil {
+	checkCtx, cancelCheck := dbContext()
+	err = s.checkBackupSigningFingerprint(checkCtx, c, run, meta)
+	cancelCheck()
+	if err != nil {
 		return
 	}
 	if err := writeStagedSidecars(dir, meta, signature); err != nil {
@@ -392,18 +405,29 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 	// 而这一刻就是。记在组装里面的话，服务端自己那部分读不到时它会停在 NULL，
 	// 于是运维照 §8.4 的列注释排查，得出的是「打包机没传上来」——一个完全错误的
 	// 结论，而真相是打包机做完了、服务端配置有问题。
-	if _, err := s.markBackupPayloadComplete(c.Request.Context(), run.ID); err != nil {
+	markCtx, cancelMark := dbContext()
+	if _, err := s.markBackupPayloadComplete(markCtx, run.ID); err != nil {
 		slog.Error("cannot record that both backup payloads arrived", "backupId", run.ID, "error", err)
 	}
+	cancelMark()
 	committed = true
 	s.completeBackup(c, run)
 }
 
-func (s *server) checkBackupSigningFingerprint(c *gin.Context, run backupRun, meta backupbundle.PayloadMeta) error {
-	record, err := s.backupSigningKeyRecord(c.Request.Context())
-	if err != nil || record == nil || record.Current.Fingerprint != meta.BackupSigningFingerprint {
+func (s *server) checkBackupSigningFingerprint(ctx context.Context, c *gin.Context, run backupRun, meta backupbundle.PayloadMeta) error {
+	record, err := s.backupSigningKeyRecord(ctx)
+	if err != nil {
+		// 读不到登记记录不是「指纹不对」。以前两者回同一个 409，一次查库超时被报成
+		// 「打包机换了签名密钥」，人会去核对一把根本没换过的钥匙。这里不判死记录：
+		// 请求返回后暂存的这一份会被撤掉，打包机上报失败时记录才结束
+		slog.Error("cannot read the registered backup signing key", "backupId", run.ID, "error", err)
+		problem(c, http.StatusInternalServerError, "BACKUP_SIGNING_KEY_QUERY_FAILED",
+			"Unable to read the registered backup signing key")
+		return err
+	}
+	if record == nil || record.Current.Fingerprint != meta.BackupSigningFingerprint {
 		reason := "the build agent reported a backup signing key that is not the registered one"
-		if _, failErr := s.failBackupRun(c.Request.Context(), run.ID, reason); failErr != nil {
+		if _, failErr := s.failBackupRun(ctx, run.ID, reason); failErr != nil {
 			slog.Error("unable to fail a backup after a signing key mismatch", "backupId", run.ID, "error", failErr)
 		}
 		cleanBackupStaging(run.ID)
