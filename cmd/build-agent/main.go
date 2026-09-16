@@ -281,14 +281,22 @@ func showKey() {
 		fmt.Fprintln(os.Stderr, "配置读不了:", err)
 		os.Exit(2)
 	}
-	_, public, err := loadOrCreateAgentKey(cfg.StateDir)
+	// **只读**。这条命令是「身份文件放没放对」唯一的检查，它自己绝不能创建密钥。
+	//
+	// 之前它走的是 loadOrCreateAgentKey，于是恢复时有这么一条路：操作者装完环境
+	// 先跑一次 show-key 确认工具能用（很自然的顺序）→ agent-key 凭空被创建 →
+	// 再跑 recover.sh，place() 看到目标已存在、问「覆盖它？(yes/NO)」、默认 NO →
+	// 真正那把 agent-key 被「跳过」→ 机器带着新密钥起来，库里每个租户的密封盒子
+	// 永久打不开。灾难由恢复流程自己制造出来，而日志里看不出区别。
+	public, err := loadAgentKeyForDisplay(cfg.StateDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "读不了本机身份文件:", err)
+		fmt.Fprintln(os.Stderr, "state dir:", cfg.StateDir)
 		os.Exit(2)
 	}
 	fmt.Printf("agent-key fingerprint: %s\n", public.Fingerprint())
 	fmt.Printf("agent-key public key:  %s\n", public.PublicKey)
-	if _, signingPublic, err := loadOrCreateBackupSigningKey(cfg.StateDir); err == nil {
+	if signingPublic, err := loadBackupSigningKeyForDisplay(cfg.StateDir); err == nil {
 		if pub, err := backupcontainer.ParseSigningPublicKey(signingPublic); err == nil {
 			if fingerprint, err := backupcontainer.SigningFingerprint(pub); err == nil {
 				fmt.Printf("backup signing fingerprint: %s\n", fingerprint)

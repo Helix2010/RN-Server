@@ -69,3 +69,28 @@ func trimSpaceBytes(raw []byte) []byte {
 func isSpaceByte(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
+
+// loadAgentKeyForDisplay 只读，文件不在就报错而不是造一把。
+// 给 show-key 用，理由写在 showKey 的注释里
+func loadAgentKeyForDisplay(stateDir string) (buildkeystore.Recipient, error) {
+	path := filepath.Join(stateDir, agentKeyFileName)
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return buildkeystore.Recipient{}, fmt.Errorf(
+			"%s 还不存在。如果你正在做故障恢复，**先别起服务**："+
+				"恢复包里那把 agent-key 还没放到位，现在起服务会生成一把新的，"+
+				"库里每个租户的密封盒子就再也打不开了", path)
+	}
+	if err != nil {
+		return buildkeystore.Recipient{}, err
+	}
+	private, decodeErr := base64.StdEncoding.DecodeString(string(trimSpaceBytes(raw)))
+	if decodeErr != nil {
+		return buildkeystore.Recipient{}, fmt.Errorf("%s 不是合法的私钥文件: %w", path, decodeErr)
+	}
+	recipient, err := buildkeystore.RecipientFor(private)
+	if err != nil {
+		return buildkeystore.Recipient{}, fmt.Errorf("%s 里的私钥用不了: %w", path, err)
+	}
+	return recipient, nil
+}

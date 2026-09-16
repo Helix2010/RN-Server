@@ -57,3 +57,18 @@ func loadOrCreateBackupSigningKey(stateDir string) (ed25519.PrivateKey, string, 
 	encoded, err := backupcontainer.EncodeSigningPublicKey(private.Public().(ed25519.PublicKey))
 	return private, encoded, err
 }
+
+// loadBackupSigningKeyForDisplay 只读，同 loadAgentKeyForDisplay
+func loadBackupSigningKeyForDisplay(stateDir string) (string, error) {
+	path := filepath.Join(stateDir, backupSigningKeyFileName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	seed, decodeErr := base64.StdEncoding.DecodeString(string(trimSpaceBytes(raw)))
+	if decodeErr != nil || len(seed) != backupcontainer.SigningKeySeedSize {
+		return "", fmt.Errorf("%s 不是合法的备份签名私钥文件", path)
+	}
+	private := ed25519.NewKeyFromSeed(seed)
+	return backupcontainer.EncodeSigningPublicKey(private.Public().(ed25519.PublicKey))
+}
