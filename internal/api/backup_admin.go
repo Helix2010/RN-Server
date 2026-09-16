@@ -37,26 +37,32 @@ func (s *server) requireBackupSameOrigin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 备份内容永远不该进任何缓存
 		c.Header("Cache-Control", "no-store")
+
+		// Origin 判据和其它所有管理端路由**保持一致**（originAllowed）。
+		//
+		// 设计 §6 要的是「对平台组关掉 tenant_domain 回退」，理由是那张表是租户
+		// 数据、不该由它决定谁能读平台备份。这条实现不了，而且照做会把控制台
+		// 自己关在门外：备份页是挂在同一个控制台里的（它就是那个租户控制台，
+		// 平台管理员多看见几个菜单），而生产的 CORS_ORIGINS 按设计就是空的
+		// ——「租户控制台的来源已由 tenant_domain 表推导，不必再列一遍」
+		// （deploy/amos/rn-foundation.env.example:94）。
+		//
+		// 我先前按「同源或显式列出」实现，结果是任何生产部署上这一页必然 403：
+		// 控制台域名和 API 主机本来就不是同一个。
+		//
+		// 真正的授权边界不在这里，而是 requirePlatformAdmin：要有已登录会话，
+		// 且操作者在平台管理员白名单里。Origin 这一层挡的是「别的站点用你的
+		// cookie 跨源把响应读走」，而那件事由浏览器同源策略加 CORS 响应头兜底
+		// ——服务端不给不可信来源发 Access-Control-Allow-Origin，对方就读不到。
 		origin := strings.TrimSpace(c.GetHeader("Origin"))
-		if origin == "" {
-			c.Next()
-			return
-		}
-		for _, allowed := range s.cfg.CORSOrigins {
-			if allowed == origin {
-				c.Next()
-				return
-			}
-		}
-		parsed, err := url.Parse(origin)
-		if err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, c.Request.Host) {
+		if origin == "" || sameOrigin(origin, c.Request.Host) || s.originAllowed(origin) {
 			c.Next()
 			return
 		}
 		slog.Warn("a cross-origin request to the platform backup routes was refused",
 			"origin", origin, "host", c.Request.Host, "path", c.Request.URL.Path)
 		problem(c, http.StatusForbidden, "BACKUP_CROSS_ORIGIN_REFUSED",
-			"platform backups are not readable cross-origin")
+			"platform backups are not readable from "+origin)
 		c.Abort()
 	}
 }
@@ -469,4 +475,12 @@ func (s *server) backupObjectFor(c *gin.Context) (backupRun, *backupObject, bool
 	problem(c, http.StatusNotFound, "BACKUP_PAIR_NOT_FOUND",
 		"this backup has no package for that pair of key holders")
 	return backupRun{}, nil, false
+}
+
+// sameOrigin 判断 Origin 头指的就是这台机器自己。
+//
+// 同源永远放行：它在任何配置下都是安全的，而且不依赖 CORS_ORIGINS 配没配。
+func sameOrigin(origin, host string) bool {
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host != "" && strings.EqualFold(parsed.Host, host)
 }

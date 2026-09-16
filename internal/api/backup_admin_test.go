@@ -129,6 +129,56 @@ func TestDBDownloadRefusesUnknownSeqAndPair(t *testing.T) {
 
 // 跨源请求必须被挡下。authenticate 的 Origin 闸只管非安全方法，而 originAllowed
 // 会回落去查 tenant_domain 表——不补的话，「谁能读平台备份」由那张表决定
+// 控制台是从**租户域名**提供的，备份页必须能从那里访问。
+//
+// 这条是一次真实故障的回归测试：设计 §6 要求「对平台组关掉 tenant_domain 回退」，
+// 我照做了，结果任何生产部署上这一页都必然 403——因为备份页就挂在那个租户控制台
+// 里（平台管理员多看见几个菜单而已），而生产的 CORS_ORIGINS 按设计就是空的
+// （deploy/amos/rn-foundation.env.example:94：「租户控制台的来源已由 tenant_domain
+// 表推导，不必再列一遍」）。关掉回退等于关掉控制台自己。
+//
+// 真正的授权边界是 requirePlatformAdmin：要有已登录会话、且操作者在平台管理员
+// 白名单里。Origin 这一层挡的是「别的站点拿你的 cookie 跨源读走响应」。
+func TestDBBackupRoutesAllowTheConsoleServedFromATenantDomain(t *testing.T) {
+	db := openTestDB(t)
+	tenant := testTenant(61)
+	slug := "origin-" + uniqueSuffix()
+	domain := slug + ".example.com"
+	if _, err := db.Exec(`INSERT INTO tenants(id,slug,status,start_date,expiry_date,deleted,created_at,updated_at)
+		VALUES(?,?,1,CURDATE(),DATE_ADD(CURDATE(), INTERVAL 1 YEAR),0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		tenant, slug); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO tenant_domain(tenant_id,domain,is_primary,status,deleted,created_at,updated_at)
+		VALUES(?,?,1,'active',0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`, tenant, domain); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &server{db: db, tenant: newTenantResolver(db)}
+	gate := s.requireBackupSameOrigin()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("GET", "/v1/admin/platform/backup", nil)
+	c.Request.Host = "api.example"
+	c.Request.Header.Set("Origin", "https://"+domain)
+	gate(c)
+	if c.IsAborted() {
+		t.Fatalf("控制台所在的租户域名被挡下了（%d）——这一页在生产上就打不开了", recorder.Code)
+	}
+
+	// 但一个解析不出来的域名仍然要挡下
+	recorder2 := httptest.NewRecorder()
+	c2, _ := gin.CreateTestContext(recorder2)
+	c2.Request = httptest.NewRequest("GET", "/v1/admin/platform/backup", nil)
+	c2.Request.Host = "api.example"
+	c2.Request.Header.Set("Origin", "https://not-a-tenant.example")
+	gate(c2)
+	if !c2.IsAborted() {
+		t.Error("一个不属于任何租户的来源不该放行")
+	}
+}
+
 func TestBackupRoutesRefuseCrossOriginButAllowSameOrigin(t *testing.T) {
 	s := &server{cfg: config.Config{CORSOrigins: []string{"https://console.example"}}}
 	gate := s.requireBackupSameOrigin()
@@ -140,7 +190,8 @@ func TestBackupRoutesRefuseCrossOriginButAllowSameOrigin(t *testing.T) {
 		{"没有 Origin（同源 GET）", "", "api.example", false},
 		{"同源", "https://api.example", "api.example", false},
 		{"显式允许的控制台", "https://console.example", "api.example", false},
-		{"租户域名", "https://api.acme.example", "api.example", true},
+		// 没有租户解析器时解析不出来，所以挡下。带解析器的情形见下面那条测试
+		{"解析不出的域名", "https://api.acme.example", "api.example", true},
 		{"完全无关的站点", "https://evil.example", "api.example", true},
 	}
 	for _, tc := range cases {
