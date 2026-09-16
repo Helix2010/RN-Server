@@ -79,6 +79,44 @@ type fakeServer struct {
 	authCode string
 }
 
+func (f *fakeServer) setHeartbeatCode(code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heartbeatCode = code
+}
+
+func (f *fakeServer) setKeyStatus(status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keyStatus = status
+}
+
+func (f *fakeServer) setOmitMachineID(omit bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.omitMachineID = omit
+}
+
+// loadIndependentBound 是"不应该要等这么久"的上限。测试里的假构建一旦没被中止就睡
+// neverFinishesSeconds 秒，所以上限只要明显小于它、又远大于任何负载下的正常耗时即可——
+// 断言不依赖机器快慢（整仓 go test -race ./... 并行跑时单个任务慢到几秒是常事）。
+const (
+	loadIndependentBound = 5 * time.Minute
+	neverFinishesSeconds = "1800"
+)
+
+// waitFor 轮询一个条件直到成立；等不到就失败。取代"sleep 一会儿再看"。
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(loadIndependentBound)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (f *fakeServer) setAuthCode(code string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

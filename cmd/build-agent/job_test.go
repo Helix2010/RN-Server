@@ -148,18 +148,18 @@ func TestOTAJobUsesTheSameEnvironmentAsTheAPKJob(t *testing.T) {
 // 心跳收到 409 BUILD_ATTEMPT_STALE：立刻中止执行进程、清理任务目录，不再上报任何东西
 func TestStaleHeartbeatAbortsTheBuildAndCleansUp(t *testing.T) {
 	rig := newRig(t)
-	if err := os.WriteFile(rig.tools.Sleep, nil, 0o644); err != nil {
+	if err := os.WriteFile(rig.tools.Sleep, []byte(neverFinishesSeconds), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rig.server.heartbeatCode = codeAttemptStale
+	rig.server.setHeartbeatCode(codeAttemptStale)
 	rig.server.queueClaim(claimBody("bld_staleJOB0001", "apk"))
 
 	started := time.Now()
 	if !rig.agent.pollOnce(context.Background()) {
 		t.Fatal("no job")
 	}
-	if elapsed := time.Since(started); elapsed > 60*time.Second {
-		t.Fatalf("aborting took %s; the fake install sleeps 120s, so it was not stopped", elapsed)
+	if elapsed := time.Since(started); elapsed > loadIndependentBound {
+		t.Fatalf("aborting took %s; the fake install sleeps %ss, so it was not stopped", elapsed, neverFinishesSeconds)
 	}
 	for _, suffix := range []string{"/fail", "/built", "/complete", "/unsigned/upload"} {
 		if calls := rig.server.callsTo(suffix); len(calls) != 0 {
@@ -174,25 +174,25 @@ func TestStaleHeartbeatAbortsTheBuildAndCleansUp(t *testing.T) {
 // 停机信号（systemd 以 KillMode=mixed 只发给控制进程）：手上的构建做完、交付，然后才停
 func TestStopSignalDrainsTheBuildInFlight(t *testing.T) {
 	rig := newRig(t)
-	if err := os.WriteFile(rig.tools.Sleep, []byte("2"), 0o644); err != nil {
+	if err := os.WriteFile(rig.tools.Sleep, []byte("1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	rig.server.queueClaim(claimBody("bld_drainJOB0001", "apk"))
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan bool, 1)
 	go func() { done <- rig.agent.pollOnce(ctx) }()
-	deadline := time.Now().Add(20 * time.Second)
-	for len(rig.server.callsTo("/claim")) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(300 * time.Millisecond)
+	// 停机信号在执行进程已经开始构建之后才到（假 pnpm install 记下环境即表示它在跑）
+	waitFor(t, "the build runner to start installing", func() bool {
+		_, err := os.Stat(filepath.Join(rig.tools.Record, "install.env"))
+		return err == nil
+	})
 	stop()
 	select {
 	case worked := <-done:
 		if !worked {
 			t.Fatal("the claimed job was not worked on")
 		}
-	case <-time.After(60 * time.Second):
+	case <-time.After(loadIndependentBound):
 		t.Fatal("the build did not finish")
 	}
 	if fails := rig.server.callsTo("/fail"); len(fails) != 0 {
@@ -229,7 +229,7 @@ func TestLingeringProcessHoldingTheOutputDoesNotHangTheAgent(t *testing.T) {
 	if !rig.agent.pollOnce(context.Background()) {
 		t.Fatal("no job")
 	}
-	if elapsed := time.Since(started); elapsed > 60*time.Second {
+	if elapsed := time.Since(started); elapsed > loadIndependentBound {
 		t.Fatalf("the agent waited %s for a lingering process", elapsed)
 	}
 	if len(rig.server.callsTo("/built")) != 1 {
@@ -300,7 +300,7 @@ func TestJobOnAnotherBranchIsRefused(t *testing.T) {
 // 公钥没被接受之前不领任务
 func TestPendingKeyMeansNoClaims(t *testing.T) {
 	rig := newRig(t)
-	rig.server.keyStatus = "pending_key"
+	rig.server.setKeyStatus("pending_key")
 	rig.server.queueClaim(claimBody("bld_pendingJOB01", "apk"))
 	if rig.agent.pollOnce(context.Background()) {
 		t.Fatal("worked while the key was pending")
@@ -364,7 +364,7 @@ func TestKeyRotationIsProvenAndPromotedAfterAcceptance(t *testing.T) {
 // 服务端不给 machineId 时不能签换钥证明，就不换
 func TestRotationNeedsTheMachineID(t *testing.T) {
 	rig := newRig(t)
-	rig.server.omitMachineID = true
+	rig.server.setOmitMachineID(true)
 	next, _, err := createNextKey(rig.agent.cfg.StateDir)
 	if err != nil {
 		t.Fatal(err)

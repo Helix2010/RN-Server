@@ -359,3 +359,19 @@ func mustSymlink(t *testing.T, target, link string) {
 		t.Fatal(err)
 	}
 }
+
+// git fetch 默认会 detach 出一个 git maintenance run --auto，在 fetch 返回之后继续往仓库里写，
+// 和紧接着的复制、删除打架（压测里删任务目录报过 directory not empty）。每条 git 命令都要关掉它。
+func TestControllerGitNeverStartsBackgroundMaintenance(t *testing.T) {
+	joined := strings.Join(gitSafetyConfig, " ")
+	for _, want := range []string{"maintenance.auto=false", "gc.auto=0", "core.hooksPath=/dev/null"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("controller git commands lack %s", want)
+		}
+	}
+	a := &agent{cfg: config{MachineEnv: map[string]string{"PATH": "/usr/bin:/bin"}}}
+	cmd := a.gitCommand(context.Background(), "", "fetch", "--all")
+	if got := strings.Join(cmd.Args, " "); !strings.Contains(got, "-c maintenance.auto=false") || !strings.HasSuffix(got, "fetch --all") {
+		t.Fatalf("git command line = %q", got)
+	}
+}

@@ -127,10 +127,19 @@ func (a *agent) cleanupJob(layout jobspec.Layout) {
 }
 
 // removeControllerTree 删掉任务目录。执行进程的文件已经由它自己删掉；这里不跟随符号链接。
+//
+// 刚被 SIGKILL 的进程组（中止的 git、执行进程的子进程）可能还没被内核调度到退出，删到一半
+// 撞上它新建的文件就是 "directory not empty"：隔一小会儿重试几次。
 func removeControllerTree(path string) error {
-	err := os.RemoveAll(path)
-	if err == nil || errors.Is(err, fs.ErrNotExist) {
-		return nil
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		err = os.RemoveAll(path)
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 	}
 	return err
 }

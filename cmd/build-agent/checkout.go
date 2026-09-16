@@ -272,8 +272,22 @@ func (a *agent) gitEnv() []string {
 	}
 }
 
+// gitSafetyConfig 是控制进程每条 git 命令都带的配置。
+//
+// maintenance.auto / gc.auto：git fetch 结束时会拉起一个 **detach 的** `git maintenance run --auto`
+// （git 2.55 实测），它在 fetch 返回之后才去建锁文件、写 objects/。控制进程紧接着就把检出交给
+// 执行进程复制、任务结束时整棵删掉，后台进程还在往里写，删除报 "directory not empty"、复制
+// 可能撞上一闪而过的锁文件（压测里出现过）。构建机上的仓库用完即删，不需要自动维护。
+var gitSafetyConfig = []string{
+	"-c", "core.hooksPath=/dev/null",
+	"-c", "core.fsmonitor=false",
+	"-c", "protocol.file.allow=always",
+	"-c", "maintenance.auto=false",
+	"-c", "gc.auto=0",
+}
+
 func (a *agent) gitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
-	full := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=always"}, args...)
+	full := append(append([]string(nil), gitSafetyConfig...), args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Env = a.gitEnv()
 	cmd.Dir = dir

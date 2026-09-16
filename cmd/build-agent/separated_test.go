@@ -87,7 +87,11 @@ func TestSeparatedUsersEndToEnd(t *testing.T) {
 	if out, err := exec.Command(sudoPath, "-n", "-u", name, "--", "/usr/bin/touch", planted).CombinedOutput(); err != nil {
 		t.Fatalf("plant: %v %s", err, out)
 	}
-	time.Sleep(200 * time.Millisecond)
+	// 等潜伏进程真的以构建用户跑起来，否则"被回收"可能只是它还没启动
+	waitFor(t, "the lurker to run as the build user", func() bool {
+		out, _ := exec.Command("pgrep", "-u", account.Uid, "-x", "sleep").Output()
+		return len(strings.TrimSpace(string(out))) != 0
+	})
 
 	rig.server.queueClaim(claimBody("bld_sudoAPK000001", "apk"))
 	if !a.pollOnce(context.Background()) {
@@ -118,7 +122,7 @@ func TestSeparatedUsersEndToEnd(t *testing.T) {
 	}
 	select {
 	case <-lurkerDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(loadIndependentBound):
 		t.Fatal("a process left by the build user survived the next job")
 	}
 	if _, err := os.Lstat(planted); !os.IsNotExist(err) {
