@@ -43,9 +43,11 @@ const (
 	signerRolePrimary = "primary"
 	signerRoleStandby = "standby"
 
-	machineStatusPendingKey = "pending_key"
-	machineStatusActive     = "active"
-	machineStatusRevoked    = "revoked"
+	// pending_enrollment：控制台新建之后、机器用注册码在本机注册之前。没有令牌、没有公钥
+	machineStatusPendingEnrollment = "pending_enrollment"
+	machineStatusPendingKey        = "pending_key"
+	machineStatusActive            = "active"
+	machineStatusRevoked           = "revoked"
 
 	machineTokenHeader       = "x-machine-token"
 	legacyAgentTokenHeader   = "x-build-agent-token"
@@ -124,6 +126,31 @@ type buildMachine struct {
 	// 只在值变化时写。null = 从未上报
 	ReportedLocalRole   optString `json:"reportedLocalRole"`
 	ReportedLocalRoleAt optString `json:"reportedLocalRoleAt"`
+	// 一次性注册码（设计 automation-2026-09-16「新机器」）。控制台新建机器时签发，只存 sha256；
+	// 注册成功后 usedAt 写上、记录保留。手工流程登记的机器没有这个字段，读出来是 nil
+	Enrollment *machineEnrollment `json:"enrollment"`
+	// 仅签名闸：它在 POST /v1/signer/keystore-checks 里报的本机信任列表（本机记录说了算）与这个值
+	// 最近一次变化的时间。只用于控制台提示，签名闸不采信服务端。只在值变化时写；null = 从未上报
+	ReportedTrust   *machineReportedTrust `json:"reportedTrust"`
+	ReportedTrustAt optString             `json:"reportedTrustAt"`
+}
+
+// machineEnrollment 是一台机器的一次性注册码状态。注册码原文只出现在新建与重发的响应里。
+type machineEnrollment struct {
+	CodeSHA256 string    `json:"codeSha256"`
+	ExpiresAt  string    `json:"expiresAt"`
+	IssuedBy   string    `json:"issuedBy"`
+	IssuedAt   string    `json:"issuedAt"`
+	UsedAt     optString `json:"usedAt"`
+}
+
+// usable：注册码还能用（未用、未过期）。机器状态由调用方另外判断。
+func (e *machineEnrollment) usable(now time.Time) bool {
+	if e == nil || e.UsedAt != "" {
+		return false
+	}
+	expires, err := time.Parse(time.RFC3339Nano, e.ExpiresAt)
+	return err == nil && now.Before(expires)
 }
 
 type buildMachinesDoc struct {
@@ -146,7 +173,7 @@ func (d buildMachinesDoc) find(id string) (int, bool) {
 
 func (d buildMachinesDoc) byTokenSHA256(digest string) (buildMachine, bool) {
 	for _, m := range d.Machines {
-		if m.TokenSHA256 == digest {
+		if digest != "" && m.TokenSHA256 == digest {
 			return m, true
 		}
 	}
@@ -185,18 +212,29 @@ func (d buildMachinesDoc) names() map[string]string {
 func (d buildMachinesDoc) validate() error {
 	ids := map[string]bool{}
 	tokens := map[string]bool{}
+	codes := map[string]bool{}
 	liveNames := map[string]bool{}
 	primaries := 0
 	for _, m := range d.Machines {
+		// 还没注册过的机器没有令牌：pending_enrollment，或者没注册就被吊销了
+		neverEnrolled := m.Enrollment != nil && m.Enrollment.UsedAt == "" && m.TokenSHA256 == ""
 		switch {
 		case !ident.ValidServerIDWithPrefix(m.ID, machineIDPrefix) || ids[m.ID]:
 			return fmt.Errorf("machine id %q is malformed or duplicated", m.ID)
 		case m.Role != machineRoleBuilder && m.Role != machineRoleSigner:
 			return fmt.Errorf("machine %s has an unknown role", m.ID)
-		case m.Status != machineStatusPendingKey && m.Status != machineStatusActive && m.Status != machineStatusRevoked:
+		case !oneOf(m.Status, machineStatusPendingEnrollment, machineStatusPendingKey, machineStatusActive, machineStatusRevoked):
 			return fmt.Errorf("machine %s has an unknown status", m.ID)
-		case !fingerprint.Valid(m.TokenSHA256) || tokens[m.TokenSHA256]:
+		case m.Status == machineStatusPendingEnrollment && !neverEnrolled:
+			return fmt.Errorf("machine %s is pending enrollment but carries a token or a used enrollment code", m.ID)
+		case m.Status == machineStatusPendingEnrollment && (m.PublicKey != "" || m.Pending != nil):
+			return fmt.Errorf("machine %s is pending enrollment but carries a public key", m.ID)
+		case !(neverEnrolled && oneOf(m.Status, machineStatusPendingEnrollment, machineStatusRevoked)) && (!fingerprint.Valid(m.TokenSHA256) || tokens[m.TokenSHA256]):
 			return fmt.Errorf("machine %s has a malformed or duplicated token digest", m.ID)
+		case m.Enrollment != nil && (!fingerprint.Valid(m.Enrollment.CodeSHA256) || codes[m.Enrollment.CodeSHA256] || !ident.ValidRFC3339UTC(m.Enrollment.ExpiresAt)):
+			return fmt.Errorf("machine %s has a malformed or duplicated enrollment code", m.ID)
+		case m.ReportedTrust != nil && m.Role != machineRoleSigner:
+			return fmt.Errorf("machine %s reports signer trust but is not a signer", m.ID)
 		case m.Role == machineRoleBuilder && m.SignerRole != "":
 			return fmt.Errorf("builder %s carries a signer role", m.ID)
 		// 吊销的签名闸没有主备角色（吊销时置空；更早吊销的记录可能还留着原角色）
@@ -210,7 +248,13 @@ func (d buildMachinesDoc) validate() error {
 		case m.Status == machineStatusActive && m.Role == machineRoleSigner && (m.Ed25519PublicKey == "" || !fingerprint.Valid(string(m.Ed25519PublicKeySHA256))):
 			return fmt.Errorf("active signer %s has no accepted ed25519 key", m.ID)
 		}
-		ids[m.ID], tokens[m.TokenSHA256] = true, true
+		ids[m.ID] = true
+		if m.TokenSHA256 != "" {
+			tokens[m.TokenSHA256] = true
+		}
+		if m.Enrollment != nil {
+			codes[m.Enrollment.CodeSHA256] = true
+		}
 		if m.Status != machineStatusRevoked {
 			if liveNames[m.Name] {
 				return fmt.Errorf("machine name %q is used twice", m.Name)
@@ -450,6 +494,16 @@ func machineView(m buildMachine) gin.H {
 		"revokeReason":                  nullableString(string(m.RevokeReason)),
 		"reportedLocalRole":             nullableString(string(m.ReportedLocalRole)),
 		"reportedLocalRoleAt":           nullableString(string(m.ReportedLocalRoleAt)),
+		"enrollmentExpiresAt":           nil,
+		"reportedTrust":                 nil,
+		"reportedTrustAt":               nullableString(string(m.ReportedTrustAt)),
+	}
+	// 注册码的有效期只对还没注册的机器有意义；注册码本身与它的 sha256 都不出现在视图里
+	if m.Status == machineStatusPendingEnrollment && m.Enrollment != nil {
+		view["enrollmentExpiresAt"] = m.Enrollment.ExpiresAt
+	}
+	if m.ReportedTrust != nil {
+		view["reportedTrust"] = m.ReportedTrust
 	}
 	if m.Pending != nil {
 		view["pendingPublicKeySha256"] = m.Pending.PublicKeySHA256
@@ -571,9 +625,24 @@ func (s *server) createMachine(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "a signer needs signerRole primary or standby")
 		return
 	}
-	token, err := newMachineToken()
+	// 签名闸安装时要在本机 pin 一把离线恢复公钥（--recovery-sha256），它生成的密钥都要加密给恢复公钥。
+	// 平台还没有登记恢复公钥时装出来的签名闸什么也生成不了，所以不许新建
+	if role == machineRoleSigner {
+		recovery, err := readRecoveryKeys(c.Request.Context(), s.db, false)
+		if err != nil {
+			slog.Error("cannot read the recovery keys", "error", err)
+			problem(c, http.StatusInternalServerError, "RECOVERY_KEYS_INVALID", "Stored build.recovery.recipients configuration cannot be read")
+			return
+		}
+		if len(recovery.Doc.live()) == 0 {
+			problem(c, http.StatusConflict, "RECOVERY_KEY_NOT_CONFIGURED",
+				"Register the platform's offline recovery public key (Platform maintenance → signing-gate recovery key) before creating a signer")
+			return
+		}
+	}
+	code, err := machinekey.NewEnrollmentCode()
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "MACHINE_SAVE_FAILED", "Unable to issue a machine token")
+		problem(c, http.StatusInternalServerError, "MACHINE_SAVE_FAILED", "Unable to issue an enrollment code")
 		return
 	}
 	reason := strings.TrimSpace(body.Reason)
@@ -595,19 +664,66 @@ func (s *server) createMachine(c *gin.Context) {
 		}
 		created = buildMachine{
 			ID: machineIDPrefix + "_" + randomID(16), Role: role, SignerRole: optString(signerRole), Name: name,
-			Status: machineStatusPendingKey, TokenSHA256: sha256Hex(token),
+			Status: machineStatusPendingEnrollment, Enrollment: newMachineEnrollment(code, actor(c), now),
 			CreatedBy: actor(c), CreatedAt: iso(now),
 		}
 		doc.Machines = append(doc.Machines, created)
-		// 审计记机器身份，不记令牌也不记令牌 sha256
+		// 审计记机器身份与注册码有效期，不记注册码也不记它的 sha256
 		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_machine_create", machineAuditTargetType, created.ID, reason, requestID(c),
-			map[string]any{"machineId": created.ID, "role": role, "name": name, "signerRole": nullableString(signerRole)})}
+			map[string]any{"machineId": created.ID, "role": role, "name": name, "signerRole": nullableString(signerRole), "enrollmentExpiresAt": created.Enrollment.ExpiresAt})}
 	})
 	if !ok {
 		return
 	}
-	// 令牌只在这一个响应里出现。之后任何接口都拿不回来，丢了就吊销重建
-	c.JSON(http.StatusCreated, gin.H{"version": snapshot.Version, "machine": machineView(created), "token": token})
+	// 注册码只在这一个响应里出现（重发会作废它、换一个新的）。长期令牌不再经过控制台：
+	// 机器在本机注册时直接写进 env 文件
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusCreated, gin.H{"version": snapshot.Version, "machine": machineView(created), "enrollment": s.enrollmentView(c, created, code)})
+}
+
+// reissueEnrollment 重发注册码：旧码立即作废。只对还没注册的机器。
+func (s *server) reissueEnrollment(c *gin.Context) {
+	var body machineWriteCommon
+	if decode(c, &body) != nil || !body.valid() {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "expectedVersion, reason (at least 3 characters) and confirm=true are required")
+		return
+	}
+	code, err := machinekey.NewEnrollmentCode()
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "MACHINE_SAVE_FAILED", "Unable to issue an enrollment code")
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	reason := strings.TrimSpace(body.Reason)
+	var reissued buildMachine
+	snapshot, ok := s.mutateMachines(c, *body.ExpectedVersion, func(doc *buildMachinesDoc, now time.Time) (int, string, string, []auditEvent) {
+		index, found := doc.find(id)
+		if !found {
+			return http.StatusNotFound, "MACHINE_NOT_FOUND", "Machine not found", nil
+		}
+		m := &doc.Machines[index]
+		switch m.Status {
+		case machineStatusPendingEnrollment:
+		case machineStatusRevoked:
+			return http.StatusConflict, "MACHINE_REVOKED", "A revoked machine cannot be enrolled; create a new one", nil
+		default:
+			return http.StatusConflict, "MACHINE_ALREADY_ENROLLED", "This machine has already enrolled; a new enrollment code would not be accepted", nil
+		}
+		previousExpiresAt := m.Enrollment.ExpiresAt
+		m.Enrollment = newMachineEnrollment(code, actor(c), now)
+		reissued = *m
+		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_machine_enrollment_reissue", machineAuditTargetType, m.ID, reason, requestID(c),
+			map[string]any{"machineId": m.ID, "role": m.Role, "name": m.Name, "enrollmentExpiresAt": m.Enrollment.ExpiresAt, "previousEnrollmentExpiresAt": previousExpiresAt})}
+	})
+	if !ok {
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"version": snapshot.Version, "machine": machineView(reissued), "enrollment": s.enrollmentView(c, reissued, code)})
+}
+
+func newMachineEnrollment(code, issuedBy string, now time.Time) *machineEnrollment {
+	return &machineEnrollment{CodeSHA256: sha256Hex(code), ExpiresAt: iso(now.Add(enrollmentCodeTTL)), IssuedBy: issuedBy, IssuedAt: iso(now)}
 }
 
 func (s *server) revokeMachine(c *gin.Context) {

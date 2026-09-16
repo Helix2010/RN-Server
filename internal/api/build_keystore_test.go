@@ -245,7 +245,7 @@ func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 		for k, v := range item {
 			base[k] = v
 		}
-		if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": f.localRoleOf(f.primary), "items": []any{base}}); r.Code != http.StatusNoContent {
+		if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": f.localRoleOf(f.primary), "trust": f.localTrust(), "items": []any{base}}); r.Code != http.StatusNoContent {
 			t.Fatalf("report: %d %s", r.Code, r.Body.String())
 		}
 	}
@@ -380,6 +380,15 @@ func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(readinessKeystoreNotConfigured)
+	// 还没有密钥时，平台没有恢复公钥、生成请求在等主签名闸、生成失败，各是一条原因
+	expect(readinessRecoveryKeyMissing)
+	f.putGenerationRequest(generationPending, nil)
+	expect(readinessGenerationPending)
+	f.putGenerationRequest(generationFailed, &keystoreGenerationError{Code: "TRUST_ROOTS_CHANGED", Detail: "confirm the new trust roots on the signer first"})
+	expect(readinessGenerationFailed)
+	if r := readiness(); !strings.Contains(r.Problems[len(r.Problems)-1].Detail, "TRUST_ROOTS_CHANGED") {
+		t.Fatalf("a failed generation must carry the signer's code: %+v", r.Problems)
+	}
 
 	for _, code := range readinessProblemCodes {
 		if !seen[code] {

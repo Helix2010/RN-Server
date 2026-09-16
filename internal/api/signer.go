@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,12 +12,14 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 	"github.com/Helix2010/RN-Server/signing/ident"
+	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/gin-gonic/gin"
 )
 
@@ -55,10 +58,19 @@ func sanitizeSignerText(text string, max int) string {
 
 // signerKeystoreChecks 列出发给本机的密文，以及服务端算出的当前信任根（只作对照）。
 // 主备两台都调：备签名闸同样要试解、确认，才能随时接手。
+//
+// 自动化（ADR-0020）之后每项还带：
+//   - generator / generationSignature / generationRequestId / upload：当前密钥由签名闸生成时给出（离线导入的为 null），
+//     备签名闸据此验证"是本机信任的签名闸生成的"后自动确认；
+//   - publishedMaxBuildNumber：该租户 Android 发布记录里最大的 build 号（没有为 0），首次确认时定首签上限；
+//   - generationRequest：只给 active 的路由主签名闸、且请求仍在等待时。租户此时可能还没有发给本机的密文
+//     （新租户、旧格式记录、密钥没加密给这台主签名闸）：这种项 box、packageName、certificateSha256、keyAlias 为 null，
+//     只用来领生成请求，签名闸不对它上报检查结论（服务端也不收）。
 func (s *server) signerKeystoreChecks(c *gin.Context) {
 	machine, _ := machineFromContext(c)
 	ctx := c.Request.Context()
-	rows, err := s.db.QueryContext(ctx, `SELECT k.tenant_id FROM app_configs k JOIN tenants t ON t.id=k.tenant_id WHERE k.config_key=? ORDER BY k.tenant_id`, buildKeystoreConfigKey)
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT k.tenant_id FROM app_configs k JOIN tenants t ON t.id=k.tenant_id WHERE k.config_key IN (?,?) ORDER BY k.tenant_id`,
+		buildKeystoreConfigKey, buildKeystoreRequestConfigKey)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_QUERY_FAILED", "Unable to list keystores")
 		return
@@ -76,38 +88,91 @@ func (s *server) signerKeystoreChecks(c *gin.Context) {
 	rows.Close()
 	items := []gin.H{}
 	for _, tenant := range tenants {
-		state, err := s.buildKeystoreStateFor(ctx, s.db, tenant)
+		item, err := s.signerCheckItem(ctx, machine, tenant)
 		if err != nil {
 			// 一个租户的记录坏了不能挡住其它租户的检查；这个租户在控制台上会直接报错
-			slog.Error("skipping a tenant whose build.keystore cannot be read", "tenant", tenant, "error", err)
+			slog.Error("skipping a tenant in the signer keystore checks", "tenant", tenant, "machineId", machine.ID, "error", err)
 			continue
 		}
-		if state.Invalid != "" {
-			// 记录用不了（控制台就绪问题 KEYSTORE_RECORD_INVALID）：不下发给签名闸，留一条日志
-			slog.Warn("not sending an unusable build.keystore to a signer", "tenant", tenant, "machineId", machine.ID, "reason", state.Invalid)
-			continue
+		if item != nil {
+			items = append(items, item)
 		}
-		if !state.configured() || !containsString(state.Record.Recipients, string(machine.PublicKeySHA256)) {
-			continue
-		}
-		box, ok := boxFor(*state.Upload, string(machine.PublicKeySHA256))
-		if !ok {
-			continue
-		}
-		item := gin.H{
-			"tenantSlug": state.Record.TenantSlug, "keystoreVersion": state.Version, "packageName": state.Record.PackageName,
-			"certificateSha256": state.Record.CertificateSHA256, "keyAlias": state.Record.KeyAlias, "box": box,
-			"trustRoots": nil, "trustRootsDigest": nil,
-		}
-		roots, digest, _, err := s.trustRootsFor(ctx, tenant)
-		if err != nil {
-			slog.Error("cannot compose trust roots for a keystore check", "tenant", tenant, "error", err)
-		} else if roots != nil {
-			item["trustRoots"], item["trustRootsDigest"] = roots, digest
-		}
-		items = append(items, item)
 	}
 	c.JSON(http.StatusOK, gin.H{"machineId": machine.ID, "signerRole": nullableString(string(machine.SignerRole)), "items": items})
+}
+
+// signerCheckItem 拼一个租户给这台签名闸的检查项；nil = 这个租户没有要给它的东西。
+func (s *server) signerCheckItem(ctx context.Context, machine buildMachine, tenant string) (gin.H, error) {
+	state, err := s.buildKeystoreStateFor(ctx, s.db, tenant)
+	if err != nil {
+		return nil, err
+	}
+	if state.Invalid != "" {
+		// 记录用不了（控制台就绪问题 KEYSTORE_RECORD_INVALID）：不下发密文，留一条日志
+		slog.Warn("not sending an unusable build.keystore to a signer", "tenant", tenant, "machineId", machine.ID, "reason", state.Invalid)
+	}
+	var box *keystorebox.Box
+	if state.configured() && containsString(state.Record.Recipients, string(machine.PublicKeySHA256)) {
+		if found, ok := boxFor(*state.Upload, string(machine.PublicKeySHA256)); ok {
+			box = &found
+		}
+	}
+	var generation gin.H
+	firstKeyPackage := ""
+	if machine.isActivePrimary() {
+		request, err := s.generationRequestFor(ctx, s.db, tenant)
+		if err != nil {
+			return nil, err
+		}
+		if request != nil && request.Status == generationPending {
+			generation, firstKeyPackage = gin.H{"requestId": request.RequestID, "packageName": request.PackageName, "alias": request.Alias}, request.PackageName
+		}
+	}
+	if box == nil && generation == nil {
+		return nil, nil
+	}
+	slug, err := s.tenantSlug(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+	var published int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(build_number),0) FROM app_releases WHERE tenant_id=? AND platform='android'`, tenant).Scan(&published); err != nil {
+		return nil, err
+	}
+	item := gin.H{
+		"tenantSlug": slug, "keystoreVersion": state.Version, "packageName": nil, "certificateSha256": nil, "keyAlias": nil, "box": nil,
+		"trustRoots": nil, "trustRootsDigest": nil, "publishedMaxBuildNumber": published,
+		"generator": nil, "generationSignature": nil, "generationRequestId": nil, "upload": nil, "generationRequest": nil,
+	}
+	if box != nil {
+		record := state.Record
+		item["tenantSlug"], item["packageName"], item["certificateSha256"], item["keyAlias"], item["box"] = record.TenantSlug, record.PackageName, record.CertificateSHA256, record.KeyAlias, *box
+		if record.Generator != nil {
+			item["generator"] = gin.H{"machineId": record.Generator.MachineID, "name": record.Generator.Name,
+				"ed25519PublicKey": record.Generator.Ed25519PublicKey, "ed25519PublicKeySha256": record.Generator.Ed25519PublicKeySHA256}
+			item["generationSignature"], item["generationRequestId"], item["upload"] = record.GenerationSignature, record.GenerationRequestID, *state.Upload
+		}
+	}
+	roots, digest, problems, err := s.trustRootsWith(ctx, tenant, firstKeyPackage)
+	if err != nil {
+		slog.Error("cannot compose trust roots for a keystore check", "tenant", tenant, "error", err)
+	} else if roots != nil {
+		item["trustRoots"], item["trustRootsDigest"] = roots, digest
+	}
+	if generation != nil {
+		// 生成请求带着首次信任要用的信任根；算不出来（生成请求之后改坏了 App 参数或 OTA 证书）就不下发，
+		// 控制台上的就绪问题会说缺什么
+		if roots == nil {
+			slog.Warn("not sending a key generation request whose trust roots cannot be composed", "tenant", tenant, "problems", problems)
+		} else {
+			generation["trustRoots"], generation["trustRootsDigest"], generation["publishedMaxBuildNumber"] = roots, digest, published
+			item["generationRequest"] = generation
+		}
+	}
+	if box == nil && item["generationRequest"] == nil {
+		return nil, nil
+	}
+	return item, nil
 }
 
 type signerCheckReport struct {
@@ -127,8 +192,10 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	machine, _ := machineFromContext(c)
 	var body struct {
 		// LocalRole 是签名闸本机记录里的角色，每轮都带；签名闸与服务端同一次发布，缺了就是 400
-		LocalRole *string             `json:"localRole"`
-		Items     []signerCheckReport `json:"items"`
+		LocalRole *string `json:"localRole"`
+		// Trust 是签名闸本机记录里的信任列表，每轮都带（同上）
+		Trust *machineReportedTrust `json:"trust"`
+		Items []signerCheckReport   `json:"items"`
 	}
 	if decode(c, &body) != nil || len(body.Items) > maxSignerListItems {
 		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", fmt.Sprintf("items must be an array of at most %d check results", maxSignerListItems))
@@ -136,6 +203,15 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	}
 	if body.LocalRole == nil || (*body.LocalRole != signerRolePrimary && *body.LocalRole != signerRoleStandby) {
 		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "localRole (primary or standby, from this signer's local record) is required")
+		return
+	}
+	if body.Trust == nil {
+		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "trust (the signers, builders and recovery keys this signer's local record trusts) is required")
+		return
+	}
+	trust, err := body.Trust.normalize()
+	if err != nil {
+		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "trust is malformed: "+err.Error())
 		return
 	}
 	for _, item := range body.Items {
@@ -149,9 +225,9 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
-	if err := s.recordSignerLocalRole(c, machine, *body.LocalRole, now); err != nil {
-		slog.Error("cannot record a signer's local role", "machineId", machine.ID, "error", err)
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_SAVE_FAILED", "Unable to store the reported local role")
+	if err := s.recordSignerLocalState(c, machine, *body.LocalRole, trust, now); err != nil {
+		slog.Error("cannot record a signer's local role and trust", "machineId", machine.ID, "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_SAVE_FAILED", "Unable to store the reported local role and trust")
 		return
 	}
 	for _, item := range body.Items {
@@ -164,7 +240,9 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 			return
 		}
 		state, err := s.buildKeystoreStateFor(ctx, s.db, tenant)
-		if err != nil || !state.configured() || state.Version != item.KeystoreVersion || state.Record.TenantSlug != item.TenantSlug {
+		// 只收发给本机的密钥的结论：主签名闸为生成请求拿到的"没有密文的项"不是一次检查
+		if err != nil || !state.configured() || state.Version != item.KeystoreVersion || state.Record.TenantSlug != item.TenantSlug ||
+			!containsString(state.Record.Recipients, string(machine.PublicKeySHA256)) {
 			continue
 		}
 		check := keystoreMachineCheck{
@@ -213,9 +291,77 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// recordSignerLocalRole 把签名闸报的本机角色记进 build.machines 它自己那一项。值没变不写（每轮轮询都会报，
-// 写一次加一次 version，控制台上正在编辑的机器登记就会不停地版本冲突）；并发写冲突时重读重试。
-func (s *server) recordSignerLocalRole(c *gin.Context, machine buildMachine, role string, now time.Time) error {
+// machineReportedTrust 是签名闸本机记录里信任的签名闸（含本机）、构建机与恢复公钥（约定 3.4）。
+// 服务端只存下来给控制台提示（"主签名闸还没信任备签名闸"之类），不据此做任何判断。
+type machineReportedTrust struct {
+	Signers      []reportedTrustedSigner  `json:"signers"`
+	Builders     []reportedTrustedBuilder `json:"builders"`
+	RecoveryKeys []string                 `json:"recoveryKeys"`
+}
+
+type reportedTrustedSigner struct {
+	Name          string `json:"name"`
+	X25519SHA256  string `json:"x25519Sha256"`
+	Ed25519SHA256 string `json:"ed25519Sha256"`
+}
+
+type reportedTrustedBuilder struct {
+	BuilderID     string `json:"builderId"`
+	Ed25519SHA256 string `json:"ed25519Sha256"`
+}
+
+// normalize 校验形状并排序：同一份信任列表不管签名闸按什么顺序报，存下来都一样，"只在变化时写"才成立。
+func (t machineReportedTrust) normalize() (machineReportedTrust, error) {
+	if t.Signers == nil || t.Builders == nil || t.RecoveryKeys == nil {
+		return t, errors.New("signers, builders and recoveryKeys must all be arrays")
+	}
+	if len(t.Signers) > maxRegisteredMachines || len(t.Builders) > maxRegisteredMachines || len(t.RecoveryKeys) > maxRecoveryKeys {
+		return t, errors.New("too many entries")
+	}
+	out := machineReportedTrust{
+		Signers:      append([]reportedTrustedSigner(nil), t.Signers...),
+		Builders:     append([]reportedTrustedBuilder(nil), t.Builders...),
+		RecoveryKeys: append([]string(nil), t.RecoveryKeys...),
+	}
+	for _, signer := range out.Signers {
+		if !ident.ValidMachineName(signer.Name) || !fingerprint.Valid(signer.X25519SHA256) || !fingerprint.Valid(signer.Ed25519SHA256) {
+			return t, errors.New("each signer needs name, x25519Sha256 and ed25519Sha256")
+		}
+	}
+	for _, builder := range out.Builders {
+		if !ident.ValidServerIDWithPrefix(builder.BuilderID, machineIDPrefix) || !fingerprint.Valid(builder.Ed25519SHA256) {
+			return t, errors.New("each builder needs builderId and ed25519Sha256")
+		}
+	}
+	for _, digest := range out.RecoveryKeys {
+		if !fingerprint.Valid(digest) {
+			return t, errors.New("recoveryKeys must be 64-character sha256 values")
+		}
+	}
+	sort.Slice(out.Signers, func(i, j int) bool {
+		a, b := out.Signers[i], out.Signers[j]
+		return a.Name+a.X25519SHA256+a.Ed25519SHA256 < b.Name+b.X25519SHA256+b.Ed25519SHA256
+	})
+	sort.Slice(out.Builders, func(i, j int) bool {
+		return out.Builders[i].BuilderID+out.Builders[i].Ed25519SHA256 < out.Builders[j].BuilderID+out.Builders[j].Ed25519SHA256
+	})
+	sort.Strings(out.RecoveryKeys)
+	return out, nil
+}
+
+func (t *machineReportedTrust) equal(other *machineReportedTrust) bool {
+	if t == nil || other == nil {
+		return t == other
+	}
+	a, _ := json.Marshal(t)
+	b, _ := json.Marshal(other)
+	return bytes.Equal(a, b)
+}
+
+// recordSignerLocalState 把签名闸报的本机角色与信任列表记进 build.machines 它自己那一项。两样都没变
+// 就不写（每轮轮询都会报，写一次加一次 version，控制台上正在编辑的机器登记就会不停地版本冲突）；
+// 变了合成一次写，各自写审计；并发写冲突时重读重试。
+func (s *server) recordSignerLocalState(c *gin.Context, machine buildMachine, role string, trust machineReportedTrust, now time.Time) error {
 	ctx := c.Request.Context()
 	for attempt := 0; attempt < machineWriteRetries; attempt++ {
 		snapshot, err := readMachineRegistry(ctx, s.db, false)
@@ -227,11 +373,27 @@ func (s *server) recordSignerLocalRole(c *gin.Context, machine buildMachine, rol
 			return errors.New("the signer is no longer registered")
 		}
 		m := &snapshot.Doc.Machines[index]
-		if string(m.ReportedLocalRole) == role {
+		roleChanged := string(m.ReportedLocalRole) != role
+		trustChanged := !m.ReportedTrust.equal(&trust)
+		if !roleChanged && !trustChanged {
 			return nil
 		}
-		previous := string(m.ReportedLocalRole)
-		m.ReportedLocalRole, m.ReportedLocalRoleAt = optString(role), optString(iso(now))
+		events := []auditEvent{}
+		if roleChanged {
+			previous := string(m.ReportedLocalRole)
+			m.ReportedLocalRole, m.ReportedLocalRoleAt = optString(role), optString(iso(now))
+			events = append(events, newAudit(platformTenantID, signerActor, "build_machine_local_role_report", machineAuditTargetType, machine.ID,
+				"a signer reported a change of its local role", requestID(c),
+				map[string]any{"machineId": machine.ID, "name": machine.Name, "reportedLocalRole": role, "previousReportedLocalRole": nullableString(previous),
+					"signerRole": nullableString(string(m.SignerRole))}))
+		}
+		if trustChanged {
+			reported := trust
+			m.ReportedTrust, m.ReportedTrustAt = &reported, optString(iso(now))
+			events = append(events, newAudit(platformTenantID, signerActor, "build_machine_trust_report", machineAuditTargetType, machine.ID,
+				"a signer reported a change of its local trust", requestID(c),
+				map[string]any{"machineId": machine.ID, "name": machine.Name, "reportedTrust": reported}))
+		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
@@ -245,17 +407,15 @@ func (s *server) recordSignerLocalRole(c *gin.Context, machine buildMachine, rol
 			_ = tx.Rollback()
 			continue
 		}
-		event := newAudit(platformTenantID, signerActor, "build_machine_local_role_report", machineAuditTargetType, machine.ID,
-			"a signer reported a change of its local role", requestID(c),
-			map[string]any{"machineId": machine.ID, "name": machine.Name, "reportedLocalRole": role, "previousReportedLocalRole": nullableString(previous),
-				"signerRole": nullableString(string(m.SignerRole))})
-		if err := insertAudit(ctx, tx, event); err != nil {
-			_ = tx.Rollback()
-			return err
+		for _, event := range events {
+			if err := insertAudit(ctx, tx, event); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
 		}
 		return tx.Commit()
 	}
-	return errors.New("the machine registry kept changing while recording the local role")
+	return errors.New("the machine registry kept changing while recording the local role and trust")
 }
 
 // ---- 认领 ----

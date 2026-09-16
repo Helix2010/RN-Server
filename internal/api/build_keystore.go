@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -44,6 +45,21 @@ type buildKeystoreRecord struct {
 	PackageName       string   `json:"packageName"`
 	TenantSlug        string   `json:"tenantSlug"`
 	Recipients        []string `json:"recipients"`
+	// 下面三项只在密钥由主签名闸生成（POST /v1/signer/keystore-generations/:requestId）时有，离线导入的
+	// 记录没有：生成者（交回时登记的主签名闸与它当时的 Ed25519 公钥）、它对
+	// keystorebox.GenerationMessage(generationRequestId, Upload) 的签名。备签名闸凭它们判断"这份密钥
+	// 是本机信任的签名闸生成的"，服务端只转交
+	Generator           *keystoreGenerator `json:"generator,omitempty"`
+	GenerationSignature string             `json:"generationSignature,omitempty"`
+	GenerationRequestID string             `json:"generationRequestId,omitempty"`
+}
+
+// keystoreGenerator 是生成这份密钥的主签名闸（交回那一刻的登记）。
+type keystoreGenerator struct {
+	MachineID              string `json:"machineId"`
+	Name                   string `json:"name"`
+	Ed25519PublicKey       string `json:"ed25519PublicKey"`
+	Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
 }
 
 // buildKeystoreState 是这个租户 build.keystore 那一行的状态。
@@ -148,6 +164,24 @@ func (r buildKeystoreRecord) validate() error {
 			return errors.New("recipients contains a malformed fingerprint")
 		}
 	}
+	generated := r.Generator != nil || r.GenerationSignature != "" || r.GenerationRequestID != ""
+	if generated {
+		signature, err := base64.StdEncoding.Strict().DecodeString(r.GenerationSignature)
+		switch {
+		case r.Generator == nil || !ident.ValidServerIDWithPrefix(r.Generator.MachineID, machineIDPrefix) || !ident.ValidMachineName(r.Generator.Name):
+			return errors.New("generator is incomplete")
+		case !fingerprint.Valid(r.Generator.Ed25519PublicKeySHA256):
+			return errors.New("generator.ed25519PublicKeySha256 is malformed")
+		case err != nil || len(signature) != ed25519.SignatureSize:
+			return errors.New("generationSignature is malformed")
+		case !keystorebox.ValidGenerationRequestID(r.GenerationRequestID):
+			return errors.New("generationRequestId is malformed")
+		}
+		public, err := base64.StdEncoding.Strict().DecodeString(r.Generator.Ed25519PublicKey)
+		if err != nil || len(public) != ed25519.PublicKeySize || fingerprint.SHA256Hex(public) != r.Generator.Ed25519PublicKeySHA256 {
+			return errors.New("generator.ed25519PublicKey does not match its sha256")
+		}
+	}
 	return nil
 }
 
@@ -232,6 +266,10 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		"version": keystore.Version, "updatedBy": nil, "updatedAt": nil,
 		"recipients": []gin.H{}, "missingSigners": []gin.H{}, "signers": []gin.H{},
 		"ready": readiness.Ready, "readinessProblems": readiness.problemList(), "trustRoots": nil, "trustRootsDigest": nil,
+		"generationRequest": nil, "generator": nil, "recoveryRecipients": []string{},
+	}
+	if readiness.Generation != nil {
+		view["generationRequest"] = readiness.Generation.view()
 	}
 	if keystore.Exists {
 		view["updatedBy"], view["updatedAt"] = nullableString(keystore.UpdatedBy), nullableTime(keystore.UpdatedAt)
@@ -244,8 +282,20 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 	if keystore.v3Record() && keystore.Record.Format == buildKeystoreRecordFormat {
 		view["format"], view["keyAlias"] = keystore.Record.Format, keystore.Record.KeyAlias
 		view["certificateSha256"], view["packageName"] = keystore.Record.CertificateSHA256, keystore.Record.PackageName
+		if generator := keystore.Record.Generator; generator != nil {
+			view["generator"] = gin.H{"machineId": generator.MachineID, "name": generator.Name, "ed25519PublicKeySha256": generator.Ed25519PublicKeySHA256}
+		}
+		recoveryKeys, err := readRecoveryKeys(ctx, s.db, false)
+		if err != nil {
+			return nil, err
+		}
+		// 恢复收件人：密钥里加密给了哪几把登记过的恢复公钥（吊销了的也算——密文已经发给它了）
+		recoveryRecipients := []string{}
 		items := []gin.H{}
 		for _, recipient := range keystore.Record.Recipients {
+			if _, ok := recoveryKeys.Doc.anyBySHA256(recipient); ok {
+				recoveryRecipients = append(recoveryRecipients, recipient)
+			}
 			recipients[recipient] = true
 			item := gin.H{"recipientSha256": recipient, "machineId": nil, "name": nil, "signerRole": nil}
 			if signer, ok := registry.signerByRecipient(recipient); ok {
@@ -253,7 +303,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 			}
 			items = append(items, item)
 		}
-		view["recipients"] = items
+		view["recipients"], view["recoveryRecipients"] = items, recoveryRecipients
 	}
 	checks, err := s.keystoreChecksFor(ctx, s.db, tenant)
 	if err != nil {
@@ -363,36 +413,21 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusServiceUnavailable, "MACHINE_REGISTRY_UNAVAILABLE", "Machine registry cannot be read")
 		return
 	}
-	unknown := []string{}
-	for _, box := range upload.Boxes {
-		if _, ok := registry.signerByRecipient(box.RecipientSHA256); !ok {
-			unknown = append(unknown, box.RecipientSHA256)
-		}
-	}
-	if len(unknown) > 0 {
-		problem(c, http.StatusUnprocessableEntity, "BUILD_KEYSTORE_RECIPIENT_UNKNOWN",
-			"These recipients are not the accepted key of any registered signer that is not revoked: "+strings.Join(unknown, ", ")+
-				"。离线工具只应加密给 pin 文件里、并已在控制台接受公钥的签名闸")
-		return
-	}
-	if s.secrets == nil {
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Storage master key is unavailable")
-		return
-	}
-	uploadJSON, err := json.Marshal(upload)
+	recoveryKeys, err := readRecoveryKeys(ctx, s.db, false)
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to serialise the keystore file")
+		problem(c, http.StatusServiceUnavailable, "RECOVERY_KEYS_UNAVAILABLE", "Recovery keys cannot be read")
 		return
 	}
-	encrypted, err := s.secrets.Encrypt(string(uploadJSON), buildKeystoreAAD(tenantID(c)))
+	// 离线导入不强制带恢复收件人（离线原件本身就是备份）；带了就必须是登记过、未吊销的恢复公钥
+	if unknown, _ := classifyKeystoreRecipients(upload, registry, recoveryKeys.Doc); len(unknown) > 0 {
+		problem(c, http.StatusUnprocessableEntity, "BUILD_KEYSTORE_RECIPIENT_UNKNOWN", unknownRecipientsDetail(unknown))
+		return
+	}
+	record, err := s.sealKeystoreRecord(tenantID(c), upload)
 	if err != nil {
+		slog.Error("cannot protect an uploaded keystore", "tenant", tenantID(c), "error", err)
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to protect the keystore file")
 		return
-	}
-	record := buildKeystoreRecord{
-		Format: buildKeystoreRecordFormat, Sealed: base64.StdEncoding.EncodeToString(encrypted),
-		KeyAlias: upload.KeyAlias, CertificateSHA256: upload.CertificateSHA256, PackageName: upload.PackageName,
-		TenantSlug: upload.TenantSlug, Recipients: uploadRecipients(upload),
 	}
 	value, _ := json.Marshal(record)
 
@@ -469,6 +504,76 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 	}
 	view["releaseIdentityVersion"] = releaseVersion + 1
 	c.JSON(http.StatusOK, view)
+}
+
+// classifyKeystoreRecipients 把上传文件的收件人分成三类：已登记、未吊销签名闸已接受的 X25519 公钥；
+// 登记过、未吊销的恢复公钥（返回个数）；都不是（返回列表）。
+func classifyKeystoreRecipients(upload keystorebox.Upload, registry buildMachinesDoc, recoveryKeys recoveryKeysDoc) (unknown []string, recoveryRecipients int) {
+	unknown = []string{}
+	for _, box := range upload.Boxes {
+		if _, ok := registry.signerByRecipient(box.RecipientSHA256); ok {
+			continue
+		}
+		if _, ok := recoveryKeys.liveBySHA256(box.RecipientSHA256); ok {
+			recoveryRecipients++
+			continue
+		}
+		unknown = append(unknown, box.RecipientSHA256)
+	}
+	return unknown, recoveryRecipients
+}
+
+func unknownRecipientsDetail(unknown []string) string {
+	return "These recipients are neither the accepted key of a registered signer that is not revoked nor a registered recovery key that is not revoked: " +
+		strings.Join(unknown, ", ") + "。密钥只应加密给已在控制台接受公钥的签名闸与登记过的恢复公钥"
+}
+
+// sealKeystoreRecord 用 STORAGE_MASTER_KEY 在上传文件外面包一层，连同索引字段拼成 build.keystore 记录。
+func (s *server) sealKeystoreRecord(tenant string, upload keystorebox.Upload) (buildKeystoreRecord, error) {
+	if s.secrets == nil {
+		return buildKeystoreRecord{}, errors.New("storage master key is unavailable")
+	}
+	uploadJSON, err := json.Marshal(upload)
+	if err != nil {
+		return buildKeystoreRecord{}, err
+	}
+	encrypted, err := s.secrets.Encrypt(string(uploadJSON), buildKeystoreAAD(tenant))
+	if err != nil {
+		return buildKeystoreRecord{}, err
+	}
+	return buildKeystoreRecord{
+		Format: buildKeystoreRecordFormat, Sealed: base64.StdEncoding.EncodeToString(encrypted),
+		KeyAlias: upload.KeyAlias, CertificateSHA256: upload.CertificateSHA256, PackageName: upload.PackageName,
+		TenantSlug: upload.TenantSlug, Recipients: uploadRecipients(upload),
+	}, nil
+}
+
+// exportBuildKeystore GET /v1/admin/build-keystore/export：下载当前密钥的上传文件（纯密文，服务端与
+// 租户管理员都打不开），给离线工具 build-keystore recover 用恢复私钥解开。写审计。
+func (s *server) exportBuildKeystore(c *gin.Context) {
+	ctx := c.Request.Context()
+	state, err := s.buildKeystoreStateFor(ctx, s.db, tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
+		return
+	}
+	if !state.configured() {
+		problem(c, http.StatusNotFound, "BUILD_KEYSTORE_NOT_CONFIGURED", "This tenant has no usable v3 signing keystore to export")
+		return
+	}
+	raw, err := json.MarshalIndent(state.Upload, "", "  ")
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Unable to serialise the keystore file")
+		return
+	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "build_keystore_exported", "app-config", buildKeystoreConfigKey,
+		"the sealed keystore file was exported for offline recovery", requestID(c),
+		map[string]any{"keystoreVersion": state.Version, "keyAlias": state.Record.KeyAlias, "certificateSha256": state.Record.CertificateSHA256,
+			"packageName": state.Record.PackageName, "recipients": state.Record.Recipients}))
+	fileName := fmt.Sprintf("%s-keystore-v%d.json", strings.ToLower(state.Record.TenantSlug), state.Version)
+	c.Header("Content-Disposition", `attachment; filename="`+fileName+`"`)
+	c.Header("Cache-Control", "no-store")
+	c.Data(http.StatusOK, "application/json", append(raw, '\n'))
 }
 
 // parseKeystoreUpload 严格解析上传文件。非 v3（包括 v3 文件里夹着别的版本的密文）→ 422

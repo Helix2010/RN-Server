@@ -473,7 +473,7 @@ func TestDBSignerLocalRoleIsRecordedAndChecked(t *testing.T) {
 		t.Fatalf("view of an unreported local role: %v", view)
 	}
 	// 本机仍是备
-	if r := report(map[string]any{"localRole": "standby", "items": []any{item}}); r.Code != http.StatusNoContent {
+	if r := report(map[string]any{"localRole": "standby", "trust": f.localTrust(), "items": []any{item}}); r.Code != http.StatusNoContent {
 		t.Fatalf("report standby: %d %s", r.Code, r.Body.String())
 	}
 	if got := codes(); strings.Join(got, ",") != readinessPrimaryLocalRole {
@@ -494,7 +494,7 @@ func TestDBSignerLocalRoleIsRecordedAndChecked(t *testing.T) {
 	// 同一个值再报不写库
 	version := registryVersion(t, f)
 	for i := 0; i < 3; i++ {
-		if r := report(map[string]any{"localRole": "standby", "items": []any{item}}); r.Code != http.StatusNoContent {
+		if r := report(map[string]any{"localRole": "standby", "trust": f.localTrust(), "items": []any{item}}); r.Code != http.StatusNoContent {
 			t.Fatalf("repeat report: %d %s", r.Code, r.Body.String())
 		}
 	}
@@ -502,7 +502,7 @@ func TestDBSignerLocalRoleIsRecordedAndChecked(t *testing.T) {
 		t.Fatalf("an unchanged local role bumped the registry version %d -> %d", version, after)
 	}
 	// 本机 promote 之后是主：就绪
-	if r := report(map[string]any{"localRole": "primary", "items": []any{item}}); r.Code != http.StatusNoContent {
+	if r := report(map[string]any{"localRole": "primary", "trust": f.localTrust(), "items": []any{item}}); r.Code != http.StatusNoContent {
 		t.Fatalf("report primary: %d %s", r.Code, r.Body.String())
 	}
 	if after := registryVersion(t, f); after != version+1 {

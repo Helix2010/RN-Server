@@ -87,6 +87,13 @@ func (e *missingIdentity) Error() string {
 
 // tenantManifestFor 合成这次构建要用的 tenant.json。
 func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg buildConfig, version string, buildNumber int) (tenantManifest, error) {
+	return s.composeTenantManifest(ctx, tenant, cfg, version, buildNumber, "")
+}
+
+// composeTenantManifest 是 tenantManifestFor 的实现。firstKeyPackage 非空、且租户还没有 release.android 时，
+// 按"第一次在签名闸上生成签名密钥"合成：包名取生成请求里的，签名证书指纹此时还不存在，留空。
+// 只有算包内信任根会这么调（信任根不含包名与证书指纹）；这份清单不会下发给构建机。
+func (s *server) composeTenantManifest(ctx context.Context, tenant string, cfg buildConfig, version string, buildNumber int, firstKeyPackage string) (tenantManifest, error) {
 	var missing []string
 	add := func(field, hint string) { missing = append(missing, field+"（"+hint+"）") }
 
@@ -121,10 +128,14 @@ func (s *server) tenantManifestFor(ctx context.Context, tenant string, cfg build
 	if err != nil {
 		return tenantManifest{}, err
 	}
+	firstKey := release == nil && firstKeyPackage != ""
+	if firstKey {
+		release = &androidReleaseIdentityRecord{Value: androidReleaseIdentity{PackageName: firstKeyPackage}}
+	}
 	if release == nil || strings.TrimSpace(release.Value.PackageName) == "" {
 		add("androidPackage", "Android 打包与签名 → 正式包身份")
 	}
-	if release == nil || strings.TrimSpace(release.Value.SignerSHA256) == "" {
+	if !firstKey && (release == nil || strings.TrimSpace(release.Value.SignerSHA256) == "") {
 		add("signerSha256", "Android 打包与签名 → 签名密钥")
 	}
 

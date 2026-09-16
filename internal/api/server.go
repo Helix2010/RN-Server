@@ -58,6 +58,10 @@ type server struct {
 	machines machineRegistryCache
 	// signCompleteFault 是签名完成事务的故障注入点，只给测试用；生产为 nil
 	signCompleteFault func(point string) error
+	// machineSetup 是 machine-setup 接口按来源 IP 的限速计数，零值可用
+	machineSetup machineSetupLimiter
+	// machineBundleDir 是安装包目录；空 = defaultMachineBundleDir。只有测试会设
+	machineBundleDir string
 }
 
 type attempt struct {
@@ -209,6 +213,12 @@ func (s *server) routes() *gin.Engine {
 	platform.POST("/machines/:id/revoke", s.revokeMachine)
 	platform.POST("/machines/:id/accept-key", s.acceptMachineKey)
 	platform.POST("/machines/:id/signer-role", s.setSignerRole)
+	// 重发注册码（旧码作废），只对还没注册的机器
+	platform.POST("/machines/:id/enrollment", s.reissueEnrollment)
+	// 平台离线恢复公钥（build.recovery.recipients）：签名闸生成的密钥都要加密给它，签名闸本机另外 pin
+	platform.GET("/recovery-keys", s.listRecoveryKeys)
+	platform.POST("/recovery-keys", s.createRecoveryKey)
+	platform.POST("/recovery-keys/:id/revoke", s.revokeRecoveryKey)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
@@ -226,6 +236,13 @@ func (s *server) routes() *gin.Engine {
 	platform.GET("/wallet/blocks", s.listPlatformWalletBlocks)
 	platform.POST("/wallet/blocks", s.createPlatformWalletBlock)
 	platform.POST("/wallet/blocks/:id/revoke", s.revokePlatformWalletBlock)
+	// 新机器本机注册：不走机器令牌（此时还没有），靠控制台签发的一次性注册码；按来源 IP 限速。
+	// 安装包下载是流式的，按路由精确豁免数据库超时（exemptRouteFromDatabaseTimeout）
+	setup := r.Group("/v1/machine-setup")
+	setup.GET("/install.sh", s.machineInstallScript)
+	setup.POST("/describe", throttleMachineSetup("describe", &s.machineSetup.describe), s.describeEnrollment)
+	setup.GET("/bundle/:archive", throttleMachineSetup("bundle", &s.machineSetup.bundle), s.downloadMachineBundle)
+	setup.POST("/enroll", throttleMachineSetup("enroll", &s.machineSetup.enroll), s.enrollMachine)
 	// 构建机通道：本机令牌（x-machine-token），与管理端完全分开，也不按域名解析租户——
 	// 任务里带着租户，构建机本来就跨租户工作。构建机执行第三方代码，拿不到任何签名密钥；
 	// 每个上报都带认领编号 x-build-attempt（见 build_agent.go）。
@@ -260,6 +277,11 @@ func (s *server) routes() *gin.Engine {
 	gate.Use(s.machineAuth(machineRoleSigner, false))
 	gate.GET("/keystore-checks", s.signerKeystoreChecks)
 	gate.POST("/keystore-checks", s.reportSignerKeystoreChecks)
+	// 本机命令（trust-peer、trust-builder --builder、trust-recovery）取公钥显示用，签名闸不采信
+	gate.GET("/peers", s.signerPeers)
+	// 主签名闸交回生成的签名密钥，或报告这次生成做不了
+	gate.POST("/keystore-generations/:requestId", s.completeKeystoreGeneration)
+	gate.POST("/keystore-generations/:requestId/fail", s.failKeystoreGeneration)
 	gate.POST("/claim", s.claimSigningJob)
 	gate.POST("/jobs/:id/heartbeat", s.signingHeartbeat)
 	gate.GET("/jobs/:id/unsigned/download", s.signerJobScope(s.downloadUnsignedForSigning))
@@ -371,7 +393,12 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.DELETE("/push/credentials/fcm", s.deletePushCredentialsFCM)
 	group.POST("/push/credentials/fcm/test", s.testPushCredentialsFCM)
 	group.GET("/build-keystore", s.getBuildKeystore)
+	// 导入已有密钥（离线工具产出的 v3 文件，高级）
 	group.PUT("/build-keystore", s.saveBuildKeystore)
+	// 一键生成：记一条生成请求，由主签名闸在本机生成后交回
+	group.POST("/build-keystore/generate", s.generateBuildKeystore)
+	// 导出当前密钥的密文文件（离线恢复用）
+	group.GET("/build-keystore/export", s.exportBuildKeystore)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
@@ -423,19 +450,22 @@ func (s *server) databaseTimeout() gin.HandlerFunc {
 	}
 }
 
-// exemptRouteFromDatabaseTimeout 按**已匹配的路由**精确豁免两条不以 /upload、/download 结尾、
-// 却要等对象存储的接口，不放宽上面的后缀规则：
+// exemptRouteFromDatabaseTimeout 按**已匹配的路由**精确豁免几条不以 /upload、/download 结尾、
+// 却要等对象存储或长时间写流的接口，不放宽上面的后缀规则：
 //
 //   - PUT /v1/build-agent/jobs/:id/ota-artifact：构建机经服务端代理上传热更新包（十几 MB），
 //     一直被 10 秒的数据库超时截断；
 //   - POST /v1/signer/jobs/:id/complete：服务端要从对象存储整份取回已签名包、解析与验签之后
-//     才开事务落发布记录，大包在 10 秒内做不完。
+//     才开事务落发布记录，大包在 10 秒内做不完；
+//   - GET /v1/machine-setup/bundle/:archive：新机器下载安装包（几十 MB 的二进制），慢链路上 10 秒
+//     写不完。处理函数查登记那一步自己带超时。
 //
-// 用 c.FullPath()（路由模板）而不是 URL 后缀：只有这两条路由本身被豁免，路径参数里塞什么都不影响。
+// 用 c.FullPath()（路由模板）而不是 URL 后缀：只有这几条路由本身被豁免，路径参数里塞什么都不影响。
 func exemptRouteFromDatabaseTimeout(c *gin.Context) bool {
 	route := c.FullPath()
 	return (c.Request.Method == http.MethodPut && route == "/v1/build-agent/jobs/:id/ota-artifact") ||
-		(c.Request.Method == http.MethodPost && route == "/v1/signer/jobs/:id/complete")
+		(c.Request.Method == http.MethodPost && route == "/v1/signer/jobs/:id/complete") ||
+		(c.Request.Method == http.MethodGet && route == "/v1/machine-setup/bundle/:archive")
 }
 
 // readsTokenChain 识别要去链上读元数据的三个代币接口。它们跟 /release-storage/test

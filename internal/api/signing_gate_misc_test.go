@@ -158,7 +158,6 @@ func TestOTAAdminUploadRoutesAreGone(t *testing.T) {
 		{http.MethodPut, "/v1/admin/ota/artifacts/upload"},
 		{http.MethodDelete, "/v1/admin/ota/artifacts/upload"},
 		{http.MethodPost, "/v1/admin/ota/releases"},
-		{http.MethodPost, "/v1/admin/build-keystore/generate"},
 		{http.MethodGet, "/v1/admin/platform/build-agent/public-key"},
 		{http.MethodPost, "/v1/admin/platform/build-agent/public-key/accept"},
 		{http.MethodGet, "/v1/build-agent/keystore-checks"},
@@ -186,9 +185,9 @@ func TestOTAAdminUploadRoutesAreGone(t *testing.T) {
 	}
 }
 
-// 数据库超时豁免按路由模板精确匹配：热更新包代理上传与签名闸完成不挂 10 秒超时，
+// 数据库超时豁免按路由模板精确匹配：热更新包代理上传、签名闸完成与新机器下载安装包不挂 10 秒超时，
 // 同前缀的别的接口照挂；把路径参数写成 /upload 也骗不过去。
-func TestDatabaseTimeoutExemptsExactlyTwoLongRoutes(t *testing.T) {
+func TestDatabaseTimeoutExemptsExactlyTheLongRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	s := &server{cfg: config.Config{MySQLQueryTimeout: 10}}
 	router := gin.New()
@@ -207,6 +206,9 @@ func TestDatabaseTimeoutExemptsExactlyTwoLongRoutes(t *testing.T) {
 	router.PUT("/v1/signer/jobs/:id/signed/upload", deadline)
 	router.GET("/v1/signer/jobs/:id/unsigned/download", deadline)
 	router.POST("/v1/build-agent/jobs/:id/complete", deadline)
+	router.GET("/v1/machine-setup/bundle/:archive", deadline)
+	router.POST("/v1/machine-setup/describe", deadline)
+	router.POST("/v1/machine-setup/enroll", deadline)
 	for _, tc := range []struct {
 		method, path, want string
 	}{
@@ -217,6 +219,9 @@ func TestDatabaseTimeoutExemptsExactlyTwoLongRoutes(t *testing.T) {
 		{http.MethodPost, "/v1/build-agent/jobs/bld_1/ota-release", "deadline"},
 		{http.MethodPost, "/v1/signer/jobs/bld_1/heartbeat", "deadline"},
 		{http.MethodPost, "/v1/build-agent/jobs/bld_1/complete", "deadline"},
+		{http.MethodGet, "/v1/machine-setup/bundle/signer.tar.gz", "none"},
+		{http.MethodPost, "/v1/machine-setup/describe", "deadline"},
+		{http.MethodPost, "/v1/machine-setup/enroll", "deadline"},
 	} {
 		recorder := httptest.NewRecorder()
 		router.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, nil))

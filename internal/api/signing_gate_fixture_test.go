@@ -27,6 +27,7 @@ import (
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/Helix2010/RN-Server/signing/provenance"
+	"github.com/Helix2010/RN-Server/signing/recovery"
 	"github.com/gin-gonic/gin"
 )
 
@@ -126,7 +127,7 @@ func newGateFixture(t *testing.T, seed int) *gateFixture {
 		},
 	}
 	// 机器登记是平台级单行、任务队列跨租户：每个用例从干净的全局状态开始
-	if _, err := db.Exec(`DELETE FROM app_configs WHERE tenant_id=0 AND config_key=?`, buildMachinesConfigKey); err != nil {
+	if _, err := db.Exec(`DELETE FROM app_configs WHERE tenant_id=0 AND config_key IN (?,?)`, buildMachinesConfigKey, buildRecoveryRecipientsConfigKey); err != nil {
 		t.Fatal(err)
 	}
 	f := &gateFixture{t: t, s: s, db: db, store: store, tenant: testTenant(seed)}
@@ -256,9 +257,22 @@ func (f *gateFixture) reportCheck(machine gateMachine, confirmed bool, trialSign
 	if confirmed {
 		item["confirmedTrustRootsDigest"] = digest
 	}
-	recorder := f.do(http.MethodPost, "/v1/signer/keystore-checks", machine.Token, nil, map[string]any{"localRole": f.localRoleOf(machine), "items": []any{item}})
+	recorder := f.do(http.MethodPost, "/v1/signer/keystore-checks", machine.Token, nil, map[string]any{"localRole": f.localRoleOf(machine), "trust": f.localTrust(), "items": []any{item}})
 	if recorder.Code != http.StatusNoContent {
 		f.t.Fatalf("report check: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// localTrust 是签名闸上报的本机信任列表：夹具里两台签名闸互相信任、信任构建机，还没有恢复公钥。
+// 每次返回同一份，上报它不改变登记。
+func (f *gateFixture) localTrust() map[string]any {
+	signer := func(m gateMachine) map[string]any {
+		return map[string]any{"name": m.Name, "x25519Sha256": m.recipient(), "ed25519Sha256": fingerprint.SHA256Hex(m.ed25519Public())}
+	}
+	return map[string]any{
+		"signers":      []any{signer(f.primary), signer(f.standby)},
+		"builders":     []any{map[string]any{"builderId": f.builder.ID, "ed25519Sha256": fingerprint.SHA256Hex(f.builder.ed25519Public())}},
+		"recoveryKeys": []string{},
 	}
 }
 
@@ -503,4 +517,95 @@ func seedBuildIdentityWith(t *testing.T, db *sql.DB, tenant, slug, packageName, 
 	})
 	put(bootstrapSigningConfigKey, bootstrapSigningKey{KeyID: "main", PrivateKey: "unused-in-this-path", Address: "0x9269Ca361b9F0427ac883e89cD5B5fe113BBAD17"})
 	put(releaseAndroidIdentityConfigKey, androidReleaseIdentity{PackageName: packageName, SignerSHA256: signer})
+}
+
+// ---- 自动化（ADR-0020）：恢复公钥、注册码、生成请求 ----
+
+// gateRecoveryKey 是测试里现场生成的一把离线恢复密钥。
+type gateRecoveryKey struct {
+	ID      string
+	Private *ecdh.PrivateKey
+	SHA256  string
+}
+
+// registerRecoveryKey 以平台管理员身份登记一把新的恢复公钥。
+func (f *gateFixture) registerRecoveryKey(name string) gateRecoveryKey {
+	f.t.Helper()
+	private, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	file, err := recovery.NewPublic(name, private.PublicKey().Bytes(), time.Now().UTC())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	snapshot, err := readRecoveryKeys(context.Background(), f.db, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	r := f.adminDo(http.MethodPost, "/v1/admin/platform/recovery-keys", map[string]any{
+		"publicFile": file, "expectedVersion": snapshot.Version, "reason": "register the offline recovery key", "confirm": true,
+	})
+	if r.Code != http.StatusCreated {
+		f.t.Fatalf("register recovery key: %d %s", r.Code, r.Body.String())
+	}
+	item := decodeBody(f.t, r)["item"].(map[string]any)
+	return gateRecoveryKey{ID: item["id"].(string), Private: private, SHA256: file.X25519PublicKeySHA256}
+}
+
+// createMachine 在控制台新建一台机器，返回机器 id 与注册码。
+func (f *gateFixture) createMachine(role, name string, signerRole any) (string, string) {
+	f.t.Helper()
+	r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", map[string]any{
+		"role": role, "name": name, "signerRole": signerRole, "expectedVersion": registryVersion(f.t, f), "reason": "add a machine", "confirm": true,
+	})
+	if r.Code != http.StatusCreated {
+		f.t.Fatalf("create machine: %d %s", r.Code, r.Body.String())
+	}
+	body := decodeBody(f.t, r)
+	return body["machine"].(map[string]any)["id"].(string), body["enrollment"].(map[string]any)["code"].(string)
+}
+
+// enroll 以新机器身份调 POST /v1/machine-setup/enroll。构建机 x25519 传 nil。
+func (f *gateFixture) enroll(code string, x25519, ed25519Public []byte) *httptest.ResponseRecorder {
+	f.t.Helper()
+	body := map[string]any{"code": code, "x25519PublicKey": nil, "ed25519PublicKey": base64.StdEncoding.EncodeToString(ed25519Public)}
+	if x25519 != nil {
+		body["x25519PublicKey"] = base64.StdEncoding.EncodeToString(x25519)
+	}
+	return f.do(http.MethodPost, "/v1/machine-setup/enroll", "", nil, body)
+}
+
+// enrolledToken 注册并返回长期令牌。
+func (f *gateFixture) enrolledToken(code string, machine gateMachine) string {
+	f.t.Helper()
+	var x25519 []byte
+	if machine.X25519 != nil {
+		x25519 = machine.X25519.PublicKey().Bytes()
+	}
+	r := f.enroll(code, x25519, machine.ed25519Public())
+	if r.Code != http.StatusOK {
+		f.t.Fatalf("enroll: %d %s", r.Code, r.Body.String())
+	}
+	return decodeBody(f.t, r)["token"].(string)
+}
+
+// putGenerationRequest 直接写这个租户的生成请求（版本取当前的，不会被判成过期）。
+func (f *gateFixture) putGenerationRequest(status string, failure *keystoreGenerationError) keystoreGenerationRequest {
+	f.t.Helper()
+	keystoreVersion, identityVersion := f.keystoreVersions()
+	request := keystoreGenerationRequest{
+		RequestID: generationRequestIDPrefix + "_" + randomID(16), PackageName: f.packageName, Alias: defaultGenerationAlias(f.slug),
+		RequestedBy: "tester@example.com", RequestedAt: iso(time.Now().UTC()), KeystoreVersion: keystoreVersion, ReleaseIdentityVersion: identityVersion,
+		Status: status, Error: failure,
+	}
+	if status != generationPending {
+		request.CompletedAt = optString(iso(time.Now().UTC()))
+	}
+	raw, _ := json.Marshal(request)
+	if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,'tester',UTC_TIMESTAMP(3))
+		ON DUPLICATE KEY UPDATE config_value=VALUES(config_value),version=version+1`, f.tenant, buildKeystoreRequestConfigKey, raw); err != nil {
+		f.t.Fatal(err)
+	}
+	return request
 }

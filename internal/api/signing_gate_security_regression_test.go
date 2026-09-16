@@ -196,18 +196,12 @@ func TestDBManualUploadRequiresTheKeystoreCertificate(t *testing.T) {
 // 按真机抄来的指纹接受会发现对不上。
 func TestDBSignerKeysCannotBeAcceptedWithoutTheEd25519Fingerprint(t *testing.T) {
 	f := newGateFixture(t, 114)
-	created := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", map[string]any{
-		"role": "signer", "name": "signer-c-" + uniqueSuffix(), "signerRole": "standby",
-		"expectedVersion": registryVersion(t, f), "reason": "new standby", "confirm": true,
-	})
-	if created.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", created.Code, created.Body.String())
-	}
-	body := decodeBody(t, created)
-	token := body["token"].(string)
-	id := body["machine"].(map[string]any)["id"].(string)
+	f.registerRecoveryKey("platform-recovery")
+	id, code := f.createMachine(machineRoleSigner, "signer-c-"+uniqueSuffix(), signerRoleStandby)
 	real := newGateMachine(t, machineRoleSigner, "real")
 	thief := newGateMachine(t, machineRoleSigner, "thief")
+	// 真机用注册码注册，挂上自己的两把公钥；之后令牌被偷
+	token := f.enrolledToken(code, real)
 	report := func(x, ed []byte) int {
 		return f.do(http.MethodPost, "/v1/signer/public-key", token, nil, map[string]any{
 			"x25519PublicKey": base64.StdEncoding.EncodeToString(x), "ed25519PublicKey": base64.StdEncoding.EncodeToString(ed), "rotationSignature": nil,

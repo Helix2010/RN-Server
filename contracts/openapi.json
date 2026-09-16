@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.22"
+    "version": "2026.09.23"
   },
   "paths": {
     "/v1/mobile/referral/me": {
@@ -3176,7 +3176,7 @@
     "/v1/admin/build-keystore": {
       "get": {
         "summary": "Android signing keystore status (metadata only)",
-        "description": "Keystore status for this tenant (BuildKeystoreView). Never returns ciphertext. Lists which registered signers the keystore is sealed to, active signers it is missing, each signer's check (decrypt, local confirmation with trust roots digest, trial signing) for the current keystore version, whether the primary signer is ready, and the trust roots the server composed. legacy=true means the stored row is a retired passphrase or build-agent box: it is not usable and must be replaced by a v3 upload.",
+        "description": "Keystore status for this tenant (BuildKeystoreView). Never returns ciphertext. Lists which registered signers the keystore is sealed to, active signers it is missing, each signer's check (decrypt, local confirmation with trust roots digest, trial signing) for the current keystore version, whether the primary signer is ready, and the trust roots the server composed. legacy=true means the stored row is a retired passphrase or build-agent box: it is not usable and must be replaced by a v3 upload. Also carries the latest key generation request, the generator of the current key (null when imported) and which recipients are recovery keys.",
         "responses": {
           "200": {
             "description": "BuildKeystoreView",
@@ -3197,8 +3197,8 @@
         }
       },
       "put": {
-        "summary": "Upload the v3 Android signing keystore produced by the offline tool",
-        "description": "Accepts only rn-android-keystore-upload/v3 files from the offline build-keystore tool (v3 boxes sealed to signer X25519 keys). The server cannot open them; it checks the shape, that the file is for this tenant, that packageName and signerSha256 equal the file, that the certificate is not retired, and that every box is addressed to the accepted key of a registered signer that is not revoked (an extra box for anyone else is refused; a missing signer is only reported in missingSigners). The file is wrapped with the storage master key and stored together with release.android in one transaction (ADR-0016), each with its own optimistic lock.",
+        "summary": "Import an existing signing keystore (advanced)",
+        "description": "Accepts only rn-android-keystore-upload/v3 files from the offline build-keystore tool (v3 boxes sealed to signer X25519 keys). The server cannot open them; it checks the shape, that the file is for this tenant, that packageName and signerSha256 equal the file, that the certificate is not retired, and that every box is addressed to the accepted key of a registered signer that is not revoked (an extra box for anyone else is refused; a missing signer is only reported in missingSigners). The file is wrapped with the storage master key and stored together with release.android in one transaction (ADR-0016), each with its own optimistic lock. Recipients may be accepted keys of unrevoked signers or registered, unrevoked recovery keys; imports do not require a recovery recipient.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3230,13 +3230,94 @@
             "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY"
           },
           "422": {
-            "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED (not v3, including v1/v2 bodies), BUILD_KEYSTORE_RECIPIENT_UNKNOWN, BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH, RELEASE_SIGNER_RETIRED"
+            "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED (not v3, including v1/v2 bodies), BUILD_KEYSTORE_RECIPIENT_UNKNOWN (neither an unrevoked signer's accepted key nor an unrevoked recovery key), BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH, RELEASE_SIGNER_RETIRED"
           },
           "500": {
             "description": "BUILD_KEYSTORE_SAVE_FAILED, RELEASE_IDENTITY_SAVE_FAILED"
           },
           "503": {
-            "description": "MACHINE_REGISTRY_UNAVAILABLE"
+            "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/admin/build-keystore/generate": {
+      "post": {
+        "summary": "Generate a new signing key on the primary signer",
+        "description": "Records a key generation request (tenant app_configs build.keystore.request, audited as build_keystore_generation_request) for the primary signer to pick up; the key is generated, sealed and signed on the signer and delivered through POST /v1/signer/keystore-generations/{requestId}. packageName must be the tenant's Android package (release.android) when one is registered; a tenant without release.android generates for the given package and gets release.android written on delivery. The key alias is <slug lowercased>-release. Replacing an existing key changes the certificate: installed apps cannot upgrade. Progress: generationRequest in GET /v1/admin/build-keystore.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeystoreGenerationCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Requested",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "generationRequest"
+                  ],
+                  "properties": {
+                    "generationRequest": {
+                      "$ref": "#/components/schemas/GenerationRequestView"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_BUILD_KEYSTORE_GENERATION"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is not stale), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing)"
+          },
+          "422": {
+            "description": "KEYSTORE_PACKAGE_MISMATCH"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_GENERATION_FAILED, RELEASE_IDENTITY_CONFIG_INVALID"
+          },
+          "503": {
+            "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/admin/build-keystore/export": {
+      "get": {
+        "summary": "Export the sealed keystore file for offline recovery",
+        "description": "The current upload file (KeystoreUpload, ciphertext only: nobody but the recipient signers and recovery key holders can open it) as a JSON attachment, for build-keystore recover. Audited as build_keystore_exported.",
+        "responses": {
+          "200": {
+            "description": "Attachment <slug>-keystore-v<version>.json",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeystoreUpload"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "BUILD_KEYSTORE_NOT_CONFIGURED (no usable v3 keystore)"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_CONFIG_INVALID"
           }
         }
       }
@@ -3869,8 +3950,8 @@
         }
       },
       "post": {
-        "summary": "Create a builder or signer and issue its token",
-        "description": "The token (rnm_…) appears only in this response; it is never written to the audit log or any other response, and only its sha256 is stored. Lost tokens are replaced by revoking and creating a new machine. The new machine is pending_key until it reports its public key and a platform administrator accepts it. At most one signer that is not revoked can be primary.",
+        "summary": "Create a builder or signer and issue its one-time enrollment code",
+        "description": "No long-lived token is returned any more (the token field is gone): the response carries a one-time enrollment code and the install command. The machine enrolls itself on the box (POST /v1/machine-setup/enroll), receives its token straight into its env file, and becomes pending_key; a platform administrator then accepts its key. The code is never written to the audit log or any other response. A signer can only be created once the platform has an unrevoked offline recovery key (409 RECOVERY_KEY_NOT_CONFIGURED). At most one signer that is not revoked can be primary.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3891,18 +3972,20 @@
           "403": {
             "description": "Not a platform administrator"
           },
-          "404": {
-            "description": "MACHINE_NOT_FOUND"
-          },
           "409": {
-            "description": "MACHINES_VERSION_CONFLICT, MACHINE_NAME_TAKEN (another machine that is not revoked uses the name), SIGNER_PRIMARY_EXISTS, MACHINE_LIMIT_REACHED"
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_NAME_TAKEN (another machine that is not revoked uses the name), SIGNER_PRIMARY_EXISTS, MACHINE_LIMIT_REACHED, RECOVERY_KEY_NOT_CONFIGURED (role=signer and no unrevoked recovery key is registered)"
           },
           "201": {
-            "description": "Created",
+            "description": "Created (status pending_enrollment)",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
+                  "required": [
+                    "version",
+                    "machine",
+                    "enrollment"
+                  ],
                   "properties": {
                     "version": {
                       "type": "integer"
@@ -3910,13 +3993,16 @@
                     "machine": {
                       "$ref": "#/components/schemas/MachineView"
                     },
-                    "token": {
-                      "type": "string"
+                    "enrollment": {
+                      "$ref": "#/components/schemas/MachineEnrollment"
                     }
                   }
                 }
               }
             }
+          },
+          "500": {
+            "description": "MACHINE_SAVE_FAILED, MACHINE_REGISTRY_INVALID, RECOVERY_KEYS_INVALID"
           }
         }
       }
@@ -3980,7 +4066,7 @@
     "/v1/admin/platform/machines/{id}/accept-key": {
       "post": {
         "summary": "Accept the public key a machine reported",
-        "description": "publicKeySha256 must equal the pending key (full 64-hex sha256 read on the machine). The machine becomes active; for a rotation the old key stays valid until this call.",
+        "description": "The console fills publicKeySha256 and ed25519PublicKeySha256 from the machine view (pendingPublicKeySha256 / pendingEd25519PublicKeySha256) after showing them; the request body is unchanged. publicKeySha256 must equal the pending key (full 64-hex sha256 read on the machine). The machine becomes active; for a rotation the old key stays valid until this call.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineId"
@@ -4088,6 +4174,383 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/machines/{id}/enrollment": {
+      "post": {
+        "summary": "Reissue a machine's enrollment code",
+        "description": "Issues a new one-time code (60 minutes) and invalidates the previous one at once. Only for machines still pending_enrollment. Audited as build_machine_enrollment_reissue without the code.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineRevoke"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reissued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "machine",
+                    "enrollment"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "machine": {
+                      "$ref": "#/components/schemas/MachineView"
+                    },
+                    "enrollment": {
+                      "$ref": "#/components/schemas/MachineEnrollment"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_MACHINE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "404": {
+            "description": "MACHINE_NOT_FOUND"
+          },
+          "409": {
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_ALREADY_ENROLLED (pending_key or active), MACHINE_REVOKED"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/recovery-keys": {
+      "get": {
+        "summary": "List the platform's offline recovery public keys",
+        "description": "app_configs platform key build.recovery.recipients. Signers do not trust this list: each pins the recovery key sha256 the operator pastes from the password manager.",
+        "responses": {
+          "200": {
+            "description": "Recovery keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "items"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RecoveryKeyView"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "RECOVERY_KEYS_INVALID"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          }
+        }
+      },
+      "post": {
+        "summary": "Register an offline recovery public key",
+        "description": "Paste recovery-public.json. Parsed strictly (sha256 must match the key). Audited as build_recovery_key_create. At most 16 keys including revoked ones.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryKeyCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "item"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "item": {
+                      "$ref": "#/components/schemas/RecoveryKeyView"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_RECOVERY_KEY"
+          },
+          "409": {
+            "description": "RECOVERY_KEYS_VERSION_CONFLICT, RECOVERY_KEY_EXISTS (same sha256 registered before, revoked or not), RECOVERY_KEY_LIMIT_REACHED"
+          },
+          "422": {
+            "description": "RECOVERY_KEY_INVALID"
+          },
+          "500": {
+            "description": "RECOVERY_KEYS_INVALID, RECOVERY_KEY_SAVE_FAILED"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/recovery-keys/{id}/revoke": {
+      "post": {
+        "summary": "Revoke an offline recovery public key",
+        "description": "A revoked key no longer satisfies the recovery-recipient requirement of generated keys and is no longer listed to signers or new machines. Existing ciphertext sealed to it is unchanged. Audited as build_recovery_key_revoke.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RecoveryKeyId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineRevoke"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "item"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "item": {
+                      "$ref": "#/components/schemas/RecoveryKeyView"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_RECOVERY_KEY"
+          },
+          "404": {
+            "description": "RECOVERY_KEY_NOT_FOUND"
+          },
+          "409": {
+            "description": "RECOVERY_KEYS_VERSION_CONFLICT, RECOVERY_KEY_ALREADY_REVOKED"
+          },
+          "500": {
+            "description": "RECOVERY_KEYS_INVALID, RECOVERY_KEY_SAVE_FAILED"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          }
+        }
+      }
+    },
+    "/v1/machine-setup/install.sh": {
+      "get": {
+        "summary": "The machine installation script",
+        "description": "The install.sh embedded in the server binary (internal/machinesetup). Run as root on the new machine: curl -fsSL <origin>/v1/machine-setup/install.sh | sudo bash -s -- --server <origin> --code <code> [--recovery-sha256 <hex>] [--expect-sha256 <archive sha256>]. No authentication.",
+        "responses": {
+          "200": {
+            "description": "Shell script",
+            "content": {
+              "text/x-shellscript": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/machine-setup/describe": {
+      "post": {
+        "summary": "Describe the machine an enrollment code belongs to",
+        "description": "Does not consume the code. Returns the machine identity, the bundle manifest entry for its role, the recovery keys (signers) and the primary signer's keys (standby signers). Rate limited per client IP.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollmentCodeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Description",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineSetupDescription"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_ENROLLMENT_REQUEST"
+          },
+          "404": {
+            "description": "ENROLLMENT_CODE_INVALID: the code is malformed, unknown, expired or already used (one sentence for all)"
+          },
+          "429": {
+            "description": "MACHINE_SETUP_RATE_LIMITED: more than 20 requests a minute from this address on this route"
+          },
+          "503": {
+            "description": "MACHINE_BUNDLE_UNAVAILABLE (bundle directory, manifest or this role's bundle missing or malformed), MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/machine-setup/bundle/{archive}": {
+      "get": {
+        "summary": "Download the installation bundle",
+        "description": "Streams signer.tar.gz or builder.tar.gz from the deployed bundle directory (/opt/rn-foundation/machine-bundles/current). Only the bundle of the code's machine role. Exempt from the database timeout (exact route match). The client verifies archiveSha256 from describe (also sent as x-content-sha256, not to be trusted on its own). Rate limited per client IP.",
+        "parameters": [
+          {
+            "name": "archive",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "signer.tar.gz",
+                "builder.tar.gz"
+              ]
+            }
+          },
+          {
+            "$ref": "#/components/parameters/EnrollmentCode"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Archive",
+            "content": {
+              "application/gzip": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN: the code belongs to a machine of the other role"
+          },
+          "404": {
+            "description": "ENROLLMENT_CODE_INVALID: the code is malformed, unknown, expired or already used (one sentence for all); MACHINE_BUNDLE_NOT_FOUND: not signer.tar.gz or builder.tar.gz"
+          },
+          "429": {
+            "description": "MACHINE_SETUP_RATE_LIMITED: more than 20 requests a minute from this address on this route"
+          },
+          "503": {
+            "description": "MACHINE_BUNDLE_UNAVAILABLE (missing, or size differs from the manifest), MACHINE_REGISTRY_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/machine-setup/enroll": {
+      "post": {
+        "summary": "Enroll a machine with its one-time code",
+        "description": "In one write transaction (the build.machines row locked): checks and consumes the code, records the reported keys as pending (status pending_enrollment -> pending_key), issues the long-lived machine token (only its sha256 stored). Concurrent enrollments with the same code: exactly one succeeds, the others get 404. Audited as machine_enrolled (actor system-machine-setup, with the key fingerprints and client IP; never the token or the code). Rate limited per client IP.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineEnroll"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Enrolled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineEnrollResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_ENROLLMENT_REQUEST, INVALID_MACHINE_KEY (builders send x25519PublicKey null; signers send both keys)"
+          },
+          "404": {
+            "description": "ENROLLMENT_CODE_INVALID: the code is malformed, unknown, expired or already used (one sentence for all)"
+          },
+          "409": {
+            "description": "MACHINE_KEY_IN_USE"
+          },
+          "429": {
+            "description": "MACHINE_SETUP_RATE_LIMITED: more than 20 requests a minute from this address on this route"
+          },
+          "500": {
+            "description": "MACHINE_SAVE_FAILED"
+          },
+          "503": {
+            "description": "MACHINE_REGISTRY_UNAVAILABLE"
           }
         }
       }
@@ -4389,7 +4852,7 @@
     "/v1/signer/keystore-checks": {
       "get": {
         "summary": "Keystores sealed to this signer",
-        "description": "Only boxes addressed to this signer's accepted X25519 key, with the trust roots and digest the server composes (null when the tenant has no OTA certificate or its identity is incomplete). Both primary and standby call it.",
+        "description": "Only boxes addressed to this signer's accepted X25519 key, with the trust roots and digest the server composes (null when the tenant has no OTA certificate or its identity is incomplete). Both primary and standby call it. Items also carry the generation metadata of the current keystore and, for the active routed primary, pending key generation requests (see SignerKeystoreChecks).",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4440,13 +4903,167 @@
             "description": "Stored"
           },
           "400": {
-            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole)"
+            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole, or a missing or malformed trust)"
           },
           "401": {
             "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/peers": {
+      "get": {
+        "summary": "Accepted keys of active machines and unrevoked recovery keys",
+        "description": "For local commands only (signer trust-peer, trust-builder --builder, trust-recovery) to display keys; the operator pastes full fingerprints read on the other machine and the signer compares them. Signers never trust this response on its own.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Peers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignerPeers"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/keystore-generations/{requestId}": {
+      "post": {
+        "summary": "Deliver a key generated by the primary signer",
+        "description": "One transaction with build.keystore, release.android and build.keystore.request locked: the caller must be the active routed primary and generator.machineId itself (and its registered Ed25519 sha256); the request must be pending with build.keystore and release.android at the versions recorded when it was made (otherwise it is marked failed with KEYSTORE_GENERATION_STALE and 409); the signature is verified with the registered Ed25519 key; the upload passes every rule of PUT /v1/admin/build-keystore (format, tenant slug, package name and alias of the request, retired or debug certificates, recipients) where recipients may be accepted keys of unrevoked signers or unrevoked recovery keys and at least one recovery key is required. Writes build.keystore (with generator, generationSignature, generationRequestId) and release.android, marks the request done, audits build_keystore_generated and release_identity_update (system-signer). A retry with the same signature after success returns 200 with the same versions.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/GenerationRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeystoreGenerationDelivery"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "keystoreVersion",
+                    "releaseIdentityVersion"
+                  ],
+                  "properties": {
+                    "keystoreVersion": {
+                      "type": "integer"
+                    },
+                    "releaseIdentityVersion": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_KEYSTORE_GENERATION, INVALID_BUILD_KEYSTORE (upload shape)"
+          },
+          "403": {
+            "description": "KEYSTORE_GENERATOR_NOT_PRIMARY (not the active routed primary, or generator is not the caller); MACHINE_ROLE_FORBIDDEN; MACHINE_KEY_NOT_ACCEPTED"
+          },
+          "409": {
+            "description": "KEYSTORE_GENERATION_STALE: not the tenant's current pending request, or build.keystore / release.android changed since (the request is then marked failed) - discard the generated key"
+          },
+          "422": {
+            "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED, KEYSTORE_GENERATION_SIGNATURE_INVALID, BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH (package name or alias differ from the request), RELEASE_SIGNER_RETIRED, INVALID_RELEASE_IDENTITY (debug certificate), BUILD_KEYSTORE_RECIPIENT_UNKNOWN, KEYSTORE_RECOVERY_RECIPIENT_MISSING"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_GENERATION_SAVE_FAILED, MACHINE_REGISTRY_INVALID"
+          },
+          "503": {
+            "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/keystore-generations/{requestId}/fail": {
+      "post": {
+        "summary": "Report that the primary signer cannot generate this key",
+        "description": "Marks the pending request failed with {code, detail} (detail sanitized like other machine text) and audits build_keystore_generation_failed. Only the active routed primary.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/GenerationRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeystoreGenerationFailure"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "INVALID_KEYSTORE_GENERATION_FAILURE"
+          },
+          "403": {
+            "description": "KEYSTORE_GENERATOR_NOT_PRIMARY; MACHINE_ROLE_FORBIDDEN; MACHINE_KEY_NOT_ACCEPTED"
+          },
+          "409": {
+            "description": "KEYSTORE_GENERATION_STALE: not the tenant's current pending request"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_GENERATION_SAVE_FAILED"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "426": {
             "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
@@ -4853,7 +5470,7 @@
           "type": "string",
           "pattern": "^rnm_[A-Za-z0-9_-]{43}$"
         },
-        "description": "Per-machine token issued once when the machine is created in the console (POST /v1/admin/platform/machines). The server stores only its sha256 and checks the build.machines registry on every request (revocation takes effect immediately: a revoked machine's token gets 401 MACHINE_REVOKED, an unknown token 401 MACHINE_AUTH_REQUIRED). Builder tokens are refused on /v1/signer (403 MACHINE_ROLE_FORBIDDEN) and signer tokens on /v1/build-agent. A request that only carries the retired x-build-agent-token gets 426 MACHINE_AUTH_UPGRADE_REQUIRED."
+        "description": "Per-machine token issued to the machine itself when it enrolls with its one-time enrollment code (POST /v1/machine-setup/enroll; machines registered before 2026-09-23 got it from the console). The server stores only its sha256 and checks the build.machines registry on every request (revocation takes effect immediately: a revoked machine's token gets 401 MACHINE_REVOKED, an unknown token 401 MACHINE_AUTH_REQUIRED). Builder tokens are refused on /v1/signer (403 MACHINE_ROLE_FORBIDDEN) and signer tokens on /v1/build-agent. A request that only carries the retired x-build-agent-token gets 426 MACHINE_AUTH_UPGRADE_REQUIRED."
       },
       "BuildAttempt": {
         "name": "x-build-attempt",
@@ -4891,6 +5508,35 @@
           "type": "string",
           "pattern": "^mch_[A-Za-z0-9_-]{4,64}$"
         }
+      },
+      "GenerationRequestId": {
+        "name": "requestId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,128}$"
+        },
+        "description": "requestId of the tenant's key generation request (kgr_…), as delivered in generationRequest"
+      },
+      "RecoveryKeyId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^rck_[A-Za-z0-9_-]{4,64}$"
+        }
+      },
+      "EnrollmentCode": {
+        "name": "x-enrollment-code",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^rne_[A-Za-z0-9_-]{43}$"
+        },
+        "description": "The machine's one-time enrollment code (still unused and unexpired)."
       }
     },
     "schemas": {
@@ -6831,7 +7477,7 @@
           "boxes"
         ],
         "additionalProperties": false,
-        "description": "The file produced by the offline build-keystore tool, sealed only to the signers in the offline pin file.",
+        "description": "The v3 upload file: produced by the offline build-keystore tool (import) or by the primary signer (generation), sealed to signers and/or offline recovery keys.",
         "properties": {
           "format": {
             "type": "string",
@@ -6962,7 +7608,10 @@
           "ready",
           "readinessProblems",
           "trustRoots",
-          "trustRootsDigest"
+          "trustRootsDigest",
+          "generationRequest",
+          "generator",
+          "recoveryRecipients"
         ],
         "properties": {
           "configured": {
@@ -7024,7 +7673,8 @@
                   "nullable": true
                 }
               }
-            }
+            },
+            "description": "All recipients of the current key; recovery keys have machineId, name and signerRole null (see recoveryRecipients)"
           },
           "missingSigners": {
             "type": "array",
@@ -7106,6 +7756,45 @@
             "items": {
               "$ref": "#/components/schemas/SignerReadinessProblem"
             }
+          },
+          "generationRequest": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GenerationRequestView"
+              }
+            ],
+            "nullable": true,
+            "description": "The latest key generation request for this tenant; null if none was ever made"
+          },
+          "generator": {
+            "type": "object",
+            "nullable": true,
+            "required": [
+              "machineId",
+              "name",
+              "ed25519PublicKeySha256"
+            ],
+            "description": "The primary signer that generated the current key; null for imported keys",
+            "properties": {
+              "machineId": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "ed25519PublicKeySha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          },
+          "recoveryRecipients": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "description": "Recipients of the current key that are registered recovery keys (revoked ones included)"
           }
         }
       },
@@ -7131,7 +7820,10 @@
           "revokedAt",
           "revokeReason",
           "reportedLocalRole",
-          "reportedLocalRoleAt"
+          "reportedLocalRoleAt",
+          "enrollmentExpiresAt",
+          "reportedTrust",
+          "reportedTrustAt"
         ],
         "properties": {
           "id": {
@@ -7160,10 +7852,12 @@
           "status": {
             "type": "string",
             "enum": [
+              "pending_enrollment",
               "pending_key",
               "active",
               "revoked"
-            ]
+            ],
+            "description": "pending_enrollment: created in the console, waiting for the machine to enroll with its one-time code (no token, no key). pending_key: enrolled (or created before 2026-09-23), its reported key waits to be accepted. active. revoked."
           },
           "publicKeySha256": {
             "type": "string",
@@ -7226,6 +7920,27 @@
             "format": "date-time",
             "nullable": true,
             "description": "When reportedLocalRole last changed; null = never reported"
+          },
+          "enrollmentExpiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When the current enrollment code expires; only while status is pending_enrollment, otherwise null. The code itself is never listed."
+          },
+          "reportedTrust": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignerReportedTrust"
+              }
+            ],
+            "nullable": true,
+            "description": "Signers only: what this signer's local record trusts, as it last reported (POST /v1/signer/keystore-checks trust). Display only (e.g. the primary does not trust the standby yet, so new keys will not be sealed to it); signers never take it from the server. null = never reported."
+          },
+          "reportedTrustAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When reportedTrust last changed; null = never reported"
           }
         }
       },
@@ -7529,16 +8244,24 @@
                   "type": "integer"
                 },
                 "packageName": {
-                  "type": "string"
+                  "type": "string",
+                  "nullable": true
                 },
                 "certificateSha256": {
-                  "type": "string"
+                  "type": "string",
+                  "nullable": true
                 },
                 "keyAlias": {
-                  "type": "string"
+                  "type": "string",
+                  "nullable": true
                 },
                 "box": {
-                  "$ref": "#/components/schemas/KeystoreBox"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/KeystoreBox"
+                    }
+                  ],
+                  "nullable": true
                 },
                 "trustRoots": {
                   "allOf": [
@@ -7551,8 +8274,65 @@
                 "trustRootsDigest": {
                   "type": "string",
                   "nullable": true
+                },
+                "publishedMaxBuildNumber": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Largest build number among this tenant's Android release records (0 if none)"
+                },
+                "generator": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/KeystoreGeneratorKeys"
+                    }
+                  ],
+                  "nullable": true,
+                  "description": "The primary signer that generated the current keystore, as registered when it delivered it; null for imported keystores (confirm them with signer confirm)"
+                },
+                "generationSignature": {
+                  "type": "string",
+                  "nullable": true,
+                  "description": "base64 Ed25519 signature over keystorebox.GenerationMessage(generationRequestId, upload)"
+                },
+                "generationRequestId": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "upload": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/KeystoreUpload"
+                    }
+                  ],
+                  "nullable": true,
+                  "description": "The whole current upload file, when generator is not null (a standby verifies the generation signature over it)"
+                },
+                "generationRequest": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SignerGenerationRequest"
+                    }
+                  ],
+                  "nullable": true
                 }
-              }
+              },
+              "required": [
+                "tenantSlug",
+                "keystoreVersion",
+                "packageName",
+                "certificateSha256",
+                "keyAlias",
+                "box",
+                "trustRoots",
+                "trustRootsDigest",
+                "publishedMaxBuildNumber",
+                "generator",
+                "generationSignature",
+                "generationRequestId",
+                "upload",
+                "generationRequest"
+              ],
+              "description": "One item per tenant with a keystore sealed to this signer, plus (for the active routed primary) tenants with a pending key generation. An item that only carries a generation request (new tenant, legacy record, or a keystore not sealed to this primary) has box, packageName, certificateSha256 and keyAlias null; keystoreVersion is the current build.keystore row version (0 if none), and its trustRoots are composed with the requested package when the tenant has no release identity yet. Do not report checks for such items."
             }
           }
         }
@@ -7561,6 +8341,7 @@
         "type": "object",
         "required": [
           "localRole",
+          "trust",
           "items"
         ],
         "additionalProperties": false,
@@ -7572,6 +8353,14 @@
               "standby"
             ],
             "description": "This signer's role according to its own local record (signer promote/abandon). Required on every report. Stored on the machine as reportedLocalRole/reportedLocalRoleAt, written only when it changes; a routed primary whose reportedLocalRole is not primary makes tenants not ready (PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH)."
+          },
+          "trust": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignerReportedTrust"
+              }
+            ],
+            "description": "Required on every report: the signers (including this one), builders and recovery keys this signer's local record trusts. Stored on the machine as reportedTrust/reportedTrustAt (build_machine_trust_report audit), written only when it changes."
           },
           "items": {
             "type": "array",
@@ -7626,7 +8415,8 @@
                   "nullable": true
                 }
               }
-            }
+            },
+            "description": "Check results only for keystores sealed to this signer; items for other tenants, other keystore versions or keystores without a box for this signer are ignored."
           }
         }
       },
@@ -7713,7 +8503,7 @@
           "detail"
         ],
         "additionalProperties": false,
-        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH: the primary signer in the console has never reported its local role or its local record still says standby (it was not promoted on the machine), so it will not claim jobs; promote it on the machine or switch the console back. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed.",
+        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH: the primary signer in the console has never reported its local role or its local record still says standby (it was not promoted on the machine), so it will not claim jobs; promote it on the machine or switch the console back. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed. The last three only appear while the tenant has no usable v3 keystore (they explain why there is no key yet; a tenant with a usable key keeps signing with it while a replacement is generated): RECOVERY_KEY_NOT_CONFIGURED: the platform has no unrevoked offline recovery key, so no key can be generated. KEYSTORE_GENERATION_PENDING: a generation request waits for the primary signer. KEYSTORE_GENERATION_FAILED: the latest generation request failed; detail carries the signer's code (e.g. TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, PEER_NOT_TRUSTED) or KEYSTORE_GENERATION_STALE.",
         "properties": {
           "code": {
             "type": "string",
@@ -7735,7 +8525,10 @@
               "PRIMARY_SIGNER_NOT_CONFIRMED",
               "TRUST_ROOTS_CHANGED",
               "PRIMARY_SIGNER_TRIAL_SIGN_PENDING",
-              "PRIMARY_SIGNER_TRIAL_SIGN_FAILED"
+              "PRIMARY_SIGNER_TRIAL_SIGN_FAILED",
+              "RECOVERY_KEY_NOT_CONFIGURED",
+              "KEYSTORE_GENERATION_PENDING",
+              "KEYSTORE_GENERATION_FAILED"
             ]
           },
           "detail": {
@@ -7813,6 +8606,761 @@
           }
         ],
         "description": "A claimed job. No keystore material of any kind is included."
+      },
+      "MachineEnrollment": {
+        "type": "object",
+        "required": [
+          "code",
+          "expiresAt",
+          "installCommand"
+        ],
+        "additionalProperties": false,
+        "description": "Returned only by the create and reissue responses. The server stores only the code's sha256; it is valid for 60 minutes and for one enrollment.",
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^rne_[A-Za-z0-9_-]{43}$"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "installCommand": {
+            "type": "string",
+            "description": "The one-line command to run as root on the new machine, composed by the server from the request's external origin: curl -fsSL <origin>/v1/machine-setup/install.sh | sudo bash -s -- --server <origin> --code <code>; signers additionally end with ' --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>' where the angle-bracket placeholder is kept verbatim for the operator to replace from the password manager. Show and copy it as is."
+          }
+        }
+      },
+      "SignerReportedTrust": {
+        "type": "object",
+        "required": [
+          "signers",
+          "builders",
+          "recoveryKeys"
+        ],
+        "additionalProperties": false,
+        "description": "The trust lists in a signer's local record, including the signer itself. Stored sorted; written only when it changes.",
+        "properties": {
+          "signers": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "x25519Sha256",
+                "ed25519Sha256"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9-]{1,39}$"
+                },
+                "x25519Sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "ed25519Sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          },
+          "builders": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "required": [
+                "builderId",
+                "ed25519Sha256"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "builderId": {
+                  "type": "string",
+                  "pattern": "^mch_[A-Za-z0-9_-]{4,64}$"
+                },
+                "ed25519Sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          },
+          "recoveryKeys": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      },
+      "EnrollmentCodeRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^rne_[A-Za-z0-9_-]{43}$"
+          }
+        }
+      },
+      "MachineBundleFile": {
+        "type": "object",
+        "required": [
+          "name",
+          "size",
+          "sha256"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9@._-]+(/[A-Za-z0-9@._-]+)*$",
+            "description": "Relative path inside the archive (no absolute paths, empty, . or .. segments); signer unit templates contain @, e.g. templates/rn-signer-@INSTANCE@-check@.service"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "MachineSetupDescription": {
+        "type": "object",
+        "required": [
+          "machineId",
+          "name",
+          "role",
+          "signerRole",
+          "bundle",
+          "recoveryKeys",
+          "primarySigner"
+        ],
+        "properties": {
+          "machineId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "builder",
+              "signer"
+            ]
+          },
+          "signerRole": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "primary",
+              "standby",
+              null
+            ]
+          },
+          "bundle": {
+            "type": "object",
+            "required": [
+              "role",
+              "commit",
+              "archive",
+              "archiveSha256",
+              "archiveSize",
+              "files"
+            ],
+            "description": "From manifest.json (rn-machine-bundles/v1) of the deployed bundle directory. install.sh verifies the archive and every file against these sha256 values; with --expect-sha256 it also compares archiveSha256 with the value from the CI log.",
+            "properties": {
+              "role": {
+                "type": "string",
+                "enum": [
+                  "builder",
+                  "signer"
+                ]
+              },
+              "commit": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{7,40}$"
+              },
+              "archive": {
+                "type": "string",
+                "enum": [
+                  "signer.tar.gz",
+                  "builder.tar.gz"
+                ]
+              },
+              "archiveSha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "archiveSize": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MachineBundleFile"
+                }
+              }
+            }
+          },
+          "recoveryKeys": {
+            "type": "array",
+            "description": "Signers only (empty for builders): the unrevoked recovery keys. signer enroll pins the one whose sha256 the operator pasted (--recovery-sha256).",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "x25519PublicKey",
+                "x25519PublicKeySha256"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "x25519PublicKey": {
+                  "type": "string",
+                  "description": "base64 std, 32 bytes"
+                },
+                "x25519PublicKeySha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          },
+          "primarySigner": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignerPeerKeys"
+              }
+            ],
+            "nullable": true,
+            "description": "Standby signers only: the active routed primary's accepted keys, trusted on first use by signer enroll to verify the primary's generation signatures. null otherwise."
+          }
+        }
+      },
+      "SignerPeerKeys": {
+        "type": "object",
+        "required": [
+          "machineId",
+          "name",
+          "x25519PublicKey",
+          "x25519PublicKeySha256",
+          "ed25519PublicKey",
+          "ed25519PublicKeySha256"
+        ],
+        "properties": {
+          "machineId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "x25519PublicKey": {
+            "type": "string"
+          },
+          "x25519PublicKeySha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "ed25519PublicKey": {
+            "type": "string"
+          },
+          "ed25519PublicKeySha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "MachineEnroll": {
+        "type": "object",
+        "required": [
+          "code",
+          "x25519PublicKey",
+          "ed25519PublicKey"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^rne_[A-Za-z0-9_-]{43}$"
+          },
+          "x25519PublicKey": {
+            "type": "string",
+            "nullable": true,
+            "description": "Signers: base64 std of the 32-byte X25519 key. Builders: must be null."
+          },
+          "ed25519PublicKey": {
+            "type": "string",
+            "description": "base64 std, 32 bytes. Signers: the record-signing key. Builders: the provenance key (stored as the machine's publicKey)."
+          }
+        }
+      },
+      "MachineEnrollResult": {
+        "type": "object",
+        "required": [
+          "machineId",
+          "token",
+          "status"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "machineId": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string",
+            "pattern": "^rnm_[A-Za-z0-9_-]{43}$",
+            "description": "The long-lived machine token. Appears only in this response; the server stores its sha256. The enroll command writes it straight into the env file and never prints it."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending_key"
+            ]
+          }
+        }
+      },
+      "RecoveryPublicFile": {
+        "type": "object",
+        "required": [
+          "format",
+          "name",
+          "x25519PublicKey",
+          "x25519PublicKeySha256",
+          "createdAt"
+        ],
+        "additionalProperties": false,
+        "description": "recovery-public.json written by the offline tool (build-keystore recovery-key create), signing/recovery.PublicFile.",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "rn-recovery-public/v1"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{1,39}$"
+          },
+          "x25519PublicKey": {
+            "type": "string",
+            "description": "base64 std, 32 bytes"
+          },
+          "x25519PublicKeySha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "RecoveryKeyView": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "x25519PublicKeySha256",
+          "x25519PublicKey",
+          "createdBy",
+          "createdAt",
+          "revokedBy",
+          "revokedAt",
+          "revokeReason"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "x25519PublicKeySha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "x25519PublicKey": {
+            "type": "string"
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "revokedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "revokedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "revokeReason": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "RecoveryKeyCreate": {
+        "type": "object",
+        "required": [
+          "publicFile",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "publicFile": {
+            "$ref": "#/components/schemas/RecoveryPublicFile"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "GenerationRequestView": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "status",
+          "packageName",
+          "alias",
+          "requestedBy",
+          "requestedAt",
+          "completedAt",
+          "error"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "done",
+              "failed"
+            ],
+            "description": "A pending request whose build.keystore or release.android version changed since it was made is reported as failed with error.code KEYSTORE_GENERATION_STALE (derived on read)."
+          },
+          "packageName": {
+            "type": "string"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "requestedBy": {
+            "type": "string"
+          },
+          "requestedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "error": {
+            "type": "object",
+            "nullable": true,
+            "required": [
+              "code",
+              "detail"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "What the primary signer reported (TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, NOT_LOCAL_PRIMARY, PEER_NOT_TRUSTED, GENERATION_FAILED, …) or KEYSTORE_GENERATION_STALE"
+              },
+              "detail": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "SignerGenerationRequest": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "packageName",
+          "alias",
+          "trustRoots",
+          "trustRootsDigest",
+          "publishedMaxBuildNumber"
+        ],
+        "description": "Only sent to the active routed primary signer while the request is pending. trustRoots are what a first generation for this package trusts (auto:first-generation); a signer that already confirmed the package with a different digest refuses (TRUST_ROOTS_CHANGED).",
+        "properties": {
+          "requestId": {
+            "type": "string"
+          },
+          "packageName": {
+            "type": "string"
+          },
+          "alias": {
+            "type": "string"
+          },
+          "trustRoots": {
+            "$ref": "#/components/schemas/TrustRoots"
+          },
+          "trustRootsDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "publishedMaxBuildNumber": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Largest build number among this tenant's Android release records (0 if none); the first-signing versionCode cap is this + 100 when the signer has no local history"
+          }
+        }
+      },
+      "KeystoreGeneratorKeys": {
+        "type": "object",
+        "required": [
+          "machineId",
+          "name",
+          "ed25519PublicKey",
+          "ed25519PublicKeySha256"
+        ],
+        "properties": {
+          "machineId": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ed25519PublicKey": {
+            "type": "string"
+          },
+          "ed25519PublicKeySha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "SignerPeers": {
+        "type": "object",
+        "required": [
+          "signers",
+          "builders",
+          "recoveryKeys"
+        ],
+        "properties": {
+          "signers": {
+            "type": "array",
+            "items": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/SignerPeerKeys"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "status",
+                    "signerRole"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active"
+                      ]
+                    },
+                    "signerRole": {
+                      "type": "string",
+                      "enum": [
+                        "primary",
+                        "standby"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "builders": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "machineId",
+                "name",
+                "status",
+                "publicKey",
+                "publicKeySha256"
+              ],
+              "properties": {
+                "machineId": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active"
+                  ]
+                },
+                "publicKey": {
+                  "type": "string",
+                  "description": "base64 Ed25519 provenance key"
+                },
+                "publicKeySha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          },
+          "recoveryKeys": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "x25519PublicKey",
+                "x25519PublicKeySha256",
+                "revoked"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "x25519PublicKey": {
+                  "type": "string"
+                },
+                "x25519PublicKeySha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "revoked": {
+                  "type": "boolean",
+                  "enum": [
+                    false
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "KeystoreGenerationDelivery": {
+        "type": "object",
+        "required": [
+          "upload",
+          "generator",
+          "signature"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "upload": {
+            "$ref": "#/components/schemas/KeystoreUpload"
+          },
+          "generator": {
+            "type": "object",
+            "required": [
+              "machineId",
+              "ed25519PublicKeySha256"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "machineId": {
+                "type": "string"
+              },
+              "ed25519PublicKeySha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          },
+          "signature": {
+            "type": "string",
+            "description": "base64 std Ed25519 signature by the primary's registered key over \"rn-keystore-generation/v1\\n\" + requestId + \"\\n\" + UploadDigest(upload) (keystorebox.GenerationMessage)"
+          }
+        }
+      },
+      "KeystoreGenerationFailure": {
+        "type": "object",
+        "required": [
+          "code",
+          "detail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{2,63}$",
+            "description": "At least TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, NOT_LOCAL_PRIMARY, GENERATION_FAILED"
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "KeystoreGenerationCreate": {
+        "type": "object",
+        "required": [
+          "packageName",
+          "expectedVersion",
+          "releaseIdentityExpectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "packageName": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "build.keystore version (0 = no row)"
+          },
+          "releaseIdentityExpectedVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "release.android version (0 = no row)"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
       }
     }
   }

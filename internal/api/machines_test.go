@@ -76,24 +76,18 @@ func TestDBMachineAuthRolesPendingKeyAndRevocation(t *testing.T) {
 		t.Fatalf("an unknown token: %d %s", r.Code, r.Body.String())
 	}
 
-	// 新建一台构建机：pending_key，只能调 public-key
-	created := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", map[string]any{
-		"role": "builder", "name": "builder-new-" + uniqueSuffix(), "signerRole": nil, "expectedVersion": registryVersion(t, f), "reason": "add a builder", "confirm": true,
-	})
-	if created.Code != http.StatusCreated {
-		t.Fatalf("create machine: %d %s", created.Code, created.Body.String())
+	// 新建一台构建机：注册之后是 pending_key，只能调 public-key
+	_, code := f.createMachine(machineRoleBuilder, "builder-new-"+uniqueSuffix(), nil)
+	_, private, _ := ed25519.GenerateKey(rand.Reader)
+	public := private.Public().(ed25519.PublicKey)
+	enrolled := f.enroll(code, nil, public)
+	if enrolled.Code != http.StatusOK || decodeBody(t, enrolled)["status"] != "pending_key" {
+		t.Fatalf("enroll a builder: %d %s", enrolled.Code, enrolled.Body.String())
 	}
-	body := decodeBody(t, created)
-	token := body["token"].(string)
-	machine := body["machine"].(map[string]any)
-	if machine["status"] != "pending_key" {
-		t.Fatalf("a new machine: %v", machine)
-	}
+	token := decodeBody(t, enrolled)["token"].(string)
 	if r := f.do(http.MethodPost, "/v1/build-agent/claim", token, nil, map[string]any{"platforms": []string{"android"}, "kinds": []string{"apk"}}); r.Code != http.StatusForbidden || problemCode(t, r) != "MACHINE_KEY_NOT_ACCEPTED" {
 		t.Fatalf("a pending machine claimed: %d %s", r.Code, r.Body.String())
 	}
-	_, private, _ := ed25519.GenerateKey(rand.Reader)
-	public := private.Public().(ed25519.PublicKey)
 	if r := f.do(http.MethodPost, "/v1/build-agent/public-key", token, nil, map[string]any{"publicKey": base64.StdEncoding.EncodeToString(public), "rotationSignature": nil}); r.Code != http.StatusOK {
 		t.Fatalf("a pending machine could not report its key: %d %s", r.Code, r.Body.String())
 	}
@@ -123,10 +117,11 @@ func registryVersion(t *testing.T, f *gateFixture) int {
 	return snapshot.Version
 }
 
-// 管理端写登记：乐观锁、令牌只出现在新建响应里（不进登记原文以外的地方、不进审计）、
+// 管理端写登记：乐观锁、注册码只出现在新建响应里（不进审计、不进列表）、新建不再返回令牌、
 // 同时最多一台 primary、名称不重复、视图里没有令牌 sha256 和公钥原文。
 func TestDBMachineAdminWrites(t *testing.T) {
 	f := newGateFixture(t, 52)
+	f.registerRecoveryKey("platform-recovery")
 	version := registryVersion(t, f)
 	stale := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", map[string]any{"role": "signer", "name": "signer-c", "signerRole": "standby", "expectedVersion": version - 1, "reason": "stale write", "confirm": true})
 	if stale.Code != http.StatusConflict || problemCode(t, stale) != "MACHINES_VERSION_CONFLICT" {
@@ -154,7 +149,10 @@ func TestDBMachineAdminWrites(t *testing.T) {
 		t.Fatalf("create: %d %s", created.Code, created.Body.String())
 	}
 	body := decodeBody(t, created)
-	token := body["token"].(string)
+	if _, leaked := body["token"]; leaked {
+		t.Fatalf("creating a machine still returns a token: %v", body)
+	}
+	code := body["enrollment"].(map[string]any)["code"].(string)
 	if body["version"] != float64(version+1) {
 		t.Fatalf("version after create: %v", body["version"])
 	}
@@ -162,15 +160,15 @@ func TestDBMachineAdminWrites(t *testing.T) {
 	if err := f.db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=0 AND action='build_machine_create' ORDER BY created_at DESC LIMIT 1`).Scan(&audit); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(audit, token) || strings.Contains(audit, sha256Hex(token)) {
-		t.Fatalf("the token reached the audit log: %s", audit)
+	if strings.Contains(audit, code) || strings.Contains(audit, sha256Hex(code)) {
+		t.Fatalf("the enrollment code reached the audit log: %s", audit)
 	}
 	list := f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil)
 	if list.Code != http.StatusOK {
 		t.Fatalf("list: %d", list.Code)
 	}
 	raw := list.Body.String()
-	if strings.Contains(raw, token) || strings.Contains(raw, sha256Hex(token)) || strings.Contains(raw, "tokenSha256") ||
+	if strings.Contains(raw, code) || strings.Contains(raw, sha256Hex(code)) || strings.Contains(raw, "codeSha256") || strings.Contains(raw, "tokenSha256") ||
 		strings.Contains(raw, base64.StdEncoding.EncodeToString(f.builder.ed25519Public())) {
 		t.Fatalf("the machine list leaks tokens or raw public keys: %s", raw)
 	}

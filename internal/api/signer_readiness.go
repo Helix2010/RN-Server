@@ -73,6 +73,12 @@ func parseKeystoreChecks(raw []byte) (map[string]keystoreMachineCheck, error) {
 // trustRootsFor 用服务端合成的 tenant manifest 与当前 OTA 证书算出包内信任根与摘要。
 // 算不出来时返回原因（给控制台与排队门禁看），不是错误：租户配置没配全是正常状态。
 func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.Roots, string, []readinessProblem, error) {
+	return s.trustRootsWith(ctx, tenant, "")
+}
+
+// trustRootsWith 同 trustRootsFor；firstKeyPackage 见 composeTenantManifest：租户第一次生成签名密钥、
+// 还没有 release.android 时，信任根照样算得出来（它不含包名与证书指纹），摘要与之后登记了身份时一致。
+func (s *server) trustRootsWith(ctx context.Context, tenant, firstKeyPackage string) (*trustroots.Roots, string, []readinessProblem, error) {
 	slug, err := s.tenantSlug(ctx, tenant)
 	if err != nil {
 		return nil, "", nil, err
@@ -82,7 +88,7 @@ func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.
 		return nil, "", nil, err
 	}
 	// 版本号与 build 号不进信任根，这里随便给一组合法值
-	manifest, err := s.tenantManifestFor(ctx, tenant, buildCfg, "0.0.0", 1)
+	manifest, err := s.composeTenantManifest(ctx, tenant, buildCfg, "0.0.0", 1, firstKeyPackage)
 	if err != nil {
 		var missing *missingIdentity
 		if errors.As(err, &missing) {
@@ -168,6 +174,11 @@ const (
 	readinessTrustRootsChanged       = "TRUST_ROOTS_CHANGED"
 	readinessPrimaryTrialSignPending = "PRIMARY_SIGNER_TRIAL_SIGN_PENDING"
 	readinessPrimaryTrialSignFailed  = "PRIMARY_SIGNER_TRIAL_SIGN_FAILED"
+	// 下面三条（ADR-0020）只在租户没有可用的 v3 密钥时出现：它们说的是"为什么还没有密钥"。已经有可用
+	// 密钥的租户换密钥期间照常用旧密钥签，生成中或失败看 GET /v1/admin/build-keystore 的 generationRequest
+	readinessRecoveryKeyMissing = "RECOVERY_KEY_NOT_CONFIGURED"
+	readinessGenerationPending  = "KEYSTORE_GENERATION_PENDING"
+	readinessGenerationFailed   = "KEYSTORE_GENERATION_FAILED"
 )
 
 // readinessProblemCodes 按判断顺序列出全部枚举值（测试与 OpenAPI 对照用）。
@@ -176,6 +187,7 @@ var readinessProblemCodes = []string{
 	readinessPrimarySignerMissing, readinessPrimarySignerNoBox, readinessPrimaryLocalRole, readinessAppIdentityIncomplete, readinessOTACertificateMissing,
 	readinessAPIBaseURLInvalid, readinessTrustRootsInvalid, readinessPrimaryCheckMissing, readinessPrimaryDecryptFailed,
 	readinessPrimaryNotConfirmed, readinessTrustRootsChanged, readinessPrimaryTrialSignPending, readinessPrimaryTrialSignFailed,
+	readinessRecoveryKeyMissing, readinessGenerationPending, readinessGenerationFailed,
 }
 
 type signerReadiness struct {
@@ -189,6 +201,8 @@ type signerReadiness struct {
 	Check   *keystoreMachineCheck
 	Roots   *trustroots.Roots
 	Digest  string
+	// Generation 是最近一次生成请求（状态已按当前版本推导），没有为 nil
+	Generation *keystoreGenerationRequest
 }
 
 // signerReadinessFor：该租户存在 v3 记录、与发布身份一致；主签名闸 active 且有发给它的密文；
@@ -286,6 +300,27 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 			default:
 				add(readinessPrimaryTrialSignPending, "主签名闸 "+primary.Name+" 还没有试签通过")
 			}
+		}
+	}
+	generation, err := s.generationRequestFor(ctx, s.db, tenant)
+	if err != nil {
+		return r, err
+	}
+	r.Generation = generation
+	if !keystore.configured() {
+		recoveryKeys, err := readRecoveryKeys(ctx, s.db, false)
+		if err != nil {
+			return r, err
+		}
+		if len(recoveryKeys.Doc.live()) == 0 {
+			add(readinessRecoveryKeyMissing, "平台还没有登记离线恢复公钥，不能在签名闸上生成签名密钥（平台管理员在「平台维护 → 签名闸恢复密钥」登记）")
+		}
+		switch {
+		case generation == nil:
+		case generation.Status == generationPending:
+			add(readinessGenerationPending, "已发起生成签名密钥（"+generation.RequestedAt+"），主签名闸还没有交回")
+		case generation.Status == generationFailed:
+			add(readinessGenerationFailed, "生成签名密钥失败（"+generation.Error.Code+"）："+generation.Error.Detail)
 		}
 	}
 	r.Ready = len(r.Problems) == 0
