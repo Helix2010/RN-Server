@@ -392,8 +392,8 @@ func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path,
 	return nil
 }
 
-// downloadIcon 取一张图标，直接写进检出，不经过内存里的字符串。
-func (c *client) downloadIcon(ctx context.Context, job claimedJob, name, target string) error {
+// downloadIcon 取一张图标写进 w（调用方给的是检出里以 O_EXCL 新建的文件），不经过内存里的字符串。
+func (c *client) downloadIcon(ctx context.Context, job claimedJob, name string, w io.Writer) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.server+jobPath(job.ID, "/icons/"+url.PathEscape(name)), nil)
 	if err != nil {
 		return err
@@ -408,13 +408,8 @@ func (c *client) downloadIcon(ctx context.Context, job claimedJob, name, target 
 		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return newAPIError("icon "+name, response.StatusCode, payload)
 	}
-	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
 	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
-	written, err := io.Copy(file, io.LimitReader(response.Body, 12<<20+1))
+	written, err := io.Copy(w, io.LimitReader(response.Body, 12<<20+1))
 	if err != nil {
 		return err
 	}

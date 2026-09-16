@@ -35,7 +35,7 @@ func tenantJSON(t *testing.T, fields map[string]any) []byte {
 
 func TestWriteTenantFileLandsTheManifestUnderTheTenantDirectory(t *testing.T) {
 	worktree := t.TempDir()
-	path, err := writeTenantFile(worktree, "anyfun", tenantJSON(t, baseTenant()))
+	path, err := writeTenantFile(testCheckout(t, worktree), "anyfun", tenantJSON(t, baseTenant()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestWriteTenantFileRefusesAManifestThatWouldBreakTheApp(t *testing.T) {
 	} {
 		fields := baseTenant()
 		mutate(fields)
-		if _, err := writeTenantFile(t.TempDir(), "anyfun", tenantJSON(t, fields)); err == nil {
+		if _, err := writeTenantFile(testCheckout(t, t.TempDir()), "anyfun", tenantJSON(t, fields)); err == nil {
 			t.Fatalf("%s 被放过了", name)
 		}
 	}
@@ -84,19 +84,19 @@ func TestWriteTenantFileRefusesAManifestThatWouldBreakTheApp(t *testing.T) {
 func TestWriteTenantFileRefusesThePublicDebugSigner(t *testing.T) {
 	fields := baseTenant()
 	fields["signerSha256"] = reactNativeDebugSigner
-	_, err := writeTenantFile(t.TempDir(), "anyfun", tenantJSON(t, fields))
+	_, err := writeTenantFile(testCheckout(t, t.TempDir()), "anyfun", tenantJSON(t, fields))
 	if err == nil || !strings.Contains(err.Error(), "debug key") {
 		t.Fatalf("公共 debug 签名指纹被接受了: %v", err)
 	}
 }
 
 func TestWriteTenantFileRejectsInputItCannotUnderstand(t *testing.T) {
-	if _, err := writeTenantFile(t.TempDir(), "anyfun", []byte("not json")); err == nil {
+	if _, err := writeTenantFile(testCheckout(t, t.TempDir()), "anyfun", []byte("not json")); err == nil {
 		t.Fatal("不是 JSON 的身份文件被接受了")
 	}
 	// 任务里没带身份文件，说明服务端根本没能合成出来——这时候硬打出来的包装上去
 	// 也起不来，要在这里就说清楚
-	if _, err := writeTenantFile(t.TempDir(), "anyfun", nil); err == nil {
+	if _, err := writeTenantFile(testCheckout(t, t.TempDir()), "anyfun", nil); err == nil {
 		t.Fatal("空的身份文件被接受了")
 	}
 }
@@ -185,7 +185,7 @@ func TestMissingTenantIconsAreCaughtBeforeTheExpensiveSteps(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	missing := missingTenantIcons(worktree, "predict-kim")
+	missing := missingTenantIcons(testCheckout(t, worktree), "predict-kim")
 	if len(missing) != 4 {
 		t.Fatalf("一个都没有时应当报四个：%v", missing)
 	}
@@ -194,11 +194,11 @@ func TestMissingTenantIconsAreCaughtBeforeTheExpensiveSteps(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if left := missingTenantIcons(worktree, "predict-kim"); len(left) != 0 {
+	if left := missingTenantIcons(testCheckout(t, worktree), "predict-kim"); len(left) != 0 {
 		t.Fatalf("补齐之后还报缺：%v", left)
 	}
 	// 别的租户目录不该影响判断
-	if left := missingTenantIcons(worktree, "anyfun"); len(left) != 4 {
+	if left := missingTenantIcons(testCheckout(t, worktree), "anyfun"); len(left) != 4 {
 		t.Fatalf("另一个租户应当照样报缺：%v", left)
 	}
 }
@@ -216,7 +216,7 @@ func TestFetchTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
 	worktree := t.TempDir()
 	job := claimedJob{ID: "bld_x", Attempt: 1, TenantDirectory: "predict-kim",
 		Icons: []string{"icon.png", "android-icon-foreground.png"}}
-	written, err := fetchTenantIcons(context.Background(), api, job, worktree)
+	written, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree))
 	if err != nil || written != 2 {
 		t.Fatalf("取了 %d 张：%v", written, err)
 	}
@@ -226,7 +226,7 @@ func TestFetchTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
 	}
 
 	// 一张都不下发时什么也不做，不去动仓库里已有的
-	if n, err := fetchTenantIcons(context.Background(), api, claimedJob{ID: "bld_x"}, worktree); err != nil || n != 0 {
+	if n, err := fetchTenantIcons(context.Background(), api, claimedJob{ID: "bld_x"}, testCheckout(t, worktree)); err != nil || n != 0 {
 		t.Fatalf("空下发不该动任何东西：%d %v", n, err)
 	}
 }
@@ -237,8 +237,18 @@ func TestFetchTenantIconsRefusesNamesThatEscape(t *testing.T) {
 	worktree := t.TempDir()
 	for _, name := range []string{"../outside.png", "sub/dir.png", "..", "a/../../b.png"} {
 		job := claimedJob{ID: "bld_x", TenantDirectory: "predict-kim", Icons: []string{name}}
-		if _, err := fetchTenantIcons(context.Background(), api, job, worktree); err == nil {
+		if _, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree)); err == nil {
 			t.Fatalf("%q 应当被拒", name)
 		}
 	}
+}
+
+func testCheckout(t *testing.T, dir string) *checkoutFS {
+	t.Helper()
+	fsys, err := openCheckoutFS(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fsys.Close() })
+	return fsys
 }

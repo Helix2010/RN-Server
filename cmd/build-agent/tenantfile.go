@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -40,7 +39,7 @@ var (
 // 让人以为这里已经拦住了。值与服务端共用一处定义，见 androidkeystore。
 const reactNativeDebugSigner = androidkeystore.PublicDebugSignerSHA256
 
-func writeTenantFile(worktree, directory string, raw json.RawMessage) (string, error) {
+func writeTenantFile(checkout *checkoutFS, directory string, raw json.RawMessage) (string, error) {
 	if len(raw) == 0 {
 		return "", fmt.Errorf("the job carries no tenant file; the server could not compose this tenant's app identity")
 	}
@@ -51,19 +50,16 @@ func writeTenantFile(worktree, directory string, raw json.RawMessage) (string, e
 	if err := validateTenantFile(manifest); err != nil {
 		return "", err
 	}
-	dir := filepath.Join(worktree, "tenants", directory)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return "", fmt.Errorf("create tenant directory: %w", err)
-	}
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, "tenant.json")
-	if err := os.WriteFile(path, append(encoded, '\n'), 0o640); err != nil {
+	// 检出里的 tenants/ 是仓库内容：写的时候不跟随其中的符号链接（见 checkoutfs.go）
+	rel := filepath.Join("tenants", directory, "tenant.json")
+	if err := checkout.writeFile(rel, append(encoded, '\n')); err != nil {
 		return "", fmt.Errorf("write tenant file: %w", err)
 	}
-	return path, nil
+	return filepath.Join(checkout.dir, rel), nil
 }
 
 func validateTenantFile(manifest map[string]any) error {

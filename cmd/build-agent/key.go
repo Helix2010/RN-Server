@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -78,14 +79,23 @@ func checkPrivate(path string, info fs.FileInfo, wantDir bool) error {
 
 // readKeyFile 读一把私钥（base64 的 32 字节种子），核对文件权限。文件不在返回 fs.ErrNotExist。
 func readKeyFile(path string) (machineKey, error) {
-	info, err := os.Lstat(path)
+	if _, err := os.Lstat(path); err != nil {
+		return machineKey{}, err
+	}
+	// 打开时不跟随符号链接，权限按打开的这个文件核对，读的也是它
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return machineKey{}, fmt.Errorf("%s: %w", path, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
 		return machineKey{}, err
 	}
 	if err := checkPrivate(path, info, false); err != nil {
 		return machineKey{}, err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := io.ReadAll(io.LimitReader(file, 4096))
 	if err != nil {
 		return machineKey{}, err
 	}

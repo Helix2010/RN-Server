@@ -153,6 +153,9 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 			"artifact": map[string]any{"token": "ota-token"},
 			"upload":   map[string]any{"method": "PUT", "url": f.srv.URL + jobPrefix + "/ota-artifact", "headers": map[string]string{"content-type": "application/zip"}},
 		})
+	case strings.Contains(path, "/icons/"):
+		w.Header().Set("content-type", "image/png")
+		_, _ = w.Write([]byte("png-from-server"))
 	case strings.HasSuffix(path, "/ota-release"):
 		_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]any{"id": "ota_rel0001"}})
 	case strings.HasSuffix(path, "/built"), strings.HasSuffix(path, "/fail"), strings.HasSuffix(path, "/complete"):
