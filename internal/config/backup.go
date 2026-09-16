@@ -159,8 +159,11 @@ func (l *loader) backup(environment string) Backup {
 	if cfg.InstanceID != "" && !backupInstanceIDPattern.MatchString(cfg.InstanceID) {
 		l.fail("BACKUP_INSTANCE_ID must match ^[a-z0-9-]{1,32}$ (it goes into the object key); leave it empty if one bucket holds only one system")
 	}
-	if cfg.Bucket.Bucket == "" || cfg.Bucket.Region == "" {
-		l.fail("BACKUP_BUCKET_BUCKET and BACKUP_BUCKET_REGION are required when backups are enabled")
+	// 桶可以只配在控制台上，所以「开了定时、env 里没有桶」是合法的——要求 env 里必须有桶
+	// 的话，在控制台上配好桶再打开定时，重启就起不来，倒下的是整个后端。没有生效的桶时
+	// 由产出备份那一刻（createBackupRun）拒绝。这里只挡 env 里填了一半
+	if cfg.Bucket.Bucket != "" && cfg.Bucket.Region == "" {
+		l.fail("BACKUP_BUCKET_REGION is required when BACKUP_BUCKET_BUCKET is set")
 	}
 	if environment == "production" && cfg.Bucket.Endpoint != "" && !strings.HasPrefix(cfg.Bucket.Endpoint, "https://") {
 		l.fail("BACKUP_BUCKET_ENDPOINT must be https in production")
@@ -168,9 +171,9 @@ func (l *loader) backup(environment string) Backup {
 
 	// 三把必须全齐，但这条**不在启动时拦**。
 	//
-	// 三把公钥是三个人各自生成的，收齐是一件跨人跨天的事；而桶是在控制台上配的，
-	// 配了桶就让 Enabled() 成立。如果启动就要求全齐，管理员在控制台点一下保存桶，
-	// 就给下一次重启埋了个起不来的雷——而那时候他不在现场。
+	// 三把公钥是三个人各自生成的，收齐是一件跨人跨天的事；而桶和定时往往先配上。
+	// 如果启动就要求全齐，先配好桶、打开定时的那次改动，就给下一次重启埋了个起不来
+	// 的雷——而那时候改的人不在现场。
 	//
 	// 真正的闸在产出备份那一刻：createBackupRun 会在不足三把时拒绝并说明差哪几把。
 	// 那里拦既不会误伤启动，报错也更接近人当时在做的事。

@@ -116,7 +116,9 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		items = append(items, backupRunView(run))
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"enabled": s.cfg.Backup.Enabled(),
+		// 同一个判据：生效的桶（控制台优先）或者开了定时。只看 env 的话，桶在控制台上
+		// 配好之后这里永远是 false
+		"enabled": strings.TrimSpace(effectiveBucket.Bucket) != "" || s.cfg.Backup.IntervalHours > 0,
 		// 三把齐了才是就绪。少一把就产不出备份（§2.1 没有降级模式），控制台
 		// 靠它把「立刻备份」置灰并说明差哪几把
 		"ready":            s.backupRecoveryReady(),
@@ -191,12 +193,22 @@ func (s *server) runBackupNow(c *gin.Context) {
 	if !s.requireBackupPassword(c, body.Password) {
 		return
 	}
-	if !s.cfg.Backup.Enabled() {
-		problem(c, http.StatusPreconditionFailed, "BACKUP_NOT_CONFIGURED",
-			"backups are not configured on this deployment")
-		return
-	}
 	run, err := s.createBackupRun(c.Request.Context(), "manual", actor(c), strings.TrimSpace(body.Reason))
+	// 三道前置各回各的码，detail 原样说差什么。只回一句「没配置」的话，
+	// 人对着一页全绿的卡片不知道该去改哪
+	for _, gate := range []struct {
+		err  error
+		code string
+	}{
+		{errBackupBucketMissing, "BACKUP_NOT_CONFIGURED"},
+		{errBackupRecipientsIncomplete, "BACKUP_RECIPIENTS_INCOMPLETE"},
+		{errBackupInstanceIDInvalid, "BACKUP_INSTANCE_ID_INVALID"},
+	} {
+		if errors.Is(err, gate.err) {
+			problem(c, http.StatusPreconditionFailed, gate.code, err.Error())
+			return
+		}
+	}
 	if errors.Is(err, errBackupInFlight) {
 		// 409 要告诉运维是**哪一条**占着闸——他没有别的出口去看
 		live, liveErr := s.liveBackupRun(c.Request.Context())

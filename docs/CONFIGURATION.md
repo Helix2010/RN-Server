@@ -172,8 +172,8 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BACKUP_RETENTION_DAYS` | `0` | 桶上生命周期规则配的保留天数，**抄一份给控制台看**。服务端不删任何对象。`0` = 未设置，控制台显示「未设置」而不是按一个猜出来的天数把下载按钮置灰 |
 | `BACKUP_BUCKET_PROVIDER` | `s3` | `s3` / `r2` / `minio` / `obs`，和发布存储认同一份清单（`objectstore.Providers`）。`obs` 是华为云，没有默认地址，`BACKUP_BUCKET_ENDPOINT` 必填。留空按老配置处理（见下一行） |
 | `BACKUP_BUCKET_FORCE_PATH_STYLE` | `false` | MinIO 必须 `true`，S3 / R2 不用。**以前是猜的**（填了 endpoint 就开），猜错的表现是连不上桶而没人在现场——`BACKUP_BUCKET_PROVIDER` 留空时仍按那条旧推断走 |
-| `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露 |
-| `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域 |
+| `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露。也可以只在控制台「平台备份 → 备份桶」里配，那份优先；env 和控制台都没有时「立刻备份」和定时都会被拒绝 |
+| `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域。env 里填了 `BACKUP_BUCKET_BUCKET` 就必填 |
 | `BACKUP_BUCKET_ENDPOINT` | 空 | 自定义 endpoint（兼容 S3 的对象存储）。生产强制 https |
 | `BACKUP_BUCKET_PREFIX` | 空 | 对象键前缀 |
 | `BACKUP_BUCKET_ACCESS_KEY_ID` | 空 | 只要三项：写对象、读对象、读版本控制状态（S3 / MinIO 是 `s3:PutObject` + `s3:GetObject` + `s3:GetBucketVersioning`；华为云是 `obs:object:PutObject` + `obs:object:GetObject` + `obs:bucket:GetBucketVersioning`）。**不要给**删除对象、删除版本、改版本控制、改生命周期——给了就能先关版本控制再覆盖真包。在机器上测：`rn-server backup-bucket-test` |

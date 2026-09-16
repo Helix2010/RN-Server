@@ -37,14 +37,11 @@ func backupServer(t *testing.T) *server {
 	return srv
 }
 
-// 三把公钥是产出备份的硬前置（§2.1 没有降级模式），所以每个用到备份的测试
-// 都得先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
+// withBackupPrerequisites 把产出备份的前置条件（三把恢复公钥、一个生效的桶）补进 cfg。
 //
-// 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光是生成密钥就要几十秒。
-// withBackupPrerequisites 把产出备份的前置条件（三把恢复公钥、实例 ID）补进 cfg。
-//
-// 三把公钥是产出备份的硬前置（§2.1 没有降级模式），所以每个用到备份的测试都得
-// 先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
+// 这两样是产出备份的硬前置（§2.1 没有降级模式；没有桶的待办注定在上传那一步失败），
+// 所以每个用到备份的测试都得先有它们——这也正是线上会发生的事：没配齐就点不动
+// 「立即备份」。
 //
 // 写成「包一层 cfg」而不是「往 s 上盖一遍」，是因为测试常常整个换掉 s.cfg 来
 // 造场景；那样会把种好的公钥一起冲掉，而表现是一堆莫名其妙的「槽位 A、B、C
@@ -53,9 +50,12 @@ func backupServer(t *testing.T) *server {
 // 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光生成密钥就要几十秒。
 func withBackupPrerequisites(t *testing.T, cfg config.Config) config.Config {
 	t.Helper()
-	// 实例 ID 也是产出备份的前置：它进对象键。测试自己指定了的不覆盖
+	// 测试自己指定了的不覆盖
 	if cfg.Backup.InstanceID == "" {
 		cfg.Backup.InstanceID = "test-instance"
+	}
+	if cfg.Backup.Bucket.Bucket == "" {
+		cfg.Backup.Bucket.Bucket, cfg.Backup.Bucket.Region = "test-bucket", "test-region"
 	}
 	keys := testRecoveryPublicKeys(t)
 	for i, name := range backupcontainer.SlotNames {

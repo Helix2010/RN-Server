@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,14 +88,73 @@ func TestDBRunNowTellsYouWhichBackupIsHoldingTheSlot(t *testing.T) {
 
 // 备份没配就不该能点。返回 412 而不是建一条注定失败的待办
 func TestDBRunNowRefusesWhenBackupsAreNotConfigured(t *testing.T) {
-	s := backupServer(t)
+	s := storageServer(t)
 	s.cfg = withBackupPrerequisites(t, config.Config{AdminPasswordHash: testAdminPasswordHash})
+	s.cfg.Backup.Bucket = config.BackupBucket{}
 	c, recorder := testContext(t, platformTenantID, "POST", "/x",
 		map[string]any{"reason": "try it anyway", "confirm": true,
 			"password": testAdminPassword})
 	s.runBackupNow(c)
 	if recorder.Code != http.StatusPreconditionFailed {
 		t.Fatalf("没配备份时应当 412，得到 %d", recorder.Code)
+	}
+	if body := decodeBody(t, recorder); body["code"] != "BACKUP_NOT_CONFIGURED" ||
+		!strings.Contains(fmt.Sprint(body["detail"]), "备份桶") {
+		t.Fatalf("要说清差的是桶: %v", body)
+	}
+	if runs, _ := s.listBackupRuns(context.Background(), 10); len(runs) != 0 {
+		t.Fatalf("被拒绝时不该留下待办，得到 %d 条", len(runs))
+	}
+}
+
+// 桶只配在控制台上、env 里一个桶的键都没有——线上正是这么配的——「立即备份」必须能建待办。
+//
+// 以前这里看的是 cfg.Backup.Enabled()，它只认 env，于是控制台上配好桶、测试连接也过了，
+// 点下去仍然是「backups are not configured on this deployment」
+func TestDBRunNowAcceptsABucketConfiguredOnlyInTheConsole(t *testing.T) {
+	s := storageServer(t)
+	s.cfg = withBackupPrerequisites(t, config.Config{AdminPasswordHash: testAdminPasswordHash})
+	s.cfg.Backup.Bucket = config.BackupBucket{}
+
+	save, saved := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
+		"provider": "obs", "endpoint": "https://obs.ap-southeast-1.myhuaweicloud.com",
+		"bucket": "console-only", "region": "ap-southeast-1",
+		"accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "s3cr3t",
+		"reason": "桶只配在控制台上", "confirm": true,
+	})
+	s.updateBackupStorage(save)
+	if saved.Code != http.StatusOK {
+		t.Fatalf("保存桶失败: %d %s", saved.Code, saved.Body.String())
+	}
+
+	status, statusRecorder := testContext(t, platformTenantID, "GET", "/x", nil)
+	s.getBackupStatus(status)
+	if body := decodeBody(t, statusRecorder); body["enabled"] != true || body["bucket"] != "console-only" {
+		t.Fatalf("状态页要按生效的桶显示已启用: %v", body)
+	}
+
+	c, recorder := testContext(t, platformTenantID, "POST", "/x",
+		map[string]any{"reason": "first backup", "confirm": true, "password": testAdminPassword})
+	s.runBackupNow(c)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("桶在控制台上配好了就该能建待办，得到 %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// 三把公钥没齐时回 412 并点名差哪几把，而不是一句 500「Unable to queue a backup」
+func TestDBRunNowNamesTheMissingRecoveryKeys(t *testing.T) {
+	s := backupServer(t)
+	s.cfg = withBackupPrerequisites(t, config.Config{AdminPasswordHash: testAdminPasswordHash})
+	s.cfg.Backup.Recipients[1] = config.BackupRecipient{}
+	c, recorder := testContext(t, platformTenantID, "POST", "/x",
+		map[string]any{"reason": "missing slot b", "confirm": true, "password": testAdminPassword})
+	s.runBackupNow(c)
+	if recorder.Code != http.StatusPreconditionFailed {
+		t.Fatalf("少一把公钥应当 412，得到 %d %s", recorder.Code, recorder.Body.String())
+	}
+	body := decodeBody(t, recorder)
+	if body["code"] != "BACKUP_RECIPIENTS_INCOMPLETE" || !strings.Contains(fmt.Sprint(body["detail"]), "B") {
+		t.Fatalf("要点名差的是槽位 B: %v", body)
 	}
 }
 

@@ -683,6 +683,12 @@ func TestBackupReadyRefusesWhenRecoveryKeysAreMissing(t *testing.T) {
 		t.Fatalf("错误要指名是哪个键，运维才知道去哪台机器改: %v", err)
 	}
 
+	// 键名抄成了服务端那一侧的：要点破，否则人盯着文件里明明有值的三行找不出原因
+	cfg.backupRecipientMisnamed[0] = true
+	if err := cfg.backupReady(); err == nil || !strings.Contains(err.Error(), "BACKUP_RECOVERY_RECIPIENT_A instead") {
+		t.Fatalf("配成服务端键名时要说破，得到: %v", err)
+	}
+
 	// 配齐三把但没有签名私钥：同样不能产出——没有签名的包，持有人无法判断
 	// 它是不是我们那台机器产出的
 	key, err := rsa.GenerateKey(rand.Reader, 3072)

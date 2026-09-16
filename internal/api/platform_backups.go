@@ -112,14 +112,20 @@ func scanBackupRun(row interface{ Scan(...any) error }) (backupRun, error) {
 
 // errBackupRecipientsIncomplete 说明三把恢复公钥还没配齐。
 //
-// 这条闸不在启动时（见 config/backup.go 里那段注释）：桶是在控制台上配的，
-// 配了桶就让备份「算投用」——启动就要求三把全齐的话，管理员在控制台点一下保存桶，
-// 就给下一次重启埋了个起不来的雷。在产出备份这一刻拦，既不误伤启动，报错也更
-// 接近人当时在做的事。
+// 这条闸不在启动时（见 config/backup.go 里那段注释）：三把公钥收齐是跨人跨天的事，
+// 启动就要求全齐的话，先配好桶、开了定时的那次改动就给下一次重启埋了个起不来的雷。
+// 在产出备份这一刻拦，既不误伤启动，报错也更接近人当时在做的事。
 var errBackupRecipientsIncomplete = errors.New("backup recovery keys are incomplete")
 
 // errBackupInstanceIDInvalid 说明 BACKUP_INSTANCE_ID 配了但进不了对象键。
 var errBackupInstanceIDInvalid = errors.New("backup instance id is invalid")
+
+// errBackupBucketMissing 说明生效的桶配置里没有桶名。
+//
+// 看的是 resolveBackupBucket（控制台优先、其次 env），**不是** cfg.Backup.Enabled()：
+// 后者只看 env，桶搬到控制台上配之后它恒为 false，「立刻备份」就一直回
+// 「没配置」——哪怕桶已经在控制台上配好、测试连接也过了。
+var errBackupBucketMissing = errors.New("backup bucket is not configured")
 
 // backupDefaultInstanceID 是没配 BACKUP_INSTANCE_ID 时写进 meta 的值。
 const backupDefaultInstanceID = "default"
@@ -143,6 +149,15 @@ func (s *server) backupMetaInstanceID() string {
 // UPDATE（live_slot 1→NULL）会让并发 INSERT 一直等到该事务提交，5 秒的事务就
 // 阻塞 5 秒——而 /backup/run 不在 10 秒数据库超时的豁免名单里，一慢就是 500。
 func (s *server) createBackupRun(ctx context.Context, trigger, requestedBy, reason string) (backupRun, error) {
+	// 没有桶的待办注定在打包机上传那一步失败，而那时候全部租户的签名密钥已经解开、
+	// 封好、在暂存盘上躺过一轮了。在这里拦
+	bucket, _, err := s.resolveBackupBucket(ctx)
+	if err != nil {
+		return backupRun{}, fmt.Errorf("读取备份桶配置: %w", err)
+	}
+	if strings.TrimSpace(bucket.Bucket) == "" {
+		return backupRun{}, fmt.Errorf("%w: 备份桶还没配，先在「备份桶」里填好并测试连接", errBackupBucketMissing)
+	}
 	// 少一把不会退回两把跑——没有降级模式（§2.1）。
 	// 在这里拦住，而不是产出到一半才发现
 	recipients := s.backupRecipients()
@@ -165,7 +180,7 @@ func (s *server) createBackupRun(ctx context.Context, trigger, requestedBy, reas
 
 	id := "pbk_" + randomID(16)
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO platform_backups(id,status,trigger_by,requested_by,reason,created_at,updated_at)
 		 VALUES(?,?,?,?,?,?,?)`,
 		id, backupStatusPending, trigger, requestedBy, reason, now, now)

@@ -169,12 +169,28 @@ func TestBackupIntervalBounds(t *testing.T) {
 	}
 }
 
-// 只开定时、不配桶也算启用：那同样是「这套东西要跑了」的宣告
-func TestBackupIntervalAloneEnablesTheGate(t *testing.T) {
+// 只开定时、env 里不配桶必须能启动：桶可以配在控制台上。
+//
+// 以前这里要求 env 里必须有桶，于是「控制台上配好桶、再打开定时」之后重启，整个后端
+// 起不来。没有生效的桶由产出备份那一刻拒绝（api 包里 createBackupRun 那道闸）
+func TestBackupIntervalWithoutAnEnvBucketStillStarts(t *testing.T) {
 	baseEnv(t)
 	t.Setenv("BACKUP_INTERVAL_HOURS", "24")
-	if _, err := Load(); err == nil {
-		t.Fatal("an interval without recovery keys must be refused")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("the bucket may live in the console; an interval alone must not stop startup: %v", err)
+	}
+	if !cfg.Backup.Enabled() {
+		t.Fatal("an interval still declares backups as in use")
+	}
+}
+
+// env 里填了桶名没填区域是写了一半，当场说出来
+func TestBackupEnvBucketNeedsARegion(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("BACKUP_BUCKET_BUCKET", "rn-platform-backup")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BACKUP_BUCKET_REGION") {
+		t.Fatalf("a bucket without a region must be refused by name, got %v", err)
 	}
 }
 

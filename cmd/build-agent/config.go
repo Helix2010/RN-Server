@@ -50,6 +50,11 @@ type config struct {
 	BackupRecipients [backupcontainer.SlotCount]*rsa.PublicKey
 	// BackupFingerprints 和上面一一对应，用来和服务端下发的比对
 	BackupFingerprints [backupcontainer.SlotCount]string
+	// backupRecipientMisnamed 记下哪几个槽位没配、却配了服务端那一侧的键名
+	// （BACKUP_RECOVERY_RECIPIENT_*）。两台机器的 env 长得几乎一样，照着服务端那段
+	// 抄过来是最容易犯的错，而它的表现只是一句「没配」——人盯着文件里明明有值的三行
+	// 找不出原因。报错时点破它
+	backupRecipientMisnamed [backupcontainer.SlotCount]bool
 	// BackupSigningKey 给内层密文签名；BackupSigningPublicKey 登记给服务端
 	BackupSigningKey       ed25519.PrivateKey
 	BackupSigningPublicKey string
@@ -62,6 +67,11 @@ type config struct {
 // 「打包机没配恢复公钥」，而不是静默不备份。
 func (c config) backupReady() error {
 	for i, slot := range backupcontainer.SlotNames {
+		if c.BackupRecipients[i] == nil && c.backupRecipientMisnamed[i] {
+			return fmt.Errorf("BUILD_AGENT_RECOVERY_RECIPIENT_%s is not configured on this build machine: "+
+				"its env has BACKUP_RECOVERY_RECIPIENT_%s instead, which is the server's name for the key. "+
+				"Rename it to BUILD_AGENT_RECOVERY_RECIPIENT_%s and restart build-agent", slot, slot, slot)
+		}
 		if c.BackupRecipients[i] == nil {
 			return fmt.Errorf("BUILD_AGENT_RECOVERY_RECIPIENT_%s is not configured on this build machine", slot)
 		}
@@ -90,6 +100,14 @@ func loadConfig() (config, error) {
 		PollEvery:          10 * time.Second,
 		KeystorePassphrase: envOr("BUILD_KEYSTORE_PASSPHRASE", ""),
 		StateDir:           envOr("BUILD_AGENT_STATE_DIR", ""),
+	}
+	// 服务端那一侧的键名只用来在报错时点破「抄错了键名」，**不当作公钥读**：打包机只认自己那组键
+	for i, raw := range []string{
+		envOr("BACKUP_RECOVERY_RECIPIENT_A", ""),
+		envOr("BACKUP_RECOVERY_RECIPIENT_B", ""),
+		envOr("BACKUP_RECOVERY_RECIPIENT_C", ""),
+	} {
+		cfg.backupRecipientMisnamed[i] = raw != ""
 	}
 	// 三把恢复公钥。值是 PEM 的 base64 单行——PEM 带换行，直接写进 systemd 的
 	// EnvironmentFile 极易写坏，而这个键要用的那一天正好最不该出意外。

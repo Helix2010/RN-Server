@@ -39,10 +39,9 @@ func NewBackupScheduler(cfg config.Config, db *sql.DB) *BackupScheduler {
 
 // Run 一直跑到 ctx 结束。
 func (b *BackupScheduler) Run(ctx context.Context) {
-	if !b.server.cfg.Backup.Enabled() {
-		slog.Info("platform backups are not configured; the scheduler is idle")
-		return
-	}
+	// 不看 cfg.Backup.Enabled()：那只看 env，桶在控制台上配的部署里它恒为 false，
+	// 调度器会整个不跑——包括回收。那样一条没人领的 pending 会永远占着闸，此后
+	// 「立即备份」一直 409。回收只是两条带索引的 UPDATE，没投用的部署跑它也不花什么
 	slog.Info("platform backup scheduler started",
 		"intervalHours", b.server.cfg.Backup.IntervalHours, "instanceId", b.server.cfg.Backup.InstanceID)
 
