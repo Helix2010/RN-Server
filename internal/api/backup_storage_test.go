@@ -39,7 +39,7 @@ func TestDBBackupBucketIsMaintainedFromTheConsole(t *testing.T) {
 	s := storageServer(t)
 
 	c, recorder := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
-		"bucket": "rn-backup", "region": "ap-southeast-1", "prefix": "prod/",
+		"provider": "s3", "bucket": "rn-backup", "region": "ap-southeast-1", "prefix": "prod/",
 		"accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "s3cr3t",
 		"reason": "第一次配桶", "confirm": true,
 	})
@@ -118,7 +118,7 @@ func TestDBBackupBucketFallsBackToEnv(t *testing.T) {
 func TestDBBackupBucketWriteNeedsAReason(t *testing.T) {
 	s := storageServer(t)
 	c, recorder := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
-		"bucket": "x", "region": "r", "confirm": true,
+		"provider": "s3", "bucket": "x", "region": "r", "confirm": true,
 	})
 	s.updateBackupStorage(c)
 	if recorder.Code != http.StatusBadRequest {
@@ -131,7 +131,7 @@ func TestDBBackupBucketRejectsAStaleWrite(t *testing.T) {
 	s := storageServer(t)
 	save := func(version int, bucket string) int {
 		c, recorder := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
-			"bucket": bucket, "region": "r", "expectedVersion": version,
+			"provider": "s3", "bucket": bucket, "region": "r", "expectedVersion": version,
 			"reason": "并发写", "confirm": true,
 		})
 		s.updateBackupStorage(c)
@@ -143,5 +143,31 @@ func TestDBBackupBucketRejectsAStaleWrite(t *testing.T) {
 	// 现在库里是 version=1；有人拿着 version=1 之前读到的旧值再写
 	if code := save(99, "second"); code != http.StatusConflict {
 		t.Errorf("拿着过期版本号写应当 409，得到 %d", code)
+	}
+}
+
+// provider 和 path style 是后加的两项。老配置里没有它们，而 ForcePathStyle 的
+// 零值是 false——直接用零值会让一个本来连得上的 MinIO 桶在升级之后连不上，
+// 而备份是无人值守跑的，没人在现场看那条错误。
+func TestBackupBucketDefaultsKeepOldConfigsWorking(t *testing.T) {
+	// 老配置：没有 provider，但填了 endpoint → 沿用以前那条推断
+	legacy := applyBackupBucketDefaults(config.BackupBucket{
+		Endpoint: "https://minio.internal", Bucket: "b", Region: "r",
+	})
+	if legacy.Provider != "s3" || !legacy.ForcePathStyle {
+		t.Errorf("老配置应当沿用「填了 endpoint 就开 path style」: %+v", legacy)
+	}
+	// 老配置且没有 endpoint → 不开
+	plain := applyBackupBucketDefaults(config.BackupBucket{Bucket: "b", Region: "r"})
+	if plain.ForcePathStyle {
+		t.Errorf("没有 endpoint 的老配置不该开 path style: %+v", plain)
+	}
+	// 显式配过的：说什么就是什么，不再推断
+	explicit := applyBackupBucketDefaults(config.BackupBucket{
+		Provider: "r2", Endpoint: "https://account.r2.cloudflarestorage.com",
+		Bucket: "b", Region: "auto", ForcePathStyle: false,
+	})
+	if explicit.ForcePathStyle {
+		t.Errorf("显式配了 provider 就不该再推断 path style: %+v", explicit)
 	}
 }

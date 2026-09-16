@@ -15,43 +15,58 @@ import (
 	"github.com/Helix2010/RN-Server/internal/config"
 )
 
-// 三把恢复公钥在控制台上录入（设计 §6）。
+// 三把恢复公钥只从配置文件读，控制台**只显示不编辑**（设计 §4.2）。
 //
-// 为什么不能只认 env：三把公钥是**三个人各自生成**的，生成和交付是一件跨人、
-// 跨时间的事——A 今天给了，B 明天才给。只认 env 的话，每收到一把就要改一次
-// env 重启一次整个 wallet 后端，而且在三把齐之前服务端**根本起不来**
-// （config 里那条「三把必须全齐」的硬前置）。那等于这个功能没法从控制台启用。
+// 中间有一版把它们挪进了 app_configs，让管理员在控制台录入。那一版开了一条
+// 不该有的路：只拿到**数据库写权限**的人（注入、库凭据泄露、一个被盗的管理员
+// 会话）可以改掉外层收件人，而外层里装着 rn-foundation.env——STORAGE_MASTER_KEY、
+// ADMIN_PASSWORD_HASH、TLS 私钥。等下一次备份，这些就封给他了，拿到主密钥之后
+// 库里所有密文一起解开。公钥回到配置文件，改它需要 root 上机器，而能做到这个的人
+// 已经不需要绕这一圈。
 //
-// env 仍然是回退，也仍然是「库也没了」那天唯一还在的那份。
+// 代价是换持有人要运维上两台机器改配置再重启。**这件事本来就应该需要一个人到场。**
 //
-// 安全性不靠这里：打包机**不接受服务端下发的公钥**，它只认自己 env 里那三把，
-// 拿服务端下发的指纹逐一比对，对不上就拒绝产出备份并上报原因（§4.2）。
-// 所以就算有人写了库把公钥换掉，换来的也只是「备份失败并指名哪一把对不上」。
-const backupRecipientsConfigKey = "backup.recipients"
+// 打包机那一侧同样只认自己 env 里那三把（BUILD_AGENT_RECOVERY_RECIPIENT_*），
+// 服务端下发的只是指纹、只用于比对：服务端被攻破也改不了签名密钥最终封给谁。
+// 两边各管各的 env，是这个架构里两个安全域各自独立的形状。
 
-type storedBackupRecipient struct {
-	Slot string `json:"slot"`
-	// PublicKey 是 PEM 公钥的 base64（单行），和 env 里那三个键同样的格式
-	PublicKey string `json:"publicKey"`
-	// Holder 是「由谁保管」。印进 README-FIRST：拿到包的人得知道该去找谁
-	Holder string `json:"holder,omitempty"`
+// backupRecipients 返回按槽位顺序 A/B/C 的三把公钥。没配的那一项 Fingerprint 是
+// 空串——调用方据此判断「配齐了没有」。
+func (s *server) backupRecipients() [backupcontainer.SlotCount]config.BackupRecipient {
+	return s.cfg.Backup.Recipients
 }
 
-type backupRecipientsRecord struct {
-	Slots     []storedBackupRecipient `json:"slots"`
-	Version   int                     `json:"-"`
+// legacyBackupRecipientsKey 是上一版存在库里的那条记录。
+//
+// 现在**不再有任何东西读它来封包**，留着只为一件事：如果这套东西是在控制台上
+// 配好的，升级之后那三把会安静地「不见了」，而表现是下一次备份报「槽位 A/B/C
+// 还没有公钥」——人会以为配置丢了。控制台把这条遗留记录原样显示出来，让运维
+// 照着抄进 env，抄完按面板里那条 SQL 删掉它，横幅自然消失。
+const legacyBackupRecipientsKey = "backup.recipients"
+
+type legacyBackupRecipient struct {
+	Slot      string `json:"slot"`
+	PublicKey string `json:"publicKey"`
+	Holder    string `json:"holder,omitempty"`
+}
+
+type legacyBackupRecipientsRecord struct {
+	Slots     []legacyBackupRecipient `json:"slots"`
 	UpdatedBy string                  `json:"-"`
 	UpdatedAt time.Time               `json:"-"`
 }
 
-func (s *server) backupRecipientsRecord(ctx context.Context) (*backupRecipientsRecord, error) {
+func (s *server) legacyBackupRecipients(ctx context.Context) (*legacyBackupRecipientsRecord, error) {
+	if s.db == nil {
+		return nil, nil
+	}
 	var raw []byte
-	var record backupRecipientsRecord
+	var record legacyBackupRecipientsRecord
 	err := s.db.QueryRowContext(ctx,
-		`SELECT config_value, version, updated_by, updated_at FROM app_configs
+		`SELECT config_value, updated_by, updated_at FROM app_configs
 		  WHERE tenant_id=? AND config_key=? LIMIT 1`,
-		platformTenantID, backupRecipientsConfigKey).
-		Scan(&raw, &record.Version, &record.UpdatedBy, &record.UpdatedAt)
+		platformTenantID, legacyBackupRecipientsKey).
+		Scan(&raw, &record.UpdatedBy, &record.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -64,196 +79,49 @@ func (s *server) backupRecipientsRecord(ctx context.Context) (*backupRecipientsR
 	return &record, nil
 }
 
-// resolveBackupRecipients 返回当前生效的三个槽位，按 A/B/C 顺序。
-// 某个槽位没配时那一项的 Fingerprint 是空串——调用方据此判断「配齐了没有」。
-func (s *server) resolveBackupRecipients(ctx context.Context) ([backupcontainer.SlotCount]config.BackupRecipient, []string, error) {
-	out := s.cfg.Backup.Recipients
-	holders := make([]string, backupcontainer.SlotCount)
-
-	record, err := s.backupRecipientsRecord(ctx)
-	if err != nil {
-		return out, holders, err
-	}
-	if record == nil {
-		return out, holders, nil
-	}
-	for _, stored := range record.Slots {
-		index := slotIndex(stored.Slot)
-		if index < 0 {
-			continue
-		}
-		holders[index] = stored.Holder
-		if strings.TrimSpace(stored.PublicKey) == "" {
-			continue
-		}
-		parsed, err := config.ParseBackupRecipient(stored.PublicKey)
-		if err != nil {
-			// 存进去的时候校验过；这里还坏就说明有人直接写了库。
-			// 不静默回落到 env——那会让人以为控制台上那把在生效
-			return out, holders, err
-		}
-		out[index] = parsed
-	}
-	return out, holders, nil
-}
-
-func slotIndex(slot string) int {
-	for i, name := range backupcontainer.SlotNames {
-		if name == slot {
-			return i
-		}
-	}
-	return -1
-}
-
-// getBackupRecipients 是控制台那张公钥表单的数据源。
+// getBackupRecipients 是控制台那张只读卡片的数据源。
+//
+// 三个 env 键名一起回：控制台要照着它们生成「去哪台机器、改哪个键、怎么重启」
+// 那段指令，而键名写在前端就会和后端漂开——漂开的表现是运维照着控制台改了一个
+// 根本没人读的键，然后备份继续报「还没有公钥」。
 func (s *server) getBackupRecipients(c *gin.Context) {
-	ctx := c.Request.Context()
-	record, err := s.backupRecipientsRecord(ctx)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_READ_FAILED", err.Error())
-		return
-	}
-	resolved, holders, err := s.resolveBackupRecipients(ctx)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_READ_FAILED", err.Error())
-		return
-	}
-	stored := map[string]storedBackupRecipient{}
-	if record != nil {
-		for _, item := range record.Slots {
-			stored[item.Slot] = item
-		}
-	}
-	slots := []gin.H{}
+	recipients := s.backupRecipients()
+	slots := make([]gin.H, 0, backupcontainer.SlotCount)
 	for i, name := range backupcontainer.SlotNames {
-		item := stored[name]
+		recipient := recipients[i]
 		slots = append(slots, gin.H{
 			"slot": name,
-			// 公钥不是机密，可以回给前端——回了才能在控制台上核对和修改
-			"publicKey":   nullableString(item.PublicKey),
-			"fingerprint": nullableString(resolved[i].Fingerprint),
-			"holder":      nullableString(holders[i]),
-			"configured":  resolved[i].Fingerprint != "",
-			"source":      recipientSource(item.PublicKey, resolved[i].Fingerprint),
+			// 公钥不是机密。回它是为了让控制台能把**服务端上真正生效的那个值**
+			// 填进打包机那条指令里——两边不一致这类事故就是这么消掉的
+			"publicKey":    nullableString(recipient.Encoded),
+			"fingerprint":  nullableString(recipient.Fingerprint),
+			"holder":       nullableString(recipient.Holder),
+			"configured":   recipient.Fingerprint != "",
+			"serverEnvKey": "BACKUP_RECOVERY_RECIPIENT_" + name,
+			"holderEnvKey": "BACKUP_RECOVERY_HOLDER_" + name,
+			"agentEnvKey":  "BUILD_AGENT_RECOVERY_RECIPIENT_" + name,
 		})
 	}
-	view := gin.H{"slots": slots, "threshold": "2-of-3", "version": 0}
-	if record != nil {
-		view["version"] = record.Version
-		view["updatedBy"] = record.UpdatedBy
-		view["updatedAt"] = iso(record.UpdatedAt)
+
+	view := gin.H{"slots": slots, "threshold": "2-of-3", "source": "env"}
+	if record, err := s.legacyBackupRecipients(c.Request.Context()); err == nil && record != nil {
+		legacy := make([]gin.H, 0, len(record.Slots))
+		for _, item := range record.Slots {
+			if strings.TrimSpace(item.PublicKey) == "" && strings.TrimSpace(item.Holder) == "" {
+				continue
+			}
+			legacy = append(legacy, gin.H{
+				"slot": item.Slot, "publicKey": nullableString(item.PublicKey),
+				"holder": nullableString(item.Holder),
+			})
+		}
+		if len(legacy) > 0 {
+			view["legacy"] = gin.H{
+				"configKey": legacyBackupRecipientsKey, "slots": legacy,
+				"updatedBy": record.UpdatedBy, "updatedAt": iso(record.UpdatedAt),
+			}
+		}
 	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, view)
-}
-
-func recipientSource(stored, fingerprint string) string {
-	switch {
-	case strings.TrimSpace(stored) != "":
-		return "console"
-	case fingerprint != "":
-		return "env"
-	default:
-		return "none"
-	}
-}
-
-type backupRecipientsWrite struct {
-	Slots []struct {
-		Slot      string `json:"slot"`
-		PublicKey string `json:"publicKey"`
-		Holder    string `json:"holder"`
-	} `json:"slots"`
-	ExpectedVersion int    `json:"expectedVersion"`
-	Reason          string `json:"reason"`
-	Confirm         bool   `json:"confirm"`
-}
-
-// updateBackupRecipients 录入/替换三把公钥和保管人。
-//
-// 允许只填其中一两把：三把是三个人各自生成的，收到一把就录一把，不必攒齐再一次性填。
-// 「三把必须齐」那条在**真正要产出备份的时候**才拦（createBackupRun），
-// 而不是在这里——那样会逼人把公钥攒在别处，反而更危险。
-func (s *server) updateBackupRecipients(c *gin.Context) {
-	var body backupRecipientsWrite
-	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
-		problem(c, http.StatusBadRequest, "INVALID_BACKUP_RECIPIENTS", "reason and confirm=true are required")
-		return
-	}
-
-	ctx := c.Request.Context()
-	existing, err := s.backupRecipientsRecord(ctx)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_READ_FAILED", err.Error())
-		return
-	}
-	currentVersion := 0
-	if existing != nil {
-		currentVersion = existing.Version
-	}
-	if body.ExpectedVersion != 0 && body.ExpectedVersion != currentVersion {
-		problem(c, http.StatusConflict, "BACKUP_RECIPIENTS_STALE",
-			"someone else changed the recovery keys; reload and try again")
-		return
-	}
-
-	next := make([]storedBackupRecipient, 0, backupcontainer.SlotCount)
-	byFingerprint := map[string]string{}
-	for _, name := range backupcontainer.SlotNames {
-		item := storedBackupRecipient{Slot: name}
-		for _, incoming := range body.Slots {
-			if incoming.Slot != name {
-				continue
-			}
-			item.PublicKey = strings.TrimSpace(incoming.PublicKey)
-			item.Holder = strings.TrimSpace(incoming.Holder)
-		}
-		if item.PublicKey != "" {
-			parsed, err := config.ParseBackupRecipient(item.PublicKey)
-			if err != nil {
-				problem(c, http.StatusBadRequest, "INVALID_BACKUP_RECIPIENTS",
-					"槽位 "+name+" 的公钥读不了："+err.Error())
-				return
-			}
-			// 两把相同 = 那一组的两层封给同一个人 = 他一个人就能开。
-			// 这是「填串了」最常见的表现，而它的后果安静得可怕
-			if other, seen := byFingerprint[parsed.Fingerprint]; seen {
-				problem(c, http.StatusBadRequest, "INVALID_BACKUP_RECIPIENTS",
-					"槽位 "+other+" 和 "+name+" 是同一把公钥："+
-						other+name+" 那一组会被封给同一个人两次，他一个人就能打开")
-				return
-			}
-			byFingerprint[parsed.Fingerprint] = name
-		}
-		next = append(next, item)
-	}
-
-	encoded, err := json.Marshal(backupRecipientsRecord{Slots: next})
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_SAVE_FAILED", err.Error())
-		return
-	}
-	now := time.Now().UTC()
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
-		 VALUES(?,?,?,1,?,?)
-		 ON DUPLICATE KEY UPDATE config_value=VALUES(config_value),version=version+1,
-		   updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)`,
-		platformTenantID, backupRecipientsConfigKey, encoded, actor(c), now); err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_SAVE_FAILED", err.Error())
-		return
-	}
-
-	configured := []string{}
-	for _, item := range next {
-		if item.PublicKey != "" {
-			configured = append(configured, item.Slot)
-		}
-	}
-	s.auditNow(newAudit(platformTenantID, actor(c), "backup_recipients_updated", "app-config",
-		backupRecipientsConfigKey, strings.TrimSpace(body.Reason), requestID(c),
-		map[string]any{"configured": configured}))
-	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{"status": "saved", "configured": configured})
 }

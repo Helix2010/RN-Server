@@ -27,6 +27,8 @@ import (
 const backupBucketConfigKey = "backup.bucket"
 
 type storedBackupBucket struct {
+	Provider                 string `json:"provider,omitempty"`
+	ForcePathStyle           bool   `json:"forcePathStyle,omitempty"`
 	Endpoint                 string `json:"endpoint,omitempty"`
 	Region                   string `json:"region"`
 	Bucket                   string `json:"bucket"`
@@ -53,13 +55,15 @@ func (s *server) resolveBackupBucket(ctx context.Context) (config.BackupBucket, 
 		return config.BackupBucket{}, "", err
 	}
 	if record == nil || strings.TrimSpace(record.Value.Bucket) == "" {
-		return s.cfg.Backup.Bucket, "env", nil
+		return applyBackupBucketDefaults(s.cfg.Backup.Bucket), "env", nil
 	}
 	out := config.BackupBucket{
-		Endpoint: record.Value.Endpoint,
-		Region:   record.Value.Region,
-		Bucket:   record.Value.Bucket,
-		Prefix:   record.Value.Prefix,
+		Provider:       record.Value.Provider,
+		ForcePathStyle: record.Value.ForcePathStyle,
+		Endpoint:       record.Value.Endpoint,
+		Region:         record.Value.Region,
+		Bucket:         record.Value.Bucket,
+		Prefix:         record.Value.Prefix,
 	}
 	// 凭据没填就沿用 env 的那一份：允许「桶名落库、凭据仍在 env」这种过渡状态
 	out.AccessKeyID, out.SecretAccessKey = s.cfg.Backup.Bucket.AccessKeyID, s.cfg.Backup.Bucket.SecretAccessKey
@@ -74,7 +78,21 @@ func (s *server) resolveBackupBucket(ctx context.Context) (config.BackupBucket, 
 		}
 		out.AccessKeyID, out.SecretAccessKey = id, secret
 	}
-	return out, "console", nil
+	return applyBackupBucketDefaults(out), "console", nil
+}
+
+// applyBackupBucketDefaults 补上 provider 和 path style。
+//
+// 这两项是后加的。老配置（库里那条 JSON 或者 env）里没有它们，而 ForcePathStyle
+// 的零值是 false——直接用零值会让一个本来连得上的 MinIO 桶在升级之后连不上，
+// 而备份是无人值守跑的，没人在现场看那条错误。所以：**只有在 provider 也没有的
+// 时候**才认定是老配置，沿用以前那条推断（填了 endpoint 就开）。
+func applyBackupBucketDefaults(bucket config.BackupBucket) config.BackupBucket {
+	if strings.TrimSpace(bucket.Provider) == "" {
+		bucket.Provider = "s3"
+		bucket.ForcePathStyle = strings.TrimSpace(bucket.Endpoint) != ""
+	}
+	return bucket
 }
 
 func (s *server) decryptBackupBucketField(encoded, field string) (string, error) {
@@ -124,11 +142,13 @@ func (s *server) getBackupStorage(c *gin.Context) {
 		return
 	}
 	view := gin.H{
-		"source":   source,
-		"endpoint": nullableString(effective.Endpoint),
-		"region":   nullableString(effective.Region),
-		"bucket":   nullableString(effective.Bucket),
-		"prefix":   nullableString(effective.Prefix),
+		"source":         source,
+		"provider":       effective.Provider,
+		"forcePathStyle": effective.ForcePathStyle,
+		"endpoint":       nullableString(effective.Endpoint),
+		"region":         nullableString(effective.Region),
+		"bucket":         nullableString(effective.Bucket),
+		"prefix":         nullableString(effective.Prefix),
 		// 只说配没配。凭据的值任何接口都不回
 		"credentialsConfigured": effective.AccessKeyID != "" && effective.SecretAccessKey != "",
 		"version":               0,
@@ -145,6 +165,8 @@ func (s *server) getBackupStorage(c *gin.Context) {
 }
 
 type backupBucketWrite struct {
+	Provider        string `json:"provider"`
+	ForcePathStyle  bool   `json:"forcePathStyle"`
 	Endpoint        string `json:"endpoint"`
 	Region          string `json:"region"`
 	Bucket          string `json:"bucket"`
@@ -167,8 +189,14 @@ func (s *server) updateBackupStorage(c *gin.Context) {
 	body.Bucket = strings.TrimSpace(body.Bucket)
 	body.Region = strings.TrimSpace(body.Region)
 	body.Endpoint = strings.TrimSpace(body.Endpoint)
+	body.Provider = strings.ToLower(strings.TrimSpace(body.Provider))
 	if body.Bucket == "" || body.Region == "" {
 		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET", "bucket and region are required")
+		return
+	}
+	// 和发布存储认同一套提供商，别在两个地方各长出一套
+	if !oneOf(body.Provider, "s3", "r2", "minio") {
+		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET", "provider must be s3, r2 or minio")
 		return
 	}
 	if s.cfg.Environment == "production" && body.Endpoint != "" && !strings.HasPrefix(body.Endpoint, "https://") {
@@ -201,6 +229,7 @@ func (s *server) updateBackupStorage(c *gin.Context) {
 
 	value.Endpoint, value.Region = body.Endpoint, body.Region
 	value.Bucket, value.Prefix = body.Bucket, strings.TrimSpace(body.Prefix)
+	value.Provider, value.ForcePathStyle = body.Provider, body.ForcePathStyle
 	if body.AccessKeyID != "" {
 		if s.secrets == nil {
 			problem(c, http.StatusPreconditionFailed, "BACKUP_BUCKET_NO_MASTER_KEY",
@@ -241,7 +270,7 @@ func (s *server) updateBackupStorage(c *gin.Context) {
 
 	s.auditNow(newAudit(platformTenantID, actor(c), "backup_bucket_updated", "app-config",
 		backupBucketConfigKey, strings.TrimSpace(body.Reason), requestID(c),
-		map[string]any{"bucket": value.Bucket, "region": value.Region,
+		map[string]any{"bucket": value.Bucket, "region": value.Region, "provider": value.Provider,
 			"credentialsChanged": body.AccessKeyID != ""}))
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"status": "saved", "bucket": value.Bucket})

@@ -27,7 +27,7 @@ const advSigningFingerprint = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44e
 func advServer(t *testing.T) *server {
 	t.Helper()
 	s := backupServer(t)
-	s.cfg = config.Config{Environment: "test"}
+	s.cfg = withBackupRecipients(t, config.Config{Environment: "test"})
 	// 登记一把签名公钥，否则 checkBackupSigningFingerprint 一律判死
 	if err := s.saveBackupSigningKey(context.Background(), backupSigningKeyRecord{
 		Current: backupSigningKey{PublicKey: "unused", Fingerprint: advSigningFingerprint},
@@ -326,7 +326,9 @@ func TestAdvSchedulerUnderRestartsAndIntervalChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	sched := &BackupScheduler{server: s, tick: time.Minute}
-	s.cfg.Backup = config.Backup{IntervalHours: 24, InstanceID: "inst", Bucket: config.BackupBucket{Bucket: "b"}}
+	s.cfg = withBackupRecipients(t, config.Config{Backup: config.Backup{
+		IntervalHours: 24, InstanceID: "inst", Bucket: config.BackupBucket{Bucket: "b"},
+	}})
 
 	// 第一次：库里什么都没有 -> 立刻建一条
 	sched.maybeSchedule(context.Background())

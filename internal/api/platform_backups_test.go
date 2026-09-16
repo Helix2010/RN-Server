@@ -6,10 +6,10 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
+	"github.com/Helix2010/RN-Server/internal/config"
 	"sync"
 	"testing"
 	"time"
@@ -33,7 +33,7 @@ func backupServer(t *testing.T) *server {
 		t.Fatalf("清掉上一轮的记录: %v", err)
 	}
 	srv := &server{db: db}
-	seedBackupRecipients(t, srv)
+	srv.cfg = withBackupRecipients(t, config.Config{})
 	return srv
 }
 
@@ -41,26 +41,28 @@ func backupServer(t *testing.T) *server {
 // 都得先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
 //
 // 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光是生成密钥就要几十秒。
-func seedBackupRecipients(t *testing.T, s *server) {
+// withBackupRecipients 把三把恢复公钥补进 cfg。
+//
+// 三把公钥是产出备份的硬前置（§2.1 没有降级模式），所以每个用到备份的测试都得
+// 先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
+//
+// 写成「包一层 cfg」而不是「往 s 上盖一遍」，是因为测试常常整个换掉 s.cfg 来
+// 造场景；那样会把种好的公钥一起冲掉，而表现是一堆莫名其妙的「槽位 A、B、C
+// 还没有公钥」。这么写，换 cfg 的地方自然带着它们。
+//
+// 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光生成密钥就要几十秒。
+func withBackupRecipients(t *testing.T, cfg config.Config) config.Config {
 	t.Helper()
 	keys := testRecoveryPublicKeys(t)
-	slots := []map[string]string{}
 	for i, name := range backupcontainer.SlotNames {
-		slots = append(slots, map[string]string{
-			"slot": name, "publicKey": keys[i], "holder": "持有人" + name,
-		})
+		parsed, err := config.ParseBackupRecipient(keys[i])
+		if err != nil {
+			t.Fatalf("解析测试用恢复公钥: %v", err)
+		}
+		parsed.Holder = "持有人" + name
+		cfg.Backup.Recipients[i] = parsed
 	}
-	encoded, err := json.Marshal(map[string]any{"slots": slots})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(
-		`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
-		 VALUES(?,?,?,1,'test',UTC_TIMESTAMP(3))
-		 ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)`,
-		platformTenantID, backupRecipientsConfigKey, encoded); err != nil {
-		t.Fatalf("种恢复公钥: %v", err)
-	}
+	return cfg
 }
 
 var (

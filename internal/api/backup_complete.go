@@ -465,16 +465,13 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 		return backupbundle.Input{}, err
 	}
 
-	resolvedRecipients, _, err := s.resolveBackupRecipients(ctx)
-	if err != nil {
-		return backupbundle.Input{}, err
-	}
+	resolvedRecipients := s.backupRecipients()
 	recipients := make([]backupbundle.Recipient, 0, backupcontainer.SlotCount)
 	for i, slot := range backupcontainer.SlotNames {
 		configured := resolvedRecipients[i]
 		recipients = append(recipients, backupbundle.Recipient{
 			Slot: slot, Fingerprint: configured.Fingerprint, Key: configured.Key,
-			Holder: s.backupHolderName(ctx, slot),
+			Holder: strings.TrimSpace(configured.Holder),
 		})
 	}
 
@@ -586,29 +583,4 @@ func serverBuildVersion() string {
 		return "unknown"
 	}
 	return "sha256:" + sum[:12]
-}
-
-// backupRecoveryHoldersKey 存「哪个槽位由谁保管」。
-//
-// 这一行由运维在控制台上填，印进 README-FIRST.txt——拿到包的人得知道该去找谁。
-// 它不是机密，但它是恢复流程里唯一能把「槽位 A」翻译成一个具体的人的东西。
-const backupRecoveryHoldersKey = "backup.recovery.holders"
-
-func (s *server) backupHolders(ctx context.Context) map[string]string {
-	var raw []byte
-	err := s.db.QueryRowContext(ctx,
-		`SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=? LIMIT 1`,
-		platformTenantID, backupRecoveryHoldersKey).Scan(&raw)
-	if err != nil {
-		return map[string]string{}
-	}
-	holders := map[string]string{}
-	if json.Unmarshal(raw, &holders) != nil {
-		return map[string]string{}
-	}
-	return holders
-}
-
-func (s *server) backupHolderName(ctx context.Context, slot string) string {
-	return strings.TrimSpace(s.backupHolders(ctx)[slot])
 }

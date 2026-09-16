@@ -210,13 +210,11 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	backup := platform.Group("/backup", s.requireBackupSameOrigin())
 	backup.GET("", s.getBackupStatus)
 	backup.POST("/run", s.runBackupNow)
-	backup.PUT("/holders", s.updateBackupHolders)
 	// 桶在控制台上维护：换桶、轮凭据是平台管理员的日常运维，
 	// 不该需要改 env 再重启整个后端
-	// 三把恢复公钥在控制台上录入：它们是三个人各自生成的，收齐是跨人跨天的事，
-	// 只认 env 的话在收齐之前服务端根本起不来（见 backup_recipients.go 开头）
+	// 三把恢复公钥只从配置文件读，这里只读不写：能写库的人不该能改掉
+	// 「外层封给谁」（见 backup_recipients.go 开头）
 	backup.GET("/recipients", s.getBackupRecipients)
-	backup.PUT("/recipients", s.updateBackupRecipients)
 	backup.GET("/storage", s.getBackupStorage)
 	backup.PUT("/storage", s.updateBackupStorage)
 	backup.POST("/storage/test", s.testBackupBucket)

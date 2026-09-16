@@ -151,16 +151,27 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 
 打包机硬盘坏了，数据库里的签名密钥全在但没有任何东西能打开它们——能解开的只有打包机上那个 `agent-key`。这组键配的就是防这件事的备份（设计 `docs/design/platform-backup-recovery-2026-09-15.md`）。
 
-**这组键要么全配，要么全不配。** 只要配了桶（`BACKUP_BUCKET_BUCKET`）或开了定时（`BACKUP_INTERVAL_HOURS`），就算「备份已投用」，三把恢复公钥从那一刻起是硬前置，缺一把服务端**拒绝启动**。没投用时这组键全空，服务端照常跑——不能让一个还没上线的功能扣住整个后端。
+**三把恢复公钥只从这里读，控制台上只显示不编辑。** 能写数据库的人不该能改掉「外层封给谁」——外层里装着 `rn-foundation.env`（`STORAGE_MASTER_KEY`、`ADMIN_PASSWORD_HASH`、TLS 私钥）。换持有人要运维上两台机器改配置再重启，这件事本来就应该需要一个人到场。
+
+**三把要么全填、要么全空。** 填了一半是打字错误或者复制粘贴漏了一行，服务端**拒绝启动**并指名缺哪几个键。三把全空时服务端照常跑，但点「立刻备份」会被拒并告诉你差哪几把——没有降级模式，两把不会凑合着跑。
+
+指纹不配：它是公钥的函数（DER SPKI 的 SHA-256，64 位小写 hex），由服务端算出来显示在控制台上，三个持有人各自核对自己那一行。
+
+打包机那一侧是**另外三个键**（`BUILD_AGENT_RECOVERY_RECIPIENT_A/_B/_C`，见 `deploy/build-agent/rn-build-agent.env.example`），值一模一样。它只认自己 env 里那三把，服务端下发的只是指纹、只用于比对——服务端被攻破也改不了签名密钥最终封给谁。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `BACKUP_RECOVERY_RECIPIENT_A` | 空 | 槽位 A 的恢复公钥，**PEM 的 base64，单行**。RSA ≥ 3072 位（4096 推荐） |
 | `BACKUP_RECOVERY_RECIPIENT_B` | 空 | 槽位 B，同上 |
-| `BACKUP_RECOVERY_RECIPIENT_C` | 空 | 槽位 C，同上。三把**必须两两不同** |
+| `BACKUP_RECOVERY_RECIPIENT_C` | 空 | 槽位 C，同上。三把**必须两两不同**——两把相同就是那一组的两层封给同一个人，他一个人就能开 |
+| `BACKUP_RECOVERY_HOLDER_A` | 空 | 槽位 A 由谁保管，一行人名。印进 `README-FIRST.txt`：拿到包的人得知道该去找谁。不填只是恢复说明里少一句，不影响产出 |
+| `BACKUP_RECOVERY_HOLDER_B` | 空 | 槽位 B，同上 |
+| `BACKUP_RECOVERY_HOLDER_C` | 空 | 槽位 C，同上 |
 | `BACKUP_INSTANCE_ID` | 空 | 进对象键前缀，`^[a-z0-9-]{1,32}$`。**显式配，不要从主机名推导**——改名或在新机器上恢复之后前缀就变了，历史备份全部下载不到 |
 | `BACKUP_INTERVAL_HOURS` | `0` | `0` = 关闭定时只留手动；否则 **6–168**，建议 `24` |
 | `BACKUP_RETENTION_DAYS` | `0` | 桶上生命周期规则配的保留天数，**抄一份给控制台看**。服务端不删任何对象。`0` = 未设置，控制台显示「未设置」而不是按一个猜出来的天数把下载按钮置灰 |
+| `BACKUP_BUCKET_PROVIDER` | `s3` | `s3` / `r2` / `minio`，和发布存储认同一套。留空按老配置处理（见下一行） |
+| `BACKUP_BUCKET_FORCE_PATH_STYLE` | `false` | MinIO 必须 `true`，S3 / R2 不用。**以前是猜的**（填了 endpoint 就开），猜错的表现是连不上桶而没人在现场——`BACKUP_BUCKET_PROVIDER` 留空时仍按那条旧推断走 |
 | `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露 |
 | `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域 |
 | `BACKUP_BUCKET_ENDPOINT` | 空 | 自定义 endpoint（兼容 S3 的对象存储）。生产强制 https |

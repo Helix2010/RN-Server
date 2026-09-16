@@ -11,8 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Helix2010/RN-Server/internal/backupbundle"
-	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"github.com/gin-gonic/gin"
 )
 
@@ -80,28 +78,6 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BACKUP_LIST_FAILED", "Unable to count failures")
 		return
 	}
-	holders := s.backupHolders(ctx)
-
-	// 控制台上录入的优先，没录过才回落到 env
-	resolved, storedHolders, err := s.resolveBackupRecipients(ctx)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_READ_FAILED", err.Error())
-		return
-	}
-	slots := make([]gin.H, 0, backupcontainer.SlotCount)
-	for i, slot := range backupcontainer.SlotNames {
-		holder := strings.TrimSpace(storedHolders[i])
-		if holder == "" {
-			holder = strings.TrimSpace(holders[slot])
-		}
-		slots = append(slots, gin.H{
-			"slot":        slot,
-			"fingerprint": nullableString(resolved[i].Fingerprint),
-			"configured":  resolved[i].Fingerprint != "",
-			"holder":      nullableString(holder),
-		})
-	}
-
 	// 打包机公钥指纹。它和上面三把恢复公钥的指纹算法不同（16 字符 vs 64 字符），
 	// 设计 §2.2 特意要求分开显示——混在一起显示会让核对仪式失效
 	agentKeyView := gin.H{"registered": false, "fingerprint": nil, "algorithm": "X25519 公钥 sha256 前 16 字符"}
@@ -122,9 +98,9 @@ func (s *server) getBackupStatus(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"enabled": s.cfg.Backup.Enabled(),
-		// 三把齐了才是就绪。少一把服务端根本起不来（§8.3），所以正常情况下
-		// 这里恒为 true；它存在是为了让人一眼确认「三个指纹都是我认识的那三个」
-		"ready":            s.backupRecoveryReady(ctx),
+		// 三把齐了才是就绪。少一把就产不出备份（§2.1 没有降级模式），控制台
+		// 靠它把「立刻备份」置灰并说明差哪几把
+		"ready":            s.backupRecoveryReady(),
 		"threshold":        "2-of-3",
 		"instanceId":       nullableString(s.cfg.Backup.InstanceID),
 		"intervalHours":    s.cfg.Backup.IntervalHours,
@@ -136,8 +112,10 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		// 第四个指纹：打包机公钥。它是 16 字符的（buildkeystore 那套），
 		// 和上面三把 64 字符的**不是一回事**，所以单独一项、单独标注算法。
 		// 恢复时 build-agent show-key 要比对的正是它
-		"agentKey":         agentKeyView,
-		"recoverySlots":    slots,
+		"agentKey": agentKeyView,
+		// 三个恢复槽位不在这里回：它们有自己的接口（GET /backup/recipients），
+		// 两处各回一份迟早会漂，而漂开的表现是同一个指纹在同一页上显示成两个值
+		// ——那正好毁掉设计 §2.2 那个唯一的人工核对
 		"signingKey":       signing,
 		"consecutiveFails": failures,
 		"runs":             items,
@@ -145,12 +123,8 @@ func (s *server) getBackupStatus(c *gin.Context) {
 }
 
 // backupRecoveryReady 说明三把公钥配齐了没有。没配齐就产不出备份（§2.1 没有降级模式）
-func (s *server) backupRecoveryReady(ctx context.Context) bool {
-	resolved, _, err := s.resolveBackupRecipients(ctx)
-	if err != nil {
-		return false
-	}
-	for _, recipient := range resolved {
+func (s *server) backupRecoveryReady() bool {
+	for _, recipient := range s.backupRecipients() {
 		if recipient.Fingerprint == "" {
 			return false
 		}
@@ -322,52 +296,6 @@ func (s *server) downloadBackup(c *gin.Context) {
 	if _, err := io.Copy(c.Writer, body); err != nil {
 		slog.Error("streaming a backup download failed", "seq", run.Seq, "pair", found.Pair, "error", err)
 	}
-}
-
-// updateBackupHolders 维护「哪个槽位由谁保管」。
-//
-// 这一行印进 README-FIRST.txt——拿到包的人得知道该去找谁。它不是机密，但它是
-// 恢复流程里唯一能把「槽位 A」翻译成一个具体的人的东西。
-func (s *server) updateBackupHolders(c *gin.Context) {
-	var body struct {
-		Holders map[string]string `json:"holders"`
-		Reason  string            `json:"reason"`
-	}
-	if decode(c, &body) != nil || len(strings.TrimSpace(body.Reason)) < 3 {
-		problem(c, http.StatusBadRequest, "INVALID_BACKUP_HOLDERS", "holders and reason are required")
-		return
-	}
-	cleaned := map[string]string{}
-	for slot, name := range body.Holders {
-		if !backupbundle.IsSlotName(slot) {
-			problem(c, http.StatusBadRequest, "INVALID_BACKUP_HOLDERS", "unknown slot "+slot)
-			return
-		}
-		trimmed := clipRunes(strings.TrimSpace(name), 120)
-		// 这个值会被渲染进 README-FIRST.txt。那份文件不是脚本，但它会被人照着读，
-		// 一段带控制字符的内容只会让人困惑
-		if strings.ContainsAny(trimmed, "\n\r\t") {
-			problem(c, http.StatusBadRequest, "INVALID_BACKUP_HOLDERS", "a holder name cannot contain newlines")
-			return
-		}
-		cleaned[slot] = trimmed
-	}
-	encoded, err := marshalIndentJSON(cleaned)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_HOLDERS_SAVE_FAILED", "Unable to save")
-		return
-	}
-	if _, err := s.db.ExecContext(c.Request.Context(),
-		`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,?,?)
-		 ON DUPLICATE KEY UPDATE config_value=VALUES(config_value),version=app_configs.version+1,
-		   updated_by=VALUES(updated_by),updated_at=VALUES(updated_at)`,
-		platformTenantID, backupRecoveryHoldersKey, encoded, actor(c), time.Now().UTC()); err != nil {
-		problem(c, http.StatusInternalServerError, "BACKUP_HOLDERS_SAVE_FAILED", "Unable to save")
-		return
-	}
-	s.auditNow(newAudit(platformTenantID, actor(c), "backup_holders_updated", "app-config",
-		backupRecoveryHoldersKey, strings.TrimSpace(body.Reason), requestID(c), nil))
-	c.JSON(http.StatusOK, gin.H{"holders": cleaned})
 }
 
 // testBackupBucket 只 Put 一个随机探针键。
