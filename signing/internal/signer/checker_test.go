@@ -25,6 +25,12 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "enroll-init" {
+		// rootHost.Init 以 "<可执行文件> enroll-init" 启动子进程
+		os.Exit(EnrollInitMain(os.Stdin, os.Stdout, os.Stderr))
+	}
+	// RSA 生成在 -race 下很慢：生成密钥的测试从一个小密钥池里轮流取（相邻两次一定不同）
+	generateReleaseKey = pooledReleaseKey
 	switch filepath.Base(os.Args[0]) {
 	case actAsChecker:
 		// ExecChecker 必须以空环境启动检查进程：令牌不能漏进去

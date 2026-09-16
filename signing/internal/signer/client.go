@@ -38,6 +38,8 @@ const (
 	// 上传：对象存储写失败、连接中途断开，原地重试
 	codeUploadStorageFailed = "UPLOAD_STORAGE_FAILED"
 	codeUploadInterrupted   = "UPLOAD_INTERRUPTED"
+	// 交回生成的密钥：请求已不是 pending 或版本变了（服务端已把请求标 failed）
+	codeKeystoreGenerationStale = "KEYSTORE_GENERATION_STALE"
 )
 
 const (
@@ -116,7 +118,10 @@ func (e *ProtocolError) Error() string { return "server response violates the co
 type API interface {
 	RegisterKey(ctx context.Context, x25519Pub, ed25519Pub []byte) (KeyStatus, error)
 	KeystoreChecks(ctx context.Context) (ChecksResponse, error)
-	ReportChecks(ctx context.Context, localRole records.Role, items []CheckReport) error
+	ReportChecks(ctx context.Context, localRole records.Role, trust TrustReport, items []CheckReport) error
+	Peers(ctx context.Context) (PeersResponse, error)
+	SubmitGeneration(ctx context.Context, requestID string, req GenerationSubmit) (GenerationResult, error)
+	FailGeneration(ctx context.Context, requestID, code, detail string) error
 	Claim(ctx context.Context, ready []ReadyItem) (*Claim, error)
 	Heartbeat(ctx context.Context, jobID string, signAttempt int) error
 	DownloadUnsigned(ctx context.Context, jobID string, signAttempt int, dst io.Writer, maxSize int64) (Download, error)
@@ -142,16 +147,122 @@ type ChecksResponse struct {
 	Items      []CheckItem `json:"items"`
 }
 
-// CheckItem 是发给本机的一份密钥。
+// CheckItem 是一个租户项：发给本机的一份密钥（Box 非空），和/或发给主签名闸的生成请求。
 type CheckItem struct {
 	TenantSlug        string            `json:"tenantSlug"`
 	KeystoreVersion   int64             `json:"keystoreVersion"`
 	PackageName       string            `json:"packageName"`
 	CertificateSHA256 string            `json:"certificateSha256"`
 	KeyAlias          string            `json:"keyAlias"`
-	Box               keystorebox.Box   `json:"box"`
+	Box               *keystorebox.Box  `json:"box"`
 	TrustRoots        *trustroots.Roots `json:"trustRoots"`
 	TrustRootsDigest  *string           `json:"trustRootsDigest"`
+
+	// GenerationRequest 只下发给 active 路由主签名闸，且请求状态为 pending（约定 3.4）。
+	GenerationRequest *GenerationRequest `json:"generationRequest"`
+	// 当前密钥由签名闸生成时，服务端给出生成者与生成签名（约定 3.4）。
+	Generator           *GeneratorView `json:"generator"`
+	GenerationSignature *string        `json:"generationSignature"`
+	// 验证生成签名还需要生成请求 id 与完整 Upload（签名覆盖全部 Box），首签上限需要服务端已发布的
+	// 最大 build 号。约定 3.4 没有列这三项，签名闸按这些名字读；缺了就不自动接受（退回 signer confirm）。
+	GenerationRequestID     *string             `json:"generationRequestId"`
+	Upload                  *keystorebox.Upload `json:"upload"`
+	PublishedMaxBuildNumber *int64              `json:"publishedMaxBuildNumber"`
+}
+
+// GenerationRequest 是控制台发起的"生成签名密钥"。服务端的信任根只在首次信任时使用。
+type GenerationRequest struct {
+	RequestID               string            `json:"requestId"`
+	PackageName             string            `json:"packageName"`
+	Alias                   string            `json:"alias"`
+	TrustRoots              *trustroots.Roots `json:"trustRoots"`
+	TrustRootsDigest        *string           `json:"trustRootsDigest"`
+	PublishedMaxBuildNumber *int64            `json:"publishedMaxBuildNumber"`
+}
+
+// GeneratorView 是服务端记录的生成者（签名闸不采信服务端的名字与 id，只认 Ed25519 指纹）。
+type GeneratorView struct {
+	MachineID              string `json:"machineId"`
+	Name                   string `json:"name"`
+	Ed25519PublicKey       string `json:"ed25519PublicKey"`
+	Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
+}
+
+// TrustReport 是 POST /v1/signer/keystore-checks 顶层的 trust：本机记录里的信任列表（含本机）。
+// 服务端只用来在控制台提示，签名闸不采信服务端。
+type TrustReport struct {
+	Signers      []TrustedSignerReport  `json:"signers"`
+	Builders     []TrustedBuilderReport `json:"builders"`
+	RecoveryKeys []string               `json:"recoveryKeys"`
+}
+
+// TrustedSignerReport 是一台受信签名闸。
+type TrustedSignerReport struct {
+	Name          string `json:"name"`
+	X25519SHA256  string `json:"x25519Sha256"`
+	Ed25519SHA256 string `json:"ed25519Sha256"`
+}
+
+// TrustedBuilderReport 是一台受信构建机。
+type TrustedBuilderReport struct {
+	BuilderID     string `json:"builderId"`
+	Ed25519SHA256 string `json:"ed25519Sha256"`
+}
+
+// PeersResponse 是 GET /v1/signer/peers：服务端视图里 active 的机器与未吊销的恢复公钥。
+// 只用来给运维命令显示、给生成取收件人公钥（公钥按本机记录的指纹核对）。
+type PeersResponse struct {
+	Signers      []PeerSigner      `json:"signers"`
+	Builders     []PeerBuilder     `json:"builders"`
+	RecoveryKeys []PeerRecoveryKey `json:"recoveryKeys"`
+}
+
+// PeerSigner 是服务端视图里的一台签名闸。
+type PeerSigner struct {
+	MachineID              string  `json:"machineId"`
+	Name                   string  `json:"name"`
+	Status                 string  `json:"status"`
+	SignerRole             *string `json:"signerRole"`
+	X25519PublicKey        string  `json:"x25519PublicKey"`
+	X25519PublicKeySHA256  string  `json:"x25519PublicKeySha256"`
+	Ed25519PublicKey       string  `json:"ed25519PublicKey"`
+	Ed25519PublicKeySHA256 string  `json:"ed25519PublicKeySha256"`
+}
+
+// PeerBuilder 是服务端视图里的一台构建机。
+type PeerBuilder struct {
+	MachineID       string `json:"machineId"`
+	Name            string `json:"name"`
+	Status          string `json:"status"`
+	PublicKey       string `json:"publicKey"`
+	PublicKeySHA256 string `json:"publicKeySha256"`
+}
+
+// PeerRecoveryKey 是服务端登记的一把恢复公钥。
+type PeerRecoveryKey struct {
+	Name                  string `json:"name"`
+	X25519PublicKey       string `json:"x25519PublicKey"`
+	X25519PublicKeySHA256 string `json:"x25519PublicKeySha256"`
+	Revoked               bool   `json:"revoked"`
+}
+
+// GenerationSubmit 是 POST /v1/signer/keystore-generations/:requestId 的请求体。
+type GenerationSubmit struct {
+	Upload    keystorebox.Upload `json:"upload"`
+	Generator GeneratorRef       `json:"generator"`
+	Signature string             `json:"signature"`
+}
+
+// GeneratorRef 是交回生成结果时的生成者。
+type GeneratorRef struct {
+	MachineID              string `json:"machineId"`
+	Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
+}
+
+// GenerationResult 是交回生成结果的 200 响应。
+type GenerationResult struct {
+	KeystoreVersion        int64 `json:"keystoreVersion"`
+	ReleaseIdentityVersion int64 `json:"releaseIdentityVersion"`
 }
 
 // CheckReport 是 POST /v1/signer/keystore-checks 的一项。
@@ -259,7 +370,10 @@ func (c *HTTPClient) newRequest(ctx context.Context, method, path string, body i
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("x-machine-token", c.token)
+	if c.token != "" {
+		// machine-setup 接口（describe、enroll）没有令牌，靠注册码
+		req.Header.Set("x-machine-token", c.token)
+	}
 	req.Header.Set("user-agent", "rn-signer/1")
 	if contentType != "" {
 		req.Header.Set("content-type", contentType)
@@ -365,14 +479,52 @@ func (c *HTTPClient) KeystoreChecks(ctx context.Context) (ChecksResponse, error)
 
 // ReportChecks 上报试解、确认、试签状态，以及本机记录里的当前角色（localRole）。
 // 控制台的主备路由与本机角色不一致时（例如控制台切了主，本机还没 promote），服务端据此判定不就绪。
-func (c *HTTPClient) ReportChecks(ctx context.Context, localRole records.Role, items []CheckReport) error {
+func (c *HTTPClient) ReportChecks(ctx context.Context, localRole records.Role, trust TrustReport, items []CheckReport) error {
 	if localRole != records.RolePrimary && localRole != records.RoleStandby {
 		return &ProtocolError{Msg: "local role must be primary or standby"}
 	}
 	if items == nil {
 		items = []CheckReport{}
 	}
-	_, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-checks", 0, map[string]any{"localRole": localRole, "items": items}, nil)
+	if trust.Signers == nil {
+		trust.Signers = []TrustedSignerReport{}
+	}
+	if trust.Builders == nil {
+		trust.Builders = []TrustedBuilderReport{}
+	}
+	if trust.RecoveryKeys == nil {
+		trust.RecoveryKeys = []string{}
+	}
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-checks", 0, map[string]any{"localRole": localRole, "trust": trust, "items": items}, nil)
+	return err
+}
+
+// Peers 取服务端视图里的签名闸、构建机与恢复公钥（只作显示与取公钥，按本机记录的指纹核对）。
+func (c *HTTPClient) Peers(ctx context.Context) (PeersResponse, error) {
+	var out PeersResponse
+	_, err := c.doJSON(ctx, http.MethodGet, "/v1/signer/peers", 0, nil, &out)
+	return out, err
+}
+
+// SubmitGeneration 交回主签名闸生成的密钥。
+func (c *HTTPClient) SubmitGeneration(ctx context.Context, requestID string, req GenerationSubmit) (GenerationResult, error) {
+	var out GenerationResult
+	if !keystorebox.ValidGenerationRequestID(requestID) {
+		return out, &ProtocolError{Msg: "generation request id is malformed"}
+	}
+	status, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-generations/"+requestID, 0, req, &out)
+	if err == nil && status != http.StatusOK {
+		return out, &ProtocolError{Msg: "keystore generation submit did not return 200"}
+	}
+	return out, err
+}
+
+// FailGeneration 报告生成失败（请求标 failed，控制台显示 code 与 detail）。
+func (c *HTTPClient) FailGeneration(ctx context.Context, requestID, code, detail string) error {
+	if !keystorebox.ValidGenerationRequestID(requestID) {
+		return &ProtocolError{Msg: "generation request id is malformed"}
+	}
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-generations/"+requestID+"/fail", 0, map[string]string{"code": code, "detail": detail}, nil)
 	return err
 }
 

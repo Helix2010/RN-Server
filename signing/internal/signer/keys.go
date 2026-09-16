@@ -68,9 +68,15 @@ func (k MachineKeys) MarshalJSON() ([]byte, error) {
 }
 
 // LoadKeys 只读地加载本机私钥（show-key、confirm 等运维命令用）。
-func LoadKeys(stateDir string) (MachineKeys, error) {
+func LoadKeys(stateDir string) (MachineKeys, error) { return loadKeys(stateDir, false) }
+
+// loadKeys：allowEnrollPending 只给 signer enroll 自己用（注册没完成时读回刚生成的公钥）。
+func loadKeys(stateDir string, allowEnrollPending bool) (MachineKeys, error) {
 	if err := securefs.CheckPrivateDir(stateDir); err != nil {
 		return MachineKeys{}, fmt.Errorf("state directory: %w", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, enrollMarkerFile)); err == nil && !allowEnrollPending {
+		return MachineKeys{}, errEnrollPending
 	}
 	if _, err := os.Lstat(filepath.Join(stateDir, initMarkerFile)); err == nil {
 		return MachineKeys{}, errors.New("this signing gate's first start did not finish; start `signer run` again")
@@ -101,7 +107,19 @@ func LoadKeys(stateDir string) (MachineKeys, error) {
 //
 // 半途崩溃留下 init.incomplete 标记：此时私钥还没登记给任何人、记录里也没有任何签名，
 // 清掉重来是安全的。没有标记却只存在一部分文件，说明状态目录被人动过，拒绝启动。
+//
+// signer enroll 没完成（有 enroll.incomplete）时拒绝：那套密钥与记录属于一次没换到令牌的注册。
 func InitState(stateDir, machineName string) (MachineKeys, bool, error) {
+	if err := securefs.CheckPrivateDir(stateDir); err != nil {
+		return MachineKeys{}, false, fmt.Errorf("state directory: %w", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, enrollMarkerFile)); err == nil {
+		return MachineKeys{}, false, errEnrollPending
+	}
+	return initState(stateDir, machineName)
+}
+
+func initState(stateDir, machineName string) (MachineKeys, bool, error) {
 	if err := securefs.CheckPrivateDir(stateDir); err != nil {
 		return MachineKeys{}, false, fmt.Errorf("state directory: %w", err)
 	}
@@ -127,7 +145,7 @@ func InitState(stateDir, machineName string) (MachineKeys, bool, error) {
 	}
 	switch present {
 	case len(parts):
-		keys, err := LoadKeys(stateDir)
+		keys, err := loadKeys(stateDir, true)
 		return keys, false, err
 	case 0:
 	default:

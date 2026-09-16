@@ -20,6 +20,9 @@ const (
 	generatedValidityYear = 30
 )
 
+// generateReleaseKey 生成 RSA 密钥、证书与 PKCS#12。测试替换成预先生成的密钥池提速。
+var generateReleaseKey = releasekey.Generate
+
 // GenerateParams 是生成一把租户签名密钥需要的输入。收件人由调用方按本机记录定好（本机、
 // 本机信任的签名闸、本机信任的恢复公钥），这里不做任何信任判断。
 type GenerateParams struct {
@@ -75,7 +78,7 @@ func GenerateKeystore(p GenerateParams) (GeneratedKeystore, error) {
 	if bits == 0 {
 		bits = generatedKeyBits
 	}
-	generated, err := releasekey.Generate(releasekey.Params{
+	generated, err := generateReleaseKey(releasekey.Params{
 		Alias: p.KeyAlias, CommonName: p.TenantSlug + " Android Release", KeyBits: bits, ValidityYears: generatedValidityYear,
 	})
 	if err != nil {

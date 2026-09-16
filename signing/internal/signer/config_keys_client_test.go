@@ -340,10 +340,10 @@ func TestHTTPClient(t *testing.T) {
 	if _, err := c.UploadSigned(ctx, "bld_abc12345", 1, signed); !IsTransient(err) {
 		t.Fatalf("UPLOAD_STORAGE_FAILED must be retried: %v", err)
 	}
-	if err := c.ReportChecks(ctx, "leader", nil); err == nil || IsTransient(err) {
+	if err := c.ReportChecks(ctx, "leader", TrustReport{}, nil); err == nil || IsTransient(err) {
 		t.Fatalf("an unknown local role was sent: %v", err)
 	}
-	if err := c.ReportChecks(ctx, records.RoleStandby, nil); !errors.As(err, &apiErr) || apiErr.Transient() || IsTransient(err) {
+	if err := c.ReportChecks(ctx, records.RoleStandby, TrustReport{}, nil); !errors.As(err, &apiErr) || apiErr.Transient() || IsTransient(err) {
 		t.Fatalf("404 must not be transient: %v", err)
 	}
 	var sink bytes.Buffer

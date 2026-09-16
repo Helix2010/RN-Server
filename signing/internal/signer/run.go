@@ -74,12 +74,18 @@ type Runner struct {
 	RetryDelays       []time.Duration
 	// MaxClaimBackoff 是认领退避的上限（默认 10 分钟）。
 	MaxClaimBackoff time.Duration
+	// KeyBits 是生成租户签名密钥的 RSA 位数；0 表示 4096（测试用 2048 提速）。
+	KeyBits int
 
 	mu         sync.Mutex
 	ready      []ReadyItem
 	lastChecks time.Time
 	trials     map[string]trialResult
 	waiting    bool
+	// checksDue：刚交回生成的密钥，下一轮不等 ChecksInterval 就重新试解、试签
+	checksDue bool
+	// generationsDone：本进程已经处理完（交回、报失败或服务端说已过期）的生成请求
+	generationsDone map[string]bool
 
 	// 认领退避：没有签完交付（暂不能签、临时错误、违规、过期）之后，至少隔一个 PollInterval 才再认领；
 	// 同一任务连续没签完，间隔按 PollInterval×2^(n-1) 翻倍，封顶 MaxClaimBackoff。签完交付清零。
@@ -125,6 +131,9 @@ func (r *Runner) defaults() {
 	}
 	if r.jobFailures == nil {
 		r.jobFailures = map[string]jobFailure{}
+	}
+	if r.generationsDone == nil {
+		r.generationsDone = map[string]bool{}
 	}
 }
 
@@ -233,7 +242,11 @@ func (r *Runner) checkKeyStatus(s KeyStatus) error {
 // 返回的错误是致命的（本机记录不可用等），签名闸应当退出。
 func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	r.defaults()
-	if r.lastChecks.IsZero() || time.Since(r.lastChecks) >= r.ChecksInterval {
+	r.mu.Lock()
+	due := r.checksDue
+	r.checksDue = false
+	r.mu.Unlock()
+	if due || r.lastChecks.IsZero() || time.Since(r.lastChecks) >= r.ChecksInterval {
 		if err := r.RunChecks(ctx); err != nil {
 			var fatal *fatalError
 			if errors.As(err, &fatal) {
@@ -341,7 +354,8 @@ func (f *fatalError) Error() string { return f.err.Error() }
 
 // ---- 试解、确认状态、试签 ----
 
-// RunChecks 取回发给本机的密文，逐份试解、查本机确认、试签，上报并更新就绪列表。
+// RunChecks 取回发给本机的密文，逐份试解、查本机确认（签名闸生成的密钥按规则自动确认）、试签，
+// 上报并更新就绪列表；然后处理发给本机（主）的生成请求。
 func (r *Runner) RunChecks(ctx context.Context) error {
 	r.defaults()
 	resp, err := r.API.KeystoreChecks(ctx)
@@ -351,7 +365,15 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 	}
 	reports := []CheckReport{}
 	var ready []ReadyItem
+	var generations []CheckItem
 	for _, item := range resp.Items {
+		if item.GenerationRequest != nil {
+			generations = append(generations, item)
+		}
+		if item.Box == nil {
+			// 还没有发给本机的密钥（新租户等生成、或密钥没加密给本机）：没有可上报的试解结果
+			continue
+		}
 		report, readyItem, err := r.checkItem(ctx, item)
 		if err != nil {
 			r.setReady(nil)
@@ -371,7 +393,21 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 		r.setReady(nil)
 		return &fatalError{err}
 	}
-	return r.retry(ctx, "report keystore checks", func(ctx context.Context) error { return r.API.ReportChecks(ctx, role.Role, reports) })
+	trust, err := LocalTrust(r.Keys, r.Store)
+	if err != nil {
+		r.setReady(nil)
+		return &fatalError{err}
+	}
+	reportErr := r.retry(ctx, "report keystore checks", func(ctx context.Context) error { return r.API.ReportChecks(ctx, role.Role, trust, reports) })
+	if IsTokenRejected(reportErr) {
+		return reportErr
+	}
+	for _, item := range generations {
+		if err := r.processGeneration(ctx, resp.MachineID, item); err != nil {
+			return err
+		}
+	}
+	return reportErr
 }
 
 func (r *Runner) setReady(ready []ReadyItem) {
@@ -418,10 +454,10 @@ func (r *Runner) checkItem(ctx context.Context, item CheckItem) (*CheckReport, *
 		return fail("the server's keystore record has a malformed packageName")
 	case !fingerprint.Valid(item.CertificateSHA256):
 		return fail("the server's keystore record has a malformed certificateSha256")
-	case item.Box.ValidateShape() != nil:
+	case item.Box == nil || item.Box.ValidateShape() != nil:
 		return fail("the server's keystore box is malformed")
 	}
-	material, err := openKeystore(item.Box, r.Keys, expectedIdentity{item.TenantSlug, item.PackageName, item.CertificateSHA256})
+	material, err := openKeystore(*item.Box, r.Keys, expectedIdentity{item.TenantSlug, item.PackageName, item.CertificateSHA256})
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -431,7 +467,19 @@ func (r *Runner) checkItem(ctx context.Context, item CheckItem) (*CheckReport, *
 		return nil, nil, err
 	}
 	if !ok || conf.TenantSlug != item.TenantSlug {
-		return report, nil, nil
+		accepted, reason, err := r.acceptGenerated(item, material)
+		if err != nil {
+			return nil, nil, err
+		}
+		if accepted == nil {
+			if reason != "" {
+				r.Log.Warn("a generated keystore was not accepted automatically", "tenant", item.TenantSlug, "reason", reason)
+				m := cleanText(reason, 300)
+				report.Error = &m
+			}
+			return report, nil, nil
+		}
+		conf = *accepted
 	}
 	report.Confirmed = true
 	digest := conf.TrustRootsDigest

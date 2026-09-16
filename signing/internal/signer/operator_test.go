@@ -221,6 +221,11 @@ func TestOperatorCommandsRefuseWithoutATerminal(t *testing.T) {
 			{"confirm", "--tenant", "AnyFun"},
 			{"trust-builder", "--builder-id", "mch_builderXYZ01", "--name", "amos-builder"},
 			{"trust-builder", "--revoke", "--builder-id", "mch_builderXYZ01", "--reason", "rebuilt"},
+			{"trust-builder", "--builder", "amos-builder"},
+			{"trust-peer", "--peer", "amos-signer-b"},
+			{"trust-peer", "--revoke", "--peer", "amos-signer-b", "--reason", "rebuilt"},
+			{"trust-recovery"},
+			{"trust-recovery", "--revoke", "--recovery-sha256", strings.Repeat("a", 64), "--reason", "rotated"},
 			{"promote", "--first"},
 			{"abandon", "--job", "bld_job0000000001", "--reason", "never delivered"},
 		} {
@@ -241,7 +246,10 @@ func TestOperatorCommandsRefuseWithoutATerminal(t *testing.T) {
 }
 
 func TestMainUsage(t *testing.T) {
-	for _, args := range [][]string{nil, {"sign"}, {"run", "--tenant", "x"}, {"promote", "--first", "--manual"}, {"confirm", "extra-arg"}, {"trust-builder", "--revoke", "--name", "x"}} {
+	for _, args := range [][]string{nil, {"sign"}, {"run", "--tenant", "x"}, {"promote", "--first", "--manual"}, {"confirm", "extra-arg"}, {"trust-builder", "--revoke", "--name", "x"},
+		{"trust-builder", "--builder", "amos-builder", "--builder-id", "mch_builderXYZ01"}, {"trust-builder", "--revoke", "--builder", "amos-builder"},
+		{"trust-peer", "--peer", "amos-signer-b", "--reason", "why"}, {"trust-recovery", "--recovery-sha256", "abcd"}, {"trust-recovery", "--peer", "x"},
+		{"enroll", "--tenant", "x"}, {"enroll-init", "extra"}} {
 		var stdout, stderr bytes.Buffer
 		if code := Main(args, os.Stdin, &stdout, &stderr, func(string) string { return "" }); code != 2 {
 			t.Errorf("%v: exit %d", args, code)
