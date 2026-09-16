@@ -42,12 +42,13 @@ var builderPub, builderPriv, _ = ed25519.GenerateKey(rand.Reader)
 // scenario 描述一次检查：先按 spec 合成包、按包的真实摘要签出处声明，再允许逐项篡改。
 type scenario struct {
 	spec          func(*apktest.Spec)
-	manifest      func(*axml.Node)            // 改清单树
-	zip           *apktest.ZipOptions         // 用自定义 ZIP 选项写包
-	extraFiles    []apktest.File              // 追加条目（走 zip 选项路径）
-	statement     func(*provenance.Statement) // 签名前改声明
-	input         func(*Input)                // 改策略输入
-	replaceAPK    func(spec apktest.Spec) []byte
+	manifest      func(*axml.Node)               // 改清单树
+	zip           *apktest.ZipOptions            // 用自定义 ZIP 选项写包
+	extraFiles    []apktest.File                 // 追加条目（走 zip 选项路径）
+	statement     func(*provenance.Statement)    // 签名前改声明
+	input         func(*Input)                   // 改策略输入
+	replaceAPK    func(spec apktest.Spec) []byte // 出处签完之后换掉包（摘要对不上）
+	rawAPK        []byte                         // 出处签的就是这些字节（构建机本身出了问题）
 	signWith      ed25519.PrivateKey
 	expectCode    string
 	expectDetails string
@@ -92,7 +93,10 @@ func run(t *testing.T, sc scenario) Verdict {
 	if sc.spec != nil {
 		sc.spec(&spec)
 	}
-	raw := buildAPK(t, spec, sc)
+	raw := sc.rawAPK
+	if raw == nil {
+		raw = buildAPK(t, spec, sc)
+	}
 	sum := sha256.Sum256(raw)
 	shaHex := hex.EncodeToString(sum[:])
 	statement := provenance.Statement{
@@ -440,13 +444,21 @@ func TestEveryRuleRejects(t *testing.T) {
 
 // 包里读出的字符串进入 detail 时必须转义：控制字符不能原样到达运维终端与控制台。
 func TestDetailsQuoteHostileStrings(t *testing.T) {
+	// 控制字符在解析器里就被拒绝（与 Android 在 NUL 处截断的分歧、终端控制序列），细节不回显原字符
+	for _, name := range []string{"android.permission.\x1b[2JEVIL", "android.permission.INTERNET\x00.EVIL"} {
+		v := run(t, scenario{spec: func(s *apktest.Spec) { s.Permissions = append(s.Permissions, name) }})
+		if v.OK || v.Code != "AXML_STRING_CONTROL_CHARACTER" || strings.ContainsAny(v.Detail, "\x00\x1b") {
+			t.Fatalf("control character in a permission: %+v", v)
+		}
+	}
+	// 解析器允许的非 ASCII（这里是 RLO 双向覆盖符）在细节里转义
 	v := run(t, scenario{spec: func(s *apktest.Spec) {
-		s.Permissions = append(s.Permissions, "android.permission.\x1b[2JEVIL")
+		s.Permissions = append(s.Permissions, "android.permission.\xe2\x80\xaeLIVE")
 	}})
 	if v.OK || v.Code != "PERMISSION_NOT_ALLOWED" {
 		t.Fatalf("got %+v", v)
 	}
-	if strings.Contains(v.Detail, "\x1b") || !strings.Contains(v.Detail, `\x1b`) {
+	if strings.Contains(v.Detail, "\xe2\x80\xae") || !strings.Contains(v.Detail, `\u202e`) {
 		t.Fatalf("detail not escaped: %q", v.Detail)
 	}
 }

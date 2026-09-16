@@ -213,25 +213,40 @@ func violation(code, format string, args ...any) Verdict {
 	return Verdict{Kind: KindViolation, Code: code, Detail: fmt.Sprintf(format, args...)}
 }
 
-// EvaluateFile 计算文件 sha256、解析 APK 并执行检查。
+// parseFile 是 apk.ParseFile；测试替换它来确认"出处不过就不解析"。
+var parseFile = apk.ParseFile
+
+// EvaluateFile 计算文件 sha256，先核对出处签名与摘要，通过之后才解析 APK 并执行其余检查。
+//
+// 出处只依赖策略输入与文件摘要，不需要解析。服务端单独被攻破时拿不到受信构建机的签名，
+// 它塞过来的任意字节在这里就被拒绝，解析器（最大的攻击面）一个字节都碰不到。
 func EvaluateFile(in Input, path string, lim apk.Limits) Verdict {
 	sum, size, err := hashFile(path, lim.MaxFileSize)
 	if err != nil {
 		return violation("APK_UNREADABLE", "the unsigned package could not be read: %v", err)
 	}
-	pkg, parseErr := apk.ParseFile(path, lim)
+	statement, v := checkBeforeParsing(in, sum, size)
+	if !v.OK {
+		v.CheckedSHA256 = sum
+		return v
+	}
+	pkg, parseErr := parseFile(path, lim)
 	if pkg != nil && (pkg.SHA256 != sum || pkg.Size != size) {
 		// 文件在两次读取之间变了：检查进程自己的临时文件，只可能是故障
-		return violation("APK_UNREADABLE", "the package changed while it was being checked")
+		v = violation("APK_UNREADABLE", "the package changed while it was being checked")
+	} else {
+		v = checkParsed(in, statement, size, pkg, parseErr)
 	}
-	v := evaluate(in, sum, size, pkg, parseErr)
 	v.CheckedSHA256 = sum
 	return v
 }
 
 // Evaluate 对已经解析好的包执行检查（sha256 与大小取自 pkg）。
 func Evaluate(in Input, pkg *apk.Package) Verdict {
-	v := evaluate(in, pkg.SHA256, pkg.Size, pkg, nil)
+	statement, v := checkBeforeParsing(in, pkg.SHA256, pkg.Size)
+	if v.OK {
+		v = checkParsed(in, statement, pkg.Size, pkg, nil)
+	}
 	v.CheckedSHA256 = pkg.SHA256
 	return v
 }
@@ -253,21 +268,26 @@ func hashFile(path string, limit int64) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-func evaluate(in Input, sum string, size int64, pkg *apk.Package, parseErr error) Verdict {
+// checkBeforeParsing：输入形状、第 2 条出处签名、第 3 条文件摘要与大小。只用策略输入与文件摘要。
+func checkBeforeParsing(in Input, sum string, size int64) (provenance.Statement, Verdict) {
 	if err := ValidateInput(in); err != nil {
-		return violation("POLICY_INPUT_INVALID", "%v", err)
+		return provenance.Statement{}, violation("POLICY_INPUT_INVALID", "%v", err)
 	}
-	// 第 2、3 条：出处与文件摘要。先于解析：摘要不对的包没有检查的意义。
 	statement, v := checkProvenance(in)
 	if !v.OK {
-		return v
+		return statement, v
 	}
 	if sum != statement.UnsignedSHA256 || sum != in.Job.UnsignedSHA256 {
-		return violation("UNSIGNED_SHA256_MISMATCH", "the downloaded package sha256 %s does not match the provenance statement (%s) or the job (%s)", sum, statement.UnsignedSHA256, in.Job.UnsignedSHA256)
+		return statement, violation("UNSIGNED_SHA256_MISMATCH", "the downloaded package sha256 %s does not match the provenance statement (%s) or the job (%s)", sum, statement.UnsignedSHA256, in.Job.UnsignedSHA256)
 	}
 	if size != statement.UnsignedSize || size != in.Job.UnsignedSize || size != in.APKSize {
-		return violation("UNSIGNED_SIZE_MISMATCH", "the downloaded package is %d bytes; the provenance statement says %d and the job says %d", size, statement.UnsignedSize, in.Job.UnsignedSize)
+		return statement, violation("UNSIGNED_SIZE_MISMATCH", "the downloaded package is %d bytes; the provenance statement says %d and the job says %d", size, statement.UnsignedSize, in.Job.UnsignedSize)
 	}
+	return statement, pass
+}
+
+// checkParsed：出处与摘要通过之后，对解析结果执行其余检查。
+func checkParsed(in Input, statement provenance.Statement, size int64, pkg *apk.Package, parseErr error) Verdict {
 	// 第 5、9 条：结构（ZIP、二进制 XML）由解析器严格拒绝
 	if parseErr != nil {
 		var apkErr *apk.Error
