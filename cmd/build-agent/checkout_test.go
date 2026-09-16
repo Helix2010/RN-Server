@@ -188,3 +188,174 @@ func TestTenantFileMustMatchTheJob(t *testing.T) {
 		t.Fatal("a tenant file with another versionCode was accepted")
 	}
 }
+
+// commitToSource 在构建机镜像的上游仓库里改一次并提交，下次检出时就是这份内容。
+func commitToSource(t *testing.T, rig *testRig, change func(source string)) {
+	t.Helper()
+	source := filepath.Join(filepath.Dir(rig.bare), "source")
+	change(source)
+	fakebuild.Git(t, source, "add", "-A")
+	fakebuild.Git(t, source, "commit", "-qm", "symlink fixture")
+}
+
+// 检出内容来自仓库 main，不可信：控制进程往检出里写服务端下发的文件时，不管符号链接在最后一段、
+// 中间一段还是整个目录，都不许写穿到检出外面（出处私钥就在状态目录里），也不许写穿到检出里的
+// 另一个文件。
+func TestPrepareWorktreeNeverWritesThroughSymlinksInTheCheckout(t *testing.T) {
+	cases := map[string]struct {
+		icons  bool
+		change func(t *testing.T, source, victim, outside string)
+		// untouched 是必须保持原样的文件（相对检出以外的绝对路径由用例自己给）
+		mustStayEmpty bool
+	}{
+		"ota certificate links to the provenance key": {
+			change: func(t *testing.T, source, victim, _ string) {
+				mustSymlink(t, victim, filepath.Join(source, "ota-certificate.pem"))
+			},
+		},
+		"google-services.json links to the provenance key": {
+			change: func(t *testing.T, source, victim, _ string) {
+				mustSymlink(t, victim, filepath.Join(source, "google-services.json"))
+			},
+		},
+		"tenant.json links to the provenance key": {
+			change: func(t *testing.T, source, victim, _ string) {
+				if err := os.MkdirAll(filepath.Join(source, "tenants", "anyfun"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				mustSymlink(t, victim, filepath.Join(source, "tenants", "anyfun", "tenant.json"))
+			},
+		},
+		"tenants/ is a directory link out of the checkout": {
+			mustStayEmpty: true,
+			change: func(t *testing.T, source, _, outside string) {
+				if err := os.RemoveAll(filepath.Join(source, "tenants")); err != nil {
+					t.Fatal(err)
+				}
+				mustSymlink(t, outside, filepath.Join(source, "tenants"))
+			},
+		},
+		"an intermediate icon directory links out of the checkout": {
+			icons:         true,
+			mustStayEmpty: true,
+			change: func(t *testing.T, source, _, outside string) {
+				if err := os.RemoveAll(filepath.Join(source, "assets", "tenants", "anyfun")); err != nil {
+					t.Fatal(err)
+				}
+				mustSymlink(t, outside, filepath.Join(source, "assets", "tenants", "anyfun"))
+			},
+		},
+		"an icon file links to the provenance key": {
+			icons: true,
+			change: func(t *testing.T, source, victim, _ string) {
+				icon := filepath.Join(source, "assets", "tenants", "anyfun", "icon.png")
+				if err := os.Remove(icon); err != nil {
+					t.Fatal(err)
+				}
+				mustSymlink(t, victim, icon)
+			},
+		},
+		"a relative link to another file inside the checkout": {
+			change: func(t *testing.T, source, _, _ string) {
+				mustSymlink(t, "package.json", filepath.Join(source, "google-services.json"))
+			},
+		},
+		"an icon that is only a symlink counts as missing": {
+			change: func(t *testing.T, source, _, _ string) {
+				icon := filepath.Join(source, "assets", "tenants", "anyfun", "icon.png")
+				if err := os.Remove(icon); err != nil {
+					t.Fatal(err)
+				}
+				mustSymlink(t, "/etc/hostname", icon)
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rig := newRig(t)
+			victim := filepath.Join(rig.agent.cfg.StateDir, provenanceKeyFile)
+			before, err := os.ReadFile(victim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			outside := t.TempDir()
+			commitToSource(t, rig, func(source string) { tc.change(t, source, victim, outside) })
+			packageBefore, _ := os.ReadFile(filepath.Join(filepath.Dir(rig.bare), "source", "package.json"))
+
+			body := claimBody("bld_symlinkJOB01", "apk")
+			if tc.icons {
+				body["icons"] = []string{"icon.png", "android-icon-foreground.png", "android-icon-background.png", "android-icon-monochrome.png"}
+			}
+			prepared, err := rig.agent.prepareWorktree(context.Background(), mustClaimedJob(t, body), newLogBuffer(newRedactor()))
+			if err == nil {
+				t.Fatal("a checkout with a symlink in a written path was accepted")
+			}
+			if !strings.Contains(err.Error(), "symlink") && !strings.Contains(err.Error(), "启动图标") {
+				t.Fatalf("refused for another reason: %v", err)
+			}
+			after, readErr := os.ReadFile(victim)
+			if readErr != nil || !bytes.Equal(before, after) {
+				t.Fatalf("the provenance key was changed through a symlink (%v)", readErr)
+			}
+			if _, err := loadOrCreateKeyring(rig.agent.cfg.StateDir); err != nil {
+				t.Fatalf("the state directory is no longer usable: %v", err)
+			}
+			if entries, _ := os.ReadDir(outside); tc.mustStayEmpty && len(entries) != 0 {
+				t.Fatalf("files were written outside the checkout: %v", entries)
+			}
+			if src := prepared.Layout.Src(); src != "" {
+				if got, err := os.ReadFile(filepath.Join(src, "package.json")); err == nil && !bytes.Equal(got, packageBefore) {
+					t.Fatalf("a file inside the checkout was overwritten through a relative link: %q", got)
+				}
+			}
+			// 失败的任务照常上报与清理由 runJob 负责；这里清掉目录以免影响别的用例
+			rig.agent.cleanupJob(prepared.Layout)
+		})
+	}
+}
+
+// 仓库里有同名的普通文件（tenants/anyfun/tenant.json 仍在 RN-App 里）：删掉重建，内容是服务端下发的
+func TestPrepareWorktreeReplacesRegularFilesFromTheRepository(t *testing.T) {
+	rig := newRig(t)
+	commitToSource(t, rig, func(source string) {
+		dir := filepath.Join(source, "tenants", "anyfun")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "tenant.json"), []byte(`{"stale":true}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(source, "ota-certificate.pem"), []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	})
+	body := claimBody("bld_replaceJOB01", "apk")
+	body["icons"] = []string{"icon.png"}
+	prepared, err := rig.agent.prepareWorktree(context.Background(), mustClaimedJob(t, body), newLogBuffer(newRedactor()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant, _ := os.ReadFile(filepath.Join(prepared.Layout.Src(), "tenants", "anyfun", "tenant.json"))
+	if strings.Contains(string(tenant), "stale") || !strings.Contains(string(tenant), "com.anyfun.foundation") {
+		t.Fatalf("tenant.json was not replaced: %s", tenant)
+	}
+	certificate, _ := os.ReadFile(filepath.Join(prepared.Layout.Src(), "ota-certificate.pem"))
+	if string(certificate) != fakebuild.CertificatePEM {
+		t.Fatal("ota-certificate.pem was not replaced")
+	}
+	icon, _ := os.ReadFile(filepath.Join(prepared.Layout.Src(), "assets", "tenants", "anyfun", "icon.png"))
+	if string(icon) != "png-from-server" {
+		t.Fatalf("the icon from the server was not written: %q", icon)
+	}
+	rig.agent.cleanupJob(prepared.Layout)
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}

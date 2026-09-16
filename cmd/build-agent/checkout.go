@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,17 +111,22 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		return prepared, err
 	}
 	prepared.Commit = commit
-	src := layout.Src()
+	// 从这里开始往检出里写服务端下发的文件：检出内容不可信，写入一律不跟随符号链接
+	checkout, err := openCheckoutFS(layout.Src())
+	if err != nil {
+		return prepared, err
+	}
+	defer checkout.Close()
 
-	// 身份文件由服务端合成随任务下发，仓库里没有这份文件。构建机仍然校验一遍（见 tenantfile.go）
-	if _, err := writeTenantFile(src, job.TenantDirectory, job.TenantFile); err != nil {
+	// 身份文件由服务端合成随任务下发。构建机仍然校验一遍（见 tenantfile.go）
+	if _, err := writeTenantFile(checkout, job.TenantDirectory, job.TenantFile); err != nil {
 		return prepared, err
 	}
 	buf.add(fmt.Sprintf("tenant %s written as %s (%d)", job.TenantDirectory, job.Version, job.BuildNumber))
 	if err := checkTenantFileMatchesJob(job); err != nil {
 		return prepared, err
 	}
-	written, err := fetchTenantIcons(ctx, a.api, job, src)
+	written, err := fetchTenantIcons(ctx, a.api, job, checkout)
 	if err != nil {
 		return prepared, err
 	}
@@ -128,14 +134,14 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		buf.add(fmt.Sprintf("%d icons written from the tenant configuration", written))
 	}
 	// 图标在 prebuild 里才被读到，而那是 pnpm install 之后的事。这里先看一眼。
-	if missing := missingTenantIcons(src, job.TenantDirectory); len(missing) > 0 {
+	if missing := missingTenantIcons(checkout, job.TenantDirectory); len(missing) > 0 {
 		return prepared, fmt.Errorf("这个租户缺这几张启动图标：%s。"+
 			"在控制台「Android 打包与签名 → 启动图标」上传，或者提交到 App 仓库的 assets/tenants/%s/ 下",
 			strings.Join(missing, "、"), job.TenantDirectory)
 	}
 	// 证书与 Firebase 配置两种任务都写：它们是真实的原生输入，进 expo config，也就进原生指纹。
 	// 路径必须是相对的（见 jobspec.OTACertificateRelPath），否则每个任务目录一个指纹。
-	if err := writeJobFile(filepath.Join(src, jobspec.OTACertificateRelPath), []byte(job.OTACertificatePEM)); err != nil {
+	if err := checkout.writeFile(jobspec.OTACertificateRelPath, []byte(job.OTACertificatePEM)); err != nil {
 		return prepared, err
 	}
 	googleServices := strings.TrimSpace(job.GoogleServicesJSON) != ""
@@ -144,7 +150,7 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		if err != nil {
 			return prepared, fmt.Errorf("googleServicesJson is not base64: %w", err)
 		}
-		if err := writeJobFile(filepath.Join(src, jobspec.GoogleServicesRelPath), decoded); err != nil {
+		if err := checkout.writeFile(jobspec.GoogleServicesRelPath, decoded); err != nil {
 			return prepared, err
 		}
 		buf.add("google-services.json written from the tenant build configuration")
@@ -185,7 +191,7 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 	if err != nil {
 		return prepared, err
 	}
-	if err := writeJobFile(layout.Spec(), raw); err != nil {
+	if err := writeNewFile(layout.Dir(), jobspec.SpecFileName, raw); err != nil {
 		return prepared, err
 	}
 	prepared.Spec = spec
@@ -205,10 +211,6 @@ func checkTenantFileMatchesJob(job claimedJob) error {
 		return fmt.Errorf("the tenant file androidVersionCode does not match the job build number %d", job.BuildNumber)
 	}
 	return nil
-}
-
-func writeJobFile(path string, content []byte) error {
-	return os.WriteFile(path, content, 0o640)
 }
 
 // checkoutMain 在控制进程里把 main 检出成一个自包含的单提交仓库（src/.git 是真目录），
@@ -308,21 +310,20 @@ func (a *agent) gitOutput(ctx context.Context, args ...string) (string, error) {
 }
 
 // fetchTenantIcons 把服务端列出的图标一张一张取下来，写进 assets/tenants/<目录>/。
-// 文件名由服务端给（约定的那四个），这里仍然挡一次路径逃逸。
-func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout string) (int, error) {
+// 文件名由服务端给（约定的那四个），这里仍然挡一次路径逃逸；写入不跟随检出里的符号链接。
+func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout *checkoutFS) (int, error) {
 	if len(job.Icons) == 0 {
 		return 0, nil
 	}
-	dir := filepath.Join(checkout, "assets", "tenants", job.TenantDirectory)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return 0, fmt.Errorf("create tenant asset directory: %w", err)
-	}
+	dir := filepath.Join("assets", "tenants", job.TenantDirectory)
 	written := 0
 	for _, name := range job.Icons {
-		if name != filepath.Base(name) || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") || name == "" {
+		if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
 			return written, fmt.Errorf("refusing an icon name that escapes the tenant directory: %q", firstRunes(name, 64))
 		}
-		if err := api.downloadIcon(ctx, job, name, filepath.Join(dir, name)); err != nil {
+		if err := checkout.writeFrom(filepath.Join(dir, name), func(w io.Writer) error {
+			return api.downloadIcon(ctx, job, name, w)
+		}); err != nil {
 			return written, fmt.Errorf("cannot fetch icon %s: %w", name, err)
 		}
 		written++
@@ -330,8 +331,8 @@ func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout
 	return written, nil
 }
 
-// missingTenantIcons 返回 prebuild 会去读、而检出里还没有的那几个图标。
-func missingTenantIcons(checkout, directory string) []string {
+// missingTenantIcons 返回 prebuild 会去读、而检出里还没有（或者不是普通文件）的那几个图标。
+func missingTenantIcons(checkout *checkoutFS, directory string) []string {
 	var missing []string
 	for _, name := range []string{
 		"icon.png",
@@ -339,7 +340,7 @@ func missingTenantIcons(checkout, directory string) []string {
 		"android-icon-background.png",
 		"android-icon-monochrome.png",
 	} {
-		if _, err := os.Stat(filepath.Join(checkout, "assets", "tenants", directory, name)); err != nil {
+		if !checkout.isRegularFile(filepath.Join("assets", "tenants", directory, name)) {
 			missing = append(missing, name)
 		}
 	}

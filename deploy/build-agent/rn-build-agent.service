@@ -32,12 +32,17 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/rn-build-agent/build-agent
 Restart=always
 RestartSec=10
-# 停机时先做完手上那一条构建（控制进程收到 SIGTERM 只是不再领新活），所以这个值必须比
-# BUILD_AGENT_TIMEOUT_MINUTES 长，否则 systemd 会在构建中途补一刀 SIGKILL。
-# 急着换就 `systemctl kill -s SIGKILL rn-build-agent`：任务由服务端回收，残留的任务目录与
-# builder 进程在下次启动时清掉。
+# 停机时先做完手上那一条构建：控制进程收到 SIGTERM 只是不再领新活，手上的构建照常跑完、
+# 交付或上报失败，然后退出。
+#
+# KillMode=mixed：SIGTERM 只发给控制进程。control-group 会把 SIGTERM 发给整个 cgroup，
+# sudo 转给执行进程，构建当场被打断——和"先做完"正好相反。
+#
+# TimeoutStopSec 必须比 BUILD_AGENT_TIMEOUT_MINUTES 长，到期 systemd 对整个 cgroup 补
+# SIGKILL。急着换就 `systemctl kill -s SIGKILL rn-build-agent`：任务由服务端回收（或下次
+# 启动时以 BUILDER_HAS_ACTIVE_JOB 判失败），残留的任务目录与 builder 进程在下次启动时清掉。
 TimeoutStopSec=3600
-KillMode=control-group
+KillMode=mixed
 UMask=0027
 LimitCORE=0
 
@@ -52,6 +57,15 @@ ProtectProc=invisible
 ReadWritePaths=/var/lib/rn-build-agent /var/lib/rn-build-jobs
 ReadWritePaths=-/run/sudo
 # Android SDK、JDK 以只读方式可见（ProtectSystem=strict 已经让它们只读）
+
+# 开发阶段签名闸与构建机同机（deploy/signer/）：签名闸的配置、状态、运行时目录、检查进程
+# socket 与程序目录对构建机整个 unit 不可见。真正的边界是这些路径的属主与权限，这里是纵深防御。
+InaccessiblePaths=-/etc/rn-signer-a.env -/etc/rn-signer-b.env
+InaccessiblePaths=-/var/lib/rn-signer-a -/var/lib/rn-signer-b
+InaccessiblePaths=-/run/rn-signer-a -/run/rn-signer-b -/run/rn-signer-a-check.sock -/run/rn-signer-b-check.sock
+InaccessiblePaths=-/opt/rn-signer
+# 服务端的配置同理
+InaccessiblePaths=-/etc/rn-foundation.env
 
 [Install]
 WantedBy=multi-user.target

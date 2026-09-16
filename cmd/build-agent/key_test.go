@@ -64,6 +64,21 @@ func TestProvenanceKeyRefusesLoosePermissions(t *testing.T) {
 	if _, err := readKeyringReadOnly(dir); err == nil {
 		t.Fatal("show-key read a group-readable key file")
 	}
+	// 私钥文件换成符号链接（哪怕指向一个权限正确的文件）也拒绝
+	key := filepath.Join(dir, provenanceKeyFile)
+	real := filepath.Join(t.TempDir(), "elsewhere.key")
+	if err := os.Chmod(key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(key, real); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateKeyring(dir); err == nil {
+		t.Fatal("a symlinked key file was accepted")
+	}
 }
 
 // show-key 只读：空目录下不造密钥，打印的是完整 sha256 与公钥 base64

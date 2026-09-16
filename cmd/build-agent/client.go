@@ -26,6 +26,7 @@ const (
 	codeBuilderHasActiveJob = "BUILDER_HAS_ACTIVE_JOB"
 	codeKeyNotAccepted      = "MACHINE_KEY_NOT_ACCEPTED"
 	codeKeyRotationUnproven = "MACHINE_KEY_ROTATION_UNPROVEN"
+	codeClaimInProgress     = "BUILDER_CLAIM_IN_PROGRESS"
 
 	headerMachineToken = "x-machine-token"
 	headerBuildAttempt = "x-build-attempt"
@@ -71,7 +72,25 @@ func newAPIError(path string, status int, payload []byte) error {
 	if detail == "" {
 		detail = string(payload)
 	}
-	return classify(status, &apiError{Path: path, Status: status, Code: problem.Code, Detail: detail})
+	err := &apiError{Path: path, Status: status, Code: problem.Code, Detail: detail}
+	if transientCodes[problem.Code] {
+		return retryLater{err}
+	}
+	return classify(status, err)
+}
+
+// transientCodes 是状态码是 4xx、但服务端明说"现在不行、等会儿再来"的几种。其余 4xx 都是
+// 明确的拒绝（UPLOAD_CONTENT_TYPE_INVALID、UPLOAD_TOO_LARGE、UPLOAD_EMPTY、INVALID_BUILD_ATTEMPT、
+// BUILD_SBOM_INVALID、BUILD_PROVENANCE_INVALID、BUILD_KIND_MISMATCH……），重试一百次也是同一个答案。
+var transientCodes = map[string]bool{
+	// 同一台机器的另一次领取还在服务端手里（上一次请求超时后重发）
+	codeClaimInProgress: true,
+	// 上传的请求体没读完整：链路上断了，重传
+	"UPLOAD_INTERRUPTED": true,
+	// 服务端写对象存储失败（424）
+	"UPLOAD_STORAGE_FAILED": true,
+	// 机器登记表并发写冲突
+	"MACHINES_VERSION_CONFLICT": true,
 }
 
 // classify 决定一个 HTTP 失败要不要再试：5xx 和 429 是"现在不行"，4xx 是"不行"。
@@ -392,8 +411,8 @@ func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path,
 	return nil
 }
 
-// downloadIcon 取一张图标，直接写进检出，不经过内存里的字符串。
-func (c *client) downloadIcon(ctx context.Context, job claimedJob, name, target string) error {
+// downloadIcon 取一张图标写进 w（调用方给的是检出里以 O_EXCL 新建的文件），不经过内存里的字符串。
+func (c *client) downloadIcon(ctx context.Context, job claimedJob, name string, w io.Writer) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.server+jobPath(job.ID, "/icons/"+url.PathEscape(name)), nil)
 	if err != nil {
 		return err
@@ -408,13 +427,8 @@ func (c *client) downloadIcon(ctx context.Context, job claimedJob, name, target 
 		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return newAPIError("icon "+name, response.StatusCode, payload)
 	}
-	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
 	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
-	written, err := io.Copy(file, io.LimitReader(response.Body, 12<<20+1))
+	written, err := io.Copy(w, io.LimitReader(response.Body, 12<<20+1))
 	if err != nil {
 		return err
 	}

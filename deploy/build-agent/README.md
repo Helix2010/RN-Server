@@ -108,7 +108,7 @@ builder 能写的地方只有当前任务的 `work/`、`out/` 与 `/tmp` 一类�
 
 ## unit 硬化
 
-`rn-build-agent.service`：`User=rn-build-agent`、`SupplementaryGroups=rn-build-jobs`、`UMask=0027`、`PrivateTmp`、`ProtectSystem=strict`（可写只有 `/var/lib/rn-build-agent`、`/var/lib/rn-build-jobs`）、`ProtectHome`、`ProtectControlGroups`、`ProtectProc=invisible`（同一个 unit 里的 builder 进程看不见 rn-build-agent 的进程）、`KillMode=control-group`、`LimitCORE=0`。
+`rn-build-agent.service`：`User=rn-build-agent`、`SupplementaryGroups=rn-build-jobs`、`UMask=0027`、`PrivateTmp`、`ProtectSystem=strict`（可写只有 `/var/lib/rn-build-agent`、`/var/lib/rn-build-jobs`）、`ProtectHome`、`ProtectControlGroups`、`ProtectProc=invisible`（同一个 unit 里的 builder 进程看不见 rn-build-agent 的进程）、`KillMode=mixed`（见「换二进制」）、`LimitCORE=0`，以及 `InaccessiblePaths` 挡住同机签名闸的 `/etc/rn-signer-{a,b}.env`、`/var/lib/rn-signer-{a,b}`、`/run/rn-signer-{a,b}`、两个检查进程 socket、`/opt/rn-signer`，和服务端的 `/etc/rn-foundation.env`（纵深防御，真正的边界是那些路径的属主与权限）。
 
 **没有 `NoNewPrivileges`**，也没有任何会被 systemd 隐式换成 `NoNewPrivileges` 的选项（`SystemCallFilter`、`SystemCallArchitectures`、`RestrictAddressFamilies`、`PrivateDevices`、`ProtectKernel*`、`MemoryDenyWriteExecute`、`RestrictSUIDSGID`、`LockPersonality` 等）：执行进程靠 sudo 切用户，那些选项会让 sudo 直接失败。2026-09-16 在开发机上用 `systemd-run` 按这份 unit 的选项实测过：sudo 切到另一个用户可行，`build-runner` 在沙箱里完整跑通一次安装包构建，控制进程靠组权限读回产物，构建用户读不到控制进程状态目录、看不到控制进程的 `/proc`；加上 `PrivateDevices=yes` 或 `SystemCallArchitectures=native` 后 sudo 报 "no new privileges flag is set"。分用户这道边界靠 uid 与文件权限，不靠这些选项。
 
@@ -186,7 +186,9 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 
 冒烟：`env -i /opt/rn-build-agent/build-agent` 必须以 2 退出（配置不全），什么都不写；`build-runner` 不带参数也以 2 退出。
 
-控制进程收到 SIGTERM 后**不再领新任务，但把手上那一条做完**，所以 `systemctl restart` 可能等一轮构建（最长 `BUILD_AGENT_TIMEOUT_MINUTES`，unit 的 `TimeoutStopSec=3600`）。急着换就 `systemctl kill -s SIGKILL rn-build-agent`：服务端回收任务，下次启动时清掉残留任务目录与 builder 进程。
+**停机是排空，不是中止。** 控制进程收到 SIGTERM 后不再发起新的领取；手上那一条（包括 SIGTERM 到达时已经发出、服务端已经派出的那次领取）照常构建、上传、交付，或者按失败上报，然后以 0 退出。unit 用 `KillMode=mixed`：SIGTERM 只发给控制进程，执行进程与它的子进程不会收到（`control-group` 会把 SIGTERM 发给整个 cgroup，sudo 转给执行进程，构建当场被打断——2026-09-16 用 `systemd-run` 对照实测过两种模式）。所以 `systemctl restart` 可能等一轮构建（最长 `BUILD_AGENT_TIMEOUT_MINUTES`）；超过 `TimeoutStopSec=3600` systemd 对整个 cgroup 补 SIGKILL。
+
+急着换就 `systemctl kill -s SIGKILL rn-build-agent`：构建被打断，不上报；服务端回收任务，或者新进程领取时收到 409 `BUILDER_HAS_ACTIVE_JOB` 把它判失败；残留任务目录与 builder 进程在新进程启动时清掉。
 
 ## 从旧结构迁移（旧打包机以 builder 跑 build-agent）
 
@@ -207,7 +209,8 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 | 执行进程留下的进程握着输出管道 | 执行进程退出后最多等 20 秒就强制关管道，残留进程由清理回收 |
 | 领取结果里出现 `sealedKeystore`、`keyAlias`、口令一类字段 | 整条任务拒收并报失败，不写盘 |
 | 服务端重启 / 5xx | 心跳失败只打 WARN；上传、交付、失败上报退避重试 |
-| 服务端明确拒绝（4xx） | 不重试；出处声明被拒（422 `BUILD_PROVENANCE_INVALID`）按失败上报 |
+| 服务端说"等会儿再来" | 409 `BUILDER_CLAIM_IN_PROGRESS`（上一次领取还在处理）下一轮再领；400 `UPLOAD_INTERRUPTED`、424 `UPLOAD_STORAGE_FAILED` 退避重传 |
+| 服务端明确拒绝（其余 4xx） | 不重试，带错误码按失败上报：`UPLOAD_CONTENT_TYPE_INVALID`、`UPLOAD_TOO_LARGE`、`UPLOAD_EMPTY`、`INVALID_BUILD_ATTEMPT`、`BUILD_SBOM_INVALID`、`BUILD_KIND_MISMATCH`、`BUILD_PROVENANCE_INVALID` 等 |
 | 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 中止执行进程，按超时上报 |
 | 公钥未被接受 / 令牌被吊销 | 不领任务，journal 里说清楚在等什么 |
 | 状态目录或密钥权限不对 | 控制进程以 2 退出，不把密钥留在别人读得到的地方 |
