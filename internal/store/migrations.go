@@ -72,6 +72,8 @@ var migrations = []migration{
 	{version: 53, name: "platform_backups", apply: platformBackupsMigration},
 	// Android 签名闸（设计 android-signing-gate-2026-09-16、ADR 0019）：构建与签名拆成两段
 	{version: 54, name: "build_jobs_signing_gate", apply: buildJobsSigningGateMigration},
+	// 第二次发布（ADR 0019「两次发布」）：新链路稳定之后单独发，不要与 54 一起上
+	{version: 55, name: "drop_platform_backups", apply: dropPlatformBackupsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1982,6 +1984,35 @@ func buildJobsSigningGateMigration(ctx context.Context, db *sql.DB) error {
 			COMMENT '每台构建机同时只派一条：认领前查本机有没有 claimed/running 的任务'`); err != nil {
 			return fmt.Errorf("build jobs signing gate migration create machine index: %w", err)
 		}
+	}
+	return nil
+}
+
+// dropPlatformBackupsMigration 删掉已整体移除的平台备份方案（platform-backup-recovery-2026-09-15）
+// 留下的表与配置行，以及签名闸切换后不再有人读的两类记录：
+//
+//   - platform_backups 表；
+//   - app_configs 的 backup.bucket、backup.recipients、build.agent.backup-sign（备份）与
+//     build.agent.recipient（打包机单一公钥，被 build.machines 取代）；
+//   - 旧格式（不是 format 2）的 build.keystore.check：打包机时代的单机记录，新代码读到它
+//     本来就当作空，删掉只是清理。
+//
+// **这是第二次发布**（ADR 0019「两次发布」）。第一次发布删代码、不删表：那一次失败回滚到
+// 旧二进制时，旧代码面对的表和配置还在。新链路稳定之后才单独发布这一条迁移。
+//
+// 迁移 53 留在列表里不动：跑过 53 的库靠 schema_migrations 跳过它，新库先建后删，结果一致。
+// 每一步都能重复执行（DROP TABLE IF EXISTS、按键 DELETE），中途失败重跑就是从头再来。
+func dropPlatformBackupsMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `DELETE FROM app_configs
+		WHERE config_key IN ('backup.bucket','backup.recipients','build.agent.backup-sign','build.agent.recipient')`); err != nil {
+		return fmt.Errorf("drop platform backups migration delete configs: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM app_configs
+		WHERE config_key='build.keystore.check' AND NOT COALESCE(JSON_TYPE(config_value)='OBJECT' AND JSON_EXTRACT(config_value,'$.format')=2, FALSE)`); err != nil {
+		return fmt.Errorf("drop platform backups migration delete legacy keystore checks: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS platform_backups`); err != nil {
+		return fmt.Errorf("drop platform backups migration drop table: %w", err)
 	}
 	return nil
 }
