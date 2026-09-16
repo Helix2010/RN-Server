@@ -34,18 +34,15 @@ func TestRevokedExitStatusIsDistinctAndNotRestarted(t *testing.T) {
 // 在跑的构建中途被吊销（心跳先撞上）：立刻中止、清理、不再上报，常驻循环以 77 退出
 func TestRevocationDuringABuildAbortsAndExits(t *testing.T) {
 	rig := newRig(t)
-	if err := os.WriteFile(rig.tools.Sleep, []byte("60"), 0o644); err != nil {
+	if err := os.WriteFile(rig.tools.Sleep, []byte(neverFinishesSeconds), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	rig.server.failOnce("/heartbeat", http.StatusUnauthorized, codeMachineRevoked)
 	rig.server.queueClaim(claimBody("bld_revokedJOB01", "apk"))
 
-	started := time.Now()
-	if code := serveWithTimeout(t, rig.agent, 45*time.Second); code != exitMachineRevoked {
+	// 没被中止的话假构建要睡 neverFinishesSeconds 秒，serve 会等到上限到期才以 0 返回
+	if code := serveWithTimeout(t, rig.agent, loadIndependentBound); code != exitMachineRevoked {
 		t.Fatalf("serve returned %d, want %d", code, exitMachineRevoked)
-	}
-	if elapsed := time.Since(started); elapsed > 40*time.Second {
-		t.Fatalf("the build was not aborted (%s)", elapsed)
 	}
 	for _, suffix := range []string{"/fail", "/built", "/unsigned/upload", "/complete"} {
 		if calls := rig.server.callsTo(suffix); len(calls) != 0 {
@@ -62,7 +59,7 @@ func TestRevocationDuringDeliveryIsNotReported(t *testing.T) {
 	rig := newRig(t)
 	rig.server.failOnce("/unsigned/upload", http.StatusUnauthorized, codeMachineRevoked)
 	rig.server.queueClaim(claimBody("bld_revokedJOB02", "apk"))
-	if code := serveWithTimeout(t, rig.agent, 30*time.Second); code != exitMachineRevoked {
+	if code := serveWithTimeout(t, rig.agent, loadIndependentBound); code != exitMachineRevoked {
 		t.Fatalf("serve returned %d", code)
 	}
 	if len(rig.server.callsTo("/fail")) != 0 || len(rig.server.callsTo("/built")) != 0 {
@@ -78,7 +75,7 @@ func TestRevokedAtRegistrationExits(t *testing.T) {
 	rig := newRig(t)
 	rig.server.setAuthCode(codeMachineRevoked)
 	rig.server.queueClaim(claimBody("bld_neverClaimed", "apk"))
-	if code := serveWithTimeout(t, rig.agent, 10*time.Second); code != exitMachineRevoked {
+	if code := serveWithTimeout(t, rig.agent, loadIndependentBound); code != exitMachineRevoked {
 		t.Fatalf("serve returned %d", code)
 	}
 	if len(rig.server.callsTo("/claim")) != 0 {
@@ -94,7 +91,7 @@ func TestAuthRequiredAfterRegistrationMeansRevoked(t *testing.T) {
 	}
 	rig.server.setAuthCode(codeMachineAuthRequired)
 	rig.agent.keyActive = false
-	if code := serveWithTimeout(t, rig.agent, 10*time.Second); code != exitMachineRevoked {
+	if code := serveWithTimeout(t, rig.agent, loadIndependentBound); code != exitMachineRevoked {
 		t.Fatalf("serve returned %d", code)
 	}
 }
@@ -103,10 +100,24 @@ func TestAuthRequiredAfterRegistrationMeansRevoked(t *testing.T) {
 func TestAuthRequiredBeforeRegistrationKeepsWaiting(t *testing.T) {
 	rig := newRig(t)
 	rig.server.setAuthCode(codeMachineAuthRequired)
-	if code := serveWithTimeout(t, rig.agent, 300*time.Millisecond); code != 0 {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	// 至少让它撞上两次 401 之后再发停机信号，否则断言可能什么都没验
+	go func() {
+		defer stop()
+		// 不能在这个 goroutine 里 t.Fatal：等不到就照样停，由下面的断言报出来
+		deadline := time.Now().Add(loadIndependentBound)
+		for len(rig.server.callsTo("/public-key")) < 2 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	if code := rig.agent.serve(ctx); code != 0 {
 		t.Fatalf("serve returned %d, want 0 after the stop signal", code)
 	}
 	if rig.agent.api.isRevoked() {
 		t.Fatal("an unrecognised token before any registration was treated as a revocation")
+	}
+	if n := len(rig.server.callsTo("/public-key")); n < 2 {
+		t.Fatalf("only %d key registrations were attempted before stopping", n)
 	}
 }

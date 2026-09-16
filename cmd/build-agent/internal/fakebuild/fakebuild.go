@@ -32,7 +32,7 @@ type Tools struct {
 	Record string
 	// Sleep 存在时，假 pnpm install 睡文件里写的秒数（空文件是 120 秒，用来测中止）
 	Sleep string
-	// Linger 存在时，假 pnpm install 留下一个握着标准输出的后台进程，PID 写进 <Record>/linger.pid
+	// Linger 存在时，假 pnpm install 留下一个握着标准输出的后台进程（睡 1800 秒），PID 写进 <Record>/linger.pid
 	Linger string
 	// APK 与 OTA 是假产物的内容
 	APK []byte
@@ -70,7 +70,7 @@ case "$1" in
 install)
   record install
   if [ -e %[2]q ]; then seconds=$(cat %[2]q); sleep "${seconds:-120}"; fi
-  if [ -e %[6]q ]; then sleep 300 & echo $! > %[1]q/linger.pid; fi
+  if [ -e %[6]q ]; then sleep 1800 & echo $! > %[1]q/linger.pid; fi
   mkdir -p node_modules
   ;;
 exec)
