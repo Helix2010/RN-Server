@@ -90,21 +90,20 @@ type claimedJob struct {
 	ClaimedMachineID string `json:"claimedMachineId"`
 	TenantSlug       string `json:"tenantSlug"`
 	// TenantDirectory 是仓库里 tenants/ 下的目录名，与 TenantSlug 是两套命名，只用它拼路径。
-	TenantDirectory      string          `json:"tenantDirectory"`
-	Platform             string          `json:"platform"`
-	Kind                 string          `json:"kind"`
-	BaseReleaseID        string          `json:"baseReleaseId"`
-	Channel              string          `json:"channel"`
-	ApplyStrategy        string          `json:"applyStrategy"`
-	RuntimeVersion       string          `json:"runtimeVersion"`
-	GitRef               string          `json:"gitRef"`
-	Version              string          `json:"version"`
-	BuildNumber          int             `json:"buildNumber"`
-	OTACertificatePEM    string          `json:"otaCertificatePem"`
-	OTACertificateSHA256 string          `json:"otaCertificateSha256"`
-	GoogleServicesJSON   string          `json:"googleServicesJson"`
-	Icons                []string        `json:"icons"`
-	TenantFile           json.RawMessage `json:"tenantFile"`
+	TenantDirectory    string          `json:"tenantDirectory"`
+	Platform           string          `json:"platform"`
+	Kind               string          `json:"kind"`
+	BaseReleaseID      string          `json:"baseReleaseId"`
+	Channel            string          `json:"channel"`
+	ApplyStrategy      string          `json:"applyStrategy"`
+	RuntimeVersion     string          `json:"runtimeVersion"`
+	GitRef             string          `json:"gitRef"`
+	Version            string          `json:"version"`
+	BuildNumber        int             `json:"buildNumber"`
+	OTACertificatePEM  string          `json:"otaCertificatePem"`
+	GoogleServicesJSON string          `json:"googleServicesJson"`
+	Icons              []string        `json:"icons"`
+	TenantFile         json.RawMessage `json:"tenantFile"`
 }
 
 // APIBaseURL / ApplicationID / PackageName 从服务端合成的身份文件里取。
