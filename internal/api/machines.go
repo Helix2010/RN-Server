@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,15 @@ const (
 	machineReasonMinLength   = 3
 	machineRevokeReasonLimit = 500
 )
+
+// 签名闸在机器上以系统用户 rn-signer-<机器名> 运行（install.sh 按机器名实例化），Linux 用户名最多 32 个字符，
+// 所以签名闸的机器名比通用规则（40 个字符）更短。只在新建时检查：已登记的机器名不受影响。
+const (
+	signerSystemUserPrefix     = "rn-signer-"
+	maxSignerMachineNameLength = 32 - len(signerSystemUserPrefix)
+)
+
+var signerMachineNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,21}$`)
 
 // optString 是 JSON 里可以为 null 的字符串：空串序列化成 null，null 读回空串。
 // 登记里有十来个可空字段，全用 *string 写起来到处是判空。
@@ -623,6 +633,11 @@ func (s *server) createMachine(c *gin.Context) {
 		return
 	case role == machineRoleSigner && signerRole != signerRolePrimary && signerRole != signerRoleStandby:
 		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "a signer needs signerRole primary or standby")
+		return
+	case role == machineRoleSigner && !signerMachineNamePattern.MatchString(name):
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", fmt.Sprintf(
+			"a signer's name must match ^[a-z0-9][a-z0-9-]{1,21}$ (at most %d characters): the signer runs as the system user %s<name>, and Linux user names are limited to 32 characters",
+			maxSignerMachineNameLength, signerSystemUserPrefix))
 		return
 	}
 	// 签名闸安装时要在本机 pin 一把离线恢复公钥（--recovery-sha256），它生成的密钥都要加密给恢复公钥。

@@ -37,7 +37,7 @@ ADR-0019 上线 amos 时每一步都靠人：每台新机器要传部署包、�
 ### 1. 新机器：注册码与 machine-setup
 
 - `POST /v1/admin/platform/machines` 不再返回令牌，返回 `enrollment: {code, expiresAt, installCommand}`；机器状态新增 `pending_enrollment`。安装命令由服务端按请求的外部源拼好（`https` 只在 TLS、生产环境、或 `TRUSTED_PROXIES` 里的代理说 `X-Forwarded-Proto: https` 时成立），签名闸的命令末尾带 `--recovery-sha256 <从密码管理器粘贴恢复公钥指纹>` 占位——**恢复公钥指纹不取控制台的值**。
-- 新建签名闸要求平台已登记未吊销的恢复公钥（409 `RECOVERY_KEY_NOT_CONFIGURED`）：没有恢复公钥的签名闸什么密钥都生成不了。
+- 新建签名闸要求平台已登记未吊销的恢复公钥（409 `RECOVERY_KEY_NOT_CONFIGURED`）：没有恢复公钥的签名闸什么密钥都生成不了。签名闸的机器名最多 22 个字符（400 `INVALID_MACHINE`）：install.sh 按机器名建系统用户 `rn-signer-<机器名>`，Linux 用户名上限 32 个字符；构建机仍按通用规则（40 个字符）。
 - `POST /v1/admin/platform/machines/:id/enrollment` 重发注册码（旧码作废），只对 `pending_enrollment`。
 - `/v1/machine-setup`（不走机器令牌）：`GET /install.sh`（`internal/machinesetup` 嵌入的脚本）、`POST /describe`（不消耗注册码；机器身份、安装包清单、签名闸的恢复公钥、备签名闸的当前主签名闸公钥）、`GET /bundle/{role}.tar.gz`（头 `x-enrollment-code`，只给注册码所属角色，流式，按路由模板精确豁免数据库超时）、`POST /enroll`。三条按来源 IP 每分钟 20 次限速（429 `MACHINE_SETUP_RATE_LIMITED`）。注册码无效、过期、已用一律 404 `ENROLLMENT_CODE_INVALID`，同一句话。
 - `enroll` 在**一个写事务**里 `FOR UPDATE` 读 `build.machines`、核对并消耗注册码、挂上待接受的公钥（`pending_key`）、签发令牌、写审计 `machine_enrolled`（不含令牌与注册码）。同一个码并发注册恰好一个成功（有测试）。

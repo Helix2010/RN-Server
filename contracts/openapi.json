@@ -3964,7 +3964,7 @@
         },
         "responses": {
           "400": {
-            "description": "INVALID_MACHINE"
+            "description": "INVALID_MACHINE (including a signer name longer than 22 characters)"
           },
           "401": {
             "description": "Admin authentication required"
@@ -7966,7 +7966,8 @@
           },
           "name": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9-]{1,39}$"
+            "pattern": "^[a-z0-9][a-z0-9-]{1,39}$",
+            "description": "Builders: ^[a-z0-9][a-z0-9-]{1,39}$. Signers additionally at most 22 characters (^[a-z0-9][a-z0-9-]{1,21}$): a signer runs as the system user rn-signer-<name>, and Linux user names are limited to 32 characters. Only checked on create; machines registered earlier keep their names."
           },
           "signerRole": {
             "type": "string",

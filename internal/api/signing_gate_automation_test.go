@@ -580,6 +580,21 @@ func TestDBSignerCreationNeedsARecoveryKeyAndTheInstallCommandIsComposed(t *test
 		t.Fatalf("a signer without a recovery key: %d %s", r.Code, r.Body.String())
 	}
 	f.registerRecoveryKey("platform-recovery")
+	// 签名闸的机器名最多 22 个字符（系统用户 rn-signer-<机器名> 不超过 Linux 的 32 个字符）；构建机仍按 40 个
+	tooLong := map[string]any{"role": "signer", "name": "s" + strings.Repeat("x", 22), "signerRole": "standby", "expectedVersion": registryVersion(t, f), "reason": "add a signer", "confirm": true}
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", tooLong); r.Code != http.StatusBadRequest || problemCode(t, r) != "INVALID_MACHINE" ||
+		!strings.Contains(r.Body.String(), "at most 22 characters") || !strings.Contains(r.Body.String(), "rn-signer-") {
+		t.Fatalf("a 23-character signer name: %d %s", r.Code, r.Body.String())
+	}
+	longest := map[string]any{"role": "signer", "name": "s" + strings.Repeat("y", 21), "signerRole": "standby", "expectedVersion": registryVersion(t, f), "reason": "add a signer", "confirm": true}
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", longest); r.Code != http.StatusCreated {
+		t.Fatalf("a 22-character signer name: %d %s", r.Code, r.Body.String())
+	}
+	longBuilder := map[string]any{"role": "builder", "name": "b" + strings.Repeat("z", 39), "signerRole": nil, "expectedVersion": registryVersion(t, f), "reason": "add a builder", "confirm": true}
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", longBuilder); r.Code != http.StatusCreated {
+		t.Fatalf("a 40-character builder name: %d %s", r.Code, r.Body.String())
+	}
+	body["expectedVersion"] = registryVersion(t, f)
 	created := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", body)
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create a signer: %d %s", created.Code, created.Body.String())
