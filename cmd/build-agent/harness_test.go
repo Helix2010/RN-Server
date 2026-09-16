@@ -75,6 +75,14 @@ type fakeServer struct {
 	failNext map[string][]injectedProblem
 	// redirects 让以某个后缀结尾的请求回 307 到给定的源
 	redirects map[string]string
+	// authCode 非空时每个请求都回 401 这个码（MACHINE_REVOKED / MACHINE_AUTH_REQUIRED）
+	authCode string
+}
+
+func (f *fakeServer) setAuthCode(code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authCode = code
 }
 
 type injectedProblem struct {
@@ -138,6 +146,10 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		Token: r.Header.Get(headerMachineToken), Body: body})
 	if r.Header.Get(headerMachineToken) != testToken {
 		f.problem(w, http.StatusUnauthorized, "MACHINE_AUTH_REQUIRED")
+		return
+	}
+	if f.authCode != "" {
+		f.problem(w, http.StatusUnauthorized, f.authCode)
 		return
 	}
 	path := r.URL.Path
