@@ -3,6 +3,7 @@
 #
 #   sudo rn-foundation-apply server
 #   sudo rn-foundation-apply admin <租户 slug>
+#   sudo rn-foundation-apply build-agent
 #
 # 这是**唯一**一个 CI 能用 sudo 跑的东西。sudoers 里放行的是这个文件、不带参数
 # 限制，参数合法性由脚本自己管——理由是：把 install/mv/rm/systemctl 逐条写进
@@ -13,12 +14,21 @@
 # 部署账号除了这个脚本没有任何 sudo 权限，所以拿到 CI 密钥也读不到那把口令；脚本
 # 换上去的二进制以 rnfoundation 身份运行，不是 root。这两条是这套权限设计的全部
 # 意义，改 sudoers 之前先想清楚会不会把它们破坏掉。
+#
+# **build-agent 那条是有代价的，单独说清楚。** 它换掉的是**以 builder 身份运行、
+# 读得到那把封装口令和 agent-key** 的那个二进制。开了它，能往 main 推代码的人（或者
+# 拿到 CI 密钥的人）就能在握着全平台签名密钥的那台机器上执行任意代码——而"服务端
+# 读不到签名密钥"正是整套备份方案的前提。所以它在工作流里是**单独一个开关**
+# （AMOS_DEPLOY_BUILD_AGENT），默认不开；不开的时候还是手工 scp（见
+# deploy/build-agent/README.md）。开之前先确认这个交换你认。
 set -euo pipefail
 
 STAGE_ROOT=/var/lib/rn-foundation-deploy/incoming
 ADMIN_ROOT=/opt/rn-foundation/admin
 BINARY=/opt/rn-foundation/rn-server
 PREVIOUS=/opt/rn-foundation/rn-server.prev
+AGENT_BINARY=/opt/rn-build-agent/build-agent
+AGENT_PREVIOUS=/opt/rn-build-agent/build-agent.prev
 ENV_FILE=/etc/rn-foundation.env
 
 log() { printf '   %s\n' "$*"; }
@@ -142,6 +152,75 @@ apply_admin() {
   # 整目录换掉而不是覆盖：上一版留下的旧 chunk 必须消失，否则目录只会越长越大。
   # 不 reload nginx——静态文件不经过它的缓存（open_file_cache 默认关），换完即生效
   log "$slug 控制台已更新"
+}
+
+# 打包机。它和服务端共用 internal/backupcontainer、internal/backupbundle 和
+# /v1/build-agent 那套契约，所以**和服务端同一个 commit 一起发**——分开发的那天，
+# 对不上的是备份容器格式，而发现它的时机是灾难当天。
+#
+# 和服务端不同的两件事：
+#
+#  1. **不阻塞等它停。** 代理收到 SIGTERM 会先把手上那条构建做完（最长
+#     BUILD_AGENT_TIMEOUT_MINUTES，默认 45 分钟，unit 里 TimeoutStopSec=3600）。
+#     阻塞式 restart 会把 CI 挂在那里直到超时被杀，而被杀掉的那条构建要人重新排。
+#     所以 --no-block 发出去，然后看一眼结果，排空中就如实说"排空中"。
+#  2. **没有健康检查可等。** 它不监听任何端口（只出不进），活着的判据只有
+#     systemd 的 ActiveState 和 MainPID 变没变。
+apply_build_agent() {
+  local src="$STAGE_ROOT/build-agent"
+  [ -s "$src" ] || die "暂存目录里没有 build-agent：$src"
+  [ "$(head -c 4 "$src" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
+    || die "$src 不是 ELF 可执行文件"
+  chmod 0755 "$src"
+
+  # 冒烟：不带任何配置跑一下，它必须以 2 退出并抱怨配置不全。这不验业务，
+  # 它验的是"这个二进制在这台机器上跑得起来"——架构不对、动态链接缺库都在这里露馅，
+  # 而不是换上去之后由 systemd 反复重启
+  local code=0
+  env -i "$src" >/dev/null 2>&1 || code=$?
+  [ "$code" = "2" ] || die "新的 build-agent 跑不起来（退出码 $code），不换"
+
+  local before_pid
+  before_pid="$(systemctl show -p MainPID --value rn-build-agent 2>/dev/null || echo 0)"
+
+  if [ -f "$AGENT_BINARY" ]; then
+    cp -a "$AGENT_BINARY" "$AGENT_PREVIOUS"
+  else
+    rm -f "$AGENT_PREVIOUS"
+  fi
+  # 正在跑的进程握着旧 inode，install 不会打断它
+  install -m 0755 -o root -g root "$src" "$AGENT_BINARY"
+  rm -f "$src"
+
+  log "请求重启（手上有构建的话会先把它做完）"
+  systemctl --no-block restart rn-build-agent
+
+  local deadline=$(( $(date +%s) + 90 )) state pid
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    state="$(systemctl show -p ActiveState --value rn-build-agent 2>/dev/null || true)"
+    pid="$(systemctl show -p MainPID --value rn-build-agent 2>/dev/null || echo 0)"
+    if [ "$state" = "active" ] && [ "$pid" != "$before_pid" ] && [ "$pid" != "0" ]; then
+      rm -f "$AGENT_PREVIOUS"
+      log "打包机已更新并起来了（pid $pid）"
+      return 0
+    fi
+    if [ "$state" = "failed" ]; then
+      log "回滚（新二进制起不来）"
+      if [ -f "$AGENT_PREVIOUS" ]; then
+        install -m 0755 -o root -g root "$AGENT_PREVIOUS" "$AGENT_BINARY"
+        rm -f "$AGENT_PREVIOUS"
+        systemctl --no-block restart rn-build-agent
+      fi
+      journalctl -u rn-build-agent -n 30 --no-pager -o cat >&2
+      die "新的 build-agent 起不来，已回滚二进制"
+    fi
+    sleep 3
+  done
+
+  # 90 秒还没换 pid：多半是在排空一条构建。这不是失败，但也不能说"已更新"——
+  # 新二进制在磁盘上，生效时机是那条构建做完
+  rm -f "$AGENT_PREVIOUS"
+  log "新二进制已就位；代理正在把手上那条构建做完，做完自动起新版（systemctl status rn-build-agent 看进度）"
 }
 
 case "${1:-}" in

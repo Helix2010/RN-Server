@@ -34,7 +34,7 @@
 | `/etc/rn-foundation.env` | 配置，0600 root，含数据库口令 |
 | `/var/lib/rn-foundation/` | 状态目录 |
 | `/etc/nginx/conf.d/rn-foundation.conf` | 四个域名的站点配置 |
-| `/usr/local/sbin/rn-foundation-apply` | 特权收口脚本，换二进制／换控制台都走它 |
+| `/usr/local/sbin/rn-foundation-apply` | 特权收口脚本，换二进制／换控制台／换打包机都走它（`server` / `admin <slug>` / `build-agent`） |
 | `/var/lib/rn-foundation-deploy/incoming/` | 部署暂存目录，属 `rndeploy` |
 
 三个 systemd unit：`rn-foundation-server`（监听 `127.0.0.1:13080`）、

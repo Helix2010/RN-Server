@@ -142,10 +142,31 @@ sudo systemctl enable --now rn-build-agent
 
 ## 换二进制 / 重启
 
+两条路，默认走手工那条。
+
+**手工（默认）**
+
 ```bash
+GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+  go build -trimpath -ldflags="-s -w" -o build-agent ./cmd/build-agent
 scp build-agent amos:~/build-agent.new
 ssh amos 'sudo install -m 0755 ~/build-agent.new /opt/rn-build-agent/build-agent && sudo systemctl restart rn-build-agent'
 ```
+
+**CI（要显式开）**：在 RN-Server 仓库的 Variables 里把 `AMOS_DEPLOY_BUILD_AGENT`
+设成 `true`，此后每次 push 到 main，代理和服务端**同一个 commit 一起发**——两边共用
+`internal/backupcontainer`、`internal/backupbundle` 和 `/v1/build-agent` 那套契约，
+分开发的那天对不上的是备份容器格式，而发现它的时机是灾难当天。
+
+**开之前先认下这个交换。** 服务端那个二进制以 `rnfoundation` 身份跑，读不到
+`/etc/rn-build-agent.env` 里 Android keystore 的封装口令，也读不到 `agent-key`；
+代理这个读得到。把它交给 CI，等于「能往 main 推代码的人 = 能在握着全平台签名密钥的
+机器上执行任意代码」，而**「服务端读不到签名密钥」是整套备份方案的前提**
+（`docs/design/platform-backup-recovery-2026-09-15.md` §1）。这个开关默认关着就是这个原因。
+
+CI 那条不会阻塞等构建排空：新二进制就位后发一个不阻塞的 restart，代理手上有活就先
+把它做完再起新版（最长 `BUILD_AGENT_TIMEOUT_MINUTES`）。日志里会说是「已起来」还是
+「排空中」。
 
 代理收到 SIGTERM 后**不再领新任务，但会把手上那一条做完**再退出，所以 `systemctl restart` 可能挂着等一轮构建（最长 `BUILD_AGENT_TIMEOUT_MINUTES`，默认 45 分钟；unit 里 `TimeoutStopSec=3600` 就是为它留的）。日志里会有一行 `stop requested: not claiming any more builds`。
 

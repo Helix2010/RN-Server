@@ -62,11 +62,20 @@ jobs:
 
       - name: Cross-compile for amos
         # 与 deploy/amos/deploy.sh 同一组参数。GOTOOLCHAIN=local：go.mod 固定了版本，
-        # 不让它自己去下别的工具链
+        # 不让它自己去下别的工具链。
+        #
+        # 扫链服务不单独编：它就是这个二进制的 `rn-server indexer` 子命令，
+        # rn-foundation-apply 里换二进制时会连它一起停、一起起。
+        #
+        # 打包机是另一个二进制，但**和服务端同一个 commit**：两边共用
+        # internal/backupcontainer / internal/backupbundle 和 /v1/build-agent 那套
+        # 契约，分开发的那天对不上的是备份容器格式，而发现它的时机是灾难当天
         run: |
           GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
             go build -trimpath -ldflags="-s -w" -o rn-server ./cmd/server
-          ls -l rn-server
+          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o build-agent ./cmd/build-agent
+          ls -l rn-server build-agent
 
       - name: Configure SSH
         env:
@@ -125,5 +134,26 @@ jobs:
           ssh amos "mv '$STAGE/rn-server.part' '$STAGE/rn-server'"
 
       - name: Apply
-        # 停服务、换二进制、跑迁移、健康检查、失败回滚都在 amos 那个脚本里
+        # 停服务、换二进制、跑迁移、健康检查、失败回滚都在 amos 那个脚本里。
+        # 扫链（rn-foundation-indexer）跟着这一步一起换——同一个二进制
         run: ssh amos 'sudo /usr/local/sbin/rn-foundation-apply server'
+
+      # ---- 打包机 ----------------------------------------------------------
+      #
+      # **默认不开，而且不该随手开。** 这一步换掉的是以 builder 身份运行、读得到
+      # Android keystore 封装口令和 agent-key 的那个二进制。开了它，能往 main 推代码
+      # 的人就能在握着全平台签名密钥的机器上执行任意代码——而「服务端读不到签名密钥」
+      # 正是整套备份方案的前提（docs/design/platform-backup-recovery-2026-09-15.md §1）。
+      #
+      # 不开的时候照旧手工 scp，见 deploy/build-agent/README.md。
+      - name: Upload the build agent
+        if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
+        run: |
+          ssh amos "cat > '$STAGE/build-agent.part'" < build-agent
+          ssh amos "mv '$STAGE/build-agent.part' '$STAGE/build-agent'"
+
+      - name: Apply the build agent
+        if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
+        # 放在服务端之后：代理起来第一件事是连服务端登记公钥。
+        # 这一步不会阻塞等构建排空——代理手上有活时，新二进制就位、做完自动生效
+        run: ssh amos 'sudo /usr/local/sbin/rn-foundation-apply build-agent'
