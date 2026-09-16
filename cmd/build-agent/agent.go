@@ -157,10 +157,14 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 	// 领到了就照常做完（停机只是不再发起新的领取）。
 	result, err := a.api.claim(context.WithoutCancel(ctx), a.cfg.Platforms)
 	if err != nil {
-		if errorCode(err) == codeKeyNotAccepted {
+		switch errorCode(err) {
+		case codeKeyNotAccepted:
 			a.keyActive = false
-		}
-		if ctx.Err() == nil {
+			a.log.Warn("cannot claim a build", "error", err)
+		case codeClaimInProgress:
+			// 上一次领取请求还在服务端手里（超时后重发）：等下一轮再领
+			a.log.Info("a previous claim from this machine is still being processed; retrying later")
+		default:
 			a.log.Warn("cannot claim a build", "error", err)
 		}
 		return false

@@ -71,10 +71,24 @@ type fakeServer struct {
 	heartbeatCode string
 	calls         []recordedCall
 	uploads       map[string][]byte
+	// failNext 按路径后缀排好的错误响应，依次消耗
+	failNext map[string][]injectedProblem
+}
+
+type injectedProblem struct {
+	status int
+	code   string
+}
+
+// failOnce 让以 suffix 结尾的下一次请求返回这个 Problem Details（可以连着排几次）。
+func (f *fakeServer) failOnce(suffix string, status int, code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNext[suffix] = append(f.failNext[suffix], injectedProblem{status: status, code: code})
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
-	f := &fakeServer{t: t, keyStatus: "active", uploads: map[string][]byte{}}
+	f := &fakeServer{t: t, keyStatus: "active", uploads: map[string][]byte{}, failNext: map[string][]injectedProblem{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -125,6 +139,13 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	for suffix, queue := range f.failNext {
+		if strings.HasSuffix(path, suffix) && len(queue) > 0 {
+			f.failNext[suffix] = queue[1:]
+			f.problem(w, queue[0].status, queue[0].code)
+			return
+		}
+	}
 	switch {
 	case path == "/v1/build-agent/public-key":
 		f.publicKey(w, body)

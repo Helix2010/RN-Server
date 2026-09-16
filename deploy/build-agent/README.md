@@ -209,7 +209,8 @@ ssh <构建机> 'sudo install -o root -g root -m 0755 ~/build-agent ~/build-runn
 | 执行进程留下的进程握着输出管道 | 执行进程退出后最多等 20 秒就强制关管道，残留进程由清理回收 |
 | 领取结果里出现 `sealedKeystore`、`keyAlias`、口令一类字段 | 整条任务拒收并报失败，不写盘 |
 | 服务端重启 / 5xx | 心跳失败只打 WARN；上传、交付、失败上报退避重试 |
-| 服务端明确拒绝（4xx） | 不重试；出处声明被拒（422 `BUILD_PROVENANCE_INVALID`）按失败上报 |
+| 服务端说"等会儿再来" | 409 `BUILDER_CLAIM_IN_PROGRESS`（上一次领取还在处理）下一轮再领；400 `UPLOAD_INTERRUPTED`、424 `UPLOAD_STORAGE_FAILED` 退避重传 |
+| 服务端明确拒绝（其余 4xx） | 不重试，带错误码按失败上报：`UPLOAD_CONTENT_TYPE_INVALID`、`UPLOAD_TOO_LARGE`、`UPLOAD_EMPTY`、`INVALID_BUILD_ATTEMPT`、`BUILD_SBOM_INVALID`、`BUILD_KIND_MISMATCH`、`BUILD_PROVENANCE_INVALID` 等 |
 | 构建超过 `BUILD_AGENT_TIMEOUT_MINUTES` | 中止执行进程，按超时上报 |
 | 公钥未被接受 / 令牌被吊销 | 不领任务，journal 里说清楚在等什么 |
 | 状态目录或密钥权限不对 | 控制进程以 2 退出，不把密钥留在别人读得到的地方 |

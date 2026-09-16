@@ -26,6 +26,7 @@ const (
 	codeBuilderHasActiveJob = "BUILDER_HAS_ACTIVE_JOB"
 	codeKeyNotAccepted      = "MACHINE_KEY_NOT_ACCEPTED"
 	codeKeyRotationUnproven = "MACHINE_KEY_ROTATION_UNPROVEN"
+	codeClaimInProgress     = "BUILDER_CLAIM_IN_PROGRESS"
 
 	headerMachineToken = "x-machine-token"
 	headerBuildAttempt = "x-build-attempt"
@@ -71,7 +72,25 @@ func newAPIError(path string, status int, payload []byte) error {
 	if detail == "" {
 		detail = string(payload)
 	}
-	return classify(status, &apiError{Path: path, Status: status, Code: problem.Code, Detail: detail})
+	err := &apiError{Path: path, Status: status, Code: problem.Code, Detail: detail}
+	if transientCodes[problem.Code] {
+		return retryLater{err}
+	}
+	return classify(status, err)
+}
+
+// transientCodes 是状态码是 4xx、但服务端明说"现在不行、等会儿再来"的几种。其余 4xx 都是
+// 明确的拒绝（UPLOAD_CONTENT_TYPE_INVALID、UPLOAD_TOO_LARGE、UPLOAD_EMPTY、INVALID_BUILD_ATTEMPT、
+// BUILD_SBOM_INVALID、BUILD_PROVENANCE_INVALID、BUILD_KIND_MISMATCH……），重试一百次也是同一个答案。
+var transientCodes = map[string]bool{
+	// 同一台机器的另一次领取还在服务端手里（上一次请求超时后重发）
+	codeClaimInProgress: true,
+	// 上传的请求体没读完整：链路上断了，重传
+	"UPLOAD_INTERRUPTED": true,
+	// 服务端写对象存储失败（424）
+	"UPLOAD_STORAGE_FAILED": true,
+	// 机器登记表并发写冲突
+	"MACHINES_VERSION_CONFLICT": true,
 }
 
 // classify 决定一个 HTTP 失败要不要再试：5xx 和 429 是"现在不行"，4xx 是"不行"。
