@@ -371,15 +371,29 @@ func TestValidConfigRequiresSemverInTheUpdatePolicy(t *testing.T) {
 			"updatePolicy": policy, "support": map[string]any{},
 		}
 	}
-	if !validConfig(base(map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": "1.2.0"})) {
+	perPlatform := func(min, latest string) map[string]any {
+		return map[string]any{
+			"minSupportedVersion": map[string]any{"android": min, "ios": min},
+			"latestVersion":       map[string]any{"android": latest, "ios": latest},
+		}
+	}
+	if !validConfig(base(perPlatform("1.0.0", "1.2.0"))) {
 		t.Fatal("a semver policy should be valid")
 	}
 	// 非法版本号会让 compareVersion 当成 1.0.0，强制升级静默失效
-	if validConfig(base(map[string]any{"minSupportedVersion": "abc", "latestVersion": "1.2.0"})) {
+	if validConfig(base(perPlatform("abc", "1.2.0"))) {
 		t.Fatal("a garbage minimum version must be rejected")
 	}
-	if validConfig(base(map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": ""})) {
+	if validConfig(base(perPlatform("1.0.0", ""))) {
 		t.Fatal("an empty latest version must be rejected")
+	}
+	// 两个平台都要合法：只有一个平台是非法 semver 也必须整体拒绝，否则那个平台会
+	// 悄悄用上 compareVersion 的兜底值，强更判定对它形同虚设
+	if validConfig(base(map[string]any{
+		"minSupportedVersion": map[string]any{"android": "1.0.0", "ios": "abc"},
+		"latestVersion":       map[string]any{"android": "1.2.0", "ios": "1.2.0"},
+	})) {
+		t.Fatal("a garbage ios minimum version must be rejected even if android is valid")
 	}
 }
 
