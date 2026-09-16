@@ -15,16 +15,27 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/Helix2010/RN-Server/signing/trustroots"
 )
 
-// 服务端错误码（约定第 5 节）。
+// 服务端错误码（约定第 5 节，以及 S2 实现补充的码）。
 const (
 	codeSignAttemptStale      = "SIGN_ATTEMPT_STALE"
 	codeMachineKeyNotAccepted = "MACHINE_KEY_NOT_ACCEPTED"
+	codeMachineRevoked        = "MACHINE_REVOKED"
 	codeReleaseSequenceBusy   = "RELEASE_SEQUENCE_BUSY"
+	// complete：签名包对象丢了（重新上传）、被更晚的一次上传取代（重新 complete）、
+	// 与服务端核对的结果或对象不一致（违规）
+	codeSignedArtifactMissing  = "SIGNED_ARTIFACT_MISSING"
+	codeSignedArtifactReplaced = "SIGNED_ARTIFACT_REPLACED"
+	codeSignResultMismatch     = "SIGN_RESULT_MISMATCH"
+	codeSignedArtifactMismatch = "SIGNED_ARTIFACT_MISMATCH"
+	// 上传：对象存储写失败、连接中途断开，原地重试
+	codeUploadStorageFailed = "UPLOAD_STORAGE_FAILED"
+	codeUploadInterrupted   = "UPLOAD_INTERRUPTED"
 )
 
 const (
@@ -49,9 +60,17 @@ func (e *APIError) Stale() bool {
 	return e.Status == http.StatusConflict && e.Code == codeSignAttemptStale
 }
 
-// Transient：网络层以外的临时错误（5xx、429、发布序列忙）。
+// Transient：可以原地重试的服务端错误（5xx、429、发布序列忙、上传存储失败或中断、
+// 签名包被更晚的上传取代）。
 func (e *APIError) Transient() bool {
-	return e.Status >= 500 || e.Status == http.StatusTooManyRequests || e.Code == codeReleaseSequenceBusy
+	if e.Status >= 500 || e.Status == http.StatusTooManyRequests {
+		return true
+	}
+	switch e.Code {
+	case codeReleaseSequenceBusy, codeUploadStorageFailed, codeUploadInterrupted, codeSignedArtifactReplaced:
+		return true
+	}
+	return false
 }
 
 // IsTransient 判断一个调用错误能不能原地重试：网络错误与 APIError.Transient。
@@ -65,6 +84,12 @@ func IsTransient(err error) bool {
 	}
 	var protocolErr *ProtocolError
 	return !errors.As(err, &protocolErr)
+}
+
+// IsRevoked 判断错误是否为 401 MACHINE_REVOKED：本机令牌被吊销，签名闸应当停下。
+func IsRevoked(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized && apiErr.Code == codeMachineRevoked
 }
 
 // IsStale 判断错误是否为 409 SIGN_ATTEMPT_STALE。
@@ -94,6 +119,7 @@ type API interface {
 
 // KeyStatus 是 POST /v1/signer/public-key 的响应。
 type KeyStatus struct {
+	MachineID              string  `json:"machineId"`
 	Status                 string  `json:"status"`
 	PublicKeySHA256        *string `json:"publicKeySha256"`
 	Ed25519PublicKeySHA256 *string `json:"ed25519PublicKeySha256"`
@@ -282,20 +308,32 @@ func parseProblem(status int, raw []byte) error {
 	return &APIError{Status: status, Code: cleanText(p.Code, 64), Detail: cleanText(p.Detail, 300)}
 }
 
-// cleanText 去掉控制字符并截断：服务端的文字会进日志与运维终端。
+// cleanText 去掉控制字符与非法 UTF-8，截断到至多 max 字节（截断时以 "…" 结尾，也算在
+// max 里）：服务端的文字会进日志与运维终端，上报给服务端的文字有长度上限。
 func cleanText(s string, max int) string {
+	const ellipsis = "…"
 	var b strings.Builder
 	for _, r := range s {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
+		if r == utf8.RuneError || r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
 			r = '?'
 		}
-		if b.Len()+len(string(r)) > max {
-			b.WriteString("…")
+		b.WriteRune(r)
+		if b.Len() > max {
 			break
 		}
-		b.WriteRune(r)
 	}
-	return b.String()
+	out := b.String()
+	if len(out) <= max {
+		return out
+	}
+	for len(out) > 0 && len(out)+len(ellipsis) > max {
+		_, size := utf8.DecodeLastRuneInString(out)
+		out = out[:len(out)-size]
+	}
+	if len(out)+len(ellipsis) > max {
+		return out
+	}
+	return out + ellipsis
 }
 
 // RegisterKey 登记本机公钥（首次启动与每次启动都调用，同钥重复登记幂等）。

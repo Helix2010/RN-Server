@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -26,7 +28,24 @@ type keystoreMaterial struct {
 	P12   []byte
 }
 
-func (m keystoreMaterial) String() string { return "signer.keystoreMaterial{[redacted]}" }
+func (m keystoreMaterial) String() string {
+	return "signer.keystoreMaterial{tenantSlug=" + m.Plain.TenantSlug + " packageName=" + m.Plain.PackageName +
+		" certificateSha256=" + m.Plain.CertificateSHA256 + " keyAlias=" + m.Plain.KeyAlias + " p12=[redacted] passwords=[redacted]}"
+}
+
+// GoString 覆盖 %#v。
+func (m keystoreMaterial) GoString() string { return m.String() }
+
+// Format 覆盖所有动词（%x、%d 这类不经过 String 的也包括在内）。
+func (m keystoreMaterial) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, m.String()) }
+
+// LogValue 覆盖 slog。
+func (m keystoreMaterial) LogValue() slog.Value { return slog.StringValue(m.String()) }
+
+// MarshalJSON 拒绝序列化。
+func (m keystoreMaterial) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("signer: refusing to JSON-encode keystore material")
+}
 
 // keystoreError 区分"解不开 / 内容不对"的原因，调用方据此决定违规码。
 type keystoreError struct {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/internal/checkwire"
+	"github.com/Helix2010/RN-Server/signing/internal/securefs"
 	"github.com/Helix2010/RN-Server/signing/policy"
 )
 
@@ -25,7 +26,11 @@ const checkTimeout = 5 * time.Minute
 
 // SocketChecker 连 systemd socket 激活的检查进程（生产）。
 type SocketChecker struct {
-	Path    string
+	Path string
+	// PeerUID 是创建并监听这个 socket 的进程必须具有的 uid。生产里 socket 由 systemd 创建，
+	// 零值 0 即 root；这样即使 socket 路径被换成别人监听的 socket，签名闸也不会把包和策略
+	// 输入交给它、更不会采信它的结论。测试里设成测试进程自己的 uid。
+	PeerUID int
 	Timeout time.Duration
 }
 
@@ -42,12 +47,22 @@ func (s SocketChecker) Check(ctx context.Context, in policy.Input, apkPath strin
 		return policy.Verdict{}, err
 	}
 	defer f.Close()
+	if err := securefs.CheckTrustedPath(s.Path); err != nil {
+		return policy.Verdict{}, fmt.Errorf("checker socket: %w", err)
+	}
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", s.Path)
+	c, err := dialer.DialContext(ctx, "unix", s.Path)
 	if err != nil {
 		return policy.Verdict{}, fmt.Errorf("connect to the checker socket: %w", err)
 	}
-	defer conn.Close()
+	defer c.Close()
+	conn, ok := c.(*net.UnixConn)
+	if !ok {
+		return policy.Verdict{}, errors.New("the checker socket is not a unix socket")
+	}
+	if err := checkPeerUID(conn, s.PeerUID); err != nil {
+		return policy.Verdict{}, err
+	}
 	deadline, _ := ctx.Deadline()
 	_ = conn.SetDeadline(deadline)
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
@@ -55,10 +70,8 @@ func (s SocketChecker) Check(ctx context.Context, in policy.Input, apkPath strin
 	if err := checkwire.WriteRequest(conn, in, f); err != nil {
 		return policy.Verdict{}, fmt.Errorf("send to the checker: %w", err)
 	}
-	if unix, ok := conn.(*net.UnixConn); ok {
-		if err := unix.CloseWrite(); err != nil {
-			return policy.Verdict{}, err
-		}
+	if err := conn.CloseWrite(); err != nil {
+		return policy.Verdict{}, err
 	}
 	verdict, err := checkwire.ReadVerdict(conn)
 	if err != nil {

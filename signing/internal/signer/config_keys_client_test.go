@@ -3,6 +3,7 @@ package signer
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/Helix2010/RN-Server/signing/records"
 )
 
@@ -111,6 +114,49 @@ func TestConfigNeverPrintsTheToken(t *testing.T) {
 		if strings.Contains(out, seed) || strings.Contains(out, fmt.Sprintf("%x", keys.X25519.Bytes())) {
 			t.Fatalf("machine keys leaked: %s", out)
 		}
+	}
+}
+
+// 解开的签名密钥：任何格式化、日志、JSON 都不带出原件与口令。
+func TestKeystoreMaterialNeverPrintsSecrets(t *testing.T) {
+	const password = "PASSWORD-SENTINEL-123"
+	p12 := []byte("P12-SENTINEL-BYTES")
+	m := keystoreMaterial{P12: p12, Plain: keystorebox.Plaintext{TenantSlug: "AnyFun", KeyAlias: testAlias, StorePassword: password, KeyPassword: password,
+		P12Base64: base64.StdEncoding.EncodeToString(p12)}}
+	var outputs []string
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%d", "%x", "%q"} {
+		outputs = append(outputs, fmt.Sprintf(verb, m), fmt.Sprintf(verb, &m), fmt.Sprintf(verb, []keystoreMaterial{m}))
+	}
+	var logs bytes.Buffer
+	slog.New(slog.NewJSONHandler(&logs, nil)).Info("x", "material", m)
+	slog.New(slog.NewTextHandler(&logs, nil)).Info("x", "material", m)
+	outputs = append(outputs, logs.String())
+	if raw, err := json.Marshal(m); err == nil {
+		outputs = append(outputs, string(raw))
+	}
+	for _, out := range outputs {
+		for _, secret := range []string{password, string(p12), base64.StdEncoding.EncodeToString(p12), fmt.Sprintf("%x", p12)} {
+			if strings.Contains(out, secret) {
+				t.Fatalf("keystore material leaked: %s", out)
+			}
+		}
+	}
+}
+
+func TestCleanTextStaysWithinTheByteLimit(t *testing.T) {
+	for _, in := range []string{strings.Repeat("a", 400), strings.Repeat("签", 200), "ok", "bad\x1b[2Jutf8\xff", strings.Repeat("é", 151)} {
+		for _, max := range []int{300, 64, 5, 2} {
+			out := cleanText(in, max)
+			if len(out) > max || !utf8.ValidString(out) || strings.ContainsAny(out, "\x1b\xff") {
+				t.Fatalf("cleanText(%q, %d) = %q (%d bytes)", in, max, out, len(out))
+			}
+		}
+	}
+	if got := cleanText(strings.Repeat("a", 400), 300); len(got) != 300 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("truncation marker: %q", got)
+	}
+	if got := cleanText("short", 300); got != "short" {
+		t.Fatalf("short text changed: %q", got)
 	}
 }
 
@@ -246,6 +292,12 @@ func TestHTTPClient(t *testing.T) {
 			problemJSON(w, 409, "RELEASE_SEQUENCE_BUSY", "busy")
 		case "/v1/signer/jobs/bld_abc12345/reject":
 			problemJSON(w, 503, "UNAVAILABLE", "down")
+		case "/v1/signer/keystore-checks":
+			problemJSON(w, 401, "MACHINE_REVOKED", "revoked")
+		case "/v1/signer/jobs/bld_abc12345/complete":
+			problemJSON(w, 409, "SIGNED_ARTIFACT_REPLACED", "replaced")
+		case "/v1/signer/jobs/bld_abc12345/signed/upload":
+			problemJSON(w, 424, "UPLOAD_STORAGE_FAILED", "storage")
 		case "/v1/signer/jobs/bld_abc12345/unsigned/download":
 			w.Header().Set("content-length", "100")
 			_, _ = w.Write([]byte("short"))
@@ -277,6 +329,17 @@ func TestHTTPClient(t *testing.T) {
 		t.Fatalf("503 must be transient: %v", err)
 	}
 	var apiErr *APIError
+	if _, err := c.KeystoreChecks(ctx); !IsRevoked(err) || IsTransient(err) {
+		t.Fatalf("401 MACHINE_REVOKED: %v", err)
+	}
+	if _, err := c.Complete(ctx, "bld_abc12345", 1, CompleteRequest{}); !IsTransient(err) || IsStale(err) {
+		t.Fatalf("SIGNED_ARTIFACT_REPLACED must be retried: %v", err)
+	}
+	signed := filepath.Join(t.TempDir(), "signed.apk")
+	must(t, os.WriteFile(signed, []byte("apk"), 0o600))
+	if _, err := c.UploadSigned(ctx, "bld_abc12345", 1, signed); !IsTransient(err) {
+		t.Fatalf("UPLOAD_STORAGE_FAILED must be retried: %v", err)
+	}
 	if err := c.ReportChecks(ctx, nil); !errors.As(err, &apiErr) || apiErr.Transient() || IsTransient(err) {
 		t.Fatalf("404 must not be transient: %v", err)
 	}

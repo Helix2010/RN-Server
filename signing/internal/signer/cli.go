@@ -96,7 +96,7 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 	case "list":
 		err = cmdList(getenv, stdout)
 	case "confirm":
-		err = withOperator(stdin, getenv, NeedServer, func(env OperatorEnv) error {
+		err = withOperator(stdin, getenv, NeedServer, shared, func(env OperatorEnv) error {
 			return Confirm(context.Background(), env, *tenant)
 		})
 	case "trust-builder":
@@ -105,13 +105,13 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 				fmt.Fprintln(stderr, usageText)
 				return 2
 			}
-			err = withOperator(stdin, getenv, NeedLocal, func(env OperatorEnv) error { return RevokeBuilder(env, *builderID, *reason) })
+			err = withOperator(stdin, getenv, NeedLocal, shared, func(env OperatorEnv) error { return RevokeBuilder(env, *builderID, *reason) })
 		} else {
 			if *reason != "" {
 				fmt.Fprintln(stderr, usageText)
 				return 2
 			}
-			err = withOperator(stdin, getenv, NeedLocal, func(env OperatorEnv) error { return TrustBuilder(env, *builderID, *name) })
+			err = withOperator(stdin, getenv, NeedLocal, shared, func(env OperatorEnv) error { return TrustBuilder(env, *builderID, *name) })
 		}
 	case "promote":
 		modes := 0
@@ -129,9 +129,9 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 			fmt.Fprintln(stderr, usageText)
 			return 2
 		}
-		err = withOperator(stdin, getenv, NeedLocal, func(env OperatorEnv) error { return Promote(env, mode, *importPath) })
+		err = withOperator(stdin, getenv, NeedLocal, exclusive, func(env OperatorEnv) error { return Promote(env, mode, *importPath) })
 	case "abandon":
-		err = withOperator(stdin, getenv, NeedLocal, func(env OperatorEnv) error { return Abandon(env, *job, *reason) })
+		err = withOperator(stdin, getenv, NeedLocal, exclusive, func(env OperatorEnv) error { return Abandon(env, *job, *reason) })
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "错误:", cleanText(err.Error(), 2000))
@@ -140,20 +140,41 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 	return 0
 }
 
+// runLockMode 说明运维命令是否要求签名闸服务已停。
+type runLockMode bool
+
+const (
+	// shared：记录文件自带多进程锁，可以与 signer run 同时执行（confirm、trust-builder）。
+	shared runLockMode = false
+	// exclusive：与正在处理任务的 signer run 有竞争（abandon 可能释放它手上的预留，
+	// promote 改角色并导入记录），必须先停服务、拿到运行锁。
+	exclusive runLockMode = true
+)
+
 // withOperator 先确认是交互终端（不是就在读任何东西之前拒绝），再加载配置与本机记录。
-func withOperator(stdin *os.File, getenv func(string) string, need Need, fn func(OperatorEnv) error) error {
+func withOperator(stdin *os.File, getenv func(string) string, need Need, lock runLockMode, fn func(OperatorEnv) error) error {
 	term, closeTerm, err := OpenTerminal(stdin)
 	if err != nil {
 		return err
 	}
 	defer closeTerm()
-	return runOperator(term, getenv, need, fn)
+	return runOperator(term, getenv, need, lock, fn)
 }
 
-func runOperator(term Terminal, getenv func(string) string, need Need, fn func(OperatorEnv) error) error {
+func runOperator(term Terminal, getenv func(string) string, need Need, lock runLockMode, fn func(OperatorEnv) error) error {
 	cfg, err := LoadConfig(getenv, need)
 	if err != nil {
 		return err
+	}
+	if lock == exclusive {
+		if err := securefs.CheckPrivateDir(cfg.StateDir); err != nil {
+			return fmt.Errorf("%s: %w", EnvStateDir, err)
+		}
+		f, err := AcquireRunLock(cfg.StateDir)
+		if err != nil {
+			return fmt.Errorf("stop this signing gate's service first (systemctl stop rn-signer-a.service or rn-signer-b.service) and retry: %w", err)
+		}
+		defer f.Close()
 	}
 	keys, store, err := OpenRecords(cfg.StateDir, cfg.Name)
 	if err != nil {
@@ -226,11 +247,22 @@ func cmdRun(getenv func(string) string, stderr io.Writer) error {
 		return err
 	}
 	defer store.Close()
+	// 明文 keystore 只写进 tmpfs
+	if err := securefs.CheckPrivateDir(cfg.RuntimeDir); err != nil {
+		return fmt.Errorf("%s: %w", EnvRuntimeDir, err)
+	}
+	if err := securefs.CheckTmpfs(cfg.RuntimeDir); err != nil {
+		return fmt.Errorf("%s: %w", EnvRuntimeDir, err)
+	}
 	signer, err := NewJavaAPKSigner(cfg.JavaHome, cfg.BuildToolsDir)
 	if err != nil {
 		return err
 	}
-	// 签名闸执行的每个文件都只能由 root 或签名闸用户修改（不能指向构建机那份 SDK）
+	// 签名闸执行与加载的每个文件都只能由 root 或签名闸用户修改（不能指向构建机那份 SDK）。
+	// JAVA_HOME 整棵树都查：java 会加载 lib 下的 .so 与模块文件。
+	if err := securefs.CheckTrustedTree(cfg.JavaHome); err != nil {
+		return fmt.Errorf("refusing to run an untrusted JAVA_HOME: %w", err)
+	}
 	trusted := []string{signer.Java, signer.Jar}
 	if cfg.CheckExec != "" {
 		trusted = append(trusted, cfg.CheckExec)
@@ -242,7 +274,8 @@ func cmdRun(getenv func(string) string, stderr io.Writer) error {
 	}
 	var checker Checker
 	if cfg.CheckSocket != "" {
-		checker = SocketChecker{Path: cfg.CheckSocket}
+		// 对端 uid 0：socket 必须由 systemd 创建并监听
+		checker = SocketChecker{Path: cfg.CheckSocket, PeerUID: 0}
 	} else {
 		log.Warn("the checker runs as a plain child process (SIGNER_CHECK_EXEC): no systemd isolation; use SIGNER_CHECK_SOCKET in production")
 		checker = ExecChecker{Path: cfg.CheckExec}
@@ -251,7 +284,12 @@ func cmdRun(getenv func(string) string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	log.Info("local records verified", "role", role.Role, "x25519Sha256", keys.X25519SHA256(), "ed25519Sha256", keys.Ed25519SHA256())
+	trustTip, signedTip, err := store.Tips()
+	if err != nil {
+		return err
+	}
+	log.Info("local records verified", "role", role.Role, "x25519Sha256", keys.X25519SHA256(), "ed25519Sha256", keys.Ed25519SHA256(),
+		"trustLines", trustTip.Lines, "trustLastLineSha256", trustTip.LastHash, "signedLines", signedTip.Lines, "signedLastLineSha256", signedTip.LastHash)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	runner := &Runner{Config: cfg, Keys: keys, Store: store, API: NewHTTPClient(cfg.ServerURL, cfg.MachineToken, newTransport()),

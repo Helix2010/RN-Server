@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -132,6 +133,10 @@ func TestSocketChecker(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { listener.Close() })
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var served atomic.Int32
 	// 模拟 systemd Accept=yes：每个连接一个"检查进程"，stdin/stdout 就是连接
 	go func() {
 		for {
@@ -139,6 +144,7 @@ func TestSocketChecker(t *testing.T) {
 			if err != nil {
 				return
 			}
+			served.Add(1)
 			go func() {
 				defer conn.Close()
 				checkwire.Serve(conn, conn, io.Discard)
@@ -147,11 +153,26 @@ func TestSocketChecker(t *testing.T) {
 	}()
 	build := testfixture.NewBuild(t, testfixture.NewBuilder(t), "bld_sockCHECK0000001", 46, nil)
 	in := build.Input(t, testfixture.Hex64('c'))
-	v, err := SocketChecker{Path: socket}.Check(context.Background(), in, writeAPK(t, build.APK))
+	v, err := SocketChecker{Path: socket, PeerUID: os.Getuid()}.Check(context.Background(), in, writeAPK(t, build.APK))
 	if err != nil || !v.OK {
 		t.Fatalf("verdict %+v, %v", v, err)
 	}
-	if _, err := (SocketChecker{Path: filepath.Join(dir, "missing.sock")}).Check(context.Background(), in, writeAPK(t, build.APK)); err == nil {
+	if _, err := (SocketChecker{Path: filepath.Join(dir, "missing.sock"), PeerUID: os.Getuid()}).Check(context.Background(), in, writeAPK(t, build.APK)); err == nil {
 		t.Fatal("a missing socket did not fail")
+	}
+	// 监听者不是期望的 uid（生产默认 0 = systemd）：连上了也不发送
+	before := served.Load()
+	if _, err := (SocketChecker{Path: socket, PeerUID: os.Getuid() + 1}).Check(context.Background(), in, writeAPK(t, build.APK)); err == nil || !strings.Contains(err.Error(), "uid") {
+		t.Fatalf("a socket served by another uid: %v", err)
+	}
+	// socket 文件对组可写：谁都能换掉监听者
+	if err := os.Chmod(socket, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (SocketChecker{Path: socket, PeerUID: os.Getuid()}).Check(context.Background(), in, writeAPK(t, build.APK)); err == nil {
+		t.Fatal("a group-writable socket was used")
+	}
+	if got := served.Load(); got != before+1 {
+		t.Fatalf("connections after the rejected checks: %d, want %d (the uid check connects, the path check does not)", got, before+1)
 	}
 }

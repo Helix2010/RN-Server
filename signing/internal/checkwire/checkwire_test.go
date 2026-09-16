@@ -101,6 +101,9 @@ func TestReadVerdictIsStrict(t *testing.T) {
 		"ok with a code":         `{"ok":true,"code":"X","facts":{}}` + "\n",
 		"rejection without kind": `{"ok":false,"code":"X"}` + "\n",
 		"unknown kind":           `{"ok":false,"kind":"maybe","code":"X"}` + "\n",
+		"deferred":               `{"ok":false,"kind":"deferred","code":"X"}` + "\n",
+		"rejection with facts":   `{"ok":false,"kind":"violation","code":"X","facts":{}}` + "\n",
+		"rejection without code": `{"ok":false,"kind":"violation"}` + "\n",
 		"unknown field":          `{"ok":false,"kind":"violation","code":"X","sneaky":1}` + "\n",
 		"empty":                  "",
 	} {
@@ -110,6 +113,9 @@ func TestReadVerdictIsStrict(t *testing.T) {
 	}
 	if _, err := ReadVerdict(strings.NewReader(string(facts) + "\n")); err != nil {
 		t.Fatalf("valid verdict rejected: %v", err)
+	}
+	if v, err := ReadVerdict(strings.NewReader(`{"ok":false,"kind":"violation","code":"X","detail":"d"}` + "\n")); err != nil || v.Code != "X" {
+		t.Fatalf("valid rejection: %+v, %v", v, err)
 	}
 }
 

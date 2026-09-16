@@ -63,6 +63,12 @@ type call struct {
 	Attempt                 string
 }
 
+// problem 是假服务端按脚本返回的错误。
+type problem struct {
+	status int
+	code   string
+}
+
 type fakeServer struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -80,16 +86,18 @@ type fakeServer struct {
 	headerSHA     map[string]string
 	heartbeats    map[string]int
 	staleJobs     map[string]bool
-	uploads       map[string][]byte
+	uploads       map[string][]byte // 每个任务最后一次上传（服务端只认最后一次）
+	uploadCount   map[string]int
 	completes     []CompleteRequest
-	completeFails map[string][]int // jobId → 依次返回的状态码
+	completeFails map[string][]problem // jobId → 依次返回的错误
+	revoked       bool                 // 令牌被吊销：一切请求 401 MACHINE_REVOKED
 	releases      []call
 	rejects       []call
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
 	f := &fakeServer{t: t, keyStatus: "active", apks: map[string][]byte{}, headerSHA: map[string]string{}, heartbeats: map[string]int{},
-		staleJobs: map[string]bool{}, uploads: map[string][]byte{}, completeFails: map[string][]int{}}
+		staleJobs: map[string]bool{}, uploads: map[string][]byte{}, uploadCount: map[string]int{}, completeFails: map[string][]problem{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/signer/public-key", f.publicKey)
 	mux.HandleFunc("GET /v1/signer/keystore-checks", f.getChecks)
@@ -104,6 +112,13 @@ func newFakeServer(t *testing.T) *fakeServer {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-machine-token") != testToken {
 			problemJSON(w, 401, "MACHINE_AUTH_REQUIRED", "no token")
+			return
+		}
+		f.mu.Lock()
+		revoked := f.revoked
+		f.mu.Unlock()
+		if revoked {
+			problemJSON(w, 401, "MACHINE_REVOKED", "revoked")
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -161,7 +176,7 @@ func (f *fakeServer) publicKey(w http.ResponseWriter, r *http.Request) {
 	if f.activeKey != "" {
 		xs, eds = f.activeKey, f.activeEdKey
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": f.keyStatus, "publicKeySha256": xs, "ed25519PublicKeySha256": eds, "pendingPublicKeySha256": nil})
+	_ = json.NewEncoder(w).Encode(map[string]any{"machineId": "mch_signerA0001", "status": f.keyStatus, "publicKeySha256": xs, "ed25519PublicKeySha256": eds, "pendingPublicKeySha256": nil})
 }
 
 func (f *fakeServer) getChecks(w http.ResponseWriter, r *http.Request) {
@@ -231,6 +246,10 @@ func (f *fakeServer) download(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	raw, header := f.apks[id], f.headerSHA[id]
 	f.mu.Unlock()
+	if raw == nil {
+		problemJSON(w, 424, "UNSIGNED_ARTIFACT_MISSING", "the unsigned artifact is gone")
+		return
+	}
 	if header == "" {
 		header = sha(raw)
 	}
@@ -245,9 +264,15 @@ func (f *fakeServer) upload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if ct := r.Header.Get("content-type"); ct != "application/octet-stream" {
+		f.t.Errorf("signed upload with content-type %q", ct)
+		problemJSON(w, 415, "UPLOAD_CONTENT_TYPE_INVALID", "octet-stream only")
+		return
+	}
 	raw, _ := io.ReadAll(r.Body)
 	f.mu.Lock()
 	f.uploads[id] = raw
+	f.uploadCount[id]++
 	f.mu.Unlock()
 	_ = json.NewEncoder(w).Encode(map[string]any{"sha256": sha(raw), "size": len(raw)})
 }
@@ -266,7 +291,10 @@ func (f *fakeServer) complete(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	if fails := f.completeFails[id]; len(fails) > 0 {
 		f.completeFails[id] = fails[1:]
-		problemJSON(w, fails[0], map[bool]string{true: "INTERNAL", false: "RELEASE_SIGNER_RETIRED"}[fails[0] >= 500], "scripted failure")
+		if fails[0].code == "SIGNED_ARTIFACT_MISSING" {
+			delete(f.uploads, id)
+		}
+		problemJSON(w, fails[0].status, fails[0].code, "scripted failure")
 		return
 	}
 	if uploaded := f.uploads[id]; sha(uploaded) != body.SignedSHA256 || int64(len(uploaded)) != body.SignedSize {
@@ -331,6 +359,7 @@ type fakeSigner struct {
 	signs    []SignParams
 	block    chan struct{} // 非 nil 时 Sign 等它关闭（或 ctx 取消）
 	failSign error
+	varying  bool // 每次签出的字节不同（模拟 ECDSA 签名的随机数）
 }
 
 // Sign 断言明文 keystore 与口令文件确实只在运行时目录里、权限正确、口令只以文件出现；
@@ -373,6 +402,11 @@ func (s *fakeSigner) Sign(ctx context.Context, p SignParams) error {
 	in, err := os.ReadFile(p.In)
 	if err != nil {
 		return err
+	}
+	if s.varying {
+		s.mu.Lock()
+		in = append(in, []byte(fmt.Sprintf("\nNONCE:%d", len(s.signs)))...)
+		s.mu.Unlock()
 	}
 	return os.WriteFile(p.Out, append(in, []byte("\nFAKE-SIGNED-BY:"+s.cert)...), 0o600)
 }
@@ -580,6 +614,27 @@ func (h *harness) assertRuntimeEmpty() {
 			h.t.Fatalf("%s is not empty after the job: %s", dir, strings.Join(names, ", "))
 		}
 	}
+}
+
+// testLimits 与 harness 的 Config、确认值一致。
+var testLimits = records.ReserveLimits{MaxVersionCode: 10_000_000, MaxJump: 100, FirstSignMaxVersionCode: 100}
+
+func (h *harness) reservation(jobID string) records.Reservation {
+	h.t.Helper()
+	list, err := h.store.Reservations()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var out *records.Reservation
+	for i := range list {
+		if list[i].JobID == jobID {
+			out = &list[i]
+		}
+	}
+	if out == nil {
+		h.t.Fatalf("no reservation for %s: %+v", jobID, list)
+	}
+	return *out
 }
 
 func must(t testing.TB, err error) {

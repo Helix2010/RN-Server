@@ -41,7 +41,14 @@ var (
 
 	errJobFinished = errors.New("job finished")
 	errStale       = errors.New("the server says this sign attempt is stale")
+	errRevoked     = errors.New("the server revoked this signing gate's machine token (MACHINE_REVOKED); register the machine again with a new token")
 )
+
+// autoReleaseOperator 是签名闸自己释放预留时写进记录的操作者。
+const autoReleaseOperator = "signer-run"
+
+// maxUploadRounds：complete 报 SIGNED_ARTIFACT_MISSING 时最多重新上传几轮。
+const maxUploadRounds = 3
 
 // Runner 是签名闸主循环。字段在 Run 之前填好；间隔字段为零时用默认值。
 type Runner struct {
@@ -177,10 +184,10 @@ func (r *Runner) checkKeyStatus(s KeyStatus) error {
 		if s.PublicKeySHA256 == nil || *s.PublicKeySHA256 != ours || s.Ed25519PublicKeySHA256 == nil || *s.Ed25519PublicKeySHA256 != oursEd {
 			return errors.New("the server's active keys for this machine token are not this signing gate's keys; register this machine as a new signing gate instead of reusing the token")
 		}
-		r.Log.Info("public keys are active on the server", "x25519Sha256", ours, "ed25519Sha256", oursEd)
+		r.Log.Info("public keys are active on the server", "machineId", cleanText(s.MachineID, 80), "x25519Sha256", ours, "ed25519Sha256", oursEd)
 	case "pending_key":
 		r.Log.Warn("public keys are waiting for a platform admin to accept them in the console; compare with `signer show-key` and the offline pin file",
-			"x25519Sha256", ours, "ed25519Sha256", oursEd)
+			"machineId", cleanText(s.MachineID, 80), "x25519Sha256", ours, "ed25519Sha256", oursEd)
 	default:
 		return &ProtocolError{Msg: "unknown public-key status"}
 	}
@@ -196,6 +203,9 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 			var fatal *fatalError
 			if errors.As(err, &fatal) {
 				return false, fatal.err
+			}
+			if IsRevoked(err) {
+				return false, errRevoked
 			}
 			if isKeyNotAccepted(err) {
 				if !r.waiting {
@@ -224,6 +234,9 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	}
 	claim, err := r.API.Claim(ctx, ready)
 	if err != nil {
+		if IsRevoked(err) {
+			return false, errRevoked
+		}
 		if !isKeyNotAccepted(err) && ctx.Err() == nil {
 			r.Log.Warn("claim failed", "error", err)
 		}
@@ -277,6 +290,18 @@ func (r *Runner) setReady(ready []ReadyItem) {
 	r.mu.Lock()
 	r.ready = ready
 	r.mu.Unlock()
+}
+
+// isReady 判断一项是否在本机最近一次声明的就绪列表里。
+func (r *Runner) isReady(item ReadyItem) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ready := range r.ready {
+		if ready == item {
+			return true
+		}
+	}
+	return false
 }
 
 // Ready 返回当前就绪列表（测试与日志用）。
@@ -401,6 +426,7 @@ const (
 	outcomeDeferred
 	outcomeViolation
 	outcomeTransient
+	outcomeRevoked
 )
 
 type outcome struct {
@@ -440,9 +466,11 @@ func (r *Runner) handle(ctx context.Context, claim *Claim) error {
 	}()
 	log.Info("signing job claimed", "tenant", claim.Job.TenantSlug, "buildNumber", claim.Job.BuildNumber)
 	out := r.sign(jobCtx, claim, log)
-	if cause := context.Cause(jobCtx); errors.Is(cause, errStale) && out.kind != outcomeDone {
+	if cause := context.Cause(jobCtx); errors.Is(cause, errRevoked) && out.kind != outcomeDone {
+		out = outcome{kind: outcomeRevoked, fatal: errRevoked}
+	} else if errors.Is(cause, errStale) && out.kind != outcomeDone {
 		out = outcome{kind: outcomeStale, fatal: out.fatal}
-	} else if ctx.Err() != nil && out.kind != outcomeDone && out.kind != outcomeStale {
+	} else if ctx.Err() != nil && out.kind != outcomeDone && out.kind != outcomeStale && out.kind != outcomeRevoked {
 		out = outcome{kind: outcomeShutdown, fatal: out.fatal}
 	}
 	cancel(errJobFinished)
@@ -469,6 +497,11 @@ func (r *Runner) heartbeat(ctx context.Context, cancel context.CancelCauseFunc, 
 			return
 		case <-ticker.C:
 			err := r.API.Heartbeat(ctx, jobID, attempt)
+			if IsRevoked(err) {
+				log.Error("heartbeat says this signing gate's machine token is revoked; abandoning the job immediately")
+				cancel(errRevoked)
+				return
+			}
 			if IsStale(err) {
 				log.Warn("heartbeat says the sign attempt is stale; abandoning the job immediately")
 				cancel(errStale)
@@ -490,6 +523,9 @@ func (r *Runner) report(ctx context.Context, claim *Claim, out outcome, log *slo
 		return
 	case outcomeStale:
 		log.Warn("sign attempt is stale; nothing to report")
+		return
+	case outcomeRevoked:
+		log.Error("the machine token is revoked; nothing can be reported")
 		return
 	case outcomeShutdown:
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -559,12 +595,20 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 	if c.Keystore.Box.RecipientSHA256 != r.Keys.X25519SHA256() {
 		return transient("KEYSTORE_NOT_FOR_THIS_SIGNER", "the claim carries a keystore box for a different signing gate")
 	}
+	if !r.isReady(ReadyItem{TenantSlug: job.TenantSlug, PackageName: pkg, CertificateSHA256: cert, TrustRootsDigest: c.TrustRootsDigest}) {
+		// 服务端只该派本机声明就绪的租户；试签没过或刚换了确认值时不签
+		return deferred("SIGNER_NOT_READY", "this signing gate has not declared tenant %s with this package, certificate and trust roots ready", job.TenantSlug)
+	}
 	view, err := r.Store.SignedState(pkg, cert, job.ID, job.UnsignedSHA256)
 	if err != nil {
 		return outcome{kind: outcomeDeferred, code: "SIGNER_RECORDS_UNAVAILABLE", detail: "local records are unavailable", fatal: err}
 	}
 	if e := view.Existing; e != nil && (e.PackageName != pkg || e.CertificateSHA256 != cert || e.UnsignedSHA256 != job.UnsignedSHA256 || e.VersionCode != job.BuildNumber) {
 		return violationOutcome("RESERVATION_CONFLICT", "job %s already holds a reservation for a different package or versionCode on this signing gate", job.ID)
+	}
+	if e := view.Existing; e != nil && e.Status == records.StatusCompleted {
+		// 本机已经把这个任务交付成发布，服务端又派回来（例如服务端数据库回滚）：不重签，交给人查
+		return violationOutcome("JOB_ALREADY_COMPLETED", "this signing gate already delivered job %s as release %s", job.ID, e.ReleaseID)
 	}
 	builders, err := r.Store.TrustedBuilders()
 	if err != nil {
@@ -585,7 +629,12 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 		}
 		return err
 	})
-	if err != nil {
+	switch {
+	case IsRevoked(err):
+		return outcome{kind: outcomeRevoked, fatal: errRevoked}
+	case IsStale(err):
+		return outcome{kind: outcomeStale}
+	case err != nil:
 		return transient("DOWNLOAD_FAILED", "downloading the unsigned package failed: %v", err)
 	}
 	if dl.Size != job.UnsignedSize {
@@ -620,9 +669,6 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 		return transient("CHECKER_FAILED", "the checker produced no verdict: %v", err)
 	}
 	if !verdict.OK {
-		if verdict.Kind == policy.KindDeferred {
-			return deferred(verdict.Code, "%s", verdict.Detail)
-		}
 		return violationOutcome(verdict.Code, "%s", verdict.Detail)
 	}
 	f := verdict.Facts
@@ -631,9 +677,11 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 		return transient("CHECKER_FAILED", "the checker's verdict does not describe the downloaded package")
 	}
 
-	// 预留（解密前落盘）
-	idempotent, err := r.Store.Reserve(records.Reservation{JobID: job.ID, SignAttempt: job.SignAttempt, TenantSlug: conf.TenantSlug,
-		PackageName: conf.PackageName, CertificateSHA256: conf.CertificateSHA256, VersionCode: job.BuildNumber, UnsignedSHA256: dl.SHA256})
+	// 预留（解密前落盘）。递增、跳号、绝对上限、首签上限在记录的锁里再核一遍：
+	// 检查进程看到的已签最大值可能已经过时（另一个进程刚写了记录）。
+	existing, err := r.Store.Reserve(records.Reservation{JobID: job.ID, SignAttempt: job.SignAttempt, TenantSlug: conf.TenantSlug,
+		PackageName: conf.PackageName, CertificateSHA256: conf.CertificateSHA256, VersionCode: job.BuildNumber, UnsignedSHA256: dl.SHA256},
+		records.ReserveLimits{MaxVersionCode: r.Config.MaxVersionCode, MaxJump: r.Config.MaxVersionCodeJump, FirstSignMaxVersionCode: conf.FirstSignMaxVersionCode})
 	switch {
 	case errors.Is(err, records.ErrVersionCodeTaken):
 		return violationOutcome("VERSION_CODE_ALREADY_RESERVED", "versionCode %d of %s is already reserved on this signing gate by another job or another unsigned package", job.BuildNumber, pkg)
@@ -641,11 +689,34 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 		return violationOutcome("RESERVATION_CONFLICT", "job %s already holds a different reservation on this signing gate", job.ID)
 	case errors.Is(err, records.ErrVersionCodeNotIncreasing):
 		return violationOutcome("VERSION_CODE_NOT_INCREASING", "versionCode %d of %s is not above the highest already signed", job.BuildNumber, pkg)
+	case errors.Is(err, records.ErrVersionCodeOutOfBounds):
+		return violationOutcome("VERSION_CODE_OUT_OF_BOUNDS", "versionCode %d of %s is above the absolute, jump or first-signature limit", job.BuildNumber, pkg)
 	case err != nil:
 		return outcome{kind: outcomeDeferred, code: "SIGNER_RECORDS_UNAVAILABLE", detail: "local records are unavailable", fatal: err}
 	}
-	if idempotent {
-		log.Info("resuming an existing reservation for this job and unsigned package")
+	if existing != nil {
+		if existing.Status == records.StatusCompleted {
+			return violationOutcome("JOB_ALREADY_COMPLETED", "this signing gate already delivered job %s as release %s", job.ID, existing.ReleaseID)
+		}
+		log.Info("resuming an existing reservation for this job and unsigned package", "status", existing.Status)
+	}
+	// MarkSigned 之前失败：签出的包（如果有）还没离开本机、随工作目录清掉，释放预留，
+	// 免得这个 versionCode 永久占住。已经记过签名（status=signed）的预留不能释放：
+	// 那个包可能已经在服务端手里。
+	releasable := existing == nil || existing.Status == records.StatusReserved
+	unsent := func(o outcome) outcome {
+		if !releasable {
+			return o
+		}
+		if _, err := r.Store.Abandon(job.ID, autoReleaseOperator, "released automatically, no signed package left this machine: "+o.code); err != nil {
+			log.Error("could not release the local reservation", "error", err)
+			if o.fatal == nil {
+				o.fatal = fmt.Errorf("release the local reservation of job %s: %w", job.ID, err)
+			}
+			return o
+		}
+		log.Info("released the local reservation; no signed package left this machine", "code", o.code)
+		return o
 	}
 
 	// 第 17 条：解密并与本机确认值比对；别名取密文里的
@@ -653,9 +724,13 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 	if err != nil {
 		var ke *keystoreError
 		if errors.As(err, &ke) {
-			return violationOutcome(ke.Code, "%s", ke.Msg)
+			return unsent(violationOutcome(ke.Code, "%s", ke.Msg))
 		}
-		return violationOutcome("KEYSTORE_UNUSABLE", "%v", err)
+		return unsent(violationOutcome("KEYSTORE_UNUSABLE", "%v", err))
+	}
+	// 交给 apksigner 的必须是检查进程检查过的那份字节
+	if sum, size, err := hashPath(unsignedPath); err != nil || sum != dl.SHA256 || size != dl.Size {
+		return unsent(transient("UNSIGNED_CHANGED_BEFORE_SIGNING", "the unsigned package on disk is no longer the checked one"))
 	}
 
 	// 第 18 条：签名
@@ -663,7 +738,11 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 	_ = os.Remove(signedPath)
 	files, err := writeRuntimeFiles(r.Config.RuntimeDir, material)
 	if err != nil {
-		return transient("RUNTIME_FILES_FAILED", "writing the keystore into the runtime directory failed: %v", err)
+		return unsent(transient("RUNTIME_FILES_FAILED", "writing the keystore into the runtime directory failed: %v", err))
+	}
+	if ctx.Err() != nil {
+		_ = files.Remove()
+		return unsent(transient("SIGNER_INTERRUPTED", "the job was interrupted before signing"))
 	}
 	signErr := r.Signer.Sign(ctx, SignParams{
 		KeystorePath: files.KeystorePath, KeyAlias: material.Plain.KeyAlias,
@@ -672,62 +751,90 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 	})
 	material = keystoreMaterial{}
 	if err := files.Remove(); err != nil {
-		return outcome{kind: outcomeTransient, code: "RUNTIME_FILES_FAILED", detail: "removing the plaintext keystore failed", fatal: fmt.Errorf("remove plaintext keystore files: %w", err)}
+		return unsent(outcome{kind: outcomeTransient, code: "RUNTIME_FILES_FAILED", detail: "removing the plaintext keystore failed", fatal: fmt.Errorf("remove plaintext keystore files: %w", err)})
 	}
 	if signErr != nil {
-		return transient("APKSIGNER_FAILED", "%v", signErr)
+		return unsent(transient("APKSIGNER_FAILED", "%v", signErr))
 	}
 
 	// 第 19 条：复核
 	result, err := r.Signer.Verify(ctx, signedPath, conf.MinSDK, "")
 	if err != nil {
-		return transient("SIGNED_VERIFY_FAILED", "%v", err)
+		return unsent(transient("SIGNED_VERIFY_FAILED", "%v", err))
 	}
 	if err := CheckSigned(result, conf.CertificateSHA256); err != nil {
-		return transient("SIGNED_VERIFY_FAILED", "%v", err)
+		return unsent(transient("SIGNED_VERIFY_FAILED", "%v", err))
 	}
 	signedSHA, signedSize, err := hashPath(signedPath)
 	if err != nil {
-		return transient("SIGNED_VERIFY_FAILED", "reading the signed package failed: %v", err)
+		return unsent(transient("SIGNED_VERIFY_FAILED", "reading the signed package failed: %v", err))
+	}
+	if ctx.Err() != nil {
+		return unsent(transient("SIGNER_INTERRUPTED", "the job was interrupted before the signed package was recorded"))
+	}
+	// 包离开本机之前落盘：从这里起这条预留不能再释放
+	if err := r.Store.MarkSigned(job.ID, dl.SHA256, signedSHA); err != nil {
+		return outcome{kind: outcomeDeferred, code: "SIGNER_RECORDS_UNAVAILABLE", detail: "local records are unavailable", fatal: err}
 	}
 
-	var up Upload
-	err = r.retry(ctx, "upload", func(ctx context.Context) error {
-		var err error
-		up, err = r.API.UploadSigned(ctx, job.ID, job.SignAttempt, signedPath)
-		return err
-	})
-	if IsStale(err) {
-		return outcome{kind: outcomeStale}
-	}
-	if err != nil {
-		return transient("UPLOAD_FAILED", "uploading the signed package failed: %v", err)
-	}
-	if up.SHA256 != signedSHA || up.Size != signedSize {
-		return transient("UPLOAD_MISMATCH", "the server stored %d bytes with sha256 %s, but the signed package is %d bytes with sha256 %s", up.Size, cleanText(up.SHA256, 64), signedSize, signedSHA)
-	}
+	return r.deliver(ctx, c, conf, dl.SHA256, f.NativeFingerprint, signedPath, signedSHA, signedSize, log)
+}
 
+// deliver 上传签名包并提交完成。服务端每次上传换一个对象、complete 只认最后一次上传：
+// SIGNED_ARTIFACT_REPLACED 重新 complete（retry 里当临时错误），SIGNED_ARTIFACT_MISSING 重新上传。
+func (r *Runner) deliver(ctx context.Context, c *Claim, conf records.Confirmation, unsignedSHA, nativeFingerprint, signedPath, signedSHA string, signedSize int64, log *slog.Logger) outcome {
+	job := c.Job
 	var releaseID string
-	err = r.retry(ctx, "complete", func(ctx context.Context) error {
-		var err error
-		releaseID, err = r.API.Complete(ctx, job.ID, job.SignAttempt, CompleteRequest{
-			SignedSHA256: signedSHA, SignedSize: signedSize, CertificateSHA256: conf.CertificateSHA256,
-			UnsignedSHA256: dl.SHA256, NativeFingerprint: f.NativeFingerprint,
+	for round := 1; ; round++ {
+		var up Upload
+		err := r.retry(ctx, "upload", func(ctx context.Context) error {
+			var err error
+			up, err = r.API.UploadSigned(ctx, job.ID, job.SignAttempt, signedPath)
+			return err
 		})
-		return err
-	})
-	var apiErr *APIError
-	switch {
-	case IsStale(err):
-		return outcome{kind: outcomeStale}
-	case errors.As(err, &apiErr) && !apiErr.Transient():
-		return violationOutcome("SERVER_REJECTED_SIGNED_PACKAGE", "the server refused the signed package: %s %s", apiErr.Code, apiErr.Detail)
-	case err != nil:
-		return transient("COMPLETE_FAILED", "completing the job failed: %v", err)
-	case !records.ValidReleaseID(releaseID):
+		switch {
+		case IsRevoked(err):
+			return outcome{kind: outcomeRevoked, fatal: errRevoked}
+		case IsStale(err):
+			return outcome{kind: outcomeStale}
+		case err != nil:
+			return transient("UPLOAD_FAILED", "uploading the signed package failed: %v", err)
+		case up.SHA256 != signedSHA || up.Size != signedSize:
+			return transient("UPLOAD_MISMATCH", "the server stored %d bytes with sha256 %s, but the signed package is %d bytes with sha256 %s", up.Size, cleanText(up.SHA256, 64), signedSize, signedSHA)
+		}
+
+		err = r.retry(ctx, "complete", func(ctx context.Context) error {
+			var err error
+			releaseID, err = r.API.Complete(ctx, job.ID, job.SignAttempt, CompleteRequest{
+				SignedSHA256: signedSHA, SignedSize: signedSize, CertificateSHA256: conf.CertificateSHA256,
+				UnsignedSHA256: unsignedSHA, NativeFingerprint: nativeFingerprint,
+			})
+			return err
+		})
+		if err == nil {
+			break
+		}
+		var apiErr *APIError
+		switch {
+		case IsRevoked(err):
+			return outcome{kind: outcomeRevoked, fatal: errRevoked}
+		case IsStale(err):
+			return outcome{kind: outcomeStale}
+		case errors.As(err, &apiErr) && apiErr.Code == codeSignedArtifactMissing && round < maxUploadRounds:
+			log.Warn("the server lost the signed upload; uploading again", "round", round)
+		case errors.As(err, &apiErr) && (apiErr.Code == codeSignResultMismatch || apiErr.Code == codeSignedArtifactMismatch):
+			return violationOutcome("SERVER_REJECTED_SIGNED_PACKAGE", "the server refused the signed package: %s %s", apiErr.Code, apiErr.Detail)
+		default:
+			return transient("COMPLETE_FAILED", "completing the job failed: %v", err)
+		}
+	}
+	if !records.ValidReleaseID(releaseID) {
 		return transient("COMPLETE_FAILED", "the server returned a malformed release id")
 	}
-	if err := r.Store.Complete(job.ID, dl.SHA256, signedSHA, releaseID); err != nil {
+	switch err := r.Store.Complete(job.ID, unsignedSHA, signedSHA, releaseID); {
+	case errors.Is(err, records.ErrAlreadyCompleted):
+		log.Error("the server completed the job, but the local record already holds a different release for it", "releaseId", releaseID)
+	case err != nil:
 		log.Error("the job is complete on the server but the local record could not be written", "error", err, "releaseId", releaseID)
 		return outcome{kind: outcomeDone, fatal: err}
 	}

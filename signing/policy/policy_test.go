@@ -25,6 +25,7 @@ import (
 	"github.com/Helix2010/RN-Server/signing/apk/axml"
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 	"github.com/Helix2010/RN-Server/signing/provenance"
+	"github.com/Helix2010/RN-Server/signing/records"
 	"github.com/Helix2010/RN-Server/signing/trustroots"
 )
 
@@ -205,6 +206,34 @@ func appConfig(mutate func(extra, updates map[string]any, root map[string]any)) 
 	}
 }
 
+// expoMeta 在 <application> 下追加一条 expo-updates 的 meta-data。
+func expoMeta(name string, value axml.Value) scenario {
+	return scenario{manifest: func(n *axml.Node) {
+		app := findChild(n, "application")
+		app.Children = append(app.Children, &axml.Node{Name: "meta-data", Attrs: []axml.Attr{
+			axml.AndroidAttr("name", axml.StringValue(name)), axml.AndroidAttr("value", value),
+		}})
+	}, expectCode: "OTA_CONFIGURATION_NOT_ALLOWED"}
+}
+
+// 允许列表里的 expo-updates 项，取安全的值时照常通过。
+func TestExpoUpdatesAllowedValues(t *testing.T) {
+	for name, value := range map[string]axml.Value{
+		"expo.modules.updates.CODE_SIGNING_ALLOW_UNSIGNED_MANIFESTS": axml.BoolValue(false),
+		"expo.modules.updates.DISABLE_ANTI_BRICKING_MEASURES":        axml.BoolValue(false),
+		"expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH":          axml.StringValue("ERROR_RECOVERY_ONLY"),
+		"expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS":           axml.IntValue(0),
+		"expo.modules.updates.ENABLE_BSDIFF_PATCH_SUPPORT":           axml.BoolValue(true),
+		"expo.modules.updates.HAS_EMBEDDED_UPDATE":                   axml.BoolValue(true),
+		"expo.modules.updates.EXPO_RUNTIME_VERSION":                  {Type: axml.TypeReference, Data: 0x7f110070},
+	} {
+		sc := expoMeta(name, value)
+		if v := run(t, scenario{manifest: sc.manifest}); !v.OK {
+			t.Errorf("%s: rejected %s (%s)", name, v.Code, v.Detail)
+		}
+	}
+}
+
 // 设计「测试 → 签名闸」列出的每一条拒签，外加其余规则。
 func TestEveryRuleRejects(t *testing.T) {
 	_, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
@@ -363,6 +392,20 @@ func TestEveryRuleRejects(t *testing.T) {
 			activity.Children = append(activity.Children, filter)
 		}, expectCode: "CLEARTEXT_APP_LINK"},
 
+		// ---- 不改信任根、却能让它失效的配置 ----
+		"upgrade key set": {manifest: func(n *axml.Node) {
+			n.Children = append(n.Children, &axml.Node{Name: "key-sets", Children: []*axml.Node{
+				{Name: "upgrade-key-set", Attrs: []axml.Attr{axml.AndroidAttr("name", axml.StringValue("evil"))}},
+			}})
+		}, expectCode: "MANIFEST_ELEMENT_NOT_ALLOWED"},
+		"expo allows unsigned manifests": expoMeta("expo.modules.updates.CODE_SIGNING_ALLOW_UNSIGNED_MANIFESTS", axml.BoolValue(true)),
+		"expo anti-bricking disabled":    expoMeta("expo.modules.updates.DISABLE_ANTI_BRICKING_MEASURES", axml.BoolValue(true)),
+		"expo protocol v0 compatibility": expoMeta("expo.modules.updates.ENABLE_EXPO_UPDATES_PROTOCOL_V0_COMPATIBILITY_MODE", axml.BoolValue(true)),
+		"expo scope key":                 expoMeta("expo.modules.updates.EXPO_SCOPE_KEY", axml.StringValue("https://api.evil.example")),
+		"expo unknown key":               expoMeta("expo.modules.updates.SOMETHING_NEW", axml.BoolValue(false)),
+		"expo flag as a string":          expoMeta("expo.modules.updates.DISABLE_ANTI_BRICKING_MEASURES", axml.StringValue("false")),
+		"expo no embedded update":        expoMeta("expo.modules.updates.HAS_EMBEDDED_UPDATE", axml.BoolValue(false)),
+
 		// ---- 原生指纹（第 16 条）----
 		"native fingerprint missing": {spec: func(s *apktest.Spec) { s.NativeFingerprint = "" }, expectCode: "NATIVE_FINGERPRINT_MISSING"},
 		"native fingerprint differs": {spec: func(s *apktest.Spec) { s.NativeFingerprint = strings.Repeat("b", 40) }, expectCode: "NATIVE_FINGERPRINT_MISMATCH"},
@@ -466,5 +509,18 @@ func TestValidateInputRejectsServerGarbage(t *testing.T) {
 	good := Input{Version: InputVersion}
 	if err := ValidateInput(good); err == nil {
 		t.Fatal("empty input accepted")
+	}
+	// 确认值的 SDK 下限低于地板：检查进程不替主进程兜底一个过低的确认值
+	for name, mutate := range map[string]func(*Input){
+		"minSdk 23":    func(in *Input) { in.Confirmed.MinSDK = 23 },
+		"targetSdk 27": func(in *Input) { in.Confirmed.TargetSDK = 27 },
+		"target < min": func(in *Input) { in.Confirmed.MinSDK, in.Confirmed.TargetSDK = 30, 29 },
+	} {
+		if v := run(t, scenario{input: mutate}); v.OK || v.Code != "POLICY_INPUT_INVALID" {
+			t.Errorf("%s: verdict %+v", name, v)
+		}
+	}
+	if MinSDKFloor != records.MinConfirmedMinSDK || TargetSDKFloor != records.MinConfirmedTargetSDK {
+		t.Fatal("policy SDK floors differ from the records floors")
 	}
 }

@@ -168,8 +168,8 @@ func ReadVerdict(r io.Reader) (policy.Verdict, error) {
 	if v.OK && (v.Kind != "" || v.Code != "" || v.Facts == nil) {
 		return policy.Verdict{}, errors.New("checkwire: an OK verdict must carry facts and no rejection")
 	}
-	if !v.OK && (v.Kind != policy.KindViolation && v.Kind != policy.KindDeferred || v.Code == "") {
-		return policy.Verdict{}, errors.New("checkwire: a rejection must carry a kind and a code")
+	if !v.OK && (v.Kind != policy.KindViolation || v.Code == "" || v.Facts != nil) {
+		return policy.Verdict{}, errors.New("checkwire: a rejection must be a violation with a code and no facts")
 	}
 	return v, nil
 }

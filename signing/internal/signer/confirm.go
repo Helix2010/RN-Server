@@ -170,11 +170,12 @@ func Confirm(ctx context.Context, env OperatorEnv, tenantSlug string) error {
 	if err != nil {
 		return err
 	}
-	minSDK, err := askInt(t, "minSdkVersion floor (packages below it are refused): ", 1, 1000)
+	// 签名闸只签 v2/v3：minSdk 低于 24 的设备装不上；targetSdk 不低于 28 时明文流量缺省关闭
+	minSDK, err := askInt(t, fmt.Sprintf("minSdkVersion floor (packages below it are refused; at least %d): ", records.MinConfirmedMinSDK), records.MinConfirmedMinSDK, 1000)
 	if err != nil {
 		return err
 	}
-	targetSDK, err := askInt(t, "targetSdkVersion floor: ", minSDK, 1000)
+	targetSDK, err := askInt(t, fmt.Sprintf("targetSdkVersion floor (at least %d and not below minSdk): ", max(minSDK, records.MinConfirmedTargetSDK)), max(minSDK, records.MinConfirmedTargetSDK), 1000)
 	if err != nil {
 		return err
 	}
@@ -208,6 +209,21 @@ func Confirm(ctx context.Context, env OperatorEnv, tenantSlug string) error {
 	summaryLine("distributionChannel", roots.DistributionChannel, serverRootsField(serverRoots, "channel"))
 	summaryLine("applicationId", roots.ApplicationID, serverRootsField(serverRoots, "appId"))
 	printf(t, "  %-24s %s\n  %-24s %d / %d\n  %-24s %d\n", "trustRootsDigest", digest, "min/target SDK floors", minSDK, targetSDK, "first-sign cap", firstCap)
+	// 同一包名只有一份有效确认：新确认取代旧的，旧证书从此不能再签
+	active, hasActive, err := env.Store.ActiveConfirmation(plain.PackageName)
+	if err != nil {
+		return err
+	}
+	if hasActive {
+		printf(t, "\n  ! This replaces the active confirmation for package %s (tenant %s, certificate %s, confirmed at %s by %s).\n",
+			active.PackageName, active.TenantSlug, active.CertificateSHA256, active.ConfirmedAt, active.ConfirmedBy)
+		if active.TenantSlug != plain.TenantSlug {
+			printf(t, "  ! The package moves from tenant %s to tenant %s.\n", active.TenantSlug, plain.TenantSlug)
+		}
+		if active.CertificateSHA256 != computedCert {
+			printf(t, "  ! The certificate changes: devices with the old build cannot upgrade in place, and this signing gate stops signing with the old certificate.\n")
+		}
+	}
 	if item.TrustRootsDigest == nil || *item.TrustRootsDigest != digest {
 		printf(t, "\n  ! The server's current trust roots differ from what you entered. Packages the server builds now will be refused\n    and the tenant will not be ready until the tenant configuration matches your offline record.\n")
 	}

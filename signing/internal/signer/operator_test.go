@@ -88,6 +88,33 @@ func TestConfirmWritesOperatorValuesAndReports(t *testing.T) {
 	}
 }
 
+func TestConfirmSDKFloorsAndSupersede(t *testing.T) {
+	h := newHarness(t, harnessOptions{noConfirm: true})
+	// minSdk 23、targetSdk 27 低于地板：各自重问，三次都不对就放弃
+	inputs := h.confirmInputs()
+	sdk := len(inputs) - 4
+	low := append(append(append([]string{}, inputs[:sdk]...), "23", "24", "27", "28"), inputs[sdk+2:]...)
+	term := newTerm(low...)
+	if err := Confirm(context.Background(), h.operatorEnv(term), testfixture.TenantSlug); err != nil {
+		t.Fatalf("Confirm: %v\n%s", err, term.out.String())
+	}
+	c, ok, _ := h.store.Confirmation(testfixture.PackageName, h.key.CertificateSHA256)
+	if !ok || c.MinSDK != 24 || c.TargetSDK != 28 {
+		t.Fatalf("confirmation: %+v", c)
+	}
+	if strings.Contains(term.out.String(), "replaces the active confirmation") {
+		t.Fatal("warned about superseding on the first confirmation")
+	}
+	// 再确认一次：提示取代了哪一份
+	term = newTerm(h.confirmInputs()...)
+	if err := Confirm(context.Background(), h.operatorEnv(term), testfixture.TenantSlug); err != nil {
+		t.Fatalf("second Confirm: %v", err)
+	}
+	if !strings.Contains(term.out.String(), "replaces the active confirmation for package "+testfixture.PackageName) || strings.Contains(term.out.String(), "certificate changes") {
+		t.Fatalf("supersede warning:\n%s", term.out.String())
+	}
+}
+
 func TestConfirmNeverShowsTheCertificateBeforeThePaste(t *testing.T) {
 	h := newHarness(t, harnessOptions{noConfirm: true})
 	inputs := h.confirmInputs()
@@ -249,7 +276,7 @@ func TestTrustAndRevokeBuilder(t *testing.T) {
 	}
 }
 
-// oldPrimary 造一台"旧主"：独立的状态目录与记录，签过 46、预留了 47。
+// oldPrimary 造一台"旧主"：独立的状态目录与记录，交付了 46、签出 47 但没完成、预留了 48。
 func oldPrimary(t *testing.T) (signedPath string, ed25519SHA string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -266,14 +293,16 @@ func oldPrimary(t *testing.T) (signedPath string, ed25519SHA string) {
 	}
 	defer store.Close()
 	cert := sharedTenantKey(t).CertificateSHA256
-	for i, vc := range []int64{46, 47} {
+	for i, vc := range []int64{46, 47, 48} {
 		r := records.Reservation{JobID: "bld_oldPRIMARY000" + string(rune('1'+i)), SignAttempt: 1, TenantSlug: "AnyFun",
 			PackageName: testfixture.PackageName, CertificateSHA256: cert, VersionCode: vc, UnsignedSHA256: testfixture.Hex64(byte('1' + i))}
-		if _, err := store.Reserve(r); err != nil {
+		if _, err := store.Reserve(r, testLimits); err != nil {
 			t.Fatal(err)
 		}
 	}
+	must(t, store.MarkSigned("bld_oldPRIMARY0001", testfixture.Hex64('1'), testfixture.Hex64('9')))
 	must(t, store.Complete("bld_oldPRIMARY0001", testfixture.Hex64('1'), testfixture.Hex64('9'), "rel_oldRELEASE01"))
+	must(t, store.MarkSigned("bld_oldPRIMARY0002", testfixture.Hex64('2'), testfixture.Hex64('8')))
 	return filepath.Join(dir, records.SignedFileName), keys.Ed25519SHA256()
 }
 
@@ -298,13 +327,20 @@ func TestPromoteImport(t *testing.T) {
 		t.Fatalf("role: %+v", role)
 	}
 	view, _ := h.store.SignedState(testfixture.PackageName, h.key.CertificateSHA256, "bld_newJOB00000001", testfixture.Hex64('5'))
-	if !view.HasMax || view.Max != 47 {
+	if !view.HasMax || view.Max != 48 {
 		t.Fatalf("imported max: %+v", view)
 	}
-	// 旧主预留了 47 没完成：新主能幂等续签同一任务，别的任务签不了 47
-	if idem, err := h.store.Reserve(records.Reservation{JobID: "bld_oldPRIMARY0002", SignAttempt: 2, TenantSlug: "AnyFun", PackageName: testfixture.PackageName,
-		CertificateSHA256: h.key.CertificateSHA256, VersionCode: 47, UnsignedSHA256: testfixture.Hex64('2')}); err != nil || !idem {
-		t.Fatalf("resume: %v %v", idem, err)
+	if !strings.Contains(term.out.String(), "3 reservations (2 not completed), highest versionCode 48") || !strings.Contains(term.out.String(), "last line sha256") {
+		t.Fatalf("import summary:\n%s", term.out.String())
+	}
+	// 旧主签出 47 没完成：新主能续签同一任务，签名状态随导入保留（不能释放），别的任务签不了 47
+	existing, err := h.store.Reserve(records.Reservation{JobID: "bld_oldPRIMARY0002", SignAttempt: 2, TenantSlug: "AnyFun", PackageName: testfixture.PackageName,
+		CertificateSHA256: h.key.CertificateSHA256, VersionCode: 47, UnsignedSHA256: testfixture.Hex64('2')}, testLimits)
+	if err != nil || existing == nil || existing.Status != records.StatusSigned || existing.SignedSHA256 != testfixture.Hex64('8') {
+		t.Fatalf("resume: %+v %v", existing, err)
+	}
+	if _, err := h.store.Abandon("bld_oldPRIMARY0002", "ops", "try"); !errors.Is(err, records.ErrAlreadySigned) {
+		t.Fatalf("released an imported signed reservation: %v", err)
 	}
 	if err := Promote(h.operatorEnv(newTerm("ops", "again", testMachine)), PromoteFirst, ""); err == nil {
 		t.Fatal("promoted a primary again")
@@ -347,29 +383,76 @@ func TestAbandon(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	r := records.Reservation{JobID: "bld_abandonJOB0001", SignAttempt: 1, TenantSlug: "AnyFun", PackageName: testfixture.PackageName,
 		CertificateSHA256: h.key.CertificateSHA256, VersionCode: 46, UnsignedSHA256: testfixture.Hex64('1')}
-	if _, err := h.store.Reserve(r); err != nil {
+	if _, err := h.store.Reserve(r, testLimits); err != nil {
 		t.Fatal(err)
 	}
 	if err := Abandon(h.operatorEnv(newTerm("ops", "bld_other")), r.JobID, "never delivered"); !errors.Is(err, ErrAborted) {
 		t.Fatalf("wrong job typed: %v", err)
 	}
 	term := newTerm("ops-erin", r.JobID)
-	if err := Abandon(h.operatorEnv(term), r.JobID, "never delivered, server has no release"); err != nil {
+	if err := Abandon(h.operatorEnv(term), r.JobID, "apksigner never ran"); err != nil {
 		t.Fatal(err)
 	}
-	list, _ := h.store.Reservations()
-	if list[0].Status != records.StatusAbandoned {
-		t.Fatalf("status: %+v", list[0])
+	if got := h.reservation(r.JobID); got.Status != records.StatusAbandoned {
+		t.Fatalf("status: %+v", got)
 	}
 	r2 := r
 	r2.JobID, r2.UnsignedSHA256 = "bld_abandonJOB0002", testfixture.Hex64('2')
-	if _, err := h.store.Reserve(r2); err != nil {
+	if _, err := h.store.Reserve(r2, testLimits); err != nil {
 		t.Fatalf("versionCode not released: %v", err)
+	}
+	// 记下了签名包：那个包可能已经在服务端，不能释放
+	must(t, h.store.MarkSigned(r2.JobID, r2.UnsignedSHA256, testfixture.Hex64('9')))
+	if err := Abandon(h.operatorEnv(newTerm("ops", r2.JobID)), r2.JobID, "too late"); err == nil || !strings.Contains(err.Error(), "signed package") {
+		t.Fatalf("released a signed reservation: %v", err)
 	}
 	must(t, h.store.Complete(r2.JobID, r2.UnsignedSHA256, testfixture.Hex64('9'), "rel_x1234"))
 	if err := Abandon(h.operatorEnv(newTerm("ops", r2.JobID)), r2.JobID, "too late"); err == nil {
 		t.Fatal("released a delivered reservation")
 	}
+}
+
+// abandon、promote 与正在处理任务的 signer run 竞争：必须先停服务。confirm、trust-builder 不必。
+func TestExclusiveOperatorCommandsNeedTheRunLock(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	env := map[string]string{
+		EnvServerURL: h.server.srv.URL, EnvMachineToken: testToken, EnvName: testMachine, EnvStateDir: h.cfg.StateDir,
+	}
+	getenv := func(k string) string { return env[k] }
+	lock, err := AcquireRunLock(h.cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	fn := func(OperatorEnv) error { called++; return nil }
+	if err := runOperator(newTerm(), getenv, NeedLocal, exclusive, fn); err == nil || called != 0 || !strings.Contains(err.Error(), "systemctl stop") {
+		t.Fatalf("exclusive command while signer run holds the lock: %v (called %d)", err, called)
+	}
+	if err := runOperator(newTerm(), getenv, NeedLocal, shared, fn); err != nil || called != 1 {
+		t.Fatalf("shared command: %v (called %d)", err, called)
+	}
+	lock.Close()
+	if err := runOperator(newTerm(), getenv, NeedLocal, exclusive, fn); err != nil || called != 2 {
+		t.Fatalf("exclusive command after the service stopped: %v (called %d)", err, called)
+	}
+	// 运维命令拿着锁时 signer run 起不来
+	held := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runOperator(newTerm(), getenv, NeedLocal, exclusive, func(OperatorEnv) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	_, err = AcquireRunLock(h.cfg.StateDir)
+	close(release)
+	if err == nil {
+		t.Fatal("signer run started while abandon or promote was running")
+	}
+	must(t, <-done)
 }
 
 func TestListAndShowKey(t *testing.T) {
@@ -378,7 +461,11 @@ func TestListAndShowKey(t *testing.T) {
 	if err := List(&out, h.keys, h.store); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{testMachine, h.key.CertificateSHA256, h.digest, h.builder.ID, "role primary"} {
+	trustTip, signedTip, err := h.store.Tips()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{testMachine, h.key.CertificateSHA256, h.digest, h.builder.ID, "role primary", trustTip.LastHash, signedTip.LastHash} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("list output misses %q:\n%s", want, out.String())
 		}

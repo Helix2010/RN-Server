@@ -35,11 +35,16 @@ import (
 // InputVersion 是 Input.Version 唯一允许的值。
 const InputVersion = 1
 
-// 结论类型。
+// 确认值里 SDK 下限的最低取值，与 records.MinConfirmedMinSDK / MinConfirmedTargetSDK 一致。
+// targetSdk >= 28 时 usesCleartextTraffic 默认 false，第 11 条靠它兜住没有显式声明的包。
 const (
-	KindViolation = "violation"
-	KindDeferred  = "deferred"
+	MinSDKFloor    = 24
+	TargetSDKFloor = 28
 )
+
+// KindViolation 是检查结论唯一的拒签类型。检查进程不产生"暂不能签"：那由主进程按本机记录
+// 判断；让检查进程能报 deferred，等于让一个被不可信 APK 打穿的检查进程把违规降级成无限重试。
+const KindViolation = "violation"
 
 // meta-data 名（expo-updates 读 AndroidManifest 里的这几项，不读 assets/app.config）。
 const (
@@ -51,7 +56,56 @@ const (
 
 	// protectionLevel="signature"
 	protectionSignature = 2
+
+	expoUpdatesMetaPrefix = "expo.modules.updates."
 )
+
+// expoUpdatesMeta 是 expo-updates（android/.../UpdatesConfiguration.kt）读取的 meta-data 允许列表。
+// 值为 nil 的项在上面的专门检查里核对；其余项给出允许的字面量。列表之外的
+// expo.modules.updates.* 一律拒签：例如 CODE_SIGNING_ALLOW_UNSIGNED_MANIFESTS=true 让内嵌 OTA
+// 证书形同虚设，DISABLE_ANTI_BRICKING_MEASURES=true 让 JS 在运行时改更新地址与请求头，
+// EXPO_SCOPE_KEY 换掉更新的存储作用域。
+var expoUpdatesMeta = map[string]func(apk.MetaData) bool{
+	metaCodeSigningCertificate:                                                      nil,
+	metaCodeSigningMetadata:                                                         nil,
+	metaUpdateURL:                                                                   nil,
+	metaUpdatesEnabled:                                                              nil,
+	metaRequestHeaders:                                                              nil,
+	"expo.modules.updates.EXPO_RUNTIME_VERSION":                                     func(md apk.MetaData) bool { return !md.HasResource || md.Value.Type == 0 },
+	"expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH":                             stringIn("ALWAYS", "WIFI_ONLY", "NEVER", "ERROR_RECOVERY_ONLY"),
+	"expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS":                              func(md apk.MetaData) bool { _, ok := md.Value.Int(); return ok && !md.HasResource },
+	"expo.modules.updates.ENABLE_BSDIFF_PATCH_SUPPORT":                              literalBool(nil),
+	"expo.modules.updates.HAS_EMBEDDED_UPDATE":                                      literalBool(ptrBool(true)),
+	"expo.modules.updates.CODE_SIGNING_ALLOW_UNSIGNED_MANIFESTS":                    literalBool(ptrBool(false)),
+	"expo.modules.updates.DISABLE_ANTI_BRICKING_MEASURES":                           literalBool(ptrBool(false)),
+	"expo.modules.updates.ENABLE_EXPO_UPDATES_PROTOCOL_V0_COMPATIBILITY_MODE":       literalBool(ptrBool(false)),
+	"expo.modules.updates.CODE_SIGNING_INCLUDE_MANIFEST_RESPONSE_CERTIFICATE_CHAIN": literalBool(ptrBool(false)),
+}
+
+func ptrBool(b bool) *bool { return &b }
+
+// literalBool：布尔字面量；want 不为 nil 时还必须等于它。
+func literalBool(want *bool) func(apk.MetaData) bool {
+	return func(md apk.MetaData) bool {
+		v, ok := md.Value.Bool()
+		return ok && !md.HasResource && (want == nil || v == *want)
+	}
+}
+
+func stringIn(values ...string) func(apk.MetaData) bool {
+	return func(md apk.MetaData) bool {
+		s, ok := md.Value.Str()
+		if !ok || md.HasResource {
+			return false
+		}
+		for _, v := range values {
+			if s == v {
+				return true
+			}
+		}
+		return false
+	}
+}
 
 var (
 	nativeFingerprintPattern = regexp.MustCompile(`^[0-9a-f]{32,128}$`)
@@ -266,8 +320,8 @@ func ValidateInput(in Input) error {
 	switch {
 	case !ident.ValidTenantSlug(c.TenantSlug) || !ident.ValidPackageName(c.PackageName) || !fingerprint.Valid(c.CertificateSHA256):
 		return errors.New("confirmed identity is malformed")
-	case c.MinSDK < 1 || c.TargetSDK < c.MinSDK:
-		return errors.New("confirmed SDK floors are malformed")
+	case c.MinSDK < MinSDKFloor || c.TargetSDK < c.MinSDK || c.TargetSDK < TargetSDKFloor:
+		return fmt.Errorf("confirmed SDK floors must be minSdk >= %d and targetSdk >= max(minSdk, %d)", MinSDKFloor, TargetSDKFloor)
 	case c.FirstSignMaxVersionCode < 1:
 		return errors.New("confirmed first-sign cap is malformed")
 	case in.Limits.MaxVersionCodeJump < 1 || in.Limits.MaxVersionCode < 1:
@@ -512,6 +566,23 @@ func checkEmbeddedConfig(in Input, pkg *apk.Package, facts *Facts) Verdict {
 	meta, v := metaDataByName(pkg.Manifest)
 	if !v.OK {
 		return v
+	}
+	var names []string
+	for name := range meta {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !strings.HasPrefix(name, expoUpdatesMetaPrefix) {
+			continue
+		}
+		check, known := expoUpdatesMeta[name]
+		if !known {
+			return violation("OTA_CONFIGURATION_NOT_ALLOWED", "meta-data %s is not on the signing gate's expo-updates allow list", quote(name))
+		}
+		if check != nil && !check(meta[name]) {
+			return violation("OTA_CONFIGURATION_NOT_ALLOWED", "meta-data %s has a value the signing gate does not allow", quote(name))
+		}
 	}
 	wantURL := trustroots.OTAManifestURL(c.TrustRoots.APIBaseURL)
 	if got, ok := metaString(meta, metaUpdateURL); !ok || got != wantURL {

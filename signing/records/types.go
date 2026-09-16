@@ -18,6 +18,7 @@ const (
 	typeTenant        = "tenant"
 
 	typeReserve  = "reserve"
+	typeSigned   = "signed"
 	typeComplete = "complete"
 	typeAbandon  = "abandon"
 	typeImport   = "import"
@@ -143,10 +144,10 @@ func (c Confirmation) validate() error {
 		return errors.New("keyAlias is malformed")
 	case c.KeystoreVersion < 0:
 		return errors.New("keystoreVersion must not be negative")
-	case c.MinSDK < 1 || c.MinSDK > 1000:
-		return errors.New("minSdk must be between 1 and 1000")
-	case c.TargetSDK < c.MinSDK || c.TargetSDK > 1000:
-		return errors.New("targetSdk must be between minSdk and 1000")
+	case c.MinSDK < MinConfirmedMinSDK || c.MinSDK > 1000:
+		return fmt.Errorf("minSdk must be between %d and 1000", MinConfirmedMinSDK)
+	case c.TargetSDK < c.MinSDK || c.TargetSDK < MinConfirmedTargetSDK || c.TargetSDK > 1000:
+		return fmt.Errorf("targetSdk must be at least minSdk and %d, and at most 1000", MinConfirmedTargetSDK)
 	case c.FirstSignMaxVersionCode < 1 || c.FirstSignMaxVersionCode > MaxVersionCode:
 		return errors.New("firstSignMaxVersionCode must be between 1 and 2100000000")
 	case !operatorPattern.MatchString(c.ConfirmedBy):
@@ -176,8 +177,8 @@ type Reservation struct {
 	VersionCode       int64  `json:"versionCode"`
 	UnsignedSHA256    string `json:"unsignedSha256"`
 
-	// 以下由 complete / import 填写
-	Status       string `json:"-"` // reserved | completed | abandoned
+	// 以下由 signed / complete / import 填写
+	Status       string `json:"-"` // reserved | signed | completed | abandoned
 	SignedSHA256 string `json:"-"`
 	ReleaseID    string `json:"-"`
 	Source       string `json:"-"` // local | import
@@ -186,11 +187,59 @@ type Reservation struct {
 }
 
 // Reservation.Status 的取值。
+//
+//	reserved  预留已落盘，还没有签出任何东西（apksigner 可能跑过，但输出只在本机工作目录，
+//	          启动时清空，从未离开本机）——可以释放
+//	signed    已签名并复核，签名包 sha256 已落盘，随后才上传——不能释放：服务端可能已经拿到它
+//	completed 服务端确认完成，记下发布 id
+//	abandoned 已释放（运维 abandon，或签名闸在记下签名包之前失败时自动释放）
 const (
 	StatusReserved  = "reserved"
+	StatusSigned    = "signed"
 	StatusCompleted = "completed"
 	StatusAbandoned = "abandoned"
 )
+
+// SDK 下限的最低值：签名闸关掉了 v1 签名，minSdk 低于 24 的设备装不上；targetSdk 不低于 28
+// 时 usesCleartextTraffic 缺省即为 false，第 10 条"不允许明文流量"才对缺省值成立。
+const (
+	MinConfirmedMinSDK    = 24
+	MinConfirmedTargetSDK = 28
+)
+
+// ReserveLimits 是预留时在本机记录的锁内复核的版本号上限（检查进程已经判过一次）。
+type ReserveLimits struct {
+	MaxVersionCode          int64 // 绝对上限
+	MaxJump                 int64 // 比已签最大值最多跳多少
+	FirstSignMaxVersionCode int64 // 该 (包名, 证书) 首次签名的上限
+}
+
+func (l ReserveLimits) validate() error {
+	if l.MaxVersionCode < 1 || l.MaxJump < 1 || l.FirstSignMaxVersionCode < 1 {
+		return errors.New("reserve limits must all be positive")
+	}
+	return nil
+}
+
+type signedRecord struct {
+	JobID             string `json:"jobId"`
+	PackageName       string `json:"packageName"`
+	CertificateSHA256 string `json:"certificateSha256"`
+	VersionCode       int64  `json:"versionCode"`
+	UnsignedSHA256    string `json:"unsignedSha256"`
+	SignedSHA256      string `json:"signedSha256"`
+}
+
+func (s signedRecord) validate() error {
+	r := Reservation{JobID: s.JobID, TenantSlug: "x", PackageName: s.PackageName, CertificateSHA256: s.CertificateSHA256, VersionCode: s.VersionCode, UnsignedSHA256: s.UnsignedSHA256}
+	if err := r.validateReserve(); err != nil {
+		return err
+	}
+	if !fingerprint.Valid(s.SignedSHA256) {
+		return errors.New("signedSha256 must be 64 lowercase hex characters")
+	}
+	return nil
+}
 
 func (r Reservation) validateReserve() error {
 	switch {
@@ -284,12 +333,16 @@ func (i importRecord) validate() error {
 		if i.SignedSHA256 != "" || i.ReleaseID != "" {
 			return errors.New("a reserved import must not carry signedSha256 or releaseId")
 		}
+	case StatusSigned:
+		if !fingerprint.Valid(i.SignedSHA256) || i.ReleaseID != "" {
+			return errors.New("a signed import needs signedSha256 and no releaseId")
+		}
 	case StatusCompleted:
 		if !fingerprint.Valid(i.SignedSHA256) || !releaseIDPattern.MatchString(i.ReleaseID) {
 			return errors.New("a completed import needs signedSha256 and releaseId")
 		}
 	default:
-		return errors.New("status must be reserved or completed")
+		return errors.New("status must be reserved, signed or completed")
 	}
 	if !operatorPattern.MatchString(i.Operator) {
 		return errors.New("operator is malformed")

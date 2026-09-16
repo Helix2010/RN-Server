@@ -186,6 +186,8 @@ func Promote(env OperatorEnv, mode PromoteMode, importPath string) error {
 			return fmt.Errorf("the file does not verify against the pinned key: %w", err)
 		}
 		printf(t, "  ✓ %d lines verified, written by %s\n", foreign.Lines, foreign.Genesis.MachineName)
+		// 哈希链发现不了"整行截掉文件末尾"：让运维与旧主 `signer list` 显示过的末行对一下
+		printf(t, "  last line sha256 %s\n  Compare the line count and last line hash with the old primary's `signer list` output or the offline records;\n  a file cut short verifies just as well.\n", foreign.LastHash)
 		printImportSummary(t, foreign)
 		if err := confirmTyped(t, "Type this machine's name to import these records and promote it: ", name); err != nil {
 			return err
@@ -267,13 +269,17 @@ func Promote(env OperatorEnv, mode PromoteMode, importPath string) error {
 
 func printImportSummary(t Terminal, f records.Foreign) {
 	type key struct{ tenant, pkg, cert string }
-	counts := map[key][2]int64{}
+	type count struct{ total, open, max int64 }
+	counts := map[key]count{}
 	for _, r := range f.Reservations {
 		k := key{r.TenantSlug, r.PackageName, r.CertificateSHA256}
 		c := counts[k]
-		c[0]++
-		if r.VersionCode > c[1] {
-			c[1] = r.VersionCode
+		c.total++
+		if r.Status != records.StatusCompleted {
+			c.open++
+		}
+		if r.VersionCode > c.max {
+			c.max = r.VersionCode
 		}
 		counts[k] = c
 	}
@@ -283,7 +289,8 @@ func printImportSummary(t Terminal, f records.Foreign) {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].tenant+keys[i].pkg < keys[j].tenant+keys[j].pkg })
 	for _, k := range keys {
-		printf(t, "    %s %s certificate %s: %d reservations, highest versionCode %d\n", k.tenant, k.pkg, k.cert, counts[k][0], counts[k][1])
+		c := counts[k]
+		printf(t, "    %s %s certificate %s: %d reservations (%d not completed), highest versionCode %d\n", k.tenant, k.pkg, k.cert, c.total, c.open, c.max)
 	}
 	for _, b := range f.Baselines {
 		printf(t, "    baseline %s certificate %s: versionCode %d\n", b.PackageName, b.CertificateSHA256, b.MaxVersionCode)
@@ -309,8 +316,8 @@ func readRegularFile(path string, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, limit))
 }
 
-// Abandon 释放一条从未交付出去的预留。运维先在控制台确认服务端没有对应的发布记录，
-// 也没有下载记录。
+// Abandon 释放一条还没有记下签名包的预留（status=reserved）。已签名、已完成的预留不能释放。
+// 调用方必须持有运行锁（签名闸服务已停），否则可能与正在处理这个任务的 signer run 竞争。
 func Abandon(env OperatorEnv, jobID, reason string) error {
 	t := env.Term
 	if !ident.ValidServerID(jobID) {
@@ -332,12 +339,15 @@ func Abandon(env OperatorEnv, jobID, reason string) error {
 	if found == nil {
 		return fmt.Errorf("this signing gate holds no open reservation for job %s", jobID)
 	}
-	if found.Status == records.StatusCompleted {
+	switch found.Status {
+	case records.StatusCompleted:
 		return fmt.Errorf("job %s was signed and delivered (release %s); a delivered reservation cannot be released", jobID, found.ReleaseID)
+	case records.StatusSigned:
+		return fmt.Errorf("job %s already produced signed package %s, which may have reached the server; its versionCode stays taken — build again with a higher versionCode", jobID, found.SignedSHA256)
 	}
 	printf(t, "\nRelease a reservation / 释放预留\n  job:       %s\n  tenant:    %s\n  package:   %s\n  certificate: %s\n  versionCode: %d\n  unsigned sha256: %s\n  reserved at: %s\n\n",
 		found.JobID, found.TenantSlug, found.PackageName, found.CertificateSHA256, found.VersionCode, found.UnsignedSHA256, found.ReservedAt)
-	printf(t, "  Only continue if the server has no release and no download record for this job: a package signed with\n  this versionCode may otherwise exist, and releasing the reservation lets another package use it.\n\n")
+	printf(t, "  No signed package was recorded for this reservation, so none left this machine. Releasing it lets another\n  package use this versionCode.\n\n")
 	operator, err := askOperator(t)
 	if err != nil {
 		return err
@@ -375,7 +385,14 @@ func List(w io.Writer, keys MachineKeys, store *records.Store) error {
 	if err != nil {
 		return err
 	}
+	trustTip, signedTip, err := store.Tips()
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(w, "machine %s\n  x25519 sha256  %s\n  ed25519 sha256 %s\n", g.MachineName, keys.X25519SHA256(), keys.Ed25519SHA256())
+	// 行数与末行哈希抄进离线记录：日后 promote --import 时用来发现被截短的 signed.jsonl
+	fmt.Fprintf(w, "  trust.jsonl  %d lines, last line sha256 %s\n", trustTip.Lines, trustTip.LastHash)
+	fmt.Fprintf(w, "  signed.jsonl %d lines, last line sha256 %s\n", signedTip.Lines, signedTip.LastHash)
 	if role.Mode == "" {
 		fmt.Fprintf(w, "role standby (no role record)\n")
 	} else {
@@ -396,7 +413,10 @@ func List(w io.Writer, keys MachineKeys, store *records.Store) error {
 	fmt.Fprintf(w, "\nsigned (%d)\n", len(reservations))
 	for _, r := range reservations {
 		fmt.Fprintf(w, "  %s %-9s %s %s %s vc %d unsigned %s", r.UpdatedAt, r.Status, r.JobID, r.TenantSlug, r.PackageName, r.VersionCode, r.UnsignedSHA256)
-		if r.Status == records.StatusCompleted {
+		switch r.Status {
+		case records.StatusSigned:
+			fmt.Fprintf(w, " signed %s", r.SignedSHA256)
+		case records.StatusCompleted:
 			fmt.Fprintf(w, " signed %s release %s", r.SignedSHA256, r.ReleaseID)
 		}
 		if r.Source == "import" {
