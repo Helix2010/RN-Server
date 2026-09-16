@@ -62,6 +62,8 @@ type server struct {
 	machineSetup machineSetupLimiter
 	// machineBundleDir 是安装包目录；空 = defaultMachineBundleDir。只有测试会设
 	machineBundleDir string
+	// clock 是 s.now() 的时间源；nil = time.Now。只有测试会设
+	clock func() time.Time
 }
 
 type attempt struct {
@@ -985,7 +987,7 @@ func (s *server) setReleaseMandatory(c *gin.Context, r release, mandatory *bool,
 		problem(c, 409, "RELEASE_FLAG_LOCKED", fmt.Sprintf("Cannot change the upgrade type of a %s release", r.Status))
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
@@ -997,7 +999,11 @@ func (s *server) setReleaseMandatory(c *gin.Context, r release, mandatory *bool,
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	// 同一毫秒里重复提交同一个值时 RowsAffected 是 0，按条件复查（rowsMatched）
+	if matched, err := rowsMatched(c.Request.Context(), tx, result, "app_releases", "tenant_id=? AND id=? AND status=?", tenantID(c), r.ID, r.Status); err != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	} else if !matched {
 		problem(c, 409, "RELEASE_STATE_CHANGED", "Release changed; refresh and retry")
 		return
 	}
@@ -1043,7 +1049,7 @@ func (s *server) setReleaseCanaryAudience(c *gin.Context, r release, installatio
 		problem(c, 422, code, detail)
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
@@ -1056,7 +1062,10 @@ func (s *server) setReleaseCanaryAudience(c *gin.Context, r release, installatio
 		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if matched, err := rowsMatched(c.Request.Context(), tx, result, "app_releases", "tenant_id=? AND id=? AND status='canary'", tenantID(c), r.ID); err != nil {
+		problem(c, 500, "TRANSITION_FAILED", "Unable to update release")
+		return
+	} else if !matched {
 		problem(c, 409, "RELEASE_STATE_CHANGED", "Release changed; refresh and retry")
 		return
 	}

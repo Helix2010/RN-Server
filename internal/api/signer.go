@@ -686,7 +686,20 @@ func signingJobFromContext(c *gin.Context) buildJob {
 }
 
 // signingGuard 是签名闸所有状态更新共用的 WHERE：状态、编号、机器都要对得上。
-const signingGuard = ` WHERE id=? AND kind='apk' AND status='signing' AND sign_attempt=? AND signing_machine_id=?`
+const signingGuard = ` WHERE ` + signingCondition
+
+const signingCondition = `id=? AND kind='apk' AND status='signing' AND sign_attempt=? AND signing_machine_id=?`
+
+// refreshSigningHeartbeat 刷新签名心跳。只改心跳时间：同一毫秒里重复刷新时值不变、RowsAffected 是 0，
+// 用 rowsMatched 复查条件，免得把一次正常的心跳判成 SIGN_ATTEMPT_STALE。
+func (s *server) refreshSigningHeartbeat(ctx context.Context, jobID string, attempt int, machineID string) (bool, error) {
+	now := s.now()
+	result, err := s.db.ExecContext(ctx, `UPDATE build_jobs SET signing_heartbeat_at=?,updated_at=?`+signingGuard, now, now, jobID, attempt, machineID)
+	if err != nil {
+		return false, err
+	}
+	return rowsMatched(ctx, s.db, result, "build_jobs", signingCondition, jobID, attempt, machineID)
+}
 
 func (s *server) signingHeartbeat(c *gin.Context) {
 	machine, _ := machineFromContext(c)
@@ -695,14 +708,12 @@ func (s *server) signingHeartbeat(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_SIGN_ATTEMPT", "x-sign-attempt must carry the sign attempt number returned by claim")
 		return
 	}
-	now := time.Now().UTC()
-	result, err := s.db.ExecContext(c.Request.Context(), `UPDATE build_jobs SET signing_heartbeat_at=?,updated_at=?`+signingGuard,
-		now, now, c.Param("id"), attempt, machine.ID)
+	matched, err := s.refreshSigningHeartbeat(c.Request.Context(), c.Param("id"), attempt, machine.ID)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record signing progress")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if !matched {
 		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
 	}
@@ -857,11 +868,10 @@ func (s *server) completeSigning(c *gin.Context) {
 		return
 	}
 	// 下载与复核大包可能要几分钟：先刷新签名心跳，免得复核还没做完任务就被回收器退回待签名
-	if result, err := s.db.ExecContext(ctx, `UPDATE build_jobs SET signing_heartbeat_at=?,updated_at=?`+signingGuard,
-		time.Now().UTC(), time.Now().UTC(), job.ID, attempt, machine.ID); err != nil {
+	if matched, err := s.refreshSigningHeartbeat(ctx, job.ID, attempt, machine.ID); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record signing progress")
 		return
-	} else if affected, _ := result.RowsAffected(); affected != 1 {
+	} else if !matched {
 		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
 	}

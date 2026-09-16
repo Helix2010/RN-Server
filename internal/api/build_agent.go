@@ -369,16 +369,21 @@ func (s *server) buildJobHeartbeat(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_PROGRESS", "logTail must be an array of strings")
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
+	guard := `id=? AND status IN (` + sqlBuilderActive + `) AND attempt=? AND claimed_machine_id=?`
+	guardArgs := []any{c.Param("id"), attempt, machine.ID}
 	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='running',heartbeat_at=?,log_tail=?,updated_at=?
-		  WHERE id=? AND status IN (`+sqlBuilderActive+`) AND attempt=? AND claimed_machine_id=?`,
-		now, clampLogTail(body.LogTail), now, c.Param("id"), attempt, machine.ID)
+		`UPDATE build_jobs SET status='running',heartbeat_at=?,log_tail=?,updated_at=? WHERE `+guard,
+		append([]any{now, clampLogTail(body.LogTail), now}, guardArgs...)...)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record build progress")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	// 同一毫秒里两次心跳、日志尾部相同：值没变，RowsAffected 是 0，但编号是对的（rowsMatched）
+	if matched, err := rowsMatched(c.Request.Context(), s.db, result, "build_jobs", guard, guardArgs...); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record build progress")
+		return
+	} else if !matched {
 		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
 		return
 	}

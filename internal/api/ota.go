@@ -643,14 +643,18 @@ func (s *server) saveOTARelease(c *gin.Context) {
 
 // commitOTACanaryAudience 在已经持有 slot 锁与事务的前提下改灰度名单，不动状态。
 func (s *server) commitOTACanaryAudience(c *gin.Context, tx *sql.Tx, id, status string, audience []string, reason string) {
-	now := time.Now().UTC()
+	now := s.now()
 	audienceValue, _ := json.Marshal(audience)
 	result, err := tx.ExecContext(c.Request.Context(), `UPDATE ota_releases SET canary_installations=?,updated_at=? WHERE tenant_id=? AND id=? AND status='canary'`, audienceValue, now, tenantID(c), id)
 	if err != nil {
 		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	// 同一毫秒里重复提交同一份名单时 RowsAffected 是 0，按条件复查（rowsMatched）
+	if matched, err := rowsMatched(c.Request.Context(), tx, result, "ota_releases", "tenant_id=? AND id=? AND status='canary'", tenantID(c), id); err != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
+		return
+	} else if !matched {
 		problem(c, 409, "OTA_STATE_CHANGED", "OTA release changed; refresh and retry")
 		return
 	}
@@ -1215,7 +1219,7 @@ func (s *server) setOTAApplyStrategy(c *gin.Context, id, strategy, reason string
 		problem(c, 409, "OTA_FLAG_LOCKED", fmt.Sprintf("Cannot change the apply strategy of a %s OTA release", status))
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
@@ -1227,7 +1231,10 @@ func (s *server) setOTAApplyStrategy(c *gin.Context, id, strategy, reason string
 		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if matched, err := rowsMatched(c.Request.Context(), tx, result, "ota_releases", "tenant_id=? AND id=? AND status=?", tenantID(c), id, status); err != nil {
+		problem(c, 500, "OTA_TRANSITION_FAILED", "Unable to update OTA release")
+		return
+	} else if !matched {
 		problem(c, 409, "OTA_STATE_CHANGED", "OTA release changed; refresh and retry")
 		return
 	}
