@@ -1044,6 +1044,23 @@ go build ./cmd/server ./cmd/build-agent
 | 打包机公钥的 base64 值全系统没有出口（接口只回指纹，`build_agent_key.go:141-155`；`build-agent` 没有任何子命令——`grep "os.Args\|flag\." cmd/build-agent/*.go` 零命中） | 修好上面那条也还是卡住——重新封盒子需要这个值。要补的子命令是 **`build-agent show-key`**：打印 `agent-key` 的指纹和公钥 base64。§7.2 第 4 步用的就是它，`manifest.agentKeyFingerprint`（§4.5）是它的比对对象 |
 | 恢复后签名密钥不会重新校验：待验清单跳过「这一版已经验过」的租户（`build_keystore_check.go:95-122`），而恢复场景里数据库一个字没动 | 控制台显示「正常」，看的是灾难前那台机器写下的记录。**已补 `POST /v1/admin/platform/build-agent/keystore-checks/reset`**，RECOVERY.md 里给的是这条接口，连库那条 SQL 降为兜底 |
 
+### 11.1 实现时有意偏离的一条
+
+**§8.6 列的 20 个 i18n key 没有加，页面正文用中文字面量。**
+
+不是漏掉，是照做会让这一页变成全仓唯一一个正文全 key 化的页面。核对过的事实：
+`src/modules/app-config/ota-signing-page.tsx` 全文只有 1 处 `t("`、20 处硬编码中文；
+`admin-password-page.tsx` 一处 `t("` 都没有。仓库的实际约定是 **i18n key 只用于
+导航项和 aria-label，正文一律中文字面量**——备份页现在就是这样（`navPlatformBackup`
+已加）。
+
+所以「英文语言下整页是中文」是这个管理端的现状，不是本功能引入的。单独把这一页
+key 化，得到的是一页和邻居都不一样的代码，以及 20 条没有第二个页面在用的英文
+翻译；真要解决，应该是管理端整体做一次，那是另一件事。
+
+记在这里而不是默默跳过，是因为下一个读设计的人会拿 §8.6 对照代码，
+他需要知道这是个决定而不是遗漏。
+
 ## 12. 怎么证明备份是有效的
 
 **服务端永远无法证明「那两把恢复私钥真的能开」**——它一把都没有。它能做的只有结构自检，而且这个自检比看上去弱得多：现有 `SealTo` 封完调的那次自解（`recipient.go:142`）在真正解密之前就返回了，只做了三个长度断言。
