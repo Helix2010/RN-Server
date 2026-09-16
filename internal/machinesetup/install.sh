@@ -317,7 +317,8 @@ PY
 
 # ---- 2b. 装到哪里 ---------------------------------------------------------------------------
 
-# 签名闸定下实例名；注册码还没用过（describe 真的查到了）而目标已经注册过时拒绝：那是另一台机器的码，
+# 签名闸定下实例名：--instance，否则这个注册码注册成功时记下的实例名，否则机器名。
+# 注册码还没用过（describe 真的查到了）而目标已经注册过时拒绝：那是另一台机器的码，
 # 继续下去会用新机器的身份覆盖一台在跑的机器。
 resolve_target() {
   if [ "$ROLE" = signer ]; then
@@ -328,10 +329,7 @@ resolve_target() {
     if [ -z "$INSTANCE" ]; then
       INSTANCE="${cached_instance:-$MACHINE_NAME}"
     elif [ -n "$cached_instance" ] && [ "$cached_instance" != "$INSTANCE" ]; then
-      die "这个注册码上次装成了实例 $cached_instance，这次 --instance 是 $INSTANCE；去掉 --instance 或写成 $cached_instance"
-    fi
-    if [[ "$INSTANCE" =~ ^[a-z0-9][a-z0-9-]{0,21}$ ]]; then
-      printf '%s\n' "$INSTANCE" >"$CACHE/instance"
+      die "这个注册码已经注册成了实例 $cached_instance，这次 --instance 是 $INSTANCE；去掉 --instance 或写成 $cached_instance"
     fi
     if [ "$DESCRIBED_LIVE" = yes ] && has_machine_token "/etc/rn-signer-$INSTANCE.env" SIGNER_MACHINE_TOKEN; then
       die "实例 $INSTANCE 已经注册过（/etc/rn-signer-$INSTANCE.env 里有机器令牌），而这个注册码还没用过：它属于另一台机器。给新机器换一个 --instance；注册码没有使用"
@@ -629,6 +627,8 @@ install_signer() {
       die "signer enroll 失败（见上面的输出）。修好之后重新执行同一条命令"
     has_machine_token "$env" SIGNER_MACHINE_TOKEN || die "signer enroll 报告成功，但 $env 里没有机器令牌"
   fi
+  # 记下这个注册码落在哪个实例上：之后不带 --instance 重复执行时用它
+  printf '%s\n' "$INSTANCE" >"$CACHE/instance"
 
   step "启动"
   systemctl enable --now "$unit-check.socket" "$unit.service"
