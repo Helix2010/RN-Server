@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"strings"
@@ -103,6 +104,17 @@ func testInputWithSigner(t *testing.T, holders []holder) (Input, ed25519.PublicK
 	for _, slot := range backupcontainer.InnerSlots() {
 		inner[slot] = sealInnerFor(t, byslot[slot], signer, agentPlain)
 	}
+
+	// 指纹和公钥必须是真的、而且互相对得上：recover.sh 会拿包里的 signing.der
+	// 算一次 sha256 和纸上的指纹比对，假值会让那一步自相矛盾
+	signingDER, err := x509.MarshalPKIXPublicKey(signingPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingFP, err := backupcontainer.SigningFingerprint(signingPub)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return Input{
 		Seq:        7,
 		InstanceID: "test-1",
@@ -130,7 +142,8 @@ func testInputWithSigner(t *testing.T, holders []holder) (Input, ed25519.PublicK
 		AgentVersion:             "2026-09-15-agent",
 		SchemaVersion:            53,
 		AgentKeyFingerprint:      strings.Repeat("e", 16),
-		BackupSigningFingerprint: strings.Repeat("f", 64),
+		BackupSigningFingerprint: signingFP,
+		BackupSigningPublicKey:   signingDER,
 	}, signingPub
 }
 
@@ -385,7 +398,7 @@ func TestRecoverScriptQuotesEveryInterpolatedValue(t *testing.T) {
 		Path: "keystores/acme/keystore.p12", Size: 1, SHA256: strings.Repeat("0", 64),
 		Target: "/var/lib/rn-build-agent/it's here", Mode: "0600", Owner: "builder:builder",
 	})
-	script := renderRecoverScript(in, backupcontainer.Pairs()[0])
+	script := renderRecoverScript(in, backupcontainer.Pairs()[0], nil)
 
 	// 带单引号的路径必须被正确转义成 '\'' 形式
 	if !strings.Contains(script, `'/var/lib/rn-build-agent/it'\''s here'`) {

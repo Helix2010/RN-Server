@@ -88,6 +88,13 @@ type Input struct {
 	SchemaVersion            int
 	AgentKeyFingerprint      string
 	BackupSigningFingerprint string
+	// BackupSigningPublicKey 是备份签名公钥的 DER SubjectPublicKeyInfo。
+	//
+	// 它要跟着包走：灾难当天控制台多半也起不来，从库里取公钥这条路是断的。
+	// 放在包里安全的前提是**锚点在纸上不在包里**——recover.sh 把持有人抄的那
+	// 64 位指纹当参数收进来，先比指纹再验签。攻击者能换掉包里的公钥和 README
+	// 上印的指纹，换不掉三个人纸上的那一行。
+	BackupSigningPublicKey []byte
 }
 
 // Package 是产出的一组包。
@@ -144,12 +151,13 @@ type innerManifest struct {
 }
 
 const (
-	nameManifest  = "manifest.json"
-	nameRecovery  = "RECOVERY.md"
-	nameRecoverSh = "recover.sh"
-	nameInner     = "inner.rnbk"
-	nameInnerSig  = "inner.rnbk.sig"
-	nameServer    = "server.rnbk"
+	nameManifest   = "manifest.json"
+	nameRecovery   = "RECOVERY.md"
+	nameRecoverSh  = "recover.sh"
+	nameInner      = "inner.rnbk"
+	nameInnerSig   = "inner.rnbk.sig"
+	nameServer     = "server.rnbk"
+	nameSigningKey = "signing.der"
 )
 
 // Assemble 产出三组包，写进 sink。
@@ -248,6 +256,11 @@ func (in Input) validate() error {
 		}
 		seen[r.Fingerprint] = true
 	}
+	// 没有公钥，包里的签名就只是一串没人能验的字节，而验签是两个真实性锚点之一
+	if len(in.BackupSigningPublicKey) == 0 {
+		return fmt.Errorf("backupbundle: the backup signing public key is missing; " +
+			"without it nobody can verify the signature that comes with this package")
+	}
 	for _, slot := range backupcontainer.InnerSlots() {
 		part, ok := in.AgentInner[slot]
 		if !ok || len(part.Sealed) == 0 {
@@ -300,14 +313,15 @@ func sealServerPart(in Input, recipient Recipient) ([]byte, error) {
 
 func buildOuterPayload(in Input, pair backupcontainer.Pair, inner InnerPart, serverPart []byte) ([]byte, error) {
 	members := map[string][]byte{
-		nameInner:    inner.Sealed,
-		nameInnerSig: inner.Signature,
-		nameServer:   serverPart,
+		nameInner:      inner.Sealed,
+		nameInnerSig:   inner.Signature,
+		nameServer:     serverPart,
+		nameSigningKey: in.BackupSigningPublicKey,
 	}
 	// files[] 覆盖除 manifest.json 自身之外的每一个外层成员，
 	// 三个密文成员一个都不能漏——这一条是防拼接的
 	files := []FileEntry{}
-	for _, name := range []string{nameInner, nameInnerSig, nameServer} {
+	for _, name := range []string{nameInner, nameInnerSig, nameServer, nameSigningKey} {
 		files = append(files, FileEntry{
 			Path:   name,
 			Size:   int64(len(members[name])),
@@ -316,7 +330,13 @@ func buildOuterPayload(in Input, pair backupcontainer.Pair, inner InnerPart, ser
 	}
 
 	recovery := renderRecoveryMarkdown(in, pair)
-	script := renderRecoverScript(in, pair)
+	// 这四个成员的摘要要印进脚本里，脚本才能自己核对解包解全了没有。
+	// 必须在这里取：下面两行一加，files 里就多了 recover.sh 自己
+	digests := map[string]string{}
+	for _, f := range files {
+		digests[f.Path] = f.SHA256
+	}
+	script := renderRecoverScript(in, pair, digests)
 	members[nameRecovery] = []byte(recovery)
 	members[nameRecoverSh] = []byte(script)
 	files = append(files,

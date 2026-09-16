@@ -177,7 +177,7 @@ func TestForgedMetadataCannotInjectIntoTheRecoverScript(t *testing.T) {
 		Path: "keystores/acme/keystore.p12", Size: 1, SHA256: strings.Repeat("0", 64),
 		Target: "/var/lib/x'; " + forgeMarker + " #", Mode: "0600", Owner: "builder:builder",
 	})
-	script := renderRecoverScript(in, backupcontainer.Pairs()[0])
+	script := renderRecoverScript(in, backupcontainer.Pairs()[0], nil)
 
 	// 恶意内容必须整段被单引号包住，不能在引号外面出现
 	for _, line := range strings.Split(script, "\n") {

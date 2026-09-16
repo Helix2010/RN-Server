@@ -220,7 +220,7 @@ func TestGeneratedScriptsAreSyntacticallyValid(t *testing.T) {
 
 	for _, pair := range backupcontainer.Pairs() {
 		for name, body := range map[string]string{
-			"recover.sh":    renderRecoverScript(in, pair),
+			"recover.sh":    renderRecoverScript(in, pair, nil),
 			"open-layer.sh": extractOpenLayerScript(t, renderReadmeFirst(in, pair, recipientMap(in), "deadbeef")),
 		} {
 			path := filepath.Join(dir, pair.Name+"-"+name)
@@ -261,7 +261,7 @@ func TestReadmeTellsYouToExtractOntoRamAndDestroyAfterwards(t *testing.T) {
 // 很贵。但它必须说——不说的话，那份明文会一直留着。
 func TestRecoverScriptRemindsYouToDestroyThePlaintext(t *testing.T) {
 	holders := testHolders(t)
-	script := renderRecoverScript(testInput(t, holders), backupcontainer.Pairs()[0])
+	script := renderRecoverScript(testInput(t, holders), backupcontainer.Pairs()[0], nil)
 	for _, want := range []string{"别忘了销毁", "rm -rf", "umask 077"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("recover.sh 里没有 %q", want)
@@ -275,4 +275,163 @@ func recipientMap(in Input) map[string]Recipient {
 		out[r.Slot] = r
 	}
 	return out
+}
+
+// 设计 §9 要求的那条测试：recover.sh 要在一台干净机器上真的跑通。
+//
+// 这条测试之前不存在，代价是三个缺陷一起交付：
+//
+//   - recover.sh 找 $ROOT/inner.rnbk.sig 和 $ROOT/L2-server/，而 README 教人建的是
+//     $work/L1/inner.rnbk.sig 和 $work/L2-server/。**没有任何目录同时满足两者**，
+//     传谁进去都在第一步就 die，而且给的还是一句误导的提示。
+//   - 验签分支要一个 signing.pem，而全系统没有任何东西会生成它，于是永远走进
+//     「没有 signing.pem，跳过验签。仍然继续？(yes/NO)」——设计里「验不过就停」
+//     的硬要求，在实现里退化成一句敲 yes 就过的提示。
+//   - 防拼接的核对一行都没有。
+//
+// 三条都是「脚本自己跑一次就会露」的问题，而在此之前只有 bash -n（语法检查）。
+func TestRecoverScriptRunsAgainstTheLayoutTheReadmeCreates(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl is not installed")
+	}
+	work, recover, fingerprint := stageOpenedPackage(t)
+
+	// 真的跑。跑到「放文件」那一步会因为不是 root 而停，但四道校验必须全部走过
+	cmd := exec.Command("bash", recover, work, fingerprint)
+	cmd.Stdin = strings.NewReader("")
+	out, _ := cmd.CombinedOutput()
+	got := string(out)
+
+	for _, want := range []string{"核对文件完整性", "核对备份签名公钥", "签名 OK", "核对两层是不是同一次备份"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("脚本没走到「%s」这一步。输出:\n%s", want, got)
+		}
+	}
+	for _, bad := range []string{"卡在这一步", "跳过验签", "仍然继续"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("脚本在校验阶段出现了「%s」，它应当一路验过去。输出:\n%s", bad, got)
+		}
+	}
+}
+
+// 纸上的指纹对不上时必须停，而且不能给「仍然继续」这种选项。
+func TestRecoverScriptStopsWhenTheFingerprintDoesNotMatchThePaper(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl is not installed")
+	}
+	work, recover, _ := stageOpenedPackage(t)
+
+	cmd := exec.Command("bash", recover, work, strings.Repeat("0", 64))
+	cmd.Stdin = strings.NewReader("yes\nyes\nyes\n")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("指纹对不上，脚本却没有以非零退出。输出:\n%s", out)
+	}
+	if !strings.Contains(string(out), "和纸上抄的对不上") {
+		t.Errorf("停下来的原因应当是指纹对不上。输出:\n%s", out)
+	}
+	if strings.Contains(string(out), "签名 OK") {
+		t.Errorf("指纹都没对上就去验签了。输出:\n%s", out)
+	}
+}
+
+// 真的做一次拼接：把内层 meta 的 seq 改成上一次备份的。
+//
+// 这条是 §4.5 防拼接那一条的实测。签名挡不住它——旧的 inner.rnbk 连同它那份
+// 旧 .sig 一起塞进新包，签名照样验得过（同一台机器签的），外层 MAC 是攻击者
+// 自己算的也是好的。能发现它的只有「内层 seq 和外层对不上」。
+func TestRecoverScriptDetectsASplicedInnerLayer(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl is not installed")
+	}
+	work, recoverPath, fingerprint := stageOpenedPackage(t)
+
+	metaPath := filepath.Join(work, "L2-agent", "layer-meta.json")
+	original, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("内层解出来没有 layer-meta.json，防拼接那一步就无从谈起: %v", err)
+	}
+	spliced := strings.Replace(string(original), `"seq":7`, `"seq":6`, 1)
+	if spliced == string(original) {
+		spliced = strings.Replace(string(original), `"seq": 7`, `"seq": 6`, 1)
+	}
+	if spliced == string(original) {
+		t.Fatalf("没能改动 seq，meta.json 长这样: %s", original)
+	}
+	if err := os.WriteFile(metaPath, []byte(spliced), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", recoverPath, work, fingerprint)
+	cmd.Stdin = strings.NewReader("yes\nyes\nyes\n")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("内层被换成了另一次备份，脚本却没有停。输出:\n%s", out)
+	}
+	if !strings.Contains(string(out), "拼接") {
+		t.Errorf("停下来的原因应当点明拼接。输出:\n%s", out)
+	}
+}
+
+// stageOpenedPackage 走完「拿到包 → 两个持有人各解一层 → 三层各在自己的目录里」，
+// 返回 README-FIRST 第三步建出来的那个 $work、包里那份 recover.sh 的路径，
+// 以及持有人纸上抄的那 64 位指纹。
+func stageOpenedPackage(t *testing.T) (work, recoverPath, fingerprint string) {
+	t.Helper()
+	holders := testHolders(t)
+	in, signingPub := testInputWithSigner(t, holders)
+	fp, err := backupcontainer.SigningFingerprint(signingPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sink := newSink()
+	packages, err := Assemble(in, sink)
+	if err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+
+	dir := t.TempDir()
+	keyPaths := map[string]string{}
+	for _, h := range holders {
+		path := filepath.Join(dir, h.slot+".key")
+		der, err := x509.MarshalPKCS8PrivateKey(h.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path,
+			pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		keyPaths[h.slot] = path
+	}
+
+	pkg := packages[0]
+	pair := pairByName(t, pkg.Pair)
+	pkgPath := filepath.Join(dir, "backup.rnbk")
+	if err := os.WriteFile(pkgPath, sink.packages[pkg.Pair].Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 用 README 正文里印的那段脚本，不是常量——要测的正是印给人看的那一份
+	openLayer := filepath.Join(dir, "open-layer.sh")
+	if err := os.WriteFile(openLayer, []byte(extractOpenLayerScript(t, pkg.ReadmeFirst)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	work = filepath.Join(dir, "work")
+	runScript(t, openLayer, pkgPath, keyPaths[pair.Outer], filepath.Join(work, "L1"))
+	runScript(t, openLayer, filepath.Join(work, "L1", "inner.rnbk"),
+		keyPaths[pair.Inner], filepath.Join(work, "L2-agent"))
+	runScript(t, openLayer, filepath.Join(work, "L1", "server.rnbk"),
+		keyPaths[pair.Inner], filepath.Join(work, "L2-server"))
+
+	recoverPath = filepath.Join(dir, "recover.sh")
+	body, err := os.ReadFile(filepath.Join(work, "L1", "recover.sh"))
+	if err != nil {
+		t.Fatalf("包里没有 recover.sh: %v", err)
+	}
+	if err := os.WriteFile(recoverPath, body, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return work, recoverPath, fp
 }

@@ -122,19 +122,37 @@ func renderReadmeFirst(in Input, pair backupcontainer.Pair, byslot map[string]Re
 
 第四步：验签
 ------------
-    # 把登记在案的备份签名公钥转成 PEM（指纹见下，也在控制台上）
-    openssl pkey -pubin -inform DER -in signing.der -out signing.pem
-    openssl pkeyutl -verify -pubin -inkey signing.pem \
-      -rawin -in L1/inner.rnbk -sigfile L1/inner.rnbk.sig
+备份签名公钥就在 "$work/L1/signing.der"，跟着包一起来的——灾难当天控制台多半
+也起不来，从库里取公钥那条路是断的。
 
-备份签名公钥指纹: %s
+它可信**不是因为它在包里**，是因为下面这一步拿它和你手上的纸比对：
 
-这个指纹应当和三位持有人当初各自抄在纸上的那一行一致。**验签通过之前不要跑
-recover.sh** ——那个脚本恢复时以 root 执行。
+    sha256sum "$work/L1/signing.der"
+
+算出来的值应当和三位持有人当初各自抄在纸上的那一行一致：
+
+    %s
+
+（这一行也印在包里，但包里的东西攻击者全都能改，包括这一行。唯一他改不到的
+是纸。对不上就停下来找人，不要往下走。）
+
+**验签通过之前不要跑 recover.sh** ——那个脚本恢复时以 root 执行。
+
+对上之后验签：
+
+    openssl pkey -pubin -inform DER -in "$work/L1/signing.der" -out "$work/signing.pem"
+    openssl pkeyutl -verify -pubin -inkey "$work/signing.pem" \
+      -rawin -in "$work/L1/inner.rnbk" -sigfile "$work/L1/inner.rnbk.sig"
 
 第五步
 ------
 读 L1/RECOVERY.md。它带的是产出这一刻的真实路径和真实值，不是模板。
+
+recover.sh 会把上面这些再自己核一遍（外加一条防拼接的检查），所以你也可以直接：
+
+    sudo bash "$work/L1/recover.sh" "$work" <纸上的那 64 位指纹>
+
+指纹要手敲，理由同上：脚本在包里，纸不在。
 
 `, openLayerScript, name, pair.Outer, pair.Inner, pair.Inner, in.BackupSigningFingerprint)
 	return b.String()
@@ -176,6 +194,10 @@ const openLayerScript = `    #!/bin/bash
     openssl enc -d -aes-256-cbc -K "$ENC" -iv "$IV" -in payload.enc -out plain.tar
     mkdir -p "$OUT"
     tar xf plain.tar -C "$OUT"
+    # 这一层的 meta.json 也留一份：recover.sh 要拿两层的 seq 比对，
+    # 那是唯一能发现「旧备份的内层被塞进新包」的检查。内层的这份在签名
+    # 覆盖范围内（签的是整个 inner.rnbk），改不动
+    cp meta.json "$OUT/layer-meta.json"
     echo "OK -> $OUT"`
 
 // renderRecoveryMarkdown 是密文里面那份手册（§5.2）。
@@ -335,7 +357,7 @@ func writeFileTable(b *strings.Builder, files []FileEntry) {
 // renderRecoverScript 是密文里面那个交互式脚本（§5.3）。
 //
 // 它**只做恢复，不做破坏**：目标路径已有文件就停下来问，不覆盖。
-func renderRecoverScript(in Input, pair backupcontainer.Pair) string {
+func renderRecoverScript(in Input, pair backupcontainer.Pair, digests map[string]string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `#!/bin/bash
 # 打包服务故障恢复 —— 备份 #%d（%s 组），产出于 %s
@@ -343,40 +365,100 @@ func renderRecoverScript(in Input, pair backupcontainer.Pair) string {
 # 照着 RECOVERY.md 一步步敲容易漏、容易错，所以有这个脚本。但它不替代手册：
 # 环境不一样、脚本跑不通时，RECOVERY.md 里每一步都有对应的那条命令。
 #
-# 用法: sudo bash recover.sh <解开后的目录>
-#   <解开后的目录> 里应当有 L2-agent/ 和 L2-server/
+# 用法: sudo bash recover.sh <工作目录> <备份签名公钥指纹>
+#
+#   <工作目录>  README-FIRST 第三步里那个 $work，里面应当有
+#               L1/  L2-agent/  L2-server/  三个目录
+#   <指纹>      三位持有人当初各自抄在纸上的那 64 位十六进制
+#
+# 为什么指纹要你手敲：包里的东西——包括 README 上印的指纹——攻击者全都能改。
+# 唯一他改不到的是纸。所以锚点在纸上，不在包里。
 
 set -euo pipefail
 umask 077
 
 ROOT="${1:-}"
-if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
-  echo "用法: sudo bash recover.sh <解开后的目录>" >&2
-  exit 2
-fi
+PAPER_FP="${2:-}"
+usage() { echo "用法: sudo bash recover.sh <工作目录> <备份签名公钥指纹>" >&2; exit 2; }
+[ -n "$ROOT" ] && [ -d "$ROOT" ] || usage
+[ -n "$PAPER_FP" ] || usage
+
+L1="$ROOT/L1"
 
 say()  { printf '\n==> %%s\n' "$1"; }
 die()  { printf '\n!! 卡在这一步: %%s\n   下一步该查: %%s\n' "$1" "$2" >&2; exit 1; }
 
-# --- 先验签。验不过就停 -------------------------------------------------
-# 这是纵深不是主防线：整包被伪造时这个脚本本身也是伪造的。真正的锚点是
-# README-FIRST 里那个 sha256（和控制台比对）以及持有人纸上抄的签名公钥指纹。
+for d in "$L1" "$ROOT/L2-agent" "$ROOT/L2-server"; do
+  [ -d "$d" ] || die "找不到 $d" "按 README-FIRST 第三步把三层各解到一个目录：L1、L2-agent、L2-server"
+done
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# --- 一、文件完整性 -----------------------------------------------------
+# 外层 MAC 已经覆盖了这些成员，所以这一步抓的不是篡改，是**解包解漏了或解坏了**
+# ——在灾难当天这比篡改常见得多，而症状（脚本半路报一个看不懂的错）很难往这边想
+say "核对文件完整性"
+check_file() {
+  local name="$1" want="$2" got
+  [ -f "$L1/$name" ] || die "L1/ 里没有 $name" "确认第一层是完整解开的，不是只取了几个文件"
+  got=$(sha256_of "$L1/$name")
+  [ "$got" = "$want" ] || die "$name 的 sha256 对不上" "这一层没解完整或者文件损坏了，重新解一次"
+  echo "  $name  OK"
+}
+`, in.Seq, pair.Name, in.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"))
+
+	for _, name := range []string{nameInner, nameInnerSig, nameServer, nameSigningKey} {
+		if digest := digests[name]; digest != "" {
+			fmt.Fprintf(&b, "check_file %s %s\n", shellQuote(name), shellQuote(digest))
+		}
+	}
+
+	fmt.Fprintf(&b, `
+# --- 二、这把公钥是不是我们那把（对纸）--------------------------------
+# signing.der 跟着包走，因为灾难当天控制台多半也起不来。它可信不是因为它在包里，
+# 是因为下面这一行拿它和你手上的纸比对
+say "核对备份签名公钥"
+got_fp=$(sha256_of "$L1/signing.der")
+echo "  包里这把: $got_fp"
+echo "  你敲进来的: %s"
+if [ "$got_fp" != "$PAPER_FP" ]; then
+  die "签名公钥和纸上抄的对不上" "先确认你敲的那 64 位没抄错；确认没错就停下来找人——这个包不是我们产出的"
+fi
+echo "  一致"
+
+# --- 三、验签。验不过就停，没有跳过这个选项 ----------------------------
+# 设计里这是两个真实性锚点之一。之前这里有一个「仍然继续？(yes/NO)」的分支，
+# 那等于把锚点变成一句提示——恢复的人在灾难当天是会敲 yes 的
 say "验证内层签名"
-if [ ! -f "$ROOT/inner.rnbk.sig" ]; then
-  die "找不到 inner.rnbk.sig" "确认外层是完整解开的，不是只取了几个文件"
+[ -f "$L1/inner.rnbk.sig" ] || die "找不到 inner.rnbk.sig" "确认第一层是完整解开的"
+pem=$(mktemp); trap 'rm -f "$pem"' EXIT
+openssl pkey -pubin -inform DER -in "$L1/signing.der" -out "$pem" \
+  || die "signing.der 不是一把能用的公钥" "文件在传输中损坏了，重新取一份包"
+openssl pkeyutl -verify -pubin -inkey "$pem" \
+  -rawin -in "$L1/inner.rnbk" -sigfile "$L1/inner.rnbk.sig" \
+  || die "签名验不过" "这个包不是我们那台机器产出的，停下来找人"
+echo "  签名 OK"
+
+# --- 四、防拼接：两层的 seq 必须是同一次备份 --------------------------
+# 签名挡不住拼接：把一次旧备份的 inner.rnbk 连同它那份 .sig 一起塞进新包，
+# 签名照样验得过（同一台机器签的）、外层 MAC 也是攻击者自己算的。
+# 但内层的 seq 在签名覆盖范围内、改不动，所以它和外层对不上就是拼接。
+# 后果是恢复出来的是旧密钥，而这正是整个方案唯一要防的事
+say "核对两层是不是同一次备份"
+seq_of() { sed -n 's/.*"seq"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$1" | head -1; }
+outer_seq=$(seq_of "$L1/layer-meta.json")
+inner_seq=$(seq_of "$ROOT/L2-agent/layer-meta.json")
+echo "  外层 seq=$outer_seq  内层 seq=$inner_seq  本包应为 %d"
+if [ -z "$outer_seq" ] || [ -z "$inner_seq" ]; then
+  die "读不到 layer-meta.json 里的 seq" "确认 L1/ 和 L2-agent/ 都是用包里这一版 open-layer.sh 解出来的"
 fi
-if [ -f "$ROOT/signing.pem" ]; then
-  openssl pkeyutl -verify -pubin -inkey "$ROOT/signing.pem" \
-    -rawin -in "$ROOT/inner.rnbk" -sigfile "$ROOT/inner.rnbk.sig" \
-    || die "签名验不过" "这个包不是我们那台机器产出的，停下来找人"
-  echo "签名 OK"
-else
-  echo "!! 没有 signing.pem，跳过验签。"
-  echo "   备份签名公钥指纹应当是 %s"
-  echo "   强烈建议先按 README-FIRST 第四步验一次再继续。"
-  read -r -p "   仍然继续？(yes/NO) " answer
-  [ "$answer" = "yes" ] || exit 1
+if [ "$outer_seq" != "$inner_seq" ] || [ "$outer_seq" != "%d" ]; then
+  die "两层不是同一次备份（seq 对不上）" "这是拼接的特征：有人把旧备份的内层塞进了新包。停下来找人"
 fi
+echo "  一致"
 
 # --- 放文件。已存在就问，不覆盖 -----------------------------------------
 place() {
@@ -394,8 +476,7 @@ place() {
   echo "  $dst  ($mode $owner)"
 }
 
-`, in.Seq, pair.Name, in.CreatedAt.UTC().Format("2006-01-02 15:04:05 UTC"),
-		in.BackupSigningFingerprint)
+`, in.BackupSigningFingerprint, in.Seq, in.Seq)
 
 	b.WriteString("say \"恢复服务端那部分（场景 B；场景 A 可以跳过）\"\n")
 	b.WriteString("read -r -p \"服务端也需要恢复吗？(yes/NO) \" want_server\n")

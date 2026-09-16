@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -356,6 +358,20 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 	tenants := anyMeta.Tenants
 	agentManifest := anyMeta.InnerFiles
 
+	// 签名公钥要跟着包走：灾难当天控制台多半也起不来，从库里取公钥那条路是断的。
+	// 安全性靠的是 recover.sh 拿持有人纸上抄的指纹来比对，不是靠包自证
+	signingRecord, err := s.backupSigningKeyRecord(ctx)
+	if err != nil {
+		return backupbundle.Input{}, fmt.Errorf("load backup signing key: %w", err)
+	}
+	if signingRecord == nil {
+		return backupbundle.Input{}, errors.New("backup signing key is not registered")
+	}
+	signingDER, err := base64.StdEncoding.DecodeString(signingRecord.Current.PublicKey)
+	if err != nil {
+		return backupbundle.Input{}, fmt.Errorf("decode backup signing public key: %w", err)
+	}
+
 	return backupbundle.Input{
 		Seq: run.Seq, InstanceID: s.cfg.Backup.InstanceID, CreatedAt: time.Now().UTC(),
 		Recipients: recipients, AgentInner: inner,
@@ -364,6 +380,7 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 		SchemaVersion:            currentSchemaVersion(ctx, s.db),
 		AgentKeyFingerprint:      anyMeta.AgentKeyFingerprint,
 		BackupSigningFingerprint: anyMeta.BackupSigningFingerprint,
+		BackupSigningPublicKey:   signingDER,
 	}, nil
 }
 
