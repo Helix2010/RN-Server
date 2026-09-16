@@ -97,11 +97,11 @@ func TestStateSurvivesRestart(t *testing.T) {
 	must(t, s.TrustBuilder(BuilderTrust{BuilderID: "mch_builder02", Ed25519PublicKeySHA256: shaTwo, Name: "old-builder", Operator: "ops-alice"}))
 	must(t, s.RevokeBuilder("mch_builder02", "ops-alice", "machine rebuilt"))
 	must(t, s.Confirm(confirmation(t)))
-	if _, err := s.Reserve(reservation("bld_job00001", 46, shaOne)); err != nil {
+	if _, err := s.reserveT(reservation("bld_job00001", 46, shaOne)); err != nil {
 		t.Fatal(err)
 	}
-	must(t, s.Complete("bld_job00001", shaOne, shaSign, "rel_abcdef"))
-	if _, err := s.Reserve(reservation("bld_job00002", 47, shaTwo)); err != nil {
+	must(t, s.completeT("bld_job00001", shaOne, shaSign, "rel_abcdef"))
+	if _, err := s.reserveT(reservation("bld_job00002", 47, shaTwo)); err != nil {
 		t.Fatal(err)
 	}
 	must(t, s.SetBaseline(Baseline{PackageName: pkg, CertificateSHA256: certB, MaxVersionCode: 12, Operator: "ops-alice"}))
@@ -140,13 +140,13 @@ func TestStateSurvivesRestart(t *testing.T) {
 func TestReserveRules(t *testing.T) {
 	f := newFixture(t)
 	s := f.open(t)
-	idem, err := s.Reserve(reservation("bld_job00001", 46, shaOne))
+	idem, err := s.reserveT(reservation("bld_job00001", 46, shaOne))
 	if err != nil || idem {
 		t.Fatalf("first reserve: %v %v", idem, err)
 	}
 	// 同一任务、同一输入包：幂等，不写新行
 	before := fileSize(t, filepath.Join(f.dir, SignedFileName))
-	idem, err = s.Reserve(reservation("bld_job00001", 46, shaOne))
+	idem, err = s.reserveT(reservation("bld_job00001", 46, shaOne))
 	if err != nil || !idem {
 		t.Fatalf("idempotent reserve: %v %v", idem, err)
 	}
@@ -168,14 +168,14 @@ func TestReserveRules(t *testing.T) {
 		"lower versionCode":                  {reservation("bld_job00003", 45, shaTwo), ErrVersionCodeNotIncreasing},
 		"other tenant slug same versionCode": {func() Reservation { r := reservation("bld_job00004", 46, shaTwo); r.TenantSlug = "Other"; return r }(), ErrVersionCodeTaken},
 	} {
-		if _, err := s.Reserve(tc.r); !errors.Is(err, tc.want) {
+		if _, err := s.reserveT(tc.r); !errors.Is(err, tc.want) {
 			t.Errorf("%s: %v, want %v", name, err, tc.want)
 		}
 	}
 	// 不同证书是另一条序列
 	other := reservation("bld_job00005", 1, shaTwo)
 	other.CertificateSHA256 = certB
-	if _, err := s.Reserve(other); err != nil {
+	if _, err := s.reserveT(other); err != nil {
 		t.Fatalf("other certificate: %v", err)
 	}
 	// 释放之后同一个 versionCode 可以给别的任务
@@ -183,25 +183,25 @@ func TestReserveRules(t *testing.T) {
 	if err != nil || abandoned.VersionCode != 46 {
 		t.Fatalf("abandon: %+v %v", abandoned, err)
 	}
-	if _, err := s.Reserve(reservation("bld_job00006", 46, shaTwo)); err != nil {
+	if _, err := s.reserveT(reservation("bld_job00006", 46, shaTwo)); err != nil {
 		t.Fatalf("reserve after abandon: %v", err)
 	}
 	if _, err := s.Abandon("bld_job00001", "ops-alice", "twice"); !errors.Is(err, ErrNotReserved) {
 		t.Fatalf("second abandon: %v", err)
 	}
-	must(t, s.Complete("bld_job00006", shaTwo, shaSign, "rel_one"))
-	must(t, s.Complete("bld_job00006", shaTwo, shaSign, "rel_one")) // 幂等
+	must(t, s.completeT("bld_job00006", shaTwo, shaSign, "rel_one"))
+	must(t, s.completeT("bld_job00006", shaTwo, shaSign, "rel_one")) // 幂等
 	if err := s.Complete("bld_job00006", shaTwo, shaOne, "rel_one"); !errors.Is(err, ErrAlreadyCompleted) {
 		t.Fatalf("conflicting complete: %v", err)
 	}
-	if err := s.Complete("bld_job00006", shaOne, shaSign, "rel_one"); !errors.Is(err, ErrNotReserved) {
+	if err := s.completeT("bld_job00006", shaOne, shaSign, "rel_one"); !errors.Is(err, ErrNotReserved) {
 		t.Fatalf("complete with other unsigned sha: %v", err)
 	}
 	if _, err := s.Abandon("bld_job00006", "ops-alice", "too late"); !errors.Is(err, ErrAlreadyCompleted) {
 		t.Fatalf("abandon completed: %v", err)
 	}
 	// 已完成的任务仍可幂等重签（服务端完成请求失败后重试）
-	if idem, err := s.Reserve(reservation("bld_job00006", 46, shaTwo)); err != nil || !idem {
+	if idem, err := s.reserveT(reservation("bld_job00006", 46, shaTwo)); err != nil || !idem {
 		t.Fatalf("re-sign completed: %v %v", idem, err)
 	}
 	s.Close()
@@ -213,11 +213,11 @@ func TestTamperingIsDetectedAtStartup(t *testing.T) {
 		f := newFixture(t)
 		s := f.open(t)
 		for i, sha := range []string{shaOne, shaTwo} {
-			if _, err := s.Reserve(reservation("bld_job0000"+string(rune('1'+i)), int64(46+i), sha)); err != nil {
+			if _, err := s.reserveT(reservation("bld_job0000"+string(rune('1'+i)), int64(46+i), sha)); err != nil {
 				t.Fatal(err)
 			}
 		}
-		must(t, s.Complete("bld_job00001", shaOne, shaSign, "rel_one"))
+		must(t, s.completeT("bld_job00001", shaOne, shaSign, "rel_one"))
 		s.Close()
 		return f
 	}
@@ -335,13 +335,13 @@ func TestTwoStoresShareTheFiles(t *testing.T) {
 	if _, ok, err := daemon.Confirmation(pkg, certA); err != nil || !ok {
 		t.Fatalf("daemon did not see the operator's confirmation: %v %v", ok, err)
 	}
-	if _, err := daemon.Reserve(reservation("bld_job00001", 46, shaOne)); err != nil {
+	if _, err := daemon.reserveT(reservation("bld_job00001", 46, shaOne)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := operator.Abandon("bld_job00001", "ops-alice", "released by operator"); err != nil {
 		t.Fatalf("operator abandon: %v", err)
 	}
-	if _, err := daemon.Reserve(reservation("bld_job00002", 46, shaTwo)); err != nil {
+	if _, err := daemon.reserveT(reservation("bld_job00002", 46, shaTwo)); err != nil {
 		t.Fatalf("daemon reserve after operator abandon: %v", err)
 	}
 	must(t, operator.SetRole(RoleChange{Role: RolePrimary, Mode: RoleModeInitial, Operator: "ops-alice", Reason: "first"}))
@@ -357,11 +357,11 @@ func TestForeignImport(t *testing.T) {
 	primary := newFixture(t)
 	p := primary.open(t)
 	for i, sha := range []string{shaOne, shaTwo, shaSign} {
-		if _, err := p.Reserve(reservation("bld_job0000"+string(rune('1'+i)), int64(46+i), sha)); err != nil {
+		if _, err := p.reserveT(reservation("bld_job0000"+string(rune('1'+i)), int64(46+i), sha)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	must(t, p.Complete("bld_job00001", shaOne, shaSign, "rel_one"))
+	must(t, p.completeT("bld_job00001", shaOne, shaSign, "rel_one"))
 	if _, err := p.Abandon("bld_job00003", "ops-alice", "never delivered"); err != nil {
 		t.Fatal(err)
 	}
@@ -411,14 +411,14 @@ func TestForeignImport(t *testing.T) {
 		t.Fatalf("imported max: %+v", view)
 	}
 	// 旧主预留但没完成的任务，新主可以幂等续签；别的任务拿不到这个 versionCode
-	if idem, err := s.Reserve(reservation("bld_job00002", 47, shaTwo)); err != nil || !idem {
+	if idem, err := s.reserveT(reservation("bld_job00002", 47, shaTwo)); err != nil || !idem {
 		t.Fatalf("resume imported reservation: %v %v", idem, err)
 	}
-	if _, err := s.Reserve(reservation("bld_job00010", 47, shaOne)); !errors.Is(err, ErrVersionCodeTaken) {
+	if _, err := s.reserveT(reservation("bld_job00010", 47, shaOne)); !errors.Is(err, ErrVersionCodeTaken) {
 		t.Fatalf("taken imported versionCode: %v", err)
 	}
 	// 被释放的 48 没有导入，但 48 > 47，所以可以签
-	if _, err := s.Reserve(reservation("bld_job00011", 48, shaOne)); err != nil {
+	if _, err := s.reserveT(reservation("bld_job00011", 48, shaOne)); err != nil {
 		t.Fatalf("reserve 48: %v", err)
 	}
 	// 与本机冲突的导入整体拒绝，一行都不写
@@ -464,10 +464,10 @@ func TestRecordValidation(t *testing.T) {
 	if _, err := s.Abandon("bld_job00001", "ops", "\x1b[2Jreason"); err == nil {
 		t.Fatal("accepted a control character in the reason")
 	}
-	if err := s.Complete("bld_job00001", shaOne, shaSign, "rel_x"); !errors.Is(err, ErrNotReserved) {
+	if err := s.completeT("bld_job00001", shaOne, shaSign, "rel_x"); !errors.Is(err, ErrNotReserved) {
 		t.Fatalf("complete without reservation: %v", err)
 	}
-	if _, err := s.Reserve(Reservation{JobID: "bld_job00001", TenantSlug: "AnyFun", PackageName: pkg, CertificateSHA256: certA, VersionCode: MaxVersionCode + 1, UnsignedSHA256: shaOne}); err == nil {
+	if _, err := s.reserveT(Reservation{JobID: "bld_job00001", TenantSlug: "AnyFun", PackageName: pkg, CertificateSHA256: certA, VersionCode: MaxVersionCode + 1, UnsignedSHA256: shaOne}); err == nil {
 		t.Fatal("accepted a versionCode above the Android maximum")
 	}
 	// 所有被拒的写入都没有留下行
@@ -492,4 +492,149 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return info.Size()
+}
+
+var testLimits = ReserveLimits{MaxVersionCode: MaxVersionCode, MaxJump: MaxVersionCode, FirstSignMaxVersionCode: MaxVersionCode}
+
+// reserveT 用宽松上限预留，返回是否幂等。
+func (s *Store) reserveT(r Reservation) (bool, error) {
+	existing, err := s.Reserve(r, testLimits)
+	return existing != nil, err
+}
+
+// completeT 走签名闸的真实顺序：先记签名包，再记完成。
+func (s *Store) completeT(jobID, unsigned, signed, release string) error {
+	if err := s.MarkSigned(jobID, unsigned, signed); err != nil {
+		return err
+	}
+	return s.Complete(jobID, unsigned, signed, release)
+}
+
+// 预留 → 签名 → 完成的状态机：签出包之后不能释放，也不能换一个签名包。
+func TestSignedStateMachine(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	r := reservation("bld_state00001", 46, shaOne)
+	if _, err := s.reserveT(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(r.JobID, shaOne, shaSign, "rel_x"); !errors.Is(err, ErrNotSigned) {
+		t.Fatalf("complete before signed: %v", err)
+	}
+	must(t, s.MarkSigned(r.JobID, shaOne, shaTwo))
+	must(t, s.MarkSigned(r.JobID, shaOne, shaTwo)) // 幂等
+	if err := s.MarkSigned(r.JobID, shaTwo, shaTwo); !errors.Is(err, ErrNotReserved) {
+		t.Fatalf("signed package for another unsigned input: %v", err)
+	}
+	// 重签（ECDSA 每次字节不同）：以最后一次为准，之前的签名包不能再用来完成
+	must(t, s.MarkSigned(r.JobID, shaOne, shaSign))
+	if _, err := s.Abandon(r.JobID, "ops", "try to release"); !errors.Is(err, ErrAlreadySigned) {
+		t.Fatalf("abandon a signed reservation: %v", err)
+	}
+	if err := s.Complete(r.JobID, shaOne, shaTwo, "rel_x"); !errors.Is(err, ErrSignedMismatch) {
+		t.Fatalf("complete with an earlier signed package: %v", err)
+	}
+	must(t, s.Complete(r.JobID, shaOne, shaSign, "rel_x"))
+	if err := s.MarkSigned(r.JobID, shaOne, shaTwo); !errors.Is(err, ErrAlreadyCompleted) {
+		t.Fatalf("re-sign after completion: %v", err)
+	}
+	must(t, s.MarkSigned(r.JobID, shaOne, shaSign)) // 完成后同一个包仍幂等
+	if err := s.Complete(r.JobID, shaOne, shaSign, "rel_other"); !errors.Is(err, ErrAlreadyCompleted) {
+		t.Fatalf("complete with another release id: %v", err)
+	}
+	// 已完成的预留照样可以幂等预留（签名闸据此识别"本机已经签过"）
+	if existing, err := s.Reserve(r, testLimits); err != nil || existing == nil || existing.Status != StatusCompleted || existing.SignedSHA256 != shaSign {
+		t.Fatalf("idempotent reserve of a completed job: %+v %v", existing, err)
+	}
+	s.Close()
+	reopened := f.open(t)
+	list, _ := reopened.Reservations()
+	if len(list) != 1 || list[0].Status != StatusCompleted || list[0].SignedSHA256 != shaSign {
+		t.Fatalf("after restart: %+v", list)
+	}
+}
+
+func TestReserveEnforcesLimitsUnderTheLock(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	lim := ReserveLimits{MaxVersionCode: 1000, MaxJump: 10, FirstSignMaxVersionCode: 50}
+	if _, err := s.Reserve(reservation("bld_limit00001", 51, shaOne), lim); !errors.Is(err, ErrVersionCodeOutOfBounds) {
+		t.Fatalf("first signature above the cap: %v", err)
+	}
+	if _, err := s.Reserve(reservation("bld_limit00001", 50, shaOne), lim); err != nil {
+		t.Fatalf("first signature at the cap: %v", err)
+	}
+	if _, err := s.Reserve(reservation("bld_limit00002", 61, shaTwo), lim); !errors.Is(err, ErrVersionCodeOutOfBounds) {
+		t.Fatalf("jump of 11: %v", err)
+	}
+	if _, err := s.Reserve(reservation("bld_limit00002", 60, shaTwo), lim); err != nil {
+		t.Fatalf("jump of 10: %v", err)
+	}
+	lim.MaxVersionCode = 60
+	if _, err := s.Reserve(reservation("bld_limit00003", 61, shaSign), lim); !errors.Is(err, ErrVersionCodeOutOfBounds) {
+		t.Fatalf("above the absolute limit: %v", err)
+	}
+	if _, err := s.Reserve(reservation("bld_limit00004", 62, shaSign), ReserveLimits{}); err == nil {
+		t.Fatal("accepted zero limits")
+	}
+}
+
+// 同一包名的新确认（换了证书）取代旧确认：服务端留着旧密文也用不上旧证书。
+func TestConfirmationSupersededPerPackage(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	must(t, s.Confirm(confirmation(t)))
+	next := confirmation(t)
+	next.CertificateSHA256 = certB
+	must(t, s.Confirm(next))
+	if _, ok, _ := s.Confirmation(pkg, certA); ok {
+		t.Fatal("the replaced certificate is still confirmed")
+	}
+	if c, ok, _ := s.Confirmation(pkg, certB); !ok || c.CertificateSHA256 != certB {
+		t.Fatal("the new certificate is not confirmed")
+	}
+	if list, _ := s.Confirmations(); len(list) != 1 {
+		t.Fatalf("confirmations: %+v", list)
+	}
+	s.Close()
+	if _, ok, _ := f.open(t).Confirmation(pkg, certA); ok {
+		t.Fatal("the replaced certificate is confirmed again after a restart")
+	}
+	low := confirmation(t)
+	low.MinSDK, low.TargetSDK = 23, 35
+	if err := f.open(t).Confirm(low); err == nil {
+		t.Fatal("accepted a minSdk floor below 24")
+	}
+	low.MinSDK, low.TargetSDK = 24, 27
+	if err := f.open(t).Confirm(low); err == nil {
+		t.Fatal("accepted a targetSdk floor below 28")
+	}
+}
+
+// 一批导入里任何一条不合法，一行都不写。
+func TestBatchIsAllOrNothing(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	good := Reservation{JobID: "bld_batch00001", SignAttempt: 1, TenantSlug: "AnyFun", PackageName: pkg, CertificateSHA256: certA, VersionCode: 10, UnsignedSHA256: shaOne, Status: StatusReserved}
+	dupJob := good
+	dupJob.VersionCode = 11
+	before := fileSize(t, filepath.Join(f.dir, SignedFileName))
+	if _, err := s.Import(shaTwo, []Reservation{good, dupJob}, "ops"); !errors.Is(err, ErrJobConflict) {
+		t.Fatalf("duplicate job in one batch: %v", err)
+	}
+	if fileSize(t, filepath.Join(f.dir, SignedFileName)) != before {
+		t.Fatal("a rejected batch wrote lines")
+	}
+	signed := good
+	signed.Status, signed.SignedSHA256 = StatusSigned, shaSign
+	if n, err := s.Import(shaTwo, []Reservation{signed}, "ops"); err != nil || n != 1 {
+		t.Fatalf("import a signed reservation: %d %v", n, err)
+	}
+	if _, err := s.Abandon(good.JobID, "ops", "cannot release imported signed"); !errors.Is(err, ErrAlreadySigned) {
+		t.Fatalf("abandon an imported signed reservation: %v", err)
+	}
+	trust, signedTip, err := s.Tips()
+	if err != nil || trust.Lines != 1 || signedTip.Lines != 2 || len(signedTip.LastHash) != 64 {
+		t.Fatalf("tips: %+v %+v %v", trust, signedTip, err)
+	}
 }

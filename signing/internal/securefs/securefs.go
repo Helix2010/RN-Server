@@ -150,6 +150,100 @@ func Unlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
+// CheckTrustedPath 要求签名闸要执行或加载的文件（java、apksigner.jar、signer-check）以及它
+// 所在的每一级目录（按原路径与解析符号链接后的真实路径各查一遍）都只能由 root 或当前用户
+// 修改：属主是 root 或当前有效用户，没有组与其它用户写权限（带粘滞位的目录如 /tmp 除外）。
+//
+// 这挡住"把 SIGNER_BUILD_TOOLS_DIR 指向构建机那份 Android SDK"这类配置：构建机用户能改的
+// apksigner.jar 等于能在签名闸里执行任意代码。
+func CheckTrustedPath(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%s: path must be absolute", path)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	for _, p := range []string{filepath.Clean(path), resolved} {
+		for current := p; ; current = filepath.Dir(current) {
+			if err := checkTrustedComponent(current, current == p); err != nil {
+				return err
+			}
+			if current == "/" {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func checkTrustedComponent(path string, leaf bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s: cannot read the owner", path)
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		// 符号链接本身的权限没有意义；它指向哪里由解析后的路径检查。只要求链接属主可信
+		if stat.Uid != 0 && int(stat.Uid) != os.Geteuid() {
+			return fmt.Errorf("%s: symbolic link owned by uid %d, which could repoint it", path, stat.Uid)
+		}
+		return nil
+	}
+	if stat.Uid != 0 && int(stat.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s: owned by uid %d; files the signing gate executes must be owned by root or by the signing gate user", path, stat.Uid)
+	}
+	perm := info.Mode().Perm()
+	if perm&0o022 != 0 && !(info.IsDir() && info.Mode()&fs.ModeSticky != 0 && !leaf) {
+		return fmt.Errorf("%s: permissions %04o let group or other users modify it", path, perm)
+	}
+	return nil
+}
+
+// MaxTrustedTreeEntries 是 CheckTrustedTree 最多检查的目录项数（一个 JDK 通常几百项）。
+const MaxTrustedTreeEntries = 100_000
+
+// CheckTrustedTree 对目录 root 做 CheckTrustedPath，并要求它下面的每个文件与子目录都只能由
+// root 或当前用户修改；树里的符号链接按解析后的目标再做一次 CheckTrustedPath（可以指向树外，
+// 例如发行版 JDK 指向 /etc 的配置）。
+//
+// 用于 JAVA_HOME：java 进程会加载树里的 lib/*.so、lib/modules、conf/security 等文件，
+// 只查 bin/java 挡不住替换这些文件。
+func CheckTrustedTree(root string) error {
+	if err := CheckTrustedPath(root); err != nil {
+		return err
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	entries := 0
+	return filepath.WalkDir(resolved, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entries++; entries > MaxTrustedTreeEntries {
+			return fmt.Errorf("%s: more than %d entries", root, MaxTrustedTreeEntries)
+		}
+		if err := checkTrustedComponent(path, !d.IsDir()); err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			if err := CheckTrustedPath(path); err != nil {
+				// 悬空链接不会被加载，不算问题
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // RemoveContents 删除目录里的全部内容（目录本身保留）。用于清空运行时目录。
 func RemoveContents(dir string) error {
 	entries, err := os.ReadDir(dir)

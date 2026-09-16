@@ -132,7 +132,7 @@ func Equal(a, b Roots) bool {
 // ValidateAPIBaseURL：https 源（scheme + host + 可选端口），无路径、无查询、无尾斜杠，
 // host 必须是小写的 DNS 名（不收 IP、不收 localhost）。"原样"比较，所以这里不做任何改写。
 func ValidateAPIBaseURL(raw string) error {
-	const problem = "apiBaseUrl must be an https origin like https://api.example.com (lowercase host, optional port, no path or trailing slash)"
+	const problem = "apiBaseUrl must be an https origin like https://api.example.com (lowercase host, optional non-default port, no path or trailing slash)"
 	if raw == "" || len(raw) > 262 || !printableASCII(raw) || !strings.HasPrefix(raw, "https://") {
 		return errors.New(problem)
 	}
@@ -147,7 +147,10 @@ func ValidateAPIBaseURL(raw string) error {
 	host := u.Hostname()
 	if port := u.Port(); port != "" {
 		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		// 显式写默认端口 443 直接拒绝：RN-App 用 WHATWG URL 派生 App Links host 时会去掉它，
+		// 而 extra.apiBaseUrl 按原样编进包、按原样比对——同一个源出现两种写法，服务端与签名闸
+		// 就会对 host 与摘要得出不同结论。不做改写，要求配置本身就是唯一写法。
+		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port || n == 443 {
 			return errors.New(problem)
 		}
 	} else if strings.HasSuffix(u.Host, ":") {
@@ -204,13 +207,14 @@ func NormalizeHosts(hosts []string) ([]string, error) {
 }
 
 func validateHostPort(hostport string) error {
-	const problem = "appLinksHosts must be DNS names with an optional port"
+	const problem = "appLinksHosts must be DNS names with an optional non-default port"
 	host := hostport
 	if i := strings.LastIndexByte(hostport, ':'); i >= 0 {
 		host = hostport[:i]
 		port := hostport[i+1:]
 		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		// WHATWG URL 的 host 不含默认端口 443，与 ValidateAPIBaseURL 一致
+		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port || n == 443 {
 			return errors.New(problem)
 		}
 	}

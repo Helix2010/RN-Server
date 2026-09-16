@@ -1,0 +1,16 @@
+# 签名闸 B 的检查进程入口。说明见 rn-signer-a-check.socket。
+[Unit]
+Description=RN signing gate B checker socket
+PartOf=rn-signer-b.service
+
+[Socket]
+ListenStream=/run/rn-signer-b-check.sock
+SocketUser=rn-signer-b
+SocketGroup=rn-signer-b
+SocketMode=0600
+Accept=yes
+MaxConnections=2
+MaxConnectionsPerSource=2
+
+[Install]
+WantedBy=sockets.target

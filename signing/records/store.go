@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
-	"github.com/Helix2010/RN-Server/signing/ident"
 	"github.com/Helix2010/RN-Server/signing/internal/securefs"
 )
 
@@ -26,10 +25,18 @@ var (
 	ErrVersionCodeTaken = errors.New("records: this versionCode is already reserved by another job or another unsigned package")
 	// ErrVersionCodeNotIncreasing：versionCode 不大于本机记录里该 (包名, 证书) 已签过的最大值。
 	ErrVersionCodeNotIncreasing = errors.New("records: versionCode is not greater than the highest one already signed for this package and certificate")
+	// ErrVersionCodeOutOfBounds：超过绝对上限、跳号上限或首签上限。
+	ErrVersionCodeOutOfBounds = errors.New("records: versionCode is above the absolute, jump or first-signature limit")
 	// ErrJobConflict：同一个任务已经预留了另一个 versionCode 或另一个输入包。
 	ErrJobConflict = errors.New("records: this job already holds a different reservation")
 	// ErrNotReserved：没有这个任务的有效预留。
 	ErrNotReserved = errors.New("records: this job has no matching reservation")
+	// ErrNotSigned：预留还没有签名记录，不能记完成。
+	ErrNotSigned = errors.New("records: this reservation has no signed package recorded")
+	// ErrSignedMismatch：完成时给出的签名包与本机最后记录的签名包不同。
+	ErrSignedMismatch = errors.New("records: the signed package differs from the one last recorded for this reservation")
+	// ErrAlreadySigned：预留已经签出过包（可能已交付），不能释放。
+	ErrAlreadySigned = errors.New("records: a package was already signed for this reservation; it cannot be released")
 	// ErrAlreadyCompleted：预留已经完成，不能释放；或完成值与已记录的不同。
 	ErrAlreadyCompleted = errors.New("records: this reservation has already been completed")
 )
@@ -113,9 +120,11 @@ type vcKey struct {
 type pkgKey struct{ pkg, cert string }
 
 type trustState struct {
-	role          RoleChange
-	builders      map[string]BuilderTrust
-	confirmations map[pkgKey]Confirmation
+	role     RoleChange
+	builders map[string]BuilderTrust
+	// confirmations 按包名存当前有效的那一条确认：同一包名的新确认（换了证书或租户）
+	// 取代旧的，旧证书从此不再被认。旧行留在文件里作历史。
+	confirmations map[string]Confirmation
 }
 
 type signedState struct {
@@ -129,12 +138,44 @@ func newTrustState() *trustState {
 	return &trustState{
 		role:          RoleChange{Role: RoleStandby},
 		builders:      map[string]BuilderTrust{},
-		confirmations: map[pkgKey]Confirmation{},
+		confirmations: map[string]Confirmation{},
 	}
 }
 
 func newSignedState() *signedState {
 	return &signedState{byVC: map[vcKey]*Reservation{}, byJob: map[string]*Reservation{}, baselines: map[pkgKey]Baseline{}}
+}
+
+func (ts *trustState) clone() *trustState {
+	out := newTrustState()
+	out.role = ts.role
+	for k, v := range ts.builders {
+		out.builders[k] = v
+	}
+	for k, v := range ts.confirmations {
+		out.confirmations[k] = v
+	}
+	return out
+}
+
+func (ss *signedState) clone() *signedState {
+	out := newSignedState()
+	copies := make(map[*Reservation]*Reservation, len(ss.all))
+	for _, r := range ss.all {
+		c := *r
+		copies[r] = &c
+		out.all = append(out.all, &c)
+	}
+	for k, r := range ss.byVC {
+		out.byVC[k] = copies[r]
+	}
+	for k, r := range ss.byJob {
+		out.byJob[k] = copies[r]
+	}
+	for k, b := range ss.baselines {
+		out.baselines[k] = b
+	}
+	return out
 }
 
 // Store 是打开并校验过的本机记录。方法可并发调用；多个进程（签名闸主进程与运维
@@ -227,8 +268,25 @@ func (s *Store) Close() error {
 // Genesis 返回本机记录的 genesis。
 func (s *Store) Genesis() Genesis { return s.trust.v.genesis }
 
-// SetClock 替换时间来源（测试用）。
-func (s *Store) SetClock(now func() time.Time) { s.now = now }
+// Tip 是一个记录文件当前的行数与最后一行的哈希。运维可以把它记进离线记录，
+// 之后对照发现记录被整行截断或从旧快照恢复（链本身证明不了"后面还有没有行"）。
+type Tip struct {
+	Lines    uint64
+	LastHash string
+}
+
+// Tips 返回 trust.jsonl 与 signed.jsonl 的当前 Tip。
+func (s *Store) Tips() (trust, signed Tip, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.refresh(s.trust, false); err != nil {
+		return Tip{}, Tip{}, err
+	}
+	if err := s.refresh(s.signed, false); err != nil {
+		return Tip{}, Tip{}, err
+	}
+	return Tip{s.trust.v.seq, s.trust.v.tail}, Tip{s.signed.v.seq, s.signed.v.tail}, nil
+}
 
 // refresh 读入并校验 offset 之后别的进程追加的行。调用方持有 s.mu；locked=true 表示
 // 调用方已经持有该文件的 flock。
@@ -250,7 +308,7 @@ func (s *Store) refresh(lf *logFile, locked bool) error {
 	if err != nil {
 		return s.fail(err)
 	}
-	if err := lf.v.feed(data, s.applier(lf.kind)); err != nil {
+	if err := lf.v.feed(data, s.applier(lf.kind, s.ts, s.ss)); err != nil {
 		return s.fail(err)
 	}
 	lf.offset = info.Size()
@@ -262,15 +320,23 @@ func (s *Store) fail(err error) error {
 	return err
 }
 
-func (s *Store) applier(kind string) func(entry) error {
+func (s *Store) applier(kind string, ts *trustState, ss *signedState) func(entry) error {
 	if kind == kindTrust {
-		return func(e entry) error { return applyTrust(s.ts, e) }
+		return func(e entry) error { return applyTrust(ts, e) }
 	}
-	return func(e entry) error { return applySigned(s.ss, e) }
+	return func(e entry) error { return applySigned(ss, e) }
 }
 
-// append 在独占锁下：读入新行 → check（基于最新状态）→ 写一行 → fsync → 经校验器回放。
-func (s *Store) append(lf *logFile, typ string, data any, check func() error) error {
+// pending 是一条待写的记录。
+type pending struct {
+	typ  string
+	data any
+}
+
+// appendRecords 在独占锁下：读入新行 → plan（基于最新状态）给出要写的记录 → 在状态副本上
+// 逐条校验回放（任何一条不过就一行都不写）→ 一次写入并 fsync → 经校验器回放到真实状态。
+// plan 返回 errSkip 表示不需要写（幂等）。
+func (s *Store) appendRecords(lf *logFile, plan func() ([]pending, error)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := securefs.Lock(lf.f, true); err != nil {
@@ -280,18 +346,41 @@ func (s *Store) append(lf *logFile, typ string, data any, check func() error) er
 	if err := s.refresh(lf, true); err != nil {
 		return err
 	}
-	if check != nil {
-		if err := check(); err != nil {
-			return err
-		}
-	}
-	raw, err := encodeLine(lf.kind, lf.v.seq, lf.v.tail, s.now(), typ, data, s.priv)
+	items, err := plan()
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
-	n, err := lf.f.Write(raw)
-	if err == nil && n != len(raw) {
+	if len(items) == 0 {
+		return nil
+	}
+	dryVerifier := *lf.v
+	dryTrust, drySigned := s.ts, s.ss
+	if lf.kind == kindTrust {
+		dryTrust = s.ts.clone()
+	} else {
+		drySigned = s.ss.clone()
+	}
+	dryApply := s.applier(lf.kind, dryTrust, drySigned)
+	var buf bytes.Buffer
+	now := s.now()
+	for _, item := range items {
+		raw, err := encodeLine(lf.kind, dryVerifier.seq, dryVerifier.tail, now, item.typ, item.data, s.priv)
+		if err != nil {
+			return err
+		}
+		e, err := dryVerifier.verifyLine(raw)
+		if err != nil {
+			return fmt.Errorf("records: refusing to write an invalid record: %w", err)
+		}
+		if err := dryApply(e); err != nil {
+			return fmt.Errorf("records: refusing to write a record that would not replay: %w", err)
+		}
+		buf.Write(raw)
+		buf.WriteByte('\n')
+	}
+	data := buf.Bytes()
+	n, err := lf.f.Write(data)
+	if err == nil && n != len(data) {
 		err = errors.New("short write")
 	}
 	if err == nil {
@@ -301,11 +390,22 @@ func (s *Store) append(lf *logFile, typ string, data any, check func() error) er
 		// 半行留在文件里：下次启动会报 ErrTornTail，由运维查看。本进程不再写。
 		return s.fail(fmt.Errorf("records: append to %s failed: %w", lf.path, err))
 	}
-	if err := lf.v.feed(raw, s.applier(lf.kind)); err != nil {
+	if err := lf.v.feed(data, s.applier(lf.kind, s.ts, s.ss)); err != nil {
 		return s.fail(err)
 	}
-	lf.offset += int64(len(raw))
+	lf.offset += int64(len(data))
 	return nil
+}
+
+func (s *Store) append(lf *logFile, typ string, data any, check func() error) error {
+	return s.appendRecords(lf, func() ([]pending, error) {
+		if check != nil {
+			if err := check(); err != nil {
+				return nil, err
+			}
+		}
+		return []pending{{typ, data}}, nil
+	})
 }
 
 // read 在共享锁下读入新行后执行 fn。
@@ -370,7 +470,7 @@ func (s *Store) TrustedBuilders() ([]BuilderTrust, error) {
 	return out, err
 }
 
-// Confirm 写入一条租户确认。
+// Confirm 写入一条租户确认。同一包名之前的确认（别的证书或别的租户）随之失效。
 func (s *Store) Confirm(c Confirmation) error {
 	if err := c.validate(); err != nil {
 		return fmt.Errorf("records: confirmation: %w", err)
@@ -378,15 +478,28 @@ func (s *Store) Confirm(c Confirmation) error {
 	return s.append(s.trust, typeTenant, c, nil)
 }
 
-// Confirmation 返回 (包名, 证书) 的最新确认。
+// Confirmation 返回 (包名, 证书) 的确认；只有当这是该包名当前有效的确认时 ok 才为 true。
 func (s *Store) Confirmation(packageName, certificateSHA256 string) (Confirmation, bool, error) {
 	var out Confirmation
 	var ok bool
-	err := s.read(s.trust, func() { out, ok = s.ts.confirmations[pkgKey{packageName, certificateSHA256}] })
+	err := s.read(s.trust, func() {
+		out, ok = s.ts.confirmations[packageName]
+		if ok && out.CertificateSHA256 != certificateSHA256 {
+			out, ok = Confirmation{}, false
+		}
+	})
 	return out, ok, err
 }
 
-// Confirmations 返回每个 (包名, 证书) 的最新确认，按租户、包名排序。
+// ActiveConfirmation 返回包名当前有效的确认（不论证书）。
+func (s *Store) ActiveConfirmation(packageName string) (Confirmation, bool, error) {
+	var out Confirmation
+	var ok bool
+	err := s.read(s.trust, func() { out, ok = s.ts.confirmations[packageName] })
+	return out, ok, err
+}
+
+// Confirmations 返回每个包名当前有效的确认，按租户、包名排序。
 func (s *Store) Confirmations() ([]Confirmation, error) {
 	var out []Confirmation
 	err := s.read(s.trust, func() {
@@ -398,10 +511,7 @@ func (s *Store) Confirmations() ([]Confirmation, error) {
 		if out[i].TenantSlug != out[j].TenantSlug {
 			return out[i].TenantSlug < out[j].TenantSlug
 		}
-		if out[i].PackageName != out[j].PackageName {
-			return out[i].PackageName < out[j].PackageName
-		}
-		return out[i].CertificateSHA256 < out[j].CertificateSHA256
+		return out[i].PackageName < out[j].PackageName
 	})
 	return out, err
 }
@@ -410,7 +520,7 @@ func (s *Store) Confirmations() ([]Confirmation, error) {
 
 // SignedView 是某个 (包名, 证书) 在本机记录里的版本号状态。
 type SignedView struct {
-	// Max 是已签（预留、完成、导入、人工基线）的最大 versionCode；HasMax=false 表示从未签过。
+	// Max 是已签（预留、签名、完成、导入、人工基线）的最大 versionCode；HasMax=false 表示从未签过。
 	// 不含 Existing 这条（同一任务同一输入包的幂等重签不和自己比）。
 	Max    int64
 	HasMax bool
@@ -451,81 +561,126 @@ func (ss *signedState) view(packageName, certificateSHA256, jobID, unsignedSHA25
 
 // Reserve 在解密前预留 (包名, 证书, versionCode)，写入并 fsync。
 //
-// 同一任务、同一输入包、同一 versionCode 已经预留（或已完成）时返回 idempotent=true，
-// 不写新行：允许重签、重传。其余冲突一律报错，调用方按违规永久拒签。
-func (s *Store) Reserve(r Reservation) (idempotent bool, err error) {
+// 同一任务、同一输入包、同一 versionCode 已经预留（或已签名、已完成）时返回 existing=该预留，
+// 不写新行：允许重签、重传。其余冲突一律报错，调用方按违规永久拒签。新预留在同一把锁里
+// 复核递增、跳号、绝对上限与首签上限。
+func (s *Store) Reserve(r Reservation, lim ReserveLimits) (existing *Reservation, err error) {
 	if err := r.validateReserve(); err != nil {
-		return false, fmt.Errorf("records: reservation: %w", err)
+		return nil, fmt.Errorf("records: reservation: %w", err)
+	}
+	if err := lim.validate(); err != nil {
+		return nil, fmt.Errorf("records: %w", err)
 	}
 	r.Status, r.SignedSHA256, r.ReleaseID, r.Source = "", "", "", ""
-	err = s.append(s.signed, typeReserve, r, func() error {
+	err = s.appendRecords(s.signed, func() ([]pending, error) {
 		k := vcKey{r.PackageName, r.CertificateSHA256, r.VersionCode}
 		if cur := s.ss.byVC[k]; cur != nil {
 			if cur.JobID == r.JobID && cur.UnsignedSHA256 == r.UnsignedSHA256 && cur.TenantSlug == r.TenantSlug {
-				idempotent = true
-				return errIdempotent
+				copied := *cur
+				existing = &copied
+				return nil, nil
 			}
-			return ErrVersionCodeTaken
+			return nil, ErrVersionCodeTaken
 		}
 		if cur := s.ss.byJob[r.JobID]; cur != nil && cur.Status != StatusAbandoned {
-			return ErrJobConflict
+			return nil, ErrJobConflict
 		}
-		if view := s.ss.view(r.PackageName, r.CertificateSHA256, r.JobID, r.UnsignedSHA256); view.HasMax && r.VersionCode <= view.Max {
-			return ErrVersionCodeNotIncreasing
+		view := s.ss.view(r.PackageName, r.CertificateSHA256, r.JobID, r.UnsignedSHA256)
+		switch {
+		case r.VersionCode > lim.MaxVersionCode:
+			return nil, ErrVersionCodeOutOfBounds
+		case view.HasMax && r.VersionCode <= view.Max:
+			return nil, ErrVersionCodeNotIncreasing
+		case view.HasMax && r.VersionCode-view.Max > lim.MaxJump:
+			return nil, ErrVersionCodeOutOfBounds
+		case !view.HasMax && r.VersionCode > lim.FirstSignMaxVersionCode:
+			return nil, ErrVersionCodeOutOfBounds
 		}
-		return nil
+		return []pending{{typeReserve, r}}, nil
 	})
-	if errors.Is(err, errIdempotent) {
-		return true, nil
-	}
-	return false, err
+	return existing, err
 }
 
-var errIdempotent = errors.New("idempotent")
-
-// Complete 记录签名完成：已签名包 sha256 与服务端返回的发布 id。已完成且值相同时幂等。
-func (s *Store) Complete(jobID, unsignedSHA256, signedSHA256, releaseID string) error {
-	var rec completeRecord
-	err := s.append(s.signed, typeComplete, &rec, func() error {
+// MarkSigned 在上传之前记下签出的包。之后这条预留不能释放。
+//
+// 已记录相同的包时幂等。已签名（未完成）而这次签出的包不同时追加一行，以最后一行为准：
+// 同一输入包、同一把密钥重签，内容等价，但 ECDSA 签名带随机数、每次字节不同；上次签出的包
+// 可能没传上去，服务端也只认最后一次上传。已完成的预留不能再换包（ErrAlreadyCompleted）。
+func (s *Store) MarkSigned(jobID, unsignedSHA256, signedSHA256 string) error {
+	return s.appendRecords(s.signed, func() ([]pending, error) {
 		cur := s.ss.byJob[jobID]
 		if cur == nil || cur.Status == StatusAbandoned || cur.UnsignedSHA256 != unsignedSHA256 {
-			return ErrNotReserved
+			return nil, ErrNotReserved
 		}
-		if cur.Status == StatusCompleted {
-			if cur.SignedSHA256 == signedSHA256 && cur.ReleaseID == releaseID {
-				return errIdempotent
+		if cur.Status == StatusSigned || cur.Status == StatusCompleted {
+			if cur.SignedSHA256 == signedSHA256 {
+				return nil, nil
 			}
-			return ErrAlreadyCompleted
+			if cur.Status == StatusCompleted {
+				return nil, ErrAlreadyCompleted
+			}
 		}
-		rec = completeRecord{JobID: jobID, PackageName: cur.PackageName, CertificateSHA256: cur.CertificateSHA256,
-			VersionCode: cur.VersionCode, UnsignedSHA256: unsignedSHA256, SignedSHA256: signedSHA256, ReleaseID: releaseID}
-		return rec.validate()
+		rec := signedRecord{JobID: jobID, PackageName: cur.PackageName, CertificateSHA256: cur.CertificateSHA256,
+			VersionCode: cur.VersionCode, UnsignedSHA256: unsignedSHA256, SignedSHA256: signedSHA256}
+		if err := rec.validate(); err != nil {
+			return nil, err
+		}
+		return []pending{{typeSigned, rec}}, nil
 	})
-	if errors.Is(err, errIdempotent) {
-		return nil
-	}
-	return err
 }
 
-// Abandon 释放一条从未交付出去的预留（运维确认服务端没有对应发布记录与下载记录后执行）。
+// Complete 记录签名完成：服务端返回的发布 id。必须先 MarkSigned 且签名包一致；已完成且值相同时幂等。
+func (s *Store) Complete(jobID, unsignedSHA256, signedSHA256, releaseID string) error {
+	return s.appendRecords(s.signed, func() ([]pending, error) {
+		cur := s.ss.byJob[jobID]
+		if cur == nil || cur.Status == StatusAbandoned || cur.UnsignedSHA256 != unsignedSHA256 {
+			return nil, ErrNotReserved
+		}
+		switch cur.Status {
+		case StatusReserved:
+			return nil, ErrNotSigned
+		case StatusCompleted:
+			if cur.SignedSHA256 == signedSHA256 && cur.ReleaseID == releaseID {
+				return nil, nil
+			}
+			return nil, ErrAlreadyCompleted
+		}
+		if cur.SignedSHA256 != signedSHA256 {
+			return nil, ErrSignedMismatch
+		}
+		rec := completeRecord{JobID: jobID, PackageName: cur.PackageName, CertificateSHA256: cur.CertificateSHA256,
+			VersionCode: cur.VersionCode, UnsignedSHA256: unsignedSHA256, SignedSHA256: signedSHA256, ReleaseID: releaseID}
+		if err := rec.validate(); err != nil {
+			return nil, err
+		}
+		return []pending{{typeComplete, rec}}, nil
+	})
+}
+
+// Abandon 释放一条还没有签出任何包的预留（运维 abandon，或签名闸在调用 apksigner 之前失败）。
+// 已签名或已完成的预留不能释放：那个 versionCode 的包可能已经在服务端手里。
 func (s *Store) Abandon(jobID, operator, reason string) (Reservation, error) {
 	if err := validateOperatorReason(operator, reason); err != nil {
 		return Reservation{}, fmt.Errorf("records: abandon: %w", err)
 	}
-	var rec abandonRecord
 	var out Reservation
-	err := s.append(s.signed, typeAbandon, &rec, func() error {
+	err := s.appendRecords(s.signed, func() ([]pending, error) {
 		cur := s.ss.byJob[jobID]
-		if cur == nil || cur.Status == StatusAbandoned {
-			return ErrNotReserved
-		}
-		if cur.Status == StatusCompleted {
-			return ErrAlreadyCompleted
+		switch {
+		case cur == nil || cur.Status == StatusAbandoned:
+			return nil, ErrNotReserved
+		case cur.Status == StatusCompleted:
+			return nil, ErrAlreadyCompleted
+		case cur.Status == StatusSigned:
+			return nil, ErrAlreadySigned
 		}
 		out = *cur
-		rec = abandonRecord{JobID: jobID, PackageName: cur.PackageName, CertificateSHA256: cur.CertificateSHA256,
+		rec := abandonRecord{JobID: jobID, PackageName: cur.PackageName, CertificateSHA256: cur.CertificateSHA256,
 			VersionCode: cur.VersionCode, UnsignedSHA256: cur.UnsignedSHA256, Operator: operator, Reason: reason}
-		return rec.validate()
+		if err := rec.validate(); err != nil {
+			return nil, err
+		}
+		return []pending{{typeAbandon, rec}}, nil
 	})
 	return out, err
 }
@@ -565,52 +720,44 @@ func (s *Store) HasSigningHistory() (bool, error) {
 	return out, err
 }
 
-// Import 把旧主签名闸仍然有效的预留与完成记录写进本机（promote 用）。已经存在且完全相同的跳过；
-// 任何冲突在写入第一行之前报错。返回写入的条数。
+// Import 把旧主签名闸仍然有效的预留、签名与完成记录写进本机（promote 用）。已经存在且完全相同的
+// 跳过；任何冲突在写入第一行之前报错，整批在一把锁里写入。返回写入的条数。
 func (s *Store) Import(sourceEd25519SHA256 string, list []Reservation, operator string) (int, error) {
 	if !fingerprint.Valid(sourceEd25519SHA256) || !operatorPattern.MatchString(operator) {
 		return 0, errors.New("records: import: source fingerprint or operator is malformed")
 	}
-	var pending []importRecord
-	s.mu.Lock()
-	err := func() error {
-		if err := s.refresh(s.signed, false); err != nil {
-			return err
-		}
+	written := 0
+	err := s.appendRecords(s.signed, func() ([]pending, error) {
+		var items []pending
+		seenJobs := map[string]bool{}
+		seenVC := map[vcKey]bool{}
 		for _, r := range list {
 			rec := importRecord{SourceEd25519SHA256: sourceEd25519SHA256, JobID: r.JobID, SignAttempt: r.SignAttempt,
 				TenantSlug: r.TenantSlug, PackageName: r.PackageName, CertificateSHA256: r.CertificateSHA256,
 				VersionCode: r.VersionCode, UnsignedSHA256: r.UnsignedSHA256, Status: r.Status,
 				SignedSHA256: r.SignedSHA256, ReleaseID: r.ReleaseID, Operator: operator}
 			if err := rec.validate(); err != nil {
-				return fmt.Errorf("records: import %s: %w", r.JobID, err)
+				return nil, fmt.Errorf("records: import %s: %w", r.JobID, err)
 			}
 			k := vcKey{r.PackageName, r.CertificateSHA256, r.VersionCode}
 			if cur := s.ss.byVC[k]; cur != nil {
-				if cur.JobID == r.JobID && cur.UnsignedSHA256 == r.UnsignedSHA256 &&
-					(cur.Status == r.Status || cur.Status == StatusCompleted) {
+				if cur.JobID == r.JobID && cur.UnsignedSHA256 == r.UnsignedSHA256 && cur.Status == r.Status &&
+					cur.SignedSHA256 == r.SignedSHA256 && cur.ReleaseID == r.ReleaseID {
 					continue
 				}
-				return fmt.Errorf("%w: import of job %s conflicts with job %s on this machine", ErrVersionCodeTaken, r.JobID, cur.JobID)
+				return nil, fmt.Errorf("%w: import of job %s conflicts with job %s on this machine", ErrVersionCodeTaken, r.JobID, cur.JobID)
 			}
-			if cur := s.ss.byJob[r.JobID]; cur != nil && cur.Status != StatusAbandoned {
-				return fmt.Errorf("%w: job %s", ErrJobConflict, r.JobID)
+			if cur := s.ss.byJob[r.JobID]; (cur != nil && cur.Status != StatusAbandoned) || seenJobs[r.JobID] || seenVC[k] {
+				return nil, fmt.Errorf("%w: job %s", ErrJobConflict, r.JobID)
 			}
-			pending = append(pending, rec)
+			seenJobs[r.JobID], seenVC[k] = true, true
+			items = append(items, pending{typeImport, rec})
 		}
-		return nil
-	}()
-	s.mu.Unlock()
+		written = len(items)
+		return items, nil
+	})
 	if err != nil {
 		return 0, err
-	}
-	written := 0
-	for _, rec := range pending {
-		rec := rec
-		if err := s.append(s.signed, typeImport, rec, nil); err != nil {
-			return written, err
-		}
-		written++
 	}
 	return written, nil
 }
@@ -670,7 +817,7 @@ func applyTrust(ts *trustState, e entry) error {
 			return err
 		}
 		c.ConfirmedAt = e.At
-		ts.confirmations[pkgKey{c.PackageName, c.CertificateSHA256}] = c
+		ts.confirmations[c.PackageName] = c
 	default:
 		return fmt.Errorf("unknown trust record type %q", e.Type)
 	}
@@ -703,6 +850,20 @@ func applySigned(ss *signedState, e entry) error {
 			CertificateSHA256: i.CertificateSHA256, VersionCode: i.VersionCode, UnsignedSHA256: i.UnsignedSHA256,
 			Status: i.Status, SignedSHA256: i.SignedSHA256, ReleaseID: i.ReleaseID, Source: "import", ReservedAt: e.At, UpdatedAt: e.At}
 		return ss.insert(&r)
+	case typeSigned:
+		var sr signedRecord
+		if err := strictUnmarshal(e.Data, &sr); err != nil {
+			return err
+		}
+		if err := sr.validate(); err != nil {
+			return err
+		}
+		cur := ss.byJob[sr.JobID]
+		if cur == nil || (cur.Status != StatusReserved && cur.Status != StatusSigned) || cur.PackageName != sr.PackageName ||
+			cur.CertificateSHA256 != sr.CertificateSHA256 || cur.VersionCode != sr.VersionCode || cur.UnsignedSHA256 != sr.UnsignedSHA256 {
+			return errors.New("records a signed package for a reservation that does not exist or is already completed or released")
+		}
+		cur.Status, cur.SignedSHA256, cur.UpdatedAt = StatusSigned, sr.SignedSHA256, e.At
 	case typeComplete:
 		var c completeRecord
 		if err := strictUnmarshal(e.Data, &c); err != nil {
@@ -712,11 +873,11 @@ func applySigned(ss *signedState, e entry) error {
 			return err
 		}
 		cur := ss.byJob[c.JobID]
-		if cur == nil || cur.Status != StatusReserved || cur.PackageName != c.PackageName || cur.CertificateSHA256 != c.CertificateSHA256 ||
-			cur.VersionCode != c.VersionCode || cur.UnsignedSHA256 != c.UnsignedSHA256 {
-			return errors.New("completes a reservation that does not exist")
+		if cur == nil || cur.Status != StatusSigned || cur.PackageName != c.PackageName || cur.CertificateSHA256 != c.CertificateSHA256 ||
+			cur.VersionCode != c.VersionCode || cur.UnsignedSHA256 != c.UnsignedSHA256 || cur.SignedSHA256 != c.SignedSHA256 {
+			return errors.New("completes a reservation that has no matching signed package")
 		}
-		cur.Status, cur.SignedSHA256, cur.ReleaseID, cur.UpdatedAt = StatusCompleted, c.SignedSHA256, c.ReleaseID, e.At
+		cur.Status, cur.ReleaseID, cur.UpdatedAt = StatusCompleted, c.ReleaseID, e.At
 	case typeAbandon:
 		var a abandonRecord
 		if err := strictUnmarshal(e.Data, &a); err != nil {
@@ -728,7 +889,7 @@ func applySigned(ss *signedState, e entry) error {
 		cur := ss.byJob[a.JobID]
 		if cur == nil || cur.Status != StatusReserved || cur.PackageName != a.PackageName || cur.CertificateSHA256 != a.CertificateSHA256 ||
 			cur.VersionCode != a.VersionCode || cur.UnsignedSHA256 != a.UnsignedSHA256 {
-			return errors.New("abandons a reservation that does not exist or is not open")
+			return errors.New("abandons a reservation that does not exist or has already produced a signed package")
 		}
 		cur.Status, cur.UpdatedAt = StatusAbandoned, e.At
 		delete(ss.byVC, vcKey{cur.PackageName, cur.CertificateSHA256, cur.VersionCode})
@@ -771,12 +932,16 @@ func (ss *signedState) insert(r *Reservation) error {
 type Foreign struct {
 	Genesis      Genesis
 	Lines        uint64
-	Reservations []Reservation // 仍然有效的（预留或完成，未释放）
+	LastHash     string
+	Reservations []Reservation // 仍然有效的（预留、签名或完成，未释放）
 	Baselines    []Baseline
 }
 
 // VerifyForeignSigned 校验另一台签名闸的 signed.jsonl：genesis 里的 Ed25519 公钥指纹必须等于
 // 运维从离线 pin 文件粘贴的 pinnedEd25519SHA256，每一行的链与签名都要对。
+//
+// 链证明不了文件在某一行之后被整行截掉：调用方要把行数、最后一行哈希与每个包的最大
+// versionCode 显示给运维，与离线记录核对。
 func VerifyForeignSigned(raw []byte, pinnedEd25519SHA256 string) (Foreign, error) {
 	if !fingerprint.Valid(pinnedEd25519SHA256) {
 		return Foreign{}, errors.New("records: pinned ed25519 fingerprint is malformed")
@@ -800,9 +965,9 @@ func VerifyForeignSigned(raw []byte, pinnedEd25519SHA256 string) (Foreign, error
 	if v.seq == 0 {
 		return Foreign{}, fmt.Errorf("%w: empty file", ErrCorrupt)
 	}
-	out := Foreign{Genesis: v.genesis, Lines: v.seq}
+	out := Foreign{Genesis: v.genesis, Lines: v.seq, LastHash: v.tail}
 	for _, r := range ss.all {
-		if r.Status == StatusReserved || r.Status == StatusCompleted {
+		if r.Status != StatusAbandoned {
 			out.Reservations = append(out.Reservations, *r)
 		}
 	}
@@ -812,6 +977,3 @@ func VerifyForeignSigned(raw []byte, pinnedEd25519SHA256 string) (Foreign, error
 	sort.Slice(out.Baselines, func(i, j int) bool { return out.Baselines[i].PackageName < out.Baselines[j].PackageName })
 	return out, nil
 }
-
-// ValidJobID 判断任务 id。
-func ValidJobID(s string) bool { return ident.ValidServerID(s) }
