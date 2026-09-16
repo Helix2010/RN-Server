@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
@@ -251,9 +252,13 @@ func (r *Runner) generate(ctx context.Context, log *slog.Logger, machineID strin
 	}
 
 	log.Info("generating a keystore", "package", req.PackageName, "firstTrust", plan.firstTrust, "recipients", names)
+	binding := &keystorebox.Generation{TrustRootsDigest: plan.digest, MinSDK: plan.minSDK, TargetSDK: plan.targetSDK, FirstSignMaxVersionCode: plan.firstCap}
+	if plan.previous != nil {
+		binding.SupersedesCertificateSHA256 = plan.previous.CertificateSHA256
+	}
 	generated, err := GenerateKeystore(GenerateParams{
 		RequestID: req.RequestID, TenantSlug: item.TenantSlug, PackageName: req.PackageName, KeyAlias: req.Alias,
-		Recipients: recipients, Generator: r.Keys.Ed25519, KeyBits: r.KeyBits, Now: time.Now(),
+		Recipients: recipients, Generator: r.Keys.Ed25519, KeyBits: r.KeyBits, Now: time.Now(), Binding: binding,
 	})
 	if err != nil {
 		return genFail(GenerationFailed, "generating the keystore failed: %v", err), nil
@@ -306,8 +311,13 @@ func (r *Runner) generate(ctx context.Context, log *slog.Logger, machineID strin
 // ---- 自动接受签名闸生成的密钥（备签名闸；主签名闸崩溃恢复时也走这里）----
 
 // acceptGenerated 在本机对 (包名, 证书) 没有有效确认时尝试自动确认：生成者必须是本机或本机信任的
-// 签名闸，生成签名覆盖的 Upload 里必须有发给本机的这个 Box，证书没为这个包名确认过，信任根按
-// planConfirmation 的规则。返回 (确认, 不接受的原因, 致命错误)。
+// 签名闸，生成签名覆盖的 Upload 里必须有发给本机的这个 Box，证书没为这个包名确认过，并按密文里生成者
+// 写下的确认参数（keystorebox.Generation）核对：
+//   - 本机已有确认：它替换的证书必须是本机当前的证书（挡住重放更早的生成），信任根摘要必须与本机相同；
+//     沿用本机的信任根与 SDK 下限，首签上限取生成者的；
+//   - 本机没有确认：服务端给的信任根摘要必须等于生成者确认的摘要，SDK 下限与首签上限取生成者的。
+//
+// 返回 (确认, 不接受的原因, 致命错误)。
 func (r *Runner) acceptGenerated(item CheckItem, material keystoreMaterial) (*records.Confirmation, string, error) {
 	g := item.Generator
 	if g == nil {
@@ -354,12 +364,41 @@ func (r *Runner) acceptGenerated(item CheckItem, material keystoreMaterial) (*re
 	if seen {
 		return nil, "this certificate was confirmed for this package before and later replaced; switching back needs signer confirm", nil
 	}
-	plan, failure, err := r.planConfirmation(item.TenantSlug, item.PackageName, item.TrustRoots, item.TrustRootsDigest, item.PublishedMaxBuildNumber)
+	// 生成者写下的确认参数在密文里（Box 密文被生成签名覆盖），服务端改不了
+	bound := material.Plain.Generation
+	if bound == nil {
+		return nil, "the keystore carries no generation parameters from its generator; run signer confirm", nil
+	}
+	active, has, err := r.Store.ActiveConfirmation(item.PackageName)
 	if err != nil {
 		return nil, "", err
 	}
-	if failure != nil {
-		return nil, failure.code + ": " + failure.detail, nil
+	var plan confirmationPlan
+	if has {
+		switch {
+		case active.TenantSlug != item.TenantSlug:
+			return nil, fmt.Sprintf("%s: package %s is confirmed for tenant %s on this signing gate, not %s; run signer confirm", GenerationTrustRootsChanged, item.PackageName, active.TenantSlug, item.TenantSlug), nil
+		case bound.SupersedesCertificateSHA256 != active.CertificateSHA256:
+			// 生成者生成时替换的不是本机当前的证书：可能是服务端重放了更早的一次生成，或本机错过了中间一次换密钥
+			return nil, fmt.Sprintf("the keystore replaces certificate %q, but this signing gate's current certificate for %s is %s; run signer confirm if this key is expected", bound.SupersedesCertificateSHA256, item.PackageName, active.CertificateSHA256), nil
+		case bound.TrustRootsDigest != active.TrustRootsDigest:
+			return nil, fmt.Sprintf("%s: the generator confirmed different trust roots than this signing gate for %s; run signer confirm", GenerationTrustRootsChanged, item.PackageName), nil
+		}
+		previous := active
+		plan = confirmationPlan{previous: &previous, roots: active.TrustRoots, digest: active.TrustRootsDigest, minSDK: active.MinSDK, targetSDK: active.TargetSDK, firstCap: bound.FirstSignMaxVersionCode}
+	} else {
+		// 首次信任：只接受与生成者确认的摘要一致的服务端信任根
+		if item.TrustRoots == nil {
+			return nil, "the server sent no trust roots for this tenant", nil
+		}
+		normalized, err := item.TrustRoots.Normalize()
+		if err != nil || !trustroots.Equal(normalized, *item.TrustRoots) {
+			return nil, "the server's trust roots for this tenant are malformed", nil
+		}
+		if digest, err := trustroots.Digest(normalized); err != nil || digest != bound.TrustRootsDigest {
+			return nil, fmt.Sprintf("%s: the server's trust roots are not the ones the generator confirmed for %s; refusing to trust them", GenerationTrustRootsChanged, item.PackageName), nil
+		}
+		plan = confirmationPlan{firstTrust: true, roots: normalized, digest: bound.TrustRootsDigest, minSDK: bound.MinSDK, targetSDK: bound.TargetSDK, firstCap: bound.FirstSignMaxVersionCode}
 	}
 	if mode == "" {
 		mode = records.ConfirmModeRegenerated
@@ -373,6 +412,10 @@ func (r *Runner) acceptGenerated(item CheckItem, material keystoreMaterial) (*re
 	case errors.Is(err, records.ErrConfirmationChanged), errors.Is(err, records.ErrCertificateSeen):
 		return nil, "the local confirmation changed while accepting the generated keystore; it is retried next round", nil
 	case err != nil:
+		// 生成者给的 SDK 下限、首签上限不合本机记录的规则（例如低于 24/28）也落在这里：不接受，要运维确认
+		if strings.Contains(err.Error(), "records: confirmation:") {
+			return nil, "the generator's confirmation parameters are not acceptable on this signing gate (" + cleanText(err.Error(), 200) + "); run signer confirm", nil
+		}
 		return nil, "", err
 	}
 	r.Log.Info("accepted a keystore generated by a trusted signing gate", "tenant", conf.TenantSlug, "package", conf.PackageName,

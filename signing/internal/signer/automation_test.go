@@ -170,7 +170,7 @@ func generationItem(requestID string, roots trustroots.Roots, published any) map
 }
 
 // generatedItem 是服务端落库后给某台签名闸的租户项：发给它的 Box、生成者、生成签名、请求 id 与完整 Upload。
-func (h *harness) generatedItem(g GeneratedKeystore, requestID string, generatorName, generatorID string, generatorPub ed25519.PublicKey, roots trustroots.Roots, published int64) map[string]any {
+func (h *harness) generatedItem(g GeneratedKeystore, requestID string, generatorName, generatorID string, generatorPub ed25519.PublicKey, roots trustroots.Roots) map[string]any {
 	h.t.Helper()
 	box, ok := g.Upload.BoxFor(h.keys.X25519SHA256())
 	if !ok {
@@ -182,7 +182,7 @@ func (h *harness) generatedItem(g GeneratedKeystore, requestID string, generator
 		"keyAlias": serverAlias, "box": box, "trustRoots": roots, "trustRootsDigest": digest, "generationRequest": nil,
 		"generator": map[string]any{"machineId": generatorID, "name": generatorName, "ed25519PublicKey": base64.StdEncoding.EncodeToString(generatorPub),
 			"ed25519PublicKeySha256": fingerprint.SHA256Hex(generatorPub)},
-		"generationSignature": g.Signature, "generationRequestId": requestID, "upload": g.Upload, "publishedMaxBuildNumber": published,
+		"generationSignature": g.Signature, "generationRequestId": requestID, "upload": g.Upload,
 	}
 }
 
@@ -210,10 +210,15 @@ func (h *harness) lastReport() CheckReport {
 	return last[len(last)-1]
 }
 
-func generateFor(t *testing.T, requestID string, generator ed25519.PrivateKey, recipients ...[]byte) GeneratedKeystore {
+// binding 是生成者写进密文的确认参数：信任根摘要、SDK 下限 24/28、首签上限、替换的证书。
+func binding(digest string, firstCap int64, supersedes string) *keystorebox.Generation {
+	return &keystorebox.Generation{TrustRootsDigest: digest, MinSDK: 24, TargetSDK: 28, FirstSignMaxVersionCode: firstCap, SupersedesCertificateSHA256: supersedes}
+}
+
+func generateFor(t *testing.T, requestID string, generator ed25519.PrivateKey, bound *keystorebox.Generation, recipients ...[]byte) GeneratedKeystore {
 	t.Helper()
 	g, err := GenerateKeystore(GenerateParams{RequestID: requestID, TenantSlug: testfixture.TenantSlug, PackageName: testfixture.PackageName,
-		KeyAlias: testAlias, Recipients: recipients, Generator: generator, KeyBits: 2048, Now: time.Now()})
+		KeyAlias: testAlias, Recipients: recipients, Generator: generator, KeyBits: 2048, Now: time.Now(), Binding: bound})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,6 +274,10 @@ func TestPrimaryGeneratesWithFirstTrust(t *testing.T) {
 		if err != nil || plain.CertificateSHA256 != sub.Upload.CertificateSHA256 || strings.Join(plain.Recipients, ",") != strings.Join(want, ",") {
 			t.Fatalf("%s cannot open its box: %v", name, err)
 		}
+		// 生成者的确认参数绑在密文里
+		if g := plain.Generation; g == nil || *g != *binding(h.digest, 157, "") {
+			t.Fatalf("%s box generation binding: %+v", name, plain.Generation)
+		}
 	}
 	conf, ok, _ := h.store.ActiveConfirmation(testfixture.PackageName)
 	if !ok || conf.Mode != records.ConfirmModeFirstGeneration || conf.ConfirmedBy != "auto:first-generation" || conf.CertificateSHA256 != sub.Upload.CertificateSHA256 ||
@@ -290,7 +299,7 @@ func TestPrimaryGeneratesWithFirstTrust(t *testing.T) {
 	// 服务端落库：下一轮（不等 ChecksInterval）解开发给本机的新密钥、确认已在、试签、就绪
 	h.server.mu.Lock()
 	h.server.items = []map[string]any{h.generatedItem(GeneratedKeystore{Upload: sub.Upload, Signature: sub.Signature, CertificateSHA256: sub.Upload.CertificateSHA256},
-		"kgr_first0000001", testMachine, "mch_signerA0001", h.keys.Ed25519PublicKey(), h.roots, 57)}
+		"kgr_first0000001", testMachine, "mch_signerA0001", h.keys.Ed25519PublicKey(), h.roots)}
 	h.server.mu.Unlock()
 	h.useGeneratedKey(GeneratedKeystore{Upload: sub.Upload, CertificateSHA256: sub.Upload.CertificateSHA256})
 	h.runner.lastChecks = time.Now()
@@ -341,6 +350,12 @@ func TestPrimaryRegeneratesWithConfirmedTrustRoots(t *testing.T) {
 	}
 	if got := recipientsOf(sub.Upload); len(got) != 2 {
 		t.Fatalf("recipients: %v", got)
+	}
+	box, _ := sub.Upload.BoxFor(h.keys.X25519SHA256())
+	plain, err := keystorebox.Open(box, h.keys.X25519.Bytes())
+	if err != nil || plain.Generation == nil || *plain.Generation != (keystorebox.Generation{TrustRootsDigest: old.TrustRootsDigest, MinSDK: old.MinSDK,
+		TargetSDK: old.TargetSDK, FirstSignMaxVersionCode: 180, SupersedesCertificateSHA256: h.key.CertificateSHA256}) {
+		t.Fatalf("generation binding: %+v %v", plain.Generation, err)
 	}
 }
 
@@ -493,19 +508,29 @@ func TestGenerationSubmitOutcomes(t *testing.T) {
 
 func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 	ctx := context.Background()
-	newStandby := func(t *testing.T, opts harnessOptions) (*harness, peerMachine, recoveryKeyPair) {
+	newStandby := func(t *testing.T, opts harnessOptions) (*harness, peerMachine) {
 		opts.role = records.RoleStandby
 		h := newHarness(t, opts)
 		primary := newPeerMachine(t, "amos-signer-main", "mch_signerM0001")
 		must(t, h.store.TrustPeer(primary.trust(records.TrustModeEnrollFirstTrust)))
-		return h, primary, newRecoveryKeyPair(t, "platform-recovery")
+		return h, primary
 	}
-	accepted := func(t *testing.T, h *harness) {
+	serve := func(t *testing.T, h *harness, g GeneratedKeystore, requestID string, p peerMachine, roots trustroots.Roots) {
+		t.Helper()
+		h.server.mu.Lock()
+		h.server.items = []map[string]any{h.generatedItem(g, requestID, p.name, p.id, p.edPub(), roots)}
+		h.server.mu.Unlock()
+		h.useGeneratedKey(g)
+		must(t, h.runner.RunChecks(ctx))
+	}
+	accepted := func(t *testing.T, h *harness) records.Confirmation {
 		t.Helper()
 		rep := h.lastReport()
 		if rep.Decrypt != "ok" || !rep.Confirmed || rep.TrialSign != "ok" || rep.Error != nil {
 			t.Fatalf("report: %+v; logs:\n%s", rep, h.logs.String())
 		}
+		conf, _, _ := h.store.ActiveConfirmation(testfixture.PackageName)
+		return conf
 	}
 	refused := func(t *testing.T, h *harness, reason string) {
 		t.Helper()
@@ -515,14 +540,12 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 		}
 	}
 
-	t.Run("trusted primary, first trust", func(t *testing.T) {
-		h, p, r := newStandby(t, harnessOptions{noConfirm: true})
-		g := generateFor(t, "kgr_standby00001", p.ed, h.keys.X25519PublicKey(), p.xPub(), mustPublic(t, r.priv.Bytes()))
-		h.server.items = []map[string]any{h.generatedItem(g, "kgr_standby00001", p.name, p.id, p.edPub(), h.roots, 40)}
-		h.useGeneratedKey(g)
-		must(t, h.runner.RunChecks(ctx))
-		accepted(t, h)
-		conf, _, _ := h.store.ActiveConfirmation(testfixture.PackageName)
+	t.Run("trusted primary, first trust with the generator's trust roots", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		r := newRecoveryKeyPair(t, "platform-recovery")
+		g := generateFor(t, "kgr_standby00001", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey(), p.xPub(), mustPublic(t, r.priv.Bytes()))
+		serve(t, h, g, "kgr_standby00001", p, h.roots)
+		conf := accepted(t, h)
 		if conf.Mode != records.ConfirmModePeerGenerated || conf.ConfirmedBy != "auto:peer-generated:amos-signer-main" || conf.GeneratorEd25519SHA256 != p.edSHA() ||
 			conf.CertificateSHA256 != g.CertificateSHA256 || conf.FirstSignMaxVersionCode != 140 || conf.TargetSDK != 28 || !trustroots.Equal(conf.TrustRoots, h.roots) {
 			t.Fatalf("confirmation: %+v", conf)
@@ -532,28 +555,52 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 		}
 	})
 
+	// 审查 H1：本机还没确认这个包名时，服务端不能给备签名闸一套与主签名闸不同的信任根
+	t.Run("server swaps the trust roots for a standby without a confirmation", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		g := generateFor(t, "kgr_standby00002", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey(), p.xPub())
+		attacker := h.roots
+		attacker.APIBaseURL, attacker.AppLinksHosts, attacker.Scheme = "https://api.attacker.example", []string{"api.attacker.example"}, "attacker"
+		attacker, _ = attacker.Normalize()
+		serve(t, h, g, "kgr_standby00002", p, attacker)
+		refused(t, h, GenerationTrustRootsChanged)
+		if _, ok, _ := h.store.ActiveConfirmation(testfixture.PackageName); ok {
+			t.Fatal("the standby trusted the server's substituted trust roots")
+		}
+	})
+
 	t.Run("trusted primary, keeps confirmed trust roots", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{})
+		h, p := newStandby(t, harnessOptions{})
 		old, _, _ := h.store.ActiveConfirmation(testfixture.PackageName)
-		g := generateFor(t, "kgr_standby00002", p.ed, h.keys.X25519PublicKey(), p.xPub())
-		h.server.items = []map[string]any{h.generatedItem(g, "kgr_standby00002", p.name, p.id, p.edPub(), h.roots, 40)}
-		h.useGeneratedKey(g)
-		must(t, h.runner.RunChecks(ctx))
-		accepted(t, h)
+		g := generateFor(t, "kgr_standby00003", p.ed, binding(h.digest, 140, h.key.CertificateSHA256), h.keys.X25519PublicKey(), p.xPub())
+		// 服务端此刻的信任根不同：照样按本机确认的信任根接受证书，但不就绪
+		changed := h.roots
+		changed.Scheme = "anyfun2"
+		serve(t, h, g, "kgr_standby00003", p, changed)
+		rep := h.lastReport()
 		conf, _, _ := h.store.ActiveConfirmation(testfixture.PackageName)
-		if conf.CertificateSHA256 != g.CertificateSHA256 || conf.TargetSDK != old.TargetSDK || conf.Mode != records.ConfirmModePeerGenerated {
-			t.Fatalf("confirmation: %+v", conf)
+		if !rep.Confirmed || conf.CertificateSHA256 != g.CertificateSHA256 || conf.TargetSDK != old.TargetSDK || conf.TrustRootsDigest != old.TrustRootsDigest ||
+			conf.Mode != records.ConfirmModePeerGenerated || len(h.runner.Ready()) != 0 {
+			t.Fatalf("report %+v confirmation %+v ready %+v", rep, conf, h.runner.Ready())
+		}
+	})
+
+	t.Run("generator confirmed different trust roots", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{})
+		g := generateFor(t, "kgr_standby00004", p.ed, binding(strings.Repeat("ab", 32), 140, h.key.CertificateSHA256), h.keys.X25519PublicKey())
+		serve(t, h, g, "kgr_standby00004", p, h.roots)
+		refused(t, h, GenerationTrustRootsChanged)
+		if _, ok, _ := h.store.Confirmation(testfixture.PackageName, h.key.CertificateSHA256); !ok {
+			t.Fatal("the confirmed certificate was replaced")
 		}
 	})
 
 	t.Run("forged generation signature", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{noConfirm: true})
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
 		_, forger, _ := ed25519.GenerateKey(rand.Reader)
-		g := generateFor(t, "kgr_standby00003", forger, h.keys.X25519PublicKey())
+		g := generateFor(t, "kgr_standby00005", forger, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
 		// 服务端声称生成者是受信的主签名闸，签名却是别人的
-		h.server.items = []map[string]any{h.generatedItem(g, "kgr_standby00003", p.name, p.id, p.edPub(), h.roots, 40)}
-		h.useGeneratedKey(g)
-		must(t, h.runner.RunChecks(ctx))
+		serve(t, h, g, "kgr_standby00005", p, h.roots)
 		refused(t, h, "does not verify")
 		if _, ok, _ := h.store.ActiveConfirmation(testfixture.PackageName); ok || len(h.runner.Ready()) != 0 {
 			t.Fatal("a forged generation was accepted")
@@ -561,12 +608,10 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 	})
 
 	t.Run("untrusted generator", func(t *testing.T) {
-		h, _, _ := newStandby(t, harnessOptions{noConfirm: true})
+		h, _ := newStandby(t, harnessOptions{noConfirm: true})
 		rogue := newPeerMachine(t, "rogue-signer", "mch_signerR0001")
-		g := generateFor(t, "kgr_standby00004", rogue.ed, h.keys.X25519PublicKey(), rogue.xPub())
-		h.server.items = []map[string]any{h.generatedItem(g, "kgr_standby00004", rogue.name, rogue.id, rogue.edPub(), h.roots, 40)}
-		h.useGeneratedKey(g)
-		must(t, h.runner.RunChecks(ctx))
+		g := generateFor(t, "kgr_standby00006", rogue.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey(), rogue.xPub())
+		serve(t, h, g, "kgr_standby00006", rogue, h.roots)
 		refused(t, h, "does not trust")
 		if _, ok, _ := h.store.ActiveConfirmation(testfixture.PackageName); ok {
 			t.Fatal("a keystore from an untrusted generator was accepted")
@@ -574,10 +619,10 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 	})
 
 	t.Run("box swapped into a signed upload", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{noConfirm: true})
-		signed := generateFor(t, "kgr_standby00005", p.ed, h.keys.X25519PublicKey())
-		other := generateFor(t, "kgr_standby00006", p.ed, h.keys.X25519PublicKey())
-		item := h.generatedItem(signed, "kgr_standby00005", p.name, p.id, p.edPub(), h.roots, 40)
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		signed := generateFor(t, "kgr_standby00007", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
+		other := generateFor(t, "kgr_standby00008", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
+		item := h.generatedItem(signed, "kgr_standby00007", p.name, p.id, p.edPub(), h.roots)
 		otherBox, _ := other.Upload.BoxFor(h.keys.X25519SHA256())
 		item["box"], item["certificateSha256"] = otherBox, other.CertificateSHA256
 		h.server.items = []map[string]any{item}
@@ -587,9 +632,9 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 	})
 
 	t.Run("server omits the verification fields", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{noConfirm: true})
-		g := generateFor(t, "kgr_standby00007", p.ed, h.keys.X25519PublicKey())
-		item := h.generatedItem(g, "kgr_standby00007", p.name, p.id, p.edPub(), h.roots, 40)
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		g := generateFor(t, "kgr_standby00009", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
+		item := h.generatedItem(g, "kgr_standby00009", p.name, p.id, p.edPub(), h.roots)
 		delete(item, "upload")
 		delete(item, "generationRequestId")
 		h.server.items = []map[string]any{item}
@@ -598,58 +643,68 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 		refused(t, h, "signer confirm")
 	})
 
-	t.Run("trust roots changed", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{})
-		g := generateFor(t, "kgr_standby00008", p.ed, h.keys.X25519PublicKey())
-		roots := h.roots
-		roots.Scheme = "attacker"
-		h.server.items = []map[string]any{h.generatedItem(g, "kgr_standby00008", p.name, p.id, p.edPub(), roots, 40)}
-		h.useGeneratedKey(g)
-		must(t, h.runner.RunChecks(ctx))
-		refused(t, h, GenerationTrustRootsChanged)
-		if _, ok, _ := h.store.Confirmation(testfixture.PackageName, h.key.CertificateSHA256); !ok {
-			t.Fatal("the confirmed certificate was replaced despite changed trust roots")
-		}
+	t.Run("generation without bound parameters", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		g := generateFor(t, "kgr_standby00010", p.ed, nil, h.keys.X25519PublicKey())
+		serve(t, h, g, "kgr_standby00010", p, h.roots)
+		refused(t, h, "no generation parameters")
 	})
 
-	t.Run("superseded certificate replayed", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{noConfirm: true})
-		first := generateFor(t, "kgr_standby00009", p.ed, h.keys.X25519PublicKey())
-		second := generateFor(t, "kgr_standby00010", p.ed, h.keys.X25519PublicKey())
-		for _, step := range []struct {
-			g  GeneratedKeystore
-			id string
-		}{{first, "kgr_standby00009"}, {second, "kgr_standby00010"}} {
-			h.server.items = []map[string]any{h.generatedItem(step.g, step.id, p.name, p.id, p.edPub(), h.roots, 40)}
-			h.useGeneratedKey(step.g)
-			must(t, h.runner.RunChecks(ctx))
-			accepted(t, h)
+	t.Run("generator's SDK floors below the local minimum", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		low := binding(h.digest, 140, "")
+		low.MinSDK, low.TargetSDK = 21, 21
+		g := generateFor(t, "kgr_standby00011", p.ed, low, h.keys.X25519PublicKey())
+		serve(t, h, g, "kgr_standby00011", p, h.roots)
+		refused(t, h, "not acceptable")
+	})
+
+	t.Run("chain of generations, replays refused", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		c1 := generateFor(t, "kgr_standby00012", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
+		c2 := generateFor(t, "kgr_standby00013", p.ed, binding(h.digest, 140, c1.CertificateSHA256), h.keys.X25519PublicKey())
+		serve(t, h, c1, "kgr_standby00012", p, h.roots)
+		accepted(t, h)
+		serve(t, h, c2, "kgr_standby00013", p, h.roots)
+		if conf := accepted(t, h); conf.CertificateSHA256 != c2.CertificateSHA256 {
+			t.Fatalf("confirmation after the second generation: %+v", conf)
 		}
-		h.server.items = []map[string]any{h.generatedItem(first, "kgr_standby00009", p.name, p.id, p.edPub(), h.roots, 40)}
-		h.useGeneratedKey(first)
-		must(t, h.runner.RunChecks(ctx))
+		// 重放本机确认过、已被取代的 C1
+		serve(t, h, c1, "kgr_standby00012", p, h.roots)
 		refused(t, h, "confirmed for this package before")
-		if conf, _, _ := h.store.ActiveConfirmation(testfixture.PackageName); conf.CertificateSHA256 != second.CertificateSHA256 {
+		if conf, _, _ := h.store.ActiveConfirmation(testfixture.PackageName); conf.CertificateSHA256 != c2.CertificateSHA256 {
 			t.Fatal("a replayed older generation replaced the current key")
 		}
 	})
 
+	// 审查 M1：本机从没确认过的更早一次生成（服务端当时扣住没给）也不能把当前证书换回去
+	t.Run("older generation never seen locally is refused", func(t *testing.T) {
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
+		c1 := generateFor(t, "kgr_standby00014", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
+		c2 := generateFor(t, "kgr_standby00015", p.ed, binding(h.digest, 140, c1.CertificateSHA256), h.keys.X25519PublicKey())
+		serve(t, h, c2, "kgr_standby00015", p, h.roots) // 新备第一次见到的就是 C2
+		accepted(t, h)
+		serve(t, h, c1, "kgr_standby00014", p, h.roots)
+		refused(t, h, "replaces certificate")
+		if conf, _, _ := h.store.ActiveConfirmation(testfixture.PackageName); conf.CertificateSHA256 != c2.CertificateSHA256 {
+			t.Fatal("an older generation replaced the current key")
+		}
+	})
+
 	t.Run("revoked peer is no longer trusted", func(t *testing.T) {
-		h, p, _ := newStandby(t, harnessOptions{noConfirm: true})
+		h, p := newStandby(t, harnessOptions{noConfirm: true})
 		must(t, h.store.RevokePeer(p.name, "ops", "primary rebuilt"))
-		g := generateFor(t, "kgr_standby00011", p.ed, h.keys.X25519PublicKey())
-		h.server.items = []map[string]any{h.generatedItem(g, "kgr_standby00011", p.name, p.id, p.edPub(), h.roots, 40)}
-		h.useGeneratedKey(g)
-		must(t, h.runner.RunChecks(ctx))
+		g := generateFor(t, "kgr_standby00016", p.ed, binding(h.digest, 140, ""), h.keys.X25519PublicKey())
+		serve(t, h, g, "kgr_standby00016", p, h.roots)
 		refused(t, h, "does not trust")
 	})
 }
 
-// 主签名闸交回成功、写本机确认之前崩溃：重启后按本机签过的生成签名自动确认。
+// 主签名闸交回成功、写本机确认之前崩溃：重启后按本机签过的生成签名与密文里的确认参数自动确认。
 func TestPrimaryConfirmsItsOwnGenerationAfterACrash(t *testing.T) {
 	h := newHarness(t, harnessOptions{noConfirm: true})
-	g := generateFor(t, "kgr_crash0000001", h.keys.Ed25519, h.keys.X25519PublicKey())
-	h.server.items = []map[string]any{h.generatedItem(g, "kgr_crash0000001", "server-says-anything", "mch_signerA0001", h.keys.Ed25519PublicKey(), h.roots, 12)}
+	g := generateFor(t, "kgr_crash0000001", h.keys.Ed25519, binding(h.digest, 112, ""), h.keys.X25519PublicKey())
+	h.server.items = []map[string]any{h.generatedItem(g, "kgr_crash0000001", "server-says-anything", "mch_signerA0001", h.keys.Ed25519PublicKey(), h.roots)}
 	h.useGeneratedKey(g)
 	must(t, h.runner.RunChecks(context.Background()))
 	rep := h.lastReport()

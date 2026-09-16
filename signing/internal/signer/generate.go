@@ -37,6 +37,9 @@ type GenerateParams struct {
 	// KeyBits 为 0 时用 4096；测试用 2048 提速
 	KeyBits int
 	Now     time.Time
+	// Binding 是生成者本机为这把密钥写下的确认参数，写进每个 Box 的明文（被生成签名覆盖）。
+	// 签名闸生成时必填；别的签名闸没有它就不自动接受。
+	Binding *keystorebox.Generation
 }
 
 // GeneratedKeystore 是生成结果。明文原件与口令只在 GenerateKeystore 里存在，返回的只有密文与签名。
@@ -96,6 +99,7 @@ func GenerateKeystore(p GenerateParams) (GeneratedKeystore, error) {
 		P12Base64:         base64.StdEncoding.EncodeToString(generated.PKCS12),
 		StorePassword:     generated.Password,
 		KeyPassword:       generated.Password,
+		Generation:        p.Binding,
 	}
 	boxes := make([]keystorebox.Box, 0, len(p.Recipients))
 	for _, pub := range p.Recipients {

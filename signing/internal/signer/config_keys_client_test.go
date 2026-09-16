@@ -354,3 +354,16 @@ func TestHTTPClient(t *testing.T) {
 		t.Fatal("the client's String includes the token")
 	}
 }
+
+// keystore-checks 每个租户项可能带完整 Upload：响应超过普通接口的 4 MiB 上限也要能读。
+func TestKeystoreChecksAllowsLargeResponses(t *testing.T) {
+	pad := strings.Repeat("A", 6<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"machineId":"mch_signerA0001","signerRole":"standby","items":[],"padding":"` + pad + `"}`))
+	}))
+	defer srv.Close()
+	resp, err := NewHTTPClient(srv.URL, testToken, nil).KeystoreChecks(context.Background())
+	if err != nil || resp.MachineID != "mch_signerA0001" {
+		t.Fatalf("KeystoreChecks with a 6 MiB response: %+v %v", resp, err)
+	}
+}

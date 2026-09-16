@@ -94,6 +94,7 @@ func TestRecoveryKeyRoundTripWithSignerGeneration(t *testing.T) {
 	generated, err := signer.GenerateKeystore(signer.GenerateParams{
 		RequestID: "kgr_roundtrip01", TenantSlug: "AnyFun", PackageName: "com.anyfun.foundation", KeyAlias: "anyfun-release",
 		Recipients: [][]byte{signerKey.PublicKey().Bytes(), recoveryPub}, Generator: generator, KeyBits: 2048, Now: time.Now(),
+		Binding: &keystorebox.Generation{TrustRootsDigest: strings.Repeat("cd", 32), MinSDK: 24, TargetSDK: 28, FirstSignMaxVersionCode: 100},
 	})
 	if err != nil {
 		t.Fatal(err)

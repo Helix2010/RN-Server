@@ -44,8 +44,10 @@ const (
 
 const (
 	maxJSONResponse = 4 << 20
-	jsonTimeout     = 30 * time.Second
-	transferTimeout = 15 * time.Minute
+	// keystore-checks 每个租户项可能带完整 Upload（每个 Box 约 10 KiB）：单独放宽
+	maxChecksResponse = 64 << 20
+	jsonTimeout       = 30 * time.Second
+	transferTimeout   = 15 * time.Minute
 )
 
 // APIError 是服务端返回的 Problem Details。Detail 已经过清理，可以打印。
@@ -163,11 +165,10 @@ type CheckItem struct {
 	// 当前密钥由签名闸生成时，服务端给出生成者与生成签名（约定 3.4）。
 	Generator           *GeneratorView `json:"generator"`
 	GenerationSignature *string        `json:"generationSignature"`
-	// 验证生成签名还需要生成请求 id 与完整 Upload（签名覆盖全部 Box），首签上限需要服务端已发布的
-	// 最大 build 号。约定 3.4 没有列这三项，签名闸按这些名字读；缺了就不自动接受（退回 signer confirm）。
-	GenerationRequestID     *string             `json:"generationRequestId"`
-	Upload                  *keystorebox.Upload `json:"upload"`
-	PublishedMaxBuildNumber *int64              `json:"publishedMaxBuildNumber"`
+	// 验证生成签名还需要生成请求 id 与完整 Upload（签名覆盖全部 Box）。约定 3.4 没有列这两项，
+	// 签名闸按这些名字读；缺了就不自动接受（退回 signer confirm）。
+	GenerationRequestID *string             `json:"generationRequestId"`
+	Upload              *keystorebox.Upload `json:"upload"`
 }
 
 // GenerationRequest 是控制台发起的"生成签名密钥"。服务端的信任根只在首次信任时使用。
@@ -382,6 +383,10 @@ func (c *HTTPClient) newRequest(ctx context.Context, method, path string, body i
 }
 
 func (c *HTTPClient) doJSON(ctx context.Context, method, path string, attempt int, in, out any) (int, error) {
+	return c.doJSONLimit(ctx, method, path, attempt, in, out, maxJSONResponse)
+}
+
+func (c *HTTPClient) doJSONLimit(ctx context.Context, method, path string, attempt int, in, out any, limit int64) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, jsonTimeout)
 	defer cancel()
 	var body io.Reader
@@ -404,12 +409,12 @@ func (c *HTTPClient) doJSON(ctx context.Context, method, path string, attempt in
 		return 0, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONResponse+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return resp.StatusCode, err
 	}
-	if len(raw) > maxJSONResponse {
-		return resp.StatusCode, &ProtocolError{Msg: path + ": response body is larger than 4 MiB"}
+	if int64(len(raw)) > limit {
+		return resp.StatusCode, &ProtocolError{Msg: fmt.Sprintf("%s: response body is larger than %d MiB", path, limit>>20)}
 	}
 	if resp.StatusCode >= 300 {
 		return resp.StatusCode, parseProblem(resp.StatusCode, raw)
@@ -473,7 +478,7 @@ func (c *HTTPClient) RegisterKey(ctx context.Context, x25519Pub, ed25519Pub []by
 // KeystoreChecks 取回发给本机的全部密文。
 func (c *HTTPClient) KeystoreChecks(ctx context.Context) (ChecksResponse, error) {
 	var out ChecksResponse
-	_, err := c.doJSON(ctx, http.MethodGet, "/v1/signer/keystore-checks", 0, nil, &out)
+	_, err := c.doJSONLimit(ctx, http.MethodGet, "/v1/signer/keystore-checks", 0, nil, &out, maxChecksResponse)
 	return out, err
 }
 

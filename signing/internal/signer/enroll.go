@@ -543,7 +543,7 @@ func Enroll(ctx context.Context, opts EnrollOptions, api SetupAPI, host enrollHo
 
 	desc, err := api.Describe(ctx, opts.Code)
 	if err != nil {
-		return fmt.Errorf("look up the enrollment code: %w", err)
+		return fmt.Errorf("look up the enrollment code: %w (an expired or used code: reissue it in the console; if an earlier run of this command was interrupted after enrolling, the machine is already pending_key — delete it in the console and create it again)", err)
 	}
 	signerRole := ""
 	if desc.SignerRole != nil {
@@ -602,7 +602,7 @@ func Enroll(ctx context.Context, opts EnrollOptions, api SetupAPI, host enrollHo
 	}
 	enrolled, err := api.Enroll(ctx, opts.Code, x, ed)
 	if err != nil {
-		return fmt.Errorf("enroll this machine: %w", err)
+		return fmt.Errorf("enroll this machine: %w (if the server accepted the enrollment before the connection failed, the code is used up: delete the machine in the console, create it again and rerun the new install command)", err)
 	}
 	if !tokenPattern.MatchString(enrolled.Token) {
 		return &ProtocolError{Msg: "enroll returned a malformed machine token"}

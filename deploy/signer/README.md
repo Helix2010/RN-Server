@@ -160,6 +160,8 @@ sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-recovery --env-file /
 - 首签 versionCode 上限：本机对这个包名签过就取历史最大值 + 100，否则取服务端已发布的最大 build 号 + 100；
 - 生成 RSA 4096，只加密给本机、本机信任且服务端 active 的签名闸、本机信任且服务端未吊销的恢复公钥，签生成签名交回；
   服务端接受后本机写自动确认（`signer list` 里 `confirmedBy` 为 `auto:first-generation` 或 `auto:regenerated`）。
+- 主签名闸这次确认用的信任根摘要、SDK 下限、首签上限，以及被替换的证书（首次生成为空）写进每份密文的明文里。
+  密文被生成签名覆盖，服务端改不了。
 
 生成失败时控制台显示签名闸报回的原因：
 
@@ -170,10 +172,22 @@ sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-recovery --env-file /
 | `NOT_LOCAL_PRIMARY` | 控制台路由的主签名闸本机记录不是主：`signer promote`，或在控制台切回 |
 | `GENERATION_FAILED` | 看 detail（服务端拒收、信任根格式不对等）与主签名闸 journal |
 
-**备签名闸**在 `keystore-checks` 里拿到新密文时自动接受，条件是：生成者是本机信任的签名闸、生成签名验证通过、
-签名覆盖的上传文件里正是发给本机的这份、这张证书没为这个包名确认过（旧的生成被重放时拒绝）、信任根规则同上。
-写入的确认记为 `auto:peer-generated:<主签名闸机器名>`。不满足时控制台检查项显示原因，仍可在本机 `signer confirm`。
-离线导入的密钥（没有生成签名）照旧 `signer confirm`。
+**备签名闸**在 `keystore-checks` 里拿到新密文时自动接受。条件：
+
+- 生成者是本机信任的签名闸，生成签名验证通过；
+- 签名覆盖的上传文件里，正是发给本机的这一份；
+- 这张证书没为这个包名确认过；
+- 按密文里主签名闸写下的参数核对：
+  - 本机已有确认时，被替换的证书必须是本机当前的证书，信任根摘要必须与本机相同。这样可以挡住服务端重放更早的一次生成，
+    也挡住主备信任根不一致的情况。确认沿用本机的信任根与 SDK 下限。
+  - 本机没有确认时（新加的备），服务端给的信任根摘要必须等于主签名闸确认的摘要。确认采用主签名闸的 SDK 下限与首签上限。
+
+写入的确认记为 `auto:peer-generated:<主签名闸机器名>`。不满足时，控制台检查项显示原因，仍可在本机 `signer confirm`。
+
+以下情况需要人工处理：
+- 备签名闸离线期间主签名闸换了两次密钥：服务端只保留最新一份，它替换的不是备本机的证书，所以不会自动接受，
+  要在备上 `signer confirm`。
+- 离线导入的密钥（没有生成签名）：照旧 `signer confirm`。
 
 ## E. amos 现有部署迁移
 
@@ -201,6 +215,8 @@ sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-recovery --env-file /
    ```
 
 5. `signer list` 核对两台的 `trusted signing gates`、`trusted recovery keys`，抄录记录文件行数与末行哈希（第 8 节）。
+   注意：本机记录写入新类型（受信签名闸、恢复公钥、自动确认）之后，旧版 `signer` 会以 unknown record type 拒绝启动，
+   二进制不能再退回旧版本。
    控制台机器卡片的 `reportedTrust` 不再提示缺信任。
 6. 控制台对 AnyFun、Predict 各点一次「生成签名密钥」；两台检查项都显示已确认、主试签通过后，排第一个新签名的安装包，
    按上线手册验证并发布。
