@@ -82,8 +82,12 @@ func (e *Error) Error() string { return e.Code + ": " + e.Detail }
 
 // 错误码。
 const (
-	CodeMalformed                 = "AXML_MALFORMED"
-	CodeStringPool                = "AXML_STRING_POOL"
+	CodeMalformed  = "AXML_MALFORMED"
+	CodeStringPool = "AXML_STRING_POOL"
+	// CodeStringBudget：字符串池解码总量超过 Limits.MaxStringBytes（重叠偏移放大）。
+	CodeStringBudget = "AXML_STRING_POOL_BUDGET_EXCEEDED"
+	// CodeStringControl：池里的字符串含 U+0000、TAB/LF/CR 以外的 C0、DEL 或 C1 控制字符。
+	CodeStringControl             = "AXML_STRING_CONTROL_CHARACTER"
 	CodeUnknownFrameworkAttribute = "AXML_UNKNOWN_FRAMEWORK_ATTRIBUTE"
 	CodeAttributeIDMismatch       = "AXML_ATTRIBUTE_ID_MISMATCH"
 	CodeNamespace                 = "AXML_NAMESPACE"

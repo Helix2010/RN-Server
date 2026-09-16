@@ -2,6 +2,7 @@ package axml
 
 import (
 	"encoding/binary"
+	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -37,11 +38,16 @@ type Limits struct {
 	MaxElements   int // 元素总数
 	MaxDepth      int // 元素嵌套深度
 	MaxAttributes int // 单个元素的属性数
+	// MaxStringBytes 是字符串池解码结果的总字节数（同一偏移只算一次）。不同偏移可以指向互相重叠的
+	// 长串（例如一串长度头逐个递减、共用同一个结尾 NUL），逐个解码的总量随池大小平方增长；
+	// 没有这个总量上限，几 MiB 的清单就能让检查进程分配几 GiB。
+	MaxStringBytes int
 }
 
-// DefaultLimits 远大于真实清单（anyfun 1.3.16：34 KiB、约 400 个元素）。
+// DefaultLimits 远大于真实清单（anyfun 1.3.16：34 KiB、213 个字符串、约 400 个元素）。
+// MaxStringBytes 是 MaxSize 的 2 倍：不重叠的池解码后最多是文件大小的 1.5 倍（UTF-16 每单元最多 3 字节 UTF-8）。
 func DefaultLimits() Limits {
-	return Limits{MaxSize: 8 << 20, MaxStrings: 100000, MaxElements: 50000, MaxDepth: 64, MaxAttributes: 256}
+	return Limits{MaxSize: 8 << 20, MaxStrings: 100000, MaxElements: 50000, MaxDepth: 64, MaxAttributes: 256, MaxStringBytes: 16 << 20}
 }
 
 // Document 是解析结果。
@@ -337,33 +343,65 @@ func (d *decoder) parseStringPool(chunk []byte) error {
 		return errorf(CodeStringPool, "UTF-16 string data has odd length")
 	}
 	d.strings = make([]string, stringCount)
+	// 同一偏移只解码一次，结果共享（Go 字符串共享底层字节）；解码总字节数有上限
+	byOffset := make(map[uint32]string)
+	budget := d.lim.MaxStringBytes
 	for i := uint32(0); i < stringCount; i++ {
 		offset := binary.LittleEndian.Uint32(chunk[stringPoolHeaderSize+4*i:])
 		if uint64(offset) >= uint64(len(pool)) {
 			return errorf(CodeStringPool, "string %d offset is outside the pool", i)
+		}
+		if s, ok := byOffset[offset]; ok {
+			d.strings[i] = s
+			continue
 		}
 		var (
 			s   string
 			err *Error
 		)
 		if utf8Pool {
-			s, err = decodeUTF8String(pool[offset:], i)
+			s, err = decodeUTF8String(pool[offset:], i, budget)
 		} else {
 			if offset%2 != 0 {
 				return errorf(CodeStringPool, "string %d has an odd UTF-16 offset", i)
 			}
-			s, err = decodeUTF16String(pool[offset:], i)
+			s, err = decodeUTF16String(pool[offset:], i, budget)
 		}
 		if err != nil {
 			return err
 		}
+		budget -= len(s)
+		byOffset[offset] = s
 		d.strings[i] = s
 	}
 	return nil
 }
 
+// budgetError：解码到第 index 个字符串时总量超限。
+func budgetError(index uint32) *Error {
+	return errorf(CodeStringBudget, "decoding string %d exceeds the string pool budget; distinct offsets overlap into more text than a manifest can hold", index)
+}
+
+// allowedPoolRune：池里的字符串只允许 XML 1.0 能表达的字符，并排除 DEL 与 C1。
+//
+// aapt2 从 XML 源文件编出清单；XML 1.0 连字符引用都不能表达 U+0000 与 TAB/LF/CR 以外的 C0，
+// 所以真实清单里不会有。U+0000 尤其要拒：aapt2 与 Android 的部分路径在 NUL 处截断，而这里读出整串，
+// 同一个权限名或组件名两边看到的不一样。TAB/LF/CR 必须允许：expo-updates 的
+// CODE_SIGNING_CERTIFICATE 是多行 PEM（anyfun 1.3.16 的清单里有 29 个 LF）。
+// DEL 与 C1 与 ZIP 条目名规则一致一并拒绝（它们也是终端控制序列的来源）。
+func allowedPoolRune(r rune) bool {
+	switch {
+	case r == '\t' || r == '\n' || r == '\r':
+		return true
+	case r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0):
+		return false
+	}
+	return true
+}
+
 // decodeUTF8String：先 UTF-16 长度，再 UTF-8 字节长度，各 1 或 2 字节，后面是字节和一个 NUL。
-func decodeUTF8String(b []byte, index uint32) (string, *Error) {
+// budget 是剩余可解码字节数。
+func decodeUTF8String(b []byte, index uint32, budget int) (string, *Error) {
 	u16len, n, ok := decodeLength8(b)
 	if !ok {
 		return "", errorf(CodeStringPool, "string %d has a truncated length", index)
@@ -377,6 +415,9 @@ func decodeUTF8String(b []byte, index uint32) (string, *Error) {
 	if u8len >= len(b) {
 		return "", errorf(CodeStringPool, "string %d overruns the pool", index)
 	}
+	if u8len > budget {
+		return "", budgetError(index)
+	}
 	raw := b[:u8len]
 	if b[u8len] != 0 {
 		return "", errorf(CodeStringPool, "string %d is not NUL-terminated", index)
@@ -384,16 +425,18 @@ func decodeUTF8String(b []byte, index uint32) (string, *Error) {
 	if !utf8.Valid(raw) {
 		return "", errorf(CodeStringPool, "string %d is not valid UTF-8", index)
 	}
-	s := string(raw)
 	actual := 0
-	for _, r := range s {
+	for _, r := range string(raw) {
+		if !allowedPoolRune(r) {
+			return "", errorf(CodeStringControl, "string %d contains control character U+%04X", index, r)
+		}
 		actual += utf16.RuneLen(r)
 	}
 	if actual != u16len {
 		// Android 在这种情况下返回 null，我们却能读出字符串：分歧，拒绝
 		return "", errorf(CodeStringPool, "string %d declares %d UTF-16 units but has %d", index, u16len, actual)
 	}
-	return s, nil
+	return string(raw), nil
 }
 
 func decodeLength8(b []byte) (length, consumed int, ok bool) {
@@ -410,7 +453,10 @@ func decodeLength8(b []byte) (length, consumed int, ok bool) {
 	return length, 1, true
 }
 
-func decodeUTF16String(b []byte, index uint32) (string, *Error) {
+// decodeUTF16String：长度（1 或 2 个单元），后面是 UTF-16LE 单元和一个 NUL 单元。
+// 第一遍只校验（代理对、控制字符）并算出 UTF-8 字节数，核对 budget 之后才分配，第二遍写出；
+// 不分配中间的 []uint16 / []rune。
+func decodeUTF16String(b []byte, index uint32, budget int) (string, *Error) {
 	if len(b) < 2 {
 		return "", errorf(CodeStringPool, "string %d has a truncated length", index)
 	}
@@ -427,26 +473,55 @@ func decodeUTF16String(b []byte, index uint32) (string, *Error) {
 	if uint64(length)*2+2 > uint64(len(b)) {
 		return "", errorf(CodeStringPool, "string %d overruns the pool", index)
 	}
-	units := make([]uint16, length)
-	for i := range units {
-		units[i] = binary.LittleEndian.Uint16(b[2*i:])
-	}
 	if binary.LittleEndian.Uint16(b[2*length:]) != 0 {
 		return "", errorf(CodeStringPool, "string %d is not NUL-terminated", index)
 	}
-	for i := 0; i < len(units); i++ {
-		u := units[i]
-		switch {
-		case u >= 0xd800 && u < 0xdc00:
-			if i+1 >= len(units) || units[i+1] < 0xdc00 || units[i+1] >= 0xe000 {
-				return "", errorf(CodeStringPool, "string %d has an unpaired surrogate", index)
-			}
-			i++
-		case u >= 0xdc00 && u < 0xe000:
-			return "", errorf(CodeStringPool, "string %d has an unpaired surrogate", index)
-		}
+	if length > budget { // 每个单元至少产出 1 字节
+		return "", budgetError(index)
 	}
-	return string(utf16.Decode(units)), nil
+	size := 0
+	for i := 0; i < length; {
+		r, consumed, err := utf16RuneAt(b, i, length, index)
+		if err != nil {
+			return "", err
+		}
+		i += consumed
+		size += utf8.RuneLen(r)
+	}
+	if size > budget {
+		return "", budgetError(index)
+	}
+	var out strings.Builder // Grow 一次、String 不再拷贝
+	out.Grow(size)
+	for i := 0; i < length; {
+		r, consumed, _ := utf16RuneAt(b, i, length, index)
+		i += consumed
+		out.WriteRune(r)
+	}
+	return out.String(), nil
+}
+
+// utf16RuneAt 读第 i 个单元开始的一个字符，返回它占的单元数（1 或 2）。
+func utf16RuneAt(b []byte, i, length int, index uint32) (rune, int, *Error) {
+	u := rune(binary.LittleEndian.Uint16(b[2*i:]))
+	r, consumed := u, 1
+	switch {
+	case u >= 0xd800 && u < 0xdc00:
+		if i+1 >= length {
+			return 0, 0, errorf(CodeStringPool, "string %d has an unpaired surrogate", index)
+		}
+		lo := rune(binary.LittleEndian.Uint16(b[2*(i+1):]))
+		if lo < 0xdc00 || lo >= 0xe000 {
+			return 0, 0, errorf(CodeStringPool, "string %d has an unpaired surrogate", index)
+		}
+		r, consumed = utf16.DecodeRune(u, lo), 2
+	case u >= 0xdc00 && u < 0xe000:
+		return 0, 0, errorf(CodeStringPool, "string %d has an unpaired surrogate", index)
+	}
+	if !allowedPoolRune(r) {
+		return 0, 0, errorf(CodeStringControl, "string %d contains control character U+%04X", index, r)
+	}
+	return r, consumed, nil
 }
 
 func (d *decoder) parseStartElement(chunk, ext []byte, scopes []string) (*Element, uint32, uint32, error) {
