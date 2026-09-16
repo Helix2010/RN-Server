@@ -2009,9 +2009,14 @@ func validConfig(v map[string]any) bool {
 	policy := object(v["updatePolicy"])
 	// 版本号不是 semver 时，compareVersion 会把非法值当成 "1.0.0"，强制升级静默失效。
 	// minSupportedVersion / latestVersion 按平台各自校验——两个平台的值都得是合法
-	// semver，缺一个都不行，否则会有一个平台悄悄用上 compareVersion 的兜底值
-	minVersions := object(policy["minSupportedVersion"])
-	latestVersions := object(policy["latestVersion"])
+	// semver，缺一个都不行，否则会有一个平台悄悄用上 compareVersion 的兜底值。
+	// 用 versionPolicyShape 只摊平新旧两种形状，不像 normalizeUpdatePolicy 那样
+	// 拿另一个平台或硬编码默认值兜底空值——写路径要能看见"提交了空字符串/漏了一个
+	// 平台"这种明确的坏输入并拒绝，不能像读路径那样把它悄悄填成看似合法的值。
+	// 但旧的单值字符串形状（拆分之前的管理端、还没升级的调用方）仍然要接受，
+	// 否则读路径能容忍的配置在写路径上无法通过，整份保存都会被拒
+	minVersions := versionPolicyShape(policy["minSupportedVersion"])
+	latestVersions := versionPolicyShape(policy["latestVersion"])
 	policyValid := policy != nil &&
 		validVersion(text(minVersions["android"], "")) && validVersion(text(minVersions["ios"], "")) &&
 		validVersion(text(latestVersions["android"], "")) && validVersion(text(latestVersions["ios"], ""))
@@ -2034,19 +2039,27 @@ func normalizeModules(value map[string]any) map[string]any {
 	return map[string]any{"predict": truth(value["predict"]), "dex": truth(value["dex"])}
 }
 
-// normalizeUpdatePolicy 把 minSupportedVersion / latestVersion 收敛成 {android, ios} 对象。
+// versionPolicyShape 把 minSupportedVersion / latestVersion 摊平成 {android, ios}，
+// 只认新旧两种形状（单值字符串 / 按平台的对象），不做任何默认值兜底——空值该拒绝
+// 还是该兜底由调用方决定，这里只负责"认出这是哪种形状"。
+func versionPolicyShape(raw any) map[string]any {
+	if flat, ok := raw.(string); ok {
+		return map[string]any{"android": flat, "ios": flat}
+	}
+	return object(raw)
+}
+
+// normalizeUpdatePolicy 把 minSupportedVersion / latestVersion 收敛成 {android, ios} 对象，
+// 缺值时用默认值或另一个平台的值兜底——读路径必须总能产出可用的配置。
 //
 // 存量租户存的还是旧的单值字符串（按平台拆分之前的形态）：这里原样套到两个平台，
 // 强更判定结果和拆分之前完全一致，不需要一次性数据库迁移——appConfigView 是
 // bootstrap 和管理端配置视图共用的唯一入口，旧数据永远先过这一层再被用到。
 func normalizeUpdatePolicy(value map[string]any) map[string]any {
 	normalizeField := func(raw any, fallback string) map[string]any {
-		if flat, ok := raw.(string); ok && flat != "" {
-			return map[string]any{"android": flat, "ios": flat}
-		}
-		obj := object(raw)
-		android := text(obj["android"], "")
-		ios := text(obj["ios"], "")
+		shaped := versionPolicyShape(raw)
+		android := text(shaped["android"], "")
+		ios := text(shaped["ios"], "")
 		if android == "" {
 			android = text(ios, fallback)
 		}
