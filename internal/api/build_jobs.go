@@ -715,6 +715,41 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
 		return
 	}
+	// 下发的分支必须是我们自己那一个，不认库里那一列（`build-concurrency-2026-09-15.md` §9，
+	// 平台备份设计 §11 把这条列为「必须同时修的」）。
+	//
+	// 写入路径上每一条用的都是 buildGitRef 这个常量，所以这一列出现别的值只有
+	// 两种可能：常量上线之前的历史脏数据，或者**有人直接写了库**。后者是一条
+	// 完整的提权路径，而且绕开了整个备份方案的前提：不用改任何收件人配置，
+	// 让打包机检出一个带后门的提交、以 builder 身份读走 agent-key 就行——
+	// 而 agent-key 能解开每一个租户的签名密钥。
+	//
+	// 打包机侧的 validateGitRef 只挡形状（选项注入、路径穿越），挡不住一个
+	// 形状完全合法的分支名。真正的闸必须在这里：服务端不把它下发出去。
+	//
+	// 判死而不是改写成 main：改写会让这条任务构建出和记录不符的东西，
+	// 而记录是事后追查唯一的依据。判死并写明原因，让人看得见发生过什么。
+	if job.GitRef != buildGitRef {
+		if _, err := tx.ExecContext(c.Request.Context(),
+			`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
+			"refusing to build a git ref that is not "+buildGitRef, now, id); err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
+			return
+		}
+		// 这是「有人写了库」的信号，不是日常噪音。审计要能查到
+		slog.Error("refused to dispatch a build job whose git ref is not the fixed branch",
+			"jobId", id, "tenant", job.TenantID, "agent", agent)
+		s.auditNow(newAudit(platformTenantID, "system-build", "build_job_ref_refused", "build-job", id,
+			"a build job carried a git ref that is not the fixed branch", requestID(c),
+			map[string]any{"expected": buildGitRef, "jobId": id}))
+		c.Status(http.StatusNoContent)
+		return
+	}
+
 	// 解析不出租户（租户被删了、任务是脏数据）时不能把这条任务留在队列里报 500：
 	// 认领总是取最早那条，一条解析不了的任务会把**整个队列**堵死，而队列是跨租户的。
 	// 直接判它失败，让代理立刻去拿下一条。
