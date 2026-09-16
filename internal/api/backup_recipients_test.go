@@ -163,3 +163,17 @@ func indexOf(haystack, needle string) int {
 	}
 	return -1
 }
+
+// 实例 ID 进对象键，必须显式配。启动时那道检查只在 env 里配了桶时才跑——桶改到
+// 控制台上配之后，它就不跑了，于是产出备份那一刻要再拦一次。
+func TestDBBackupRunRefusesWithoutAnInstanceID(t *testing.T) {
+	s := backupServer(t)
+	s.cfg.Backup.InstanceID = ""
+	_, err := s.createBackupRun(context.Background(), "manual", "tester", "no instance id")
+	if err == nil {
+		t.Fatal("没有实例 ID 却建出了备份——包会落成没有实例段的键，和别的实例混在一起")
+	}
+	if !contains(err.Error(), "BACKUP_INSTANCE_ID") {
+		t.Errorf("报错没说清缺的是哪个键: %v", err)
+	}
+}

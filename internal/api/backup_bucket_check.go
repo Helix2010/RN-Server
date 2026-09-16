@@ -25,11 +25,13 @@ type BackupBucketCheck struct {
 
 // BackupBucketCheckResult 是一次完整的桶检查。
 type BackupBucketCheckResult struct {
-	OK       bool   `json:"ok"`
-	Provider string `json:"provider"`
-	Bucket   string `json:"bucket"`
-	Prefix   string `json:"prefix"`
-	ProbeKey string `json:"probeKey"`
+	OK         bool   `json:"ok"`
+	Provider   string `json:"provider"`
+	Endpoint   string `json:"endpoint"`
+	Bucket     string `json:"bucket"`
+	Prefix     string `json:"prefix"`
+	InstanceID string `json:"instanceId"`
+	ProbeKey   string `json:"probeKey"`
 	// Checks 固定三项、固定顺序：写对象、读对象、读版本控制状态
 	Checks           []BackupBucketCheck `json:"checks"`
 	Versioning       bool                `json:"versioning"`
@@ -40,12 +42,7 @@ type BackupBucketCheckResult struct {
 // backupProbeKey 放在单独的 _probe/ 下面：凭据故意不给删除权限，探针删不掉，
 // 单独一个目录才好让桶上的生命周期规则把它们清掉，也不会和真包的名字混在一起。
 func backupProbeKey(prefix, instance string) string {
-	parts := []string{}
-	if p := strings.Trim(strings.TrimSpace(prefix), "/"); p != "" {
-		parts = append(parts, p)
-	}
-	parts = append(parts, instance, "_probe", "probe-"+randomID(8)+".txt")
-	return strings.Join(parts, "/")
+	return joinObjectKey(prefix, instance, "_probe", "probe-"+randomID(8)+".txt")
 }
 
 // runBackupBucketChecks 分别测一次备份真正要用的三项权限。
@@ -65,8 +62,8 @@ func runBackupBucketChecks(ctx context.Context, client objectstore.Client,
 	now := iso(time.Now().UTC())
 	provider := bucket.Provider
 	result := BackupBucketCheckResult{
-		Provider: provider, Bucket: bucket.Bucket, Prefix: bucket.Prefix, CheckedAt: now,
-		ProbeKey: backupProbeKey(bucket.Prefix, instanceID),
+		Provider: provider, Endpoint: bucket.Endpoint, Bucket: bucket.Bucket, Prefix: bucket.Prefix,
+		InstanceID: instanceID, CheckedAt: now, ProbeKey: backupProbeKey(bucket.Prefix, instanceID),
 	}
 	check := func(action, label string) BackupBucketCheck {
 		return BackupBucketCheck{Action: action, Label: label,

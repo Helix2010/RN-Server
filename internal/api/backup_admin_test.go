@@ -16,7 +16,7 @@ import (
 // 能把它收掉。没有它的话 30 分钟内一次备份都做不了，而他手上什么都做不了
 func TestDBForceFailFreesTheInFlightSlot(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{})
+	s.cfg = withBackupPrerequisites(t, config.Config{})
 	run := mustCreate(t, s, "stuck")
 	if _, _, err := s.claimBackupRun(context.Background(), "builder"); err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestDBForceFailFreesTheInFlightSlot(t *testing.T) {
 // 强制判失败对一条已经结束的记录要 409，不能把 succeeded 翻回去
 func TestDBForceFailRefusesAFinishedBackup(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{})
+	s.cfg = withBackupPrerequisites(t, config.Config{})
 	run := mustCreate(t, s, "done")
 	if _, _, err := s.claimBackupRun(context.Background(), "builder"); err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestDBForceFailRefusesAFinishedBackup(t *testing.T) {
 // 409 必须带上占着闸那条的 seq——运维没有别的出口去看是哪一条
 func TestDBRunNowTellsYouWhichBackupIsHoldingTheSlot(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{
+	s.cfg = withBackupPrerequisites(t, config.Config{
 		AdminPasswordHash: testAdminPasswordHash,
 		Backup:            config.Backup{Bucket: config.BackupBucket{Bucket: "b"}},
 	})
@@ -87,7 +87,7 @@ func TestDBRunNowTellsYouWhichBackupIsHoldingTheSlot(t *testing.T) {
 // 备份没配就不该能点。返回 412 而不是建一条注定失败的待办
 func TestDBRunNowRefusesWhenBackupsAreNotConfigured(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{AdminPasswordHash: testAdminPasswordHash})
+	s.cfg = withBackupPrerequisites(t, config.Config{AdminPasswordHash: testAdminPasswordHash})
 	c, recorder := testContext(t, platformTenantID, "POST", "/x",
 		map[string]any{"reason": "try it anyway", "confirm": true,
 			"password": testAdminPassword})
@@ -100,7 +100,7 @@ func TestDBRunNowRefusesWhenBackupsAreNotConfigured(t *testing.T) {
 // 下载：未知 seq、未知 pair 都要 404，且**不产生任何对象读**
 func TestDBDownloadRefusesUnknownSeqAndPair(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{})
+	s.cfg = withBackupPrerequisites(t, config.Config{})
 	run := mustCreate(t, s, "for download")
 	if _, _, err := s.claimBackupRun(context.Background(), "builder"); err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func TestDBSchedulerDecidesFromTheDatabaseNotTheTickerPhase(t *testing.T) {
 	if _, err := db.Exec(`DELETE FROM platform_backups`); err != nil {
 		t.Fatal(err)
 	}
-	cfg := withBackupRecipients(t, config.Config{Backup: config.Backup{
+	cfg := withBackupPrerequisites(t, config.Config{Backup: config.Backup{
 		InstanceID: "test-1", IntervalHours: 24,
 		Bucket: config.BackupBucket{Bucket: "b", Region: "r"},
 	}})
@@ -284,7 +284,7 @@ func itoa(seq uint64) string { return strconv.FormatUint(seq, 10) }
 // 机器写下的记录，真相要等到第一次构建才暴露
 func TestDBResetKeystoreChecksClearsEveryTenantRecord(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{})
+	s.cfg = withBackupPrerequisites(t, config.Config{})
 	ctx := context.Background()
 	for _, tenant := range []string{"100000001", "100000002"} {
 		if _, err := s.db.ExecContext(ctx,
@@ -323,7 +323,7 @@ func TestDBResetKeystoreChecksClearsEveryTenantRecord(t *testing.T) {
 // 没有 confirm 或原因太短时不执行：这条动作会让全平台的密钥状态一起变成「待验」
 func TestDBResetKeystoreChecksNeedsConfirmAndReason(t *testing.T) {
 	s := backupServer(t)
-	s.cfg = withBackupRecipients(t, config.Config{})
+	s.cfg = withBackupPrerequisites(t, config.Config{})
 	for _, body := range []map[string]any{
 		{"reason": "restored onto a new build machine"},
 		{"confirm": true},

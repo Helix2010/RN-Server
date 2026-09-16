@@ -33,7 +33,7 @@ func backupServer(t *testing.T) *server {
 		t.Fatalf("清掉上一轮的记录: %v", err)
 	}
 	srv := &server{db: db}
-	srv.cfg = withBackupRecipients(t, config.Config{})
+	srv.cfg = withBackupPrerequisites(t, config.Config{})
 	return srv
 }
 
@@ -41,7 +41,7 @@ func backupServer(t *testing.T) *server {
 // 都得先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
 //
 // 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光是生成密钥就要几十秒。
-// withBackupRecipients 把三把恢复公钥补进 cfg。
+// withBackupPrerequisites 把产出备份的前置条件（三把恢复公钥、实例 ID）补进 cfg。
 //
 // 三把公钥是产出备份的硬前置（§2.1 没有降级模式），所以每个用到备份的测试都得
 // 先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
@@ -51,8 +51,12 @@ func backupServer(t *testing.T) *server {
 // 还没有公钥」。这么写，换 cfg 的地方自然带着它们。
 //
 // 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光生成密钥就要几十秒。
-func withBackupRecipients(t *testing.T, cfg config.Config) config.Config {
+func withBackupPrerequisites(t *testing.T, cfg config.Config) config.Config {
 	t.Helper()
+	// 实例 ID 也是产出备份的前置：它进对象键。测试自己指定了的不覆盖
+	if cfg.Backup.InstanceID == "" {
+		cfg.Backup.InstanceID = "test-instance"
+	}
 	keys := testRecoveryPublicKeys(t)
 	for i, name := range backupcontainer.SlotNames {
 		parsed, err := config.ParseBackupRecipient(keys[i])

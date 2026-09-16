@@ -101,6 +101,15 @@ func backupHolderName(value string) string {
 
 var backupInstanceIDPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
+// ValidBackupInstanceID 说明 BACKUP_INSTANCE_ID 是不是一个能进对象键的值。
+//
+// 启动时的那道检查只在 Enabled()（env 里配了桶或开了定时）时生效；桶改到控制台上
+// 配之后，env 里可以一个备份的键都没有，那道检查就不跑了。所以产出备份那一刻还要
+// 再拦一次，用的是同一条规则。
+func ValidBackupInstanceID(value string) bool {
+	return backupInstanceIDPattern.MatchString(value)
+}
+
 const (
 	backupIntervalMin = 6
 	backupIntervalMax = 168

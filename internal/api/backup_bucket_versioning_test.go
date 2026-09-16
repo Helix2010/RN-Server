@@ -169,3 +169,22 @@ func TestBackupBucketTestReportsEachPermission(t *testing.T) {
 		}
 	})
 }
+
+// 前缀和实例 ID 都为空时，拼出来的键不能以 / 开头：那在控制台里显示成一个名字为空的
+// 目录，有的兼容存储还会把 / 当成字面量，同一个包在两家存储上的键就对不上了。
+// amos 上第一次跑 backup-bucket-test 时探针就落在了 "/_probe/…"。
+func TestBackupObjectKeysNeverStartWithASlash(t *testing.T) {
+	cases := map[string]string{
+		backupObjectKey("", "", 1, "AB", ".rnbk"):          "backup-00000001-AB.rnbk",
+		backupObjectKey("prod/", "inst", 1, "AB", ".rnbk"): "prod/inst/backup-00000001-AB.rnbk",
+		backupObjectKey("/prod/", "", 2, "BC", ".rnbk"):    "prod/backup-00000002-BC.rnbk",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("对象键 %q，应为 %q", got, want)
+		}
+	}
+	if probe := backupProbeKey("", ""); strings.HasPrefix(probe, "/") || !strings.HasPrefix(probe, "_probe/") {
+		t.Errorf("探针键不该以 / 开头: %q", probe)
+	}
+}

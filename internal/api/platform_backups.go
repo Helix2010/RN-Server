@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
+	"github.com/Helix2010/RN-Server/internal/config"
 	"strings"
 	"time"
 
@@ -117,6 +118,9 @@ func scanBackupRun(row interface{ Scan(...any) error }) (backupRun, error) {
 // 接近人当时在做的事。
 var errBackupRecipientsIncomplete = errors.New("backup recovery keys are incomplete")
 
+// errBackupInstanceIDMissing 说明 BACKUP_INSTANCE_ID 没配。
+var errBackupInstanceIDMissing = errors.New("backup instance id is not configured")
+
 // createBackupRun 建一条待办。
 //
 // **单条 INSERT**，不包在有外部调用的事务里。实测过：把状态翻成 succeeded 的
@@ -135,6 +139,13 @@ func (s *server) createBackupRun(ctx context.Context, trigger, requestedBy, reas
 	if len(missing) > 0 {
 		return backupRun{}, fmt.Errorf("%w: 槽位 %s 还没有公钥",
 			errBackupRecipientsIncomplete, strings.Join(missing, "、"))
+	}
+	// 实例 ID 进对象键，而且**必须显式配**：从主机名推导的话，改名或在新机器上恢复之后
+	// 前缀就变了。启动时那道检查只在 env 里配了桶时才跑，桶改到控制台上配之后它就不跑了
+	// ——于是包会落成 "backup-00000001-AB.rnbk" 这种没有实例段的键，和另一台实例的包混在一起
+	if !config.ValidBackupInstanceID(s.cfg.Backup.InstanceID) {
+		return backupRun{}, fmt.Errorf("%w: BACKUP_INSTANCE_ID 没配或格式不对（要求 ^[a-z0-9-]{1,32}$），"+
+			"写进 /etc/rn-foundation.env 后重启服务端", errBackupInstanceIDMissing)
 	}
 
 	id := "pbk_" + randomID(16)

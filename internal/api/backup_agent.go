@@ -525,11 +525,21 @@ func (s *server) backupBucketClient() (objectstore.Client, error) {
 // backupObjectKey 拼对象键。它只在**上传**时用一次，结果存进 objects 那一列；
 // 下载时从行上读，不重新拼——主机改名或在新机器上恢复之后前缀就变了
 func backupObjectKey(prefix, instance string, seq uint64, pair, suffix string) string {
-	parts := []string{}
-	if p := strings.Trim(strings.TrimSpace(prefix), "/"); p != "" {
-		parts = append(parts, p)
+	return joinObjectKey(prefix, instance, fmt.Sprintf("backup-%08d-%s%s", seq, pair, suffix))
+}
+
+// joinObjectKey 拼对象键，跳过空段。
+//
+// 不跳过的话，前缀和实例 ID 都为空时拼出来的是 "/backup-…"：以 / 开头的键在
+// S3 上合法，但在控制台里显示成一个名字为空的目录，而有的兼容存储把它当成字面量，
+// 同一个包在两家存储上的键就对不上了。
+func joinObjectKey(segments ...string) string {
+	parts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if trimmed := strings.Trim(strings.TrimSpace(segment), "/"); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
 	}
-	parts = append(parts, instance, fmt.Sprintf("backup-%08d-%s%s", seq, pair, suffix))
 	return strings.Join(parts, "/")
 }
 
