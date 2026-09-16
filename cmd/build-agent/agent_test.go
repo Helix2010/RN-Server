@@ -635,3 +635,34 @@ func TestUploadRetriesTransientFailuresButNotRejections(t *testing.T) {
 		t.Fatalf("409 被重试了 %d 次", attempts["release"])
 	}
 }
+
+// git ref 是**服务端从库里读出来下发的**，而它会被原样交给 git。
+// 同一个函数里 TenantDirectory 已经这么挡过一次，理由一样：两端分属不同的
+// 信任域，各自把住自己那一侧。
+func TestValidateGitRef(t *testing.T) {
+	for _, ok := range []string{
+		"main", "release/2026-09", "v1.2.3", "feat/backup_recovery",
+		"0123456789abcdef0123456789abcdef01234567",
+	} {
+		if err := validateGitRef(ok); err != nil {
+			t.Fatalf("%q 是正常的 ref，不该被拒: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"",                    // 空
+		"--force",             // 选项注入：git 会把它当成 worktree add 的选项
+		"-b",                  //
+		"--upload-pack=sh -c", //
+		"main;rm -rf /",       // 元字符
+		"main branch",         // 空格
+		"../../etc/passwd",    // 路径穿越
+		"a..b",                // 区间语法，不是单个 committish
+		"main\nrm -rf /",      // 换行
+		"$(id)",               //
+		"`id`",                //
+	} {
+		if err := validateGitRef(bad); err == nil {
+			t.Fatalf("%q 应当被拒绝", bad)
+		}
+	}
+}

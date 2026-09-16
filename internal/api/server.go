@@ -209,6 +209,9 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	backup.POST("/storage/test", s.testBackupBucket)
 	backup.POST("/:seq/force-fail", s.forceFailBackup)
 	backup.GET("/:seq/:pair/download", s.downloadBackup)
+	// 恢复之后让打包机把每个租户重验一遍。不做这一步，控制台显示的是灾难前
+	// 那台机器写下的记录（设计 §11）
+	platform.POST("/build-agent/keystore-checks/reset", s.resetKeystoreChecks)
 	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)

@@ -354,3 +354,37 @@ func (s *server) testBackupBucket(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "bucket": s.cfg.Backup.Bucket.Bucket, "probeKey": key,
 		"checkedAt": iso(time.Now().UTC())})
 }
+
+// resetKeystoreChecks 把每个租户的签名密钥校验结果作废，让打包机重新验一遍。
+//
+// **恢复之后必须做这件事。** 待验清单会跳过「这一版已经验过」的租户
+// （build_keystore_check.go），而恢复场景里数据库一个字都没动——于是控制台显示
+// 「正常」，看的却是灾难前那台机器写下的记录。真相要等到第一次构建才暴露，
+// 而那时明文 keystore 多半已经不在手边了。
+//
+// 做成接口而不是让人连库跑 DELETE（设计 §11）：灾难当天每少一步手工 SQL，
+// 就少一次敲错表名的机会，而且这一步会进审计。
+func (s *server) resetKeystoreChecks(c *gin.Context) {
+	var body struct {
+		Reason  string `json:"reason"`
+		Confirm bool   `json:"confirm"`
+	}
+	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
+		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK_RESET",
+			"reason and confirm=true are required")
+		return
+	}
+	result, err := s.db.ExecContext(c.Request.Context(),
+		`DELETE FROM app_configs WHERE config_key=?`, buildKeystoreCheckConfigKey)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "KEYSTORE_CHECK_RESET_FAILED",
+			"Unable to reset the keystore verification state")
+		return
+	}
+	cleared, _ := result.RowsAffected()
+	s.auditNow(newAudit(platformTenantID, actor(c), "keystore_checks_reset", "app-config",
+		buildKeystoreCheckConfigKey, strings.TrimSpace(body.Reason), requestID(c),
+		map[string]any{"cleared": cleared}))
+	c.JSON(http.StatusOK, gin.H{"cleared": cleared,
+		"detail": "the build agent will re-verify every tenant on its next idle poll"})
+}

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -120,6 +121,18 @@ func prepareWorktree(ctx context.Context, cfg config, api *client, job claimedJo
 	// 各自把住自己那一侧是这类路径拼接的常规做法。
 	if strings.ContainsAny(job.TenantDirectory, `/\`) || strings.Contains(job.TenantDirectory, "..") {
 		return "", "", nil, fmt.Errorf("refusing a tenant directory that escapes tenants/: %q", job.TenantDirectory)
+	}
+	// git ref 同样会被原样交给 git，而它是**服务端从库里读出来下发的**——同一个
+	// 函数上面几行已经为 TenantDirectory 做过这件事，理由一样：两端分属不同的
+	// 信任域，各自把住自己那一侧。
+	//
+	// 最直接的危害是选项注入：`git worktree add --detach <path> <ref>` 里，一个
+	// 以 `-` 开头的 ref 会被 git 当成选项。这条校验挡住它，也挡住路径穿越。
+	//
+	// 它**挡不住**「攻击者已经能往 RN-App 推一个带后门的提交」那种情况——那要靠
+	// 把 ref 限定到白名单，是另一个设计决定（build-concurrency-2026-09-15 §9）。
+	if err := validateGitRef(job.GitRef); err != nil {
+		return "", "", nil, err
 	}
 	worktree := filepath.Join(cfg.Workspace, job.ID)
 	env := os.Environ()
@@ -445,4 +458,29 @@ func utf16LE(text string) []byte {
 		out = append(out, text[i], 0)
 	}
 	return out
+}
+
+// gitRefPattern 是我们愿意交给 git 的 ref 形状：分支名、标签、40 位 sha。
+var gitRefPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$`)
+
+func validateGitRef(ref string) error {
+	if !gitRefPattern.MatchString(ref) {
+		// 不回显整个值：它来自服务端，长度不受控
+		return fmt.Errorf("refusing a git ref that is not a plain branch, tag or sha (%d bytes, starts with %q)",
+			len(ref), firstRunes(ref, 8))
+	}
+	// `..` 在 ref 里是合法语法（a..b 是区间），但 worktree add 要的是单个
+	// committish，而它同时也是路径穿越的形状
+	if strings.Contains(ref, "..") {
+		return fmt.Errorf("refusing a git ref containing '..'")
+	}
+	return nil
+}
+
+func firstRunes(value string, n int) string {
+	runes := []rune(value)
+	if len(runes) <= n {
+		return string(runes)
+	}
+	return string(runes[:n]) + "…"
 }

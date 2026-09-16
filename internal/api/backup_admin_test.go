@@ -222,3 +222,61 @@ func TestDBSchedulerDoesNothingWhenTheIntervalIsZero(t *testing.T) {
 }
 
 func itoa(seq uint64) string { return strconv.FormatUint(seq, 10) }
+
+// 恢复之后必须把每个租户的校验结果作废：待验清单会跳过「这一版已经验过」的租户，
+// 而恢复场景里数据库一个字都没动——于是控制台显示「正常」，看的却是灾难前那台
+// 机器写下的记录，真相要等到第一次构建才暴露
+func TestDBResetKeystoreChecksClearsEveryTenantRecord(t *testing.T) {
+	s := backupServer(t)
+	s.cfg = config.Config{}
+	ctx := context.Background()
+	for _, tenant := range []string{"100000001", "100000002"} {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+			 VALUES(?,?,'{"version":1,"ok":true}',1,'test',UTC_TIMESTAMP(3))
+			 ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)`,
+			tenant, buildKeystoreCheckConfigKey); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = s.db.Exec(`DELETE FROM app_configs WHERE config_key=?`, buildKeystoreCheckConfigKey)
+	})
+
+	c, recorder := testContext(t, platformTenantID, "POST",
+		"/v1/admin/platform/build-agent/keystore-checks/reset",
+		map[string]any{"reason": "restored onto a new build machine", "confirm": true})
+	s.resetKeystoreChecks(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("重置应当成功: %d %s", recorder.Code, recorder.Body.String())
+	}
+	body := decodeBody(t, recorder)
+	if int(body["cleared"].(float64)) < 2 {
+		t.Fatalf("两个租户的记录都该被清掉: %v", body)
+	}
+	var left int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM app_configs WHERE config_key=?`, buildKeystoreCheckConfigKey).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 {
+		t.Fatalf("还剩 %d 条校验记录没清", left)
+	}
+}
+
+// 没有 confirm 或原因太短时不执行：这条动作会让全平台的密钥状态一起变成「待验」
+func TestDBResetKeystoreChecksNeedsConfirmAndReason(t *testing.T) {
+	s := backupServer(t)
+	s.cfg = config.Config{}
+	for _, body := range []map[string]any{
+		{"reason": "restored onto a new build machine"},
+		{"confirm": true},
+		{"reason": "x", "confirm": true},
+	} {
+		c, recorder := testContext(t, platformTenantID, "POST", "/x", body)
+		s.resetKeystoreChecks(c)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%v 应当被拒绝，得到 %d", body, recorder.Code)
+		}
+	}
+}

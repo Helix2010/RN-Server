@@ -270,7 +270,19 @@ build-agent show-key
 
 输出的指纹必须等于 `+"`%s`"+`。不等就是文件放错了位置。
 
-让下一轮校验重新跑一次（不做这步，看到的是灾难前那台机器写下的旧记录）：
+让下一轮校验重新跑一次。**不做这步，控制台显示的是灾难前那台机器写下的旧记录**，
+而真相要等到第一次构建才暴露——那时明文 keystore 多半已经不在手边了：
+
+`+"```bash"+`
+curl -sS -X POST \
+  -H "x-admin-key: $ADMIN_API_KEY" \
+  -H "Host: <租户域名>" \
+  -H "content-type: application/json" \
+  -d '{"reason":"restored onto a new build machine","confirm":true}' \
+  http://127.0.0.1:13080/v1/admin/platform/build-agent/keystore-checks/reset
+`+"```"+`
+
+连不上服务端时的兜底（直接连库）：
 
 `+"```sql"+`
 DELETE FROM app_configs WHERE config_key='build.keystore.check';
