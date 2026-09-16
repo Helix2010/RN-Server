@@ -246,11 +246,13 @@ func unsealKeystores(cfg config, items []sealedKeystoreItem) (map[string][]byte,
 		if err := json.Unmarshal(item.SealedKeystore, &sealed); err != nil {
 			return nil, nil, fmt.Errorf("tenant %s: the sealed keystore is not readable: %w", item.Tenant, err)
 		}
-		bundle, err := buildkeystore.OpenWith(sealed, cfg.AgentPrivateKey)
+		// 和构建走同一个解法：迁移之前存下的租户还是 v1（口令封）。这里只认 v2 的话，
+		// 那些租户能正常构建、却让每一次备份都失败——而它们恰恰是最该有离线副本的
+		bundle, err := openSealedKeystore(sealed, cfg)
 		if err != nil {
 			// 打不开一个租户的盒子是**严重**的：它的签名密钥就此没有离线副本。
 			// 整次备份失败，而不是安静地少备一个
-			return nil, nil, fmt.Errorf("tenant %s: cannot open the sealed keystore: %w", item.Tenant, err)
+			return nil, nil, fmt.Errorf("tenant %s: %w", item.Tenant, err)
 		}
 		raw, err := base64.StdEncoding.DecodeString(bundle.KeystoreBase64)
 		if err != nil {
