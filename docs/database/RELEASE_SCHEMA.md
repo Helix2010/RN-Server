@@ -103,8 +103,9 @@ ota：queued → claimed → running → succeeded
 - `ux_build_jobs_live_ota`：同租户同平台同时只允许一条在跑的 OTA 任务。
 - `ix_build_jobs_claimed_machine (claimed_machine_id, status)`：每台构建机同时只派一条。
 - 排队时就要求严格递增（`app_releases` 与在途任务一起算），android apk 还要求主签名闸就绪（409 `SIGNER_NOT_READY`）。
+- 手工上传 Android 发布记录还要求：v3 签名密钥存在、包的签名证书就是密钥记录里的证书、主签名闸对当前密钥版本 `decrypt=ok` 且 `confirmed=true`（ADR-0019 第 9 节），与在途检查一起在发布序列锁的事务里判。
 - 手工上传 Android 发布记录时，该租户该平台有 `built`/`signing` 任务就 409 `RELEASE_SIGNING_IN_FLIGHT`：手工那条会抢走签名闸要用的版本号。
 - 交付对象随任务放弃或重新认领删除：状态变化与键列置空同一个事务，提交后删对象，删不掉只记日志。退回待签名只删已签名包；签成的任务的未签名包与 SBOM 随发布记录删除。
-- `log_tail` 最多 200 行、每行最多 2000 字节。
+- `log_tail` 最多 200 行、每行最多 2000 字节。机器上报的自由文本（`log_tail`、构建机的 `failure_reason`、签名闸的 `sign_outcome.detail` 与检查 `error`）入库前去掉 C0/C1 控制字符（保留 \t）与 Unicode 双向覆盖/隔离字符（U+202A–U+202E、U+2066–U+2069、U+200E/U+200F）。
 - 认领是**跨租户**的，取最早那条。解析不出租户、`git_ref` 不是固定分支的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。
 - 回收是服务端独立的定时器（每分钟），条件更新，多实例并发安全。

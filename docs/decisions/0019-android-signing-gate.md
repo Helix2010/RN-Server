@@ -31,7 +31,7 @@
 
 - 平台级 `app_configs` 键 `build.machines`：每台机器一个令牌（`rnm_` + 32 字节 base64url，只存 sha256，原文只在新建响应里出现一次）、角色、主备、公钥与状态。`BUILD_AGENT_TOKEN` 删除。
 - 鉴权中间件按令牌 sha256 找机器，校验角色（构建机令牌调签名闸接口 403，反之亦然），`revoked` 401。每个请求主键查一次 `version, updated_at`，没变用缓存——吊销即时生效，又不必每次解析整份 JSON。只带旧头 `x-build-agent-token` 返回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`，旧打包机升级前看到的是"要升级"而不是"令牌错"。
-- 公钥由机器自己上报为待接受，平台管理员核对完整 64 位指纹后接受；签名闸接受时可以（建议）同时核对 Ed25519 指纹，带了就必须一致，否则偷到令牌的人能在待接受期间把真机的 X25519 与自己的 Ed25519 配成一对。已 active 的机器换钥必须带当前私钥对 `machinekey.RotationMessage` 的签名，否则 403——偷到令牌不等于能换掉出处密钥。
+- 公钥由机器自己上报为待接受，平台管理员核对完整 64 位指纹后接受；接受签名闸时**必须**同时带从本机抄来的 Ed25519 指纹（缺了 400 `INVALID_MACHINE`，对不上 409 `MACHINE_KEY_MISMATCH`），否则偷到令牌的人能在待接受期间把真机的 X25519 与自己的 Ed25519 配成一对，此后的换钥证明就归他（安全评审 R2）。已 active 的机器换钥必须带当前私钥对 `machinekey.RotationMessage` 的签名，否则 403——偷到令牌不等于能换掉出处密钥。
 - 签名闸有两把钥：X25519 解密钥密文（其 sha256 是收件人指纹），Ed25519 签本机记录与换钥证明。构建机一把 Ed25519 出处密钥。
 - **主备只影响路由**。签名闸与离线工具不采信这份登记：签名闸只信本机记录，离线工具只加密给离线 pin 文件里的签名闸。服务端被攻破能做到的是"不派活、派给错的机器"，做不到"让签名闸签一个它不认的包"。
 
@@ -60,7 +60,16 @@
 
 真实的已签名包里没有 `assets/fingerprint`，签名闸读不出原生指纹（设计「签名前检查」第 16 条的前提不成立，负责人决定）。发布记录的 `file_metadata.nativeFingerprint` 取任务行上构建机上报、经出处声明核对过的值，并记 `nativeFingerprintSource: "builder-provenance"`；签名闸 `complete` 带来的 `nativeFingerprint` 必须与它相等，否则 422 `SIGN_RESULT_MISMATCH`。热更新基线闸（`baseNativeFingerprint`）照旧用这个值。
 
-### 9. 热更新包只能来自构建任务
+### 9. 手工上传也要经过签名闸确认过的证书
+
+签名闸只管它自己签的包；手工上传（`POST /v1/admin/releases`）原来只和登记的发布身份比对。安全评审 R2 证明这是一条绕过签名闸的路：租户管理员（或拿到 `x-admin-key` 的人）可以把 `release.android` 的证书改成自己的，或者用签名闸公开的 X25519 公钥封一份自己的 v3 密文上传（服务端打不开内层，只能照收），然后手工上传自签的包。现在：
+
+- 租户有 v3 `build.keystore` 时，`PUT /v1/admin/release-identity/android` 的包名与证书必须就是密钥记录里的（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`），身份只能随 `PUT /v1/admin/build-keystore` 一起换。
+- Android 手工上传在发布序列锁的事务里再过一道闸（签名闸 `complete` 不走这里），任何一条不满足都是 409 并写审计 `release_rejected`：租户有 v3 密钥（`RELEASE_KEYSTORE_NOT_CONFIGURED`）；包的签名证书就是密钥记录里的证书（`RELEASE_SIGNER_KEYSTORE_MISMATCH`）；**主签名闸**对当前密钥版本报告 `decrypt=ok` 且 `confirmed=true`（`RELEASE_SIGNER_NOT_CONFIRMED`）。确认是运维在签名闸本机对照离线指纹做的，服务端改不了它。
+
+**结论：租户管理员账号被攻破时，手工上传只能发"签名闸本机确认过的证书"签的包。** 这是相对设计的一处收紧（设计里手工上传只受在途门禁约束），代价是没迁到签名闸的租户不能再手工上传 Android 包。
+
+### 10. 热更新包只能来自构建任务
 
 管理端直接上传热更新包的接口（`/ota/artifacts/uploads`、`/ota/artifacts/upload`、`/ota/releases`）与 upload-sessions 的 `uploadType=ota` 删除。热更新包的代理上传（`PUT /v1/build-agent/jobs/:id/ota-artifact`）与签名闸完成按路由模板精确豁免 10 秒数据库超时。
 

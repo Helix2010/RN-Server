@@ -1249,7 +1249,7 @@
             "description": "Verified release created from uploaded artifact (mandatory=true makes the update unskippable once this release is active)"
           },
           "409": {
-            "description": "RELEASE_SEQUENCE_BUSY / RELEASE_VERSION_NOT_INCREASING / RELEASE_SIGNING_IN_FLIGHT (android: this tenant has a build waiting for or being signed by the signer; checked before download and again inside the release transaction)"
+            "description": "RELEASE_SEQUENCE_BUSY / RELEASE_VERSION_NOT_INCREASING / RELEASE_SIGNING_IN_FLIGHT (android: this tenant has a build waiting for or being signed by the signer; checked before download and again inside the release transaction). Android uploads by hand also pass a gate inside the release transaction, so a compromised tenant admin can only publish packages signed with a certificate the primary signer confirmed on the machine itself; each refusal is audited as release_rejected: RELEASE_KEYSTORE_NOT_CONFIGURED (no v3 signing keystore, or only a retired-format record), RELEASE_SIGNER_KEYSTORE_MISMATCH (the package is not signed with the v3 keystore's certificate), RELEASE_SIGNER_NOT_CONFIRMED (no active primary signer, or the primary has not reported decrypt=ok and confirmed=true for the current keystore version)"
           },
           "422": {
             "description": "RELEASE_FILE_INVALID, RELEASE_VERIFY_FAILED, RELEASE_EMBEDDED_CONFIG_INVALID, RELEASE_DEBUG_SIGNER, RELEASE_SIGNER_RETIRED (a retired tenant signing certificate, refused forever), RELEASE_SIGNER_UNPINNED (production without release.android pin), RELEASE_PACKAGE_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_APPLICATION_ID_MISSING, RELEASE_IDENTITY_MISMATCH; every rejection is audited as release_rejected"
@@ -2827,7 +2827,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version"
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version. RELEASE_IDENTITY_KEYSTORE_MISMATCH: the tenant has a v3 signing keystore and packageName/signerSha256 differ from its package name and certificate; the identity can only change together with the keystore (PUT /v1/admin/build-keystore writes both)"
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
@@ -3295,7 +3295,7 @@
     "/v1/build-agent/jobs/{id}/heartbeat": {
       "post": {
         "summary": "Report build progress",
-        "description": "Moves the job to running and stores a bounded log tail (200 lines, 2000 bytes each).",
+        "description": "Moves the job to running and stores a bounded log tail (200 lines, 2000 bytes each). Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -3342,7 +3342,7 @@
     "/v1/build-agent/jobs/{id}/complete": {
       "post": {
         "summary": "Report an OTA build result",
-        "description": "OTA jobs only: the job moves to succeeded with the OTA revision id. apk jobs are delivered through /unsigned/upload, /sbom/upload and /built.",
+        "description": "OTA jobs only: the job moves to succeeded with the OTA revision id. apk jobs are delivered through /unsigned/upload, /sbom/upload and /built. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -3389,7 +3389,7 @@
     "/v1/build-agent/jobs/{id}/fail": {
       "post": {
         "summary": "Report a build failure",
-        "description": "The commit is recorded when the builder got that far. Anything this claim delivered (unsigned package, SBOM) is deleted from storage.",
+        "description": "The commit is recorded when the builder got that far. Anything this claim delivered (unsigned package, SBOM) is deleted from storage. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -3998,7 +3998,7 @@
         },
         "responses": {
           "400": {
-            "description": "INVALID_MACHINE"
+            "description": "INVALID_MACHINE (including a signer accepted without ed25519PublicKeySha256)"
           },
           "401": {
             "description": "Admin authentication required"
@@ -4232,7 +4232,7 @@
     "/v1/build-agent/jobs/{id}/built": {
       "post": {
         "summary": "Deliver the unsigned package with provenance",
-        "description": "apk jobs only. The job moves to built (waiting for the primary signer). The server verifies the provenance signature with this machine's accepted key and that jobId, attempt, tenantSlug, packageName, versionCode (= buildNumber), versionName, unsignedSha256, unsignedSize, sbomSha256, nativeFingerprint, commitSha and builderId match the job row, the request and the uploaded files. The signer verifies it again against its own pinned builders.",
+        "description": "apk jobs only. The job moves to built (waiting for the primary signer). The server verifies the provenance signature with this machine's accepted key and that jobId, attempt, tenantSlug, packageName, versionCode (= buildNumber), versionName, unsignedSha256, unsignedSize, sbomSha256, nativeFingerprint, commitSha and builderId match the job row, the request and the uploaded files. The signer verifies it again against its own pinned builders. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4419,7 +4419,7 @@
       },
       "post": {
         "summary": "Report decrypt, confirmation and trial-signing status",
-        "description": "Stored per machine id under build.keystore.check (format 2) with JSON_SET, so primary and standby never overwrite each other. Items for an unknown tenant slug or a keystore version that is no longer current are ignored. An item whose conclusion (keystoreVersion, decrypt, confirmed, confirmedTrustRootsDigest, trialSign, error) is unchanged is not written at all: the row version and checkedAt do not move. Changes are written and audited as build_keystore_check_update by system-signer.",
+        "description": "Stored per machine id under build.keystore.check (format 2) with JSON_SET, so primary and standby never overwrite each other. Items for an unknown tenant slug or a keystore version that is no longer current are ignored. An item whose conclusion (keystoreVersion, decrypt, confirmed, confirmedTrustRootsDigest, trialSign, error) is unchanged is not written at all: the row version and checkedAt do not move. Changes are written and audited as build_keystore_check_update by system-signer. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4727,7 +4727,7 @@
     "/v1/signer/jobs/{id}/release": {
       "post": {
         "summary": "Cannot sign yet",
-        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred. The signed package uploaded under this sign attempt, if any, is deleted from storage.",
+        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred. The signed package uploaded under this sign attempt, if any, is deleted from storage. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4774,7 +4774,7 @@
     "/v1/signer/jobs/{id}/reject": {
       "post": {
         "summary": "Refuse to sign",
-        "description": "violation: a policy check failed; the job fails and is audited as build_job_sign_rejected. transient: a temporary error the signer gave up on; signFailures increases, at 2 the job fails (build_job_sign_failed), otherwise it returns to built. The signed package uploaded under this sign attempt is deleted; when the job fails the unsigned package and SBOM are deleted too. Non-final transient rejections and deferrals are recorded in signOutcome only (not audited).",
+        "description": "violation: a policy check failed; the job fails and is audited as build_job_sign_rejected. transient: a temporary error the signer gave up on; signFailures increases, at 2 the job fails (build_job_sign_failed), otherwise it returns to built. The signed package uploaded under this sign attempt is deleted; when the job fails the unsigned package and SBOM are deleted too. Non-final transient rejections and deferrals are recorded in signOutcome only (not audited). Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -7299,7 +7299,7 @@
           },
           "ed25519PublicKeySha256": {
             "type": "string",
-            "description": "Signers only, optional but recommended: the full 64-hex sha256 of the signer's Ed25519 key read on the signer itself. When present it must equal the pending Ed25519 key (409 MACHINE_KEY_MISMATCH); without it only the X25519 fingerprint is checked, and a stolen token could pair the real X25519 key with a foreign Ed25519 key while the machine is pending."
+            "description": "Required when the machine is a signer (400 INVALID_MACHINE without it): the full 64-hex sha256 of the signer's Ed25519 key read on the signer itself (colons and upper case accepted), which must equal the pending Ed25519 key (409 MACHINE_KEY_MISMATCH). Checking only the X25519 fingerprint would let a stolen token pair the real X25519 key with a foreign Ed25519 key while the machine is pending. Builders have a single key: leave it out (any value is 409 MACHINE_KEY_MISMATCH)."
           }
         }
       },
