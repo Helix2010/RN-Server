@@ -474,44 +474,55 @@ func (c *client) registerBackupSigningKey(ctx context.Context, publicKey string)
 //
 // **meta 必须排在 payload 之前**：服务端靠这个顺序先解析元数据、校验通过再决定
 // 要不要收那几十 MB。顺序反了服务端会直接拒。
+// backupUploadResult 是服务端对一次上报的回答。
+//
+// **StillExpecting 必须看。** 服务端在两份没到齐时回 202 加一个「还缺哪几份」，
+// 而只判 >=400 的话，打包机会把它当成功、打出「备份产出成功」然后走人——
+// 而记录停在 running 干等 30 分钟产出超时。这个时序不是假想：服务端在两份之间
+// 重启就会发生（启动时会清掉上一次的暂存）。
+type backupUploadResult struct {
+	StillExpecting []string `json:"stillExpecting"`
+	Status         string   `json:"status"`
+}
+
 func (c *client) uploadBackupPayload(ctx context.Context, requestID string,
-	meta backupbundle.PayloadMeta, payload, signature []byte) error {
+	meta backupbundle.PayloadMeta, payload, signature []byte) (backupUploadResult, error) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
 	encoded, err := json.Marshal(meta)
 	if err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	metaPart, err := writer.CreateFormField("meta")
 	if err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	if _, err := metaPart.Write(encoded); err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	payloadPart, err := writer.CreateFormFile("payload", "inner.rnbk")
 	if err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	if _, err := payloadPart.Write(payload); err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	sigPart, err := writer.CreateFormFile("sig", "inner.rnbk.sig")
 	if err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	if _, err := sigPart.Write(signature); err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	if err := writer.Close(); err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.cfg.Server+"/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/payload", &body)
 	if err != nil {
-		return err
+		return backupUploadResult{}, err
 	}
 	request.Header.Set("content-type", writer.FormDataContentType())
 	request.Header.Set("x-build-agent-token", c.cfg.Token)
@@ -521,14 +532,16 @@ func (c *client) uploadBackupPayload(ctx context.Context, requestID string,
 	uploader := &http.Client{}
 	response, err := uploader.Do(request)
 	if err != nil {
-		return retryLater{err}
+		return backupUploadResult{}, retryLater{err}
 	}
 	defer response.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if response.StatusCode >= 400 {
-		return classify(response.StatusCode,
+		return backupUploadResult{}, classify(response.StatusCode,
 			fmt.Errorf("uploading the backup payload returned %d: %s",
 				response.StatusCode, truncate(string(raw), 300)))
 	}
-	return nil
+	var out backupUploadResult
+	_ = json.Unmarshal(raw, &out)
+	return out, nil
 }

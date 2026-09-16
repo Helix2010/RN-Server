@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -207,11 +208,25 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 		signature []byte
 		staged    string
 	)
+	seenParts := map[string]bool{}
+	// 这个请求出错时要把它自己写下的东西撤掉。留下一个半截的 <槽位>.enc 的话，
+	// 此后**合法的**同槽位上报永远被当成「已经传过」拒掉，而这条记录只能等
+	// 30 分钟产出超时——一次畸形请求就能让一次备份报废
 	dir := backupStagingDir(run.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		problem(c, http.StatusInternalServerError, "BACKUP_STAGING_FAILED", "Unable to stage the payload")
 		return
 	}
+
+	committed := false
+	defer func() {
+		if committed || staged == "" {
+			return
+		}
+		for _, suffix := range []string{".enc", ".sig", ".meta.json"} {
+			_ = os.Remove(filepath.Join(dir, meta.RecipientSlot+suffix))
+		}
+	}()
 
 	for {
 		part, err := reader.NextPart()
@@ -222,6 +237,17 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 			problem(c, http.StatusBadRequest, "BACKUP_PAYLOAD_MALFORMED", "the multipart body could not be read")
 			return
 		}
+		// 每个部件只许出现一次。两个 meta 的后果很具体：第一个决定 payload 落到
+		// 哪个文件，最后一个决定 sidecar 写成哪个槽位——暂存目录里会出现
+		// A.enc + B.sig + B.meta.json 这种自相矛盾的组合，而此后**合法的 A 上报
+		// 永远 400**（A.enc 已被占住），这条记录只能等 30 分钟产出超时
+		if seenParts[part.FormName()] {
+			problem(c, http.StatusBadRequest, "BACKUP_PAYLOAD_DUPLICATE_PART",
+				"the "+part.FormName()+" part appears more than once")
+			return
+		}
+		seenParts[part.FormName()] = true
+
 		switch part.FormName() {
 		case "meta":
 			raw, err := io.ReadAll(io.LimitReader(part, backupbundle.PayloadMetaMaxBytes+1))
@@ -259,9 +285,17 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 					"the meta part must come before the payload part")
 				return
 			}
-			staged, err = stageBackupPayload(dir, meta.RecipientSlot, part)
+			var duplicate bool
+			staged, duplicate, err = stageBackupPayload(dir, meta.RecipientSlot, part)
+			if duplicate {
+				// 409 而不是 400：同一槽位重复传是**正常的重试**撞上了已经收到的
+				// 那一份，不是请求有错。打包机据此知道不用再传这一份
+				c.JSON(http.StatusConflict, gin.H{"error": "BACKUP_SLOT_ALREADY_UPLOADED",
+					"slot": meta.RecipientSlot, "detail": err.Error()})
+				return
+			}
 			if err != nil {
-				problem(c, http.StatusBadRequest, "BACKUP_PAYLOAD_TOO_LARGE", err.Error())
+				problem(c, http.StatusRequestEntityTooLarge, "BACKUP_PAYLOAD_REJECTED", err.Error())
 				return
 			}
 		}
@@ -284,9 +318,18 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 
 	missing := missingInnerSlots(dir)
 	if len(missing) > 0 {
+		committed = true
 		c.JSON(http.StatusAccepted, gin.H{"received": meta.RecipientSlot, "stillExpecting": missing})
 		return
 	}
+	// **在这里记，不等组装。** payload_received_at 的语义是「两份都到齐了」，
+	// 而这一刻就是。记在组装里面的话，服务端自己那部分读不到时它会停在 NULL，
+	// 于是运维照 §8.4 的列注释排查，得出的是「打包机没传上来」——一个完全错误的
+	// 结论，而真相是打包机做完了、服务端配置有问题。
+	if _, err := s.markBackupPayloadComplete(c.Request.Context(), run.ID); err != nil {
+		slog.Error("cannot record that both backup payloads arrived", "backupId", run.ID, "error", err)
+	}
+	committed = true
 	s.completeBackup(c, run)
 }
 
@@ -306,26 +349,27 @@ func (s *server) checkBackupSigningFingerprint(c *gin.Context, run backupRun, me
 }
 
 // stageBackupPayload 把密文落到 0700 的暂存目录里，同一槽位重复传直接拒绝。
-func stageBackupPayload(dir, slot string, body io.Reader) (string, error) {
+// stageBackupPayload 把密文落到 0700 的暂存目录里。
+//
+// 第二个返回值说明失败是不是「这个槽位已经传过了」——那是正常重试撞上已收到的
+// 那一份，调用方翻 409；其余是请求本身有问题，翻 413。
+func stageBackupPayload(dir, slot string, body io.Reader) (string, bool, error) {
 	path := filepath.Join(dir, slot+".enc")
-	if _, err := os.Stat(path); err == nil {
-		return "", fmt.Errorf("slot %s has already been uploaded for this backup", slot)
-	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", fmt.Errorf("slot %s has already been uploaded for this backup", slot)
+		return "", true, fmt.Errorf("slot %s has already been uploaded for this backup", slot)
 	}
 	defer file.Close()
 	written, err := io.Copy(file, io.LimitReader(body, backupPayloadMaxBytes+1))
 	if err != nil {
 		_ = os.Remove(path)
-		return "", fmt.Errorf("the payload could not be received")
+		return "", false, fmt.Errorf("the payload could not be received")
 	}
 	if written > backupPayloadMaxBytes {
 		_ = os.Remove(path)
-		return "", fmt.Errorf("the payload exceeds %d bytes", int64(backupPayloadMaxBytes))
+		return "", false, fmt.Errorf("the payload exceeds %d bytes", int64(backupPayloadMaxBytes))
 	}
-	return path, nil
+	return path, false, nil
 }
 
 func writeStagedSidecars(dir string, meta backupbundle.PayloadMeta, signature []byte) error {
@@ -441,3 +485,29 @@ func parseSeq(raw string) (uint64, bool) {
 }
 
 var _ = time.Now
+
+// sweepBackupStaging 清掉不再属于任何在途备份的暂存目录。
+//
+// 判死（超时扫描、force-fail、打包机上报失败）只写库，暂存还留在盘上——一条被
+// 判死的备份会留下最多两份 512 MiB 的密文。它们是封给持有人的密文、服务端读不懂，
+// 但这台机器同时在构建 APK，磁盘被占满倒下的不止备份功能。
+//
+// 扫一遍而不是让每个判死点各自清：那样漏一个点就漏一份，而崩溃留下的残留谁也
+// 收不掉。这里以「库里这条还 running 吗」为唯一判据，和超时扫描一样不依赖内存状态。
+func (s *server) sweepBackupStaging(ctx context.Context) {
+	entries, err := os.ReadDir(backupStagingRoot())
+	if err != nil {
+		return // 目录还没建起来就是没有残留
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		run, err := s.backupRunByID(ctx, entry.Name())
+		if err == nil && run.Status == backupStatusRunning {
+			continue // 还在产出，留着
+		}
+		slog.Info("removing staging for a backup that is no longer in flight", "backupId", entry.Name())
+		cleanBackupStaging(entry.Name())
+	}
+}

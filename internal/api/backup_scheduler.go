@@ -73,6 +73,10 @@ func (b *BackupScheduler) once(ctx context.Context) {
 	} else if reaped > 0 {
 		slog.Warn("timed out backup runs were failed", "count", reaped)
 	}
+	// 判死只写库，暂存还在盘上——一条被判死的备份会留下最多两份 512 MiB 的密文。
+	// 它们是密文、服务端读不懂，但这台机器同时在构建 APK，磁盘被占满倒下的不止
+	// 备份。扫一遍而不是让 reap 逐条清：这样进程崩过之后的残留也一起收掉
+	b.server.sweepBackupStaging(work)
 	b.maybeSchedule(work)
 }
 

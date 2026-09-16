@@ -133,6 +133,7 @@ func produceBackup(ctx context.Context, cfg config, api *client, request backupR
 	}
 
 	// 两份内层：封给 A 和封给 B。同一份明文，两把不同的锁
+	uploaded := map[string]bool{}
 	for _, slot := range backupcontainer.InnerSlots() {
 		index := slotIndex(slot)
 		var sealed bytes.Buffer
@@ -153,8 +154,20 @@ func produceBackup(ctx context.Context, cfg config, api *client, request backupR
 			Tenants:                  tenants,
 			InnerFiles:               manifest,
 		}
-		if err := api.uploadBackupPayload(ctx, request.ID, meta2, sealed.Bytes(), signature); err != nil {
+		result, err := api.uploadBackupPayload(ctx, request.ID, meta2, sealed.Bytes(), signature)
+		if err != nil {
 			return fmt.Errorf("cannot upload the agent part for slot %s: %w", slot, err)
+		}
+		uploaded[slot] = true
+		// 服务端说还缺一份**我们已经传过**的槽位，说明它那边的暂存没了
+		// （最常见的原因：两份之间服务端重启了，启动时会清掉上一次的暂存）。
+		// 只判 >=400 的话这里是「成功」，打包机会打出「备份产出成功」然后走人，
+		// 而记录停在 running 干等 30 分钟产出超时——没有人知道发生了什么
+		for _, still := range result.StillExpecting {
+			if uploaded[still] {
+				return fmt.Errorf("the server lost the payload for slot %s (it still expects it after we uploaded it); "+
+					"it probably restarted mid-backup", still)
+			}
 		}
 	}
 	return nil

@@ -270,10 +270,6 @@ func (s *server) assembleAndUploadBackup(ctx context.Context, run backupRun) ([]
 	if err != nil {
 		return nil, 0, err
 	}
-	if _, err := s.markBackupPayloadComplete(ctx, run.ID); err != nil {
-		return nil, 0, fmt.Errorf("record payload arrival: %w", err)
-	}
-
 	sink := &fileSink{dir: dir, paths: map[string]string{}}
 	packages, err := backupbundle.Assemble(input, sink)
 	if err != nil {

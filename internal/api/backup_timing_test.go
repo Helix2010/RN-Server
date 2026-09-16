@@ -18,7 +18,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ---- 对抗性评审用的临时测试。跑完会删掉 ----
+// 对抗性评审留下的时序攻击。**每一条都对应一个真实修过的缺陷**，留在仓库里
+// 是为了那些缺陷不会悄悄回来——它们的共同点是「不炸，只是安静地卡住」，
+// 而那种问题在常规测试下完全看不出来。
 
 const advSigningFingerprint = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900"
 
@@ -136,9 +138,10 @@ func TestAdvSlotCIsAcceptedButNeverCounts(t *testing.T) {
 	}
 }
 
-// 攻击 2：超时扫描判死时，服务端侧的暂存密文有没有被清掉？
+// 判死之后暂存必须被清掉。
 //
-// cleanBackupStaging 的注释写着「收尾、判死、以及进程启动时都要调」。
+// 一条被判死的备份会留下最多两份 512 MiB 的密文。它们是封给持有人的密文、
+// 服务端读不懂，但这台机器同时在构建 APK——磁盘被占满倒下的不止备份功能。
 func TestAdvReaperLeavesTheStagedCiphertextOnDisk(t *testing.T) {
 	s := advServer(t)
 	run := advClaimed(t, s, "reaper leaves staging")
@@ -172,9 +175,12 @@ func TestAdvReaperLeavesTheStagedCiphertextOnDisk(t *testing.T) {
 	if after.Status != backupStatusFailed {
 		t.Fatalf("记录应当 failed，得到 %s", after.Status)
 	}
+	// 判死只写库；清盘由 sweep 做——扫一遍而不是让每个判死点各自清，
+	// 这样崩溃留下的残留也一起收掉
+	s.sweepBackupStaging(context.Background())
 	if info, err := os.Stat(filepath.Join(dir, "A.enc")); err == nil {
-		t.Errorf("超时判死之后暂存密文还在盘上（%d 字节，%s）——reapBackupRuns 只写库，没调 cleanBackupStaging",
-			info.Size(), filepath.Join(dir, "A.enc"))
+		t.Fatalf("判死并扫过之后暂存密文还在盘上（%d 字节）——这台机器同时在构建 APK，"+
+			"磁盘被占满倒下的不止备份", info.Size())
 	}
 }
 
@@ -206,35 +212,32 @@ func TestAdvPayloadReceivedAtIsNullWhenAssemblyFails(t *testing.T) {
 	}
 }
 
-// 攻击 4：一个请求里塞两个 meta，槽位不同。
+// 一个请求里塞两个 meta、槽位不同。
 //
-// 服务端用第一个 meta 决定 payload 落到哪个文件，用最后一个 meta 写 sidecar。
+// 原来的行为：第一个 meta 决定 payload 落到哪个文件，最后一个 meta 决定 sidecar
+// 写成哪个槽位——暂存目录里出现 A.enc + B.sig + B.meta.json 这种自相矛盾的组合，
+// 而此后合法的 A 上报永远 400。
 func TestAdvTwoMetaPartsPoisonTheStagingDirectory(t *testing.T) {
 	s := advServer(t)
 	run := advClaimed(t, s, "two meta parts")
 
 	recorder := advPost(t, s, run.ID, []backupbundle.PayloadMeta{advMeta("A"), advMeta("B")}, []byte("payload"))
-	t.Logf("两个 meta 的响应: %d %s", recorder.Code, recorder.Body.String())
-
-	dir := backupStagingDir(run.ID)
-	entries, _ := os.ReadDir(dir)
-	names := []string{}
-	for _, e := range entries {
-		names = append(names, e.Name())
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("重复的 meta 部件必须当场拒掉，得到 %d %s", recorder.Code, recorder.Body.String())
 	}
-	t.Logf("暂存目录: %v，missingInnerSlots=%v", names, missingInnerSlots(dir))
 
-	// 现在打包机老老实实传 A：A.enc 已经被占了
+	// 关键是**拒掉之后不留痕**：留下一个半截的 A.enc 的话，此后合法的 A 上报
+	// 永远 400（槽位已被占），这条记录只能等 30 分钟产出超时
 	retry := advPost(t, s, run.ID, []backupbundle.PayloadMeta{advMeta("A")}, []byte("real-A"))
-	t.Logf("之后正常上报 A 的响应: %d %s", retry.Code, retry.Body.String())
 	if retry.Code >= 400 {
-		t.Errorf("上一个自相矛盾的请求把 A.enc 占住了，之后合法的 A 上报永远 %d——"+
-			"这条记录只能等 30 分钟产出超时", retry.Code)
+		t.Fatalf("上一个自相矛盾的请求把槽位占住了，之后合法的 A 上报拿到 %d %s",
+			retry.Code, retry.Body.String())
 	}
 }
 
-// 攻击 5：服务端在两份之间重启（PrivateTmp=true 下 /tmp 本来就没了，
-// ResetBackupStaging 更是显式清）。打包机会知道吗？
+// 服务端在两份之间重启（PrivateTmp=true 下 /tmp 本来就没了，ResetBackupStaging
+// 更是显式清）。打包机必须知道——否则它打出「备份产出成功」然后走人，
+// 而记录停在 running 干等 30 分钟产出超时，没有人知道发生了什么。
 func TestAdvRestartBetweenSlotsIsInvisibleToTheAgent(t *testing.T) {
 	s := advServer(t)
 	run := advClaimed(t, s, "restart between slots")
@@ -245,16 +248,26 @@ func TestAdvRestartBetweenSlotsIsInvisibleToTheAgent(t *testing.T) {
 	ResetBackupStaging() // 服务端重启
 
 	recorder := advPost(t, s, run.ID, []backupbundle.PayloadMeta{advMeta("B")}, []byte("B"))
-	t.Logf("重启后第二份的响应: %d %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("第二份应当 202，得到 %d %s", recorder.Code, recorder.Body.String())
+	}
 
-	after, _ := s.backupRunByID(context.Background(), run.ID)
-	t.Logf("记录状态=%s payloadReceivedAt=%v", after.Status, after.PayloadReceivedAt)
-
-	// cmd/build-agent/client.go:526 只看 >= 400。202 在打包机眼里 == 成功
-	if recorder.Code < 400 {
-		t.Errorf("服务端回了 %d（<400），而 uploadBackupPayload 只判 >=400——"+
-			"打包机会打出 'platform backup produced' 然后走人，记录停在 %s 等 30 分钟超时",
-			recorder.Code, after.Status)
+	// 服务端没法回 4xx——从它的角度看这是一次完全正常的上报。所以判据在响应体：
+	// 它必须说「我还缺 A」，而打包机知道自己已经传过 A，于是能当场报失败，
+	// 而不是打出「备份产出成功」然后让记录干等 30 分钟超时
+	body := decodeBody(t, recorder)
+	still, ok := body["stillExpecting"].([]any)
+	if !ok || len(still) == 0 {
+		t.Fatalf("响应必须说清还缺哪几份，否则打包机分辨不出来: %s", recorder.Body.String())
+	}
+	found := false
+	for _, slot := range still {
+		if slot == "A" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("服务端把 A 弄丢了却没说，打包机会以为成功: %v", still)
 	}
 }
 
