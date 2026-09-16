@@ -506,18 +506,39 @@ report_file() {
   fi
 }
 
-wait_active() { # $1 unit
-  local state="" i
+# 等服务起来并稳定跑一小会儿：Type=exec/simple 的服务一 fork 就算 active，启动后几秒内因为配置、
+# 权限或连不上服务端退出的，要在这里发现，而不是报“在运行”。$1 unit
+wait_active() {
+  local state="" pid="" restarts="" i stable=0 first_restarts
+  first_restarts="$(systemctl show -p NRestarts --value "$1" 2>/dev/null || true)"
   for i in $(seq 1 60); do
     state="$(systemctl show -p ActiveState --value "$1" 2>/dev/null || true)"
-    case "$state" in
-      active) return 0 ;;
-      failed) break ;;
-    esac
+    if [ "$state" = active ]; then
+      local now_pid now_restarts
+      now_pid="$(systemctl show -p MainPID --value "$1" 2>/dev/null || true)"
+      now_restarts="$(systemctl show -p NRestarts --value "$1" 2>/dev/null || true)"
+      if [ -n "$pid" ] && [ "$now_pid" = "$pid" ] && [ "$now_restarts" = "$restarts" ]; then
+        stable=$((stable + 1))
+      else
+        stable=0
+      fi
+      pid="$now_pid"
+      restarts="$now_restarts"
+      [ "$stable" -ge 10 ] && return 0
+    else
+      pid=""
+      stable=0
+      [ "$state" = failed ] && break
+      # 这次等待期间已经被 systemd 重启过两次：不会自己好起来
+      restarts="$(systemctl show -p NRestarts --value "$1" 2>/dev/null || true)"
+      if [[ "$restarts" =~ ^[0-9]+$ && "$first_restarts" =~ ^[0-9]+$ ]] && [ "$restarts" -ge $((first_restarts + 2)) ]; then
+        break
+      fi
+    fi
     [ "$i" = 60 ] || sleep 1
   done
   journalctl -u "$1" -n 30 --no-pager -o cat >&2 || true
-  die "$1 没有起来（状态 ${state:-unknown}），见上面的日志"
+  die "$1 没有稳定运行（状态 ${state:-unknown}），见上面的日志；修好之后重新执行同一条命令"
 }
 
 # ---- 4–6. 签名闸 ----------------------------------------------------------------------------
