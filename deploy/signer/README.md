@@ -179,8 +179,10 @@ sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-recovery --env-file /
 
 `amos-signer-a`（主）、`amos-signer-b`（备）不重装，unit 名与 `/etc/rn-signer-a/b.env` 不改：
 
-1. 按第 1、2 节构建并替换 `/opt/rn-signer/bin/signer`、`signer-check`（新版本能读现有本机记录），
-   `systemctl restart rn-signer-a rn-signer-b`，journal 里 `local records verified` 正常。
+1. **先部署服务端**（`keystore-checks` 接受 `trust`、有 `/v1/signer/peers` 与生成接口的版本）：新签名闸每轮上报都带
+   `trust`，旧服务端按严格解码会拒收，控制台就收不到检查结果。然后按第 1、2 节构建并替换 `/opt/rn-signer/bin/signer`、
+   `signer-check`（新版本能读现有本机记录），`systemctl restart rn-signer-a rn-signer-b`，journal 里 `local records verified` 正常、
+   没有 `keystore checks failed`。
 2. 离线生成恢复密钥（第 C 节），控制台登记。
 3. 两台都信任恢复公钥：
 
