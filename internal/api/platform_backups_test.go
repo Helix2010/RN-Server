@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+// backupServer 给每个测试一张干净的 platform_backups。
+//
+// 已知脆性：`go test ./...` 并行跑不同的包，而 internal/store 的
+// platform_backups_migration_test 用的是同一个测试库，也 DELETE 这张表、也抢
+// 「至多一条在途」那个唯一索引。两边撞上时的表现是偶发失败、重跑又好。
+//
+// 本地要稳定跑这两个包，用 `go test -p 1 ./...` 串行化。
+//
+// 不在测试里加锁：试过用 MySQL 的 GET_LOCK 串起来，结果 internal/api 从 8 秒
+// 涨到 284 秒（每个测试都要等另一个包放锁，还会撞 30 秒超时反而变红）——
+// 药比病重。CI 上没有 RN_TEST_MYSQL_DSN，两个包都 skip，撞不到这件事。
 func backupServer(t *testing.T) *server {
 	t.Helper()
 	db := openTestDB(t)
