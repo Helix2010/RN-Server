@@ -371,15 +371,55 @@ func TestValidConfigRequiresSemverInTheUpdatePolicy(t *testing.T) {
 			"updatePolicy": policy, "support": map[string]any{},
 		}
 	}
-	if !validConfig(base(map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": "1.2.0"})) {
+	perPlatform := func(min, latest string) map[string]any {
+		return map[string]any{
+			"minSupportedVersion": map[string]any{"android": min, "ios": min},
+			"latestVersion":       map[string]any{"android": latest, "ios": latest},
+		}
+	}
+	if !validConfig(base(perPlatform("1.0.0", "1.2.0"))) {
 		t.Fatal("a semver policy should be valid")
 	}
 	// 非法版本号会让 compareVersion 当成 1.0.0，强制升级静默失效
-	if validConfig(base(map[string]any{"minSupportedVersion": "abc", "latestVersion": "1.2.0"})) {
+	if validConfig(base(perPlatform("abc", "1.2.0"))) {
 		t.Fatal("a garbage minimum version must be rejected")
 	}
-	if validConfig(base(map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": ""})) {
+	if validConfig(base(perPlatform("1.0.0", ""))) {
 		t.Fatal("an empty latest version must be rejected")
+	}
+	// 两个平台都要合法：只有一个平台是非法 semver 也必须整体拒绝，否则那个平台会
+	// 悄悄用上 compareVersion 的兜底值，强更判定对它形同虚设
+	if validConfig(base(map[string]any{
+		"minSupportedVersion": map[string]any{"android": "1.0.0", "ios": "abc"},
+		"latestVersion":       map[string]any{"android": "1.2.0", "ios": "1.2.0"},
+	})) {
+		t.Fatal("a garbage ios minimum version must be rejected even if android is valid")
+	}
+	// 只提交了一个平台：写路径不兜底另一个平台，必须整体拒绝——这和 appConfigView
+	// 读路径的容错是两回事，写路径不该悄悄替调用方把缺的那个平台填上
+	if validConfig(base(map[string]any{
+		"minSupportedVersion": map[string]any{"android": "1.0.0"},
+		"latestVersion":       map[string]any{"android": "1.2.0", "ios": "1.2.0"},
+	})) {
+		t.Fatal("an updatePolicy missing the ios minimum version must be rejected")
+	}
+	// 拆分平台之前的旧形状（单值字符串）仍然要接受：appConfigView 的读路径一直
+	// 容忍它，写路径不能比读路径更严格——否则任何还没升级到新前端的调用方
+	// （灰度中的管理端页面、脚本、重放一份旧的配置快照）一提交就会被整份配置拒掉，
+	// 而这份配置本来是合法的
+	if !validConfig(base(map[string]any{
+		"minSupportedVersion": "1.0.0",
+		"latestVersion":       "1.2.0",
+	})) {
+		t.Fatal("the legacy flat-string updatePolicy shape must still be accepted")
+	}
+	// 旧形状里塞进空字符串或非法版本号，不能被当成"没填"兜底成合法值——必须原样
+	// 按 validVersion 判断拒绝，和新形状的语义一致
+	if validConfig(base(map[string]any{
+		"minSupportedVersion": "1.0.0",
+		"latestVersion":       "",
+	})) {
+		t.Fatal("a legacy shape with an empty latest version must still be rejected")
 	}
 }
 

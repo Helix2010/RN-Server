@@ -9,9 +9,12 @@ func baseModuleConfig() map[string]any {
 		"localization":  map[string]any{},
 		"theme":         map[string]any{},
 		"features":      map[string]any{},
-		// updatePolicy 的版本号必须是 semver（非法值会让强制升级静默失效）
-		"updatePolicy": map[string]any{"minSupportedVersion": "1.0.0", "latestVersion": "1.1.0"},
-		"support":      map[string]any{},
+		// updatePolicy 的版本号必须是 semver（非法值会让强制升级静默失效），且 android/ios 都要有值
+		"updatePolicy": map[string]any{
+			"minSupportedVersion": map[string]any{"android": "1.0.0", "ios": "1.0.0"},
+			"latestVersion":       map[string]any{"android": "1.1.0", "ios": "1.1.0"},
+		},
+		"support": map[string]any{},
 	}
 }
 

@@ -1182,6 +1182,7 @@ func (s *server) appConfigView(ctx context.Context, tenant string) (gin.H, error
 	value["modules"] = normalizeModules(object(value["modules"]))
 	value["wallet"] = normalizeWallet(object(value["wallet"]))
 	value["services"] = normalizeServices(value["services"])
+	value["updatePolicy"] = normalizeUpdatePolicy(object(value["updatePolicy"]))
 	// 管理端要看到实际生效值（含未配置时的声明式默认）。这里只放可编辑项：
 	// 配置中心整份 PATCH 回来，回显里多一个只读键就会让保存被写入校验拒掉
 	value["referral"] = normalizeReferral(object(value["referral"]))
@@ -1838,8 +1839,8 @@ func (s *server) bootstrap(c *gin.Context) {
 	version := normalizeVersion(c.GetHeader("x-app-version"))
 	buildNumber := text(c.GetHeader("x-build-number"), "0")
 	updatePolicy := object(cfg["updatePolicy"])
-	latest := text(updatePolicy["latestVersion"], "1.1.0")
-	minimum := text(updatePolicy["minSupportedVersion"], "0.9.0")
+	latest := versionForPlatform(object(updatePolicy["latestVersion"]), platform, "1.1.0")
+	minimum := versionForPlatform(object(updatePolicy["minSupportedVersion"]), platform, "0.9.0")
 	// 下载地址是按租户的：有可见发布时由下面的 /v1/public/releases/{id}/download
 	// 填上。商店 / MDM 渠道没有直装包，留空。从前这里读 env 里的四个全局链接，
 	// 那是错的——一个全局值不可能同时对四个租户都对，而且它总会被下面覆盖掉。
@@ -2004,8 +2005,19 @@ func validConfig(v map[string]any) bool {
 	}
 	ttl, ok2 := v["ttlSeconds"].(float64)
 	policy := object(v["updatePolicy"])
-	// 版本号不是 semver 时，compareVersion 会把非法值当成 "1.0.0"，强制升级静默失效
-	policyValid := policy != nil && validVersion(text(policy["minSupportedVersion"], "")) && validVersion(text(policy["latestVersion"], ""))
+	// 版本号不是 semver 时，compareVersion 会把非法值当成 "1.0.0"，强制升级静默失效。
+	// minSupportedVersion / latestVersion 按平台各自校验——两个平台的值都得是合法
+	// semver，缺一个都不行，否则会有一个平台悄悄用上 compareVersion 的兜底值。
+	// 用 versionPolicyShape 只摊平新旧两种形状，不像 normalizeUpdatePolicy 那样
+	// 拿另一个平台或硬编码默认值兜底空值——写路径要能看见"提交了空字符串/漏了一个
+	// 平台"这种明确的坏输入并拒绝，不能像读路径那样把它悄悄填成看似合法的值。
+	// 但旧的单值字符串形状（拆分之前的管理端、还没升级的调用方）仍然要接受，
+	// 否则读路径能容忍的配置在写路径上无法通过，整份保存都会被拒
+	minVersions := versionPolicyShape(policy["minSupportedVersion"])
+	latestVersions := versionPolicyShape(policy["latestVersion"])
+	policyValid := policy != nil &&
+		validVersion(text(minVersions["android"], "")) && validVersion(text(minVersions["ios"], "")) &&
+		validVersion(text(latestVersions["android"], "")) && validVersion(text(latestVersions["ios"], ""))
 	return ok2 && ttl >= 300 && ttl <= 86400 && object(v["localization"]) != nil && object(v["theme"]) != nil && object(v["features"]) != nil && policyValid && object(v["support"]) != nil
 }
 
@@ -2023,6 +2035,52 @@ func normalizeModules(value map[string]any) map[string]any {
 		return map[string]any{"predict": true, "dex": true}
 	}
 	return map[string]any{"predict": truth(value["predict"]), "dex": truth(value["dex"])}
+}
+
+// versionPolicyShape 把 minSupportedVersion / latestVersion 摊平成 {android, ios}，
+// 只认新旧两种形状（单值字符串 / 按平台的对象），不做任何默认值兜底——空值该拒绝
+// 还是该兜底由调用方决定，这里只负责"认出这是哪种形状"。
+func versionPolicyShape(raw any) map[string]any {
+	if flat, ok := raw.(string); ok {
+		return map[string]any{"android": flat, "ios": flat}
+	}
+	return object(raw)
+}
+
+// normalizeUpdatePolicy 把 minSupportedVersion / latestVersion 收敛成 {android, ios} 对象，
+// 缺值时用默认值或另一个平台的值兜底——读路径必须总能产出可用的配置。
+//
+// 存量租户存的还是旧的单值字符串（按平台拆分之前的形态）：这里原样套到两个平台，
+// 强更判定结果和拆分之前完全一致，不需要一次性数据库迁移——appConfigView 是
+// bootstrap 和管理端配置视图共用的唯一入口，旧数据永远先过这一层再被用到。
+func normalizeUpdatePolicy(value map[string]any) map[string]any {
+	normalizeField := func(raw any, fallback string) map[string]any {
+		shaped := versionPolicyShape(raw)
+		android := text(shaped["android"], "")
+		ios := text(shaped["ios"], "")
+		if android == "" {
+			android = text(ios, fallback)
+		}
+		if ios == "" {
+			ios = android
+		}
+		return map[string]any{"android": android, "ios": ios}
+	}
+	result := map[string]any{
+		"minSupportedVersion": normalizeField(value["minSupportedVersion"], "0.9.0"),
+		"latestVersion":       normalizeField(value["latestVersion"], "1.1.0"),
+		"otaChannel":          text(value["otaChannel"], "production"),
+	}
+	return result
+}
+
+// versionForPlatform 取该平台对应的版本阈值；harmony 装的是 Android 包，按 Android 算
+// ——和 minBuild.forPlatform 是同一个惯例。
+func versionForPlatform(v map[string]any, platform, fallback string) string {
+	if platform == "ios" {
+		return text(v["ios"], fallback)
+	}
+	return text(v["android"], fallback)
 }
 func configSummary(v map[string]any) gin.H {
 	l := object(v["localization"])
@@ -2246,4 +2304,4 @@ func normalizeVersion(v string) string {
 func validVersion(v string) bool     { return semver.IsValid("v" + v) }
 func compareVersion(a, b string) int { return semver.Compare("v"+a, "v"+b) }
 
-const initialConfig = `{"ttlSeconds":21600,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true,"crashAutoReport":false},"updatePolicy":{"minSupportedVersion":"0.9.0","latestVersion":"1.1.0","otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`
+const initialConfig = `{"ttlSeconds":21600,"localization":{"fallbackLocale":"zh-CN","supportedLocales":["zh-CN","en-US"],"messagesVersion":"2026.08.24.1","messages":{"zh-CN":{"app.name":"RN 应用基座","home.title":"远程配置中心"},"en-US":{"app.name":"RN App Foundation","home.title":"Remote configuration center"}}},"theme":{"defaultMode":"system","allowUserOverride":true,"paletteVersion":"ocean-1","light":{"primary":"#3157D5","onPrimary":"#FFFFFF","background":"#F4F7FB","surface":"#FFFFFF","surfaceVariant":"#EAF0F8","text":"#101828","textMuted":"#5A687C","border":"#D5DDE9","success":"#147A50","warning":"#9A5C00","danger":"#B42318","info":"#2962A3","pricePositive":"#0E8A5F","priceNegative":"#D03C45","risk":"#7A4D00","focus":"#7293FF","backdrop":"rgba(11,18,32,.56)"},"dark":{"primary":"#AFC6FF","onPrimary":"#082B78","background":"#0B1220","surface":"#121C2D","surfaceVariant":"#1D2A3E","text":"#F0F4FA","textMuted":"#A9B7CA","border":"#35445A","success":"#61D6A3","warning":"#F4BD68","danger":"#FFB4AB","info":"#A8CAFF","pricePositive":"#5CDBA8","priceNegative":"#FF7B86","risk":"#F4BD68","focus":"#AFC6FF","backdrop":"rgba(0,0,0,.72)"}},"modules":{"predict":true,"dex":true},"features":{"updateCenter":true,"otaEnabled":true,"directUpdateEnabled":true,"diagnosticsEnabled":true,"crashAutoReport":false},"updatePolicy":{"minSupportedVersion":{"android":"0.9.0","ios":"0.9.0"},"latestVersion":{"android":"1.1.0","ios":"1.1.0"},"otaChannel":"production"},"support":{"statusPageUrl":"https://status.example.com"}}`
