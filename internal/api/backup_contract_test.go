@@ -2,10 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"strings"
 	"testing"
 
 	"github.com/Helix2010/RN-Server/internal/backupbundle"
@@ -50,30 +49,50 @@ func TestDBBackupKeystoresReturnsEveryTenantNotJustTwenty(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("认领之后应当能拉到盒子: %d %s", recorder.Code, recorder.Body.String())
 	}
-	// 这个环境里解不开盒子（没有 master key），所以 items 会是空的——
-	// 但接口**枚举**了多少租户才是这条测试的判据。用日志之外的方式看不到，
-	// 所以直接查一遍它枚举的那条 SQL，确认没有 LIMIT
-	var counted int
+	// 这个环境里解不开盒子（没有 master key），所以 sealedKeystore 会缺，
+	// 但**枚举到了多少租户**才是这条测试的判据——而那是可以直接看响应的。
+	//
+	// 上面插的 25 行是「孤儿盒子」：app_configs 里有 build.keystore，tenants 里
+	// 没有对应行。它们最容易被一个朴素的 LEFT JOIN 悄悄丢掉，而丢掉的后果是
+	// 这些租户的签名密钥永远没有离线副本，且没有任何人会发现。
+	var body struct {
+		Items []struct {
+			Tenant      string `json:"tenant"`
+			Slug        string `json:"slug"`
+			HasKeystore bool   `json:"hasKeystore"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, item := range body.Items {
+		seen[item.Tenant] = true
+		if item.Slug == "" {
+			t.Errorf("租户 %s 的 slug 是空的——包里会出现 keystores//", item.Tenant)
+		}
+	}
+	missing := []string{}
+	for _, id := range ids {
+		if !seen[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("枚举漏了 %d 个租户（%v...）——它们的签名密钥就此永远没有离线副本",
+			len(missing), missing[:min(3, len(missing))])
+	}
+
+	// 库里每个未删租户也都要在清单里，哪怕它还没配签名密钥：
+	// 少了它们 hasKeystore 恒为 true，设计 §12 第 2 级的清单核对就没法做
+	var live int
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM app_configs WHERE config_key=?`, buildKeystoreConfigKey).Scan(&counted); err != nil {
+		`SELECT COUNT(*) FROM tenants WHERE deleted=0`).Scan(&live); err != nil {
 		t.Fatal(err)
 	}
-	if counted < tenants {
-		t.Fatalf("测试夹具没建够租户: %d", counted)
-	}
-	// 直接读源码断言那条枚举语句没有 LIMIT。绕，但它守的东西很硬：
-	// 漏掉的租户的签名密钥就此永远没有离线副本，而没有任何人会发现
-	source, err := os.ReadFile("backup_agent.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	query := string(source)
-	start := strings.Index(query, "SELECT tenant_id, version FROM app_configs WHERE config_key=?")
-	if start < 0 {
-		t.Fatal("找不到备份用的枚举语句——它被改过了，这条测试要跟着改")
-	}
-	if strings.Contains(query[start:start+200], "LIMIT") {
-		t.Fatal("备份用的枚举语句带了 LIMIT——漏掉的租户的签名密钥就此永远没有离线副本")
+	if len(body.Items) < live {
+		t.Errorf("清单里只有 %d 条，而库里有 %d 个未删租户——没配密钥的那些不见了",
+			len(body.Items), live)
 	}
 }
 

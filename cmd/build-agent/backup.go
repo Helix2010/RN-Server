@@ -57,7 +57,16 @@ type backupRequest struct {
 }
 
 type sealedKeystoreItem struct {
-	Tenant         string          `json:"tenant"`
+	// Tenant 是租户主键（数字）。Slug 才是人看的那个标识，包里的目录名用它
+	Tenant string `json:"tenant"`
+	Slug   string `json:"slug"`
+	// Domain 是主域名。RECOVERY.md 的验证命令要拿它填 Host 头，
+	// 否则那一步是个填不了的占位符
+	Domain      string `json:"domain"`
+	HasKeystore bool   `json:"hasKeystore"`
+	// Unavailable 表示服务端有这个租户的盒子但打不开。备份必须因此失败：
+	// 一个静默少了某个租户密钥的包，比没有备份更危险——它看起来是成功的
+	Unavailable    bool            `json:"unavailable"`
 	Version        int             `json:"version"`
 	SealedKeystore json.RawMessage `json:"sealedKeystore"`
 	KeyAlias       string          `json:"keyAlias"`
@@ -219,6 +228,20 @@ func unsealKeystores(cfg config, items []sealedKeystoreItem) (map[string][]byte,
 	files := map[string][]byte{}
 	tenants := make([]backupbundle.Tenant, 0, len(items))
 	for _, item := range items {
+		// 还没配签名密钥的租户：进清单，不进 keystores/。少了它，hasKeystore
+		// 恒为 true，设计 §12 第 2 级那条「清单对得上」就没法照着核
+		if !item.HasKeystore {
+			tenants = append(tenants, backupbundle.Tenant{
+				Slug: item.Slug, Domain: item.Domain, HasKeystore: false,
+			})
+			continue
+		}
+		if item.Unavailable {
+			return nil, nil, fmt.Errorf(
+				"tenant %s (%s): the server has a keystore but could not prepare it; "+
+					"refusing to produce a backup that would silently be missing it",
+				item.Slug, item.Tenant)
+		}
 		var sealed buildkeystore.Sealed
 		if err := json.Unmarshal(item.SealedKeystore, &sealed); err != nil {
 			return nil, nil, fmt.Errorf("tenant %s: the sealed keystore is not readable: %w", item.Tenant, err)
@@ -239,7 +262,7 @@ func unsealKeystores(cfg config, items []sealedKeystoreItem) (map[string][]byte,
 		if err != nil {
 			return nil, nil, fmt.Errorf("tenant %s: cannot read the certificate fingerprint: %w", item.Tenant, err)
 		}
-		slug := item.Tenant
+		slug := item.Slug
 		prefix := "keystores/" + slug + "/"
 		files[prefix+"keystore.p12"] = raw
 		files[prefix+"store-password.txt"] = []byte(bundle.StorePassword)
@@ -247,10 +270,16 @@ func unsealKeystores(cfg config, items []sealedKeystoreItem) (map[string][]byte,
 		files[prefix+"key-alias.txt"] = []byte(bundle.KeyAlias)
 		files[prefix+"fingerprint.txt"] = []byte(fingerprint)
 		tenants = append(tenants, backupbundle.Tenant{
-			Slug: slug, HasKeystore: true, SignerSHA256: fingerprint,
+			Slug: slug, Domain: item.Domain, HasKeystore: true, SignerSHA256: fingerprint,
 		})
 	}
-	if len(tenants) == 0 {
+	withKeystore := 0
+	for _, t := range tenants {
+		if t.HasKeystore {
+			withKeystore++
+		}
+	}
+	if withKeystore == 0 {
 		return nil, nil, fmt.Errorf("no tenant keystores could be prepared; a backup with none is not worth keeping")
 	}
 	return files, tenants, nil

@@ -128,9 +128,33 @@ func (s *server) backupKeystores(c *gin.Context) {
 		return
 	}
 
+	// 判据是「每个租户的签名密钥都有离线副本」，所以枚举要同时兜住三种情况：
+	//
+	//   1. 正常租户——从 tenants 出发才能拿到 slug 和域名。打包机拿不到它们，
+	//      此前只能拿 tenant_id 当 slug，包里是 keystores/100000001/ 而不是
+	//      keystores/acme/；域名整列是空的，RECOVERY.md 的 Host 头填不了。
+	//   2. 已软删的租户——它的密钥还在，租户还可能被恢复。漏掉就是永久失去。
+	//   3. 孤儿盒子——app_configs 里有 build.keystore 但 tenants 里没有对应行。
+	//      单纯 LEFT JOIN 会把它悄悄丢掉，而这正是最该被发现的一种。
+	//
+	// 还没配密钥的租户也要在清单里，否则 hasKeystore 恒为 true，
+	// 设计 §12 第 2 级那条「清单对得上」就没法照着核。
 	rows, err := s.db.QueryContext(c.Request.Context(),
-		`SELECT tenant_id, version FROM app_configs WHERE config_key=? ORDER BY tenant_id`,
-		buildKeystoreConfigKey)
+		`SELECT t.id, t.slug,
+		        COALESCE((SELECT d.domain FROM tenant_domain d
+		                   WHERE d.tenant_id=t.id AND d.deleted=0
+		                   ORDER BY d.is_primary DESC, d.domain LIMIT 1), '') AS domain,
+		        COALESCE(c.version, 0) AS version,
+		        c.tenant_id IS NOT NULL AS has_keystore
+		   FROM tenants t
+		   LEFT JOIN app_configs c ON c.tenant_id=t.id AND c.config_key=?
+		 UNION
+		 SELECT c.tenant_id, '', '', c.version, 1
+		   FROM app_configs c
+		   LEFT JOIN tenants t ON t.id=c.tenant_id
+		  WHERE c.config_key=? AND t.id IS NULL
+		 ORDER BY 1`,
+		buildKeystoreConfigKey, buildKeystoreConfigKey)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BACKUP_KEYSTORE_QUERY_FAILED", "Unable to list keystores")
 		return
@@ -138,13 +162,16 @@ func (s *server) backupKeystores(c *gin.Context) {
 	defer rows.Close()
 
 	type pending struct {
-		tenant  string
-		version int
+		tenant      string
+		slug        string
+		domain      string
+		version     int
+		hasKeystore bool
 	}
 	all := []pending{}
 	for rows.Next() {
 		var item pending
-		if err := rows.Scan(&item.tenant, &item.version); err != nil {
+		if err := rows.Scan(&item.tenant, &item.slug, &item.domain, &item.version, &item.hasKeystore); err != nil {
 			problem(c, http.StatusInternalServerError, "BACKUP_KEYSTORE_QUERY_FAILED", "Unable to list keystores")
 			return
 		}
@@ -157,18 +184,38 @@ func (s *server) backupKeystores(c *gin.Context) {
 
 	items := []gin.H{}
 	for _, item := range all {
+		if item.slug == "" {
+			// 孤儿盒子：没有 tenants 行就没有 slug。回落到 id，
+			// 至少包里是 keystores/<id>/ 而不是 keystores//
+			item.slug = item.tenant
+		}
+		entry := gin.H{
+			"tenant": item.tenant, "slug": item.slug, "domain": item.domain,
+			"version": item.version, "hasKeystore": false,
+		}
+		if !item.hasKeystore {
+			// 还没配签名密钥的租户也要进清单，只是没有盒子
+			items = append(items, entry)
+			continue
+		}
 		sealed, alias, err := s.sealedBuildKeystoreFor(c.Request.Context(), item.tenant)
 		if err != nil || len(sealed) == 0 {
 			// 漏掉一个租户是**严重**的：它的签名密钥就此没有离线副本。
-			// 所以记一条 error，而不是安静地跳过
+			//
+			// 此前这里是 continue + 一条 error 日志，于是备份照样 succeeded，
+			// 而包里少了那个租户的密钥——「以为有、其实没有」，正是整个方案最怕
+			// 的那件事。现在如实上报，由打包机拒绝产出一个不完整的备份。
 			slog.Error("a tenant keystore could not be prepared for backup",
 				"tenant", item.tenant, "backupId", run.ID, "error", err)
+			entry["hasKeystore"] = true
+			entry["unavailable"] = true
+			items = append(items, entry)
 			continue
 		}
-		items = append(items, gin.H{
-			"tenant": item.tenant, "version": item.version,
-			"sealedKeystore": sealed, "keyAlias": alias,
-		})
+		entry["hasKeystore"] = true
+		entry["sealedKeystore"] = sealed
+		entry["keyAlias"] = alias
+		items = append(items, entry)
 	}
 	// 这个接口的价值比现有任何代理接口都高，单独记一条审计
 	s.auditNow(newAudit(platformTenantID, "build-agent", "backup_keystores_read", "platform-backup", run.ID,
