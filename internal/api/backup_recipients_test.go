@@ -164,16 +164,26 @@ func indexOf(haystack, needle string) int {
 	return -1
 }
 
-// 实例 ID 进对象键，必须显式配。启动时那道检查只在 env 里配了桶时才跑——桶改到
-// 控制台上配之后，它就不跑了，于是产出备份那一刻要再拦一次。
-func TestDBBackupRunRefusesWithoutAnInstanceID(t *testing.T) {
+// BACKUP_INSTANCE_ID 是可选的：对象键里带了产出时间，不靠它防重名。但配了就得能进
+// 对象键——启动时那道格式检查只在 env 里配了桶时才跑，所以产出备份那一刻再看一眼。
+func TestDBBackupInstanceIDIsOptionalButMustBeValidWhenSet(t *testing.T) {
 	s := backupServer(t)
 	s.cfg.Backup.InstanceID = ""
-	_, err := s.createBackupRun(context.Background(), "manual", "tester", "no instance id")
-	if err == nil {
-		t.Fatal("没有实例 ID 却建出了备份——包会落成没有实例段的键，和别的实例混在一起")
+	run, err := s.createBackupRun(context.Background(), "manual", "tester", "no instance id")
+	if err != nil {
+		t.Fatalf("没配实例 ID 应当也能建: %v", err)
 	}
-	if !contains(err.Error(), "BACKUP_INSTANCE_ID") {
-		t.Errorf("报错没说清缺的是哪个键: %v", err)
+	if got := s.backupMetaInstanceID(); got != backupDefaultInstanceID {
+		t.Errorf("没配时写进 meta 的应当是固定值，得到 %q", got)
+	}
+	// 释放在途闸，下一次才建得出来
+	if _, err := s.failBackupRun(context.Background(), run.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	s.cfg.Backup.InstanceID = "Prod_1"
+	_, err = s.createBackupRun(context.Background(), "manual", "tester", "bad instance id")
+	if err == nil || !contains(err.Error(), "BACKUP_INSTANCE_ID") {
+		t.Fatalf("格式不对的实例 ID 应当被拒并指名: %v", err)
 	}
 }

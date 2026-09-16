@@ -174,6 +174,13 @@ func (c *s3Client) Head(ctx context.Context, key string) (int64, string, error) 
 func (c *s3Client) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 	output, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	if err != nil {
+		// 和 Get 一样把「不存在」和「读不了」分开：备份上传前靠它判断「这个键能不能写」，
+		// 把 403 当成不存在的话，就会去覆盖一个其实存在、只是看不见的对象
+		var missing *types.NoSuchKey
+		var notFound *types.NotFound
+		if errors.As(err, &missing) || errors.As(err, &notFound) {
+			return ObjectInfo{}, fmt.Errorf("head artifact: %w: %w", ErrObjectNotFound, err)
+		}
 		return ObjectInfo{}, fmt.Errorf("head artifact: %w", err)
 	}
 	return ObjectInfo{

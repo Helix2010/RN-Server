@@ -118,8 +118,24 @@ func scanBackupRun(row interface{ Scan(...any) error }) (backupRun, error) {
 // 接近人当时在做的事。
 var errBackupRecipientsIncomplete = errors.New("backup recovery keys are incomplete")
 
-// errBackupInstanceIDMissing 说明 BACKUP_INSTANCE_ID 没配。
-var errBackupInstanceIDMissing = errors.New("backup instance id is not configured")
+// errBackupInstanceIDInvalid 说明 BACKUP_INSTANCE_ID 配了但进不了对象键。
+var errBackupInstanceIDInvalid = errors.New("backup instance id is invalid")
+
+// backupDefaultInstanceID 是没配 BACKUP_INSTANCE_ID 时写进 meta 的值。
+const backupDefaultInstanceID = "default"
+
+// backupMetaInstanceID 是写进两层 meta.json 和 manifest 的实例标识。
+//
+// BACKUP_INSTANCE_ID 是可选的：对象键里带了产出时间，不再靠它防重名，它只剩「一个桶
+// 里放了几套系统时，按目录分开」这一个用处。没配时 meta 里写固定的 "default"——两层
+// meta 要逐字相同（open-layer 教人 cat 出来核对），这个值只能在这一处决定，也不能从
+// 主机名推导（改名、换机器恢复之后就变了）。
+func (s *server) backupMetaInstanceID() string {
+	if id := strings.TrimSpace(s.cfg.Backup.InstanceID); id != "" {
+		return id
+	}
+	return backupDefaultInstanceID
+}
 
 // createBackupRun 建一条待办。
 //
@@ -140,12 +156,11 @@ func (s *server) createBackupRun(ctx context.Context, trigger, requestedBy, reas
 		return backupRun{}, fmt.Errorf("%w: 槽位 %s 还没有公钥",
 			errBackupRecipientsIncomplete, strings.Join(missing, "、"))
 	}
-	// 实例 ID 进对象键，而且**必须显式配**：从主机名推导的话，改名或在新机器上恢复之后
-	// 前缀就变了。启动时那道检查只在 env 里配了桶时才跑，桶改到控制台上配之后它就不跑了
-	// ——于是包会落成 "backup-00000001-AB.rnbk" 这种没有实例段的键，和另一台实例的包混在一起
-	if !config.ValidBackupInstanceID(s.cfg.Backup.InstanceID) {
-		return backupRun{}, fmt.Errorf("%w: BACKUP_INSTANCE_ID 没配或格式不对（要求 ^[a-z0-9-]{1,32}$），"+
-			"写进 /etc/rn-foundation.env 后重启服务端", errBackupInstanceIDMissing)
+	// BACKUP_INSTANCE_ID 可选，但配了就得能进对象键。启动时那道格式检查只在 env 里
+	// 配了桶时才跑——桶改到控制台上配之后它就不跑了，所以这里再看一眼
+	if id := s.cfg.Backup.InstanceID; id != "" && !config.ValidBackupInstanceID(id) {
+		return backupRun{}, fmt.Errorf("%w: BACKUP_INSTANCE_ID=%q 格式不对（要求 ^[a-z0-9-]{1,32}$）",
+			errBackupInstanceIDInvalid, id)
 	}
 
 	id := "pbk_" + randomID(16)

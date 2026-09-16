@@ -45,10 +45,10 @@ func runBackupBucketTest(cfg config.Config, database *store.Store) int {
 		location += "，前缀 " + result.Prefix
 	}
 	fmt.Printf("备份桶 %s（%s）\n", result.Bucket, location)
-	if !config.ValidBackupInstanceID(result.InstanceID) {
-		// 桶能不能连和这件事无关，但不配它备份建不出来——在这里一起说，省得人
+	if result.InstanceID != "" && !config.ValidBackupInstanceID(result.InstanceID) {
+		// 桶能不能连和这件事无关，但配错了备份建不出来——在这里一起说，省得人
 		// 测完桶以为万事俱备，点「立刻备份」才撞上
-		fmt.Println("  注意：BACKUP_INSTANCE_ID 没配或格式不对，备份建不出来（它进对象键，要显式写进 /etc/rn-foundation.env）")
+		fmt.Printf("  注意：BACKUP_INSTANCE_ID=%q 格式不对（要求 ^[a-z0-9-]{1,32}$），备份建不出来\n", result.InstanceID)
 	}
 	for _, check := range result.Checks {
 		mark := "通过"

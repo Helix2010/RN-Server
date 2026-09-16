@@ -12,8 +12,8 @@ import (
 
 // Backup 是打包服务故障恢复备份的配置（设计 platform-backup-recovery-2026-09-15 §8.3）。
 type Backup struct {
-	// InstanceID 进对象键前缀，也进 manifest。**显式配，不从主机名推导**：
-	// 主机改名、或者恰好在新机器上恢复之后，前缀就换了，历史备份全部 404
+	// InstanceID 可选，配了就进对象键前缀（一个桶里放几套系统时按目录分开），也进
+	// manifest。**不从主机名推导**：主机改名、或者换机器恢复之后，前缀就换了
 	InstanceID string
 	// IntervalHours：0 = 关闭定时只留手动；否则 6–168
 	IntervalHours int
@@ -155,9 +155,9 @@ func (l *loader) backup(environment string) Backup {
 		return cfg
 	}
 
-	if !backupInstanceIDPattern.MatchString(cfg.InstanceID) {
-		l.fail("BACKUP_INSTANCE_ID is required when backups are enabled and must match ^[a-z0-9-]{1,32}$ " +
-			"(it goes into the object key; deriving it from the hostname would break every historical download after a rename or a restore)")
+	// 可选：对象键里带了产出时间，不靠它防重名。配了就得能进对象键
+	if cfg.InstanceID != "" && !backupInstanceIDPattern.MatchString(cfg.InstanceID) {
+		l.fail("BACKUP_INSTANCE_ID must match ^[a-z0-9-]{1,32}$ (it goes into the object key); leave it empty if one bucket holds only one system")
 	}
 	if cfg.Bucket.Bucket == "" || cfg.Bucket.Region == "" {
 		l.fail("BACKUP_BUCKET_BUCKET and BACKUP_BUCKET_REGION are required when backups are enabled")

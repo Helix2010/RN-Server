@@ -167,7 +167,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BACKUP_RECOVERY_HOLDER_A` | 空 | 槽位 A 由谁保管，一行人名。印进 `README-FIRST.txt`：拿到包的人得知道该去找谁。不填只是恢复说明里少一句，不影响产出 |
 | `BACKUP_RECOVERY_HOLDER_B` | 空 | 槽位 B，同上 |
 | `BACKUP_RECOVERY_HOLDER_C` | 空 | 槽位 C，同上 |
-| `BACKUP_INSTANCE_ID` | 空 | 进对象键前缀，`^[a-z0-9-]{1,32}$`。**显式配，不要从主机名推导**——改名或在新机器上恢复之后前缀就变了，历史备份全部下载不到 |
+| `BACKUP_INSTANCE_ID` | 空 | **可选**。配了就作为对象键里的一层目录（`<前缀>/<实例 ID>/backup-…`），一个桶里放几套系统时用来分开；`^[a-z0-9-]{1,32}$`。对象名里已经带了产出时间（`backup-20260916T102405Z-00000001-AB.rnbk`），不靠它防重名；上传前还会确认键不存在、存在就拒绝覆盖。不要从主机名推导 |
 | `BACKUP_INTERVAL_HOURS` | `0` | `0` = 关闭定时只留手动；否则 **6–168**，建议 `24` |
 | `BACKUP_RETENTION_DAYS` | `0` | 桶上生命周期规则配的保留天数，**抄一份给控制台看**。服务端不删任何对象。`0` = 未设置，控制台显示「未设置」而不是按一个猜出来的天数把下载按钮置灰 |
 | `BACKUP_BUCKET_PROVIDER` | `s3` | `s3` / `r2` / `minio` / `obs`，和发布存储认同一份清单（`objectstore.Providers`）。`obs` 是华为云，没有默认地址，`BACKUP_BUCKET_ENDPOINT` 必填。留空按老配置处理（见下一行） |

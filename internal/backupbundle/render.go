@@ -43,7 +43,7 @@ func fingerprintOf(byslot map[string]Recipient, slot string) string {
 // 机密，也不能假设读它的人手上有我们的任何工具。
 func renderReadmeFirst(in Input, pair backupcontainer.Pair, byslot map[string]Recipient, sha string) string {
 	var b strings.Builder
-	name := fmt.Sprintf("backup-%08d-%s.rnbk", in.Seq, pair.Name)
+	name := PackageBaseName(in.Seq, in.CreatedAt, pair.Name) + ".rnbk"
 
 	fmt.Fprintf(&b, `打包服务故障恢复备份 —— 先读这一页
 =====================================
@@ -89,8 +89,8 @@ func renderReadmeFirst(in Input, pair backupcontainer.Pair, byslot map[string]Re
 		if other.Name == pair.Name {
 			continue
 		}
-		fmt.Fprintf(&b, "    backup-%08d-%s.rnbk   要 %s 和 %s\n",
-			in.Seq, other.Name, other.Outer, other.Inner)
+		fmt.Fprintf(&b, "    %s.rnbk   要 %s 和 %s\n",
+			PackageBaseName(in.Seq, in.CreatedAt, other.Name), other.Outer, other.Inner)
 	}
 
 	fmt.Fprintf(&b, `

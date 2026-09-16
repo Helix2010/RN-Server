@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -37,7 +38,8 @@ func (f *fakeObjectStore) put(key string, body []byte, etag string) {
 	f.objects[key] = fakeObject{body: body, etag: etag, contentType: "application/octet-stream"}
 }
 
-var errFakeObjectMissing = errors.New("fake object store: no such key")
+// 和真的客户端一样包着 objectstore.ErrObjectNotFound：备份上传前靠它区分「不存在」和「读不了」
+var errFakeObjectMissing = fmt.Errorf("fake object store: no such key: %w", objectstore.ErrObjectNotFound)
 
 func (f *fakeObjectStore) Stat(_ context.Context, key string) (objectstore.ObjectInfo, error) {
 	if f.statErr != nil {

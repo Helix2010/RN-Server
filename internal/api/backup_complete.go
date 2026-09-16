@@ -20,6 +20,7 @@ import (
 
 	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"github.com/Helix2010/RN-Server/internal/backupcontainer"
+	"github.com/Helix2010/RN-Server/internal/objectstore"
 	"github.com/gin-gonic/gin"
 )
 
@@ -414,28 +415,11 @@ func (s *server) assembleAndUploadBackup(ctx context.Context, run backupRun) ([]
 	instance := s.cfg.Backup.InstanceID
 	out := make([]backupObject, 0, len(packages))
 	for _, pkg := range packages {
-		path := sink.paths[pkg.Pair]
-		key := backupObjectKey(prefix, instance, run.Seq, pkg.Pair, ".rnbk")
-		if err := uploadFile(ctx, client, key, path, "application/octet-stream"); err != nil {
-			return nil, 0, fmt.Errorf("upload %s: %w", pkg.Pair, err)
-		}
-		// 上传完再从桶里取回来重算一次 sha256（设计 §12 第 1 级）。
-		//
-		// 本地那个值是封包时边写边算的，它只能证明「我封出来的是这个」。
-		// 一次截断的上传（多段中途失败但对象被创建、或代理层截断）会留下一个短
-		// 对象，而库里记着完整包的 sha256 和 size、状态 succeeded、控制台全绿，
-		// 直到灾难当天下载下来对不上——那时没有第二次机会。
-		// 回读是这条链路上唯一能证明「桶里那个对象和我封出来的是同一个」的动作。
-		if err := verifyUploadedObject(ctx, client, key, pkg.SHA256, pkg.Size); err != nil {
-			return nil, 0, fmt.Errorf("verify %s after upload: %w", pkg.Pair, err)
-		}
-
-		// 写入顺序固定：先 .rnbk 后 .README.txt。README 的存在就是
-		// 「这一组上传完成了」的提交标记
-		readmeKey := backupObjectKey(prefix, instance, run.Seq, pkg.Pair, ".README.txt")
-		if err := client.Put(ctx, readmeKey, strings.NewReader(pkg.ReadmeFirst),
-			int64(len(pkg.ReadmeFirst)), "text/plain; charset=utf-8"); err != nil {
-			return nil, 0, fmt.Errorf("upload the readme for %s: %w", pkg.Pair, err)
+		name := backupbundle.PackageBaseName(run.Seq, input.CreatedAt, pkg.Pair)
+		key := backupObjectKey(prefix, instance, name+".rnbk")
+		readmeKey := backupObjectKey(prefix, instance, name+".README.txt")
+		if err := uploadBackupPackage(ctx, client, key, readmeKey, sink.paths[pkg.Pair], pkg); err != nil {
+			return nil, 0, fmt.Errorf("%s: %w", pkg.Pair, err)
 		}
 		out = append(out, backupObject{Pair: pkg.Pair, ObjectKey: key, SHA256: pkg.SHA256, SizeBytes: pkg.Size})
 	}
@@ -501,7 +485,7 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 	}
 
 	return backupbundle.Input{
-		Seq: run.Seq, InstanceID: s.cfg.Backup.InstanceID, CreatedAt: time.Now().UTC(),
+		Seq: run.Seq, InstanceID: s.backupMetaInstanceID(), CreatedAt: time.Now().UTC(),
 		Recipients: recipients, AgentInner: inner,
 		ServerFiles: serverFiles, ServerManifest: serverManifest, AgentManifest: agentManifest,
 		Tenants: tenants, ServerVersion: serverBuildVersion(), AgentVersion: anyMeta.AgentVersion,
@@ -532,6 +516,40 @@ func verifyUploadedObject(ctx context.Context, client interface {
 	}
 	if got := hex.EncodeToString(digest.Sum(nil)); got != wantSHA256 {
 		return fmt.Errorf("the object in the bucket has sha256 %s, we uploaded %s", got, wantSHA256)
+	}
+	return nil
+}
+
+// uploadBackupPackage 传一组包：确认键不存在 → 传 .rnbk → 回读校验 → 传 README。
+func uploadBackupPackage(ctx context.Context, client objectstore.Client,
+	key, readmeKey, path string, pkg backupbundle.Package) error {
+	// **先确认这个键还不存在，存在就拒绝。** 名字里带了产出时间，正常情况下不可能重名；
+	// 真撞上了说明配置出了错（两套环境配成同一个前缀、时钟被拨回去），而覆盖一个已经
+	// 存在的包，在桶没开版本控制时就等于把它删了。宁可这一次备份失败，也不覆盖。
+	if _, err := client.Stat(ctx, key); err == nil {
+		return fmt.Errorf("对象 %s 已经存在，拒绝覆盖（检查是不是两套环境配成了同一个前缀）", key)
+	} else if !errors.Is(err, objectstore.ErrObjectNotFound) {
+		return fmt.Errorf("上传前确认对象是否已存在失败，不敢往下写: %w", err)
+	}
+
+	if err := uploadFile(ctx, client, key, path, "application/octet-stream"); err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	// 上传完再从桶里取回来重算一次 sha256（设计 §12 第 1 级）。
+	//
+	// 本地那个值是封包时边写边算的，它只能证明「我封出来的是这个」。
+	// 一次截断的上传（多段中途失败但对象被创建、或代理层截断）会留下一个短
+	// 对象，而库里记着完整包的 sha256 和 size、状态 succeeded、控制台全绿，
+	// 直到灾难当天下载下来对不上——那时没有第二次机会。
+	// 回读是这条链路上唯一能证明「桶里那个对象和我封出来的是同一个」的动作。
+	if err := verifyUploadedObject(ctx, client, key, pkg.SHA256, pkg.Size); err != nil {
+		return fmt.Errorf("verify after upload: %w", err)
+	}
+	// 写入顺序固定：先 .rnbk 后 .README.txt。README 的存在就是
+	// 「这一组上传完成了」的提交标记
+	if err := client.Put(ctx, readmeKey, strings.NewReader(pkg.ReadmeFirst),
+		int64(len(pkg.ReadmeFirst)), "text/plain; charset=utf-8"); err != nil {
+		return fmt.Errorf("upload the readme: %w", err)
 	}
 	return nil
 }

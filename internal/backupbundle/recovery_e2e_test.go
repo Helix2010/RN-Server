@@ -76,6 +76,14 @@ func TestGeneratedReadmeScriptActuallyOpensThePackage(t *testing.T) {
 		if !strings.Contains(pkg.ReadmeFirst, pkg.SHA256) {
 			t.Fatalf("%s: README 里没有印 sha256", pkg.Pair)
 		}
+		// README 上印的「这个包」和「另外两个包」必须和上传用的对象名是同一个——
+		// 两处各拼一份的话，灾难当天照着 README 去桶里找，另外两个包找不到
+		for _, other := range backupcontainer.Pairs() {
+			want := PackageBaseName(in.Seq, in.CreatedAt, other.Name) + ".rnbk"
+			if !strings.Contains(pkg.ReadmeFirst, want) {
+				t.Fatalf("%s: README 里没有印 %s，和桶里的对象名对不上", pkg.Pair, want)
+			}
+		}
 
 		// 2) 从 README 正文里抠出那段脚本，**不是从常量里抠**——要测的正是
 		//    印给人看的那一份

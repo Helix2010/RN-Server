@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -309,7 +310,9 @@ func (s *server) downloadBackup(c *gin.Context) {
 		map[string]any{"seq": run.Seq, "pair": found.Pair}))
 
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", "attachment; filename=\"backup-"+c.Param("seq")+"-"+found.Pair+".rnbk\"")
+	// 下载下来的文件名和桶里的对象名一致：README-FIRST 上印的是桶里的名字，
+	// 灾难当天人要拿它去对
+	c.Header("Content-Disposition", "attachment; filename=\""+path.Base(found.ObjectKey)+"\"")
 	c.Header("X-Backup-Sha256", found.SHA256)
 	if _, err := io.Copy(c.Writer, body); err != nil {
 		slog.Error("streaming a backup download failed", "seq", run.Seq, "pair", found.Pair, "error", err)

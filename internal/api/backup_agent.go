@@ -103,7 +103,7 @@ func (s *server) claimBackupRequest(c *gin.Context) {
 	// 拿它填内层 meta 会让同一个包的两层 instanceId 不一样——而 open-layer.sh
 	// 教操作者 cat meta.json 人工核对，灾难当天一个说不清的不一致比没有更糟
 	c.JSON(http.StatusOK, gin.H{"id": run.ID, "seq": run.Seq,
-		"instanceId": s.cfg.Backup.InstanceID, "recipients": recipients})
+		"instanceId": s.backupMetaInstanceID(), "recipients": recipients})
 }
 
 // backupKeystores 返回**全部**租户的密封盒子。
@@ -524,8 +524,8 @@ func (s *server) backupBucketClient() (objectstore.Client, error) {
 
 // backupObjectKey 拼对象键。它只在**上传**时用一次，结果存进 objects 那一列；
 // 下载时从行上读，不重新拼——主机改名或在新机器上恢复之后前缀就变了
-func backupObjectKey(prefix, instance string, seq uint64, pair, suffix string) string {
-	return joinObjectKey(prefix, instance, fmt.Sprintf("backup-%08d-%s%s", seq, pair, suffix))
+func backupObjectKey(prefix, instance, name string) string {
+	return joinObjectKey(prefix, instance, name)
 }
 
 // joinObjectKey 拼对象键，跳过空段。

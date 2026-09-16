@@ -178,12 +178,14 @@ func TestBackupIntervalAloneEnablesTheGate(t *testing.T) {
 	}
 }
 
-func TestBackupInstanceIDMustBeExplicitAndSafe(t *testing.T) {
+// BACKUP_INSTANCE_ID 可选（对象键带了产出时间，不靠它防重名），但配了就必须能安全地
+// 进对象键：挡住大写、下划线、路径穿越和超长
+func TestBackupInstanceIDIsOptionalButMustBeSafe(t *testing.T) {
 	keys := recoveryKeys(t, 3)
 	for _, tc := range []struct {
 		id string
 		ok bool
-	}{{"prod-1", true}, {"a", true}, {"", false}, {"Prod-1", false}, {"prod_1", false}, {"../etc", false},
+	}{{"prod-1", true}, {"a", true}, {"", true}, {"Prod-1", false}, {"prod_1", false}, {"../etc", false},
 		{strings.Repeat("a", 32), true}, {strings.Repeat("a", 33), false}} {
 		t.Run(tc.id, func(t *testing.T) {
 			baseEnv(t)

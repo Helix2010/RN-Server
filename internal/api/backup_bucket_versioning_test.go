@@ -1,11 +1,17 @@
 package api
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/Helix2010/RN-Server/internal/backupbundle"
 
 	"github.com/Helix2010/RN-Server/internal/config"
 )
@@ -175,9 +181,9 @@ func TestBackupBucketTestReportsEachPermission(t *testing.T) {
 // amos 上第一次跑 backup-bucket-test 时探针就落在了 "/_probe/…"。
 func TestBackupObjectKeysNeverStartWithASlash(t *testing.T) {
 	cases := map[string]string{
-		backupObjectKey("", "", 1, "AB", ".rnbk"):          "backup-00000001-AB.rnbk",
-		backupObjectKey("prod/", "inst", 1, "AB", ".rnbk"): "prod/inst/backup-00000001-AB.rnbk",
-		backupObjectKey("/prod/", "", 2, "BC", ".rnbk"):    "prod/backup-00000002-BC.rnbk",
+		backupObjectKey("", "", "backup-x-AB.rnbk"):          "backup-x-AB.rnbk",
+		backupObjectKey("prod/", "inst", "backup-x-AB.rnbk"): "prod/inst/backup-x-AB.rnbk",
+		backupObjectKey("/prod/", "", "backup-x-BC.rnbk"):    "prod/backup-x-BC.rnbk",
 	}
 	for got, want := range cases {
 		if got != want {
@@ -187,4 +193,56 @@ func TestBackupObjectKeysNeverStartWithASlash(t *testing.T) {
 	if probe := backupProbeKey("", ""); strings.HasPrefix(probe, "/") || !strings.HasPrefix(probe, "_probe/") {
 		t.Errorf("探针键不该以 / 开头: %q", probe)
 	}
+}
+
+// **上传前先确认键不存在，存在就拒绝。** 名字里带了产出时间，正常情况下不会重名；
+// 真撞上了是配置出错（两套环境配成同一个前缀、时钟被拨回去）。覆盖一个已经存在的包，
+// 在桶没开版本控制时就等于把它删了——宁可这一次备份失败。
+func TestBackupPackageUploadRefusesToOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/pkg.rnbk"
+	body := "sealed package bytes"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(body))
+	pkg := backupbundle.Package{Pair: "AB", SHA256: hex.EncodeToString(sum[:]),
+		Size: int64(len(body)), ReadmeFirst: "readme"}
+	ctx := context.Background()
+
+	t.Run("键不存在就正常传", func(t *testing.T) {
+		store := newFakeObjectStore()
+		if err := uploadBackupPackage(ctx, store, "k.rnbk", "k.README.txt", path, pkg); err != nil {
+			t.Fatalf("全新的键应当能传: %v", err)
+		}
+		if _, ok := store.objects["k.README.txt"]; !ok {
+			t.Error("README 没写——它是「这一组传完了」的提交标记")
+		}
+	})
+
+	t.Run("键已存在就拒绝，原来的包一个字节都不动", func(t *testing.T) {
+		store := newFakeObjectStore()
+		store.put("k.rnbk", []byte("the real package from yesterday"), "etag")
+		err := uploadBackupPackage(ctx, store, "k.rnbk", "k.README.txt", path, pkg)
+		if err == nil || !strings.Contains(err.Error(), "已经存在") {
+			t.Fatalf("覆盖了一个已经存在的包: %v", err)
+		}
+		if got := string(store.objects["k.rnbk"].body); got != "the real package from yesterday" {
+			t.Errorf("原来的包被改掉了: %q", got)
+		}
+		if _, ok := store.objects["k.README.txt"]; ok {
+			t.Error("拒绝了却还写了 README")
+		}
+	})
+
+	t.Run("读不了就不敢写", func(t *testing.T) {
+		store := newFakeObjectStore()
+		store.statErr = errors.New("AccessDenied")
+		if err := uploadBackupPackage(ctx, store, "k.rnbk", "k.README.txt", path, pkg); err == nil {
+			t.Fatal("确认不了键存不存在，却照样写了——403 被当成了「不存在」")
+		}
+		if _, ok := store.objects["k.rnbk"]; ok {
+			t.Error("确认不了还是写进去了")
+		}
+	})
 }
