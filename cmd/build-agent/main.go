@@ -12,6 +12,7 @@
 //	build-agent                 常驻（配置来自环境变量；配置不全以退出码 2 退出，机器被吊销以 77 退出）
 //	build-agent show-key        只读打印出处公钥 base64 与完整 sha256
 //	build-agent rotate-key      生成下一把出处密钥，常驻进程用当前密钥签换钥证明登记它
+//	build-agent enroll          新机器用一次性注册码换机器令牌，令牌直接写进 env 文件（install.sh 以 root 调用）
 //
 // 设计见 docs/design/android-signing-gate-2026-09-16.md「构建机」。
 package main
@@ -41,8 +42,10 @@ func main() {
 			os.Exit(showKey(os.Args[2:], os.Stdout, os.Stderr))
 		case "rotate-key":
 			os.Exit(rotateKey(os.Args[2:], os.Stdout, os.Stderr))
+		case "enroll":
+			os.Exit(enroll(os.Args[2:], os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintln(os.Stderr, "usage: build-agent [show-key|rotate-key] (configuration comes from the environment)")
+			fmt.Fprintln(os.Stderr, "usage: build-agent [show-key|rotate-key|enroll] (configuration comes from the environment)")
 			os.Exit(2)
 		}
 	}

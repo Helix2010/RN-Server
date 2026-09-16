@@ -43,6 +43,7 @@ func TestSecretHoldingStructsNeverPrintTheirSecrets(t *testing.T) {
 	values := map[string]any{
 		"config": cfg, "*config": &cfg, "client": a.api, "machineKey": key, "*machineKey": &key,
 		"keyring": ring, "redactor": red, "agent": a, "logBuffer": buf,
+		"enrollment": enrollment{MachineID: testMachineID, Token: sentinelToken, Status: "pending_key"},
 		"wrapper with exported fields": struct {
 			Cfg  config
 			Keys *keyring

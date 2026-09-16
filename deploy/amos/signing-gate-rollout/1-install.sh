@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 【已被取代】新机器用服务端下发的 internal/machinesetup/install.sh（安装包由 deploy/setup/build-bundles.sh 构建），
+# 手册见 deploy/amos/SIGNING_GATE_ROLLOUT.md。这个脚本只为 amos 的首次手工上线保留，amos 迁移完成后删除，不要再用于新机器。
 # 签名闸上线 · 第 1 步（amos，root，不涉及任何令牌）：迁移构建机到两个用户、安装签名闸与 CI 收口脚本。
 #   sudo bash 1-install.sh <部署包目录>      部署包由 0-bundle.sh 在开发机上生成后 scp 过来
 # 可重复执行。旧构建机的配置、二进制、agent-key 留存在 /root/rn-build-agent-legacy-<日期>/，回滚用。

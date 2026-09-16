@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 【已被取代】新机器用服务端下发的 internal/machinesetup/install.sh（安装包由 deploy/setup/build-bundles.sh 构建），
+# 手册见 deploy/amos/SIGNING_GATE_ROLLOUT.md。这个脚本只为 amos 的首次手工上线保留，amos 迁移完成后删除，不要再用于新机器。
 # 签名闸上线 · 第 0 步（开发机）：从当前提交构建部署包。
 #   deploy/amos/signing-gate-rollout/0-bundle.sh <输出目录>
 # 输出目录里是 build-agent、build-runner、signer、signer-check 与部署文件，外加 SHA256SUMS 与 COMMIT。

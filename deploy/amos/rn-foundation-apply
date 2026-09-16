@@ -4,6 +4,7 @@
 #   sudo rn-foundation-apply server
 #   sudo rn-foundation-apply admin <租户 slug>
 #   sudo rn-foundation-apply build-agent
+#   sudo rn-foundation-apply bundles <提交>
 #
 # 这是**唯一**一个 CI 能用 sudo 跑的东西。sudoers 里放行的是这个文件、不带参数
 # 限制，参数合法性由脚本自己管——理由是：把 install/mv/rm/systemctl 逐条写进
@@ -28,6 +29,9 @@ STAGE_ROOT=/var/lib/rn-foundation-deploy/incoming
 ADMIN_ROOT=/opt/rn-foundation/admin
 BINARY=/opt/rn-foundation/rn-server
 PREVIOUS=/opt/rn-foundation/rn-server.prev
+BUNDLE_ROOT=/opt/rn-foundation/machine-bundles
+# 保留几份不是 current 的旧安装包（回滚服务端时，旧服务端的 describe 读到的还是 current）
+BUNDLE_KEEP_PREVIOUS=2
 AGENT_BINARY=/opt/rn-build-agent/build-agent
 AGENT_PREVIOUS=/opt/rn-build-agent/build-agent.prev
 # 构建机冒烟用的身份：执行用户 builder，比正式运行控制进程的 rn-build-agent 权限更小
@@ -239,9 +243,100 @@ apply_build_agent() {
   log "新二进制已就位；代理正在把手上那条构建做完，做完自动起新版（systemctl status rn-build-agent 看进度）"
 }
 
+# 新机器的安装包（deploy/setup/build-bundles.sh 的产物）。服务端 GET /v1/machine-setup/bundle/<角色>.tar.gz
+# 从 $BUNDLE_ROOT/current/ 读，describe 的清单来自同目录的 manifest.json。
+#
+# 这一步不执行任何 CI 传来的东西，只是把三个文件以 root 拷进新目录、原子切换 current 软链。
+# 安装包里有签名闸程序：换得了它就能给**之后新装**的机器下发篡改过的程序（设计「5. 安装包的来源」的
+# 残余风险）；已经在跑的签名闸不从这里升级。生产上签名闸安装时要用 CI 日志里的 sha256 核对（--expect-sha256）。
+apply_bundles() {
+  local commit="${1:-}"
+  # 提交会拼进路径与 grep 的模式：只认 40 位小写十六进制
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "非法的提交: ${commit:-（空）}"
+  local src="$STAGE_ROOT/machine-bundles" f
+  if [ -L "$src" ] || [ ! -d "$src" ]; then
+    die "暂存目录里没有安装包：$src"
+  fi
+  [ "$(find "$src" -mindepth 1 -maxdepth 1 | wc -l)" = 3 ] || die "暂存的安装包目录里应该正好是三个文件，不换"
+
+  # 暂存目录属于部署账号，它随时能换掉里面的东西：先把三个文件拷成 root 自己的副本
+  # （cp -P 不跟随符号链接，指向别处的链接拷过来还是链接，下面拒绝），之后只核对、只用副本
+  install -d -o root -g root -m 0755 "$BUNDLE_ROOT"
+  # 上一次中途失败留下的副本（部署有 flock 串行，这里不会碰到正在进行的另一次）
+  rm -rf "$BUNDLE_ROOT"/.incoming-*
+  local tmp="$BUNDLE_ROOT/.incoming-$$"
+  install -d -o root -g root -m 0700 "$tmp"
+  for f in manifest.json signer.tar.gz builder.tar.gz; do
+    if [ -L "$src/$f" ] || [ ! -f "$src/$f" ]; then
+      rm -rf "$tmp"
+      die "暂存的安装包缺 $f，或者它不是普通文件"
+    fi
+    cp -P "$src/$f" "$tmp/$f"
+    if [ -L "$tmp/$f" ] || [ ! -f "$tmp/$f" ] || [ ! -s "$tmp/$f" ]; then
+      rm -rf "$tmp"
+      die "暂存的安装包里 $f 不是非空的普通文件，不换"
+    fi
+    chown root:root "$tmp/$f"
+    chmod 0644 "$tmp/$f"
+  done
+
+  # 上传不完整时早点炸：清单是这个提交的，两个归档的 sha256 都在清单里
+  local sum problem=""
+  grep -q '"format": *"rn-machine-bundles/v1"' "$tmp/manifest.json" || problem="manifest.json 的 format 不是 rn-machine-bundles/v1"
+  grep -Eq "\"commit\": *\"$commit\"" "$tmp/manifest.json" || problem="manifest.json 不是提交 $commit 的"
+  for f in signer.tar.gz builder.tar.gz; do
+    sum="$(sha256sum "$tmp/$f")"
+    grep -Eq "\"archiveSha256\": *\"${sum%% *}\"" "$tmp/manifest.json" || problem="$f 的 sha256 不在 manifest.json 里（上传不完整？）"
+  done
+  if [ -n "$problem" ]; then
+    rm -rf "$tmp"
+    die "$problem，不换"
+  fi
+
+  local name="$commit" dest same=yes
+  dest="$BUNDLE_ROOT/$name"
+  if [ -d "$dest" ]; then
+    for f in manifest.json signer.tar.gz builder.tar.gz; do
+      cmp -s "$tmp/$f" "$dest/$f" || same=no
+    done
+    if [ "$same" = no ]; then
+      # 同一提交重跑、但工具链变了编出不同的字节：另起一个目录，不动正在用的那份
+      name="$commit-$(date -u +%Y%m%dT%H%M%SZ)"
+      dest="$BUNDLE_ROOT/$name"
+    fi
+  fi
+  if [ -d "$dest" ]; then
+    rm -rf "$tmp"
+  else
+    chmod 0755 "$tmp"
+    mv -T "$tmp" "$dest"
+  fi
+
+  # 原子切换：新软链先建在旁边，再 rename 覆盖 current
+  ln -sfn "$name" "$BUNDLE_ROOT/.current.new"
+  mv -T "$BUNDLE_ROOT/.current.new" "$BUNDLE_ROOT/current"
+  rm -rf "$src"
+  log "安装包已切换到 $name"
+  local line
+  while read -r line; do
+    log "$line"
+  done < <(cd "$dest" && sha256sum signer.tar.gz builder.tar.gz)
+
+  # 只留 current 与最近几份
+  local kept=0 dir
+  while IFS= read -r dir; do
+    [ "$dir" = "$name" ] && continue
+    kept=$((kept + 1))
+    if [ "$kept" -gt "$BUNDLE_KEEP_PREVIOUS" ]; then
+      rm -rf "${BUNDLE_ROOT:?}/$dir"
+    fi
+  done < <(find "$BUNDLE_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' | sort -rn | cut -d' ' -f2)
+}
+
 case "${1:-}" in
 server)      apply_server ;;
 admin)       apply_admin "${2:-}" ;;
 build-agent) apply_build_agent ;;
-*) die "用法: $0 server | $0 admin <租户 slug> | $0 build-agent" ;;
+bundles)     apply_bundles "${2:-}" ;;
+*) die "用法: $0 server | $0 admin <租户 slug> | $0 build-agent | $0 bundles <提交>" ;;
 esac

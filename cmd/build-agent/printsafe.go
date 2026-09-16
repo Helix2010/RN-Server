@@ -68,6 +68,15 @@ func (b *logBuffer) GoString() string            { return b.String() }
 func (b *logBuffer) Format(f fmt.State, _ rune)  { _, _ = io.WriteString(f, b.String()) }
 func (w *lineWriter) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "lineWriter{}") }
 
+func (e enrollment) safeSummary() string {
+	return "enrollment{machineId=" + safeWord(e.MachineID) + " status=" + safeWord(e.Status) + " token=" + presence(e.Token) + "}"
+}
+func (e enrollment) String() string               { return e.safeSummary() }
+func (e enrollment) GoString() string             { return e.safeSummary() }
+func (e enrollment) LogValue() slog.Value         { return slog.StringValue(e.safeSummary()) }
+func (e enrollment) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, e.safeSummary()) }
+func (e enrollment) MarshalJSON() ([]byte, error) { return json.Marshal(e.safeSummary()) }
+
 func (r *keyring) safeSummary() string {
 	if r == nil {
 		return "keyring{}"
