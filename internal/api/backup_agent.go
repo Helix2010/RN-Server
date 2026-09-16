@@ -98,7 +98,11 @@ func (s *server) claimBackupRequest(c *gin.Context) {
 		recipients = append(recipients, gin.H{"slot": slot, "fingerprint": s.cfg.Backup.Recipients[i].Fingerprint})
 	}
 	cleanBackupStaging(run.ID)
-	c.JSON(http.StatusOK, gin.H{"id": run.ID, "seq": run.Seq, "recipients": recipients})
+	// instanceId 必须由服务端下发。打包机自己那个 BUILD_AGENT_NAME 默认取主机名，
+	// 拿它填内层 meta 会让同一个包的两层 instanceId 不一样——而 open-layer.sh
+	// 教操作者 cat meta.json 人工核对，灾难当天一个说不清的不一致比没有更糟
+	c.JSON(http.StatusOK, gin.H{"id": run.ID, "seq": run.Seq,
+		"instanceId": s.cfg.Backup.InstanceID, "recipients": recipients})
 }
 
 // backupKeystores 返回**全部**租户的密封盒子。
@@ -193,6 +197,20 @@ func (s *server) receiveBackupPayload(c *gin.Context) {
 		})
 		return
 	}
+
+	// 先比 ContentLength 再收 body（设计 §8.1 实现约束 2）。没有它，一个声称
+	// 自己很小、实际一直写的请求会让我们把 512 MiB 落到盘上才发现不对
+	if c.Request.ContentLength < 0 {
+		problem(c, http.StatusLengthRequired, "BACKUP_PAYLOAD_LENGTH_REQUIRED",
+			"the upload must declare Content-Length")
+		return
+	}
+	if c.Request.ContentLength > backupPayloadMaxBytes {
+		problem(c, http.StatusRequestEntityTooLarge, "BACKUP_PAYLOAD_TOO_LARGE",
+			"the declared Content-Length is larger than the per-backup limit")
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, backupPayloadMaxBytes)
 
 	mediaType, params, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if err != nil || !strings.HasPrefix(mediaType, "multipart/") || params["boundary"] == "" {

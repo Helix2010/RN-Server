@@ -45,7 +45,10 @@ const backupTimeout = 25 * time.Minute
 const backupStagingDirName = "backup-staging"
 
 type backupRequest struct {
-	ID         string `json:"id"`
+	ID string `json:"id"`
+	// InstanceID 由服务端下发。**不许从主机名推导**：两层 meta 的 instanceId
+	// 必须是同一个值，而 BUILD_AGENT_NAME 默认就是主机名
+	InstanceID string `json:"instanceId"`
 	Seq        uint64 `json:"seq"`
 	Recipients []struct {
 		Slot        string `json:"slot"`
@@ -138,7 +141,7 @@ func produceBackup(ctx context.Context, cfg config, api *client, request backupR
 		var sealed bytes.Buffer
 		meta := backupcontainer.Meta{
 			Layer: backupcontainer.LayerInner, Seq: request.Seq,
-			InstanceID: cfg.Name, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			InstanceID: request.InstanceID, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		}
 		if err := backupcontainer.Seal(&sealed, cfg.BackupRecipients[index], meta,
 			bytes.NewReader(plain), int64(len(plain))); err != nil {
