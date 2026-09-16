@@ -62,7 +62,7 @@ func Install(t *testing.T, dir string) Tools {
 	}
 	pnpm := fmt.Sprintf(`#!/bin/sh
 set -eu
-record() { env > %[1]q/"$1".env; }
+record() { env > %[1]q/"$1".env; id -u > %[1]q/"$1".uid; }
 case "$1" in
 install)
   record install
