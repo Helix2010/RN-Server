@@ -97,6 +97,9 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		}
 	}
 
+	// 桶在控制台上配的时候 env 里那份可能是空的，显示的必须是生效的那个
+	effectiveBucket, _, _ := s.resolveBackupBucket(ctx)
+
 	signing := gin.H{"registered": false, "fingerprint": nil, "pending": nil}
 	if record, err := s.backupSigningKeyRecord(ctx); err == nil && record != nil {
 		signing["registered"] = true
@@ -119,7 +122,7 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		"threshold":        "2-of-3",
 		"instanceId":       nullableString(s.cfg.Backup.InstanceID),
 		"intervalHours":    s.cfg.Backup.IntervalHours,
-		"bucket":           nullableString(s.cfg.Backup.Bucket.Bucket),
+		"bucket":           nullableString(effectiveBucket.Bucket),
 		"bucketVersioning": s.backupBucketVersioning(),
 		// 保留期只是抄桶上生命周期规则的一份给人看。0 = 没配，控制台显示
 		// 「未设置」——比按一个猜出来的天数把按钮置灰诚实
@@ -313,47 +316,28 @@ func (s *server) downloadBackup(c *gin.Context) {
 	}
 }
 
-// testBackupBucket 只 Put 一个随机探针键。
+// testBackupBucket 是控制台上那个「测试连接」。
 //
-// 不能用现成的 objectstore.Test()：它 Put 固定键再 HeadObject，既要 Get 权限，
-// 固定键在开了 versioning 的桶上还会永久留存一堆版本。
+// 检查本身在 runBackupBucketChecks 里，和 `rn-server backup-bucket-test` 共用一份。
+// 结果永远是 200 + 三项明细，不是第一项失败就 424：人要一次看到全部缺口。
 func (s *server) testBackupBucket(c *gin.Context) {
+	// 另起 ctx：桶不可达时，10 秒的数据库超时会把这条测试砍掉，
+	// 而运维看到的是一句和桶无关的 deadline exceeded
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	bucket, _, err := s.resolveBackupBucket(ctx)
+	if err != nil {
+		problem(c, http.StatusPreconditionFailed, "BACKUP_BUCKET_UNAVAILABLE", err.Error())
+		return
+	}
 	client, err := s.backupBucketClient()
 	if err != nil {
 		problem(c, http.StatusPreconditionFailed, "BACKUP_BUCKET_UNAVAILABLE", err.Error())
 		return
 	}
-	key := backupObjectKey(s.cfg.Backup.Bucket.Prefix, s.cfg.Backup.InstanceID, 0,
-		"probe-"+randomID(8), ".txt")
-	probe := "rn-foundation backup bucket probe " + iso(time.Now().UTC()) + "\n"
-	// 另起 ctx：桶不可达时，10 秒的数据库超时会把这条测试砍掉，
-	// 而运维看到的是一句和桶无关的 deadline exceeded
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	if err := client.Put(ctx, key, strings.NewReader(probe), int64(len(probe)), "text/plain"); err != nil {
-		problem(c, http.StatusFailedDependency, "BACKUP_BUCKET_TEST_FAILED",
-			"cannot write to the backup bucket: "+err.Error())
-		return
-	}
-	// 顺带校验 versioning（设计 §6.1）。没开就是**没配对**，不是小瑕疵：
-	// Put 对一个已存在的键在没开 versioning 时就是删除，于是拿到桶写权限的人
-	// 覆盖掉真包之后原件再也取不回来。控制台上那行 sha256 那时只能告诉你完了，
-	// 不能让你取回真的——第一个真实性锚点就此只剩报丧的功能。
-	versioning, versioningErr := client.BucketVersioning(ctx)
-	view := gin.H{"ok": true, "bucket": s.cfg.Backup.Bucket.Bucket, "probeKey": key,
-		"checkedAt": iso(time.Now().UTC()), "versioning": versioning}
-	switch {
-	case versioningErr != nil:
-		view["ok"] = false
-		view["versioningDetail"] = "读不到桶的版本控制状态，凭据可能缺 s3:GetBucketVersioning：" +
-			versioningErr.Error()
-	case !versioning:
-		view["ok"] = false
-		view["versioningDetail"] = "这个桶没有开版本控制。备份桶必须开：" +
-			"没开的话覆盖写就是删除，被覆盖掉的真包再也取不回来。"
-	}
-	s.cacheBackupBucketVersioning(versioning && versioningErr == nil)
-	c.JSON(http.StatusOK, view)
+	result := runBackupBucketChecks(ctx, client, bucket, s.cfg.Backup.InstanceID)
+	s.cacheBackupBucketVersioning(result.Versioning)
+	c.JSON(http.StatusOK, result)
 }
 
 // resetKeystoreChecks 把每个租户的签名密钥校验结果作废，让打包机重新验一遍。

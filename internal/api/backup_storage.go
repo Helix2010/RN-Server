@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/Helix2010/RN-Server/internal/objectstore"
 )
 
 // 备份桶的配置在控制台上维护（设计 §6.1、§8.2）。
@@ -194,9 +195,15 @@ func (s *server) updateBackupStorage(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET", "bucket and region are required")
 		return
 	}
-	// 和发布存储认同一套提供商，别在两个地方各长出一套
-	if !oneOf(body.Provider, "s3", "r2", "minio") {
-		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET", "provider must be s3, r2 or minio")
+	// 和发布存储认同一份提供商清单（objectstore.Providers），别在两个地方各长出一套
+	if !objectstore.KnownProvider(body.Provider) {
+		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET",
+			"provider must be one of "+strings.Join(objectstore.Providers, ", "))
+		return
+	}
+	if objectstore.ProviderNeedsEndpoint(body.Provider) && body.Endpoint == "" {
+		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET",
+			"this provider has no default endpoint; fill in the endpoint")
 		return
 	}
 	if s.cfg.Environment == "production" && body.Endpoint != "" && !strings.HasPrefix(body.Endpoint, "https://") {

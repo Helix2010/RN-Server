@@ -289,8 +289,11 @@ func releaseStorageView(record releaseStorageRecord, tenant string) gin.H {
 var errStorageEndpointInsecure = errors.New("endpoint and publicBaseUrl must use https in production")
 
 func validateReleaseStorageWrite(body releaseStorageWrite, production bool) error {
-	if !oneOf(body.Provider, "s3", "r2", "minio") || body.Region == "" || body.Bucket == "" {
+	if !objectstore.KnownProvider(body.Provider) || body.Region == "" || body.Bucket == "" {
 		return errors.New("provider, region and bucket are required")
+	}
+	if objectstore.ProviderNeedsEndpoint(body.Provider) && body.Endpoint == "" {
+		return errors.New("this provider has no default endpoint; fill in the endpoint")
 	}
 	if (body.AccessKeyID == "") != (body.SecretAccessKey == "") {
 		return errors.New("accessKeyId and secretAccessKey must be provided together")

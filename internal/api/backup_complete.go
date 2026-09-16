@@ -404,7 +404,13 @@ func (s *server) assembleAndUploadBackup(ctx context.Context, run backupRun) ([]
 	if err != nil {
 		return nil, 0, err
 	}
-	prefix := s.cfg.Backup.Bucket.Prefix
+	// 前缀取生效的那份。以前读的是 env：桶在控制台上配了前缀 prod/，包却落在桶根上，
+	// 而如果凭据的策略只放行 prod/*，每一次备份都会在上传那一步 403
+	bucket, _, err := s.resolveBackupBucket(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	prefix := bucket.Prefix
 	instance := s.cfg.Backup.InstanceID
 	out := make([]backupObject, 0, len(packages))
 	for _, pkg := range packages {

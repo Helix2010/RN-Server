@@ -67,6 +67,12 @@ func main() {
 		}
 		return
 	}
+	// 在持有凭据的这台机器上分别测备份桶的三项权限，凭据不离开这台机器
+	if len(os.Args) == 2 && os.Args[1] == "backup-bucket-test" {
+		code := runBackupBucketTest(cfg, database)
+		database.Close()
+		os.Exit(code)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "indexer" {
 		runIndexer(cfg, database)
 		return

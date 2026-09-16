@@ -16,6 +16,8 @@ import (
 type fakeObjectStore struct {
 	versioningEnabled bool
 	versioningErr     error
+	putErr            error
+	getErr            error
 	corsErr           error
 	objects           map[string]fakeObject
 	statErr           error
@@ -54,6 +56,9 @@ func (f *fakeObjectStore) Head(ctx context.Context, key string) (int64, string, 
 }
 
 func (f *fakeObjectStore) Get(_ context.Context, key string) (io.ReadCloser, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	object, ok := f.objects[key]
 	if !ok {
 		return nil, errFakeObjectMissing
@@ -70,6 +75,9 @@ func (f *fakeObjectStore) GetRange(_ context.Context, key string, start, end int
 }
 
 func (f *fakeObjectStore) Put(_ context.Context, key string, body io.Reader, _ int64, contentType string) error {
+	if f.putErr != nil {
+		return f.putErr
+	}
 	raw, err := io.ReadAll(body)
 	if err != nil {
 		return err

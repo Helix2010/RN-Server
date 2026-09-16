@@ -170,13 +170,13 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BACKUP_INSTANCE_ID` | 空 | 进对象键前缀，`^[a-z0-9-]{1,32}$`。**显式配，不要从主机名推导**——改名或在新机器上恢复之后前缀就变了，历史备份全部下载不到 |
 | `BACKUP_INTERVAL_HOURS` | `0` | `0` = 关闭定时只留手动；否则 **6–168**，建议 `24` |
 | `BACKUP_RETENTION_DAYS` | `0` | 桶上生命周期规则配的保留天数，**抄一份给控制台看**。服务端不删任何对象。`0` = 未设置，控制台显示「未设置」而不是按一个猜出来的天数把下载按钮置灰 |
-| `BACKUP_BUCKET_PROVIDER` | `s3` | `s3` / `r2` / `minio`，和发布存储认同一套。留空按老配置处理（见下一行） |
+| `BACKUP_BUCKET_PROVIDER` | `s3` | `s3` / `r2` / `minio` / `obs`，和发布存储认同一份清单（`objectstore.Providers`）。`obs` 是华为云，没有默认地址，`BACKUP_BUCKET_ENDPOINT` 必填。留空按老配置处理（见下一行） |
 | `BACKUP_BUCKET_FORCE_PATH_STYLE` | `false` | MinIO 必须 `true`，S3 / R2 不用。**以前是猜的**（填了 endpoint 就开），猜错的表现是连不上桶而没人在现场——`BACKUP_BUCKET_PROVIDER` 留空时仍按那条旧推断走 |
 | `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露 |
 | `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域 |
 | `BACKUP_BUCKET_ENDPOINT` | 空 | 自定义 endpoint（兼容 S3 的对象存储）。生产强制 https |
 | `BACKUP_BUCKET_PREFIX` | 空 | 对象键前缀 |
-| `BACKUP_BUCKET_ACCESS_KEY_ID` | 空 | 只需要 `s3:PutObject` + `s3:GetObject` + `s3:GetBucketVersioning` |
+| `BACKUP_BUCKET_ACCESS_KEY_ID` | 空 | 只要三项：写对象、读对象、读版本控制状态（S3 / MinIO 是 `s3:PutObject` + `s3:GetObject` + `s3:GetBucketVersioning`；华为云是 `obs:object:PutObject` + `obs:object:GetObject` + `obs:bucket:GetBucketVersioning`）。**不要给**删除对象、删除版本、改版本控制、改生命周期——给了就能先关版本控制再覆盖真包。在机器上测：`rn-server backup-bucket-test` |
 | `BACKUP_BUCKET_SECRET_ACCESS_KEY` | 空 | 同上 |
 
 **为什么公钥要再套一层 base64**：PEM 带换行，直接写进 systemd 的 `EnvironmentFile` 极易写坏，而这个键要用的那一天正好是最不该出意外的那一天。生成方式：
