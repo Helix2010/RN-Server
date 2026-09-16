@@ -80,7 +80,10 @@ fi
 echo "== sha256 与冒烟"
 sha256sum /opt/rn-build-agent/build-agent /opt/rn-build-agent/build-runner /opt/rn-signer/bin/signer \
   /opt/rn-signer/bin/signer-check /opt/rn-signer/build-tools/35.0.0/lib/apksigner.jar /usr/local/sbin/rn-foundation-apply
-( env -i /opt/rn-build-agent/build-agent >/dev/null 2>&1; echo "build-agent 空环境 exit=$? (应为 2)" )
-( /opt/rn-build-agent/build-runner >/dev/null 2>&1; echo "build-runner 无参数 exit=$? (应为 2)" )
+# 这两个命令按设计以非 0 退出，不能让 set -e 把它们当成脚本失败
+code=0; env -i /opt/rn-build-agent/build-agent >/dev/null 2>&1 || code=$?
+echo "build-agent 空环境 exit=$code (应为 2)"
+code=0; /opt/rn-build-agent/build-runner >/dev/null 2>&1 || code=$?
+echo "build-runner 无参数 exit=$code (应为 2)"
 id rn-build-agent; id builder; id rn-signer-a; id rn-signer-b
 echo "第 1 步完成。下一步：控制台新建机器，然后 sudo bash 2-configure.sh"

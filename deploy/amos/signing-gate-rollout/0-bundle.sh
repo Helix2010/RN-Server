@@ -23,5 +23,6 @@ cp deploy/amos/rn-foundation-apply deploy/amos/rn-foundation-deploy.sudoers \
   deploy/amos/rn-foundation-server.service deploy/amos/rn-foundation-indexer.service \
   deploy/amos/rn-foundation-migrate.service "$OUT/"
 (cd "$OUT" && sha256sum build-agent build-runner signer signer-check > SHA256SUMS && cat SHA256SUMS)
-( env -i "$OUT/build-agent" >/dev/null 2>&1; code=$?; [ "$code" = 2 ] || { echo "build-agent 空环境退出码 $code，应为 2" >&2; exit 1; } )
+code=0; env -i "$OUT/build-agent" >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || { echo "build-agent 空环境退出码 $code，应为 2" >&2; exit 1; }
 echo "部署包：$OUT（提交 $(cat "$OUT/COMMIT")）"
