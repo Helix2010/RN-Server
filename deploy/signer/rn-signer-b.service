@@ -15,6 +15,9 @@ EnvironmentFile=/etc/rn-signer-b.env
 ExecStart=/opt/rn-signer/bin/signer run
 Restart=on-failure
 RestartSec=60s
+# 退出码 78：服务端不再接受本机令牌（401 MACHINE_REVOKED / MACHINE_AUTH_REQUIRED）。换令牌之前重启
+# 只会反复失败刷日志，所以不重启；unit 停在 failed，换新令牌（按新机器登记）后手工启动。
+RestartPreventExitStatus=78
 TimeoutStopSec=90s
 KillMode=mixed
 

@@ -25,9 +25,12 @@ User=rn-signer-a
 Group=rn-signer-a
 EnvironmentFile=/etc/rn-signer-a.env
 ExecStart=/opt/rn-signer/bin/signer run
-# 致命错误（本机记录校验失败、令牌被吊销、公钥不符）退出后不要高频重启刷日志
+# 其它致命错误（本机记录校验失败、公钥不符、文件不可信）退出码 1：每 60 秒重启一次，不高频刷日志
 Restart=on-failure
 RestartSec=60s
+# 退出码 78：服务端不再接受本机令牌（401 MACHINE_REVOKED / MACHINE_AUTH_REQUIRED）。换令牌之前重启
+# 只会反复失败刷日志，所以不重启；unit 停在 failed，换新令牌（按新机器登记）后手工启动。
+RestartPreventExitStatus=78
 # SIGTERM 时签名闸把手上的任务 release 回服务端再退出（apksigner 最多几十秒）
 TimeoutStopSec=90s
 KillMode=mixed
