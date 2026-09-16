@@ -72,6 +72,11 @@ func newAPIError(path string, status int, payload []byte) error {
 	if detail == "" {
 		detail = string(payload)
 	}
+	if status >= 300 && status < 400 {
+		// 重定向不重试：同一个地址下一次多半还是同一个答案，而且这说明链路上有东西不对
+		return &apiError{Path: path, Status: status,
+			Detail: "the server answered with a redirect; build agents never follow redirects (they would carry the machine token elsewhere)"}
+	}
 	err := &apiError{Path: path, Status: status, Code: problem.Code, Detail: detail}
 	if transientCodes[problem.Code] {
 		return retryLater{err}
@@ -92,6 +97,16 @@ var transientCodes = map[string]bool{
 	// 机器登记表并发写冲突
 	"MACHINES_VERSION_CONFLICT": true,
 }
+
+// refuseRedirects 让客户端从不跟随重定向，把 3xx 原样交回来按错误处理。
+//
+// Go 默认跟随重定向，并且会把自定义请求头（x-machine-token）和可重放的请求体（GetBody）
+// 一起带到新地址——API 源或它前面的反代只要回一个 307/308，本机令牌和几十兆的包就发到了
+// 任意一方（评审 R2 的 PoC 就是这样）。构建机要连的每个地址都是确定的，没有需要跟随的重定向。
+func refuseRedirects(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+// failedStatus：3xx（没有被跟随的重定向）与 4xx、5xx 都是失败。
+func failedStatus(status int) bool { return status >= 300 }
 
 // classify 决定一个 HTTP 失败要不要再试：5xx 和 429 是"现在不行"，4xx 是"不行"。
 func classify(status int, err error) error {
@@ -170,12 +185,13 @@ func newClient(cfg config) *client {
 	return &client{
 		server: cfg.Server,
 		token:  cfg.MachineToken,
-		http:   &http.Client{Timeout: defaultHTTPRequestTimeout},
+		http:   &http.Client{Timeout: defaultHTTPRequestTimeout, CheckRedirect: refuseRedirects},
 		// 几十上百兆的 PUT 经过反代链路时 h2 的流错误比 1.1 常见得多，这条路径也没有
 		// 任何需要多路复用的理由，所以强制 HTTP/1.1。
 		upload: &http.Client{
-			Timeout:   uploadRequestTimeout,
-			Transport: &http.Transport{ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}},
+			Timeout:       uploadRequestTimeout,
+			CheckRedirect: refuseRedirects,
+			Transport:     &http.Transport{ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}},
 		},
 	}
 }
@@ -210,7 +226,7 @@ func (c *client) send(ctx context.Context, method, path string, attempt int, bod
 	if len(payload) > maxJSONResponseBytes {
 		return response.StatusCode, nil, fmt.Errorf("%s returned more than %d bytes", path, maxJSONResponseBytes)
 	}
-	if response.StatusCode >= 400 {
+	if failedStatus(response.StatusCode) {
 		return response.StatusCode, payload, newAPIError(path, response.StatusCode, payload)
 	}
 	return response.StatusCode, payload, nil
@@ -393,7 +409,7 @@ func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path,
 	}
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes))
-	if response.StatusCode >= 400 {
+	if failedStatus(response.StatusCode) {
 		return newAPIError(apiPath, response.StatusCode, payload)
 	}
 	var stored struct {
@@ -423,7 +439,7 @@ func (c *client) downloadIcon(ctx context.Context, job claimedJob, name string, 
 		return retryLater{err}
 	}
 	defer response.Body.Close()
-	if response.StatusCode >= 400 {
+	if failedStatus(response.StatusCode) {
 		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return newAPIError("icon "+name, response.StatusCode, payload)
 	}
@@ -526,7 +542,7 @@ func (c *client) putTicket(ctx context.Context, job claimedJob, ticket uploadTic
 	}
 	defer response.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, maxJSONResponseBytes))
-	if response.StatusCode >= 400 {
+	if failedStatus(response.StatusCode) {
 		return newAPIError("upload of "+filepath.Base(path), response.StatusCode, payload)
 	}
 	return nil

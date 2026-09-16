@@ -73,6 +73,8 @@ type fakeServer struct {
 	uploads       map[string][]byte
 	// failNext 按路径后缀排好的错误响应，依次消耗
 	failNext map[string][]injectedProblem
+	// redirects 让以某个后缀结尾的请求回 307 到给定的源
+	redirects map[string]string
 }
 
 type injectedProblem struct {
@@ -88,7 +90,7 @@ func (f *fakeServer) failOnce(suffix string, status int, code string) {
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
-	f := &fakeServer{t: t, keyStatus: "active", uploads: map[string][]byte{}, failNext: map[string][]injectedProblem{}}
+	f := &fakeServer{t: t, keyStatus: "active", uploads: map[string][]byte{}, failNext: map[string][]injectedProblem{}, redirects: map[string]string{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -139,6 +141,12 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	for suffix, origin := range f.redirects {
+		if strings.HasSuffix(path, suffix) {
+			http.Redirect(w, r, origin+path, http.StatusTemporaryRedirect)
+			return
+		}
+	}
 	for suffix, queue := range f.failNext {
 		if strings.HasSuffix(path, suffix) && len(queue) > 0 {
 			f.failNext[suffix] = queue[1:]
