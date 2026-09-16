@@ -155,7 +155,6 @@ type backupBucketWrite struct {
 	ExpectedVersion int    `json:"expectedVersion"`
 	Reason          string `json:"reason"`
 	Confirm         bool   `json:"confirm"`
-	Password        string `json:"password"`
 }
 
 // updateBackupStorage 保存桶配置。
@@ -163,10 +162,6 @@ func (s *server) updateBackupStorage(c *gin.Context) {
 	var body backupBucketWrite
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 {
 		problem(c, http.StatusBadRequest, "INVALID_BACKUP_BUCKET", "reason and confirm=true are required")
-		return
-	}
-	// 改桶等于改「备份往哪写、以后从哪取」，和跑一次备份同级，要重输口令
-	if !s.requireBackupPassword(c, body.Password) {
 		return
 	}
 	body.Bucket = strings.TrimSpace(body.Bucket)

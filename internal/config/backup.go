@@ -122,16 +122,30 @@ func (l *loader) backup(environment string) Backup {
 		l.fail("BACKUP_BUCKET_ENDPOINT must be https in production")
 	}
 
-	// 三把必须全齐。少一把不会退回两把跑——没有降级模式（§2.1）
-	missing := []string{}
+	// 三把必须全齐，但这条**不在启动时拦**。
+	//
+	// 三把公钥是三个人各自生成的，收齐是一件跨人跨天的事。如果启动就要求全齐，
+	// 那么在收齐之前服务端根本起不来——而三把公钥恰恰要在控制台上录入，
+	// 控制台又要服务端活着。这是个死结，而且把整个 wallet 后端的启动挂在了一个
+	// 还没配完的功能上（§4.2 的 Enabled() 注释说的就是这种事不该发生）。
+	//
+	// 真正的闸在产出备份那一刻：createBackupRun 会在不足三把时拒绝并说明差哪几把。
+	// 那里拦既不会误伤启动，报错也更接近人当时在做的事。
+	//
+	// 这里只挡一种情况：env 里填了一部分。那不是「还没配」，那是打字错误或者
+	// 复制粘贴漏了一行，必须当场说出来。
+	configured, missing := []string{}, []string{}
 	for i, slot := range backupcontainer.SlotNames {
-		if cfg.Recipients[i].Fingerprint == "" {
+		if cfg.Recipients[i].Fingerprint != "" {
+			configured = append(configured, slot)
+		} else {
 			missing = append(missing, "BACKUP_RECOVERY_RECIPIENT_"+slot)
 		}
 	}
-	if len(missing) > 0 {
-		l.fail(strings.Join(missing, ", ") + " must be set when backups are enabled: the threshold is 2-of-3 and " +
-			"there is no reduced mode. Configure all three, or turn backups off (leave BACKUP_BUCKET_BUCKET empty and BACKUP_INTERVAL_HOURS at 0)")
+	if len(configured) > 0 && len(missing) > 0 {
+		l.fail(strings.Join(missing, ", ") + " is missing while " + strings.Join(configured, "/") +
+			" is set: the threshold is 2-of-3 and there is no reduced mode. " +
+			"Set all three here, or leave all three empty and enter them in the console.")
 	}
 
 	// 两把相同 = 某一组的两层封给同一个人 = 那一组一个人就能开。
@@ -150,20 +164,32 @@ func (l *loader) backup(environment string) Backup {
 	return cfg
 }
 
-func (l *loader) recoveryRecipient(key, value string) BackupRecipient {
+// ParseBackupRecipient 解析一把恢复公钥（PEM 的 base64）。
+//
+// 导出是为了让控制台录入走**同一套校验**：env 和控制台两条路认的必须是同一种
+// 格式、同一个指纹算法，否则「env 里能起、控制台上填同样的值却报错」这种事
+// 会耗掉排查的人一整天。
+func ParseBackupRecipient(value string) (BackupRecipient, error) {
 	raw := strings.TrimSpace(value)
 	if raw == "" {
-		return BackupRecipient{}
+		return BackupRecipient{}, nil
 	}
 	pub, err := backupcontainer.ParsePublicKey(raw)
 	if err != nil {
-		l.fail(key + ": " + err.Error())
-		return BackupRecipient{}
+		return BackupRecipient{}, err
 	}
 	fingerprint, err := backupcontainer.Fingerprint(pub)
+	if err != nil {
+		return BackupRecipient{}, err
+	}
+	return BackupRecipient{Encoded: raw, Key: pub, Fingerprint: fingerprint}, nil
+}
+
+func (l *loader) recoveryRecipient(key, value string) BackupRecipient {
+	parsed, err := ParseBackupRecipient(value)
 	if err != nil {
 		l.fail(key + ": " + err.Error())
 		return BackupRecipient{}
 	}
-	return BackupRecipient{Encoded: raw, Key: pub, Fingerprint: fingerprint}
+	return parsed
 }

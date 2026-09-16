@@ -94,8 +94,13 @@ func (s *server) claimBackupRequest(c *gin.Context) {
 	// 下发三个指纹供打包机**核对**——它封给自己 env 里那三把，任何一个对不上
 	// 就拒绝执行并上报。比对的是指纹不是公钥本体，所以下发的内容没有被信任过
 	recipients := make([]gin.H, 0, backupcontainer.SlotCount)
+	resolved, _, err := s.resolveBackupRecipients(c.Request.Context())
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_READ_FAILED", err.Error())
+		return
+	}
 	for i, slot := range backupcontainer.SlotNames {
-		recipients = append(recipients, gin.H{"slot": slot, "fingerprint": s.cfg.Backup.Recipients[i].Fingerprint})
+		recipients = append(recipients, gin.H{"slot": slot, "fingerprint": resolved[i].Fingerprint})
 	}
 	cleanBackupStaging(run.ID)
 	// instanceId 必须由服务端下发。打包机自己那个 BUILD_AGENT_NAME 默认取主机名，

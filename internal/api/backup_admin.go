@@ -82,14 +82,23 @@ func (s *server) getBackupStatus(c *gin.Context) {
 	}
 	holders := s.backupHolders(ctx)
 
+	// 控制台上录入的优先，没录过才回落到 env
+	resolved, storedHolders, err := s.resolveBackupRecipients(ctx)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BACKUP_RECIPIENTS_READ_FAILED", err.Error())
+		return
+	}
 	slots := make([]gin.H, 0, backupcontainer.SlotCount)
 	for i, slot := range backupcontainer.SlotNames {
-		recipient := s.cfg.Backup.Recipients[i]
+		holder := strings.TrimSpace(storedHolders[i])
+		if holder == "" {
+			holder = strings.TrimSpace(holders[slot])
+		}
 		slots = append(slots, gin.H{
 			"slot":        slot,
-			"fingerprint": nullableString(recipient.Fingerprint),
-			"configured":  recipient.Fingerprint != "",
-			"holder":      nullableString(strings.TrimSpace(holders[slot])),
+			"fingerprint": nullableString(resolved[i].Fingerprint),
+			"configured":  resolved[i].Fingerprint != "",
+			"holder":      nullableString(holder),
 		})
 	}
 
@@ -115,7 +124,7 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		"enabled": s.cfg.Backup.Enabled(),
 		// 三把齐了才是就绪。少一把服务端根本起不来（§8.3），所以正常情况下
 		// 这里恒为 true；它存在是为了让人一眼确认「三个指纹都是我认识的那三个」
-		"ready":            s.backupRecoveryReady(),
+		"ready":            s.backupRecoveryReady(ctx),
 		"threshold":        "2-of-3",
 		"instanceId":       nullableString(s.cfg.Backup.InstanceID),
 		"intervalHours":    s.cfg.Backup.IntervalHours,
@@ -135,8 +144,13 @@ func (s *server) getBackupStatus(c *gin.Context) {
 	})
 }
 
-func (s *server) backupRecoveryReady() bool {
-	for _, recipient := range s.cfg.Backup.Recipients {
+// backupRecoveryReady 说明三把公钥配齐了没有。没配齐就产不出备份（§2.1 没有降级模式）
+func (s *server) backupRecoveryReady(ctx context.Context) bool {
+	resolved, _, err := s.resolveBackupRecipients(ctx)
+	if err != nil {
+		return false
+	}
+	for _, recipient := range resolved {
 		if recipient.Fingerprint == "" {
 			return false
 		}

@@ -41,7 +41,7 @@ func TestDBBackupBucketIsMaintainedFromTheConsole(t *testing.T) {
 	c, recorder := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
 		"bucket": "rn-backup", "region": "ap-southeast-1", "prefix": "prod/",
 		"accessKeyId": "AKIAEXAMPLE", "secretAccessKey": "s3cr3t",
-		"reason": "第一次配桶", "confirm": true, "password": testAdminPassword,
+		"reason": "第一次配桶", "confirm": true,
 	})
 	s.updateBackupStorage(c)
 	if recorder.Code != http.StatusOK {
@@ -111,15 +111,18 @@ func TestDBBackupBucketFallsBackToEnv(t *testing.T) {
 	}
 }
 
-// 改桶要重输口令：它决定「备份往哪写、以后从哪取」，和跑一次备份同级。
-func TestDBBackupBucketWriteNeedsThePassword(t *testing.T) {
+// 改桶要填变更原因（和发布存储那页一致：原因进审计，不要口令）。
+//
+// 口令留给「跑一次备份」和「下载」——那两个动作直接经手全平台每个租户的签名密钥，
+// 改桶不是。参考实现 release-storage 也只要原因。
+func TestDBBackupBucketWriteNeedsAReason(t *testing.T) {
 	s := storageServer(t)
 	c, recorder := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
-		"bucket": "x", "region": "r", "reason": "no password", "confirm": true,
+		"bucket": "x", "region": "r", "confirm": true,
 	})
 	s.updateBackupStorage(c)
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("没有口令应当 403，得到 %d", recorder.Code)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("没有变更原因应当 400，得到 %d", recorder.Code)
 	}
 }
 
@@ -129,7 +132,7 @@ func TestDBBackupBucketRejectsAStaleWrite(t *testing.T) {
 	save := func(version int, bucket string) int {
 		c, recorder := testContext(t, platformTenantID, "PUT", "/x", map[string]any{
 			"bucket": bucket, "region": "r", "expectedVersion": version,
-			"reason": "并发写", "confirm": true, "password": testAdminPassword,
+			"reason": "并发写", "confirm": true,
 		})
 		s.updateBackupStorage(c)
 		return recorder.Code

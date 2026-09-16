@@ -465,9 +465,13 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 		return backupbundle.Input{}, err
 	}
 
+	resolvedRecipients, _, err := s.resolveBackupRecipients(ctx)
+	if err != nil {
+		return backupbundle.Input{}, err
+	}
 	recipients := make([]backupbundle.Recipient, 0, backupcontainer.SlotCount)
 	for i, slot := range backupcontainer.SlotNames {
-		configured := s.cfg.Backup.Recipients[i]
+		configured := resolvedRecipients[i]
 		recipients = append(recipients, backupbundle.Recipient{
 			Slot: slot, Fingerprint: configured.Fingerprint, Key: configured.Key,
 			Holder: s.backupHolderName(ctx, slot),

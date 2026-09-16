@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"strings"
 	"time"
 
@@ -113,10 +114,34 @@ func scanBackupRun(row interface{ Scan(...any) error }) (backupRun, error) {
 // **单条 INSERT**，不包在有外部调用的事务里。实测过：把状态翻成 succeeded 的
 // UPDATE（live_slot 1→NULL）会让并发 INSERT 一直等到该事务提交，5 秒的事务就
 // 阻塞 5 秒——而 /backup/run 不在 10 秒数据库超时的豁免名单里，一慢就是 500。
+// errBackupRecipientsIncomplete 说明三把恢复公钥还没配齐。
+//
+// 这条闸从启动挪到了这里（见 config/backup.go 里那段注释）：三把公钥是三个人
+// 各自生成的，收齐是跨人跨天的事，而它们要在控制台上录入——启动就要求全齐等于
+// 死结。在产出备份这一刻拦，既不误伤启动，报错也更接近人当时在做的事。
+var errBackupRecipientsIncomplete = errors.New("backup recovery keys are incomplete")
+
 func (s *server) createBackupRun(ctx context.Context, trigger, requestedBy, reason string) (backupRun, error) {
+	// 少一把不会退回两把跑——没有降级模式（§2.1）。
+	// 在这里拦住，而不是产出到一半才发现
+	recipients, _, err := s.resolveBackupRecipients(ctx)
+	if err != nil {
+		return backupRun{}, err
+	}
+	missing := []string{}
+	for i, slot := range backupcontainer.SlotNames {
+		if recipients[i].Fingerprint == "" {
+			missing = append(missing, slot)
+		}
+	}
+	if len(missing) > 0 {
+		return backupRun{}, fmt.Errorf("%w: 槽位 %s 还没有公钥",
+			errBackupRecipientsIncomplete, strings.Join(missing, "、"))
+	}
+
 	id := "pbk_" + randomID(16)
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO platform_backups(id,status,trigger_by,requested_by,reason,created_at,updated_at)
 		 VALUES(?,?,?,?,?,?,?)`,
 		id, backupStatusPending, trigger, requestedBy, reason, now, now)

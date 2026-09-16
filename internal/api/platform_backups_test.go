@@ -2,7 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"sync"
 	"testing"
 	"time"
@@ -25,7 +32,65 @@ func backupServer(t *testing.T) *server {
 	if _, err := db.Exec(`DELETE FROM platform_backups`); err != nil {
 		t.Fatalf("清掉上一轮的记录: %v", err)
 	}
-	return &server{db: db}
+	srv := &server{db: db}
+	seedBackupRecipients(t, srv)
+	return srv
+}
+
+// 三把公钥是产出备份的硬前置（§2.1 没有降级模式），所以每个用到备份的测试
+// 都得先有它们——这也正是线上会发生的事：没配齐就点不动「立即备份」。
+//
+// 三把 RSA-3072 只生成一次：每个测试各生成一次的话，光是生成密钥就要几十秒。
+func seedBackupRecipients(t *testing.T, s *server) {
+	t.Helper()
+	keys := testRecoveryPublicKeys(t)
+	slots := []map[string]string{}
+	for i, name := range backupcontainer.SlotNames {
+		slots = append(slots, map[string]string{
+			"slot": name, "publicKey": keys[i], "holder": "持有人" + name,
+		})
+	}
+	encoded, err := json.Marshal(map[string]any{"slots": slots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+		 VALUES(?,?,?,1,'test',UTC_TIMESTAMP(3))
+		 ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)`,
+		platformTenantID, backupRecipientsConfigKey, encoded); err != nil {
+		t.Fatalf("种恢复公钥: %v", err)
+	}
+}
+
+var (
+	testRecoveryKeysOnce sync.Once
+	testRecoveryKeys     [backupcontainer.SlotCount]string
+	testRecoveryKeysErr  error
+)
+
+func testRecoveryPublicKeys(t *testing.T) [backupcontainer.SlotCount]string {
+	t.Helper()
+	testRecoveryKeysOnce.Do(func() {
+		for i := range testRecoveryKeys {
+			key, err := rsa.GenerateKey(rand.Reader, 3072)
+			if err != nil {
+				testRecoveryKeysErr = err
+				return
+			}
+			der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+			if err != nil {
+				testRecoveryKeysErr = err
+				return
+			}
+			pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+			testRecoveryKeys[i] = base64.StdEncoding.EncodeToString(pemBytes)
+		}
+	})
+	if testRecoveryKeysErr != nil {
+		t.Fatalf("生成测试用恢复公钥: %v", testRecoveryKeysErr)
+	}
+	return testRecoveryKeys
 }
 
 func mustCreate(t *testing.T, s *server, reason string) backupRun {
