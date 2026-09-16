@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -422,7 +423,7 @@ func TestMachineRevokedStopsTheSigner(t *testing.T) {
 	t.Run("keystore checks", func(t *testing.T) {
 		h := newHarness(t, harnessOptions{})
 		h.server.revoked = true
-		if _, err := h.runner.RunOnce(context.Background()); !errors.Is(err, errRevoked) {
+		if _, err := h.runner.RunOnce(context.Background()); !errors.Is(err, errTokenRejected) {
 			t.Fatalf("RunOnce = %v", err)
 		}
 	})
@@ -431,7 +432,7 @@ func TestMachineRevokedStopsTheSigner(t *testing.T) {
 		must(t, h.runner.RunChecks(context.Background()))
 		h.runner.lastChecks = time.Now()
 		h.server.revoked = true
-		if _, err := h.runner.RunOnce(context.Background()); !errors.Is(err, errRevoked) {
+		if _, err := h.runner.RunOnce(context.Background()); !errors.Is(err, errTokenRejected) {
 			t.Fatalf("RunOnce = %v", err)
 		}
 	})
@@ -440,7 +441,7 @@ func TestMachineRevokedStopsTheSigner(t *testing.T) {
 		b := h.build("bld_revokeJOB0000001", 46, nil)
 		h.server.completeFails[b.JobID] = []problem{{401, "MACHINE_REVOKED"}}
 		h.enqueue(b, 1, nil)
-		if _, err := h.runner.RunOnce(context.Background()); !errors.Is(err, errRevoked) {
+		if _, err := h.runner.RunOnce(context.Background()); !errors.Is(err, errTokenRejected) {
 			t.Fatalf("RunOnce = %v", err)
 		}
 		if len(h.server.rejects) != 0 || len(h.server.releases) != 0 {
@@ -458,6 +459,168 @@ func TestMachineRevokedStopsTheSigner(t *testing.T) {
 			t.Fatalf("Register = %v", err)
 		}
 	})
+}
+
+// 签名中途令牌失效（心跳收到 401 MACHINE_AUTH_REQUIRED）：立刻放弃、按自动释放规则释放预留、
+// 不再上报、以令牌被拒的退出码结束。
+func TestTokenRejectedDuringSigning(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	must(t, h.runner.RunChecks(context.Background()))
+	b := h.build("bld_authJOB000000001", 46, nil)
+	h.signer.block = make(chan struct{})
+	h.enqueue(b, 1, nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.runner.RunOnce(context.Background())
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.signer.signCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.server.mu.Lock()
+	h.server.authRequired = true
+	h.server.mu.Unlock()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the signer kept working after its token was rejected")
+	}
+	if !errors.Is(err, errTokenRejected) || exitCode(err) != ExitTokenRejected {
+		t.Fatalf("RunOnce = %v (exit %d)", err, exitCode(err))
+	}
+	if len(h.server.rejects) != 0 || len(h.server.releases) != 0 || len(h.server.completes) != 0 {
+		t.Fatalf("reported with a rejected token: %+v %+v", h.server.rejects, h.server.releases)
+	}
+	if r := h.reservation(b.JobID); r.Status != records.StatusAbandoned {
+		t.Fatalf("reservation after the token was rejected mid-signature: %+v", r)
+	}
+	h.assertRuntimeEmpty()
+	if !strings.Contains(h.logs.String(), "rejected this signing gate's machine token") {
+		t.Fatalf("no error log:\n%s", h.logs.String())
+	}
+
+	// 其它接口收到 401 MACHINE_AUTH_REQUIRED 同样停下
+	other := newHarness(t, harnessOptions{})
+	other.server.authRequired = true
+	if _, err := other.runner.RunOnce(context.Background()); !errors.Is(err, errTokenRejected) {
+		t.Fatalf("keystore checks with an unknown token: %v", err)
+	}
+	if exitCode(errors.New("records are corrupt")) != 1 || exitCode(nil) != 0 {
+		t.Fatal("other exit codes changed")
+	}
+}
+
+// 服务端反复派同一条暂不能签（或临时失败）的任务：签名闸必须退避，不能紧循环认领。
+func TestClaimBackoff(t *testing.T) {
+	for name, setup := range map[string]func(h *harness) map[string]any{
+		// 本机没确认这个证书：release（暂不能签）
+		"deferred": func(h *harness) map[string]any {
+			b := h.build("bld_loopJOB000000001", 46, nil)
+			h.server.apks[b.JobID] = b.APK
+			return h.claimFor(b, 1, func(c map[string]any) {
+				c["keystore"].(map[string]any)["certificateSha256"] = testfixture.Hex64('e')
+			})
+		},
+		// 下载不到未签名包：reject transient
+		"transient": func(h *harness) map[string]any {
+			return h.claimFor(h.build("bld_loopJOB000000002", 46, nil), 1, nil)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, harnessOptions{})
+			h.runner.PollInterval = 10 * time.Millisecond
+			h.runner.MaxClaimBackoff = 80 * time.Millisecond
+			h.runner.RetryDelays = []time.Duration{}
+			h.server.repeatClaim = setup(h)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := h.runner.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			h.server.mu.Lock()
+			times := append([]time.Time(nil), h.server.claimTimes...)
+			h.server.mu.Unlock()
+			// 不退避时 1 秒能认领上千次；10、20、40、80、80…毫秒的间隔下大约 15 次
+			t.Logf("%d claims in one second", len(times))
+			if len(times) < 4 || len(times) > 25 {
+				t.Fatalf("%d claims in one second", len(times))
+			}
+			for i := 1; i < len(times); i++ {
+				gap := times[i].Sub(times[i-1])
+				want := min(10*time.Millisecond<<(i-1), 80*time.Millisecond)
+				if gap < want-2*time.Millisecond {
+					t.Fatalf("claim %d came %v after the previous one; the backoff is %v", i, gap, want)
+				}
+			}
+		})
+	}
+}
+
+// 签完交付之后立即认领下一条，不等 PollInterval。
+func TestDeliveredJobsAreClaimedImmediately(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	h.runner.PollInterval = time.Hour
+	h.enqueue(h.build("bld_fastJOB000000001", 46, nil), 1, nil)
+	h.enqueue(h.build("bld_fastJOB000000002", 47, nil), 1, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- h.runner.Run(ctx) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		h.server.mu.Lock()
+		n := len(h.server.completes)
+		h.server.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(h.server.completes) != 2 {
+		t.Fatalf("completes %d; the second job waited for the poll interval", len(h.server.completes))
+	}
+}
+
+func TestNoteOutcomeBackoffSchedule(t *testing.T) {
+	r := &Runner{PollInterval: 15 * time.Second}
+	now := time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC)
+	var got []time.Duration
+	for i := 0; i < 8; i++ {
+		r.noteOutcome("bld_same00000001", false, now)
+		got = append(got, r.claimNotBefore.Sub(now))
+	}
+	want := []time.Duration{15 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute, 10 * time.Minute}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("backoff schedule %v, want %v", got, want)
+		}
+	}
+	// 另一条任务第一次没签完：一个 PollInterval
+	r.noteOutcome("bld_other0000001", false, now)
+	if d := r.claimNotBefore.Sub(now); d != 15*time.Second {
+		t.Fatalf("other job backoff %v", d)
+	}
+	// 签完交付：立即可认领，连续计数清零
+	r.noteOutcome("bld_same00000001", true, now)
+	if !r.mayClaim(now) {
+		t.Fatal("a delivered job did not clear the backoff")
+	}
+	r.noteOutcome("bld_same00000001", false, now)
+	if d := r.claimNotBefore.Sub(now); d != 15*time.Second {
+		t.Fatalf("streak not reset: %v", d)
+	}
+	// 记录的任务数有上限
+	for i := 0; i < maxTrackedJobs+50; i++ {
+		r.noteOutcome(fmt.Sprintf("bld_many%08d", i), false, now.Add(time.Duration(i)))
+	}
+	if len(r.jobFailures) > maxTrackedJobs {
+		t.Fatalf("tracking %d jobs", len(r.jobFailures))
+	}
 }
 
 func TestStaleAttemptAbandonsImmediately(t *testing.T) {
@@ -546,8 +709,8 @@ func TestRegister(t *testing.T) {
 	}
 	bad := NewHTTPClient(h.server.srv.URL, "rnm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", nil)
 	r := &Runner{Config: h.cfg, Keys: h.keys, Store: h.store, API: bad, PollInterval: time.Millisecond}
-	if err := r.Register(context.Background()); err == nil {
-		t.Fatal("a rejected token did not stop the signer")
+	if err := r.Register(context.Background()); !errors.Is(err, errTokenRejected) || exitCode(err) != ExitTokenRejected {
+		t.Fatalf("a rejected token did not stop the signer with the token-rejected exit code: %v", err)
 	}
 }
 

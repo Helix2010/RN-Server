@@ -82,8 +82,9 @@ func (s SocketChecker) Check(ctx context.Context, in policy.Input, apkPath strin
 
 // ExecChecker 以子进程启动检查进程（只用于本地测试，没有 systemd 提供的隔离）。
 type ExecChecker struct {
-	Path    string
-	Timeout time.Duration
+	Path      string
+	Timeout   time.Duration
+	WaitDelay time.Duration // 零值用 childWaitDelay
 }
 
 // Check 实现 Checker。子进程环境为空（env -i），不继承签名闸的令牌。
@@ -100,6 +101,10 @@ func (e ExecChecker) Check(ctx context.Context, in policy.Input, apkPath string)
 	}
 	defer f.Close()
 	cmd := exec.CommandContext(ctx, e.Path)
+	cmd.WaitDelay = e.WaitDelay
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = childWaitDelay
+	}
 	cmd.Env = []string{}
 	cmd.Dir = "/"
 	stdin, err := cmd.StdinPipe()

@@ -232,8 +232,16 @@ journalctl -u rn-signer-a -u 'rn-signer-a-check@*'
   `RUNTIME_FILES_FAILED`、`APKSIGNER_FAILED`、`SIGNED_VERIFY_FAILED`、`UPLOAD_FAILED`、`UPLOAD_MISMATCH`、`COMPLETE_FAILED`
 
 服务端的几个错误码由签名闸自己处理：`SIGNED_ARTIFACT_REPLACED` 原地重新 complete；`SIGNED_ARTIFACT_MISSING`
-重新上传（最多 3 轮）；`UPLOAD_STORAGE_FAILED`、`UPLOAD_INTERRUPTED` 原地重试上传；`401 MACHINE_REVOKED` 时签名闸
-不再上报任何东西、直接退出（systemd 每 60 秒重启一次，每次都会因为同样的原因退出，按「登记机器」换新机器）。
+重新上传（最多 3 轮）；`UPLOAD_STORAGE_FAILED`、`UPLOAD_INTERRUPTED` 原地重试上传。
+
+**令牌被拒**：任何接口（包括公钥登记）收到 `401 MACHINE_REVOKED` 或 `401 MACHINE_AUTH_REQUIRED`，签名闸记一条错误日志、
+不再上报任何东西；正在签的任务立即放弃（还没记下签名包的预留自动释放），进程以**退出码 78** 结束。unit 里
+`RestartPreventExitStatus=78` 阻止 systemd 重启，`systemctl status rn-signer-a` 显示 failed。按「登记机器」换新令牌后再启动。
+其它致命错误（记录校验失败、文件不可信等）退出码是 1，仍按 `RestartSec=60s` 重启。
+
+**认领退避**：签完交付一条之后立即认领下一条；其余结果（暂不能签、临时错误、违规、编号过期）之后至少等一个轮询间隔
+（15 秒）才再认领，同一任务连续没签完时间隔翻倍：15 秒、30 秒、1、2、4、8 分钟，封顶 10 分钟；这个任务签完交付后清零。
+退避期间试解、上报照常进行。服务端另有 60 秒冷却，两边独立。
 
 ### 预留的状态与释放
 
@@ -349,7 +357,8 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer list --env-file /etc/rn-signer-a.e
 - **启动报 `not on tmpfs`**：`SIGNER_RUNTIME_DIR` 不在 tmpfs 上，改回 unit 的 `RuntimeDirectory`（`/run/rn-signer-a`）。
 - **检查进程 socket 报 `served by uid …`**：`SIGNER_CHECK_SOCKET` 指向的 socket 不是 systemd 创建的（签名闸要求对端是 uid 0），
   核对 `rn-signer-a-check.socket` 是否在跑、路径是否一致。
-- **启动或运行中报 `MACHINE_REVOKED`**：令牌已在控制台吊销，签名闸不再工作。
+- **服务 failed、退出码 78（`MACHINE_REVOKED` / `MACHINE_AUTH_REQUIRED`）**：令牌已在控制台吊销或失效，签名闸不再工作，
+  systemd 也不会重启它。按新机器登记、写新令牌，再 `systemctl start`；不要改 unit 去掉 `RestartPreventExitStatus`。
 - **试签失败**（控制台 `trialSign=failed`，journal 里有 apksigner 的输出）：先确认 `ProcSubset=pid`、
   `SystemCallFilter=@system-service`、`MemorySwapMax=0` 下 JVM 能正常运行（首次部署必须核对一次，本仓库的测试环境无法在完整的
   systemd 沙箱里跑 JVM）。

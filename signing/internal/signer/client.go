@@ -26,6 +26,7 @@ const (
 	codeSignAttemptStale      = "SIGN_ATTEMPT_STALE"
 	codeMachineKeyNotAccepted = "MACHINE_KEY_NOT_ACCEPTED"
 	codeMachineRevoked        = "MACHINE_REVOKED"
+	codeMachineAuthRequired   = "MACHINE_AUTH_REQUIRED"
 	codeReleaseSequenceBusy   = "RELEASE_SEQUENCE_BUSY"
 	// complete：签名包对象丢了（重新上传）、被更晚的一次上传取代（重新 complete）、
 	// 与服务端核对的结果或对象不一致（违规）
@@ -90,6 +91,13 @@ func IsTransient(err error) bool {
 func IsRevoked(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized && apiErr.Code == codeMachineRevoked
+}
+
+// IsTokenRejected 判断服务端是否不再接受本机令牌：401 MACHINE_REVOKED，或 401 MACHINE_AUTH_REQUIRED
+// （令牌不存在、被删或已失效）。两者重试都不会好，签名闸停下并以 ExitTokenRejected 退出。
+func IsTokenRejected(err error) bool {
+	var apiErr *APIError
+	return IsRevoked(err) || (errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized && apiErr.Code == codeMachineAuthRequired)
 }
 
 // IsStale 判断错误是否为 409 SIGN_ATTEMPT_STALE。

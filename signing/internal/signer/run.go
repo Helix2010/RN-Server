@@ -41,7 +41,9 @@ var (
 
 	errJobFinished = errors.New("job finished")
 	errStale       = errors.New("the server says this sign attempt is stale")
-	errRevoked     = errors.New("the server revoked this signing gate's machine token (MACHINE_REVOKED); register the machine again with a new token")
+	// errTokenRejected：服务端不再接受本机令牌（吊销或失效）。signer run 以 ExitTokenRejected 退出，
+	// unit 用 RestartPreventExitStatus 阻止重启。
+	errTokenRejected = errors.New("the server no longer accepts this signing gate's machine token (MACHINE_REVOKED or MACHINE_AUTH_REQUIRED); the signing gate stops; register the machine again with a new token")
 )
 
 // autoReleaseOperator 是签名闸自己释放预留时写进记录的操作者。
@@ -49,6 +51,12 @@ const autoReleaseOperator = "signer-run"
 
 // maxUploadRounds：complete 报 SIGNED_ARTIFACT_MISSING 时最多重新上传几轮。
 const maxUploadRounds = 3
+
+// defaultMaxClaimBackoff 是认领退避的上限。
+const defaultMaxClaimBackoff = 10 * time.Minute
+
+// maxTrackedJobs：退避计数最多记多少个任务（超出时丢掉最久没出结论的）。
+const maxTrackedJobs = 1024
 
 // Runner 是签名闸主循环。字段在 Run 之前填好；间隔字段为零时用默认值。
 type Runner struct {
@@ -64,12 +72,24 @@ type Runner struct {
 	ChecksInterval    time.Duration
 	HeartbeatInterval time.Duration
 	RetryDelays       []time.Duration
+	// MaxClaimBackoff 是认领退避的上限（默认 10 分钟）。
+	MaxClaimBackoff time.Duration
 
 	mu         sync.Mutex
 	ready      []ReadyItem
 	lastChecks time.Time
 	trials     map[string]trialResult
 	waiting    bool
+
+	// 认领退避：没有签完交付（暂不能签、临时错误、违规、过期）之后，至少隔一个 PollInterval 才再认领；
+	// 同一任务连续没签完，间隔按 PollInterval×2^(n-1) 翻倍，封顶 MaxClaimBackoff。签完交付清零。
+	claimNotBefore time.Time
+	jobFailures    map[string]jobFailure
+}
+
+type jobFailure struct {
+	streak int
+	last   time.Time
 }
 
 type trialResult struct {
@@ -96,6 +116,15 @@ func (r *Runner) defaults() {
 	}
 	if r.trials == nil {
 		r.trials = map[string]trialResult{}
+	}
+	if r.MaxClaimBackoff == 0 {
+		r.MaxClaimBackoff = defaultMaxClaimBackoff
+	}
+	if r.MaxClaimBackoff < r.PollInterval {
+		r.MaxClaimBackoff = r.PollInterval
+	}
+	if r.jobFailures == nil {
+		r.jobFailures = map[string]jobFailure{}
 	}
 }
 
@@ -143,7 +172,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if worked {
+		// 只有刚签完交付一条才立即认领下一条；其余情况（包括退避中）等一个 PollInterval，
+		// 期间照常到点试解、上报
+		if worked && r.mayClaim(time.Now()) {
 			continue
 		}
 		select {
@@ -164,6 +195,10 @@ func (r *Runner) Register(ctx context.Context) error {
 		}
 		if ctx.Err() != nil {
 			return nil
+		}
+		if IsTokenRejected(err) {
+			r.Log.Error("the server rejected this signing gate's machine token while registering its public keys", "error", err)
+			return fmt.Errorf("register this signing gate's public keys: %w: %w", errTokenRejected, err)
 		}
 		if !IsTransient(err) {
 			return fmt.Errorf("register this signing gate's public keys: %w", err)
@@ -204,8 +239,9 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 			if errors.As(err, &fatal) {
 				return false, fatal.err
 			}
-			if IsRevoked(err) {
-				return false, errRevoked
+			if IsTokenRejected(err) {
+				r.Log.Error("keystore checks: the server rejected this signing gate's machine token", "error", err)
+				return false, errTokenRejected
 			}
 			if isKeyNotAccepted(err) {
 				if !r.waiting {
@@ -229,13 +265,14 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	r.mu.Lock()
 	ready := append([]ReadyItem(nil), r.ready...)
 	r.mu.Unlock()
-	if len(ready) == 0 {
+	if len(ready) == 0 || !r.mayClaim(time.Now()) {
 		return false, nil
 	}
 	claim, err := r.API.Claim(ctx, ready)
 	if err != nil {
-		if IsRevoked(err) {
-			return false, errRevoked
+		if IsTokenRejected(err) {
+			r.Log.Error("claim: the server rejected this signing gate's machine token", "error", err)
+			return false, errTokenRejected
 		}
 		if !isKeyNotAccepted(err) && ctx.Err() == nil {
 			r.Log.Warn("claim failed", "error", err)
@@ -245,7 +282,52 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	if claim == nil {
 		return false, nil
 	}
-	return true, r.handle(ctx, claim)
+	out, err := r.handle(ctx, claim)
+	r.noteOutcome(claim.Job.ID, out.kind == outcomeDone, time.Now())
+	return true, err
+}
+
+// mayClaim：退避期是否已过。
+func (r *Runner) mayClaim(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !now.Before(r.claimNotBefore)
+}
+
+// noteOutcome 记下一条认领的结果并设定下一次认领的最早时间。
+func (r *Runner) noteOutcome(jobID string, delivered bool, now time.Time) {
+	r.defaults()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if delivered {
+		delete(r.jobFailures, jobID)
+		r.claimNotBefore = time.Time{}
+		return
+	}
+	for id, f := range r.jobFailures {
+		if now.Sub(f.last) > 4*r.MaxClaimBackoff {
+			delete(r.jobFailures, id)
+		}
+	}
+	f := r.jobFailures[jobID]
+	f.streak++
+	f.last = now
+	if _, tracked := r.jobFailures[jobID]; !tracked && len(r.jobFailures) >= maxTrackedJobs {
+		oldest := ""
+		for id, other := range r.jobFailures {
+			if oldest == "" || other.last.Before(r.jobFailures[oldest].last) {
+				oldest = id
+			}
+		}
+		delete(r.jobFailures, oldest)
+	}
+	r.jobFailures[jobID] = f
+	delay := r.PollInterval
+	for i := 1; i < f.streak && delay < r.MaxClaimBackoff; i++ {
+		delay *= 2
+	}
+	delay = min(delay, r.MaxClaimBackoff)
+	r.claimNotBefore = now.Add(delay)
 }
 
 func isKeyNotAccepted(err error) bool {
@@ -426,7 +508,7 @@ const (
 	outcomeDeferred
 	outcomeViolation
 	outcomeTransient
-	outcomeRevoked
+	outcomeTokenRejected
 )
 
 type outcome struct {
@@ -448,14 +530,14 @@ func transient(code, format string, args ...any) outcome {
 	return outcome{kind: outcomeTransient, code: code, detail: fmt.Sprintf(format, args...)}
 }
 
-func (r *Runner) handle(ctx context.Context, claim *Claim) error {
+func (r *Runner) handle(ctx context.Context, claim *Claim) (outcome, error) {
 	jobID, attempt := claim.Job.ID, claim.Job.SignAttempt
 	log := r.Log.With("job", jobID, "signAttempt", attempt)
 	if !ident.ValidServerID(jobID) || attempt < 1 {
 		// id 不合法时连上报的 URL 都拼不出来：不上报，等服务端心跳超时回收
 		log = r.Log
 		log.Error("the server sent a claim with a malformed job id or sign attempt; ignoring it")
-		return nil
+		return outcome{kind: outcomeViolation}, nil
 	}
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	var wg sync.WaitGroup
@@ -466,11 +548,11 @@ func (r *Runner) handle(ctx context.Context, claim *Claim) error {
 	}()
 	log.Info("signing job claimed", "tenant", claim.Job.TenantSlug, "buildNumber", claim.Job.BuildNumber)
 	out := r.sign(jobCtx, claim, log)
-	if cause := context.Cause(jobCtx); errors.Is(cause, errRevoked) && out.kind != outcomeDone {
-		out = outcome{kind: outcomeRevoked, fatal: errRevoked}
+	if cause := context.Cause(jobCtx); errors.Is(cause, errTokenRejected) && out.kind != outcomeDone {
+		out = outcome{kind: outcomeTokenRejected, fatal: errTokenRejected}
 	} else if errors.Is(cause, errStale) && out.kind != outcomeDone {
 		out = outcome{kind: outcomeStale, fatal: out.fatal}
-	} else if ctx.Err() != nil && out.kind != outcomeDone && out.kind != outcomeStale && out.kind != outcomeRevoked {
+	} else if ctx.Err() != nil && out.kind != outcomeDone && out.kind != outcomeStale && out.kind != outcomeTokenRejected {
 		out = outcome{kind: outcomeShutdown, fatal: out.fatal}
 	}
 	cancel(errJobFinished)
@@ -485,7 +567,7 @@ func (r *Runner) handle(ctx context.Context, claim *Claim) error {
 		log.Warn("could not clear the work directory", "error", err)
 	}
 	r.report(ctx, claim, out, log)
-	return out.fatal
+	return out, out.fatal
 }
 
 func (r *Runner) heartbeat(ctx context.Context, cancel context.CancelCauseFunc, jobID string, attempt int, log *slog.Logger) {
@@ -497,9 +579,9 @@ func (r *Runner) heartbeat(ctx context.Context, cancel context.CancelCauseFunc, 
 			return
 		case <-ticker.C:
 			err := r.API.Heartbeat(ctx, jobID, attempt)
-			if IsRevoked(err) {
-				log.Error("heartbeat says this signing gate's machine token is revoked; abandoning the job immediately")
-				cancel(errRevoked)
+			if IsTokenRejected(err) {
+				log.Error("heartbeat: the server rejected this signing gate's machine token; abandoning the job immediately", "error", err)
+				cancel(errTokenRejected)
 				return
 			}
 			if IsStale(err) {
@@ -524,8 +606,8 @@ func (r *Runner) report(ctx context.Context, claim *Claim, out outcome, log *slo
 	case outcomeStale:
 		log.Warn("sign attempt is stale; nothing to report")
 		return
-	case outcomeRevoked:
-		log.Error("the machine token is revoked; nothing can be reported")
+	case outcomeTokenRejected:
+		log.Error("the server rejected the machine token; nothing can be reported, the signing gate stops")
 		return
 	case outcomeShutdown:
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -630,8 +712,8 @@ func (r *Runner) sign(ctx context.Context, c *Claim, log *slog.Logger) outcome {
 		return err
 	})
 	switch {
-	case IsRevoked(err):
-		return outcome{kind: outcomeRevoked, fatal: errRevoked}
+	case IsTokenRejected(err):
+		return outcome{kind: outcomeTokenRejected, fatal: errTokenRejected}
 	case IsStale(err):
 		return outcome{kind: outcomeStale}
 	case err != nil:
@@ -793,8 +875,8 @@ func (r *Runner) deliver(ctx context.Context, c *Claim, conf records.Confirmatio
 			return err
 		})
 		switch {
-		case IsRevoked(err):
-			return outcome{kind: outcomeRevoked, fatal: errRevoked}
+		case IsTokenRejected(err):
+			return outcome{kind: outcomeTokenRejected, fatal: errTokenRejected}
 		case IsStale(err):
 			return outcome{kind: outcomeStale}
 		case err != nil:
@@ -816,8 +898,8 @@ func (r *Runner) deliver(ctx context.Context, c *Claim, conf records.Confirmatio
 		}
 		var apiErr *APIError
 		switch {
-		case IsRevoked(err):
-			return outcome{kind: outcomeRevoked, fatal: errRevoked}
+		case IsTokenRejected(err):
+			return outcome{kind: outcomeTokenRejected, fatal: errTokenRejected}
 		case IsStale(err):
 			return outcome{kind: outcomeStale}
 		case errors.As(err, &apiErr) && apiErr.Code == codeSignedArtifactMissing && round < maxUploadRounds:

@@ -91,6 +91,9 @@ type fakeServer struct {
 	completes     []CompleteRequest
 	completeFails map[string][]problem // jobId → 依次返回的错误
 	revoked       bool                 // 令牌被吊销：一切请求 401 MACHINE_REVOKED
+	authRequired  bool                 // 令牌失效：一切请求 401 MACHINE_AUTH_REQUIRED
+	repeatClaim   map[string]any       // 非 nil 时每次认领都派这一条（模拟服务端没有冷却）
+	claimTimes    []time.Time
 	releases      []call
 	rejects       []call
 }
@@ -115,10 +118,14 @@ func newFakeServer(t *testing.T) *fakeServer {
 			return
 		}
 		f.mu.Lock()
-		revoked := f.revoked
+		revoked, authRequired := f.revoked, f.authRequired
 		f.mu.Unlock()
 		if revoked {
 			problemJSON(w, 401, "MACHINE_REVOKED", "revoked")
+			return
+		}
+		if authRequired {
+			problemJSON(w, 401, "MACHINE_AUTH_REQUIRED", "unknown token")
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -218,6 +225,11 @@ func (f *fakeServer) claim(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimBodies = append(f.claimBodies, body.Ready)
+	f.claimTimes = append(f.claimTimes, time.Now())
+	if f.repeatClaim != nil {
+		_ = json.NewEncoder(w).Encode(f.repeatClaim)
+		return
+	}
 	if len(f.claims) == 0 {
 		w.WriteHeader(204)
 		return
@@ -590,8 +602,12 @@ func (h *harness) build(jobID string, vc int64, mutate func(*apktest.Spec)) test
 	return testfixture.NewBuild(h.t, h.builder, jobID, vc, mutate)
 }
 
+// runOnce 跑一轮。这些测试关心任务怎么处理，不关心节奏：先清掉上一条结果留下的认领退避。
 func (h *harness) runOnce() bool {
 	h.t.Helper()
+	h.runner.mu.Lock()
+	h.runner.claimNotBefore = time.Time{}
+	h.runner.mu.Unlock()
 	worked, err := h.runner.RunOnce(context.Background())
 	if err != nil {
 		h.t.Fatalf("RunOnce: %v\nlogs:\n%s", err, h.logs.String())
