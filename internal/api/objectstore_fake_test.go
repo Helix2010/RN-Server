@@ -14,11 +14,13 @@ import (
 
 // fakeObjectStore 是测试用对象存储：按 key 保存字节与 ETag，Stat/Get 可被替换成失败。
 type fakeObjectStore struct {
-	corsErr   error
-	objects   map[string]fakeObject
-	statErr   error
-	listErr   error
-	deleteErr error
+	versioningEnabled bool
+	versioningErr     error
+	corsErr           error
+	objects           map[string]fakeObject
+	statErr           error
+	listErr           error
+	deleteErr         error
 }
 
 type fakeObject struct {
@@ -128,3 +130,9 @@ func (f *fakeObjectStore) AbortMultipartUpload(context.Context, string, string) 
 func (f *fakeObjectStore) Test(context.Context) error { return nil }
 
 var _ objectstore.Client = (*fakeObjectStore)(nil)
+
+// versioningEnabled 默认 false：假桶不该让「versioning 开着吗」这个问题
+// 默认得到一个乐观的答案。要测开着的路径就显式设成 true
+func (f *fakeObjectStore) BucketVersioning(context.Context) (bool, error) {
+	return f.versioningEnabled, f.versioningErr
+}

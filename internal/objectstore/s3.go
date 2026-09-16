@@ -64,6 +64,10 @@ type Client interface {
 	CompleteMultipartUpload(context.Context, string, string, []CompletedPart) error
 	AbortMultipartUpload(context.Context, string, string) error
 	Test(context.Context) error
+	// BucketVersioning 说明桶开没开版本控制。备份桶必须开：Put 对一个已存在的
+	// 键在没开 versioning 时**就是删除**，于是拿到桶写权限的人覆盖掉真包之后，
+	// 原件再也取不回来——控制台上那行 sha256 只能告诉你完了，不能让你取回真的。
+	BucketVersioning(context.Context) (bool, error)
 }
 
 type Factory interface {
@@ -334,4 +338,14 @@ func (c *s3Client) Test(ctx context.Context) error {
 		return fmt.Errorf("storage read test failed: %w", err)
 	}
 	return nil
+}
+
+func (c *s3Client) BucketVersioning(ctx context.Context) (bool, error) {
+	out, err := c.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
+		Bucket: aws.String(c.bucket),
+	})
+	if err != nil {
+		return false, fmt.Errorf("read bucket versioning: %w", err)
+	}
+	return out.Status == types.BucketVersioningStatusEnabled, nil
 }

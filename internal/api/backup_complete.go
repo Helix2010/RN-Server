@@ -303,6 +303,17 @@ func (s *server) assembleAndUploadBackup(ctx context.Context, run backupRun) ([]
 		if err := uploadFile(ctx, client, key, path, "application/octet-stream"); err != nil {
 			return nil, 0, fmt.Errorf("upload %s: %w", pkg.Pair, err)
 		}
+		// 上传完再从桶里取回来重算一次 sha256（设计 §12 第 1 级）。
+		//
+		// 本地那个值是封包时边写边算的，它只能证明「我封出来的是这个」。
+		// 一次截断的上传（多段中途失败但对象被创建、或代理层截断）会留下一个短
+		// 对象，而库里记着完整包的 sha256 和 size、状态 succeeded、控制台全绿，
+		// 直到灾难当天下载下来对不上——那时没有第二次机会。
+		// 回读是这条链路上唯一能证明「桶里那个对象和我封出来的是同一个」的动作。
+		if err := verifyUploadedObject(ctx, client, key, pkg.SHA256, pkg.Size); err != nil {
+			return nil, 0, fmt.Errorf("verify %s after upload: %w", pkg.Pair, err)
+		}
+
 		// 写入顺序固定：先 .rnbk 后 .README.txt。README 的存在就是
 		// 「这一组上传完成了」的提交标记
 		readmeKey := backupObjectKey(prefix, instance, run.Seq, pkg.Pair, ".README.txt")
@@ -382,6 +393,30 @@ func (s *server) buildBundleInput(ctx context.Context, run backupRun, dir string
 		BackupSigningFingerprint: anyMeta.BackupSigningFingerprint,
 		BackupSigningPublicKey:   signingDER,
 	}, nil
+}
+
+// verifyUploadedObject 把刚传上去的对象取回来，重算 sha256 和大小。
+func verifyUploadedObject(ctx context.Context, client interface {
+	Get(ctx context.Context, key string) (io.ReadCloser, error)
+}, key, wantSHA256 string, wantSize int64) error {
+	body, err := client.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("read it back: %w", err)
+	}
+	defer body.Close()
+	digest := sha256.New()
+	size, err := io.Copy(digest, body)
+	if err != nil {
+		return fmt.Errorf("read it back: %w", err)
+	}
+	if size != wantSize {
+		return fmt.Errorf("the object in the bucket is %d bytes, we uploaded %d; "+
+			"the upload was truncated", size, wantSize)
+	}
+	if got := hex.EncodeToString(digest.Sum(nil)); got != wantSHA256 {
+		return fmt.Errorf("the object in the bucket has sha256 %s, we uploaded %s", got, wantSHA256)
+	}
+	return nil
 }
 
 func uploadFile(ctx context.Context, client interface {

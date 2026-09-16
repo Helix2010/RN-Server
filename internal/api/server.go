@@ -34,13 +34,16 @@ import (
 )
 
 type server struct {
-	cfg      config.Config
-	db       *sql.DB
-	mu       sync.Mutex
-	attempts map[string]attempt
-	objects  objectstore.Factory
-	tenant   *tenantResolver
-	secrets  *secretbox.Box
+	// 备份桶的 versioning 状态，「测试连接」那一刻缓存下来。nil = 从没测过
+	backupBucketVersioningMu sync.RWMutex
+	backupBucketVersioningOK *bool
+	cfg                      config.Config
+	db                       *sql.DB
+	mu                       sync.Mutex
+	attempts                 map[string]attempt
+	objects                  objectstore.Factory
+	tenant                   *tenantResolver
+	secrets                  *secretbox.Box
 	// tokens 只从平台默认端点读代币元数据；测试用假实现替换
 	tokens tokenMetadataReader
 	// verifyFCM 真去 Google 换一次访问令牌。做成字段是因为保存推送凭据这条路

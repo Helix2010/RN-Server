@@ -104,6 +104,7 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		"instanceId":       nullableString(s.cfg.Backup.InstanceID),
 		"intervalHours":    s.cfg.Backup.IntervalHours,
 		"bucket":           nullableString(s.cfg.Backup.Bucket.Bucket),
+		"bucketVersioning": s.backupBucketVersioning(),
 		"recoverySlots":    slots,
 		"signingKey":       signing,
 		"consecutiveFails": failures,
@@ -351,8 +352,25 @@ func (s *server) testBackupBucket(c *gin.Context) {
 			"cannot write to the backup bucket: "+err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "bucket": s.cfg.Backup.Bucket.Bucket, "probeKey": key,
-		"checkedAt": iso(time.Now().UTC())})
+	// 顺带校验 versioning（设计 §6.1）。没开就是**没配对**，不是小瑕疵：
+	// Put 对一个已存在的键在没开 versioning 时就是删除，于是拿到桶写权限的人
+	// 覆盖掉真包之后原件再也取不回来。控制台上那行 sha256 那时只能告诉你完了，
+	// 不能让你取回真的——第一个真实性锚点就此只剩报丧的功能。
+	versioning, versioningErr := client.BucketVersioning(ctx)
+	view := gin.H{"ok": true, "bucket": s.cfg.Backup.Bucket.Bucket, "probeKey": key,
+		"checkedAt": iso(time.Now().UTC()), "versioning": versioning}
+	switch {
+	case versioningErr != nil:
+		view["ok"] = false
+		view["versioningDetail"] = "读不到桶的版本控制状态，凭据可能缺 s3:GetBucketVersioning：" +
+			versioningErr.Error()
+	case !versioning:
+		view["ok"] = false
+		view["versioningDetail"] = "这个桶没有开版本控制。备份桶必须开：" +
+			"没开的话覆盖写就是删除，被覆盖掉的真包再也取不回来。"
+	}
+	s.cacheBackupBucketVersioning(versioning && versioningErr == nil)
+	c.JSON(http.StatusOK, view)
 }
 
 // resetKeystoreChecks 把每个租户的签名密钥校验结果作废，让打包机重新验一遍。
@@ -387,4 +405,23 @@ func (s *server) resetKeystoreChecks(c *gin.Context) {
 		map[string]any{"cleared": cleared}))
 	c.JSON(http.StatusOK, gin.H{"cleared": cleared,
 		"detail": "the build agent will re-verify every tenant on its next idle poll"})
+}
+
+// 桶的 versioning 状态是「测试连接」那一刻的缓存值（设计 §8.2）。
+//
+// 不在每次看状态时都去问桶：那是一次跨网调用，而这个页面会被反复刷新。
+// 从没测过时是 nil，控制台显示「未检查」——比显示一个乐观的 false 诚实。
+func (s *server) cacheBackupBucketVersioning(enabled bool) {
+	s.backupBucketVersioningMu.Lock()
+	defer s.backupBucketVersioningMu.Unlock()
+	s.backupBucketVersioningOK = &enabled
+}
+
+func (s *server) backupBucketVersioning() any {
+	s.backupBucketVersioningMu.RLock()
+	defer s.backupBucketVersioningMu.RUnlock()
+	if s.backupBucketVersioningOK == nil {
+		return nil
+	}
+	return *s.backupBucketVersioningOK
 }
