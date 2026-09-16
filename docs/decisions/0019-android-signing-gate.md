@@ -96,8 +96,8 @@
 
 ## 两次发布
 
-- **第一次**（本分支）：只含迁移 54，与删备份代码、本 ADR 的全部接口改动同发，无破坏性表变更。合并即部署，失败自动回滚到旧二进制时，旧代码面对的表和配置行都还在。
-- **第二次**（新链路稳定之后，对应设计「落地顺序」第 8 步，另开分支单独发布）：一条新迁移删除 `platform_backups` 表，`app_configs` 的 `backup.bucket`、`backup.recipients`、`build.agent.backup-sign`、`build.agent.recipient`，以及旧格式（不是 format 2）的 `build.keystore.check` 行。**不在本分支里**：放进来的话合并即部署会把 54 和它一起跑掉，第一次发布就没有回滚余地。
+- **第一次**（分支 `feat/signing-gate`）：只含迁移 54，与删备份代码、本 ADR 的全部接口改动同发，无破坏性表变更。合并即部署，失败自动回滚到旧二进制时，旧代码面对的表和配置行都还在。
+- **第二次**（分支 `feat/signing-gate-release2`，新链路稳定之后单独发布，对应设计「落地顺序」第 5 步；2026-09-28 发布，编号改为 69）：迁移 69 删除 `platform_backups` 表，`app_configs` 的 `backup.bucket`、`backup.recipients`、`build.agent.backup-sign`、`build.agent.recipient`，以及旧格式（不是 format 2）的 `build.keystore.check` 行（新代码读到它本来就当作空）。不要与第一次一起部署：放在一起的话合并即部署会把 54 和 55 一起跑掉，第一次发布就没有回滚余地。
 
 ## 代价
 

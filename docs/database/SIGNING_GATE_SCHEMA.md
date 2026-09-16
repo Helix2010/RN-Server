@@ -134,7 +134,7 @@
 | `error` | 签名闸给的一句说明，截断到 300 字符、去掉控制字符 |
 
 - 按机器 id 用 `JSON_SET` 只改自己那个键，主备并发上报互不覆盖；只收当前密钥版本、且密钥加密给了上报者的结论（主签名闸为领生成请求拿到的"没有密文的项"不算检查）。结论（`keystoreVersion`、`decrypt`、`confirmed`、`confirmedTrustRootsDigest`、`trialSign`、`error`）没变的项**不写库**：不加 `version`、不动 `checkedAt`（它是"结论最近一次变化的时间"）；变了才写库并写审计 `build_keystore_check_update`。
-- 没有 `format:2` 的旧行（打包机时代的单机记录 `{"version","ok","agent",…}`）读出来当作空，第一次上报时整行覆盖成 format 2。
+- 没有 `format:2` 的旧行（打包机时代的单机记录 `{"version","ok","agent",…}`）读出来当作空，第一次上报时整行覆盖成 format 2；还没被覆盖的由迁移 69（第二次发布）删除。
 
 ## 就绪（排队门禁与签名认领共用 `signerReadinessFor`）
 
