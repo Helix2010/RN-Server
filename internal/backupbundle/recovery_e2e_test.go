@@ -204,3 +204,75 @@ func pairByName(t *testing.T, name string) backupcontainer.Pair {
 	t.Fatalf("不认识的配对 %s", name)
 	return backupcontainer.Pair{}
 }
+
+// 生成出来的两个脚本必须语法正确。
+//
+// 它们是**渲染**出来的，不是仓库里的静态文件——一个拼错的引号、一个没闭合的
+// heredoc，要到灾难当天有人跑它时才暴露，而那时没有第二次机会。bash -n 只查
+// 语法不执行，几毫秒的事。
+func TestGeneratedScriptsAreSyntacticallyValid(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not available")
+	}
+	holders := testHolders(t)
+	in := testInput(t, holders)
+	dir := t.TempDir()
+
+	for _, pair := range backupcontainer.Pairs() {
+		for name, body := range map[string]string{
+			"recover.sh":    renderRecoverScript(in, pair),
+			"open-layer.sh": extractOpenLayerScript(t, renderReadmeFirst(in, pair, recipientMap(in), "deadbeef")),
+		} {
+			path := filepath.Join(dir, pair.Name+"-"+name)
+			if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-n", path)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%s（%s 组）语法不对——灾难当天才会发现:\n%s", name, pair.Name, output)
+			}
+		}
+	}
+}
+
+// README 必须教人解到**内存盘**，不是当前目录。
+//
+// open-layer.sh 自己在 tmpfs 上做解密，但最后一步 `tar xf plain.tar -C "$OUT"`
+// 会把明文拷到调用者指定的目录——README 要是示范 ./L1，全平台每个租户的签名
+// 密钥明文就留在某人的工作目录里，而 SSD 上 rm 不等于擦除。
+func TestReadmeTellsYouToExtractOntoRamAndDestroyAfterwards(t *testing.T) {
+	holders := testHolders(t)
+	in := testInput(t, holders)
+	readme := renderReadmeFirst(in, backupcontainer.Pairs()[0], recipientMap(in), "deadbeef")
+
+	for _, want := range []string{"/dev/shm", "rm -rf"} {
+		if !strings.Contains(readme, want) {
+			t.Fatalf("README 里没有 %q——明文会留在某人的工作目录里", want)
+		}
+	}
+	if strings.Contains(readme, "key  ./L1") {
+		t.Fatal("README 还在示范解到当前目录")
+	}
+}
+
+// recover.sh 结束时必须提醒销毁解出来的明文。
+//
+// 它不替你做是有意的：万一还没装完就被清掉，恢复要从头再来一遍，那在灾难当天
+// 很贵。但它必须说——不说的话，那份明文会一直留着。
+func TestRecoverScriptRemindsYouToDestroyThePlaintext(t *testing.T) {
+	holders := testHolders(t)
+	script := renderRecoverScript(testInput(t, holders), backupcontainer.Pairs()[0])
+	for _, want := range []string{"别忘了销毁", "rm -rf", "umask 077"} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("recover.sh 里没有 %q", want)
+		}
+	}
+}
+
+func recipientMap(in Input) map[string]Recipient {
+	out := map[string]Recipient{}
+	for _, r := range in.Recipients {
+		out[r.Slot] = r
+	}
+	return out
+}

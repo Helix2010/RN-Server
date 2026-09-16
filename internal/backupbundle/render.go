@@ -103,11 +103,20 @@ func renderReadmeFirst(in Input, pair backupcontainer.Pair, byslot map[string]Re
 
 %s
 
-依次跑（会提示输入各自私钥的密码）：
+**解到内存盘上，不要解到当前目录。** 解出来的是全平台每个租户的签名密钥明文
+——落在普通磁盘上，同机任何用户都可能读到，而且 SSD 上 rm 不等于擦除。
 
-    bash open-layer.sh %s  ~/%s.key  ./L1
-    bash open-layer.sh ./L1/inner.rnbk   ~/%s.key  ./L2-agent
-    bash open-layer.sh ./L1/server.rnbk  ~/%s.key  ./L2-server
+    work=$(mktemp -d /dev/shm/rnbk-open.XXXXXX)   # 内存盘，重启即失
+    bash open-layer.sh %s  ~/%s.key  "$work/L1"
+    bash open-layer.sh "$work/L1/inner.rnbk"   ~/%s.key  "$work/L2-agent"
+    bash open-layer.sh "$work/L1/server.rnbk"  ~/%s.key  "$work/L2-server"
+
+做完之后**立刻销毁**：
+
+    rm -rf "$work"
+
+（recover.sh 结束时会提醒你这一步，但它不替你做——万一你还没装完就被清掉，
+恢复要从头再来一遍，那在灾难当天是很贵的。）
 
 没有 xxd 的机器上，把 `+"`xxd -p -cN`"+` 换成 `+"`od -An -tx1 | tr -d ' \\n'`"+`，输出逐字节相同。
 
@@ -430,6 +439,21 @@ cat <<'TODO'
 TODO
 
 printf '\n恢复脚本做完了它能做的部分。上面五步做完才算完整恢复。\n'
+
+# --- 最后一句，也是最容易被忘掉的一句 -----------------------------------
+# $ROOT 里是全平台每个租户的签名密钥明文。它不该在这台机器上多留一秒，
+# 而 SSD 上 rm 不等于擦除——所以最好一开始就解在内存盘上（README 第三步）。
+cat <<CLEANUP
+
+!! 别忘了销毁解出来的明文
+   目录: $ROOT
+   里面有全平台每个租户的签名密钥明文和 agent-key。
+
+       rm -rf $(printf '%%q' "$ROOT")
+
+   这个脚本不替你做：万一你还没装完就被清掉，恢复要从头再来一遍，
+   而那在灾难当天是很贵的。
+CLEANUP
 `, in.AgentKeyFingerprint, in.AgentKeyFingerprint)
 	return b.String()
 }
