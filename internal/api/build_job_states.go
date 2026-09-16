@@ -142,7 +142,6 @@ var (
 	sqlInFlight        = sqlStatusList(buildJobInFlightStatuses)
 	sqlSignerActive    = sqlStatusList(buildJobEventFrom(eventSignerHeartbeat, jobKindAPK))
 	sqlDispatchFailure = sqlStatusList(buildJobEventFrom(eventDispatchFail, ""))
-	sqlTerminal        = sqlStatusList(buildJobTerminalStatuses)
 )
 
 func orderedStatuses(statuses []string) []string {

@@ -324,7 +324,6 @@ func (s *server) builderJobScope(next gin.HandlerFunc) gin.HandlerFunc {
 		}
 		c.Set("tenantId", job.TenantID)
 		c.Set("actorId", buildAgentActor)
-		c.Set("buildAgent", true)
 		c.Set("buildJob", job)
 		next(c)
 	}

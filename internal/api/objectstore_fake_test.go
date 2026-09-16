@@ -15,7 +15,6 @@ import (
 
 // fakeObjectStore 是测试用对象存储：按 key 保存字节与 ETag，Stat/Get 可被替换成失败。
 type fakeObjectStore struct {
-	corsErr   error
 	objects   map[string]fakeObject
 	statErr   error
 	listErr   error
