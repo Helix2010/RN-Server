@@ -1,0 +1,80 @@
+# 签名闸 @INSTANCE@（模板渲染：install.sh 把 @INSTANCE@ 换成实例名，实例名默认取机器名）。
+# 主备角色写在它自己的本机记录里，不在这个文件里。步骤见 /opt/rn-signer/README.md。
+#
+# 目录：
+#   /opt/rn-signer/bin/signer、signer-check      程序本体（root:root 0755）
+#   /opt/rn-signer/build-tools/<版本>/lib/        root 拥有的 apksigner.jar 副本（不指向构建机的 SDK）
+#   /etc/rn-signer-@INSTANCE@.env                 配置（root:rn-signer-@INSTANCE@ 0640，含本机令牌，signer enroll 写入）
+#   /var/lib/rn-signer-@INSTANCE@/                状态：本机私钥、trust.jsonl、signed.jsonl（0700）
+#   /run/rn-signer-@INSTANCE@/                    运行时（tmpfs，0700）：明文 keystore 只出现在这里，签完即删
+#   /run/rn-signer-@INSTANCE@-check.sock          检查进程 socket（rn-signer-@INSTANCE@-check.socket 创建）
+#
+# 真正的边界是文件权限（其它系统用户读不到 0700 的状态目录）；下面的硬化是纵深防御。
+[Unit]
+Description=RN Android signing gate @INSTANCE@
+Documentation=file:///opt/rn-signer/README.md
+Wants=network-online.target
+After=network-online.target rn-signer-@INSTANCE@-check.socket
+Requires=rn-signer-@INSTANCE@-check.socket
+
+[Service]
+Type=exec
+User=rn-signer-@INSTANCE@
+Group=rn-signer-@INSTANCE@
+EnvironmentFile=/etc/rn-signer-@INSTANCE@.env
+ExecStart=/opt/rn-signer/bin/signer run
+# 其它致命错误（本机记录校验失败、公钥不符、文件不可信）退出码 1：每 60 秒重启一次，不高频刷日志
+Restart=on-failure
+RestartSec=60s
+# 退出码 78：服务端不再接受本机令牌（401 MACHINE_REVOKED / MACHINE_AUTH_REQUIRED），不重启
+RestartPreventExitStatus=78
+# SIGTERM 时签名闸把手上的任务 release 回服务端再退出（apksigner 最多几十秒）
+TimeoutStopSec=90s
+KillMode=mixed
+
+StateDirectory=rn-signer-@INSTANCE@
+StateDirectoryMode=0700
+RuntimeDirectory=rn-signer-@INSTANCE@
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+
+UMask=0077
+LimitCORE=0
+# 解开的 keystore 与口令在签名闸和 java 子进程的内存里：不许换出到交换分区（需要 cgroup v2）
+MemorySwapMax=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# 不设 MemoryDenyWriteExecute：JVM 的 JIT 需要可写可执行内存
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 出站地址：模板不写死（API 地址因机器而异）。上线后用 drop-in 收紧到 API 与 DNS 解析器地址：
+#   /etc/systemd/system/rn-signer-@INSTANCE@.service.d/network.conf
+#   [Service]
+#   IPAddressDeny=any
+#   IPAddressAllow=<API 地址> <DNS 解析器地址>     （与服务端同机走回环时写 localhost）
+# 可写路径只有 StateDirectory 与 RuntimeDirectory（ProtectSystem=strict 下自动放行）。
+# 别的签名闸实例的状态目录是各自用户的 0700 目录；构建机与服务端的机密一律不可见。
+InaccessiblePaths=-/var/lib/rn-build-agent -/etc/rn-build-agent.env -/etc/rn-foundation.env
+
+[Install]
+WantedBy=multi-user.target
