@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/signing/apk"
 	"github.com/Helix2010/RN-Server/signing/apk/apktest"
@@ -124,6 +127,41 @@ func TestApksignerArgumentsAndEnvironment(t *testing.T) {
 	relative.KeystorePath = "keystore.p12"
 	if err := s.Sign(context.Background(), relative); err == nil {
 		t.Fatal("accepted a relative keystore path")
+	}
+}
+
+// 取消之后，子进程派生的孙进程握着输出管道不放：WaitDelay 到点就返回，不被拖到孙进程退出。
+func TestApksignerCancelDoesNotWaitForGrandchildren(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "grandchild.pid")
+	script := filepath.Join(dir, "java")
+	body := "#!/bin/sh\n" +
+		"sleep 30 &\n" + // 继承 stdout/stderr
+		"echo $! > " + pidFile + "\n" +
+		"sleep 30\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	s := JavaAPKSigner{Java: script, Jar: "/opt/build-tools/lib/apksigner.jar", WaitDelay: 200 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := s.Verify(ctx, filepath.Join(dir, "signed.apk"), 24, "")
+	if err == nil {
+		t.Fatal("a killed apksigner reported success")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Verify returned after %v; the grandchild holding the output pipe kept it waiting", elapsed)
+	}
+	if (JavaAPKSigner{}).WaitDelay != 0 || childWaitDelay != 10*time.Second {
+		t.Fatal("the production wait delay changed")
 	}
 }
 

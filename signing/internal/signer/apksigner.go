@@ -44,12 +44,17 @@ type APKSigner interface {
 
 const apksignerTimeout = 10 * time.Minute
 
+// childWaitDelay：取消或超时杀掉子进程之后，最多再等这么久让输出管道关闭。子进程派生的孙进程
+// 握着 stdout/stderr 不放时，没有这个上限 cmd.Wait 会被拖到孙进程自己退出。
+const childWaitDelay = 10 * time.Second
+
 // JavaAPKSigner 直接调用 $JAVA_HOME/bin/java -jar <build-tools>/lib/apksigner.jar：
 // 不走 build-tools 里那个会读 PATH、JDK_JAVA_OPTIONS 的 shell 包装脚本；子进程环境为空（env -i）。
 type JavaAPKSigner struct {
-	Java    string // 绝对路径
-	Jar     string // 绝对路径
-	Timeout time.Duration
+	Java      string // 绝对路径
+	Jar       string // 绝对路径
+	Timeout   time.Duration
+	WaitDelay time.Duration // 零值用 childWaitDelay
 }
 
 // NewJavaAPKSigner 按配置定位 java 与 apksigner.jar，并检查它们存在。
@@ -104,6 +109,10 @@ func (s JavaAPKSigner) run(ctx context.Context, dir string, args []string) (stri
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, s.Java, args...)
+	cmd.WaitDelay = s.WaitDelay
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = childWaitDelay
+	}
 	cmd.Env = []string{}
 	if dir == "" {
 		dir = "/"

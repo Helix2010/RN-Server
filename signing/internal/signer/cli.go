@@ -2,6 +2,7 @@ package signer
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,22 @@ const usageText = `用法 / usage:
 
 没有 --env-file 时从进程环境读 SIGNER_* 配置。confirm、trust-builder、promote、abandon
 必须由运维在交互终端里执行。`
+
+// ExitTokenRejected 是服务端不再接受本机令牌（401 MACHINE_REVOKED / MACHINE_AUTH_REQUIRED）时
+// signer run 的退出码（sysexits 的 EX_CONFIG）。rn-signer-*.service 用 RestartPreventExitStatus=78
+// 阻止 systemd 重启：换令牌之前重启只会反复失败刷日志。其余致命错误退出码是 1。
+const ExitTokenRejected = 78
+
+// exitCode 把命令的错误映射成退出码。
+func exitCode(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, errTokenRejected):
+		return ExitTokenRejected
+	}
+	return 1
+}
 
 // Main 是 signer 命令的入口，返回退出码。
 func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(string) string) int {
@@ -135,9 +152,8 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "错误:", cleanText(err.Error(), 2000))
-		return 1
 	}
-	return 0
+	return exitCode(err)
 }
 
 // runLockMode 说明运维命令是否要求签名闸服务已停。
