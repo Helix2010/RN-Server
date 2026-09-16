@@ -310,6 +310,14 @@ func (a *agent) deliverAPK(ctx context.Context, job claimedJob, prepared prepare
 		return fmt.Errorf("the SBOM could not be uploaded: %w", err)
 	}
 
+	// 换钥进行中：签名之前再问一次服务端，控制台刚接受了下一把的话先换上，免得用旧密钥签出
+	// 一份服务端已经不认的声明
+	if a.keys.next != nil {
+		a.keyActive = false
+		if !a.ensureKeyAccepted(ctx) {
+			return errors.New("this machine's provenance key is no longer accepted by the server")
+		}
+	}
 	statement := provenance.Statement{
 		Version:           provenance.Version,
 		Purpose:           provenance.Purpose,
