@@ -1,56 +1,97 @@
-// build-agent 是打包机上的常驻进程。
+// build-agent 是构建机上的构建控制进程，以 rn-build-agent 用户常驻。
 //
-// 它**必须**和 wallet 后端部署在不同的机器上：这台机器持有 Android keystore，而
-// 整套设计的安全论证（服务端不下发密钥、不执行命令）在两者同机的那一刻就作废了
-// ——后端的一个 RCE 直接读到磁盘上的密钥。
+// 它持有本机令牌（BUILD_AGENT_MACHINE_TOKEN）、Ed25519 出处签名密钥和仓库裸库；
+// 第三方代码（pnpm、Gradle、依赖包）只在构建执行进程 build-runner 里跑，那是经一条
+// 收窄的 sudoers 规则启动的另一个用户（builder），拿不到令牌和密钥。构建机手上没有任何
+// 签名密钥：它交付未签名包、SBOM 和出处声明，正式签名由签名闸做。
 //
-// 它只出不进：轮询服务端要任务，服务端从不连它。这台机器因此可以不开放任何入站
-// 端口。反过来做就要在握着签名密钥的机器上开一个监听端口，那个端口的每一个 bug
-// 都直接通向 keystore。
+// 它只出不进：轮询服务端要任务，服务端从不连它，这台机器因此不开放任何入站端口。
 //
-// 设计见 docs/design/build-service-2026-09-11.md 阶段 2b。
+// 子命令：
+//
+//	build-agent                 常驻（配置来自环境变量；配置不全以退出码 2 退出）
+//	build-agent show-key        只读打印出处公钥 base64 与完整 sha256
+//	build-agent rotate-key      生成下一把出处密钥，常驻进程用当前密钥签换钥证明登记它
+//
+// 设计见 docs/design/android-signing-gate-2026-09-16.md「构建机」。
 package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
-
 	"time"
 )
 
 func main() {
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "show-key":
+			os.Exit(showKey(os.Args[2:], os.Stdout, os.Stderr))
+		case "rotate-key":
+			os.Exit(rotateKey(os.Args[2:], os.Stdout, os.Stderr))
+		default:
+			fmt.Fprintln(os.Stderr, "usage: build-agent [show-key|rotate-key] (configuration comes from the environment)")
+			os.Exit(2)
+		}
+	}
+	os.Exit(runAgent())
+}
+
+func runAgent() int {
+	// 冒烟（rn-foundation-apply）以空环境跑它，必须在碰任何文件之前以 2 退出
 	cfg, err := loadConfig()
 	if err != nil {
 		slog.Error("build agent configuration is incomplete", "error", err)
-		os.Exit(2)
+		return 2
+	}
+	syscall.Umask(0o027)
+	keys, err := loadOrCreateKeyring(cfg.StateDir)
+	if err != nil {
+		slog.Error("cannot load this machine's provenance key", "stateDir", cfg.StateDir, "error", err)
+		return 2
 	}
 	if err := os.MkdirAll(cfg.Workspace, 0o750); err != nil {
-		slog.Error("cannot create the workspace", "path", cfg.Workspace, "error", err)
-		os.Exit(2)
+		slog.Error("cannot create the jobs root", "path", cfg.Workspace, "error", err)
+		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	a := newAgent(cfg, keys)
+	if !cfg.runnerSeparated() {
+		slog.Warn("!!! BUILD_AGENT_RUNNER_USER is '-': the build runner runs as the SAME user as the build agent, " +
+			"so third-party build code can read the machine token and the provenance key. LOCAL TESTING ONLY !!!")
+	}
+	if err := a.checkRunner(ctx); err != nil {
+		slog.Error("the build runner is not usable", "runner", cfg.Runner, "runnerUser", cfg.RunnerUser, "error", err)
+		return 2
+	}
+	// 停机信号只用来"不再领新活"，正在跑的构建不打断
 	go func() {
 		<-ctx.Done()
 		slog.Info("stop requested: not claiming any more builds; the one in flight will finish")
 	}()
 
-	pruneOrphanWorktrees(ctx, cfg)
+	// 上一条命留下的任务目录：硬杀时收尾那一步执行不到。这一刻手上没有任务，凡是在任务根目录里的都是孤儿。
+	a.pruneOrphans()
 
-	slog.Info("build agent started", "server", cfg.Server, "agent", cfg.Name,
-		"platforms", cfg.Platforms, "workspace", cfg.Workspace)
-	api := newClient(cfg)
+	slog.Info("build agent started", "server", cfg.Server, "platforms", cfg.Platforms,
+		"jobsRoot", cfg.Workspace, "runner", cfg.Runner, "runnerUser", cfg.RunnerUser,
+		"provenancePublicKeySha256", keys.current.sha256)
 
 	for {
-		worked := pollOnce(ctx, cfg, api)
+		worked := a.pollOnce(ctx)
 		if ctx.Err() != nil {
 			slog.Info("build agent stopped")
-			return
+			return 0
 		}
 		if worked {
 			continue
@@ -58,123 +99,74 @@ func main() {
 		select {
 		case <-ctx.Done():
 			slog.Info("build agent stopped")
-			return
+			return 0
 		case <-time.After(cfg.PollEvery):
 		}
 	}
 }
 
-// pollOnce 领一个任务并把它做完，返回是否真的做了事。任何失败都上报给服务端——
-// 悄悄失败会让管理端上的任务永远停在 running，而没人知道该去哪台机器上看。
-func pollOnce(ctx context.Context, cfg config, api *client) bool {
-	job, ok, err := api.claim(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			slog.Warn("cannot claim a build", "error", err)
-		}
-		return false
+// stateDirFlag 取 --state-dir，没有就用 BUILD_AGENT_STATE_DIR。
+func stateDirFlag(name string, args []string, stderr io.Writer) (string, bool) {
+	set := flag.NewFlagSet(name, flag.ContinueOnError)
+	set.SetOutput(stderr)
+	dir := set.String("state-dir", os.Getenv("BUILD_AGENT_STATE_DIR"), "the build agent state directory")
+	if err := set.Parse(args); err != nil || set.NArg() != 0 {
+		return "", false
 	}
-	if !ok {
-		return false
+	if *dir == "" {
+		fmt.Fprintln(stderr, "give --state-dir or set BUILD_AGENT_STATE_DIR")
+		return "", false
 	}
-	slog.Info("claimed a build", "job", job.ID, "tenant", job.TenantSlug,
-		"version", job.Version, "buildNumber", job.BuildNumber, "gitRef", job.GitRef)
-
-	red := newRedactor()
-	buf := newLogBuffer(red)
-	// 构建不挂在 ctx 上：收到 SIGTERM 就把一个跑了五分钟、已经签完名的构建拦腰砍掉
-	// 是不值当的，何况换二进制是我们自己发起的动作。信号让循环停在下一次领活之前，
-	// 这一条做完为止。unit 里的 TimeoutStopSec 必须给得比 BUILD_AGENT_TIMEOUT_MINUTES
-	// 长，否则 systemd 会在中途补一刀 SIGKILL。
-	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.Timeout)
-	defer cancel()
-
-	beats := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-beats:
-				return
-			case <-ticker.C:
-				if err := api.heartbeat(context.WithoutCancel(buildCtx), job.ID, buf.snapshot()); err != nil {
-					slog.Warn("heartbeat failed", "job", job.ID, "error", err)
-				}
-			}
-		}
-	}()
-
-	result, buildErr := buildJob(buildCtx, cfg, api, job, buf)
-
-	// 产物必须在删掉 worktree **之前**传走。第一版把删除放在前面，于是构建成功
-	// 之后包就没了，只剩一个 sha256——"成功"却拿不到任何可分发的东西。
-	releaseID := ""
-	if buildErr == nil {
-		if job.Kind == "ota" {
-			buf.add("uploading " + filepath.Base(result.ArtifactPath))
-			releaseID, buildErr = api.uploadOTAPackage(buildCtx, job.ID, result.ArtifactPath, result.CommitSHA, buf)
-		} else {
-			buf.add("uploading " + filepath.Base(result.ArtifactPath) + " and its SBOM")
-			releaseID, buildErr = api.uploadArtifact(buildCtx, job.ID, result.ArtifactPath, result.SBOMPath, result.NativeFingerprint, buf)
-		}
-		if buildErr != nil {
-			buildErr = fmt.Errorf("the package was built but could not be uploaded: %w", buildErr)
-		} else {
-			buf.add("release " + releaseID)
-		}
-	}
-	close(beats)
-	removeWorktree(cfg, job, buf)
-
-	// 上报用一个不受构建超时影响的 context：构建因为超时被杀掉时，正是最需要
-	// 把失败原因送回去的时候。
-	reportCtx, reportCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-	defer reportCancel()
-	if buildErr != nil {
-		reason := red.line(buildErr.Error())
-		if buildCtx.Err() == context.DeadlineExceeded {
-			reason = "build timed out after " + cfg.Timeout.String()
-		}
-		slog.Error("build failed", "job", job.ID, "reason", reason)
-		// 带上已经解析出来的提交：失败的构建同样需要能查"它到底构建了哪一版"
-		report(reportCtx, job.ID, "failure", func(ctx context.Context) error {
-			return api.fail(ctx, job.ID, reason, result.CommitSHA, buf.snapshot())
-		})
-		return true
-	}
-	slog.Info("build succeeded", "job", job.ID, "commit", result.CommitSHA, "sha256", result.SHA256, "release", releaseID)
-	// releaseId 留空：产物上传接入在阶段 2b 的下一步，现在先把构建结果与指纹落回去
-	report(reportCtx, job.ID, "result", func(ctx context.Context) error {
-		return api.complete(ctx, job.ID, result.CommitSHA, result.SHA256, releaseID, buf.snapshot())
-	})
-	return true
+	return *dir, true
 }
 
-// report 反复重试最后那一次上报。
-//
-// 这一步失败的代价和别处不一样：任务会永远停在 claimed，管理端上看不出发生了
-// 什么，那个 build 号也一直被占着。2026-09-11 部署时撞上过一次——上报正好落在
-// 服务端重启的几秒里拿到 521，任务从此卡住。
-//
-// 构建已经做完了，多等一会儿不浪费任何东西，所以退避重试到分钟级。
-func report(ctx context.Context, jobID, what string, send func(context.Context) error) {
-	delay := 2 * time.Second
-	for attempt := 1; attempt <= 8; attempt++ {
-		if err := send(ctx); err == nil {
-			return
-		} else {
-			slog.Warn("cannot report the "+what+", will retry", "job", jobID, "attempt", attempt, "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			slog.Error("gave up reporting the "+what, "job", jobID)
-			return
-		case <-time.After(delay):
-		}
-		if delay < 60*time.Second {
-			delay *= 2
-		}
+// showKey 只读打印这台构建机的出处公钥。**它绝不创建密钥**：运维拿它的输出去控制台接受、
+// 去签名闸上 trust-builder，它自己造一把就等于让这次核对失去意义。
+func showKey(args []string, stdout, stderr io.Writer) int {
+	dir, ok := stateDirFlag("show-key", args, stderr)
+	if !ok {
+		return 2
 	}
-	slog.Error("gave up reporting the "+what+" after repeated failures", "job", jobID)
+	ring, err := readKeyringReadOnly(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintf(stderr, "no provenance key in %s yet: start the build agent once (it creates the key), then run show-key again\n", dir)
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "cannot read the provenance key:", err)
+		return 2
+	}
+	fmt.Fprintf(stdout, "provenance public key (ed25519, base64): %s\n", ring.current.publicBase64())
+	fmt.Fprintf(stdout, "provenance public key sha256:            %s\n", ring.current.sha256)
+	if ring.next != nil {
+		fmt.Fprintf(stdout, "rotation key (ed25519, base64):          %s\n", ring.next.publicBase64())
+		fmt.Fprintf(stdout, "rotation key sha256:                     %s\n", ring.next.sha256)
+	}
+	fmt.Fprintf(stdout, "state dir: %s\n", dir)
+	return 0
+}
+
+// rotateKey 生成下一把出处密钥（已有就原样打印）。它不连服务端：常驻进程下一次登记时用
+// 当前私钥签换钥证明把它登记上去，控制台接受之后换上。顺序是先在每台签名闸上
+// trust-builder 新的 sha256，再在控制台接受——反过来的话，中间交付的包会被签名闸拒签。
+func rotateKey(args []string, stdout, stderr io.Writer) int {
+	dir, ok := stateDirFlag("rotate-key", args, stderr)
+	if !ok {
+		return 2
+	}
+	syscall.Umask(0o077)
+	next, created, err := createNextKey(dir)
+	if err != nil {
+		fmt.Fprintln(stderr, "cannot create the rotation key:", err)
+		return 2
+	}
+	if created {
+		fmt.Fprintln(stdout, "rotation key created.")
+	} else {
+		fmt.Fprintln(stdout, "a rotation key already exists; nothing was created.")
+	}
+	fmt.Fprintf(stdout, "rotation key sha256: %s\n", next.sha256)
+	fmt.Fprintln(stdout, "next: restart rn-build-agent so it registers the key with a rotation proof,")
+	fmt.Fprintln(stdout, "      run `signer trust-builder` with this sha256 on every signer, then accept it in the console.")
+	return 0
 }
