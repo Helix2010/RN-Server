@@ -7,16 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Helix2010/RN-Server/internal/backupbundle"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
 
 type claimedJob struct {
@@ -38,9 +34,6 @@ type claimedJob struct {
 	BuildNumber          int    `json:"buildNumber"`
 	OTACertificatePEM    string `json:"otaCertificatePem"`
 	OTACertificateSHA256 string `json:"otaCertificateSha256"`
-	// SealedKeystore 是运维用自己的口令封的盒子，服务端只是转交，打不开它。
-	SealedKeystore *buildkeystore.Sealed `json:"sealedKeystore"`
-	KeyAlias       string                `json:"keyAlias"`
 	// GoogleServicesJSON 不是机密（它原样编进每个 APK），但按租户不同，所以也随
 	// 任务下发——这样新加一台打包机仍然只需要一个封装口令。
 	GoogleServicesJSON string `json:"googleServicesJson"`
@@ -315,43 +308,6 @@ func (c *client) putTo(ctx context.Context, ticket uploadTicket, path string) er
 	return nil
 }
 
-type pendingKeystoreCheck struct {
-	Tenant         string          `json:"tenant"`
-	Version        int             `json:"version"`
-	SealedKeystore json.RawMessage `json:"sealedKeystore"`
-}
-
-func (c *client) pendingKeystoreChecks(ctx context.Context) ([]pendingKeystoreCheck, error) {
-	var out struct {
-		Items []pendingKeystoreCheck `json:"items"`
-	}
-	if _, err := c.get(ctx, "/v1/build-agent/keystore-checks", &out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
-}
-
-func (c *client) reportKeystoreCheck(ctx context.Context, tenant string, version int, ok bool, reason, agent string) error {
-	_, err := c.post(ctx, "/v1/build-agent/keystore-checks", map[string]any{
-		"tenant": tenant, "version": version, "ok": ok, "error": reason, "agent": agent,
-	}, nil)
-	return err
-}
-
-func (c *client) registerPublicKey(ctx context.Context, publicKey, agent string) (string, error) {
-	var out struct {
-		Status             string `json:"status"`
-		Fingerprint        string `json:"fingerprint"`
-		CurrentFingerprint string `json:"currentFingerprint"`
-	}
-	if _, err := c.post(ctx, "/v1/build-agent/public-key", map[string]any{
-		"publicKey": publicKey, "agent": agent,
-	}, &out); err != nil {
-		return "", err
-	}
-	return out.Status, nil
-}
-
 // downloadIcon 取一张图标，直接写进 worktree，不经过内存里的字符串。
 //
 // 图标原来是 base64 塞在领取任务的响应里的，而那条响应有 1 MiB 的读取上限。
@@ -424,124 +380,4 @@ func (c *client) uploadOTAPackage(ctx context.Context, jobID, path, commit strin
 		return "", errors.New("the server created an OTA revision but did not say which one")
 	}
 	return created.Release.ID, nil
-}
-
-// ---- 备份（设计 platform-backup-recovery-2026-09-15 §8.1）----
-
-// pendingBackup 认领一条备份待办。没有待办返回 (_, false, nil)。
-//
-// 用 POST 不是 GET：它会改状态，而服务端把 GET 当安全方法——Origin 闸对它完全
-// 不生效，何况任何 HTTP 客户端和代理都会对 GET 自动重试。
-func (c *client) pendingBackup(ctx context.Context) (backupRequest, bool, error) {
-	var out backupRequest
-	status, err := c.post(ctx, "/v1/build-agent/backup-requests/claim",
-		map[string]string{"agent": c.cfg.Name}, &out)
-	if err != nil {
-		return backupRequest{}, false, err
-	}
-	if status == http.StatusNoContent || out.ID == "" {
-		return backupRequest{}, false, nil
-	}
-	return out, true, nil
-}
-
-func (c *client) backupKeystores(ctx context.Context, requestID string) ([]sealedKeystoreItem, error) {
-	var out struct {
-		Items []sealedKeystoreItem `json:"items"`
-	}
-	if _, err := c.get(ctx, "/v1/build-agent/backup-keystores?request="+url.QueryEscape(requestID), &out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
-}
-
-func (c *client) failBackup(ctx context.Context, requestID, reason string) error {
-	_, err := c.post(ctx, "/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/fail",
-		map[string]string{"reason": truncate(reason, 480)}, nil)
-	return err
-}
-
-func (c *client) registerBackupSigningKey(ctx context.Context, publicKey string) (string, error) {
-	var out struct {
-		Status string `json:"status"`
-	}
-	_, err := c.post(ctx, "/v1/build-agent/backup-signing-key",
-		map[string]string{"publicKey": publicKey, "agent": c.cfg.Name}, &out)
-	return out.Status, err
-}
-
-// uploadBackupPayload 上报一份内层密文（multipart：meta / payload / sig，见 §4.7）。
-//
-// **meta 必须排在 payload 之前**：服务端靠这个顺序先解析元数据、校验通过再决定
-// 要不要收那几十 MB。顺序反了服务端会直接拒。
-// backupUploadResult 是服务端对一次上报的回答。
-//
-// **StillExpecting 必须看。** 服务端在两份没到齐时回 202 加一个「还缺哪几份」，
-// 而只判 >=400 的话，打包机会把它当成功、打出「备份产出成功」然后走人——
-// 而记录停在 running 干等 30 分钟产出超时。这个时序不是假想：服务端在两份之间
-// 重启就会发生（启动时会清掉上一次的暂存）。
-type backupUploadResult struct {
-	StillExpecting []string `json:"stillExpecting"`
-	Status         string   `json:"status"`
-}
-
-func (c *client) uploadBackupPayload(ctx context.Context, requestID string,
-	meta backupbundle.PayloadMeta, payload, signature []byte) (backupUploadResult, error) {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-
-	encoded, err := json.Marshal(meta)
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	metaPart, err := writer.CreateFormField("meta")
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	if _, err := metaPart.Write(encoded); err != nil {
-		return backupUploadResult{}, err
-	}
-	payloadPart, err := writer.CreateFormFile("payload", "inner.rnbk")
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	if _, err := payloadPart.Write(payload); err != nil {
-		return backupUploadResult{}, err
-	}
-	sigPart, err := writer.CreateFormFile("sig", "inner.rnbk.sig")
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	if _, err := sigPart.Write(signature); err != nil {
-		return backupUploadResult{}, err
-	}
-	if err := writer.Close(); err != nil {
-		return backupUploadResult{}, err
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.cfg.Server+"/v1/build-agent/backup-requests/"+url.PathEscape(requestID)+"/payload", &body)
-	if err != nil {
-		return backupUploadResult{}, err
-	}
-	request.Header.Set("content-type", writer.FormDataContentType())
-	request.Header.Set("x-build-agent-token", c.cfg.Token)
-
-	// 上传和收尾都可能要几分钟，而 client.http 的默认超时是 30 秒。
-	// 用调用方的 ctx 兜底（runBackup 给了 25 分钟，小于服务端 30 分钟的产出超时）
-	uploader := &http.Client{}
-	response, err := uploader.Do(request)
-	if err != nil {
-		return backupUploadResult{}, retryLater{err}
-	}
-	defer response.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
-	if response.StatusCode >= 400 {
-		return backupUploadResult{}, classify(response.StatusCode,
-			fmt.Errorf("uploading the backup payload returned %d: %s",
-				response.StatusCode, truncate(string(raw), 300)))
-	}
-	var out backupUploadResult
-	_ = json.Unmarshal(raw, &out)
-	return out, nil
 }

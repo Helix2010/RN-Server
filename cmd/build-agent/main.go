@@ -20,18 +20,10 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/Helix2010/RN-Server/internal/backupcontainer"
 	"time"
 )
 
 func main() {
-	// show-key 打印本机身份。恢复时要靠它核对 agent-key 有没有放对位置——
-	// manifest.agentKeyFingerprint 就是它的比对对象。没有这条子命令，
-	// RECOVERY.md 第 4 步是一条必然失败的指引。
-	if len(os.Args) == 2 && os.Args[1] == "show-key" {
-		showKey()
-		return
-	}
 	cfg, err := loadConfig()
 	if err != nil {
 		slog.Error("build agent configuration is incomplete", "error", err)
@@ -41,110 +33,27 @@ func main() {
 		slog.Error("cannot create the workspace", "path", cfg.Workspace, "error", err)
 		os.Exit(2)
 	}
-	// 本机私钥。没有就生成一把——服务端从此把签名密钥加密给对应的公钥，没有人需要
-	// 敲封装口令。丢了它的后果和丢了封装口令一样：已有的盒子全部打不开
-	private, public, err := loadOrCreateAgentKey(cfg.StateDir)
-	if err != nil {
-		slog.Error("cannot load this machine's build agent key", "stateDir", cfg.StateDir, "error", err)
-		os.Exit(2)
-	}
-	cfg.AgentPrivateKey = private
-	cfg.AgentPublicKey = public
-	// 备份签名私钥。和上面那把是两把不同算法、不同用途的钥匙：一把开盒子，
-	// 一把给备份包签名。缺了它只影响备份，不影响构建
-	signingKey, signingPublic, err := loadOrCreateBackupSigningKey(cfg.StateDir)
-	if err != nil {
-		slog.Error("cannot load this machine's backup signing key; backups will be refused",
-			"stateDir", cfg.StateDir, "error", err)
-	} else {
-		cfg.BackupSigningKey = signingKey
-		cfg.BackupSigningPublicKey = signingPublic
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// 停机信号只用来"不再领新活"，正在跑的构建不打断（见 pollOnce）。单独起一个
-	// goroutine 说一声，否则 systemctl stop 会静静地挂着，看的人不知道它在等什么。
 	go func() {
 		<-ctx.Done()
 		slog.Info("stop requested: not claiming any more builds; the one in flight will finish")
 	}()
 
-	// 上一条命留下的检出：硬杀时收尾那一步执行不到，检出、登记和里面解开的 keystore
-	// 都会留在盘上。这一刻手上没有任务，凡是在 workspace 里的都是孤儿。
 	pruneOrphanWorktrees(ctx, cfg)
 
 	slog.Info("build agent started", "server", cfg.Server, "agent", cfg.Name,
-		"platforms", cfg.Platforms, "workspace", cfg.Workspace,
-		"keyFingerprint", cfg.AgentPublicKey.Fingerprint())
+		"platforms", cfg.Platforms, "workspace", cfg.Workspace)
 	api := newClient(cfg)
 
-	// 登记本机公钥。服务端此后把签名密钥加密给它，没有人需要敲封装口令。
-	//
-	// 登记不成功不退出：服务端可能正在重启，而已经存在的任务还应该照常跑。第一次
-	// 登记之前也确实没有任何密钥加密给这台机器，没什么可损失的。
-	registerCtx, cancelRegister := context.WithTimeout(ctx, 30*time.Second)
-	if status, err := api.registerPublicKey(registerCtx, cfg.AgentPublicKey.PublicKey, cfg.Name); err != nil {
-		slog.Warn("cannot register this machine's public key; the server has nothing to encrypt new keystores to",
-			"fingerprint", cfg.AgentPublicKey.Fingerprint(), "error", err)
-	} else {
-		// pending_acceptance：服务端上已经固定了另一把公钥，换它要人核对指纹后接受。
-		// 自动接受的话，偷到令牌的人登记自己的公钥就能收下以后每一把新密钥
-		slog.Info("registered this machine's public key", "status", status,
-			"fingerprint", cfg.AgentPublicKey.Fingerprint())
-	}
-	cancelRegister()
-
-	// 备份签名公钥。规则和上面那把一样：库里没有就自动接受，已有另一把就挂成
-	// 待确认——自动接受等于偷到令牌的人换掉签名公钥，此后他伪造的备份包全都验得过
-	if cfg.BackupSigningPublicKey != "" {
-		signCtx, cancelSign := context.WithTimeout(ctx, 30*time.Second)
-		if status, err := api.registerBackupSigningKey(signCtx, cfg.BackupSigningPublicKey); err != nil {
-			slog.Warn("cannot register this machine's backup signing key; backups will be refused", "error", err)
-		} else {
-			slog.Info("registered this machine's backup signing key", "status", status)
-		}
-		cancelSign()
-	}
-	// 上一次进程留下的明文暂存。SIGKILL 之后它会一直躺在磁盘上
-	resetBackupStaging(cfg.StateDir)
-
 	for {
-		// 备份放在**领构建之前**看一眼。现有的密钥校验挂在 `if worked { continue }`
-		// 下面，只有队列空的那一轮才跑——照抄的话，只要有人连着排构建，备份就
-		// 永远轮不上。放这里，备份最多等一条正在跑的构建。
-		if request, ok, err := api.pendingBackup(ctx); err != nil {
-			// 不要把 error 吞成「没有待办」：「老服务端 + 新打包机」和「服务端挂了」
-			// 在日志里会长得一模一样
-			slog.Warn("cannot ask the server whether a backup is pending", "error", err)
-		} else if ok {
-			// 自带超时，而且**小于服务端 30 分钟的产出超时**：一次卡住的上传会让
-			// 这个 goroutine 永远不返回，而它跑在轮询循环里——症状是构建队列
-			// 无限堆积，日志里什么都没有
-			backupCtx, cancelBackup := context.WithTimeout(ctx, backupTimeout)
-			runBackup(backupCtx, cfg, api, request)
-			cancelBackup()
-		}
-		if ctx.Err() != nil {
-			slog.Info("build agent stopped")
-			return
-		}
-
 		worked := pollOnce(ctx, cfg, api)
 		if ctx.Err() != nil {
 			slog.Info("build agent stopped")
 			return
 		}
 		if worked {
-			// 刚做完一个，队列里可能还有，不必等满一轮
 			continue
-		}
-		// 队列空着的这一轮顺手验一下新存进来的盒子。放在这里是因为它要用同一个
-		// 封装口令，而构建正忙时没有理由和它抢——验证不急，早几秒晚几秒都行，
-		// 但它必须发生在"有人发起构建"之前。
-		verifyPendingKeystores(ctx, cfg, api)
-		if ctx.Err() != nil {
-			slog.Info("build agent stopped")
-			return
 		}
 		select {
 		case <-ctx.Done():
@@ -268,41 +177,4 @@ func report(ctx context.Context, jobID, what string, send func(context.Context) 
 		}
 	}
 	slog.Error("gave up reporting the "+what+" after repeated failures", "job", jobID)
-}
-
-// showKey 打印 agent-key 的指纹和公钥 base64，以及备份签名公钥的指纹。
-//
-// 指纹用的是既有实现那一种（原始公钥字节的 sha256 截断到 16 字符），
-// 和 manifest.agentKeyFingerprint **必须逐字节相同**——不同的话，恢复时
-// 那唯一一处身份核对永远对不上，而它是「文件放没放对」唯一的检查。
-func showKey() {
-	cfg, err := loadConfig()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "配置读不了:", err)
-		os.Exit(2)
-	}
-	// **只读**。这条命令是「身份文件放没放对」唯一的检查，它自己绝不能创建密钥。
-	//
-	// 之前它走的是 loadOrCreateAgentKey，于是恢复时有这么一条路：操作者装完环境
-	// 先跑一次 show-key 确认工具能用（很自然的顺序）→ agent-key 凭空被创建 →
-	// 再跑 recover.sh，place() 看到目标已存在、问「覆盖它？(yes/NO)」、默认 NO →
-	// 真正那把 agent-key 被「跳过」→ 机器带着新密钥起来，库里每个租户的密封盒子
-	// 永久打不开。灾难由恢复流程自己制造出来，而日志里看不出区别。
-	public, err := loadAgentKeyForDisplay(cfg.StateDir)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "读不了本机身份文件:", err)
-		fmt.Fprintln(os.Stderr, "state dir:", cfg.StateDir)
-		os.Exit(2)
-	}
-	fmt.Printf("agent-key fingerprint: %s\n", public.Fingerprint())
-	fmt.Printf("agent-key public key:  %s\n", public.PublicKey)
-	if signingPublic, err := loadBackupSigningKeyForDisplay(cfg.StateDir); err == nil {
-		if pub, err := backupcontainer.ParseSigningPublicKey(signingPublic); err == nil {
-			if fingerprint, err := backupcontainer.SigningFingerprint(pub); err == nil {
-				fmt.Printf("backup signing fingerprint: %s\n", fingerprint)
-				fmt.Printf("backup signing public key:  %s\n", signingPublic)
-			}
-		}
-	}
-	fmt.Printf("state dir: %s\n", cfg.StateDir)
 }

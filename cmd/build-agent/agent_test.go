@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/rsa"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -14,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Helix2010/RN-Server/internal/buildkeystore"
 )
 
 func baseTenant() map[string]any {
@@ -355,106 +350,6 @@ func TestSBOMOutputNameTracksTheArtifact(t *testing.T) {
 	}
 }
 
-// 新格式：盒子加密给本机公钥，解得开就是解得开，没有任何口令参与。
-func TestOpenableAcceptsABoxSealedToThisMachine(t *testing.T) {
-	private, recipient, err := buildkeystore.NewAgentKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sealed, err := buildkeystore.SealTo(buildkeystore.Bundle{
-		KeystoreBase64: "eA==", StorePassword: "s", KeyAlias: "a", KeyPassword: "k",
-	}, recipient)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := json.Marshal(sealed)
-	cfg := config{AgentPrivateKey: private}
-	if ok, reason := openable(raw, cfg); !ok {
-		t.Fatalf("加密给本机的盒子应当能打开：%q", reason)
-	}
-
-	// 加密给另一台打包机的，必须打不开，并且说清楚是"换了公钥"而不是"口令不对"
-	otherPrivate, _, _ := buildkeystore.NewAgentKey()
-	ok, reason := openable(raw, config{AgentPrivateKey: otherPrivate})
-	if ok {
-		t.Fatal("另一台机器的私钥竟然解开了")
-	}
-	if !strings.Contains(reason, "公钥") {
-		t.Fatalf("原因没指向公钥不匹配：%q", reason)
-	}
-}
-
-// 旧格式还在库里（迁移之前存的），本机有对的口令时照样要能开
-func TestOpenableStillHandlesTheOldPassphraseFormat(t *testing.T) {
-	sealed, err := buildkeystore.Seal(buildkeystore.Bundle{
-		KeystoreBase64: "eA==", StorePassword: "s", KeyAlias: "a", KeyPassword: "k",
-	}, "passphrase-number-one")
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := json.Marshal(sealed)
-
-	if ok, reason := openable(raw, config{KeystorePassphrase: "passphrase-number-one"}); !ok {
-		t.Fatalf("旧格式打不开了：%q", reason)
-	}
-	// 口令不对时要告诉人"重新生成一次就换成新格式"，而不是让他继续猜口令
-	ok, reason := openable(raw, config{KeystorePassphrase: "a-completely-different-one"})
-	if ok {
-		t.Fatal("错的口令报成能打开")
-	}
-	if !strings.Contains(reason, "重新生成") {
-		t.Fatalf("没有指向出路：%q", reason)
-	}
-	// 口令和私钥都不能出现在报给服务端、最终显示在控制台上的文字里
-	for _, secret := range []string{"passphrase-number-one", "a-completely-different-one"} {
-		if strings.Contains(reason, secret) {
-			t.Fatalf("原因里带上了口令：%q", reason)
-		}
-	}
-	// 本机连旧口令都没有：说清楚出路是重新生成，不是去找那个口令
-	if ok, reason := openable(raw, config{}); ok || !strings.Contains(reason, "重新生成") {
-		t.Fatalf("没配旧口令时的提示不对：%v %q", ok, reason)
-	}
-}
-
-// 没有下发盒子、盒子坏掉——两种都要能分辨，而不是都报成"解不开"
-func TestOpenableDistinguishesTheOtherFailures(t *testing.T) {
-	if ok, reason := openable(nil, config{}); ok || !strings.Contains(reason, "没有下发") {
-		t.Fatalf("空盒子：%v %q", ok, reason)
-	}
-	if ok, reason := openable(json.RawMessage(`not json`), config{}); ok || !strings.Contains(reason, "JSON") {
-		t.Fatalf("坏盒子：%v %q", ok, reason)
-	}
-}
-
-// 本机私钥：没有就生成一把 0600 的，有就读回来，两次读到同一把
-func TestAgentKeyIsCreatedOnceAndKeptPrivate(t *testing.T) {
-	dir := t.TempDir()
-	private, recipient, err := loadOrCreateAgentKey(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if recipient.Fingerprint() == "" {
-		t.Fatal("生成出来的公钥没有指纹")
-	}
-	info, err := os.Stat(filepath.Join(dir, agentKeyFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 私钥的权限和 keystore 解出来的临时文件同级。0644 意味着这台机器上任何一个
-	// 用户都能拿走所有租户的签名密钥
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("私钥文件权限是 %o，必须是 600", info.Mode().Perm())
-	}
-	again, sameRecipient, err := loadOrCreateAgentKey(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(again) != string(private) || sameRecipient.PublicKey != recipient.PublicKey {
-		t.Fatal("第二次读到了另一把私钥——已经存下去的密钥会全部打不开")
-	}
-}
-
 // 图标缺了要在花两分钟装依赖**之前**说，而且要说清楚缺哪几个、该放哪里。
 // prebuild 报的是一句 ENOENT 加一串 @expo 的栈，看的人不知道那是租户资源没提交。
 func TestMissingTenantIconsAreCaughtBeforeTheExpensiveSteps(t *testing.T) {
@@ -667,86 +562,5 @@ func TestValidateGitRef(t *testing.T) {
 		if err := validateGitRef(bad); err == nil {
 			t.Fatalf("%q 应当被拒绝", bad)
 		}
-	}
-}
-
-// 打包机缺恢复公钥时**照常领构建**，但拒绝产出备份并说清原因。
-//
-// 反过来做（缺配置就 fail-closed 启动）是负收益：那把备份做成了构建的单点故障，
-// 而第一次配置往往正好发生在恢复当天。但它不能静默不备份——控制台上要看得见
-// 「打包机没配恢复公钥」。
-func TestBackupReadyRefusesWhenRecoveryKeysAreMissing(t *testing.T) {
-	var cfg config
-	if err := cfg.backupReady(); err == nil {
-		t.Fatal("一把公钥都没有还说自己能备份")
-	} else if !strings.Contains(err.Error(), "BUILD_AGENT_RECOVERY_RECIPIENT_A") {
-		t.Fatalf("错误要指名是哪个键，运维才知道去哪台机器改: %v", err)
-	}
-
-	// 键名抄成了服务端那一侧的：要点破，否则人盯着文件里明明有值的三行找不出原因
-	cfg.backupRecipientMisnamed[0] = true
-	if err := cfg.backupReady(); err == nil || !strings.Contains(err.Error(), "BACKUP_RECOVERY_RECIPIENT_A instead") {
-		t.Fatalf("配成服务端键名时要说破，得到: %v", err)
-	}
-
-	// 配齐三把但没有签名私钥：同样不能产出——没有签名的包，持有人无法判断
-	// 它是不是我们那台机器产出的
-	key, err := rsa.GenerateKey(rand.Reader, 3072)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range cfg.BackupRecipients {
-		cfg.BackupRecipients[i] = &key.PublicKey
-	}
-	if err := cfg.backupReady(); err == nil {
-		t.Fatal("没有备份签名私钥还说自己能备份")
-	} else if !strings.Contains(err.Error(), "signing key") {
-		t.Fatalf("错误要说清缺的是签名密钥: %v", err)
-	}
-
-	_, signer, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.BackupSigningKey = signer
-	if err := cfg.backupReady(); err != nil {
-		t.Fatalf("三把公钥加签名私钥齐了就该能备份: %v", err)
-	}
-}
-
-// 服务端下发的三个指纹要和本机 env 逐一比对。
-//
-// 不接受下发的收件人**本体**：服务端被攻破之后，攻击者只要改一下收件人，
-// 就能让打包机把全部租户的签名密钥封给他自己
-func TestCheckBackupRecipientsRefusesAMismatch(t *testing.T) {
-	var cfg config
-	cfg.BackupFingerprints = [3]string{"aaa", "bbb", "ccc"}
-	good := backupRequest{Recipients: []struct {
-		Slot        string `json:"slot"`
-		Fingerprint string `json:"fingerprint"`
-	}{{"A", "aaa"}, {"B", "bbb"}, {"C", "ccc"}}}
-	if err := checkBackupRecipients(cfg, good); err != nil {
-		t.Fatalf("三个都对上了不该拒: %v", err)
-	}
-
-	bad := good
-	bad.Recipients = append([]struct {
-		Slot        string `json:"slot"`
-		Fingerprint string `json:"fingerprint"`
-	}{}, good.Recipients...)
-	bad.Recipients[1].Fingerprint = "the attacker's own key"
-	err := checkBackupRecipients(cfg, bad)
-	if err == nil {
-		t.Fatal("服务端下发了一把本机不认识的公钥，打包机竟然照做了")
-	}
-	if !strings.Contains(err.Error(), "slot B") {
-		t.Fatalf("错误要指名是哪个槽位对不上，运维才查得动: %v", err)
-	}
-
-	// 数量不对同样拒：少一个槽位就是「悄悄降级成两个人」
-	short := good
-	short.Recipients = good.Recipients[:2]
-	if err := checkBackupRecipients(cfg, short); err == nil {
-		t.Fatal("服务端只下发两个槽位，打包机应当拒绝")
 	}
 }
