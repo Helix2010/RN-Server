@@ -98,6 +98,11 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		if err := os.Chmod(dir, 0o770|os.ModeSetgid); err != nil {
 			return prepared, err
 		}
+		// 不在目录所属组里的用户 chmod g+s 会被内核静默去掉：那样执行进程交回的文件属于 builder 组，
+		// 控制进程读不到，失败会出现在很远的地方。在这里就说清楚。
+		if info, err := os.Stat(dir); err != nil || info.Mode()&os.ModeSetgid == 0 {
+			return prepared, fmt.Errorf("cannot mark %s setgid: the build agent user must be a member of the jobs root's group (rn-build-jobs)", dir)
+		}
 	}
 
 	commit, err := a.checkoutMain(ctx, layout.Src(), buf)
@@ -282,16 +287,12 @@ func (a *agent) gitCommand(ctx context.Context, dir string, args ...string) *exe
 func (a *agent) git(ctx context.Context, buf *logBuffer, dir string, args ...string) error {
 	buf.add("$ git " + strings.Join(args, " "))
 	cmd := a.gitCommand(ctx, dir, args...)
-	pipe, err := cmd.StdoutPipe()
+	lines := newLineWriter(buf, nil)
+	cmd.Stdout = lines
+	cmd.Stderr = lines
+	err := cmd.Run()
+	lines.Close()
 	if err != nil {
-		return err
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("git could not start: %w", err)
-	}
-	streamLines(pipe, buf, nil)
-	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("git %s failed: %w", args[0], err)
 	}
 	return nil

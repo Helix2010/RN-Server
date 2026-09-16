@@ -13,7 +13,7 @@
 //
 //	build-runner build      --jobs-root <abs> --job <id> --kind apk|ota
 //	build-runner cleanup    --jobs-root <abs> --job <id>
-//	build-runner self-check --jobs-root <abs> [--expect-separated]
+//	build-runner self-check --jobs-root <abs> --protocol <n> [--expect-separated]
 //
 // 退出码：0 成功；1 构建失败；2 参数、身份或任务目录不合规。失败原因最后一行以
 // "build-runner: error: " 开头写到标准输出，控制进程取它做失败原因。
@@ -100,6 +100,9 @@ func dispatch(ctx context.Context, args []string, out io.Writer, getenv func(str
 		if err != nil {
 			return err
 		}
+		if flags.protocol != strconv.Itoa(jobspec.SpecVersion) {
+			return usagef("build-runner speaks job protocol %d but the build agent asked for %q; deploy build-agent and build-runner together", jobspec.SpecVersion, flags.protocol)
+		}
 		if flags.expectSeparated && !who.separated {
 			return usagef("build-runner is running as the same user that started it (uid %d); the sudoers rule must target a separate build user", who.uid)
 		}
@@ -117,6 +120,7 @@ type runnerFlags struct {
 	job             string
 	kind            jobspec.Kind
 	expectSeparated bool
+	protocol        string
 }
 
 // onceValue 拒绝同一个参数出现两次：flag 包默认"后者覆盖前者"，那会让一次看似
@@ -147,8 +151,10 @@ func parseFlags(args []string, needJob, needKind, allowExpect bool) (runnerFlags
 		set.Var(&kind, "kind", "")
 	}
 	expect := false
+	var protocol onceValue
 	if allowExpect {
 		set.BoolVar(&expect, "expect-separated", false, "")
+		set.Var(&protocol, "protocol", "")
 	}
 	if err := set.Parse(args); err != nil {
 		return runnerFlags{}, usagef("bad arguments: %v", err)
@@ -159,7 +165,7 @@ func parseFlags(args []string, needJob, needKind, allowExpect bool) (runnerFlags
 	if err := jobspec.ValidRoot(root.value); err != nil {
 		return runnerFlags{}, usageError{err}
 	}
-	flags := runnerFlags{root: root.value, job: job.value, expectSeparated: expect}
+	flags := runnerFlags{root: root.value, job: job.value, expectSeparated: expect, protocol: protocol.value}
 	if needJob && !jobspec.ValidJobID(job.value) {
 		return runnerFlags{}, usagef("--job is malformed")
 	}

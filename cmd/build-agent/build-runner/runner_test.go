@@ -375,10 +375,17 @@ func TestLookPathUsesTheJobPathNotTheProcessPath(t *testing.T) {
 
 func TestSelfCheckRequiresSeparationWhenAsked(t *testing.T) {
 	root := t.TempDir()
-	if code, out := runRunner(t, noSudo, "self-check", "--jobs-root", root); code != 0 {
+	if code, out := runRunner(t, noSudo, "self-check", "--jobs-root", root, "--protocol", "1"); code != 0 {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	if code, out := runRunner(t, noSudo, "self-check", "--jobs-root", root, "--expect-separated"); code != exitUsage {
+	// 控制进程与执行进程的任务协议版本不一致（只换了其中一个二进制）：启动时就拒绝
+	for _, protocol := range [][]string{{}, {"--protocol", "2"}} {
+		args := append([]string{"self-check", "--jobs-root", root}, protocol...)
+		if code, out := runRunner(t, noSudo, args...); code != exitUsage || !strings.Contains(out, "together") {
+			t.Fatalf("protocol %v: exit %d\n%s", protocol, code, out)
+		}
+	}
+	if code, out := runRunner(t, noSudo, "self-check", "--jobs-root", root, "--protocol", "1", "--expect-separated"); code != exitUsage {
 		t.Fatalf("a runner started by the same user passed --expect-separated: exit %d\n%s", code, out)
 	}
 	sameUser := func(key string) string {
@@ -387,7 +394,7 @@ func TestSelfCheckRequiresSeparationWhenAsked(t *testing.T) {
 		}
 		return ""
 	}
-	if code, _ := runRunner(t, sameUser, "self-check", "--jobs-root", root, "--expect-separated"); code != exitUsage {
+	if code, _ := runRunner(t, sameUser, "self-check", "--jobs-root", root, "--protocol", "1", "--expect-separated"); code != exitUsage {
 		t.Fatal("sudo to the same user passed --expect-separated")
 	}
 }

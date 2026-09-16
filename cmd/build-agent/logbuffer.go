@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
-	"errors"
-	"io"
+	"bytes"
 	"strings"
 	"sync"
 	"unicode"
@@ -38,60 +36,66 @@ func (b *logBuffer) snapshot() []string {
 	return out
 }
 
-// maxLogLine 是一行日志保留的最大字节数。超长的行截断，剩下的丢掉——但一定读完，
-// 否则子进程写满管道就会卡死。
+// maxLogLine 是一行日志保留的最大字节数，超长的行截断。
 const maxLogLine = 4096
 
-// streamLines 把 r 按行读进 buf，直到 EOF。执行进程的输出是不可信文本：控制字符
-// （终端转义序列）替换掉，超长行截断，读取本身不设行数上限。
-func streamLines(r io.Reader, buf *logBuffer, onLine func(string)) {
-	reader := bufio.NewReaderSize(r, maxLogLine)
-	var pending []byte
-	truncated := false
-	flush := func() {
-		line := sanitizeLine(string(pending))
-		if truncated {
-			line += " …"
-		}
-		buf.add(line)
-		if onLine != nil {
-			onLine(line)
-		}
-		pending, truncated = pending[:0], false
-	}
-	for {
-		chunk, err := reader.ReadSlice('\n')
-		if len(chunk) > 0 {
-			room := maxLogLine - len(pending)
+// lineWriter 把子进程输出按行收进日志。它当 exec.Cmd 的 Stdout/Stderr 用（不用 StdoutPipe）：
+// 这样 cmd.WaitDelay 能在进程退出后强制关掉管道——执行进程留下的后台进程握着输出管道不放时，
+// 控制进程不会一直卡在读上。输出是不可信文本：控制字符替换掉，超长行截断。
+//
+// exec 保证 Stdout 与 Stderr 是同一个可比较的 writer 时同一时刻只有一个 goroutine 调 Write。
+type lineWriter struct {
+	buf       *logBuffer
+	onLine    func(string)
+	pending   []byte
+	truncated bool
+}
+
+func newLineWriter(buf *logBuffer, onLine func(string)) *lineWriter {
+	return &lineWriter{buf: buf, onLine: onLine}
+}
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		chunk, rest, newline := bytes.Cut(p, []byte{'\n'})
+		p = rest
+		if room := maxLogLine - len(w.pending); len(chunk) > room {
 			if room > 0 {
-				if len(chunk) > room {
-					pending = append(pending, chunk[:room]...)
-					truncated = true
-				} else {
-					pending = append(pending, chunk...)
-				}
-			} else {
-				truncated = true
+				w.pending = append(w.pending, chunk[:room]...)
 			}
+			w.truncated = true
+		} else {
+			w.pending = append(w.pending, chunk...)
 		}
-		switch {
-		case err == nil:
-			flush()
-		case errors.Is(err, bufio.ErrBufferFull):
-			continue
-		default:
-			if len(pending) > 0 {
-				flush()
-			}
-			// 读错误（管道被关）：把剩下的丢掉就是了
-			_, _ = io.Copy(io.Discard, r)
-			return
+		if newline {
+			w.flush()
 		}
+	}
+	return n, nil
+}
+
+// Close 把最后一段没有换行的输出也收进来。只在 cmd.Wait 返回之后调。
+func (w *lineWriter) Close() {
+	if len(w.pending) > 0 || w.truncated {
+		w.flush()
 	}
 }
 
+func (w *lineWriter) flush() {
+	line := sanitizeLine(string(w.pending))
+	if w.truncated {
+		line += " …"
+	}
+	w.buf.add(line)
+	if w.onLine != nil {
+		w.onLine(line)
+	}
+	w.pending, w.truncated = w.pending[:0], false
+}
+
 func sanitizeLine(s string) string {
-	s = strings.TrimRight(s, "\r\n")
+	s = strings.TrimRight(s, "\r")
 	return strings.Map(func(r rune) rune {
 		if r == '\t' {
 			return ' '

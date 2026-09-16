@@ -32,6 +32,8 @@ type Tools struct {
 	Record string
 	// Sleep 存在时，假 pnpm install 会睡很久（用来测中止）
 	Sleep string
+	// Linger 存在时，假 pnpm install 留下一个握着标准输出的后台进程，PID 写进 <Record>/linger.pid
+	Linger string
 	// APK 与 OTA 是假产物的内容
 	APK []byte
 	OTA []byte
@@ -44,6 +46,7 @@ func Install(t *testing.T, dir string) Tools {
 		Bin:    filepath.Join(dir, "bin"),
 		Record: filepath.Join(dir, "record"),
 		Sleep:  filepath.Join(dir, "sleep-on-install"),
+		Linger: filepath.Join(dir, "linger-on-install"),
 		APK:    APKWithCertificate(t, CertificatePEM),
 		OTA:    []byte("PK\x05\x06" + strings.Repeat("\x00", 18)),
 	}
@@ -67,6 +70,7 @@ case "$1" in
 install)
   record install
   if [ -e %[2]q ]; then sleep 120; fi
+  if [ -e %[6]q ]; then sleep 300 & echo $! > %[1]q/linger.pid; fi
   mkdir -p node_modules
   ;;
 exec)
@@ -97,7 +101,7 @@ ota:build)
   exit 3
   ;;
 esac
-`, tools.Record, tools.Sleep, NativeFingerprint, apkFixture, otaFixture)
+`, tools.Record, tools.Sleep, NativeFingerprint, apkFixture, otaFixture, tools.Linger)
 	node := fmt.Sprintf(`#!/bin/sh
 set -eu
 env > %[1]q/sbom.env

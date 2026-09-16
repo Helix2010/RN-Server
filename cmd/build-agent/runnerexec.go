@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,9 +18,10 @@ import (
 // sudoPath 是 sudo 的绝对路径。做成变量只为测试。
 var sudoPath = "/usr/bin/sudo"
 
-// runnerStopGrace 是请执行进程停下（SIGTERM）之后等它退出的时间，过了就 SIGKILL。
-// 经 sudo 时 SIGTERM 由 sudo 转发给执行进程；SIGKILL 只杀得到 sudo 本身，留下的
-// builder 进程由随后的 cleanup 回收。
+// runnerStopGrace 同时是两件事的时限（exec.Cmd.WaitDelay）：请执行进程停下（SIGTERM）之后
+// 等它退出的时间，过了就 SIGKILL；执行进程退出之后等输出管道关闭的时间，过了就强制关掉。
+// 经 sudo 时 SIGTERM 由 sudo 转发给执行进程；SIGKILL 只杀得到 sudo 本身。两种情况下留下的
+// builder 进程都由随后的 cleanup 回收。
 var runnerStopGrace = 20 * time.Second
 
 // runnerCommand 构造启动执行进程的命令。执行进程的环境与控制进程无关：这里只给 sudo /
@@ -57,21 +59,24 @@ type runnerOutcome struct {
 // invokeRunner 启动执行进程，把它的输出按行收进日志，等它退出。
 func (a *agent) invokeRunner(ctx context.Context, buf *logBuffer, args ...string) (runnerOutcome, error) {
 	cmd := a.runnerCommand(ctx, args...)
-	pipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return runnerOutcome{}, err
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return runnerOutcome{}, fmt.Errorf("the build runner could not start: %w", err)
-	}
 	outcome := runnerOutcome{}
-	streamLines(pipe, buf, func(line string) {
+	lines := newLineWriter(buf, func(line string) {
 		if reason, ok := strings.CutPrefix(line, "build-runner: error: "); ok {
 			outcome.Reason = truncate(reason, 500)
 		}
 	})
-	err = cmd.Wait()
+	cmd.Stdout = lines
+	cmd.Stderr = lines
+	if err := cmd.Start(); err != nil {
+		return runnerOutcome{}, fmt.Errorf("the build runner could not start: %w", err)
+	}
+	err := cmd.Wait()
+	lines.Close()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// 执行进程已经成功退出，但它留下的进程还握着输出管道：管道已被强制关掉，进程由 cleanup 回收
+		buf.add("build-runner exited but a process it left behind kept its output open; it will be reaped")
+		return outcome, nil
+	}
 	if err == nil {
 		return outcome, nil
 	}
@@ -140,7 +145,7 @@ func (a *agent) checkRunner(ctx context.Context) error {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("BUILD_AGENT_RUNNER %s is not an executable file", a.cfg.Runner)
 	}
-	args := []string{"self-check", "--jobs-root", a.cfg.Workspace}
+	args := []string{"self-check", "--jobs-root", a.cfg.Workspace, "--protocol", strconv.Itoa(jobspec.SpecVersion)}
 	if a.cfg.runnerSeparated() {
 		st, ok := info.Sys().(*syscall.Stat_t)
 		if !ok || st.Uid != 0 || info.Mode().Perm()&0o022 != 0 {

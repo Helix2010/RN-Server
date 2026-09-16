@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -166,6 +168,35 @@ func TestStaleHeartbeatAbortsTheBuildAndCleansUp(t *testing.T) {
 	}
 	if left := jobRootEntries(t, rig.agent); len(left) != 0 {
 		t.Fatalf("job directories left behind: %v", left)
+	}
+}
+
+// 执行进程留下的后台进程握着输出管道不放：控制进程不能一直卡在读输出上
+func TestLingeringProcessHoldingTheOutputDoesNotHangTheAgent(t *testing.T) {
+	rig := newRig(t)
+	restore := runnerStopGrace
+	runnerStopGrace = time.Second
+	t.Cleanup(func() { runnerStopGrace = restore })
+	if err := os.WriteFile(rig.tools.Linger, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if raw, err := os.ReadFile(filepath.Join(rig.tools.Record, "linger.pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	rig.server.queueClaim(claimBody("bld_lingerJOB001", "apk"))
+	started := time.Now()
+	if !rig.agent.pollOnce(context.Background()) {
+		t.Fatal("no job")
+	}
+	if elapsed := time.Since(started); elapsed > 60*time.Second {
+		t.Fatalf("the agent waited %s for a lingering process", elapsed)
+	}
+	if len(rig.server.callsTo("/built")) != 1 {
+		t.Fatalf("not delivered; fails: %+v", rig.server.callsTo("/fail"))
 	}
 }
 
