@@ -200,19 +200,28 @@ func TestDBPurgeReleaseDeletesObjectAndDetachesBuildJob(t *testing.T) {
 	insertPurgeRelease(t, db, tenant, history, "1.2.4", 18, "completed", "1.2.4", key)
 	store.put(key, []byte("apk"), "e1")
 	now := time.Now().UTC()
-	if _, err := db.Exec(`INSERT INTO build_jobs(id,tenant_id,platform,git_ref,commit_sha,version,build_number,status,release_id,reason,created_by,created_at,updated_at) VALUES(?,?,'android','main','abc','1.2.4',18,'succeeded',?,'fixture','tester',?,?)`, job, tenant, history, now, now); err != nil {
+	// 签名闸出的包：任务行上还记着未签名包与 SBOM，已签名包就是发布记录的对象
+	unsigned := "tenants/" + tenant + "/build-jobs/" + job + "/a1/r1/app-release-unsigned.apk"
+	sbom := "tenants/" + tenant + "/build-jobs/" + job + "/a1/r2/sbom.cdx.json"
+	store.put(unsigned, []byte("unsigned"), "e2")
+	store.put(sbom, []byte("{}"), "e3")
+	if _, err := db.Exec(`INSERT INTO build_jobs(id,tenant_id,platform,git_ref,commit_sha,version,build_number,status,release_id,unsigned_object_key,sbom_object_key,signed_object_key,reason,created_by,created_at,updated_at)
+		VALUES(?,?,'android','main','abc','1.2.4',18,'succeeded',?,?,?,?,'fixture','tester',?,?)`, job, tenant, history, unsigned, sbom, key, now, now); err != nil {
 		t.Fatalf("seed build job: %v", err)
 	}
 
 	if recorder := purgeApp(t, s, tenant, history, purgeBody); recorder.Code != http.StatusOK {
 		t.Fatalf("purge must succeed, got %d %s", recorder.Code, recorder.Body.String())
 	}
-	if _, ok := store.objects[key]; ok {
-		t.Fatal("the APK is still in the bucket")
+	for _, gone := range []string{key, unsigned, sbom} {
+		if _, ok := store.objects[gone]; ok {
+			t.Fatalf("%s is still in the bucket", gone)
+		}
 	}
-	var release sql.NullString
-	if err := db.QueryRow(`SELECT release_id FROM build_jobs WHERE tenant_id=? AND id=?`, tenant, job).Scan(&release); err != nil || release.Valid {
-		t.Fatalf("build job must be detached, got %v (%v)", release, err)
+	var release, unsignedKey, sbomKey, signedKey sql.NullString
+	if err := db.QueryRow(`SELECT release_id,unsigned_object_key,sbom_object_key,signed_object_key FROM build_jobs WHERE tenant_id=? AND id=?`, tenant, job).
+		Scan(&release, &unsignedKey, &sbomKey, &signedKey); err != nil || release.Valid || unsignedKey.Valid || sbomKey.Valid || signedKey.Valid {
+		t.Fatalf("build job must be detached from the release and its deliveries, got %v %v %v %v (%v)", release, unsignedKey, sbomKey, signedKey, err)
 	}
 	var audits int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=? AND action='release_purge' AND target_id=?`, tenant, history).Scan(&audits); err != nil || audits != 1 {

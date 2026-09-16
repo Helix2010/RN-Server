@@ -182,13 +182,39 @@ func (s *server) purgeRelease(c *gin.Context) {
 	}
 
 	key := strings.TrimSpace(objectKey.String)
-	if !intent.KeepObjects && key != "" {
+	// 签名闸出的包，构建任务行上还记着未签名包与 SBOM：它们只为这条发布留着，随发布一起删
+	deliveries := []string{}
+	deliveryRows, err := s.db.QueryContext(ctx, `SELECT `+jobObjectKeyColumns+` FROM build_jobs WHERE tenant_id=? AND release_id=?`, tenantID(c), id)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to read the build deliveries of this release")
+		return
+	}
+	for deliveryRows.Next() {
+		var keys jobObjectKeys
+		if err := deliveryRows.Scan(&keys.Unsigned, &keys.SBOM, &keys.Signed); err != nil {
+			deliveryRows.Close()
+			problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to read the build deliveries of this release")
+			return
+		}
+		// 已签名包就是发布记录的 object_key，上面已经算进去了
+		for _, delivery := range keys.pick(releaseBuildDelivery) {
+			if delivery != key {
+				deliveries = append(deliveries, delivery)
+			}
+		}
+	}
+	deliveryRows.Close()
+	objectKeys := append([]string{}, deliveries...)
+	if key != "" {
+		objectKeys = append([]string{key}, deliveries...)
+	}
+	if !intent.KeepObjects && len(objectKeys) > 0 {
 		client, _, clientErr := s.storageClientForTenant(ctx, tenantID(c))
 		if clientErr != nil {
 			problem(c, http.StatusFailedDependency, "STORAGE_UNAVAILABLE", "Unable to reach release storage")
 			return
 		}
-		deleteStoredObjects = func() { failed = deleteObjects(ctx, client, key, []string{key}) }
+		deleteStoredObjects = func() { failed = deleteObjects(ctx, client, key, objectKeys) }
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -201,13 +227,15 @@ func (s *server) purgeRelease(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to delete the release")
 		return
 	}
-	// 构建任务指回发布记录。任务本身是历史，不跟着删；把指针清掉，免得管理端点进去 404
-	if _, err = tx.ExecContext(ctx, `UPDATE build_jobs SET release_id=NULL WHERE tenant_id=? AND release_id=?`, tenantID(c), id); err != nil {
+	// 构建任务指回发布记录。任务本身是历史，不跟着删；把指针清掉，免得管理端点进去 404。
+	// 交付对象随发布删掉（keepObjects 时留在桶里，但任务行不再指着它们——对象键记在审计里）
+	if _, err = tx.ExecContext(ctx, `UPDATE build_jobs SET release_id=NULL`+releaseAllDeliveries.clearColumns()+` WHERE tenant_id=? AND release_id=?`, tenantID(c), id); err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to detach the build job")
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "release_purge", "release", id, intent.Reason, requestID(c),
-		map[string]any{"status": status, "platform": platform, "version": version, "buildNumber": buildNumber, "objectKey": key, "keptObjects": intent.KeepObjects})
+		map[string]any{"status": status, "platform": platform, "version": version, "buildNumber": buildNumber, "objectKey": key,
+			"deliveryObjectKeys": deliveries, "keptObjects": intent.KeepObjects})
 	if err = insertAudit(ctx, tx, event); err != nil {
 		problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to record the deletion")
 		return

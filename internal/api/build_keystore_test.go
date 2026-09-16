@@ -192,43 +192,183 @@ func TestDBBuildKeystoreLegacyRecordIsNotConfigured(t *testing.T) {
 	}
 }
 
-// 就绪判断逐条说清缺什么；主签名闸确认、信任根、试签全部对上才就绪。
+// 就绪判断逐条说清缺什么：每条原因带固定的 code（控制台按它给处理入口），全部对上才就绪。
+// 用例把每个 code 都触发一次，新增原因忘了加进枚举或 OpenAPI 时这里会失败。
 func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 	f := newGateFixture(t, 36)
-	ready, err := f.s.signerReadinessFor(t.Context(), f.tenant)
-	if err != nil || !ready.Ready {
-		t.Fatalf("the fixture tenant should be ready: %v %v", err, ready.Problems)
-	}
-	expectProblem := func(fragment string) {
+	seen := map[string]bool{}
+	readiness := func() signerReadiness {
 		t.Helper()
 		r, err := f.s.signerReadinessFor(t.Context(), f.tenant)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.Ready || !strings.Contains(strings.Join(r.Problems, "|"), fragment) {
-			t.Fatalf("expected a problem mentioning %q, got ready=%v %v", fragment, r.Ready, r.Problems)
+		for _, p := range r.Problems {
+			if !containsString(readinessProblemCodes, p.Code) || strings.TrimSpace(p.Detail) == "" {
+				t.Fatalf("a readiness problem outside the enum or without detail: %+v", p)
+			}
+			seen[p.Code] = true
+		}
+		return r
+	}
+	expect := func(code string) {
+		t.Helper()
+		r := readiness()
+		for _, p := range r.Problems {
+			if p.Code == code {
+				if r.Ready {
+					t.Fatalf("ready with a problem: %+v", r.Problems)
+				}
+				return
+			}
+		}
+		t.Fatalf("expected %s, got ready=%v %+v", code, r.Ready, r.Problems)
+	}
+	expectReady := func() {
+		t.Helper()
+		if r := readiness(); !r.Ready || len(r.Problems) != 0 {
+			t.Fatalf("expected ready, got %+v", r.Problems)
 		}
 	}
-	// 试签没通过
-	f.reportCheck(f.primary, true, "pending")
-	expectProblem("试签")
-	// 没有确认
-	f.reportCheck(f.primary, false, "ok")
-	expectProblem("signer confirm")
-	f.reportCheck(f.primary, true, "ok")
-	// 改了 apiBaseUrl：确认过的信任根摘要对不上
-	raw, _ := json.Marshal(buildConfig{RepoDirectory: f.slug, DefaultGitRef: buildGitRef, Identity: appIdentity{AppName: "Seeded", Scheme: "seeded", APIBaseURL: "https://api2.seeded.example"}})
-	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=?,version=version+1 WHERE tenant_id=? AND config_key=?`, raw, f.tenant, buildConfigKey); err != nil {
+	setConfig := func(key string, value any) {
+		t.Helper()
+		raw, _ := json.Marshal(value)
+		if _, err := f.db.Exec(`UPDATE app_configs SET config_value=?,version=version+1 WHERE tenant_id=? AND config_key=?`, raw, f.tenant, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report := func(item map[string]any) {
+		t.Helper()
+		keystoreVersion, _ := f.keystoreVersions()
+		base := map[string]any{"tenantSlug": f.slug, "keystoreVersion": keystoreVersion, "decrypt": "ok", "confirmed": true,
+			"confirmedTrustRootsDigest": f.currentDigest(), "trialSign": "ok", "error": nil}
+		for k, v := range item {
+			base[k] = v
+		}
+		if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"items": []any{base}}); r.Code != http.StatusNoContent {
+			t.Fatalf("report: %d %s", r.Code, r.Body.String())
+		}
+	}
+	expectReady()
+	c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/build-keystore", nil)
+	f.s.getBuildKeystore(c)
+	if problems, ok := decodeBody(t, recorder)["readinessProblems"].([]any); !ok || len(problems) != 0 {
+		t.Fatalf("a ready tenant must report an empty readinessProblems array: %s", recorder.Body.String())
+	}
+
+	report(map[string]any{"trialSign": "pending"})
+	expect(readinessPrimaryTrialSignPending)
+	report(map[string]any{"trialSign": "failed", "error": "apksigner exited 1"})
+	expect(readinessPrimaryTrialSignFailed)
+	report(map[string]any{"confirmed": false, "confirmedTrustRootsDigest": nil})
+	expect(readinessPrimaryNotConfirmed)
+	report(map[string]any{"decrypt": "failed", "error": "box does not open"})
+	expect(readinessPrimaryDecryptFailed)
+	report(nil)
+	expectReady()
+
+	// 控制台视图与排队门禁带同样的 code
+	report(map[string]any{"trialSign": "pending"})
+	c, recorder = testContext(t, f.tenant, http.MethodGet, "/v1/admin/build-keystore", nil)
+	f.s.getBuildKeystore(c)
+	if body := recorder.Body.String(); !strings.Contains(body, `"code":"`+readinessPrimaryTrialSignPending+`"`) {
+		t.Fatalf("the keystore view does not carry the problem code: %s", body)
+	}
+	c, recorder = testContext(t, f.tenant, http.MethodPost, "/v1/admin/builds", map[string]any{
+		"platform": "android", "gitRef": "main", "version": "9.9.9", "buildNumber": 999, "reason": "not ready", "confirm": true,
+		"releaseNotes": map[string]any{"zh-CN": []string{"测试"}},
+	})
+	f.s.createBuildJob(c)
+	if recorder.Code != http.StatusConflict || problemCode(t, recorder) != "SIGNER_NOT_READY" ||
+		!strings.Contains(recorder.Body.String(), `"code":"`+readinessPrimaryTrialSignPending+`"`) {
+		t.Fatalf("queue gate: %d %s", recorder.Code, recorder.Body.String())
+	}
+	report(nil)
+	expectReady()
+
+	identity := appIdentity{AppName: "Seeded", Scheme: "seeded", APIBaseURL: "https://api.seeded.example"}
+	buildCfg := func(id appIdentity) buildConfig {
+		return buildConfig{RepoDirectory: f.slug, DefaultGitRef: buildGitRef, Identity: id}
+	}
+	// 改了 apiBaseUrl：确认过的信任根摘要对不上；重新确认之后就绪
+	changed := identity
+	changed.APIBaseURL = "https://api2.seeded.example"
+	setConfig(buildConfigKey, buildCfg(changed))
+	expect(readinessTrustRootsChanged)
+	report(nil)
+	expectReady()
+	// 校验收紧之前存下的 :443
+	withPort := identity
+	withPort.APIBaseURL = "https://api.seeded.example:443"
+	setConfig(buildConfigKey, buildCfg(withPort))
+	expect(readinessAPIBaseURLInvalid)
+	// scheme 不是自定义 scheme：信任根不合法
+	badScheme := identity
+	badScheme.Scheme = "https"
+	setConfig(buildConfigKey, buildCfg(badScheme))
+	expect(readinessTrustRootsInvalid)
+	// App 身份缺字段
+	incomplete := identity
+	incomplete.APIBaseURL = ""
+	setConfig(buildConfigKey, buildCfg(incomplete))
+	expect(readinessAppIdentityIncomplete)
+	setConfig(buildConfigKey, buildCfg(changed))
+	expectReady()
+
+	// 发布身份与密钥不一致、没登记
+	var rawIdentity []byte
+	if err := f.db.QueryRow(`SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, releaseAndroidIdentityConfigKey).Scan(&rawIdentity); err != nil {
 		t.Fatal(err)
 	}
-	expectProblem("重新确认")
-	f.reportCheck(f.primary, true, "ok")
-	if r, _ := f.s.signerReadinessFor(t.Context(), f.tenant); !r.Ready {
-		t.Fatalf("re-confirming the new trust roots should make it ready: %v", r.Problems)
+	var identityValue map[string]any
+	_ = json.Unmarshal(rawIdentity, &identityValue)
+	mismatched := map[string]any{}
+	for k, v := range identityValue {
+		mismatched[k] = v
 	}
+	mismatched["signerSha256"] = strings.Repeat("d", 64)
+	setConfig(releaseAndroidIdentityConfigKey, mismatched)
+	expect(readinessReleaseIdentityMismatch)
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, releaseAndroidIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	expect(readinessReleaseIdentityMissing)
+	if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,9,'tester',UTC_TIMESTAMP(3))`,
+		f.tenant, releaseAndroidIdentityConfigKey, rawIdentity); err != nil {
+		t.Fatal(err)
+	}
+	expectReady()
+
+	// 主签名闸没检查过当前版本、没有收到密文、没有主签名闸
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, buildKeystoreCheckConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	expect(readinessPrimaryCheckMissing)
+	f.uploadKeystore(f.standby)
+	expect(readinessPrimarySignerNoBox)
+	f.writeMachines(f.builder.record(""), f.primary.record(signerRoleStandby), f.standby.record(signerRoleStandby))
+	expect(readinessPrimarySignerMissing)
+
 	// OTA 证书没了
 	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, otaSigningConfigKey); err != nil {
 		t.Fatal(err)
 	}
-	expectProblem("OTA")
+	expect(readinessOTACertificateMissing)
+
+	// 旧格式、没有签名密钥
+	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=?,version=version+1 WHERE tenant_id=? AND config_key=?`,
+		`{"sealed":"eA==","keyAlias":"a","keystoreSha256":"`+strings.Repeat("b", 64)+`"}`, f.tenant, buildKeystoreConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	expect(readinessKeystoreLegacyFormat)
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, buildKeystoreConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	expect(readinessKeystoreNotConfigured)
+
+	for _, code := range readinessProblemCodes {
+		if !seen[code] {
+			t.Errorf("readiness problem %s was never produced by this test", code)
+		}
+	}
 }

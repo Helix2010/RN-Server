@@ -159,7 +159,14 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	}
 	now := time.Now().UTC()
 	// 每次认领清掉上一次认领交付的东西：未签名包、SBOM、出处与提交都属于那一次认领，
-	// 这一次的交付必须完整重来，/built 才能要求"本次认领下都已上传"
+	// 这一次的交付必须完整重来，/built 才能要求"本次认领下都已上传"。上一次认领留下的对象
+	// 在认领提交之后删掉（回收时一般已经删过，这里兜住其它路径留下的）
+	var previous jobObjectKeys
+	if err := tx.QueryRowContext(ctx, `SELECT `+jobObjectKeyColumns+` FROM build_jobs WHERE id=? FOR UPDATE`, id).
+		Scan(&previous.Unsigned, &previous.SBOM, &previous.Signed); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
+		return
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE build_jobs SET status='claimed',claimed_by=?,claimed_machine_id=?,claimed_at=?,heartbeat_at=?,attempt=attempt+1,
 		        commit_sha=NULL,unsigned_object_key=NULL,unsigned_size=NULL,unsigned_sha256=NULL,
@@ -225,6 +232,7 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")
 		return
 	}
+	s.deleteDeliveryObjects(job.TenantID, job.ID, previous.pick(releaseBuildDelivery))
 
 	// 仓库里的租户目录名与本平台 slug 是两套命名，必须显式配置
 	buildCfg, _, err := s.buildConfigFor(ctx, job.TenantID, slug)
@@ -404,15 +412,19 @@ func (s *server) failBuildJob(c *gin.Context) {
 		commit = ""
 	}
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='failed',failure_reason=?,commit_sha=COALESCE(?,commit_sha),log_tail=?,heartbeat_at=?,updated_at=?
-		  WHERE id=? AND status IN (`+sqlBuilderActive+`) AND attempt=? AND claimed_machine_id=?`,
-		clipRunes(reason, 500), sqlNullableString(commit), clampLogTail(body.LogTail), now, now, c.Param("id"), attempt, machine.ID)
+	// 已经传上来的未签名包与 SBOM 不会再有人用，随失败一起删
+	_, matched, err := s.transitionBuildJob(c.Request.Context(), c.Param("id"), jobTransition{
+		Where:     `WHERE id=? AND status IN (` + sqlBuilderActive + `) AND attempt=? AND claimed_machine_id=?`,
+		WhereArgs: []any{c.Param("id"), attempt, machine.ID},
+		Set:       `status='failed',failure_reason=?,commit_sha=COALESCE(?,commit_sha),log_tail=?,heartbeat_at=?,updated_at=?`,
+		SetArgs:   []any{clipRunes(reason, 500), sqlNullableString(commit), clampLogTail(body.LogTail), now, now},
+		Release:   releaseBuildDelivery,
+	})
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the build failure")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if !matched {
 		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
 		return
 	}

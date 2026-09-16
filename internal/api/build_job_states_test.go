@@ -61,10 +61,13 @@ func TestBuildJobTransitionTable(t *testing.T) {
 func TestDBEveryIllegalBuildJobTransitionIsAConflict(t *testing.T) {
 	f := newGateFixture(t, 71)
 	jobID := f.queueBuild("7.0.0", 700)
+	// 已签名包的键摆上一个（完成要求本次签名认领交回过包），对象不在存储里：允许的状态上完成会
+	// 因为读不到包而失败，但不是 409
 	place := func(status string) {
 		f.setJob(jobID, `status=?,attempt=1,claimed_machine_id=?,sign_attempt=1,sign_failures=0,signing_machine_id=?,
-			unsigned_object_key=NULL,unsigned_size=NULL,unsigned_sha256=NULL,sbom_sha256=NULL,release_id=NULL,artifact_sha256=NULL`,
-			status, f.builder.ID, f.primary.ID)
+			unsigned_object_key=NULL,unsigned_size=NULL,unsigned_sha256=NULL,sbom_sha256=NULL,release_id=NULL,artifact_sha256=NULL,
+			signed_object_key=?`,
+			status, f.builder.ID, f.primary.ID, "tenants/"+f.tenant+"/build-jobs/"+jobID+"/s1/placed/app-release.apk")
 	}
 	type operation struct {
 		name  string

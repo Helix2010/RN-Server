@@ -73,22 +73,27 @@ func (s *server) buildKeystoreStateFor(ctx context.Context, q rowQuerier, tenant
 		return state, err
 	}
 	state.Exists = true
+	state.Record, state.Legacy, err = parseBuildKeystoreValue(raw)
+	return state, err
+}
+
+// parseBuildKeystoreValue 解析 build.keystore 这一行的值。不是 format 3 的旧记录 legacy=true、不报错。
+func parseBuildKeystoreValue(raw []byte) (record buildKeystoreRecord, legacy bool, err error) {
 	var probe struct {
 		Format int `json:"format"`
 	}
 	if json.Unmarshal(raw, &probe) != nil || probe.Format != buildKeystoreRecordFormat {
-		state.Legacy = true
-		return state, nil
+		return buildKeystoreRecord{}, true, nil
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&state.Record); err != nil {
-		return state, fmt.Errorf("build.keystore v3 record is malformed: %w", err)
+	if err := decoder.Decode(&record); err != nil {
+		return record, false, fmt.Errorf("build.keystore v3 record is malformed: %w", err)
 	}
-	if err := state.Record.validate(); err != nil {
-		return state, fmt.Errorf("build.keystore v3 record is invalid: %w", err)
+	if err := record.validate(); err != nil {
+		return record, false, fmt.Errorf("build.keystore v3 record is invalid: %w", err)
 	}
-	return state, nil
+	return record, false, nil
 }
 
 func (r buildKeystoreRecord) validate() error {
@@ -194,7 +199,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		"keyAlias": nil, "certificateSha256": nil, "packageName": nil,
 		"version": keystore.Version, "updatedBy": nil, "updatedAt": nil,
 		"recipients": []gin.H{}, "missingSigners": []gin.H{}, "signers": []gin.H{},
-		"ready": readiness.Ready, "trustRoots": nil, "trustRootsDigest": nil,
+		"ready": readiness.Ready, "readinessProblems": readiness.problemList(), "trustRoots": nil, "trustRootsDigest": nil,
 	}
 	if keystore.Exists {
 		view["updatedBy"], view["updatedAt"] = nullableString(keystore.UpdatedBy), nullableTime(keystore.UpdatedAt)

@@ -66,7 +66,7 @@ func (s *server) keystoreChecksFor(ctx context.Context, q rowQuerier, tenant str
 
 // trustRootsFor 用服务端合成的 tenant manifest 与当前 OTA 证书算出包内信任根与摘要。
 // 算不出来时返回原因（给控制台与排队门禁看），不是错误：租户配置没配全是正常状态。
-func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.Roots, string, []string, error) {
+func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.Roots, string, []readinessProblem, error) {
 	slug, err := s.tenantSlug(ctx, tenant)
 	if err != nil {
 		return nil, "", nil, err
@@ -80,7 +80,7 @@ func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.
 	if err != nil {
 		var missing *missingIdentity
 		if errors.As(err, &missing) {
-			return nil, "", []string{"App 身份不完整，算不出包内信任根：" + strings.Join(missing.Fields, "、")}, nil
+			return nil, "", []readinessProblem{{readinessAppIdentityIncomplete, "App 身份不完整，算不出包内信任根：" + strings.Join(missing.Fields, "、")}}, nil
 		}
 		return nil, "", nil, err
 	}
@@ -89,7 +89,7 @@ func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.
 		return nil, "", nil, err
 	}
 	if record == nil {
-		return nil, "", []string{"没有配置 OTA 签名密钥：包里要编进 OTA 证书，签名闸按它核对信任根"}, nil
+		return nil, "", []readinessProblem{{readinessOTACertificateMissing, "没有配置 OTA 签名密钥：包里要编进 OTA 证书，签名闸按它核对信任根"}}, nil
 	}
 	certificateSHA256, ok := certificateFingerprint(record.Value.Certificate)
 	if !ok {
@@ -97,7 +97,7 @@ func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.
 	}
 	hosts, problem := appLinksHostsFor(manifest.APIBaseURL)
 	if problem != "" {
-		return nil, "", []string{problem}, nil
+		return nil, "", []readinessProblem{{readinessAPIBaseURLInvalid, problem}}, nil
 	}
 	roots := trustroots.Roots{
 		APIBaseURL:             manifest.APIBaseURL,
@@ -110,37 +110,69 @@ func (s *server) trustRootsFor(ctx context.Context, tenant string) (*trustroots.
 	}
 	normalized, err := roots.Normalize()
 	if err != nil {
-		return nil, "", []string{"包内信任根不合法：" + err.Error()}, nil
+		return nil, "", []readinessProblem{{readinessTrustRootsInvalid, "包内信任根不合法：" + err.Error()}}, nil
 	}
 	digest, err := trustroots.Digest(normalized)
 	if err != nil {
-		return nil, "", []string{"包内信任根不合法：" + err.Error()}, nil
+		return nil, "", []readinessProblem{{readinessTrustRootsInvalid, "包内信任根不合法：" + err.Error()}}, nil
 	}
 	return &normalized, digest, nil, nil
 }
 
-// appLinksHostsFor 按 RN-App app.config.ts 的规则派生 App Links host：
-// apiBaseUrl 是 https 时 host 为 new URL(apiBaseUrl).host（含非默认端口），否则没有 App Links。
+// appLinksHostsFor 按 RN-App app.config.ts 的规则派生 App Links host：new URL(apiBaseUrl).host
+// （含非默认端口）。判据是 trustroots.AppLinksHostFor，与签名闸同一个函数。
 //
-// WHATWG URL 会去掉 https 的默认端口 443，而 trustroots.AppLinksHostFor 按原样保留。
-// 两边对 ":443" 的说法不一致，所以显式写了 :443 的 apiBaseUrl 不就绪，要求去掉之后重新保存，
-// 而不是在这里替签名闸猜它会怎么算。
+// 显式写了默认端口 :443 的 apiBaseUrl 由 trustroots.ValidateAPIBaseURL 直接拒绝（WHATWG URL 会
+// 去掉它，同一个源两种写法会让服务端与签名闸得出不同的 host）。保存打包配置时已经按同一个函数
+// 校验；这里挡的是校验收紧之前存下的旧值。
 func appLinksHostsFor(apiBaseURL string) ([]string, string) {
 	host, err := trustroots.AppLinksHostFor(apiBaseURL)
 	if err != nil {
-		return nil, "apiBaseUrl 不是签名闸能确认的 https 源（小写域名、可选端口、不带路径与尾斜杠）"
-	}
-	if strings.HasSuffix(host, ":443") {
-		return nil, "apiBaseUrl 写了默认端口 :443：App Links host 按 RN-App 的规则会去掉它，与签名闸确认的值对不上；去掉 :443 后重新保存"
+		return nil, "apiBaseUrl 不是签名闸能确认的 https 源（小写域名、不写默认端口 :443、不带路径与尾斜杠）；在「Android 打包与签名 → App 参数」改正后重新保存"
 	}
 	return []string{host}, ""
 }
 
 // ---- 就绪 ----
 
+// readinessProblem 是一条不就绪原因。Code 是固定枚举（控制台按它给出处理入口），Detail 是给人看的
+// 一句话，可能带机器名或签名闸报的错误。
+type readinessProblem struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
+}
+
+// 不就绪原因的全集。新增一条要同步 OpenAPI 的 SignerReadinessProblem 枚举与控制台。
+const (
+	readinessKeystoreNotConfigured   = "KEYSTORE_NOT_CONFIGURED"
+	readinessKeystoreLegacyFormat    = "KEYSTORE_LEGACY_FORMAT"
+	readinessReleaseIdentityMissing  = "RELEASE_IDENTITY_NOT_CONFIGURED"
+	readinessReleaseIdentityMismatch = "RELEASE_IDENTITY_MISMATCH"
+	readinessPrimarySignerMissing    = "PRIMARY_SIGNER_MISSING"
+	readinessPrimarySignerNoBox      = "PRIMARY_SIGNER_NOT_RECIPIENT"
+	readinessAppIdentityIncomplete   = "APP_IDENTITY_INCOMPLETE"
+	readinessOTACertificateMissing   = "OTA_CERTIFICATE_NOT_CONFIGURED"
+	readinessAPIBaseURLInvalid       = "API_BASE_URL_INVALID"
+	readinessTrustRootsInvalid       = "TRUST_ROOTS_INVALID"
+	readinessPrimaryCheckMissing     = "PRIMARY_SIGNER_NOT_CHECKED"
+	readinessPrimaryDecryptFailed    = "PRIMARY_SIGNER_DECRYPT_FAILED"
+	readinessPrimaryNotConfirmed     = "PRIMARY_SIGNER_NOT_CONFIRMED"
+	readinessTrustRootsChanged       = "TRUST_ROOTS_CHANGED"
+	readinessPrimaryTrialSignPending = "PRIMARY_SIGNER_TRIAL_SIGN_PENDING"
+	readinessPrimaryTrialSignFailed  = "PRIMARY_SIGNER_TRIAL_SIGN_FAILED"
+)
+
+// readinessProblemCodes 按判断顺序列出全部枚举值（测试与 OpenAPI 对照用）。
+var readinessProblemCodes = []string{
+	readinessKeystoreNotConfigured, readinessKeystoreLegacyFormat, readinessReleaseIdentityMissing, readinessReleaseIdentityMismatch,
+	readinessPrimarySignerMissing, readinessPrimarySignerNoBox, readinessAppIdentityIncomplete, readinessOTACertificateMissing,
+	readinessAPIBaseURLInvalid, readinessTrustRootsInvalid, readinessPrimaryCheckMissing, readinessPrimaryDecryptFailed,
+	readinessPrimaryNotConfirmed, readinessTrustRootsChanged, readinessPrimaryTrialSignPending, readinessPrimaryTrialSignFailed,
+}
+
 type signerReadiness struct {
 	Ready    bool
-	Problems []string
+	Problems []readinessProblem
 	Keystore buildKeystoreState
 	// 下面几项只在能算出来时有值
 	Upload  *keystorebox.Upload
@@ -161,19 +193,25 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		return r, err
 	}
 	r.Keystore = keystore
+	add := func(code, detail string) {
+		r.Problems = append(r.Problems, readinessProblem{Code: code, Detail: detail})
+	}
 	switch {
 	case !keystore.Exists:
-		r.Problems = append(r.Problems, "还没有上传签名密钥（离线工具 build-keystore 产出的 v3 文件）")
+		add(readinessKeystoreNotConfigured, "还没有上传签名密钥（离线工具 build-keystore 产出的 v3 文件）")
 	case keystore.Legacy:
-		r.Problems = append(r.Problems, "库里是旧格式的签名密钥密文（签名闸上线前的口令封或打包机公钥封），需要按密钥重置流程离线生成并上传 v3 文件")
+		add(readinessKeystoreLegacyFormat, "库里是旧格式的签名密钥密文（签名闸上线前的口令封或打包机公钥封），需要按密钥重置流程离线生成并上传 v3 文件")
 	}
 	if keystore.configured() {
 		identity, err := s.androidReleaseIdentityRecord(ctx, tenant)
 		if err != nil {
 			return r, err
 		}
-		if identity == nil || identity.Value.PackageName != keystore.Record.PackageName || identity.Value.SignerSHA256 != keystore.Record.CertificateSHA256 {
-			r.Problems = append(r.Problems, "登记的 Android 发布身份（包名、签名证书指纹）与签名密钥不一致，重新上传签名密钥会一并写入")
+		switch {
+		case identity == nil:
+			add(readinessReleaseIdentityMissing, "还没有登记 Android 发布身份（包名、签名证书指纹），重新上传签名密钥会一并写入")
+		case identity.Value.PackageName != keystore.Record.PackageName || identity.Value.SignerSHA256 != keystore.Record.CertificateSHA256:
+			add(readinessReleaseIdentityMismatch, "登记的 Android 发布身份（包名、签名证书指纹）与签名密钥不一致，重新上传签名密钥会一并写入")
 		}
 	}
 	registry, err := s.machineRegistry(ctx)
@@ -184,7 +222,7 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 	if hasPrimary {
 		r.Primary = &primary
 	} else {
-		r.Problems = append(r.Problems, "没有 active 的主签名闸（在「打包机与签名闸」登记主签名闸并接受它的公钥）")
+		add(readinessPrimarySignerMissing, "没有 active 的主签名闸（在「打包机与签名闸」登记主签名闸并接受它的公钥）")
 	}
 	if keystore.configured() {
 		upload, err := s.keystoreUploadFor(tenant, keystore.Record)
@@ -196,7 +234,7 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 			if box, ok := boxFor(upload, string(primary.PublicKeySHA256)); ok {
 				r.Box = &box
 			} else {
-				r.Problems = append(r.Problems, "签名密钥没有加密给主签名闸 "+primary.Name+"：把它加进离线 pin 文件，用离线工具重新 seal 并上传")
+				add(readinessPrimarySignerNoBox, "签名密钥没有加密给主签名闸 "+primary.Name+"：把它加进离线 pin 文件，用离线工具重新 seal 并上传")
 			}
 		}
 	}
@@ -214,24 +252,45 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		check, ok := checks[primary.ID]
 		switch {
 		case !ok || check.KeystoreVersion != keystore.Version:
-			r.Problems = append(r.Problems, "主签名闸 "+primary.Name+" 还没有检查当前这一版签名密钥")
+			add(readinessPrimaryCheckMissing, "主签名闸 "+primary.Name+" 还没有检查当前这一版签名密钥")
 		default:
 			r.Check = &check
 			if check.Decrypt != "ok" {
-				r.Problems = append(r.Problems, "主签名闸 "+primary.Name+" 解不开当前这一版签名密钥"+errorSuffix(string(check.Error)))
+				add(readinessPrimaryDecryptFailed, "主签名闸 "+primary.Name+" 解不开当前这一版签名密钥"+errorSuffix(string(check.Error)))
 			}
 			if !check.Confirmed {
-				r.Problems = append(r.Problems, "主签名闸 "+primary.Name+" 还没有在本机确认这个租户（signer confirm）")
+				add(readinessPrimaryNotConfirmed, "主签名闸 "+primary.Name+" 还没有在本机确认这个租户（signer confirm）")
 			} else if digest != "" && string(check.ConfirmedTrustRootsDigest) != digest {
-				r.Problems = append(r.Problems, "包内信任根变了（apiBaseUrl、OTA 证书、bootstrap 签名地址、scheme 等），需要在主签名闸 "+primary.Name+" 上重新确认")
+				add(readinessTrustRootsChanged, "包内信任根变了（apiBaseUrl、OTA 证书、bootstrap 签名地址、scheme 等），需要在主签名闸 "+primary.Name+" 上重新确认")
 			}
-			if check.TrialSign != "ok" {
-				r.Problems = append(r.Problems, "主签名闸 "+primary.Name+" 还没有试签通过"+errorSuffix(string(check.Error)))
+			switch check.TrialSign {
+			case "ok":
+			case "failed":
+				add(readinessPrimaryTrialSignFailed, "主签名闸 "+primary.Name+" 试签失败"+errorSuffix(string(check.Error)))
+			default:
+				add(readinessPrimaryTrialSignPending, "主签名闸 "+primary.Name+" 还没有试签通过")
 			}
 		}
 	}
 	r.Ready = len(r.Problems) == 0
 	return r, nil
+}
+
+// problemDetails 把不就绪原因连成一句话（SIGNER_NOT_READY 的 detail）。
+func (r signerReadiness) problemDetails() string {
+	details := make([]string, 0, len(r.Problems))
+	for _, p := range r.Problems {
+		details = append(details, p.Detail)
+	}
+	return strings.Join(details, "；")
+}
+
+// problemList 是给 JSON 用的原因列表：就绪时是空数组，不是 null。
+func (r signerReadiness) problemList() []readinessProblem {
+	if r.Problems == nil {
+		return []readinessProblem{}
+	}
+	return r.Problems
 }
 
 func errorSuffix(detail string) string {

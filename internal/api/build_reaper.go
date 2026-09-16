@@ -107,11 +107,15 @@ func (s *server) reapStaleBuilds(ctx context.Context, now time.Time, result *rea
 	rows.Close()
 	for _, item := range found {
 		guard := `WHERE id=? AND status IN (` + sqlBuilderActive + `) AND attempt=? AND COALESCE(heartbeat_at,claimed_at,created_at) < ?`
+		guardArgs := []any{item.id, item.attempt, cutoff}
+		// 这一次认领传上来的未签名包与 SBOM 不会再有人用：重排后下一次认领从头交付，判失败则不再交付
 		if item.kind == jobKindAPK && item.attempt < maxBuildAttempts {
-			res, err := s.db.ExecContext(ctx,
-				`UPDATE build_jobs SET status='queued',claimed_at=NULL,heartbeat_at=NULL,updated_at=? `+guard,
-				now, item.id, item.attempt, cutoff)
-			if !reaped(res, err, item.id) {
+			_, matched, err := s.transitionBuildJob(ctx, item.id, jobTransition{
+				Where: guard, WhereArgs: guardArgs,
+				Set: `status='queued',claimed_at=NULL,heartbeat_at=NULL,updated_at=?`, SetArgs: []any{now},
+				Release: releaseBuildDelivery,
+			})
+			if !reaped(matched, err, item.id) {
 				continue
 			}
 			result.Requeued = append(result.Requeued, item.id)
@@ -130,10 +134,12 @@ func (s *server) reapStaleBuilds(ctx context.Context, now time.Time, result *rea
 		} else {
 			reason += "热更新任务不自动重排，确认原因之后重新排一个。"
 		}
-		res, err := s.db.ExecContext(ctx,
-			`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? `+guard,
-			clipRunes(reason, 500), now, item.id, item.attempt, cutoff)
-		if !reaped(res, err, item.id) {
+		_, matched, err := s.transitionBuildJob(ctx, item.id, jobTransition{
+			Where: guard, WhereArgs: guardArgs,
+			Set: `status='failed',failure_reason=?,updated_at=?`, SetArgs: []any{clipRunes(reason, 500), now},
+			Release: releaseBuildDelivery,
+		})
+		if !reaped(matched, err, item.id) {
 			continue
 		}
 		result.Failed = append(result.Failed, item.id)
@@ -182,13 +188,20 @@ func (s *server) reapStaleSignings(ctx context.Context, now time.Time, result *r
 				"签名闸已经 %d 次没签成（最近一次是签名心跳超过 %s 没有更新），不再派给签名闸。检查签名闸的日志与本机记录后重新排一个任务。",
 				item.failures+1, signJobHeartbeatTimeout), 500)}
 		}
-		// 状态在 Go 里按读到的 sign_failures 算好；WHERE 带 sign_failures=?，读到之后有人改过就改不到行
-		res, err := s.db.ExecContext(ctx,
-			`UPDATE build_jobs SET status=?,failure_reason=COALESCE(?,failure_reason),sign_outcome=?,updated_at=?,sign_failures=sign_failures+1
-			  WHERE id=? AND status IN (`+sqlSignerActive+`) AND sign_attempt=? AND sign_failures=? AND COALESCE(signing_heartbeat_at,signing_claimed_at,updated_at) < ?`,
-			map[bool]string{true: jobFailed, false: jobBuilt}[failed], reason, outcome, now,
-			item.id, item.signAttempt, item.failures, cutoff)
-		if !reaped(res, err, item.id) {
+		// 状态在 Go 里按读到的 sign_failures 算好；WHERE 带 sign_failures=?，读到之后有人改过就改不到行。
+		// 这一次签名认领交回的已签名包作废；判失败时未签名包与 SBOM 也不再有人用
+		release := releaseSigned
+		if failed {
+			release = releaseAllDeliveries
+		}
+		_, matched, err := s.transitionBuildJob(ctx, item.id, jobTransition{
+			Where:     `WHERE id=? AND status IN (` + sqlSignerActive + `) AND sign_attempt=? AND sign_failures=? AND COALESCE(signing_heartbeat_at,signing_claimed_at,updated_at) < ?`,
+			WhereArgs: []any{item.id, item.signAttempt, item.failures, cutoff},
+			Set:       `status=?,failure_reason=COALESCE(?,failure_reason),sign_outcome=?,updated_at=?,sign_failures=sign_failures+1`,
+			SetArgs:   []any{map[bool]string{true: jobFailed, false: jobBuilt}[failed], reason, outcome, now},
+			Release:   release,
+		})
+		if !reaped(matched, err, item.id) {
 			continue
 		}
 		if failed {
@@ -204,11 +217,10 @@ func (s *server) reapStaleSignings(ctx context.Context, now time.Time, result *r
 	}
 }
 
-func reaped(result sql.Result, err error, id string) bool {
+func reaped(matched bool, err error, id string) bool {
 	if err != nil {
 		slog.Error("cannot reap a build job", "job", id, "error", err)
 		return false
 	}
-	affected, _ := result.RowsAffected()
-	return affected == 1
+	return matched
 }

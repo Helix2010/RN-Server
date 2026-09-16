@@ -123,7 +123,7 @@ type signerCheckReport struct {
 
 // reportSignerKeystoreChecks 收下签名闸对每个租户当前密钥的试解、确认、试签状态，按机器 id
 // 用 JSON_SET 只改自己那个键。只收当前版本的结论：密钥在检查期间被重新上传时，旧结论不能
-// 盖在新版本上。状态真的变了才写审计，签名闸每轮轮询都会报一遍。
+// 盖在新版本上。签名闸每轮轮询都会报一遍：结论没变就不写库（不加 version），变了才写库并写审计。
 func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	machine, _ := machineFromContext(c)
 	var body struct {
@@ -172,6 +172,14 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 			return
 		}
 		previous, existed := previousChecks[machine.ID]
+		changed := !existed || previous.KeystoreVersion != check.KeystoreVersion || previous.Decrypt != check.Decrypt ||
+			previous.Confirmed != check.Confirmed || previous.ConfirmedTrustRootsDigest != check.ConfirmedTrustRootsDigest ||
+			previous.TrialSign != check.TrialSign || previous.Error != check.Error
+		// 签名闸每一轮轮询都会把结论报一遍。没变就不写：不加 version、不刷 updated_at，
+		// 控制台上的 checkedAt 是"结论最近一次变化的时间"
+		if !changed {
+			continue
+		}
 		value, _ := json.Marshal(check)
 		if _, err := s.db.ExecContext(ctx,
 			`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
@@ -186,16 +194,11 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_SAVE_FAILED", "Unable to store the check results")
 			return
 		}
-		changed := !existed || previous.KeystoreVersion != check.KeystoreVersion || previous.Decrypt != check.Decrypt ||
-			previous.Confirmed != check.Confirmed || previous.ConfirmedTrustRootsDigest != check.ConfirmedTrustRootsDigest ||
-			previous.TrialSign != check.TrialSign || previous.Error != check.Error
-		if changed {
-			s.auditNow(newAudit(tenant, signerActor, "build_keystore_check_update", "app-config", buildKeystoreCheckConfigKey,
-				"a signer reported a change in its keystore check", requestID(c),
-				map[string]any{"machineId": machine.ID, "name": machine.Name, "keystoreVersion": check.KeystoreVersion, "decrypt": check.Decrypt,
-					"confirmed": check.Confirmed, "confirmedTrustRootsDigest": nullableString(string(check.ConfirmedTrustRootsDigest)),
-					"trialSign": check.TrialSign, "error": nullableString(string(check.Error))}))
-		}
+		s.auditNow(newAudit(tenant, signerActor, "build_keystore_check_update", "app-config", buildKeystoreCheckConfigKey,
+			"a signer reported a change in its keystore check", requestID(c),
+			map[string]any{"machineId": machine.ID, "name": machine.Name, "keystoreVersion": check.KeystoreVersion, "decrypt": check.Decrypt,
+				"confirmed": check.Confirmed, "confirmedTrustRootsDigest": nullableString(string(check.ConfirmedTrustRootsDigest)),
+				"trialSign": check.TrialSign, "error": nullableString(string(check.Error))}))
 	}
 	c.Status(http.StatusNoContent)
 }
@@ -229,6 +232,7 @@ func (s *server) claimSigningJob(c *gin.Context) {
 		return
 	}
 	ready := map[string]bool{}
+	slugs := map[string]bool{}
 	for _, item := range body.Ready {
 		if !ident.ValidTenantSlug(item.TenantSlug) || !ident.ValidPackageName(item.PackageName) ||
 			!fingerprint.Valid(item.CertificateSHA256) || !fingerprint.Valid(item.TrustRootsDigest) {
@@ -236,18 +240,27 @@ func (s *server) claimSigningJob(c *gin.Context) {
 			return
 		}
 		ready[item.key()] = true
+		slugs[item.TenantSlug] = true
 	}
 	if !machine.isActivePrimary() || len(ready) == 0 {
 		c.Status(http.StatusNoContent)
 		return
 	}
 	ctx := c.Request.Context()
+	// 候选是"签名闸报了就绪的租户里，各自在途 build 号最小、且已经构建完的那一条"：NOT EXISTS 保证
+	// 每个租户每个平台至多一条，所以候选数不超过就绪列表里的租户数（至多 maxSignerListItems），
+	// 不设 LIMIT。以前按创建时间取前 50 条：排在前面的租户长期不就绪时，后面的租户永远轮不到。
+	slugArgs := make([]any, 0, len(slugs))
+	for slug := range slugs {
+		slugArgs = append(slugArgs, slug)
+	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT j.id FROM build_jobs j
+		`SELECT j.id FROM build_jobs j JOIN tenants t ON t.id=j.tenant_id
 		  WHERE j.kind='apk' AND j.platform='android' AND j.status='built'
+		    AND t.slug IN (`+strings.TrimSuffix(strings.Repeat("?,", len(slugArgs)), ",")+`)
 		    AND NOT EXISTS (SELECT 1 FROM build_jobs o WHERE o.tenant_id=j.tenant_id AND o.platform=j.platform AND o.kind='apk'
 		                     AND o.status IN (`+sqlInFlight+`) AND o.build_number<j.build_number)
-		  ORDER BY j.created_at LIMIT 50`)
+		  ORDER BY j.created_at,j.id`, slugArgs...)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to look for builds to sign")
 		return
@@ -301,7 +314,18 @@ func (s *server) claimForSigning(ctx context.Context, c *gin.Context, job buildJ
 	var overtaken *latestRelease
 	reason := ""
 	now := time.Now().UTC()
+	// 提交之后要删的对象：认领时是上一次签名认领交回的已签名包；判失败时是全部交付
+	var abandoned []string
 	rejection, err := s.withReleaseSequence(ctx, job.TenantID, job.Platform, func(tx *sql.Tx) (*releaseRejection, error) {
+		var keys jobObjectKeys
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT `+jobObjectKeyColumns+` FROM build_jobs WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignerClaim, jobKindAPK))+`) AND sign_attempt=? FOR UPDATE`,
+			job.ID, job.SignAttempt).Scan(&keys.Unsigned, &keys.SBOM, &keys.Signed); {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, nil
+		case err != nil:
+			return nil, err
+		}
 		latest, err := latestReleaseFor(ctx, tx, job.TenantID, job.Platform)
 		if err != nil {
 			return nil, err
@@ -309,27 +333,19 @@ func (s *server) claimForSigning(ctx context.Context, c *gin.Context, job buildJ
 		if !latest.increasedBy(job.Version, job.BuildNumber) {
 			reason = clipRunes(fmt.Sprintf("构建期间该平台已经发布了版本 %s（build %d），这个任务的版本 %s（build %d）不再递增，签出来也入不了库，没有派给签名闸。用更高的版本号与 build 号重新排一个任务。",
 				latest.Version.String, latest.BuildNumber, job.Version, job.BuildNumber), 500)
-			result, err := tx.ExecContext(ctx,
-				`UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=?
-				  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignOvertaken, jobKindAPK))+`) AND sign_attempt=?`,
-				reason, now, job.ID, job.SignAttempt)
-			if err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=?`+releaseAllDeliveries.clearColumns()+` WHERE id=?`,
+				reason, now, job.ID); err != nil {
 				return nil, err
 			}
-			if affected, _ := result.RowsAffected(); affected == 1 {
-				overtaken = &latest
-			}
+			overtaken, abandoned = &latest, keys.pick(releaseAllDeliveries)
 			return nil, nil
 		}
-		result, err := tx.ExecContext(ctx,
-			`UPDATE build_jobs SET status='signing',sign_attempt=sign_attempt+1,signing_machine_id=?,signing_claimed_at=?,signing_heartbeat_at=?,signed_object_key=NULL,updated_at=?
-			  WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignerClaim, jobKindAPK))+`) AND sign_attempt=?`,
-			machine.ID, now, now, now, job.ID, job.SignAttempt)
-		if err != nil {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE build_jobs SET status='signing',sign_attempt=sign_attempt+1,signing_machine_id=?,signing_claimed_at=?,signing_heartbeat_at=?,signed_object_key=NULL,updated_at=? WHERE id=?`,
+			machine.ID, now, now, now, job.ID); err != nil {
 			return nil, err
 		}
-		affected, _ := result.RowsAffected()
-		claimed = affected == 1
+		claimed, abandoned = true, keys.pick(releaseSigned)
 		return nil, nil
 	})
 	if err != nil {
@@ -339,6 +355,7 @@ func (s *server) claimForSigning(ctx context.Context, c *gin.Context, job buildJ
 		// 发布序列锁忙（正在入库）：这一轮不派，签名闸下一轮再来
 		return false, nil
 	}
+	s.deleteDeliveryObjects(job.TenantID, job.ID, abandoned)
 	if overtaken != nil {
 		slog.Warn("failed a build overtaken by a newer release before signing", "job", job.ID, "tenant", job.TenantID,
 			"version", job.Version, "buildNumber", job.BuildNumber, "latestVersion", overtaken.Version.String, "latestBuildNumber", overtaken.BuildNumber)
@@ -532,6 +549,7 @@ func (s *server) uploadSignedArtifact(c *gin.Context) {
 
 // 故障注入点（只给测试）：完成事务里各个会崩的位置
 const (
+	faultAfterVerification   = "after-verification"
 	faultBeforeReleaseInsert = "before-release-insert"
 	faultAfterReleaseInsert  = "after-release-insert"
 	faultAfterJobUpdate      = "after-job-update"
@@ -583,7 +601,10 @@ func (s *server) completeSigning(c *gin.Context) {
 		problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH", "Only installable-package builds are signed")
 		return
 	}
-	if job.Status == jobSucceeded && job.ArtifactSHA256.String == body.SignedSHA256 && job.ReleaseID.Valid {
+	// 幂等重试只认同一台签名闸、同一次签名认领交回的同一个包：别的签名闸或过期编号拿着同一个
+	// sha256 来，不能从这里拿到"成功"
+	if job.Status == jobSucceeded && job.ArtifactSHA256.String == body.SignedSHA256 && job.ReleaseID.Valid &&
+		job.SignAttempt == attempt && job.SigningMachineID.String == machine.ID {
 		c.JSON(http.StatusOK, gin.H{"releaseId": job.ReleaseID.String})
 		return
 	}
@@ -595,6 +616,15 @@ func (s *server) completeSigning(c *gin.Context) {
 		problem(c, http.StatusConflict, "SIGNED_ARTIFACT_MISSING", "Upload the signed package for this signing claim before completing it")
 		return
 	}
+	// 下载与复核大包可能要几分钟：先刷新签名心跳，免得复核还没做完任务就被回收器退回待签名
+	if result, err := s.db.ExecContext(ctx, `UPDATE build_jobs SET signing_heartbeat_at=?,updated_at=?`+signingGuard,
+		time.Now().UTC(), time.Now().UTC(), job.ID, attempt, machine.ID); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record signing progress")
+		return
+	} else if affected, _ := result.RowsAffected(); affected != 1 {
+		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
+		return
+	}
 	rejectedBySigner := func(status int, code, detail string, summary map[string]any) {
 		audit := map[string]any{"code": code, "jobId": job.ID, "signAttempt": attempt, "signerMachineId": machine.ID, "signedSha256": body.SignedSHA256}
 		for key, value := range summary {
@@ -603,8 +633,14 @@ func (s *server) completeSigning(c *gin.Context) {
 		s.auditNow(newAudit(job.TenantID, signerActor, "release_rejected", "build-job", job.ID, detail, requestID(c), audit))
 		problem(c, status, code, detail)
 	}
-	if body.UnsignedSHA256 != job.UnsignedSHA256.String || body.NativeFingerprint != job.NativeFingerprint.String {
-		rejectedBySigner(http.StatusUnprocessableEntity, "SIGN_RESULT_MISMATCH", "unsignedSha256 or nativeFingerprint does not match what the builder delivered for this job", nil)
+	if body.UnsignedSHA256 != job.UnsignedSHA256.String {
+		rejectedBySigner(http.StatusUnprocessableEntity, "SIGN_RESULT_MISMATCH", "unsignedSha256 does not match the unsigned package the builder delivered for this job", nil)
+		return
+	}
+	// 原生指纹不能从已签名包里读出来（包里没有 assets/fingerprint），服务端记的是构建机上报、
+	// 经出处声明核对过的值；签名闸带来的必须与它一致，说明两边说的是同一个构建
+	if body.NativeFingerprint != job.NativeFingerprint.String {
+		rejectedBySigner(http.StatusUnprocessableEntity, "SIGN_RESULT_MISMATCH", "nativeFingerprint does not match the value in the builder's verified provenance for this job", nil)
 		return
 	}
 	if code, detail := androidSignerRetirement(body.CertificateSHA256); code != "" {
@@ -652,6 +688,10 @@ func (s *server) completeSigning(c *gin.Context) {
 		rejectedBySigner(http.StatusUnprocessableEntity, "RELEASE_SIGNER_MISMATCH", "The package is not signed with the reported certificate", nil)
 		return
 	}
+	if err := s.injectSignFault(faultAfterVerification); err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_CREATE_FAILED", "Unable to record the signed release; retry with the same signed package")
+		return
+	}
 	slug, err := s.tenantSlug(ctx, job.TenantID)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to resolve the tenant of this build")
@@ -663,11 +703,12 @@ func (s *server) completeSigning(c *gin.Context) {
 	}
 	fileName := fmt.Sprintf("%s-%s-build%d-release.apk", strings.ToLower(slug), job.Version, job.BuildNumber)
 	metadata["fileName"], metadata["size"], metadata["sha256"], metadata["objectEtag"] = fileName, stored.Size, stored.SHA256, stored.ETag
-	// 发布元数据记全链路：未签名包、SBOM、原生指纹（签名闸从包里读出、与构建机上报一致）、
-	// 自报的 commit、哪台构建机、哪台签名闸
+	// 发布元数据记全链路：未签名包、SBOM、原生指纹、自报的 commit、哪台构建机、哪台签名闸。
+	// 原生指纹取任务行上经出处声明核对过的构建机上报值，并注明来源：它不是从包里读出来的
 	metadata["unsignedSha256"] = job.UnsignedSHA256.String
 	metadata["sbom"] = map[string]any{"fileName": sbomObjectName, "objectKey": job.SBOMObjectKey.String, "size": job.SBOMSize.Int64, "sha256": job.SBOMSHA256.String, "format": "cyclonedx-json"}
-	metadata["nativeFingerprint"] = body.NativeFingerprint
+	metadata["nativeFingerprint"] = job.NativeFingerprint.String
+	metadata["nativeFingerprintSource"] = nativeFingerprintFromProvenance
 	metadata["commitSha"] = job.CommitSHA.String
 	metadata["commitSelfReported"] = true
 	metadata["buildJobId"] = job.ID
@@ -691,7 +732,8 @@ func (s *server) completeSigning(c *gin.Context) {
 			Scan(&status, &lockedAttempt, &lockedMachine, &lockedArtifact, &lockedRelease, &lockedKey); err != nil {
 			return nil, err
 		}
-		if status == jobSucceeded && lockedArtifact.String == body.SignedSHA256 && lockedRelease.Valid {
+		if status == jobSucceeded && lockedArtifact.String == body.SignedSHA256 && lockedRelease.Valid &&
+			lockedAttempt == attempt && lockedMachine.String == machine.ID {
 			releaseID = lockedRelease.String
 			return nil, nil
 		}
@@ -710,6 +752,15 @@ func (s *server) completeSigning(c *gin.Context) {
 		}
 		if index, found := registry.Doc.find(machine.ID); !found || registry.Doc.Machines[index].Status != machineStatusActive || registry.Doc.Machines[index].Role != machineRoleSigner {
 			return &releaseRejection{Status: http.StatusUnauthorized, Code: "MACHINE_REVOKED", Detail: "This signer was revoked while its package was being verified"}, nil
+		}
+		// 事务外的复核读的是那一刻的发布身份与签名密钥。复核期间管理员换了密钥或改了登记的
+		// 证书指纹，这个包就不再是"用登记证书签的"：在事务里带共享锁再读一次（挡住并发的保存
+		// 提交到本事务结束），对不上就拒绝，签名闸重试时按新登记重新复核
+		if changed, err := signingIdentityChanged(ctx, tx, job.TenantID, verified.APK.PackageName, body.CertificateSHA256); err != nil {
+			return nil, err
+		} else if changed {
+			return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_IDENTITY_CHANGED",
+				Detail: "The registered release identity or signing keystore changed while this package was being verified; call complete again"}, nil
 		}
 		if err := s.injectSignFault(faultBeforeReleaseInsert); err != nil {
 			return nil, err
@@ -745,6 +796,10 @@ func (s *server) completeSigning(c *gin.Context) {
 		return
 	}
 	if rejection != nil {
+		if rejection.Code == "RELEASE_IDENTITY_CHANGED" {
+			rejectedBySigner(rejection.Status, rejection.Code, rejection.Detail, nil)
+			return
+		}
 		problem(c, rejection.Status, rejection.Code, rejection.Detail)
 		return
 	}
@@ -753,6 +808,48 @@ func (s *server) completeSigning(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"releaseId": releaseID})
+}
+
+// nativeFingerprintFromProvenance 是发布记录 file_metadata.nativeFingerprintSource 的值：原生指纹
+// 来自构建机的出处声明（服务端验过签名、与任务行一致），不是从已签名包里读出来的。
+const nativeFingerprintFromProvenance = "builder-provenance"
+
+// signingIdentityChanged 在完成事务里带共享锁重读 release.android 与 build.keystore，判断复核之后
+// 登记的包名、证书指纹或签名密钥是否已经变了。
+func signingIdentityChanged(ctx context.Context, tx *sql.Tx, tenant, packageName, certificateSHA256 string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT config_key,config_value FROM app_configs WHERE tenant_id=? AND config_key IN (?,?) FOR SHARE`,
+		tenant, releaseAndroidIdentityConfigKey, buildKeystoreConfigKey)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	values := map[string][]byte{}
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			return false, err
+		}
+		values[key] = raw
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	identityRaw, hasIdentity := values[releaseAndroidIdentityConfigKey]
+	keystoreRaw, hasKeystore := values[buildKeystoreConfigKey]
+	if !hasIdentity || !hasKeystore {
+		return true, nil
+	}
+	identity, err := parseAndroidReleaseIdentity(identityRaw)
+	if err != nil {
+		return false, err
+	}
+	record, legacy, err := parseBuildKeystoreValue(keystoreRaw)
+	if err != nil {
+		return false, err
+	}
+	return legacy || identity.PackageName != packageName || identity.SignerSHA256 != certificateSHA256 ||
+		record.PackageName != packageName || record.CertificateSHA256 != certificateSHA256, nil
 }
 
 // ---- 暂不能签与拒签 ----
@@ -797,14 +894,17 @@ func (s *server) releaseSigningJob(c *gin.Context) {
 	now := time.Now().UTC()
 	outcome.Kind, outcome.MachineID, outcome.At = "deferred", machine.ID, iso(now)
 	raw, _ := json.Marshal(outcome)
-	result, err := s.db.ExecContext(c.Request.Context(),
-		`UPDATE build_jobs SET status='built',sign_outcome=?,signing_heartbeat_at=?,updated_at=?`+signingGuard,
-		raw, now, now, c.Param("id"), attempt, machine.ID)
+	// 退回待签名：这一次签名认领交回的包（如果有）作废，下一次认领重新签
+	_, matched, err := s.transitionBuildJob(c.Request.Context(), c.Param("id"), jobTransition{
+		Where: signingGuard, WhereArgs: []any{c.Param("id"), attempt, machine.ID},
+		Set: `status='built',sign_outcome=?,signing_heartbeat_at=?,updated_at=?`, SetArgs: []any{raw, now, now},
+		Release: releaseSigned,
+	})
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to release the build")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if !matched {
 		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
 	}
@@ -844,37 +944,35 @@ func (s *server) rejectSigningJob(c *gin.Context) {
 			reason = sql.NullString{Valid: true, String: clipRunes(fmt.Sprintf("签名闸已经 %d 次没签成，最近一次是临时错误（%s）：%s", failures, outcome.Code, outcome.Detail), 500)}
 		}
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the rejection")
-		return
-	}
-	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx,
-		`UPDATE build_jobs SET status=?,failure_reason=COALESCE(?,failure_reason),sign_outcome=?,sign_failures=?,signing_heartbeat_at=?,updated_at=?`+signingGuard+` AND sign_failures=?`,
-		nextStatus, reason, raw, failures, now, now, job.ID, job.SignAttempt, machine.ID, job.SignFailures)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the rejection")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
-		return
-	}
+	release := releaseSigned
 	if failed {
-		action := "build_job_sign_rejected"
-		if outcome.Kind == "transient" {
-			action = "build_job_sign_failed"
-		}
-		if err := insertAudit(ctx, tx, newAudit(job.TenantID, signerActor, action, "build-job", job.ID, reason.String, requestID(c),
-			map[string]any{"jobId": job.ID, "kind": outcome.Kind, "code": outcome.Code, "detail": outcome.Detail, "signAttempt": job.SignAttempt,
-				"signFailures": failures, "signerMachineId": machine.ID})); err != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the rejection")
-			return
-		}
+		release = releaseAllDeliveries
 	}
-	if err := tx.Commit(); err != nil {
+	_, matched, err := s.transitionBuildJob(ctx, job.ID, jobTransition{
+		Where:     signingGuard + ` AND sign_failures=?`,
+		WhereArgs: []any{job.ID, job.SignAttempt, machine.ID, job.SignFailures},
+		Set:       `status=?,failure_reason=COALESCE(?,failure_reason),sign_outcome=?,sign_failures=?,signing_heartbeat_at=?,updated_at=?`,
+		SetArgs:   []any{nextStatus, reason, raw, failures, now, now},
+		Release:   release,
+		After: func(tx *sql.Tx, _ lockedJob) error {
+			if !failed {
+				return nil
+			}
+			action := "build_job_sign_rejected"
+			if outcome.Kind == "transient" {
+				action = "build_job_sign_failed"
+			}
+			return insertAudit(ctx, tx, newAudit(job.TenantID, signerActor, action, "build-job", job.ID, reason.String, requestID(c),
+				map[string]any{"jobId": job.ID, "kind": outcome.Kind, "code": outcome.Code, "detail": outcome.Detail, "signAttempt": job.SignAttempt,
+					"signFailures": failures, "signerMachineId": machine.ID}))
+		},
+	})
+	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the rejection")
+		return
+	}
+	if !matched {
+		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
 	}
 	c.Status(http.StatusNoContent)

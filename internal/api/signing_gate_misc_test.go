@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -15,7 +17,7 @@ import (
 )
 
 // App Links host 按 RN-App app.config.ts 的规则派生：new URL(apiBaseUrl).host。
-// WHATWG URL 去掉 https 的默认端口 443，保留别的端口；显式写了 :443 的不就绪，要求改掉。
+// WHATWG URL 去掉 https 的默认端口 443，保留别的端口；显式写了 :443 的由 trustroots 直接拒绝。
 func TestAppLinksHostsFollowTheRNAppRule(t *testing.T) {
 	for apiBaseURL, want := range map[string]string{
 		"https://api.anyfun.win":       "api.anyfun.win",
@@ -31,6 +33,55 @@ func TestAppLinksHostsFollowTheRNAppRule(t *testing.T) {
 		if hosts, problem := appLinksHostsFor(apiBaseURL); problem == "" {
 			t.Fatalf("%s should not yield App Links hosts, got %v", apiBaseURL, hosts)
 		}
+	}
+}
+
+// 不就绪原因的枚举控制台是照 OpenAPI 做的：服务端的全集与契约里的 enum 必须一模一样。
+func TestReadinessProblemCodesMatchTheContract(t *testing.T) {
+	raw, err := os.ReadFile("../../contracts/openapi.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract struct {
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties struct {
+			Code struct {
+				Enum []string `json:"enum"`
+			} `json:"code"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(contract.Components.Schemas["SignerReadinessProblem"], &schema); err != nil {
+		t.Fatal(err)
+	}
+	enum := schema.Properties.Code.Enum
+	if strings.Join(enum, ",") != strings.Join(readinessProblemCodes, ",") {
+		t.Fatalf("OpenAPI SignerReadinessProblem.code enum %v differs from the server %v", enum, readinessProblemCodes)
+	}
+}
+
+// 保存打包配置时就按签名闸的同一个函数校验 apiBaseUrl：显式默认端口 :443、大写域名、IP、带路径的
+// 一律当场拒绝，而不是存进去之后在就绪判断里才说不行。首尾空白与结尾的 / 去掉后再判。
+func TestAPIBaseURLIsValidatedWithTheSignerRuleOnWrite(t *testing.T) {
+	for _, ok := range []string{"https://api.anyfun.win", "https://api.example.com:8443", " https://api.example.com/ "} {
+		if err := validateAPIBaseURL(ok); err != nil {
+			t.Fatalf("%q was refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "https://api.example.com:443", "https://API.example.com", "http://api.example.com",
+		"https://api.example.com/v1", "https://10.0.0.1", "https://localhost", "https://api.example.com?x=1"} {
+		if err := validateAPIBaseURL(bad); err == nil {
+			t.Fatalf("%q was accepted", bad)
+		}
+	}
+	if got := canonicalAPIBaseURL(" https://api.example.com/ "); got != "https://api.example.com" {
+		t.Fatalf("canonical form: %q", got)
 	}
 }
 

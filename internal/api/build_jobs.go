@@ -451,8 +451,9 @@ func (s *server) createBuildJob(c *gin.Context) {
 			return
 		}
 		if !readiness.Ready {
-			problem(c, http.StatusConflict, "SIGNER_NOT_READY",
-				"主签名闸还不能为这个租户签名，构建出来也签不了，所以没有排进队列："+strings.Join(readiness.Problems, "；"))
+			problemWith(c, http.StatusConflict, "SIGNER_NOT_READY",
+				"主签名闸还不能为这个租户签名，构建出来也签不了，所以没有排进队列："+readiness.problemDetails(),
+				gin.H{"readinessProblems": readiness.problemList()})
 			return
 		}
 	}
@@ -707,30 +708,26 @@ func (s *server) cancelBuildJob(c *gin.Context) {
 	reason := clipRunes(strings.TrimSpace(body.Reason), 500)
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to cancel the build")
-		return
-	}
-	defer tx.Rollback()
 	// 只取消还没开工的、或者已经构建完还没开始签的。running 的任务取消了也停不下
 	// 构建机上那个进程，状态会骗人；signing 的签名闸可能正在签，要放弃走 force-fail。
 	// 被取消的 claimed 任务，构建机下一次心跳就拿到 409 BUILD_ATTEMPT_STALE 并中止。
-	result, err := tx.ExecContext(ctx,
-		`UPDATE build_jobs SET status='canceled',failure_reason=?,updated_at=?
-		  WHERE id=? AND tenant_id=? AND ((kind='apk' AND status IN (`+sqlCancelableAPK+`)) OR (kind='ota' AND status IN (`+sqlCancelableOTA+`)))`,
-		reason, now, c.Param("id"), tenantID(c))
+	// 已经交付的未签名包与 SBOM 随取消一起删。
+	_, matched, err := s.transitionBuildJob(ctx, c.Param("id"), jobTransition{
+		Where:     `WHERE id=? AND tenant_id=? AND ((kind='apk' AND status IN (` + sqlCancelableAPK + `)) OR (kind='ota' AND status IN (` + sqlCancelableOTA + `)))`,
+		WhereArgs: []any{c.Param("id"), tenantID(c)},
+		Set:       `status='canceled',failure_reason=?,updated_at=?`,
+		SetArgs:   []any{reason, now},
+		Release:   releaseAllDeliveries,
+		After: func(tx *sql.Tx, _ lockedJob) error {
+			return insertAudit(ctx, tx, newAudit(tenantID(c), actor(c), "build_job_cancel", "build-job", c.Param("id"), reason, requestID(c), map[string]any{"jobId": c.Param("id")}))
+		},
+	})
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to cancel the build")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
+	if !matched {
 		problem(c, http.StatusConflict, "BUILD_JOB_NOT_CANCELABLE", "Only queued, claimed or built builds can be canceled")
-		return
-	}
-	event := newAudit(tenantID(c), actor(c), "build_job_cancel", "build-job", c.Param("id"), reason, requestID(c), map[string]any{"jobId": c.Param("id")})
-	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to cancel the build")
 		return
 	}
 	job, err := s.loadBuildJob(c, tenantID(c), c.Param("id"))
@@ -756,33 +753,24 @@ func (s *server) forceFailBuildJob(c *gin.Context) {
 	reason := clipRunes(strings.TrimSpace(body.Reason), 400)
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
+	// 未签名包、SBOM 与签名闸可能已经交回的已签名包都不会再有人用，随强制失败一起删
+	_, matched, err := s.transitionBuildJob(ctx, c.Param("id"), jobTransition{
+		Where:     `WHERE id=? AND tenant_id=? AND kind='apk' AND status IN (` + sqlStatusList(buildJobEventFrom(eventAdminForceFail, jobKindAPK)) + `)`,
+		WhereArgs: []any{c.Param("id"), tenantID(c)},
+		Set:       `status='failed',failure_reason=?,updated_at=?`,
+		SetArgs:   []any{clipRunes("管理员强制判失败："+reason, 500), now},
+		Release:   releaseAllDeliveries,
+		After: func(tx *sql.Tx, locked lockedJob) error {
+			return insertAudit(ctx, tx, newAudit(tenantID(c), actor(c), "build_job_force_fail", "build-job", c.Param("id"), reason, requestID(c),
+				map[string]any{"jobId": c.Param("id"), "signingMachineId": nullableString(locked.SigningMachineID.String), "signAttempt": locked.SignAttempt}))
+		},
+	})
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
 		return
 	}
-	defer tx.Rollback()
-	var signingMachine sql.NullString
-	var signAttempt int
-	err = tx.QueryRowContext(ctx, `SELECT signing_machine_id,sign_attempt FROM build_jobs WHERE id=? AND tenant_id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventAdminForceFail, jobKindAPK))+`) FOR UPDATE`,
-		c.Param("id"), tenantID(c)).Scan(&signingMachine, &signAttempt)
-	if errors.Is(err, sql.ErrNoRows) {
+	if !matched {
 		problem(c, http.StatusConflict, "BUILD_JOB_NOT_FORCE_FAILABLE", "Only builds that are being signed can be force-failed; cancel queued, claimed or built builds instead")
-		return
-	}
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
-		return
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE build_jobs SET status='failed',failure_reason=?,updated_at=? WHERE id=?`,
-		clipRunes("管理员强制判失败："+reason, 500), now, c.Param("id")); err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
-		return
-	}
-	event := newAudit(tenantID(c), actor(c), "build_job_force_fail", "build-job", c.Param("id"), reason, requestID(c),
-		map[string]any{"jobId": c.Param("id"), "signingMachineId": nullableString(signingMachine.String), "signAttempt": signAttempt})
-	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to fail the build")
 		return
 	}
 	job, err := s.loadBuildJob(c, tenantID(c), c.Param("id"))

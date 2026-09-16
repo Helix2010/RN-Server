@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Helix2010/RN-Server/signing/trustroots"
 	"github.com/gin-gonic/gin"
 )
 
@@ -81,20 +81,27 @@ func (a appIdentity) validate() error {
 }
 
 // App 启动时拿这个地址取配置。允许 http 等于允许把整份配置放在明文链路上，而
-// 客户端对这份配置的信任来自签名——签名挡不住"根本没连到我们"
+// 客户端对这份配置的信任来自签名——签名挡不住"根本没连到我们"。
+//
+// 判据是 signing/trustroots.ValidateAPIBaseURL，与签名闸确认包内信任根用的是同一个函数：
+// https、小写 DNS 名、不带路径，并且**不许显式写默认端口 :443**——RN-App 用 WHATWG URL 派生
+// App Links host 时会去掉它，而 extra.apiBaseUrl 按原样编进包，同一个源两种写法会让服务端与
+// 签名闸对 host 与信任根摘要得出不同结论。首尾空白与结尾的 / 先去掉（合成 tenant.json 时本来
+// 就去掉），其余不做改写。
 func validateAPIBaseURL(raw string) error {
-	value := strings.TrimRight(strings.TrimSpace(raw), "/")
+	value := canonicalAPIBaseURL(raw)
 	if value == "" {
 		return errors.New("apiBaseUrl is required")
 	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		return errors.New("apiBaseUrl must be an https origin")
-	}
-	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return errors.New("apiBaseUrl must be an origin with no path")
+	if err := trustroots.ValidateAPIBaseURL(value); err != nil {
+		return err
 	}
 	return nil
+}
+
+// canonicalAPIBaseURL 去掉首尾空白与结尾的 /，与 tenantManifestFor 合成时的处理一致。
+func canonicalAPIBaseURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }
 
 func (s *server) buildConfigFor(ctx context.Context, tenant, fallbackSlug string) (buildConfig, int, error) {
@@ -195,6 +202,8 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", detail)
 		return
 	}
+	// 存规范写法：读的人（控制台、合成 tenant.json、信任根）看到的都是同一个字符串
+	body.Identity.APIBaseURL = canonicalAPIBaseURL(body.Identity.APIBaseURL)
 	if err := body.Identity.validate(); err != nil {
 		problem(c, http.StatusBadRequest, "INVALID_APP_IDENTITY", err.Error())
 		return
