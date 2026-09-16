@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 签名闸上线 · 第 2 步（amos，root，**在你自己的终端里跑**，不要经过会把输出送进对话记录的通道）
-#   sudo bash 2-configure.sh
+#   sudo bash 2-configure.sh                 逐个提示粘贴令牌
 # 前提：控制台「平台维护 → 打包机与签名闸」已新建 amos-builder（构建机）、amos-signer-a（签名闸，主）、
 # amos-signer-b（签名闸，备）三台机器，令牌各显示了一次。
 # 本脚本逐个提示输入三台机器的令牌（不回显、不进命令行参数），写好三份 env，启动服务，
@@ -8,9 +8,21 @@
 set -euo pipefail
 JAVA_HOME_DIR=/usr/lib/jvm/java-17-openjdk-amd64
 
+# 用法二：sudo bash 2-configure.sh <令牌目录>——目录里是 amos-builder、amos-signer-a、amos-signer-b 三个文件，
+# 各含一台机器的令牌（root 0600，由主机到主机的管道写入，不经过屏幕）。读完即删。
+TOKEN_DIR="${1:-}"
+if [ -n "$TOKEN_DIR" ]; then
+  [ "$(stat -c '%U %a' "$TOKEN_DIR")" = "root 700" ] || { echo "$TOKEN_DIR 必须是 root 0700" >&2; exit 1; }
+fi
+
 read_token() {
   local name="$1" var
-  read -rsp "$name 的机器令牌（输入不回显）: " var; echo >&2
+  if [ -n "$TOKEN_DIR" ]; then
+    [ "$(stat -c '%U %a' "$TOKEN_DIR/$name")" = "root 600" ] || { echo "$TOKEN_DIR/$name 必须是 root 0600" >&2; exit 1; }
+    var="$(cat "$TOKEN_DIR/$name")"
+  else
+    read -rsp "$name 的机器令牌（输入不回显）: " var; echo >&2
+  fi
   case "$var" in rnm_*) ;; *) echo "$name：令牌格式不对（应以 rnm_ 开头）" >&2; exit 1 ;; esac
   printf '%s' "$var"
 }
@@ -59,6 +71,10 @@ SIGNER_MAX_VERSION_CODE="10000000"
 ENV
 done
 unset BUILDER_TOKEN SIGNER_A_TOKEN SIGNER_B_TOKEN TOKEN
+if [ -n "$TOKEN_DIR" ]; then
+  shred -u "$TOKEN_DIR/amos-builder" "$TOKEN_DIR/amos-signer-a" "$TOKEN_DIR/amos-signer-b"
+  rmdir "$TOKEN_DIR"
+fi
 
 echo "== 启动"
 systemctl daemon-reload
