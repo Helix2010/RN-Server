@@ -281,7 +281,7 @@ func sealServerPart(in Input, recipient Recipient) ([]byte, error) {
 	}
 	files[nameManifest] = encoded
 
-	plain, err := tarFiles(files)
+	plain, err := TarFiles(files)
 	if err != nil {
 		return nil, fmt.Errorf("backupbundle: pack the server part: %w", err)
 	}
@@ -344,13 +344,16 @@ func buildOuterPayload(in Input, pair backupcontainer.Pair, inner InnerPart, ser
 		return nil, err
 	}
 	members[nameManifest] = encoded
-	return tarFiles(members)
+	return TarFiles(members)
 }
 
-// tarFiles 按名字排序打一个 tar。排序是为了**同样的输入产出同样的字节**——
+// TarFiles 按名字排序打一个 tar。排序是为了**同样的输入产出同样的字节**——
 // 没有它，两次备份的差异里会混进 map 遍历顺序，而「包体相对上次有没有异常跌落」
-// 那条自检就没法用了
-func tarFiles(files map[string][]byte) ([]byte, error) {
+// 那条自检就没法用了。
+//
+// 导出是因为内层（打包机封的）和外层（服务端封的）必须是同一种布局：
+// 恢复脚本对两层用的是同一条 `tar xf`，各写各的迟早会漂。
+func TarFiles(files map[string][]byte) ([]byte, error) {
 	names := make([]string, 0, len(files))
 	for name := range files {
 		names = append(names, name)
@@ -390,5 +393,3 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	w.n += int64(len(p))
 	return len(p), nil
 }
-
-func marshalIndent(value any) ([]byte, error) { return json.MarshalIndent(value, "", "  ") }

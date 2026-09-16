@@ -91,7 +91,7 @@ func testInputWithSigner(t *testing.T, holders []holder) (Input, ed25519.PublicK
 	// 内层明文必须是一个 tar——生产里 produceBackup 就是先打 tar 再封。
 	// 封一个裸字符串的话，恢复脚本最后那步 `tar xf plain.tar` 会报
 	// 「不是 tar」，而那是夹具不真实，不是代码的问题
-	agentPlain, err := tarFiles(map[string][]byte{
+	agentPlain, err := TarFiles(map[string][]byte{
 		"agent-key":                         []byte("the build machine identity"),
 		"keystores/acme/keystore.p12":       []byte("a signing key in the clear"),
 		"keystores/acme/store-password.txt": []byte("the password for it"),

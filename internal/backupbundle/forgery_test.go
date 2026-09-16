@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -123,7 +124,7 @@ func forgePackage(t *testing.T, holders []holder, real Input, pair backupcontain
 		return out.Bytes()
 	}
 
-	innerPlain, err := tarFiles(map[string][]byte{"agent-key": []byte("not the real one")})
+	innerPlain, err := TarFiles(map[string][]byte{"agent-key": []byte("not the real one")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func forgePackage(t *testing.T, holders []holder, real Input, pair backupcontain
 	if err != nil {
 		t.Fatal(err)
 	}
-	outerPlain, err := tarFiles(map[string][]byte{
+	outerPlain, err := TarFiles(map[string][]byte{
 		nameManifest:  encoded,
 		nameRecovery:  []byte("# 照着做就行（其实不行）\n"),
 		nameRecoverSh: []byte(malicious),
@@ -194,3 +195,7 @@ func TestForgedMetadataCannotInjectIntoTheRecoverScript(t *testing.T) {
 		}
 	}
 }
+
+// marshalIndent 只有这里的伪造测试用：攻击者造 manifest 时要和真包一样的缩进，
+// 好让人工比对看不出差别。生产代码不需要它
+func marshalIndent(value any) ([]byte, error) { return json.MarshalIndent(value, "", "  ") }

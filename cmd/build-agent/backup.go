@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -127,7 +126,7 @@ func produceBackup(ctx context.Context, cfg config, api *client, request backupR
 	}
 	files["manifest.json"] = encoded
 
-	plain, err := tarFiles(files)
+	plain, err := backupbundle.TarFiles(files)
 	if err != nil {
 		return fmt.Errorf("cannot pack the agent part: %w", err)
 	}
@@ -343,32 +342,6 @@ func buildInnerManifest(cfg config, files map[string][]byte) []backupbundle.File
 		out = append(out, entry)
 	}
 	return out
-}
-
-func tarFiles(files map[string][]byte) ([]byte, error) {
-	names := make([]string, 0, len(files))
-	for name := range files {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var out bytes.Buffer
-	tw := tar.NewWriter(&out)
-	for _, name := range names {
-		body := files[name]
-		if err := tw.WriteHeader(&tar.Header{
-			Name: name, Mode: 0o600, Size: int64(len(body)),
-			Typeflag: tar.TypeReg, Format: tar.FormatPAX, ModTime: time.Unix(0, 0).UTC(),
-		}); err != nil {
-			return nil, err
-		}
-		if _, err := tw.Write(body); err != nil {
-			return nil, err
-		}
-	}
-	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
 }
 
 func sha256Hex(body []byte) string {
