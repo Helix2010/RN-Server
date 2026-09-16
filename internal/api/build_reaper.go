@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/Helix2010/RN-Server/internal/objectstore"
+	"github.com/Helix2010/RN-Server/internal/secretbox"
 	"github.com/Helix2010/RN-Server/internal/store"
 )
 
@@ -35,21 +37,24 @@ const (
 
 // RunBuildJobReaper 是 cmd/server 启动的回收循环：先跑一轮，之后每分钟一轮，ctx 结束就返回。
 func RunBuildJobReaper(ctx context.Context, cfg config.Config, storage *store.Store) {
-	s := &server{cfg: cfg, db: storage.DB}
-	runBuildJobReaperLoopWithHook(ctx, s, buildReaperInterval, nil)
+	// 对象存储与主密钥：回收时要删掉被放弃的交付对象，而租户存储凭据是用主密钥封着的。
+	// 主密钥不可用时照常回收状态，删对象那一步记日志跳过
+	box, _ := secretbox.New(cfg.StorageMasterKey)
+	s := &server{cfg: cfg, db: storage.DB, objects: objectstore.AWSFactory{}, secrets: box}
+	runReaperLoop(ctx, buildReaperInterval, func(roundCtx context.Context) {
+		s.reapBuildJobs(roundCtx, time.Now().UTC())
+	})
 }
 
-// runBuildJobReaperLoopWithHook 是回收循环本体；afterRound 在每一轮之后调用（测试用来数轮次，生产为 nil）。
-func runBuildJobReaperLoopWithHook(ctx context.Context, s *server, interval time.Duration, afterRound func()) {
+// runReaperLoop 是回收循环本体：立刻跑一轮，之后每个 interval 一轮；每一轮的 ctx 最多活一个
+// interval，一轮卡住不会叠到下一轮上。ctx 结束就返回。
+func runReaperLoop(ctx context.Context, interval time.Duration, round func(context.Context)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		roundCtx, cancel := context.WithTimeout(ctx, interval)
-		s.reapBuildJobs(roundCtx, time.Now().UTC())
+		round(roundCtx)
 		cancel()
-		if afterRound != nil {
-			afterRound()
-		}
 		select {
 		case <-ctx.Done():
 			return

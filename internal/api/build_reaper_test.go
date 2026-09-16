@@ -109,14 +109,20 @@ func TestDBReaperRequeuesAtMostTwice(t *testing.T) {
 
 // 回收循环：启动就跑一轮，之后按间隔跑，上下文结束就退出。
 func TestBuildJobReaperLoopRunsAndStops(t *testing.T) {
-	db := openTestDB(t)
-	s := &server{db: db}
 	ctx, cancel := context.WithCancel(context.Background())
+	const interval = 10 * time.Millisecond
 	var rounds atomic.Int32
+	var deadlineMissing atomic.Bool
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runBuildJobReaperLoopWithHook(ctx, s, 10*time.Millisecond, func() { rounds.Add(1) })
+		runReaperLoop(ctx, interval, func(roundCtx context.Context) {
+			// 每一轮的 ctx 必须有期限且不超过一个周期：一轮卡住不能叠到下一轮上
+			if deadline, ok := roundCtx.Deadline(); !ok || time.Until(deadline) > interval {
+				deadlineMissing.Store(true)
+			}
+			rounds.Add(1)
+		})
 	}()
 	deadline := time.After(5 * time.Second)
 	for rounds.Load() < 3 {
@@ -131,5 +137,13 @@ func TestBuildJobReaperLoopRunsAndStops(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the reaper loop did not stop when its context ended")
+	}
+	if deadlineMissing.Load() {
+		t.Fatal("a reaper round ran without a deadline of at most one interval")
+	}
+	stopped := rounds.Load()
+	time.Sleep(3 * interval)
+	if rounds.Load() != stopped {
+		t.Fatal("the reaper loop kept running after it returned")
 	}
 }

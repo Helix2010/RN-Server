@@ -24,6 +24,25 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # 数据库测试（TestDB*、迁移测试）没有 RN_TEST_MYSQL_DSN 时一律 skip，而 skip 在 go test 里
+    # 算通过：签名闸的状态机、完成事务、迁移全在这一类里，不给库等于 CI 假绿。
+    # 库是一次性的容器，口令只在这个 job 里有效，不是机密
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rn-test
+          MYSQL_DATABASE: rn_test
+        ports:
+          - 33061:3306
+        # 健康检查通过之前 Actions 不会开始跑 steps
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -prn-test --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      RN_TEST_MYSQL_DSN: root:rn-test@tcp(127.0.0.1:33061)/rn_test?parseTime=true&charset=utf8mb4
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -32,7 +51,20 @@ jobs:
           cache: true
       - run: test -z "$(gofmt -l cmd internal signing)"
       - run: go vet ./...
-      - run: go test -race ./...
+      - name: Wait for MySQL
+        # 服务容器健康之后 mysqld 偶尔还在做首次初始化后的重启；真连上一次再跑测试，
+        # 免得第一个包在连库上失败、被误读成代码问题
+        env:
+          MYSQL_PWD: rn-test
+        run: |
+          for i in $(seq 1 60); do
+            if mysqladmin ping -h 127.0.0.1 -P 33061 -uroot --silent; then exit 0; fi
+            sleep 2
+          done
+          echo "::error::MySQL 服务容器两分钟内没有就绪"
+          exit 1
+      # -p 1：几个包的数据库测试共用同一个库（迁移、build.machines 等平台级单行），并行跑会互相踩
+      - run: go test -race -p 1 ./...
       - run: go build ./cmd/server
       # signing/ 是独立 module（签名闸与离线工具只依赖标准库），根目录的 ./... 不含它
       - name: signing module
@@ -146,9 +178,9 @@ jobs:
       # ---- 打包机 ----------------------------------------------------------
       #
       # **签名闸与 amos 同机期间必须关着**（docs/design/android-signing-gate-2026-09-16.md
-      # 「开发阶段的部署」「部署与运维」）。这一步换掉的是以 builder 身份运行的那个二进制：
-      # 开着它，能往 main 推代码或拿到 AMOS_SSH_KEY 的人，就能以 builder 身份在签名闸
-      # 所在的机器上执行任意代码。开关是仓库 Variables 里的 AMOS_DEPLOY_BUILD_AGENT，
+      # 「开发阶段的部署」「部署与运维」）。这一步换掉的是构建机控制进程，它以 rn-build-agent
+      # 身份运行、持有机器令牌与出处密钥：开着它，能往 main 推代码或拿到 AMOS_SSH_KEY 的人，
+      # 就能以受信构建机的名义给签名闸送包，并在签名闸所在的机器上执行任意代码。开关是仓库 Variables 里的 AMOS_DEPLOY_BUILD_AGENT，
       # 不建或不是 'true' 即关；关着时打包机手工部署，见 deploy/build-agent/README.md。
       - name: Upload the build agent
         if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
