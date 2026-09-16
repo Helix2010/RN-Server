@@ -104,7 +104,16 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer show-key --env-file /etc/rn-signer
 
 ## 5. 设定主签名闸
 
-角色只在本机记录里。新机器默认是备，第一台主在 A 上执行（交互终端）：
+角色有两处，**两处都要做、而且要一致**：
+
+- **签名闸本机记录**（`signer promote`）：决定这台机器会不会去认领任务。本机记录是备的机器从不认领。
+- **控制台的主备路由**（「平台维护 → 打包机与签名闸」切换主备）：决定服务端把任务派给谁。
+
+签名闸每轮上报 `keystore-checks` 时带上本机记录里的角色（`localRole`：`primary` 或 `standby`）。控制台切了主、
+本机还没 `promote`（或反过来）时，控制台显示这台签名闸**不就绪**并写明原因（本机记录不是主），任务不会被当作
+"等它来领取"。只做一边，任务会一直停在已构建。
+
+新机器默认是备，第一台主在 A 上执行（交互终端），然后在控制台把 A 设为主：
 
 ```bash
 sudo -u rn-signer-a /opt/rn-signer/bin/signer promote --first --env-file /etc/rn-signer-a.env
@@ -339,8 +348,11 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer list --env-file /etc/rn-signer-a.e
 
    旧主的状态目录也没了：同样先停 B 的服务，`promote --manual`，逐包输入离线发布记录或已安装设备上的最大 versionCode
    （不取服务端的值）。
-3. 控制台把 `amos-signer-b` 切成 primary。之后按「密钥生成与上传」补一台新的备（新机器、新 id、加进 pin 文件、
-   用原件 `build-keystore seal` 重新加密上传、两台重新 confirm）。
+3. 控制台把 `amos-signer-b` 切成 primary。**控制台切换路由与 B 上的 `signer promote` 两步都必须做**：B 启动后一分钟内
+   上报 `localRole: primary`，控制台显示主签名闸就绪；只切了控制台、B 本机仍是备时，控制台显示不就绪原因
+   （本机记录不是主），此时回到第 2 步补做 promote。
+   之后按「密钥生成与上传」补一台新的备（新机器、新 id、加进 pin 文件、用原件 `build-keystore seal` 重新加密上传、
+   两台重新 confirm）。
 
 演练时旧主被吊销后按新机器处理，不要复用它的令牌与状态目录。
 

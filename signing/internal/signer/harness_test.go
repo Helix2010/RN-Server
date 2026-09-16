@@ -80,6 +80,7 @@ type fakeServer struct {
 	checksStatus  int
 	items         []map[string]any
 	reports       [][]CheckReport
+	localRoles    []string         // 每次上报带的 localRole
 	claims        []map[string]any // 依次派发；用完返回 204
 	claimBodies   [][]ReadyItem
 	apks          map[string][]byte // jobId → 未签名包
@@ -202,14 +203,21 @@ func (f *fakeServer) getChecks(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeServer) postChecks(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Items []CheckReport `json:"items"`
+		LocalRole *string       `json:"localRole"`
+		Items     []CheckReport `json:"items"`
 	}
 	if !f.decodeStrict(r, &body) {
 		problemJSON(w, 400, "BAD", "bad")
 		return
 	}
+	if body.LocalRole == nil || (*body.LocalRole != "primary" && *body.LocalRole != "standby") {
+		f.t.Errorf("keystore-checks report without a valid localRole: %v", body.LocalRole)
+		problemJSON(w, 400, "INVALID_KEYSTORE_CHECK", "localRole")
+		return
+	}
 	f.mu.Lock()
 	f.reports = append(f.reports, body.Items)
+	f.localRoles = append(f.localRoles, *body.LocalRole)
 	f.mu.Unlock()
 	w.WriteHeader(204)
 }
