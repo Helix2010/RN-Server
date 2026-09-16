@@ -230,6 +230,16 @@ func cmdRun(getenv func(string) string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// 签名闸执行的每个文件都只能由 root 或签名闸用户修改（不能指向构建机那份 SDK）
+	trusted := []string{signer.Java, signer.Jar}
+	if cfg.CheckExec != "" {
+		trusted = append(trusted, cfg.CheckExec)
+	}
+	for _, path := range trusted {
+		if err := securefs.CheckTrustedPath(path); err != nil {
+			return fmt.Errorf("refusing to execute an untrusted file: %w", err)
+		}
+	}
 	var checker Checker
 	if cfg.CheckSocket != "" {
 		checker = SocketChecker{Path: cfg.CheckSocket}

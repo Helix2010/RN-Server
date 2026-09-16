@@ -70,6 +70,58 @@ func TestCheckPrivate(t *testing.T) {
 	}
 }
 
+func TestCheckTrustedPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	java := filepath.Join(bin, "java")
+	if err := os.WriteFile(java, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(java, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckTrustedPath(java); err != nil {
+		t.Fatalf("trusted file rejected: %v", err)
+	}
+	link := filepath.Join(dir, "java-link")
+	if err := os.Symlink(java, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckTrustedPath(link); err != nil {
+		t.Fatalf("symlink to a trusted file rejected: %v", err)
+	}
+	if err := os.Chmod(bin, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckTrustedPath(java); err == nil {
+		t.Fatal("accepted a file inside a group-writable directory")
+	}
+	if err := CheckTrustedPath(link); err == nil {
+		t.Fatal("accepted a symlink whose target sits in a group-writable directory")
+	}
+	if err := os.Chmod(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(java, 0o757); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckTrustedPath(java); err == nil {
+		t.Fatal("accepted a world-writable file")
+	}
+	if err := CheckTrustedPath("relative/java"); err == nil {
+		t.Fatal("accepted a relative path")
+	}
+	if err := CheckTrustedPath("/usr/bin/env"); err != nil {
+		t.Fatalf("a root-owned system binary was rejected: %v", err)
+	}
+}
+
 func TestRemoveContentsAndLocks(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"a", "b/c"} {

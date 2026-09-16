@@ -150,6 +150,59 @@ func Unlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
+// CheckTrustedPath 要求签名闸要执行或加载的文件（java、apksigner.jar、signer-check）以及它
+// 所在的每一级目录（按原路径与解析符号链接后的真实路径各查一遍）都只能由 root 或当前用户
+// 修改：属主是 root 或当前有效用户，没有组与其它用户写权限（带粘滞位的目录如 /tmp 除外）。
+//
+// 这挡住"把 SIGNER_BUILD_TOOLS_DIR 指向构建机那份 Android SDK"这类配置：构建机用户能改的
+// apksigner.jar 等于能在签名闸里执行任意代码。
+func CheckTrustedPath(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%s: path must be absolute", path)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	for _, p := range []string{filepath.Clean(path), resolved} {
+		for current := p; ; current = filepath.Dir(current) {
+			if err := checkTrustedComponent(current, current == p); err != nil {
+				return err
+			}
+			if current == "/" {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func checkTrustedComponent(path string, leaf bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s: cannot read the owner", path)
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		// 符号链接本身的权限没有意义；它指向哪里由解析后的路径检查。只要求链接属主可信
+		if stat.Uid != 0 && int(stat.Uid) != os.Geteuid() {
+			return fmt.Errorf("%s: symbolic link owned by uid %d, which could repoint it", path, stat.Uid)
+		}
+		return nil
+	}
+	if stat.Uid != 0 && int(stat.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s: owned by uid %d; files the signing gate executes must be owned by root or by the signing gate user", path, stat.Uid)
+	}
+	perm := info.Mode().Perm()
+	if perm&0o022 != 0 && !(info.IsDir() && info.Mode()&fs.ModeSticky != 0 && !leaf) {
+		return fmt.Errorf("%s: permissions %04o let group or other users modify it", path, perm)
+	}
+	return nil
+}
+
 // RemoveContents 删除目录里的全部内容（目录本身保留）。用于清空运行时目录。
 func RemoveContents(dir string) error {
 	entries, err := os.ReadDir(dir)
