@@ -3,6 +3,7 @@ module github.com/Helix2010/RN-Server
 go 1.24.0
 
 require (
+	github.com/Helix2010/RN-Server/signing v0.0.0
 	github.com/avast/apkverifier v0.0.0-20260710162049-d0e1a791cd5a
 	github.com/aws/aws-sdk-go-v2 v1.39.6
 	github.com/aws/aws-sdk-go-v2/config v1.31.4
@@ -65,3 +66,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	software.sslmate.com/src/go-pkcs12 v0.7.3 // indirect
 )
+
+replace github.com/Helix2010/RN-Server/signing => ./signing
