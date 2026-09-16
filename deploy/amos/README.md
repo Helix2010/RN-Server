@@ -178,10 +178,14 @@ rndeploy ALL=(root) NOPASSWD: /usr/local/sbin/rn-foundation-apply
 ```
 
 不给 `ubuntu` 的密钥，是因为 `ubuntu` 是 `NOPASSWD: ALL`——把它交给 GitHub 等于把
-这台机器的 root 交出去，而这台机器上放着 Android keystore 的封装口令。实测过边界：
-`rndeploy` 读不到 `/etc/rn-build-agent.env`，也读不到 `/etc/rn-foundation.env`，
-`sudo` 跑任何别的命令都要密码。换上去的二进制以 `rnfoundation` 身份运行，不是 root。
-CI 密钥被偷的最坏结果是"发了一版坏代码"，不是"整台机器没了"。
+这台机器的 root 交出去。实测过边界：`rndeploy` 读不到 `/etc/rn-build-agent.env`，也读不到
+`/etc/rn-foundation.env`，`sudo` 跑任何别的命令都要密码。换上去的程序以非 root 身份运行
+（服务端 `rnfoundation`、打包机 `builder`），`rn-foundation-apply` 自己也不以 root 执行
+CI 传来的二进制——打包机的冒烟降到 `builder`，不继承附加组、`no_new_privs`。
+
+但别把它说成"CI 密钥被偷最多发一版坏代码"：坏代码以 `rnfoundation` 跑，读得到服务端
+进程的全部配置机密；以 `builder` 跑，拿得到打包机上的一切。所以打包机那一路在签名闸
+同机期间必须关着，见下面「签名闸同机期间，打包机不走 CI」。
 
 `sudoers` 里故意不限制参数——参数校验在脚本里。把 `install`/`mv`/`rm`/`systemctl`
 逐条写进 sudoers，任何一条带通配符的规则写松一点就等于给了 root。
@@ -211,6 +215,22 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 | `AMOS_KNOWN_HOSTS` | Secret | `setup-ci-deploy.sh` 打印的那一行 |
 | `AMOS_SSH_KEY` | Secret | 上面那把私钥全文 |
 | `AMOS_DEPLOY_ENABLED` | Variable | `true`，否则只跑校验不部署 |
+| `AMOS_DEPLOY_BUILD_AGENT` | Variable | 只有 RN-Server 用。**签名闸与 amos 同机期间不建，或值不是 `true`**（见下一节） |
+
+### 签名闸同机期间，打包机不走 CI
+
+开发阶段签名闸和打包机、后端同在 amos 上（设计
+[`android-signing-gate-2026-09-16.md`](../../docs/design/android-signing-gate-2026-09-16.md)
+「开发阶段的部署」「部署与运维」）。**同机期间 `AMOS_DEPLOY_BUILD_AGENT` 必须关着**：
+在 RN-Server 仓库 Settings → Secrets and variables → Actions → Variables 里删掉它，或者
+把值改成 `true` 以外的任何东西。打包机改为手工部署（`deploy/build-agent/README.md`）。
+
+原因：开着它，每次 push 到 main 工作流都会把新的 build-agent 送上来，由
+`rn-foundation-apply build-agent` 换上并以 `builder` 身份运行。于是能往 main 推代码、
+或者拿到 `AMOS_SSH_KEY` 的人，就能以 `builder` 在签名闸所在的机器上执行任意代码，离
+签名闸只差一次本地提权。冒烟不再以 root 跑只去掉了"直接拿到 root"那一步，不改变这一条。
+
+这个开关在 GitHub 上，仓库里的改动关不掉它，要有人去关。签名闸挪到独立机器之前不要再打开。
 
 ### 加一个租户
 
@@ -220,52 +240,30 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 
 ## 注意事项
 
-### 签名密钥加密给打包机的公钥，不再有封装口令
+### 签名密钥迁往签名闸
 
-2026-09-13 起：打包机启动时在 `/var/lib/rn-build-agent/agent-key`（0600）生成一对
-X25519 密钥，公钥登记到服务端，签名密钥直接加密给它。**没有任何人需要输入封装口令。**
+Android 签名密钥按设计
+[`android-signing-gate-2026-09-16.md`](../../docs/design/android-signing-gate-2026-09-16.md)
+迁到签名闸：各租户旧密钥全部作废、在离线机器上重新生成，只加密给签名闸，打包机只出
+未签名包。签名闸只人工部署，`rn-foundation-apply` 不管它。
 
-为什么换掉口令那条路：打包机上只有一个 `BUILD_KEYSTORE_PASSPHRASE`，全租户共用，
-于是控制台上那个输入框实际是在问操作者要一个**保护所有租户密钥的平台秘密**。租户不
-可能知道它，知道了更糟（拿到数据库快照就能开别人的盒子）；而即使是平台运维，那也是
-一串 64 字符的东西要手抄进表单，抄错的表现是存下去一切正常、构建必然失败。2026-09-12
-到 09-13 连着错了三次。
+随之删除的：
 
-安全论证没有变弱：服务端只有**公钥**，存下去之后它自己照样打不开。
+- **平台备份**（原 `platform-backup-recovery-2026-09-15` 方案）。`agent-key` 不再进备份；
+  离线保管的东西见设计「原件与配置机密的保管」。
+- **封装口令轮换**（原 `rotate-keystore-passphrase.sh`）。旧密钥不再换口令，而是整体
+  重置（设计「现有租户的签名密钥重置」）。
+- **控制台上生成签名密钥**（`POST /v1/admin/build-keystore/generate`）：服务端进程里不再
+  出现明文私钥。
 
-**公钥是固定的。** 代理换一把公钥不会自动生效，只会挂成待确认，要平台管理员在
-「平台维护」里核对指纹后接受。不这么做的话，偷到代理令牌的人登记自己的公钥就够了
-——此后每一把新密钥都直接加密给他，而现场看不出任何异常。
-
-`agent-key` 这个文件要进备份，换机器时一起搬。丢了它等于丢了所有租户的密钥盒子的
-钥匙：每个租户都要重新上传或重新生成。
-
-旧格式（口令封）的盒子继续能开，`BUILD_KEYSTORE_PASSPHRASE` 留着就行；在控制台重新
-生成一次就换成新格式了。
-
-### 轮换封装口令（旧格式，逐步作废）
-
-`BUILD_KEYSTORE_PASSPHRASE` 泄漏（或怀疑泄漏）时跑
-`deploy/amos/rotate-keystore-passphrase.sh`（在开发机上，需要 `go` 和 `ssh amos`）。
-先跑一次 `--check` 看当前状态。
-
-换的是**口令不是密钥**：只要明文 keystore 还在手上，就用同一把密钥重新封一次盒子，
-对 App 侧零影响。换密钥等于换签名证书——Android 认为那是另一个 App，装着旧版的用户
-升不上去，只能换包名让每个人手动卸载重装。
-
-脚本里 `RESEAL`（有明文 keystore，重新封）和 `REGENERATE`（没有明文、也没有已发布的
-包，直接重新生成）两张表要随租户增减维护。
-
-口令全程走 `read -rsp` 和标准输入，不进命令行、不进 shell 历史、不落盘。**不要**图省事
-用 `ssh amos 'sudo grep BUILD_KEYSTORE_PASSPHRASE ...'` 去读它——那会把它打印到终端和
-任何记录着那次会话的地方。
-
-打包机上只有一个口令、全租户共用，所以"上传新盒子"和"改打包机"之间必然有几秒对不上，
-那段时间构建会失败。脚本按「先传新盒子，再改机器」的顺序把它压到最小。
+切换完成之前，打包机仍用 `/var/lib/rn-build-agent/agent-key` 开现有租户的密文；切换完成后
+`agent-key` 与 `BUILD_KEYSTORE_PASSPHRASE` 一起作废（设计「落地顺序」第 8 步）。**在那之前
+不要图省事用 `ssh amos 'sudo grep BUILD_KEYSTORE_PASSPHRASE ...'` 去读口令**——那会把它打印到
+终端和任何记录着那次会话的地方。
 
 ### `ARTIFACT_UPLOAD_MODE` 必须是 `proxy`
 
-改成 `direct` 会让控制台**所有**上传（品牌图、安装包、OTA 包）当场失效，而且几乎查
+改成 `direct` 会让控制台**所有**上传（品牌图、安装包）当场失效，而且几乎查
 不出来：票据签发 201、`curl` 直接 PUT 200、签名和权限全对，只有浏览器传不上去，界面
 上一句"无法连接对象存储"，**服务端日志里一条都没有**——因为 direct 模式下上传那一跳
 根本不经过我们，是浏览器直接发给对象存储的。

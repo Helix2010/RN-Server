@@ -4,12 +4,12 @@
 #   ./setup-ci-deploy.sh <这台机器对外的地址> <SSH 端口>
 #
 # 为什么不直接把 ubuntu 的密钥丢给 CI：ubuntu 是 NOPASSWD: ALL，等于把这台机器的
-# root 交给 GitHub。而这台机器上放着 Android keystore 的封装口令，签名能力一旦漏出
-# 去没有补救办法——用户能装上一个你没发过的、签名却对得上的包。
+# root 交给 GitHub，而签名闸开发阶段也在这台机器上。
 #
-# 这个账号只能跑 /usr/local/sbin/rn-foundation-apply，换上去的二进制以
-# rnfoundation 身份运行而不是 root。CI 密钥被偷的最坏结果是"发了一版坏代码"，
-# 不是"整台机器没了"。
+# 这个账号只能跑 /usr/local/sbin/rn-foundation-apply，换上去的程序以 rnfoundation /
+# builder 身份运行而不是 root，脚本自己也不以 root 执行 CI 传来的二进制。但 CI 密钥
+# 被偷不只是"发了一版坏代码"：坏代码以那两个身份跑，读得到各自进程的配置与状态。
+# 签名闸同机期间打包机那一路必须关着，见 README.md。
 set -euo pipefail
 
 cd "$(dirname "$0")"

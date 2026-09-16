@@ -4,9 +4,9 @@
 # /usr/local/sbin/rn-foundation-apply，停服务、换二进制、跑迁移、健康检查、回滚
 # 都在那一个脚本里，这里只负责"编译 + 送过去"。
 #
-# 权限：CI 用的是 amos 上的 rndeploy 账号，它全部的 sudo 权限就是那个脚本。它读不到
-# /etc/rn-build-agent.env 里 Android keystore 的封装口令——这台机器同时是打包机，
-# 那把口令泄漏没有补救办法。别为了省事换成 ubuntu 账号，那是 NOPASSWD: ALL。
+# 权限：CI 用的是 amos 上的 rndeploy 账号，它全部的 sudo 权限就是那个脚本，脚本不以
+# root 执行 CI 传来的二进制。别为了省事换成 ubuntu 账号，那是 NOPASSWD: ALL——等于把
+# amos 的 root 交给 GitHub，而签名闸开发阶段也在这台机器上。
 name: Validate and deploy RN-Server to amos
 
 on:
@@ -67,9 +67,8 @@ jobs:
         # 扫链服务不单独编：它就是这个二进制的 `rn-server indexer` 子命令，
         # rn-foundation-apply 里换二进制时会连它一起停、一起起。
         #
-        # 打包机是另一个二进制，但**和服务端同一个 commit**：两边共用
-        # internal/backupcontainer / internal/backupbundle 和 /v1/build-agent 那套
-        # 契约，分开发的那天对不上的是备份容器格式，而发现它的时机是灾难当天
+        # 打包机是另一个二进制，和服务端同一个 commit 编出来；只有下面
+        # AMOS_DEPLOY_BUILD_AGENT 开着才会送上去
         run: |
           GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
             go build -trimpath -ldflags="-s -w" -o rn-server ./cmd/server
@@ -140,12 +139,11 @@ jobs:
 
       # ---- 打包机 ----------------------------------------------------------
       #
-      # **默认不开，而且不该随手开。** 这一步换掉的是以 builder 身份运行、读得到
-      # Android keystore 封装口令和 agent-key 的那个二进制。开了它，能往 main 推代码
-      # 的人就能在握着全平台签名密钥的机器上执行任意代码——而「服务端读不到签名密钥」
-      # 正是整套备份方案的前提（docs/design/platform-backup-recovery-2026-09-15.md §1）。
-      #
-      # 不开的时候照旧手工 scp，见 deploy/build-agent/README.md。
+      # **签名闸与 amos 同机期间必须关着**（docs/design/android-signing-gate-2026-09-16.md
+      # 「开发阶段的部署」「部署与运维」）。这一步换掉的是以 builder 身份运行的那个二进制：
+      # 开着它，能往 main 推代码或拿到 AMOS_SSH_KEY 的人，就能以 builder 身份在签名闸
+      # 所在的机器上执行任意代码。开关是仓库 Variables 里的 AMOS_DEPLOY_BUILD_AGENT，
+      # 不建或不是 'true' 即关；关着时打包机手工部署，见 deploy/build-agent/README.md。
       - name: Upload the build agent
         if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
         run: |

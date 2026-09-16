@@ -10,17 +10,18 @@
 # sudoers，任何一条带通配符的规则写松一点就等于给了 root（`mv * /etc/` 之类）。
 # 收口成一个脚本，攻击面就只剩这段代码。
 #
-# 这台机器同时是打包机，/etc/rn-build-agent.env 里有 Android keystore 的封装口令。
-# 部署账号除了这个脚本没有任何 sudo 权限，所以拿到 CI 密钥也读不到那把口令；脚本
-# 换上去的二进制以 rnfoundation 身份运行，不是 root。这两条是这套权限设计的全部
-# 意义，改 sudoers 之前先想清楚会不会把它们破坏掉。
+# 部署账号除了这个脚本没有任何 sudo 权限；脚本换上去的程序以非 root 身份运行
+# （服务端 rnfoundation、打包机 builder），脚本自己也**不以 root 执行**任何 CI 传来的
+# 二进制——打包机的冒烟同样降到 builder。改脚本或 sudoers 之前先想清楚会不会把这几条
+# 破坏掉。
 #
-# **build-agent 那条是有代价的，单独说清楚。** 它换掉的是**以 builder 身份运行、
-# 读得到那把封装口令和 agent-key** 的那个二进制。开了它，能往 main 推代码的人（或者
-# 拿到 CI 密钥的人）就能在握着全平台签名密钥的那台机器上执行任意代码——而"服务端
-# 读不到签名密钥"正是整套备份方案的前提。所以它在工作流里是**单独一个开关**
-# （AMOS_DEPLOY_BUILD_AGENT），默认不开；不开的时候还是手工 scp（见
-# deploy/build-agent/README.md）。开之前先确认这个交换你认。
+# 别把它理解成"拿到 CI 密钥就什么都碰不到"：换得了服务端二进制，就拿得到服务端进程的
+# 全部环境（数据库口令、STORAGE_MASTER_KEY）；换得了打包机二进制，就能以 builder 身份
+# 在这台机器上执行任意代码。
+#
+# **build-agent 那条因此单独说清楚。** 这台机器开发阶段还和签名闸同机
+# （docs/design/android-signing-gate-2026-09-16.md「开发阶段的部署」），同机期间工作流里的
+# AMOS_DEPLOY_BUILD_AGENT 必须关着，打包机手工部署（见 deploy/amos/README.md）。
 set -euo pipefail
 
 STAGE_ROOT=/var/lib/rn-foundation-deploy/incoming
@@ -29,7 +30,12 @@ BINARY=/opt/rn-foundation/rn-server
 PREVIOUS=/opt/rn-foundation/rn-server.prev
 AGENT_BINARY=/opt/rn-build-agent/build-agent
 AGENT_PREVIOUS=/opt/rn-build-agent/build-agent.prev
+# 打包机正式运行时的身份，冒烟也用它，不用 root
+AGENT_USER=builder
 ENV_FILE=/etc/rn-foundation.env
+# 打包机冒烟用的临时目录；非空时退出前删掉
+SMOKE_DIR=""
+trap '[ -z "$SMOKE_DIR" ] || rm -rf "$SMOKE_DIR"' EXIT
 
 log() { printf '   %s\n' "$*"; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -154,11 +160,7 @@ apply_admin() {
   log "$slug 控制台已更新"
 }
 
-# 打包机。它和服务端共用 internal/backupcontainer、internal/backupbundle 和
-# /v1/build-agent 那套契约，所以**和服务端同一个 commit 一起发**——分开发的那天，
-# 对不上的是备份容器格式，而发现它的时机是灾难当天。
-#
-# 和服务端不同的两件事：
+# 打包机。和服务端不同的两件事：
 #
 #  1. **不阻塞等它停。** 代理收到 SIGTERM 会先把手上那条构建做完（最长
 #     BUILD_AGENT_TIMEOUT_MINUTES，默认 45 分钟，unit 里 TimeoutStopSec=3600）。
@@ -171,14 +173,27 @@ apply_build_agent() {
   [ -s "$src" ] || die "暂存目录里没有 build-agent：$src"
   [ "$(head -c 4 "$src" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
     || die "$src 不是 ELF 可执行文件"
-  chmod 0755 "$src"
+  # 取数字 uid/gid：--regid 要的是组，账号的主组不一定和账号同名
+  local agent_uid agent_gid
+  agent_uid="$(id -u "$AGENT_USER" 2>/dev/null)" || die "没有 $AGENT_USER 账号，冒烟不能改用 root 跑"
+  agent_gid="$(id -g "$AGENT_USER")"
 
   # 冒烟：不带任何配置跑一下，它必须以 2 退出并抱怨配置不全。这不验业务，
   # 它验的是"这个二进制在这台机器上跑得起来"——架构不对、动态链接缺库都在这里露馅，
-  # 而不是换上去之后由 systemd 反复重启
+  # 而不是换上去之后由 systemd 反复重启。
+  #
+  # **不以 root 跑。** 这是 CI 传来的、还没审过的二进制，root 执行它等于能推 main 或
+  # 拿到 AMOS_SSH_KEY 的人拿到这台机器的 root。以它正式运行时的 builder 身份跑，
+  # 不继承附加组、不许再提权。先拷进 root 的目录再跑：暂存目录属 rndeploy，builder
+  # 未必进得去；换上去的也就是跑过冒烟的这一份
+  SMOKE_DIR="$(mktemp -d "$(dirname "$AGENT_BINARY")/.build-agent-smoke.XXXXXX")" \
+    || die "建不了冒烟用的临时目录"
+  chmod 0711 "$SMOKE_DIR"
+  install -m 0755 -o root -g root "$src" "$SMOKE_DIR/build-agent"
   local code=0
-  env -i "$src" >/dev/null 2>&1 || code=$?
-  [ "$code" = "2" ] || die "新的 build-agent 跑不起来（退出码 $code），不换"
+  setpriv --reuid="$agent_uid" --regid="$agent_gid" --clear-groups --no-new-privs \
+    env -i "$SMOKE_DIR/build-agent" >/dev/null 2>&1 || code=$?
+  [ "$code" = "2" ] || die "新的 build-agent 跑不起来（以 $AGENT_USER 身份，退出码 $code），不换"
 
   local before_pid
   before_pid="$(systemctl show -p MainPID --value rn-build-agent 2>/dev/null || echo 0)"
@@ -189,7 +204,7 @@ apply_build_agent() {
     rm -f "$AGENT_PREVIOUS"
   fi
   # 正在跑的进程握着旧 inode，install 不会打断它
-  install -m 0755 -o root -g root "$src" "$AGENT_BINARY"
+  install -m 0755 -o root -g root "$SMOKE_DIR/build-agent" "$AGENT_BINARY"
   rm -f "$src"
 
   log "请求重启（手上有构建的话会先把它做完）"

@@ -1,9 +1,11 @@
 # 装到 /etc/sudoers.d/rn-foundation-deploy（root:root 0440）。
 #
-# CI 部署账号全部的 sudo 权限就这一行。它换得了服务端二进制和控制台产物，但读不到
-# /etc/rn-foundation.env（数据库口令、STORAGE_MASTER_KEY）也读不到
-# /etc/rn-build-agent.env（Android keystore 的封装口令）——这台机器同时是打包机，
-# 那把口令配上库里的密文 keystore 就是完整的签名能力，泄漏没有补救办法。
+# CI 部署账号全部的 sudo 权限就这一行。它自己读不到 /etc/rn-foundation.env 和
+# /etc/rn-build-agent.env；脚本不以 root 执行 CI 传来的二进制。
+# 但它换得了服务端、控制台和打包机：换上去的程序以 rnfoundation / builder 身份运行，
+# 读得到各自进程的配置与状态。所以这一行等于"能以这两个身份在这台机器上执行任意
+# 代码"，不是"什么机密都碰不到"。签名闸与这台机器同机期间，打包机那一路
+# （工作流里的 AMOS_DEPLOY_BUILD_AGENT）必须关着，见 deploy/amos/README.md。
 #
 # 别把这行拆成 install/mv/rm/systemctl 的清单：带通配符的 sudoers 规则松一点就是
 # root（`mv * /etc/` 之类）。参数校验放在脚本里，攻击面收在一个文件上。
