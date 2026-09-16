@@ -15,10 +15,12 @@ import (
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/Helix2010/RN-Server/signing/pins"
 	"github.com/Helix2010/RN-Server/signing/pkcs12"
+	"github.com/Helix2010/RN-Server/signing/recovery"
 )
 
 func TestMain(m *testing.M) {
 	keyBits = 2048
+	scryptN = recovery.MinScryptN
 	os.Exit(m.Run())
 }
 
@@ -316,6 +318,10 @@ func TestUsage(t *testing.T) {
 		"positional":     {"seal", "extra"},
 		"seal no p12":    {"seal", "--pins", "p", "--password-file", "f", "--tenant", "AnyFun", "--package", "com.a.b"},
 		"help is usage2": {"create", "-h"},
+		"recovery-key":   {"recovery-key"},
+		"recovery-key x": {"recovery-key", "generate", "--out", "d", "--name", "n"},
+		"recovery flags": {"recovery-key", "create", "--name", "platform-recovery"},
+		"recover flags":  {"recover", "--upload", "u"},
 	} {
 		code, stdout, stderr := runTool(args...)
 		if code != 2 || !strings.Contains(stderr, "用法") || stdout != "" {

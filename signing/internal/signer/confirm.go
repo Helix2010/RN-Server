@@ -39,7 +39,7 @@ func Confirm(ctx context.Context, env OperatorEnv, tenantSlug string) error {
 	}
 	var items []CheckItem
 	for _, item := range resp.Items {
-		if item.TenantSlug == tenantSlug {
+		if item.TenantSlug == tenantSlug && item.Box != nil {
 			items = append(items, item)
 		}
 	}
@@ -58,7 +58,7 @@ func Confirm(ctx context.Context, env OperatorEnv, tenantSlug string) error {
 	}
 
 	// 第 2 步：本机私钥解开，自己算证书指纹
-	material, err := openKeystore(item.Box, env.Keys, expectedIdentity{tenantSlug, item.PackageName, item.CertificateSHA256})
+	material, err := openKeystore(*item.Box, env.Keys, expectedIdentity{tenantSlug, item.PackageName, item.CertificateSHA256})
 	if err != nil {
 		return fmt.Errorf("the keystore sent to this signing gate is unusable: %w", err)
 	}
@@ -245,7 +245,11 @@ func Confirm(ctx context.Context, env OperatorEnv, tenantSlug string) error {
 	if err != nil {
 		return err
 	}
-	if err := env.API.ReportChecks(ctx, role.Role, []CheckReport{report}); err != nil {
+	trust, err := LocalTrust(env.Keys, env.Store)
+	if err != nil {
+		return err
+	}
+	if err := env.API.ReportChecks(ctx, role.Role, trust, []CheckReport{report}); err != nil {
 		printf(t, "  ! reporting the confirmation to the server failed (%v); `signer run` reports it within a minute\n", cleanText(err.Error(), 200))
 	} else {
 		printf(t, "  ✓ reported to the server; `signer run` performs the trial signature next\n")
@@ -264,7 +268,7 @@ func validateServerItem(item CheckItem) (*trustroots.Roots, error) {
 		return nil, errors.New("certificateSha256")
 	case !ident.ValidKeyAlias(item.KeyAlias):
 		return nil, errors.New("keyAlias")
-	case item.Box.ValidateShape() != nil:
+	case item.Box == nil || item.Box.ValidateShape() != nil:
 		return nil, errors.New("box")
 	}
 	if item.TrustRoots == nil {

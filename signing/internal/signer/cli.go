@@ -18,17 +18,24 @@ import (
 )
 
 const usageText = `用法 / usage:
+  signer enroll         --server URL --code rne_… --env-file FILE --recovery-sha256 HEX [--name-check NAME]
+                                            新机器注册（install.sh 以 root 执行）
   signer run            [--env-file FILE]   签名闸主进程（systemd 启动）
   signer show-key       [--env-file FILE]   打印本机公钥与 pin 文件片段（只读）
   signer confirm        --tenant SLUG [--env-file FILE]
+  signer trust-peer     --peer NAME [--env-file FILE]
+  signer trust-peer     --revoke --peer NAME --reason TEXT [--env-file FILE]
+  signer trust-recovery [--env-file FILE]
+  signer trust-recovery --revoke --recovery-sha256 HEX --reason TEXT [--env-file FILE]
+  signer trust-builder  --builder NAME [--env-file FILE]
   signer trust-builder  --builder-id ID --name NAME [--env-file FILE]
   signer trust-builder  --revoke --builder-id ID --reason TEXT [--env-file FILE]
   signer promote        (--import OLD_PRIMARY_SIGNED_JSONL | --manual | --first) [--env-file FILE]
   signer abandon        --job ID --reason TEXT [--env-file FILE]
   signer list           [--env-file FILE]
 
-没有 --env-file 时从进程环境读 SIGNER_* 配置。confirm、trust-builder、promote、abandon
-必须由运维在交互终端里执行。`
+没有 --env-file 时从进程环境读 SIGNER_* 配置。confirm、trust-peer、trust-recovery、trust-builder、
+promote、abandon 必须由运维在交互终端里执行。`
 
 // ExitTokenRejected 是服务端不再接受本机令牌（401 MACHINE_REVOKED / MACHINE_AUTH_REQUIRED）时
 // signer run 的退出码（sysexits 的 EX_CONFIG）。rn-signer-*.service 用 RestartPreventExitStatus=78
@@ -65,16 +72,32 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 	manual := fs.Bool("manual", false, "")
 	first := fs.Bool("first", false, "")
 	job := fs.String("job", "", "")
+	peer := fs.String("peer", "", "")
+	builder := fs.String("builder", "", "")
+	recoverySHA := fs.String("recovery-sha256", "", "")
+	server := fs.String("server", "", "")
+	code := fs.String("code", "", "")
+	nameCheck := fs.String("name-check", "", "")
+	if cmd == "enroll-init" {
+		// 隐藏子命令：root 的 signer enroll 以签名闸用户身份启动，stdin 一行 JSON
+		if len(rest) != 0 {
+			return 2
+		}
+		return EnrollInitMain(stdin, stdout, stderr)
+	}
 	if err := fs.Parse(rest); err != nil || fs.NArg() != 0 {
 		fmt.Fprintln(stderr, usageText)
 		return 2
 	}
 	allowed := map[string][]string{
 		"run": {"env-file"}, "show-key": {"env-file"}, "list": {"env-file"},
-		"confirm":       {"env-file", "tenant"},
-		"trust-builder": {"env-file", "builder-id", "name", "revoke", "reason"},
-		"promote":       {"env-file", "import", "manual", "first"},
-		"abandon":       {"env-file", "job", "reason"},
+		"enroll":         {"env-file", "server", "code", "recovery-sha256", "name-check"},
+		"confirm":        {"env-file", "tenant"},
+		"trust-peer":     {"env-file", "peer", "revoke", "reason"},
+		"trust-recovery": {"env-file", "revoke", "recovery-sha256", "reason"},
+		"trust-builder":  {"env-file", "builder", "builder-id", "name", "revoke", "reason"},
+		"promote":        {"env-file", "import", "manual", "first"},
+		"abandon":        {"env-file", "job", "reason"},
 	}
 	flagsFor, ok := allowed[cmd]
 	if !ok {
@@ -94,6 +117,15 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 	if badFlag {
 		fmt.Fprintln(stderr, usageText)
 		return 2
+	}
+	if cmd == "enroll" {
+		// enroll 自己读写 env 文件（里面还没有令牌），不走下面的配置加载
+		err := Enroll(context.Background(), EnrollOptions{ServerURL: *server, Code: *code, EnvFile: *envFile, RecoverySHA256: *recoverySHA, NameCheck: *nameCheck},
+			NewHTTPClient(*server, "", newTransport()), newRootHost(), stdout)
+		if err != nil {
+			fmt.Fprintln(stderr, "错误:", cleanText(err.Error(), 2000))
+		}
+		return exitCode(err)
 	}
 	if *envFile != "" {
 		values, err := ReadEnvFile(*envFile)
@@ -117,18 +149,48 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 			return Confirm(context.Background(), env, *tenant)
 		})
 	case "trust-builder":
-		if *revoke {
-			if *name != "" {
+		switch {
+		case *revoke:
+			if *name != "" || *builder != "" {
 				fmt.Fprintln(stderr, usageText)
 				return 2
 			}
 			err = withOperator(stdin, getenv, NeedLocal, shared, func(env OperatorEnv) error { return RevokeBuilder(env, *builderID, *reason) })
-		} else {
+		case *builder != "":
+			if *reason != "" || *builderID != "" || *name != "" {
+				fmt.Fprintln(stderr, usageText)
+				return 2
+			}
+			err = withOperator(stdin, getenv, NeedServer, shared, func(env OperatorEnv) error {
+				return TrustBuilderByName(context.Background(), env, *builder)
+			})
+		default:
 			if *reason != "" {
 				fmt.Fprintln(stderr, usageText)
 				return 2
 			}
 			err = withOperator(stdin, getenv, NeedLocal, shared, func(env OperatorEnv) error { return TrustBuilder(env, *builderID, *name) })
+		}
+	case "trust-peer":
+		if *revoke {
+			err = withOperator(stdin, getenv, NeedLocal, shared, func(env OperatorEnv) error { return RevokePeer(env, *peer, *reason) })
+		} else {
+			if *reason != "" {
+				fmt.Fprintln(stderr, usageText)
+				return 2
+			}
+			err = withOperator(stdin, getenv, NeedServer, shared, func(env OperatorEnv) error { return TrustPeer(context.Background(), env, *peer) })
+		}
+	case "trust-recovery":
+		if *revoke {
+			err = withOperator(stdin, getenv, NeedLocal, shared, func(env OperatorEnv) error { return RevokeRecovery(env, *recoverySHA, *reason) })
+		} else {
+			// 指纹从密码管理器粘贴进终端，不走命令行参数
+			if *reason != "" || *recoverySHA != "" {
+				fmt.Fprintln(stderr, usageText)
+				return 2
+			}
+			err = withOperator(stdin, getenv, NeedServer, shared, func(env OperatorEnv) error { return TrustRecovery(context.Background(), env) })
 		}
 	case "promote":
 		modes := 0
@@ -160,7 +222,7 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 type runLockMode bool
 
 const (
-	// shared：记录文件自带多进程锁，可以与 signer run 同时执行（confirm、trust-builder）。
+	// shared：记录文件自带多进程锁，可以与 signer run 同时执行（confirm、trust-builder、trust-peer、trust-recovery）。
 	shared runLockMode = false
 	// exclusive：与正在处理任务的 signer run 有竞争（abandon 可能释放它手上的预留，
 	// promote 改角色并导入记录），必须先停服务、拿到运行锁。

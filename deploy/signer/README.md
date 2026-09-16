@@ -1,29 +1,229 @@
-# 签名闸部署与运维（人工）
+# 签名闸部署与运维
 
-设计：`docs/design/android-signing-gate-2026-09-16.md`「签名闸」「密钥生成与上传」「部署与运维」。
+设计：`docs/design/android-signing-gate-2026-09-16.md`（原设计）、`docs/design/android-signing-gate-automation-2026-09-16.md`
+（部署与换密钥自动化，下称“自动化设计”）。
 
-签名闸**只人工部署**：从审阅过的 tag 用固定工具链构建，二进制 sha256 记进离线记录，root 手工安装。
-`rn-foundation-apply`、CI 部署账号 `rndeploy` 不得触及 `/opt/rn-signer`、`/etc/rn-signer-*`、
-`/var/lib/rn-signer-*` 任何路径。开发阶段主（A）备（B）都在 amos 上，各用独立系统用户；这挡得住同机
-非 root 用户，挡不住 root（取舍见设计「开发阶段的部署」）。
+两种装法并存：
 
-下面的命令都在**你自己的终端**里执行。令牌、口令不要经过 Claude Code 的 `!`、聊天、工单或截图。
+- **新机器：一条命令 + 控制台接受**（第 A–D 节）。安装包由服务端下发，`install.sh` 按实例名渲染
+  `templates/` 里的 unit 与 env，`signer enroll` 用一次性注册码换令牌。unit 名 `rn-signer-<实例>.service`。
+- **手工流程**（第 1–11 节）：amos 上已经在跑的 `amos-signer-a`、`amos-signer-b` 按它装好，unit 名
+  `rn-signer-a/b.service`、`/etc/rn-signer-a/b.env` 不改；迁移到新流程只补信任记录（第 E 节）。
+
+不管哪种装法，签名闸信什么（角色、受信签名闸与构建机、恢复公钥、确认过的租户与信任根、签过的版本号）
+都只在它自己的本机记录里；服务端被攻破也改不了。`rn-foundation-apply`、CI 部署账号 `rndeploy`
+不得触及已安装的 `/opt/rn-signer`、`/etc/rn-signer-*`、`/var/lib/rn-signer-*`：已经在运行的签名闸不从服务端自动升级。
+
+下面的命令都在**你自己的终端**里执行。令牌、口令、注册码不要经过 Claude Code 的 `!`、聊天、工单或截图。
 
 ## 文件
 
 | 文件 | 安装到 | 属主 / 权限 |
 | --- | --- | --- |
 | `signer`、`signer-check`（构建产物） | `/opt/rn-signer/bin/` | root:root 0755 |
-| `rn-signer-a.service`、`rn-signer-b.service` | `/etc/systemd/system/` | root:root 0644 |
-| `rn-signer-a-check.socket`、`rn-signer-a-check@.service`（b 同理） | `/etc/systemd/system/` | root:root 0644 |
-| `rn-signer.env.example` → `rn-signer-a.env`、`rn-signer-b.env` | `/etc/` | root:rn-signer-a 0640（b 同理） |
+| `templates/rn-signer-@INSTANCE@.service`、`…-check.socket`、`…-check@.service` | `/etc/systemd/system/`（`@INSTANCE@` 换成实例名） | root:root 0644 |
+| `templates/rn-signer-@INSTANCE@.env` | `/etc/rn-signer-<实例>.env` | root:rn-signer-<实例> 0640 |
+| `rn-signer-a.service`、`rn-signer-b.service`（手工流程） | `/etc/systemd/system/` | root:root 0644 |
+| `rn-signer-a-check.socket`、`rn-signer-a-check@.service`（b 同理，手工流程） | `/etc/systemd/system/` | root:root 0644 |
+| `rn-signer.env.example` → `rn-signer-a.env`、`rn-signer-b.env`（手工流程） | `/etc/` | root:rn-signer-a 0640（b 同理） |
 | apksigner.jar 副本 | `/opt/rn-signer/build-tools/35.0.0/lib/apksigner.jar` | root:root 0644，上级目录 0755 |
 | 本 README | `/opt/rn-signer/README.md` | root:root 0644 |
 
-状态目录 `/var/lib/rn-signer-a`（本机私钥、`trust.jsonl`、`signed.jsonl`）与运行时目录 `/run/rn-signer-a`
-（tmpfs，明文 keystore 只出现在这里，签完即删）由 systemd 按 unit 创建，0700，属于 `rn-signer-a`。
+状态目录 `/var/lib/rn-signer-<实例>`（本机私钥、`trust.jsonl`、`signed.jsonl`）与运行时目录 `/run/rn-signer-<实例>`
+（tmpfs，明文 keystore 只出现在这里，签完即删）0700，属于 `rn-signer-<实例>`。
+
+## A. 新机器：一条命令 + 控制台接受
+
+前提：平台已经登记了离线恢复公钥（第 C 节）；没有登记时控制台不允许新建签名闸。
+
+1. 控制台「平台维护 → 打包机与签名闸」新建签名闸（名字、主或备），得到一次性安装命令（60 分钟有效，
+   只能用一次，过期在控制台重发）：
+
+   ```bash
+   curl -fsSL https://api.anyfun.win/v1/machine-setup/install.sh | sudo bash -s -- \
+     --server https://api.anyfun.win --code rne_… --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>
+   ```
+
+   `--recovery-sha256` 从密码管理器粘贴，**不取控制台显示的值**。生产环境再加 `--expect-sha256 <安装包清单 sha256>`，
+   先与 CI 构建日志核对。
+
+2. 在服务器本机执行这条命令。`install.sh` 检查前提（systemd、JDK 17、tmpfs 的 `/run`）、下载并核对安装包、
+   建系统用户 `rn-signer-<实例>`（实例名默认取机器名，用户名最长 32 字符）、渲染 `templates/` 里的 unit 与 env，
+   然后以 root 执行：
+
+   ```bash
+   /opt/rn-signer/bin/signer enroll --server https://api.anyfun.win --code rne_… \
+     --env-file /etc/rn-signer-<实例>.env --recovery-sha256 <指纹> [--name-check <机器名>]
+   ```
+
+   `signer enroll` 做这几件事：
+
+   - 核对 env 文件是 root 所有、属组是签名闸用户组、组不可写；状态目录不存在就以签名闸用户建 0700；
+   - 查询注册码（不消耗），核对 `--recovery-sha256` 是服务端登记的一把恢复公钥、机器名与主备；
+   - **以签名闸用户身份**生成本机两把私钥与本机记录，写入初始角色（服务端给的主或备，`mode enroll`）、
+     受信恢复公钥（`mode enroll`）；备签名闸还**首次信任**服务端给的当前主签名闸（`mode enroll-first-trust`）；
+   - 用注册码换长期机器令牌，**直接原子替换 env 文件**写进 `SIGNER_SERVER_URL`、`SIGNER_NAME`、`SIGNER_MACHINE_TOKEN`
+     （令牌不经过屏幕，env 里其余行原样保留）；
+   - 打印机器名、X25519 与 Ed25519 完整指纹，以及下一步。
+
+   重复执行是安全的：已经注册过（env 有令牌、本机记录已初始化）直接退出 0；换令牌之前中断会留下
+   `enroll.incomplete`，这时 `signer run` 拒绝启动，在控制台重发注册码后重跑即可（那套没换到令牌的密钥会被清掉重来）。
+   状态目录里已经有本机记录、env 却没有令牌（例如手工装过的机器）时拒绝，按新机器处理。
+
+3. 控制台机器卡片显示待接受的完整指纹：与安装输出**逐位**核对后点「接受」。接受只影响服务端路由。
+
+4. 在签名闸本机补信任（下一节）：新备签名闸要让主签名闸 `trust-peer` 它；构建机要让每台签名闸 `trust-builder`。
+
+出站地址：模板不写死 `IPAddressDeny/Allow`。上线后按 API 与 DNS 解析器地址加 drop-in
+`/etc/systemd/system/rn-signer-<实例>.service.d/network.conf` 收紧（与服务端同机走回环时写 `IPAddressAllow=localhost`）。
+
+## B. 签名闸之间的信任、构建机信任
+
+主签名闸生成的新密钥**只加密给本机信任的签名闸**（本机默认信任自己）和本机信任的恢复公钥；备签名闸只自动接受
+**本机信任的签名闸**签过生成签名的密钥。服务端多登记一台签名闸，新密钥也不会加密给它。
+
+**主签名闸信任新备**（在主签名闸本机，交互终端）：
+
+```bash
+sudo -u rn-signer-<主实例> /opt/rn-signer/bin/signer trust-peer --peer <新备机器名> --env-file /etc/rn-signer-<主实例>.env
+```
+
+程序从服务端取这台签名闸已接受的公钥，先只显示机器 id 与主备；粘贴**新机器安装输出里**的 X25519 与 Ed25519 完整指纹，
+与服务端已接受的一致才写入。已有租户的密钥不会自动补加密给新备：对每个租户在控制台点一次「生成签名密钥」（换证书），
+或者从恢复密钥解出原件后 `seal` 重新加密（第 C 节）。
+
+**备签名闸信任主**：装备签名闸时 `enroll` 已首次信任当时的主签名闸。以后换了主签名闸，在每台备上
+`signer trust-peer --peer <新主>`。
+
+**撤销**：`signer trust-peer --revoke --peer <机器名> --reason "…"`。
+
+**信任构建机**（每台签名闸本机都要做）：
+
+```bash
+sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-builder --builder <构建机机器名> --env-file /etc/rn-signer-<实例>.env
+```
+
+机器 id 与出处公钥从服务端取，粘贴构建机安装输出里的出处公钥 sha256，一致才写入。旧写法
+`--builder-id mch_… --name …`（粘贴两次）照常可用。
+
+两台签名闸在同一台机器上（开发阶段 amos）时，分别以两个用户各执行一次（主信任备、备信任主）。
+
+`trust-peer`、`trust-recovery`、`trust-builder`、`confirm` 可以与正在运行的 `signer run` 同时执行；
+`signer list` 显示本机的全部信任。
+
+## C. 离线恢复密钥（整个平台一次）
+
+取代“每个租户的原件进 U 盘”：签名闸生成的每把租户密钥都加密给恢复公钥，签名闸全部丢失时用恢复私钥解开。
+
+**生成**（离线机器，交互终端；口令手输两遍、不回显，非终端拒绝）：
+
+```bash
+build-keystore recovery-key create --out /media/usb1/rn-recovery --name platform-recovery-2026
+```
+
+- 写出 `recovery-private.key`（口令加密，scrypt N=2^17 + AES-256-GCM，0600）与 `recovery-public.json`，打印完整 sha256。
+- 口令与恢复公钥 sha256 记进密码管理器；`recovery-private.key` 放两个离线 U 盘（与 `STORAGE_MASTER_KEY` 的加密包一起）。
+
+**登记**：控制台「平台维护 → 签名闸恢复密钥」粘贴 `recovery-public.json` 的内容。
+
+**签名闸信任**：新机器由安装命令的 `--recovery-sha256` 写入；已经在运行的签名闸在本机：
+
+```bash
+sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-recovery --env-file /etc/rn-signer-<实例>.env
+```
+
+粘贴密码管理器里的恢复公钥 sha256，服务端有这把公钥、未吊销、公钥与指纹一致才写入。更换恢复密钥：先登记新的、
+每台签名闸 `trust-recovery` 新的，再 `signer trust-recovery --revoke --recovery-sha256 <旧指纹> --reason "…"`
+（撤销时再粘贴一次旧指纹确认）。
+
+**恢复**（签名闸全部丢失）：
+
+1. 控制台租户「打包与签名 → 导出密文文件」，把导出的 JSON 拷到离线机器。
+2. 离线机器：
+
+   ```bash
+   build-keystore recover --recovery-key /media/usb1/rn-recovery/recovery-private.key \
+     --upload AnyFun-keystore-export.json --out-dir ./anyfun-recovered
+   ```
+
+   输入恢复口令后解出 `<别名>.p12`、`<别名>.password`、`certificate.pem`（目录 0700、文件 0600）。程序核对明文与密文文件的
+   租户、包名、别名、证书一致，PKCS#12 用口令与别名打得开，证书 sha256 与密文文件一致。
+3. 核对证书 sha256 与离线记录一致后，按第 7 节 `build-keystore seal --pins <新 pin 文件> …` 加密给新签名闸，
+   控制台「导入已有密钥（高级）」上传，新签名闸 `signer confirm`。
+
+## D. 换密钥：控制台一键
+
+控制台租户「打包与签名」点「生成签名密钥」。主签名闸（本机记录是主）在下一轮 `keystore-checks`（一分钟内）处理：
+
+- **包名在本机从没确认过**：首次信任服务端的信任根，minSdk/targetSdk 下限 24/28；
+- **已确认且服务端信任根摘要与记录相同**：沿用本机确认的信任根与 SDK 下限，只换证书；
+- 首签 versionCode 上限：本机对这个包名签过就取历史最大值 + 100，否则取服务端已发布的最大 build 号 + 100；
+- 生成 RSA 4096，只加密给本机、本机信任且服务端 active 的签名闸、本机信任且服务端未吊销的恢复公钥，签生成签名交回；
+  服务端接受后本机写自动确认（`signer list` 里 `confirmedBy` 为 `auto:first-generation` 或 `auto:regenerated`）。
+- 主签名闸这次确认用的信任根摘要、SDK 下限、首签上限，以及被替换的证书（首次生成为空）写进每份密文的明文里。
+  密文被生成签名覆盖，服务端改不了。
+
+生成失败时控制台显示签名闸报回的原因：
+
+| 原因 | 怎么办 |
+| --- | --- |
+| `TRUST_ROOTS_CHANGED` | 租户改了 API 地址、scheme、OTA 证书等（或包名换了租户）：先在主签名闸 `signer confirm --tenant …`，再点生成 |
+| `RECOVERY_KEY_NOT_PINNED` | 主签名闸没有信任恢复公钥，或它信任的恢复公钥在服务端被吊销：`signer trust-recovery` |
+| `NOT_LOCAL_PRIMARY` | 控制台路由的主签名闸本机记录不是主：`signer promote`，或在控制台切回 |
+| `GENERATION_FAILED` | 看 detail（服务端拒收、信任根格式不对等）与主签名闸 journal |
+
+**备签名闸**在 `keystore-checks` 里拿到新密文时自动接受。条件：
+
+- 生成者是本机信任的签名闸，生成签名验证通过；
+- 签名覆盖的上传文件里，正是发给本机的这一份；
+- 这张证书没为这个包名确认过；
+- 按密文里主签名闸写下的参数核对：
+  - 本机已有确认时，被替换的证书必须是本机当前的证书，信任根摘要必须与本机相同。这样可以挡住服务端重放更早的一次生成，
+    也挡住主备信任根不一致的情况。确认沿用本机的信任根与 SDK 下限。
+  - 本机没有确认时（新加的备），服务端给的信任根摘要必须等于主签名闸确认的摘要。确认采用主签名闸的 SDK 下限与首签上限。
+
+写入的确认记为 `auto:peer-generated:<主签名闸机器名>`。不满足时，控制台检查项显示原因，仍可在本机 `signer confirm`。
+
+以下情况需要人工处理：
+- 备签名闸离线期间主签名闸换了两次密钥：服务端只保留最新一份，它替换的不是备本机的证书，所以不会自动接受，
+  要在备上 `signer confirm`。
+- 离线导入的密钥（没有生成签名）：照旧 `signer confirm`。
+
+## E. amos 现有部署迁移
+
+`amos-signer-a`（主）、`amos-signer-b`（备）不重装，unit 名与 `/etc/rn-signer-a/b.env` 不改：
+
+1. **先部署服务端**（`keystore-checks` 接受 `trust`、有 `/v1/signer/peers` 与生成接口的版本）：新签名闸每轮上报都带
+   `trust`，旧服务端按严格解码会拒收，控制台就收不到检查结果。然后按第 1、2 节构建并替换 `/opt/rn-signer/bin/signer`、
+   `signer-check`（新版本能读现有本机记录），`systemctl restart rn-signer-a rn-signer-b`，journal 里 `local records verified` 正常、
+   没有 `keystore checks failed`。
+2. 离线生成恢复密钥（第 C 节），控制台登记。
+3. 两台都信任恢复公钥：
+
+   ```bash
+   sudo -u rn-signer-a /opt/rn-signer/bin/signer trust-recovery --env-file /etc/rn-signer-a.env
+   sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-recovery --env-file /etc/rn-signer-b.env
+   ```
+
+4. 互相信任（指纹取各自 `signer show-key` 的输出，不取控制台）：
+
+   ```bash
+   sudo -u rn-signer-b /opt/rn-signer/bin/signer show-key --env-file /etc/rn-signer-b.env   # 记下 B 的两个指纹
+   sudo -u rn-signer-a /opt/rn-signer/bin/signer trust-peer --peer amos-signer-b --env-file /etc/rn-signer-a.env
+   sudo -u rn-signer-a /opt/rn-signer/bin/signer show-key --env-file /etc/rn-signer-a.env   # 记下 A 的两个指纹
+   sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-peer --peer amos-signer-a --env-file /etc/rn-signer-b.env
+   ```
+
+5. `signer list` 核对两台的 `trusted signing gates`、`trusted recovery keys`，抄录记录文件行数与末行哈希（第 8 节）。
+   注意：本机记录写入新类型（受信签名闸、恢复公钥、自动确认）之后，旧版 `signer` 会以 unknown record type 拒绝启动，
+   二进制不能再退回旧版本。
+   控制台机器卡片的 `reportedTrust` 不再提示缺信任。
+6. 控制台对 AnyFun、Predict 各点一次「生成签名密钥」；两台检查项都显示已确认、主试签通过后，排第一个新签名的安装包，
+   按上线手册验证并发布。
 
 ## 1. 构建（离线记录二进制 sha256）
+
+以下第 1–11 节是手工流程；第 1 节的构建、第 7–11 节的日常与故障两种装法通用。
 
 ```bash
 git fetch --tags && git checkout <审阅过的 tag>
@@ -67,6 +267,8 @@ systemd-analyze verify /etc/systemd/system/rn-signer-a.service /etc/systemd/syst
 ```
 
 ## 3. 登记机器、写配置
+
+> 控制台现在新建机器时给一次性安装命令，不再显示长期令牌：新机器按第 A 节装。本节保留为 amos 现有两台的装法记录。
 
 1. 平台管理员在控制台「平台维护 → 打包机与签名闸」新建两台签名闸：`amos-signer-a`（primary）、
    `amos-signer-b`（standby）。令牌只显示一次。
@@ -240,6 +442,11 @@ journalctl -u rn-signer-a -u 'rn-signer-a-check@*'
 - **临时错误**（reject transient，签名编号到 2 判失败）：`CHECKER_FAILED`、`DOWNLOAD_FAILED`、`UNSIGNED_CHANGED_BEFORE_SIGNING`、
   `RUNTIME_FILES_FAILED`、`APKSIGNER_FAILED`、`SIGNED_VERIFY_FAILED`、`UPLOAD_FAILED`、`UPLOAD_MISMATCH`、`COMPLETE_FAILED`
 
+生成与自动接受（第 D 节）的日志：`generating a keystore`、`generated keystore accepted by the server and confirmed locally`、
+`keystore generation refused`（带 code）、`accepted a keystore generated by a trusted signing gate`、
+`a generated keystore was not accepted automatically`（带原因）、`a trusted signing gate is not active on the server …`
+（受信的签名闸在服务端不是 active，这次新密钥没加密给它）。
+
 服务端的几个错误码由签名闸自己处理：`SIGNED_ARTIFACT_REPLACED` 原地重新 complete；`SIGNED_ARTIFACT_MISSING`
 重新上传（最多 3 轮）；`UPLOAD_STORAGE_FAILED`、`UPLOAD_INTERRUPTED` 原地重试上传。
 
@@ -358,6 +565,10 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer list --env-file /etc/rn-signer-a.e
 
 ## 10. 故障
 
+- **启动报 `enrollment did not finish (enroll.incomplete)`**：`signer enroll` 在换到令牌之前中断。在控制台重发注册码，
+  重跑安装命令。
+- **`signer enroll` 报 `already holds machine keys and local records`**：状态目录已经有本机记录（手工装过、或复用了目录），
+  不会重新初始化；确认这台机器的记录不再需要之后按新机器处理（新实例名、新状态目录）。
 - **启动报 `records: the last line of a record file is incomplete`**：断电或崩溃截断了最后一行。先
   `tail -c 2000 /var/lib/rn-signer-a/signed.jsonl` 看清是哪一条；预留在解密之前落盘，一条没写完的预留意味着
   那次签名没有发生。确认后把**只含那半行**的尾部截掉（`truncate -s <最后一个完整换行之后的字节数>`），其余行一个字节都不要改，

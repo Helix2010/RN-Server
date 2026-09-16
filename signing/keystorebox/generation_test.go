@@ -125,3 +125,38 @@ func TestParseUploadIsStrict(t *testing.T) {
 		t.Fatal("BoxFor found a box for an unknown recipient")
 	}
 }
+
+func TestPlaintextGenerationBinding(t *testing.T) {
+	a := newKey(t)
+	p := samplePlaintext(a)
+	p.Generation = &Generation{TrustRootsDigest: strings.Repeat("cd", 32), MinSDK: 24, TargetSDK: 28, FirstSignMaxVersionCode: 157}
+	box, err := Seal(p, a.PublicKey().Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Open(box, a.Bytes())
+	if err != nil || got.Generation == nil || *got.Generation != *p.Generation {
+		t.Fatalf("round trip: %+v %v", got.Generation, err)
+	}
+	if !strings.Contains(got.String(), "firstSignMaxVersionCode=157") || strings.Contains(got.String(), sentinelStore) {
+		t.Fatalf("String: %s", got.String())
+	}
+	for name, g := range map[string]Generation{
+		"digest":            {TrustRootsDigest: "x", MinSDK: 24, TargetSDK: 28, FirstSignMaxVersionCode: 1},
+		"target below min":  {TrustRootsDigest: strings.Repeat("cd", 32), MinSDK: 28, TargetSDK: 24, FirstSignMaxVersionCode: 1},
+		"cap":               {TrustRootsDigest: strings.Repeat("cd", 32), MinSDK: 24, TargetSDK: 28},
+		"supersedes format": {TrustRootsDigest: strings.Repeat("cd", 32), MinSDK: 24, TargetSDK: 28, FirstSignMaxVersionCode: 1, SupersedesCertificateSHA256: "AB"},
+		"supersedes itself": {TrustRootsDigest: strings.Repeat("cd", 32), MinSDK: 24, TargetSDK: 28, FirstSignMaxVersionCode: 1, SupersedesCertificateSHA256: p.CertificateSHA256},
+	} {
+		bad := samplePlaintext(a)
+		bad.Generation = &g
+		if _, err := Seal(bad, a.PublicKey().Bytes()); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// 离线工具产出的明文没有 generation 字段
+	raw, _ := json.Marshal(wirePlaintext(samplePlaintext(a)))
+	if strings.Contains(string(raw), "generation") {
+		t.Fatalf("a plaintext without generation serializes the field: %s", raw)
+	}
+}

@@ -36,6 +36,8 @@ const (
 	testMachine   = "amos-signer-a"
 	serverAlias   = "server-claims-this-alias"
 	testReleaseID = "rel_fixtureRELEASE01"
+	// 测试用注册码（格式合法，不是机密）
+	testEnrollCode = "rne_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"
 )
 
 var (
@@ -54,6 +56,32 @@ func sharedTenantKey(t testing.TB) releasekey.Result {
 		t.Fatal(tenantKeyErr)
 	}
 	return tenantKey
+}
+
+var (
+	releaseKeyPoolMu   sync.Mutex
+	releaseKeyPool     = map[string][]releasekey.Result{}
+	releaseKeyPoolNext = map[string]int{}
+)
+
+const releaseKeyPoolSize = 3
+
+// pooledReleaseKey 按别名维护一个 3 把 RSA 2048 密钥的池子，轮流返回。
+func pooledReleaseKey(p releasekey.Params) (releasekey.Result, error) {
+	releaseKeyPoolMu.Lock()
+	defer releaseKeyPoolMu.Unlock()
+	if len(releaseKeyPool[p.Alias]) < releaseKeyPoolSize {
+		p.KeyBits = 2048
+		r, err := releasekey.Generate(p)
+		if err != nil {
+			return releasekey.Result{}, err
+		}
+		releaseKeyPool[p.Alias] = append(releaseKeyPool[p.Alias], r)
+		return r, nil
+	}
+	i := releaseKeyPoolNext[p.Alias] % releaseKeyPoolSize
+	releaseKeyPoolNext[p.Alias]++
+	return releaseKeyPool[p.Alias][i], nil
 }
 
 // ---- 假服务端（约定 5.3）----
@@ -97,11 +125,23 @@ type fakeServer struct {
 	claimTimes    []time.Time
 	releases      []call
 	rejects       []call
+
+	trusts       []TrustReport               // 每次上报带的 trust
+	peers        PeersResponse               // GET /v1/signer/peers
+	peersStatus  int                         // 非 0 时 peers 返回这个错误码
+	submissions  map[string]GenerationSubmit // requestId → 交回的生成结果
+	submitCalls  int
+	submitStatus map[string]problem // requestId → 交回时返回的错误
+	failures     []call             // 生成失败上报（Job=requestId）
+	describe     map[string]any     // POST /v1/machine-setup/describe 的响应；nil 时 404
+	enrollToken  string
+	enrolls      []map[string]string
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
 	f := &fakeServer{t: t, keyStatus: "active", apks: map[string][]byte{}, headerSHA: map[string]string{}, heartbeats: map[string]int{},
-		staleJobs: map[string]bool{}, uploads: map[string][]byte{}, uploadCount: map[string]int{}, completeFails: map[string][]problem{}}
+		staleJobs: map[string]bool{}, uploads: map[string][]byte{}, uploadCount: map[string]int{}, completeFails: map[string][]problem{},
+		submissions: map[string]GenerationSubmit{}, submitStatus: map[string]problem{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/signer/public-key", f.publicKey)
 	mux.HandleFunc("GET /v1/signer/keystore-checks", f.getChecks)
@@ -113,7 +153,20 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("POST /v1/signer/jobs/{id}/complete", f.complete)
 	mux.HandleFunc("POST /v1/signer/jobs/{id}/release", f.release)
 	mux.HandleFunc("POST /v1/signer/jobs/{id}/reject", f.reject)
+	mux.HandleFunc("GET /v1/signer/peers", f.getPeers)
+	mux.HandleFunc("POST /v1/signer/keystore-generations/{id}", f.submitGeneration)
+	mux.HandleFunc("POST /v1/signer/keystore-generations/{id}/fail", f.failGeneration)
+	setup := http.NewServeMux()
+	setup.HandleFunc("POST /v1/machine-setup/describe", f.describeCode)
+	setup.HandleFunc("POST /v1/machine-setup/enroll", f.enrollCode)
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/machine-setup/") {
+			if _, ok := r.Header["X-Machine-Token"]; ok {
+				f.t.Errorf("%s sent a machine token header", r.URL.Path)
+			}
+			setup.ServeHTTP(w, r)
+			return
+		}
 		if r.Header.Get("x-machine-token") != testToken {
 			problemJSON(w, 401, "MACHINE_AUTH_REQUIRED", "no token")
 			return
@@ -203,8 +256,13 @@ func (f *fakeServer) getChecks(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeServer) postChecks(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		LocalRole *string       `json:"localRole"`
-		Items     []CheckReport `json:"items"`
+		LocalRole *string `json:"localRole"`
+		Trust     *struct {
+			Signers      *[]TrustedSignerReport  `json:"signers"`
+			Builders     *[]TrustedBuilderReport `json:"builders"`
+			RecoveryKeys *[]string               `json:"recoveryKeys"`
+		} `json:"trust"`
+		Items []CheckReport `json:"items"`
 	}
 	if !f.decodeStrict(r, &body) {
 		problemJSON(w, 400, "BAD", "bad")
@@ -215,11 +273,129 @@ func (f *fakeServer) postChecks(w http.ResponseWriter, r *http.Request) {
 		problemJSON(w, 400, "INVALID_KEYSTORE_CHECK", "localRole")
 		return
 	}
+	if body.Trust == nil || body.Trust.Signers == nil || body.Trust.Builders == nil || body.Trust.RecoveryKeys == nil || len(*body.Trust.Signers) == 0 {
+		f.t.Errorf("keystore-checks report without a complete trust object")
+		problemJSON(w, 400, "INVALID_KEYSTORE_CHECK", "trust")
+		return
+	}
 	f.mu.Lock()
 	f.reports = append(f.reports, body.Items)
 	f.localRoles = append(f.localRoles, *body.LocalRole)
+	f.trusts = append(f.trusts, TrustReport{Signers: *body.Trust.Signers, Builders: *body.Trust.Builders, RecoveryKeys: *body.Trust.RecoveryKeys})
 	f.mu.Unlock()
 	w.WriteHeader(204)
+}
+
+func (f *fakeServer) getPeers(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.peersStatus != 0 {
+		problemJSON(w, f.peersStatus, "UNAVAILABLE", "peers")
+		return
+	}
+	out := f.peers
+	if out.Signers == nil {
+		out.Signers = []PeerSigner{}
+	}
+	if out.Builders == nil {
+		out.Builders = []PeerBuilder{}
+	}
+	if out.RecoveryKeys == nil {
+		out.RecoveryKeys = []PeerRecoveryKey{}
+	}
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// submitGeneration 按约定 3.4 严格解码，并像服务端一样核对：生成者是本机登记的 Ed25519、签名有效、
+// 上传文件形状合法。
+func (f *fakeServer) submitGeneration(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Upload    *keystorebox.Upload `json:"upload"`
+		Generator *struct {
+			MachineID              string `json:"machineId"`
+			Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
+		} `json:"generator"`
+		Signature *string `json:"signature"`
+	}
+	if !f.decodeStrict(r, &body) {
+		problemJSON(w, 400, "BAD", "bad")
+		return
+	}
+	id := r.PathValue("id")
+	if body.Upload == nil || body.Generator == nil || body.Signature == nil {
+		f.t.Errorf("keystore generation submit is missing upload, generator or signature")
+		problemJSON(w, 400, "BAD", "missing fields")
+		return
+	}
+	if err := body.Upload.ValidateShape(); err != nil {
+		f.t.Errorf("submitted upload shape: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if body.Generator.MachineID != "mch_signerA0001" || (f.activeEdKey != "" && body.Generator.Ed25519PublicKeySHA256 != f.activeEdKey) {
+		f.t.Errorf("generator %+v is not this signing gate", *body.Generator)
+	}
+	f.submitCalls++
+	f.submissions[id] = GenerationSubmit{Upload: *body.Upload, Generator: GeneratorRef{MachineID: body.Generator.MachineID, Ed25519PublicKeySHA256: body.Generator.Ed25519PublicKeySHA256}, Signature: *body.Signature}
+	if p, ok := f.submitStatus[id]; ok {
+		problemJSON(w, p.status, p.code, "scripted failure")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"keystoreVersion": 7, "releaseIdentityVersion": 3})
+}
+
+func (f *fakeServer) failGeneration(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
+	}
+	if !f.decodeStrict(r, &body) {
+		problemJSON(w, 400, "BAD", "bad")
+		return
+	}
+	f.mu.Lock()
+	f.failures = append(f.failures, call{Job: r.PathValue("id"), Code: body.Code, Detail: body.Detail})
+	f.mu.Unlock()
+	w.WriteHeader(204)
+}
+
+func (f *fakeServer) describeCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if !f.decodeStrict(r, &body) {
+		problemJSON(w, 400, "BAD", "bad")
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.describe == nil || body.Code != testEnrollCode {
+		problemJSON(w, 404, "ENROLLMENT_CODE_INVALID", "invalid")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(f.describe)
+}
+
+func (f *fakeServer) enrollCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code             string  `json:"code"`
+		X25519PublicKey  *string `json:"x25519PublicKey"`
+		Ed25519PublicKey string  `json:"ed25519PublicKey"`
+	}
+	if !f.decodeStrict(r, &body) {
+		problemJSON(w, 400, "BAD", "bad")
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.describe == nil || body.Code != testEnrollCode || body.X25519PublicKey == nil {
+		problemJSON(w, 404, "ENROLLMENT_CODE_INVALID", "invalid")
+		return
+	}
+	f.enrolls = append(f.enrolls, map[string]string{"x25519PublicKey": *body.X25519PublicKey, "ed25519PublicKey": body.Ed25519PublicKey})
+	machineID := f.describe["machineId"]
+	f.describe = nil // 一次性
+	_ = json.NewEncoder(w).Encode(map[string]any{"machineId": machineID, "token": f.enrollToken, "status": "pending_key"})
 }
 
 func (f *fakeServer) claim(w http.ResponseWriter, r *http.Request) {
@@ -545,6 +721,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		"tenantSlug": testfixture.TenantSlug, "keystoreVersion": 3, "packageName": testfixture.PackageName,
 		"certificateSha256": h.key.CertificateSHA256, "keyAlias": serverAlias, "box": h.box,
 		"trustRoots": serverRoots, "trustRootsDigest": serverDigest,
+		"generationRequest": nil, "generator": nil, "generationSignature": nil,
 	}}
 	h.signer = &fakeSigner{t: t, password: h.key.Password, cert: h.key.CertificateSHA256}
 	checker := opts.checker
@@ -553,7 +730,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 	h.runner = &Runner{Config: h.cfg, Keys: keys, Store: store, API: NewHTTPClient(h.server.srv.URL, testToken, nil), Checker: checker,
 		Signer: h.signer, Log: slogTo(h.logs), PollInterval: time.Millisecond, ChecksInterval: time.Hour, HeartbeatInterval: 20 * time.Millisecond,
-		RetryDelays: []time.Duration{time.Millisecond, time.Millisecond}}
+		RetryDelays: []time.Duration{time.Millisecond, time.Millisecond}, KeyBits: 2048}
 	if err := h.runner.Prepare(); err != nil {
 		t.Fatal(err)
 	}

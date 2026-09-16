@@ -402,6 +402,22 @@ func List(w io.Writer, keys MachineKeys, store *records.Store) error {
 	for _, b := range builders {
 		fmt.Fprintf(w, "  %s %s ed25519 %s (at %s by %s)\n", b.BuilderID, b.Name, b.Ed25519PublicKeySHA256, b.At, b.Operator)
 	}
+	peers, err := store.TrustedPeers()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\ntrusted signing gates (%d, this machine is trusted implicitly)\n", len(peers))
+	for _, p := range peers {
+		fmt.Fprintf(w, "  %s x25519 %s ed25519 %s (%s at %s by %s)\n", p.Name, p.X25519PublicKeySHA256, p.Ed25519PublicKeySHA256, p.Mode, p.At, p.Operator)
+	}
+	recoveryKeys, err := store.TrustedRecoveryKeys()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "\ntrusted recovery keys (%d)\n", len(recoveryKeys))
+	for _, k := range recoveryKeys {
+		fmt.Fprintf(w, "  %s sha256 %s (%s at %s by %s)\n", k.Name, k.X25519PublicKeySHA256, k.Mode, k.At, k.Operator)
+	}
 	fmt.Fprintf(w, "\nconfirmed tenants (%d)\n", len(confirmations))
 	for _, c := range confirmations {
 		r := c.TrustRoots

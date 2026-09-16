@@ -340,10 +340,10 @@ func TestHTTPClient(t *testing.T) {
 	if _, err := c.UploadSigned(ctx, "bld_abc12345", 1, signed); !IsTransient(err) {
 		t.Fatalf("UPLOAD_STORAGE_FAILED must be retried: %v", err)
 	}
-	if err := c.ReportChecks(ctx, "leader", nil); err == nil || IsTransient(err) {
+	if err := c.ReportChecks(ctx, "leader", TrustReport{}, nil); err == nil || IsTransient(err) {
 		t.Fatalf("an unknown local role was sent: %v", err)
 	}
-	if err := c.ReportChecks(ctx, records.RoleStandby, nil); !errors.As(err, &apiErr) || apiErr.Transient() || IsTransient(err) {
+	if err := c.ReportChecks(ctx, records.RoleStandby, TrustReport{}, nil); !errors.As(err, &apiErr) || apiErr.Transient() || IsTransient(err) {
 		t.Fatalf("404 must not be transient: %v", err)
 	}
 	var sink bytes.Buffer
@@ -352,5 +352,18 @@ func TestHTTPClient(t *testing.T) {
 	}
 	if strings.Contains(c.String(), testToken) {
 		t.Fatal("the client's String includes the token")
+	}
+}
+
+// keystore-checks 每个租户项可能带完整 Upload：响应超过普通接口的 4 MiB 上限也要能读。
+func TestKeystoreChecksAllowsLargeResponses(t *testing.T) {
+	pad := strings.Repeat("A", 6<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"machineId":"mch_signerA0001","signerRole":"standby","items":[],"padding":"` + pad + `"}`))
+	}))
+	defer srv.Close()
+	resp, err := NewHTTPClient(srv.URL, testToken, nil).KeystoreChecks(context.Background())
+	if err != nil || resp.MachineID != "mch_signerA0001" {
+		t.Fatalf("KeystoreChecks with a 6 MiB response: %+v %v", resp, err)
 	}
 }

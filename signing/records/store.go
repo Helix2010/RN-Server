@@ -39,6 +39,11 @@ var (
 	ErrAlreadySigned = errors.New("records: a package was already signed for this reservation; it cannot be released")
 	// ErrAlreadyCompleted：预留已经完成，不能释放；或完成值与已记录的不同。
 	ErrAlreadyCompleted = errors.New("records: this reservation has already been completed")
+	// ErrConfirmationChanged：自动确认写入时，该包名当前有效的确认已经不是决定时看到的那一份
+	// （期间运维 confirm 过，或另一次自动确认先写了）。
+	ErrConfirmationChanged = errors.New("records: the active confirmation for this package changed while the automatic confirmation was being prepared")
+	// ErrCertificateSeen：这张证书在本机为这个包名确认过（之后被取代），不能自动再确认回去。
+	ErrCertificateSeen = errors.New("records: this certificate was confirmed for this package before; switching back to it needs an operator confirmation")
 )
 
 // GenesisParams 是初始化记录文件需要的本机信息。
@@ -125,6 +130,10 @@ type trustState struct {
 	// confirmations 按包名存当前有效的那一条确认：同一包名的新确认（换了证书或租户）
 	// 取代旧的，旧证书从此不再被认。旧行留在文件里作历史。
 	confirmations map[string]Confirmation
+	// certificates 是每个包名确认过的全部证书（含已被取代的）
+	certificates map[string]map[string]bool
+	peers        map[string]PeerTrust     // 按机器名
+	recovery     map[string]RecoveryTrust // 按公钥指纹
 }
 
 type signedState struct {
@@ -139,6 +148,9 @@ func newTrustState() *trustState {
 		role:          RoleChange{Role: RoleStandby},
 		builders:      map[string]BuilderTrust{},
 		confirmations: map[string]Confirmation{},
+		certificates:  map[string]map[string]bool{},
+		peers:         map[string]PeerTrust{},
+		recovery:      map[string]RecoveryTrust{},
 	}
 }
 
@@ -154,6 +166,18 @@ func (ts *trustState) clone() *trustState {
 	}
 	for k, v := range ts.confirmations {
 		out.confirmations[k] = v
+	}
+	for k, certs := range ts.certificates {
+		out.certificates[k] = map[string]bool{}
+		for c := range certs {
+			out.certificates[k][c] = true
+		}
+	}
+	for k, v := range ts.peers {
+		out.peers[k] = v
+	}
+	for k, v := range ts.recovery {
+		out.recovery[k] = v
 	}
 	return out
 }
@@ -516,7 +540,146 @@ func (s *Store) Confirmations() ([]Confirmation, error) {
 	return out, err
 }
 
+// ConfirmAuto 写入一条签名闸自动确认（Mode 非空）。在记录锁里复核：该包名当前有效的确认必须仍是
+// expectedPrevious（nil 表示当时没有确认；比较租户、证书与信任根摘要），证书在本机没为这个包名
+// 确认过。已经写过完全相同的确认（同一包名、证书、生成请求）时幂等返回 nil。
+func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) error {
+	if c.Mode == "" {
+		return errors.New("records: ConfirmAuto needs an automatic confirmation mode")
+	}
+	if err := c.validate(); err != nil {
+		return fmt.Errorf("records: confirmation: %w", err)
+	}
+	return s.appendRecords(s.trust, func() ([]pending, error) {
+		current, has := s.ts.confirmations[c.PackageName]
+		if has && current.CertificateSHA256 == c.CertificateSHA256 && current.TenantSlug == c.TenantSlug &&
+			current.GenerationRequestID == c.GenerationRequestID && current.Mode != "" {
+			return nil, nil
+		}
+		switch {
+		case expectedPrevious == nil && has, expectedPrevious != nil && !has:
+			return nil, ErrConfirmationChanged
+		case has && (current.TenantSlug != expectedPrevious.TenantSlug || current.CertificateSHA256 != expectedPrevious.CertificateSHA256 ||
+			current.TrustRootsDigest != expectedPrevious.TrustRootsDigest):
+			return nil, ErrConfirmationChanged
+		}
+		if s.ts.certificates[c.PackageName][c.CertificateSHA256] {
+			return nil, ErrCertificateSeen
+		}
+		return []pending{{typeTenant, c}}, nil
+	})
+}
+
+// CertificateSeen 报告这张证书是否为这个包名确认过（含已被取代的确认）。
+func (s *Store) CertificateSeen(packageName, certificateSHA256 string) (bool, error) {
+	var out bool
+	err := s.read(s.trust, func() { out = s.ts.certificates[packageName][certificateSHA256] })
+	return out, err
+}
+
+// TrustPeer 写入（或更新）一台受信签名闸。不能是本机；两个名字不能是同一把密钥。
+func (s *Store) TrustPeer(p PeerTrust) error {
+	if err := p.validate(); err != nil {
+		return fmt.Errorf("records: peer: %w", err)
+	}
+	return s.append(s.trust, typePeer, p, func() error {
+		g := s.trust.v.genesis
+		if p.Name == g.MachineName || p.Ed25519PublicKeySHA256 == g.Ed25519PublicKeySHA256 || p.X25519PublicKeySHA256 == g.X25519PublicKeySHA256 {
+			return errors.New("records: this signing gate trusts itself implicitly; a peer must be another machine")
+		}
+		for name, other := range s.ts.peers {
+			if name != p.Name && (other.Ed25519PublicKeySHA256 == p.Ed25519PublicKeySHA256 || other.X25519PublicKeySHA256 == p.X25519PublicKeySHA256) {
+				return fmt.Errorf("records: signing gate %s is already trusted with these keys", name)
+			}
+		}
+		return nil
+	})
+}
+
+// RevokePeer 撤销对一台签名闸的信任。
+func (s *Store) RevokePeer(name, operator, reason string) error {
+	rec := peerRevoke{Name: name, Operator: operator, Reason: reason}
+	if err := rec.validate(); err != nil {
+		return fmt.Errorf("records: peer revoke: %w", err)
+	}
+	return s.append(s.trust, typePeerRevoke, rec, func() error {
+		if _, ok := s.ts.peers[name]; !ok {
+			return fmt.Errorf("records: signing gate %s is not trusted on this signing gate", name)
+		}
+		return nil
+	})
+}
+
+// TrustedPeers 返回受信签名闸（不含本机），按名字排序。
+func (s *Store) TrustedPeers() ([]PeerTrust, error) {
+	var out []PeerTrust
+	err := s.read(s.trust, func() {
+		for _, p := range s.ts.peers {
+			out = append(out, p)
+		}
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, err
+}
+
+// TrustRecovery 写入（或更新名字）一把受信恢复公钥。
+func (s *Store) TrustRecovery(r RecoveryTrust) error {
+	if err := r.validate(); err != nil {
+		return fmt.Errorf("records: recovery key: %w", err)
+	}
+	return s.append(s.trust, typeRecovery, r, nil)
+}
+
+// RevokeRecovery 撤销对一把恢复公钥的信任。
+func (s *Store) RevokeRecovery(x25519SHA256, operator, reason string) error {
+	rec := recoveryRevoke{X25519PublicKeySHA256: x25519SHA256, Operator: operator, Reason: reason}
+	if err := rec.validate(); err != nil {
+		return fmt.Errorf("records: recovery key revoke: %w", err)
+	}
+	return s.append(s.trust, typeRecoveryRevoke, rec, func() error {
+		if _, ok := s.ts.recovery[x25519SHA256]; !ok {
+			return fmt.Errorf("records: recovery key %s is not trusted on this signing gate", x25519SHA256)
+		}
+		return nil
+	})
+}
+
+// TrustedRecoveryKeys 返回受信恢复公钥，按名字、指纹排序。
+func (s *Store) TrustedRecoveryKeys() ([]RecoveryTrust, error) {
+	var out []RecoveryTrust
+	err := s.read(s.trust, func() {
+		for _, r := range s.ts.recovery {
+			out = append(out, r)
+		}
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].X25519PublicKeySHA256 < out[j].X25519PublicKeySHA256
+	})
+	return out, err
+}
+
 // ---- signed.jsonl ----
+
+// PackageMaxVersionCode 返回这个包名在本机记录里（任何证书的预留、签名、完成、导入与人工基线）
+// 已签的最大 versionCode；ok=false 表示从未签过。
+func (s *Store) PackageMaxVersionCode(packageName string) (max int64, ok bool, err error) {
+	err = s.read(s.signed, func() {
+		for k, r := range s.ss.byVC {
+			if k.pkg == packageName && (!ok || r.VersionCode > max) {
+				max, ok = r.VersionCode, true
+			}
+		}
+		for k, b := range s.ss.baselines {
+			if k.pkg == packageName && (!ok || b.MaxVersionCode > max) {
+				max, ok = b.MaxVersionCode, true
+			}
+		}
+	})
+	return max, ok, err
+}
 
 // SignedView 是某个 (包名, 证书) 在本机记录里的版本号状态。
 type SignedView struct {
@@ -818,6 +981,54 @@ func applyTrust(ts *trustState, e entry) error {
 		}
 		c.ConfirmedAt = e.At
 		ts.confirmations[c.PackageName] = c
+		if ts.certificates[c.PackageName] == nil {
+			ts.certificates[c.PackageName] = map[string]bool{}
+		}
+		ts.certificates[c.PackageName][c.CertificateSHA256] = true
+	case typePeer:
+		var p PeerTrust
+		if err := strictUnmarshal(e.Data, &p); err != nil {
+			return err
+		}
+		if err := p.validate(); err != nil {
+			return err
+		}
+		p.At = e.At
+		ts.peers[p.Name] = p
+	case typePeerRevoke:
+		var p peerRevoke
+		if err := strictUnmarshal(e.Data, &p); err != nil {
+			return err
+		}
+		if err := p.validate(); err != nil {
+			return err
+		}
+		if _, ok := ts.peers[p.Name]; !ok {
+			return errors.New("revokes a signing gate that is not trusted")
+		}
+		delete(ts.peers, p.Name)
+	case typeRecovery:
+		var r RecoveryTrust
+		if err := strictUnmarshal(e.Data, &r); err != nil {
+			return err
+		}
+		if err := r.validate(); err != nil {
+			return err
+		}
+		r.At = e.At
+		ts.recovery[r.X25519PublicKeySHA256] = r
+	case typeRecoveryRevoke:
+		var r recoveryRevoke
+		if err := strictUnmarshal(e.Data, &r); err != nil {
+			return err
+		}
+		if err := r.validate(); err != nil {
+			return err
+		}
+		if _, ok := ts.recovery[r.X25519PublicKeySHA256]; !ok {
+			return errors.New("revokes a recovery key that is not trusted")
+		}
+		delete(ts.recovery, r.X25519PublicKeySHA256)
 	default:
 		return fmt.Errorf("unknown trust record type %q", e.Type)
 	}

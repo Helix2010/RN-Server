@@ -2,6 +2,11 @@
 //
 //	build-keystore create --pins <pin 文件> --tenant <slug> --package <包名> --alias <别名> [--out-dir <目录>]
 //	build-keystore seal   --pins <pin 文件> --p12 <原件> --password-file <口令文件> --tenant <slug> --package <包名> [--alias <别名>] [--out <文件>]
+//	build-keystore recovery-key create --out <目录> --name <名>
+//	build-keystore recover --recovery-key <恢复私钥文件> --upload <导出的密文文件> --out-dir <目录>
+//
+// recovery-key create 生成整个平台的离线恢复密钥（全平台只做一次）；recover 用恢复私钥解开控制台
+// 导出的密文文件，得到 .p12 原件与口令文件（签名闸全部丢失时用）。两者的口令只从交互终端不回显地读。
 //
 // create 生成一把新密钥（RSA 4096 + 自签证书 + PKCS#12），seal 为已有原件重新加密（新增或
 // 更换签名闸时用）。两者都**只**加密给 pin 文件里的签名闸：服务端登记了谁、控制台接受了谁，
@@ -52,8 +57,11 @@ const usageText = `用法:
                         [--out-dir <目录>] [--common-name <证书 CN>] [--org <证书 O>]
   build-keystore seal   --pins <pin 文件> --p12 <原件> --password-file <口令文件>
                         --tenant <slug> --package <包名> [--alias <别名>] [--out <上传文件>]
+  build-keystore recovery-key create --out <目录> --name <恢复密钥名>
+  build-keystore recover --recovery-key <recovery-private.key> --upload <导出的密文文件> --out-dir <目录>
 
-只在离线机器上运行。收件人只来自 pin 文件；口令只写进 0600 的文件，不打印。`
+只在离线机器上运行。create/seal 的收件人只来自 pin 文件；口令只写进 0600 的文件，不打印。
+recovery-key create 与 recover 的口令只从交互终端输入（不回显），标准输入不是终端时拒绝。`
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
@@ -65,6 +73,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return create(args[1:], stdout, stderr)
 	case "seal":
 		return seal(args[1:], stdout, stderr)
+	case "recovery-key":
+		return recoveryKey(args[1:], stdout, stderr)
+	case "recover":
+		return recoverKeystore(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, usageText)
 		return 2

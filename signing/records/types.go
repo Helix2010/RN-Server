@@ -12,10 +12,14 @@ import (
 
 // 记录类型（body.type）。
 const (
-	typeRole          = "role"
-	typeBuilder       = "builder"
-	typeBuilderRevoke = "builder-revoke"
-	typeTenant        = "tenant"
+	typeRole           = "role"
+	typeBuilder        = "builder"
+	typeBuilderRevoke  = "builder-revoke"
+	typeTenant         = "tenant"
+	typePeer           = "peer"
+	typePeerRevoke     = "peer-revoke"
+	typeRecovery       = "recovery"
+	typeRecoveryRevoke = "recovery-revoke"
 
 	typeReserve  = "reserve"
 	typeSigned   = "signed"
@@ -38,7 +42,12 @@ const (
 	RoleModeInitial    = "initial"     // 第一台主，之前没有主
 	RoleModeImportFile = "import-file" // 导入了旧主的 signed.jsonl
 	RoleModeManual     = "manual"      // 旧主目录没了，运维逐包输入已签最大 versionCode
+	// RoleModeEnroll：新机器 signer enroll 时按服务端给的主备写入的初始角色（只写在全新的本机记录里）
+	RoleModeEnroll = "enroll"
 )
+
+// EnrollOperator 是 signer enroll 写进记录的操作者。
+const EnrollOperator = "signer-enroll"
 
 // MaxVersionCode 是 Android versionCode 的上限（int32 正数，Play 的上限是 2100000000）。
 const MaxVersionCode = 2100000000
@@ -46,6 +55,8 @@ const MaxVersionCode = 2100000000
 var (
 	operatorPattern  = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)
 	releaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	// 与 keystorebox.ValidGenerationRequestID 同一条规则（records 不依赖 keystorebox）
+	generationRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 )
 
 // RoleChange 记录本机角色变化。
@@ -63,6 +74,10 @@ func (r RoleChange) validate() error {
 		return errors.New("role must be primary or standby")
 	}
 	switch r.Mode {
+	case RoleModeEnroll:
+		if r.PreviousPrimaryEd25519SHA256 != "" {
+			return errors.New("an enrollment role record must not name a previous primary")
+		}
 	case RoleModeInitial, RoleModeManual:
 		if r.PreviousPrimaryEd25519SHA256 != "" && !fingerprint.Valid(r.PreviousPrimaryEd25519SHA256) {
 			return errors.New("previousPrimaryEd25519Sha256 is malformed")
@@ -116,6 +131,98 @@ func (b builderRevoke) validate() error {
 	return validateOperatorReason(b.Operator, b.Reason)
 }
 
+// 信任签名闸与恢复公钥的来源（PeerTrust.Mode、RecoveryTrust.Mode）。
+const (
+	// TrustModeOperator：运维在本机粘贴完整指纹，与服务端的值比对一致后写入。
+	TrustModeOperator = "operator"
+	// TrustModeEnroll：signer enroll 时按运维在安装命令里给的 --recovery-sha256 核对服务端的恢复公钥后写入。
+	TrustModeEnroll = "enroll"
+	// TrustModeEnrollFirstTrust：注册备签名闸时首次信任服务端给的当前主签名闸（设计「首次信任」）。
+	TrustModeEnrollFirstTrust = "enroll-first-trust"
+)
+
+// PeerTrust 是一台受信的签名闸（不含本机：本机默认信任自己）。主签名闸生成密钥时只加密给
+// 本机与这些签名闸；备签名闸只接受这些签名闸（或本机）签过生成签名的密钥。
+type PeerTrust struct {
+	Name                   string `json:"name"`
+	X25519PublicKeySHA256  string `json:"x25519PublicKeySha256"`
+	Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
+	Mode                   string `json:"mode"`
+	Operator               string `json:"operator"`
+	Note                   string `json:"note"`
+	At                     string `json:"-"`
+}
+
+func (p PeerTrust) validate() error {
+	switch {
+	case !ident.ValidMachineName(p.Name):
+		return errors.New("name must match ^[a-z0-9][a-z0-9-]{1,39}$")
+	case !fingerprint.Valid(p.X25519PublicKeySHA256):
+		return errors.New("x25519PublicKeySha256 must be 64 lowercase hex characters")
+	case !fingerprint.Valid(p.Ed25519PublicKeySHA256):
+		return errors.New("ed25519PublicKeySha256 must be 64 lowercase hex characters")
+	case p.Mode != TrustModeOperator && p.Mode != TrustModeEnrollFirstTrust:
+		return errors.New("mode must be operator or enroll-first-trust")
+	case !operatorPattern.MatchString(p.Operator):
+		return errors.New("operator must match ^[A-Za-z0-9._@-]{1,64}$")
+	case p.Note != "" && !validText(p.Note, 512):
+		return errors.New("note must be at most 512 bytes without control characters")
+	}
+	return nil
+}
+
+type peerRevoke struct {
+	Name     string `json:"name"`
+	Operator string `json:"operator"`
+	Reason   string `json:"reason"`
+}
+
+func (p peerRevoke) validate() error {
+	if !ident.ValidMachineName(p.Name) {
+		return errors.New("name is malformed")
+	}
+	return validateOperatorReason(p.Operator, p.Reason)
+}
+
+// RecoveryTrust 是一把受信的离线恢复公钥（只记指纹；公钥从服务端取，按指纹核对）。
+type RecoveryTrust struct {
+	Name                  string `json:"name"`
+	X25519PublicKeySHA256 string `json:"x25519PublicKeySha256"`
+	Mode                  string `json:"mode"`
+	Operator              string `json:"operator"`
+	Note                  string `json:"note"`
+	At                    string `json:"-"`
+}
+
+func (r RecoveryTrust) validate() error {
+	switch {
+	case !ident.ValidMachineName(r.Name):
+		return errors.New("name must match ^[a-z0-9][a-z0-9-]{1,39}$")
+	case !fingerprint.Valid(r.X25519PublicKeySHA256):
+		return errors.New("x25519PublicKeySha256 must be 64 lowercase hex characters")
+	case r.Mode != TrustModeOperator && r.Mode != TrustModeEnroll:
+		return errors.New("mode must be operator or enroll")
+	case !operatorPattern.MatchString(r.Operator):
+		return errors.New("operator must match ^[A-Za-z0-9._@-]{1,64}$")
+	case r.Note != "" && !validText(r.Note, 512):
+		return errors.New("note must be at most 512 bytes without control characters")
+	}
+	return nil
+}
+
+type recoveryRevoke struct {
+	X25519PublicKeySHA256 string `json:"x25519PublicKeySha256"`
+	Operator              string `json:"operator"`
+	Reason                string `json:"reason"`
+}
+
+func (r recoveryRevoke) validate() error {
+	if !fingerprint.Valid(r.X25519PublicKeySHA256) {
+		return errors.New("x25519PublicKeySha256 is malformed")
+	}
+	return validateOperatorReason(r.Operator, r.Reason)
+}
+
 // Confirmation 是运维对一个 (包名, 证书指纹) 的确认。同一 key 的新确认取代旧的，旧行留作历史。
 type Confirmation struct {
 	TenantSlug              string           `json:"tenantSlug"`
@@ -129,7 +236,34 @@ type Confirmation struct {
 	TargetSDK               int64            `json:"targetSdk"`
 	FirstSignMaxVersionCode int64            `json:"firstSignMaxVersionCode"`
 	ConfirmedBy             string           `json:"confirmedBy"`
-	ConfirmedAt             string           `json:"-"`
+	// 以下只有签名闸自动确认（签名闸生成的密钥）时才有；运维 confirm 写的记录没有这些字段，
+	// 与旧版本写的记录逐字节同形。
+	Mode                   string `json:"mode,omitempty"`
+	GenerationRequestID    string `json:"generationRequestId,omitempty"`
+	GeneratorName          string `json:"generatorName,omitempty"`
+	GeneratorEd25519SHA256 string `json:"generatorEd25519Sha256,omitempty"`
+	ConfirmedAt            string `json:"-"`
+}
+
+// Confirmation.Mode 的取值。空串是运维在本机 signer confirm。
+const (
+	// ConfirmModeFirstGeneration：本机（主）生成的密钥，这个包名在本机从没确认过，信任根首次取服务端的值。
+	ConfirmModeFirstGeneration = "first-generation"
+	// ConfirmModeRegenerated：本机（主）为已确认的包名生成新密钥，沿用原有信任根，只换证书。
+	ConfirmModeRegenerated = "regenerated"
+	// ConfirmModePeerGenerated：本机信任的另一台签名闸生成、生成签名验证通过的密钥（首次信任或沿用信任根）。
+	ConfirmModePeerGenerated = "peer-generated"
+
+	autoConfirmedByPrefix = "auto:"
+)
+
+// AutoConfirmedBy 返回自动确认写进 confirmedBy 的值：auto:first-generation、auto:regenerated、
+// auto:peer-generated:<生成者机器名>。运维名不允许冒号，两者不会混淆。
+func AutoConfirmedBy(mode, generatorName string) string {
+	if mode == ConfirmModePeerGenerated {
+		return autoConfirmedByPrefix + mode + ":" + generatorName
+	}
+	return autoConfirmedByPrefix + mode
 }
 
 func (c Confirmation) validate() error {
@@ -150,8 +284,28 @@ func (c Confirmation) validate() error {
 		return fmt.Errorf("targetSdk must be at least minSdk and %d, and at most 1000", MinConfirmedTargetSDK)
 	case c.FirstSignMaxVersionCode < 1 || c.FirstSignMaxVersionCode > MaxVersionCode:
 		return errors.New("firstSignMaxVersionCode must be between 1 and 2100000000")
-	case !operatorPattern.MatchString(c.ConfirmedBy):
-		return errors.New("confirmedBy must match ^[A-Za-z0-9._@-]{1,64}$")
+	}
+	switch c.Mode {
+	case "":
+		if !operatorPattern.MatchString(c.ConfirmedBy) {
+			return errors.New("confirmedBy must match ^[A-Za-z0-9._@-]{1,64}$")
+		}
+		if c.GenerationRequestID != "" || c.GeneratorName != "" || c.GeneratorEd25519SHA256 != "" {
+			return errors.New("an operator confirmation must not carry generation fields")
+		}
+	case ConfirmModeFirstGeneration, ConfirmModeRegenerated, ConfirmModePeerGenerated:
+		switch {
+		case !generationRequestIDPattern.MatchString(c.GenerationRequestID):
+			return errors.New("generationRequestId is malformed")
+		case !ident.ValidMachineName(c.GeneratorName):
+			return errors.New("generatorName is malformed")
+		case !fingerprint.Valid(c.GeneratorEd25519SHA256):
+			return errors.New("generatorEd25519Sha256 must be 64 lowercase hex characters")
+		case c.ConfirmedBy != AutoConfirmedBy(c.Mode, c.GeneratorName):
+			return errors.New("confirmedBy does not match the automatic confirmation mode")
+		}
+	default:
+		return errors.New("mode is unknown")
 	}
 	normalized, err := c.TrustRoots.Normalize()
 	if err != nil {

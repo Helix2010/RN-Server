@@ -1,7 +1,10 @@
 // Package records 是签名闸的本机记录：两个只追加的 JSONL 文件。
 //
-//   - trust.jsonl：本机角色、受信构建机、按 (包名, 证书指纹) 确认过的租户与信任根。
-//     只由运维在本机执行 signer confirm / trust-builder / promote 写入。
+//   - trust.jsonl：本机角色、受信构建机、受信签名闸、受信恢复公钥、按 (包名, 证书指纹) 确认过的
+//     租户与信任根。由运维在本机执行 signer confirm / trust-builder / trust-peer / trust-recovery /
+//     promote 写入；另外两处自动写入：signer enroll 在全新的记录里写初始角色、恢复公钥与首次信任的
+//     主签名闸，签名闸对本机或本机信任的签名闸生成的密钥写自动确认（mode 非空）。
+//     新增的记录类型只追加，旧记录（手工流程写的）原样可读。
 //   - signed.jsonl：签名的两段式记录（预留 → 完成）、运维释放（abandon）、提升备用时
 //     导入的主签名闸记录与人工基线。
 //

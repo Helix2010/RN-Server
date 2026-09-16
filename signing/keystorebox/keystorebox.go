@@ -96,20 +96,53 @@ type Plaintext struct {
 	P12Base64         string   `json:"p12Base64"`
 	StorePassword     string   `json:"storePassword"`
 	KeyPassword       string   `json:"keyPassword"`
+	// Generation 只在签名闸生成的密钥里有（离线工具产出的没有，JSON 与之前逐字节相同）。
+	Generation *Generation `json:"generation,omitempty"`
+}
+
+// Generation 是生成者（主签名闸）为这把密钥在本机写下的确认参数。它在密文里：Box 的密文被生成签名
+// 覆盖（签名覆盖整个 Upload），所以服务端改不了、也换不了。别的签名闸自动接受这把密钥时按它核对：
+// 首次信任的信任根摘要必须等于 TrustRootsDigest（服务端不能给备签名闸另一套信任根），本机当前有效的
+// 证书必须等于 SupersedesCertificateSHA256（服务端不能把一次更早的生成重放回来）。
+type Generation struct {
+	// TrustRootsDigest 是生成者确认的信任根摘要（trustroots.Digest）
+	TrustRootsDigest string `json:"trustRootsDigest"`
+	// MinSDK、TargetSDK、FirstSignMaxVersionCode 是生成者确认的下限与首签上限
+	MinSDK                  int64 `json:"minSdk"`
+	TargetSDK               int64 `json:"targetSdk"`
+	FirstSignMaxVersionCode int64 `json:"firstSignMaxVersionCode"`
+	// SupersedesCertificateSHA256 是生成时生成者本机对这个包名有效确认的证书；首次生成为空串
+	SupersedesCertificateSHA256 string `json:"supersedesCertificateSha256"`
+}
+
+// Validate 检查生成参数的格式（取值下限由签名闸本机记录再校验）。
+func (g Generation) Validate() error {
+	switch {
+	case !fingerprint.Valid(g.TrustRootsDigest):
+		return errors.New("generation.trustRootsDigest must be 64 lowercase hex characters")
+	case g.MinSDK < 1 || g.MinSDK > 1000 || g.TargetSDK < g.MinSDK || g.TargetSDK > 1000:
+		return errors.New("generation.minSdk and targetSdk are out of range")
+	case g.FirstSignMaxVersionCode < 1 || g.FirstSignMaxVersionCode > 2100000000:
+		return errors.New("generation.firstSignMaxVersionCode is out of range")
+	case g.SupersedesCertificateSHA256 != "" && !fingerprint.Valid(g.SupersedesCertificateSHA256):
+		return errors.New("generation.supersedesCertificateSha256 must be empty or 64 lowercase hex characters")
+	}
+	return nil
 }
 
 // wirePlaintext 与 Plaintext 字段完全相同，只用于封装与解封时的 JSON 编解码。
 type wirePlaintext struct {
-	Purpose           string   `json:"purpose"`
-	TenantSlug        string   `json:"tenantSlug"`
-	PackageName       string   `json:"packageName"`
-	CertificateSHA256 string   `json:"certificateSha256"`
-	KeyAlias          string   `json:"keyAlias"`
-	Recipients        []string `json:"recipients"`
-	CreatedAt         string   `json:"createdAt"`
-	P12Base64         string   `json:"p12Base64"`
-	StorePassword     string   `json:"storePassword"`
-	KeyPassword       string   `json:"keyPassword"`
+	Purpose           string      `json:"purpose"`
+	TenantSlug        string      `json:"tenantSlug"`
+	PackageName       string      `json:"packageName"`
+	CertificateSHA256 string      `json:"certificateSha256"`
+	KeyAlias          string      `json:"keyAlias"`
+	Recipients        []string    `json:"recipients"`
+	CreatedAt         string      `json:"createdAt"`
+	P12Base64         string      `json:"p12Base64"`
+	StorePassword     string      `json:"storePassword"`
+	KeyPassword       string      `json:"keyPassword"`
+	Generation        *Generation `json:"generation,omitempty"`
 }
 
 // Upload 是离线工具产出、控制台上传的文件。
@@ -126,8 +159,13 @@ type Upload struct {
 // ---- 机密结构体的格式化白名单 ----
 
 func (p Plaintext) String() string {
-	return fmt.Sprintf("keystorebox.Plaintext{purpose=%q tenantSlug=%q packageName=%q certificateSha256=%q keyAlias=%q recipients=%q createdAt=%q p12=[redacted] storePassword=[redacted] keyPassword=[redacted]}",
-		p.Purpose, p.TenantSlug, p.PackageName, p.CertificateSHA256, p.KeyAlias, p.Recipients, p.CreatedAt)
+	generation := "none"
+	if g := p.Generation; g != nil {
+		generation = fmt.Sprintf("{trustRootsDigest=%q minSdk=%d targetSdk=%d firstSignMaxVersionCode=%d supersedesCertificateSha256=%q}",
+			g.TrustRootsDigest, g.MinSDK, g.TargetSDK, g.FirstSignMaxVersionCode, g.SupersedesCertificateSHA256)
+	}
+	return fmt.Sprintf("keystorebox.Plaintext{purpose=%q tenantSlug=%q packageName=%q certificateSha256=%q keyAlias=%q recipients=%q createdAt=%q generation=%s p12=[redacted] storePassword=[redacted] keyPassword=[redacted]}",
+		p.Purpose, p.TenantSlug, p.PackageName, p.CertificateSHA256, p.KeyAlias, p.Recipients, p.CreatedAt, generation)
 }
 
 // GoString 覆盖 %#v。
@@ -146,6 +184,7 @@ func (p Plaintext) LogValue() slog.Value {
 		slog.String("keyAlias", p.KeyAlias),
 		slog.Any("recipients", p.Recipients),
 		slog.String("createdAt", p.CreatedAt),
+		slog.Bool("generated", p.Generation != nil),
 	)
 }
 
@@ -192,6 +231,14 @@ func (p Plaintext) Validate() error {
 	}
 	if err := validatePassword(p.KeyPassword); err != nil {
 		return fmt.Errorf("keyPassword %w", err)
+	}
+	if p.Generation != nil {
+		if err := p.Generation.Validate(); err != nil {
+			return err
+		}
+		if p.Generation.SupersedesCertificateSHA256 == p.CertificateSHA256 {
+			return errors.New("generation.supersedesCertificateSha256 must differ from certificateSha256")
+		}
 	}
 	return nil
 }
