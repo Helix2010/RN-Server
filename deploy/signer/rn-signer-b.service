@@ -26,6 +26,8 @@ RuntimeDirectoryPreserve=no
 
 UMask=0077
 LimitCORE=0
+# 解开的 keystore 与口令在签名闸和 java 子进程的内存里：不许换出到交换分区（需要 cgroup v2）
+MemorySwapMax=0
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=

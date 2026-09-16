@@ -51,7 +51,8 @@ sha256sum /opt/rn-signer/bin/*   # 与离线记录核对
 
 # apksigner.jar：从 Google 的 build-tools 35.0.0 包里取，复制成 root 拥有的副本。
 # 不要把 SIGNER_BUILD_TOOLS_DIR 指向构建机那份 SDK：构建机用户能改的 jar 等于能在签名闸里执行代码。
-# 签名闸启动时检查 java、apksigner.jar（及 signer-check）与每一级上级目录只能由 root 或签名闸用户修改。
+# 签名闸启动时检查 JAVA_HOME 整棵目录树（含符号链接目标）、apksigner.jar（及 signer-check）与每一级上级目录
+# 只能由 root 或签名闸用户修改；运行时目录必须在 tmpfs 上。
 install -o root -g root -m 0644 <sdk>/build-tools/35.0.0/lib/apksigner.jar /opt/rn-signer/build-tools/35.0.0/lib/
 sha256sum /opt/rn-signer/build-tools/35.0.0/lib/apksigner.jar   # 记进离线记录
 # JDK 用系统包（root 拥有）：apt install openjdk-17-jre-headless
@@ -111,6 +112,10 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer promote --first --env-file /etc/rn
 
 B 保持备：它照样试解、确认、试签并上报，但从不认领任务。
 
+`promote` 与 `abandon` 会和正在处理任务的 `signer run` 竞争本机记录，必须先停服务（`systemctl stop rn-signer-a.service`），
+程序拿不到运行锁会直接拒绝；做完再 `systemctl start`。第一次 `promote --first` 时服务已经在跑，同样先停再起。
+`confirm`、`trust-builder`、`list`、`show-key` 不用停。
+
 ## 6. 信任构建机（两台都要做）
 
 在构建机上 `build-agent show-key` 读出出处公钥的完整 sha256；控制台里查到那台构建机的机器 id。
@@ -137,6 +142,11 @@ sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-builder --builder-id mch_…
    - 信任根逐项**由你输入/粘贴离线记录里的值**：API origin、OTA 证书 SHA-256、bootstrap 签名地址、
      App Links host、scheme、渠道、applicationId、minSdk/targetSdk 下限、首签 versionCode 上限。
      服务端的值只作对照，与你输入不同的会标 `DIFFERS`。
+   - API origin 不写默认端口：`https://api.example.com`，不是 `https://api.example.com:443`（RN-App 按 WHATWG URL
+     派生 App Links host 时会去掉 `:443`，两种写法会得出不同的 host 与摘要，所以一律拒绝显式 `:443`）。
+   - minSdk 下限至少 24（签名闸只签 v2/v3），targetSdk 下限至少 28（明文流量缺省关闭）。
+   - 同一包名只有一份有效确认：重新 confirm（例如换证书、改信任根）会取代旧的，程序会显示被取代的那份；
+     换了证书后旧证书不再能签。
    - 服务端发来的字符串格式不对时程序直接退出、不显示原文（防终端控制字符伪造屏幕）。
 4. `signer run` 一分钟内对确认过的密钥做试签（现场合成最小 APK，签完 verify 比对证书，文件只在
    `/run/rn-signer-a` 里、用完即删）。控制台显示「主、备均已确认，主试签通过」后这把密钥才算上线。
@@ -153,16 +163,44 @@ journalctl -u rn-signer-a -u 'rn-signer-a-check@*'
 
 拒签结果在控制台任务详情里：
 
-- **暂不能签**（release，不计次）：`SIGNER_NOT_PRIMARY`、`CERTIFICATE_NOT_CONFIRMED`、`TRUST_ROOTS_NOT_CONFIRMED`、`SIGNER_SHUTTING_DOWN`
-- **违规**（reject violation，终态失败并审计）：策略码（`TRUST_ROOT_MISMATCH`、`PERMISSION_NOT_ALLOWED`、`VERSION_CODE_*`、`BUILDER_NOT_TRUSTED`…）、
-  `KEYSTORE_IDENTITY_MISMATCH`、`VERSION_CODE_ALREADY_RESERVED`、`SERVER_REJECTED_SIGNED_PACKAGE`
-- **临时错误**（reject transient，签名编号到 2 判失败）：`CHECKER_FAILED`、`DOWNLOAD_FAILED`、`APKSIGNER_FAILED`、`UPLOAD_FAILED`、`COMPLETE_FAILED`
+- **暂不能签**（release，不计次）：`SIGNER_NOT_PRIMARY`、`SIGNER_NOT_READY`、`CERTIFICATE_NOT_CONFIRMED`、`TRUST_ROOTS_NOT_CONFIRMED`、`SIGNER_SHUTTING_DOWN`
+- **违规**（reject violation，终态失败并审计）：策略码（`TRUST_ROOT_MISMATCH`、`PERMISSION_NOT_ALLOWED`、`MANIFEST_ELEMENT_NOT_ALLOWED`、
+  `OTA_CONFIGURATION_NOT_ALLOWED`、`VERSION_CODE_*`、`BUILDER_NOT_TRUSTED`…）、`KEYSTORE_IDENTITY_MISMATCH`、
+  `VERSION_CODE_ALREADY_RESERVED`、`VERSION_CODE_OUT_OF_BOUNDS`、`RESERVATION_CONFLICT`、`JOB_ALREADY_COMPLETED`、`SERVER_REJECTED_SIGNED_PACKAGE`
+- **临时错误**（reject transient，签名编号到 2 判失败）：`CHECKER_FAILED`、`DOWNLOAD_FAILED`、`UNSIGNED_CHANGED_BEFORE_SIGNING`、
+  `RUNTIME_FILES_FAILED`、`APKSIGNER_FAILED`、`SIGNED_VERIFY_FAILED`、`UPLOAD_FAILED`、`UPLOAD_MISMATCH`、`COMPLETE_FAILED`
 
-释放一条从未交付出去的预留（先在控制台确认没有对应发布记录、也没有下载记录）：
+服务端的几个错误码由签名闸自己处理：`SIGNED_ARTIFACT_REPLACED` 原地重新 complete；`SIGNED_ARTIFACT_MISSING`
+重新上传（最多 3 轮）；`UPLOAD_STORAGE_FAILED`、`UPLOAD_INTERRUPTED` 原地重试上传；`401 MACHINE_REVOKED` 时签名闸
+不再上报任何东西、直接退出（systemd 每 60 秒重启一次，每次都会因为同样的原因退出，按「登记机器」换新机器）。
+
+### 预留的状态与释放
+
+`signer list` 的 signed 一节里每条预留是下面之一：
+
+| 状态 | 含义 | 能否释放 |
+| --- | --- | --- |
+| `reserved` | 解密前落盘；签名包还没记下，没有任何签名包离开过本机 | 能 |
+| `signed` | 签名包 sha256 已落盘，随后才上传；服务端可能已经拿到它 | 不能 |
+| `completed` | 服务端确认完成，记下发布 id | 不能 |
+| `abandoned` | 已释放，versionCode 可以给别的包用 | — |
+
+签名闸在记下签名包之前失败（解密不对、apksigner 失败、复核失败、被打断）会**自动释放**预留；所以正常情况下
+不需要人工 `abandon`。只有进程在那之间被杀掉、留下 `reserved` 时才需要：
 
 ```bash
+systemctl stop rn-signer-a.service
 sudo -u rn-signer-a /opt/rn-signer/bin/signer abandon --job bld_… --reason "…" --env-file /etc/rn-signer-a.env
+systemctl start rn-signer-a.service
 ```
+
+`signed` 的预留永远占着那个 versionCode：同一任务再派下来会续签续传；换一个包就用更高的 versionCode 重新构建。
+
+### 记录文件的行数与末行哈希
+
+`signer list` 开头打印 `trust.jsonl`、`signed.jsonl` 的行数与最后一行的 sha256（启动日志里也有）。每次发布后把
+`signed.jsonl` 这两项抄进离线发布记录：哈希链只能证明"每一行都没被改"，证明不了"文件末尾没被整行截掉"，
+提升备用导入旧主记录时要拿它来核对。
 
 权限允许列表（`signing/policy/permissions.json`）与 RN-App `ALLOWED_PERMISSIONS` 必须在同一次变更里一起改；
 改了要重新构建并按本文人工部署。RN-App 提高 compileSdk 时同时重新生成 `signing/apk/axml/framework_attrs.txt`。
@@ -178,8 +216,10 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer abandon --job bld_… --reason "�
    rm /run/rn-signer-b-import-a.jsonl
    ```
 
-   粘贴 pin 文件里**旧主的 Ed25519 sha256**，程序逐行验链与签名，显示每个包的预留数与最大 versionCode，
-   原样输入本机机器名后写入。旧主的状态目录也没了：`promote --manual`，逐包输入离线发布记录或已安装设备上的
+   先停 B 的服务（`systemctl stop rn-signer-b.service`，promote 需要运行锁）。粘贴 pin 文件里**旧主的 Ed25519 sha256**，
+   程序逐行验链与签名，显示文件的行数、最后一行 sha256、每个包的预留数（其中未完成的条数）与最大 versionCode——
+   **与离线发布记录里抄下的行数与末行哈希、最大 versionCode 核对**，对不上就说明文件被截短，改用 `--manual`。
+   原样输入本机机器名后写入，再 `systemctl start rn-signer-b.service`。旧主的状态目录也没了：`promote --manual`，逐包输入离线发布记录或已安装设备上的
    最大 versionCode（不取服务端的值）。
 3. 控制台把 `amos-signer-b` 切成 primary。之后按「密钥生成与上传」补一台新的备（新机器、新 id、加进 pin 文件、
    用原件 `build-keystore seal` 重新加密上传、两台重新 confirm）。
@@ -194,10 +234,14 @@ sudo -u rn-signer-a /opt/rn-signer/bin/signer abandon --job bld_… --reason "�
   改了整条链校验不过。
 - **启动报记录校验失败（断链、签名不对、genesis 不是本机）**：不要修。状态目录被改过，按设计「签名闸状态目录丢了」
   当作新机器处理；是主就先提升备。
-- **启动报 `refusing to execute an untrusted file`**：java、apksigner.jar、signer-check 或它们的某级目录能被别的用户改，
-  按第 2 步重装成 root 拥有。
+- **启动报 `refusing to execute an untrusted file` / `refusing to run an untrusted JAVA_HOME`**：java、JDK 目录树里的某个文件
+  或符号链接目标、apksigner.jar、signer-check 或它们的某级目录能被别的用户改，按第 2 步重装成 root 拥有。
+- **启动报 `not on tmpfs`**：`SIGNER_RUNTIME_DIR` 不在 tmpfs 上，改回 unit 的 `RuntimeDirectory`（`/run/rn-signer-a`）。
+- **检查进程 socket 报 `served by uid …`**：`SIGNER_CHECK_SOCKET` 指向的 socket 不是 systemd 创建的（签名闸要求对端是 uid 0），
+  核对 `rn-signer-a-check.socket` 是否在跑、路径是否一致。
+- **启动或运行中报 `MACHINE_REVOKED`**：令牌已在控制台吊销，签名闸不再工作。
 - **试签失败**（控制台 `trialSign=failed`，journal 里有 apksigner 的输出）：先确认 `ProcSubset=pid`、
-  `SystemCallFilter=@system-service` 下 JVM 能正常运行（首次部署必须核对一次，本仓库的测试环境无法在完整的
+  `SystemCallFilter=@system-service`、`MemorySwapMax=0` 下 JVM 能正常运行（首次部署必须核对一次，本仓库的测试环境无法在完整的
   systemd 沙箱里跑 JVM）。
 - **检查进程反复崩溃**：同一任务两次后判失败；`journalctl -u 'rn-signer-a-check@*'`。
 
