@@ -38,6 +38,8 @@ const (
 	signingBlockMagic = "APK Sig Block 42"
 	// 块结构：u64 size | 键值对 | u64 size | 16 字节 magic；size 不含开头那 8 字节
 	signingBlockMinSize = 8 + 8 + 16
+	// apksigner 把签名块对齐到的页大小
+	signingBlockPageSize = 4096
 
 	storedAlignment = 4
 	pageAlignment   = 16384
@@ -358,18 +360,38 @@ func (z *zipFile) checkLayout(spans []span, cdOffset int64) error {
 	if gap < signingBlockMinSize {
 		return errorf(CodeZipUnaccountedBytes, "%d bytes before the central directory are not part of any entry", gap)
 	}
-	head, err := readAt(z.r, pos, 8)
-	if err != nil {
-		return err
-	}
+	unaccounted := errorf(CodeZipUnaccountedBytes, "%d bytes before the central directory are not part of any entry", gap)
 	foot, err := readAt(z.r, cdOffset-24, 24)
 	if err != nil {
 		return err
 	}
-	sizeStart := binary.LittleEndian.Uint64(head)
 	sizeEnd := binary.LittleEndian.Uint64(foot)
-	if string(foot[8:]) != signingBlockMagic || sizeStart != sizeEnd || sizeStart > uint64(gap) || int64(sizeStart)+8 != gap {
-		return errorf(CodeZipUnaccountedBytes, "%d bytes before the central directory are not part of any entry", gap)
+	if string(foot[8:]) != signingBlockMagic || sizeEnd > uint64(gap-8) {
+		return unaccounted
+	}
+	blockStart := cdOffset - int64(sizeEnd) - 8
+	head, err := readAt(z.r, blockStart, 8)
+	if err != nil {
+		return err
+	}
+	if binary.LittleEndian.Uint64(head) != sizeEnd {
+		return unaccounted
+	}
+	// apksigner 在签名块前补零，让块从 4096 字节边界开始（给 APK verity 用）。只接受这种填充：
+	// 全是零、不足一页、块恰好落在页边界上。
+	if padding := blockStart - pos; padding > 0 {
+		if padding >= signingBlockPageSize || blockStart%signingBlockPageSize != 0 {
+			return unaccounted
+		}
+		zeros, err := readAt(z.r, pos, padding)
+		if err != nil {
+			return err
+		}
+		for _, b := range zeros {
+			if b != 0 {
+				return unaccounted
+			}
+		}
 	}
 	z.signingBlock = true
 	return nil
