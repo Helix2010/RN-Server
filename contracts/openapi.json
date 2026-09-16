@@ -3281,7 +3281,7 @@
             "description": "BUILDER_HAS_ACTIVE_JOB (body adds jobId and attempt), BUILDER_CLAIM_IN_PROGRESS, APP_IDENTITY_INCOMPLETE, OTA_BASE_RELEASE_INVALID"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3328,7 +3328,7 @@
             "description": "INVALID_BUILD_PROGRESS, INVALID_BUILD_ATTEMPT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3375,7 +3375,7 @@
             "description": "INVALID_BUILD_RESULT, INVALID_BUILD_ATTEMPT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3422,7 +3422,7 @@
             "description": "INVALID_BUILD_RESULT, INVALID_BUILD_ATTEMPT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3453,7 +3453,7 @@
             "description": "BUILD_KIND_MISMATCH (or BUILD_ATTEMPT_STALE)"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3485,7 +3485,7 @@
             "description": "BUILD_KIND_MISMATCH (or BUILD_ATTEMPT_STALE)"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3531,7 +3531,7 @@
             "description": "BUILD_ICON_NOT_FOUND, BUILD_JOB_NOT_FOUND"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3565,7 +3565,7 @@
             "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an OTA job)"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3602,7 +3602,7 @@
             "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an OTA job)"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3633,7 +3633,7 @@
             "description": "BUILD_KIND_MISMATCH (or BUILD_ATTEMPT_STALE)"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -3685,7 +3685,7 @@
             "description": "MACHINE_KEY_IN_USE, MACHINES_VERSION_CONFLICT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "426": {
             "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
@@ -3924,7 +3924,7 @@
     "/v1/admin/platform/machines/{id}/revoke": {
       "post": {
         "summary": "Revoke a machine",
-        "description": "Takes effect on the machine's next request (401).",
+        "description": "Takes effect on the machine's next request (401 MACHINE_REVOKED). A revoked signer's signerRole is cleared to null, so after promoting another signer the registry never lists two primaries.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineId"
@@ -4148,7 +4148,7 @@
             }
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4218,7 +4218,7 @@
             "description": "BUILD_SBOM_INVALID"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4268,7 +4268,7 @@
             "description": "BUILD_PROVENANCE_INVALID: bad signature, mismatching field (named in detail), or the unsigned package / SBOM were not uploaded under this attempt"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4378,7 +4378,7 @@
             "description": "MACHINE_KEY_IN_USE, MACHINES_VERSION_CONFLICT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "426": {
             "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
@@ -4407,7 +4407,7 @@
             }
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4443,7 +4443,7 @@
             "description": "INVALID_KEYSTORE_CHECK"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4457,7 +4457,7 @@
     "/v1/signer/claim": {
       "post": {
         "summary": "Claim a build to sign",
-        "description": "Only the active primary signer gets jobs (anyone else: 204). Candidates are, for every tenant named in the ready list, its apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform (at most one per tenant, no page limit, so tenants that cannot be dispatched never starve the others); a candidate is dispatched when whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming happens under the release sequence lock (the same lock as manual uploads and completions): if the platform already has a release whose version or build number is not lower than the job's (a manual upload while the job was still queued or building), the job is failed on the spot instead (failure_reason explains it, audit build_job_sign_overtaken) and not dispatched. Otherwise claiming increments signAttempt, deletes any signed package left by a previous sign attempt and moves the job to signing. keyAlias and trustRoots are for comparison only.",
+        "description": "Only the active primary signer gets jobs (anyone else: 204). Candidates are, for every tenant named in the ready list, its apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform (at most one per tenant, no page limit, so tenants that cannot be dispatched never starve the others); a candidate is dispatched when whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming happens under the release sequence lock (the same lock as manual uploads and completions): if the platform already has a release whose version or build number is not lower than the job's (a manual upload while the job was still queued or building), the job is failed on the spot instead (failure_reason explains it, audit build_job_sign_overtaken) and not dispatched. Otherwise claiming increments signAttempt, deletes any signed package left by a previous sign attempt and moves the job to signing. keyAlias and trustRoots are for comparison only. A job this signer deferred (POST /jobs/{id}/release, signOutcome.kind=deferred with this machine's id) is not dispatched to the same signer again until 60 seconds after signOutcome.at; other signers are not affected.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4491,7 +4491,7 @@
             "description": "INVALID_SIGN_CLAIM"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4528,7 +4528,7 @@
             "description": "INVALID_SIGN_ATTEMPT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4575,7 +4575,7 @@
             "description": "UNSIGNED_ARTIFACT_MISSING"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4642,7 +4642,7 @@
             }
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4656,7 +4656,7 @@
     "/v1/signer/jobs/{id}/complete": {
       "post": {
         "summary": "Complete signing: create the release and finish the job atomically",
-        "description": "Outside the transaction the server reads the signed package back from storage (the key recorded by the last signed upload of this claim) and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 must match the builder delivery and nativeFingerprint must equal the value from the builder's verified provenance (422 SIGN_RESULT_MISMATCH otherwise; the package does not carry it, so the release records the job's value with file_metadata.nativeFingerprintSource = builder-provenance). The signing heartbeat is refreshed before the download so a long verification is not reaped. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that the signed object key is still the one that was verified (409 SIGNED_ARTIFACT_REPLACED when the package was uploaded again meanwhile: call complete again) that the signer has not been revoked meanwhile (401 MACHINE_REVOKED), and re-reads release.android and build.keystore with a shared lock: if the registered package name, certificate or keystore changed after the verification the completion is refused (409 RELEASE_IDENTITY_CHANGED, audited as release_rejected; call complete again), checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, nativeFingerprintSource, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256, the same signAttempt and the same signer machine returns the same releaseId; any other signer or attempt gets 409 SIGN_ATTEMPT_STALE. Exempt from the database timeout by exact route match.",
+        "description": "Outside the transaction the server reads the signed package back from storage (the key recorded by the last signed upload of this claim) and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 must match the builder delivery and nativeFingerprint must equal the value from the builder's verified provenance (422 SIGN_RESULT_MISMATCH otherwise; the package does not carry it, so the release records the job's value with file_metadata.nativeFingerprintSource = builder-provenance). The signing heartbeat is refreshed before the download so a long verification is not reaped. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that the signed object key is still the one that was verified (409 SIGNED_ARTIFACT_REPLACED when the package was uploaded again meanwhile: call complete again) that the signer has not been revoked meanwhile (401 MACHINE_REVOKED), and re-reads release.android and build.keystore with a shared lock: if the registered package name, certificate or keystore changed after the verification the completion is refused (409 RELEASE_IDENTITY_CHANGED, audited as release_rejected; call complete again), checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, nativeFingerprintSource, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256, the same signAttempt and the same signer machine returns the same releaseId; the same signer and attempt with a different signedSha256 gets 409 SIGN_RESULT_CONFLICT (the recorded release is not replaced); any other signer or attempt gets 409 SIGN_ATTEMPT_STALE. Exempt from the database timeout by exact route match.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4698,7 +4698,7 @@
             "description": "INVALID_SIGN_RESULT, INVALID_SIGN_ATTEMPT"
           },
           "409": {
-            "description": "SIGN_ATTEMPT_STALE, BUILD_KIND_MISMATCH, SIGNED_ARTIFACT_MISSING (no signed upload for this claim yet), SIGNED_ARTIFACT_REPLACED (uploaded again during verification; call complete again), RELEASE_IDENTITY_CHANGED (release identity or keystore changed during verification; call complete again), RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
+            "description": "SIGN_ATTEMPT_STALE, SIGN_RESULT_CONFLICT (this claim already completed with a different signed package), BUILD_KIND_MISMATCH, SIGNED_ARTIFACT_MISSING (no signed upload for this claim yet), SIGNED_ARTIFACT_REPLACED (uploaded again during verification; call complete again), RELEASE_IDENTITY_CHANGED (release identity or keystore changed during verification; call complete again), RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
           },
           "422": {
             "description": "SIGN_RESULT_MISMATCH, SIGNED_ARTIFACT_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_SIGNER_RETIRED, RELEASE_FILE_INVALID and the manual upload verification codes; audited as release_rejected"
@@ -4713,7 +4713,7 @@
             "description": "STORAGE_UNAVAILABLE"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token; MACHINE_REVOKED: the signer was revoked while its package was being verified"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit (also returned when the signer was revoked while its package was being verified)"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4727,7 +4727,7 @@
     "/v1/signer/jobs/{id}/release": {
       "post": {
         "summary": "Cannot sign yet",
-        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred. The signed package uploaded under this sign attempt, if any, is deleted from storage. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F.",
+        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred. The signed package uploaded under this sign attempt, if any, is deleted from storage. Free text from machines is sanitized before it is stored: C0 control characters (except tab), DEL and C1 control characters are removed, as are Unicode bidi overrides and isolates (U+202A-U+202E, U+2066-U+2069) and the marks U+200E/U+200F. The same signer is not given this job again for 60 seconds (see POST /v1/signer/claim).",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4760,7 +4760,7 @@
             "description": "INVALID_SIGN_OUTCOME, INVALID_SIGN_ATTEMPT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4807,7 +4807,7 @@
             "description": "INVALID_SIGN_OUTCOME, INVALID_SIGN_ATTEMPT"
           },
           "401": {
-            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
           },
           "403": {
             "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
@@ -4853,7 +4853,7 @@
           "type": "string",
           "pattern": "^rnm_[A-Za-z0-9_-]{43}$"
         },
-        "description": "Per-machine token issued once when the machine is created in the console (POST /v1/admin/platform/machines). The server stores only its sha256 and checks the build.machines registry on every request (revocation takes effect immediately). Builder tokens are refused on /v1/signer (403 MACHINE_ROLE_FORBIDDEN) and signer tokens on /v1/build-agent. A request that only carries the retired x-build-agent-token gets 426 MACHINE_AUTH_UPGRADE_REQUIRED."
+        "description": "Per-machine token issued once when the machine is created in the console (POST /v1/admin/platform/machines). The server stores only its sha256 and checks the build.machines registry on every request (revocation takes effect immediately: a revoked machine's token gets 401 MACHINE_REVOKED, an unknown token 401 MACHINE_AUTH_REQUIRED). Builder tokens are refused on /v1/signer (403 MACHINE_ROLE_FORBIDDEN) and signer tokens on /v1/build-agent. A request that only carries the retired x-build-agent-token gets 426 MACHINE_AUTH_UPGRADE_REQUIRED."
       },
       "BuildAttempt": {
         "name": "x-build-attempt",
@@ -6962,7 +6962,7 @@
         "properties": {
           "configured": {
             "type": "boolean",
-            "description": "A v3 keystore is stored"
+            "description": "A v3 record is stored (even one that cannot be used; see readinessProblems KEYSTORE_RECORD_INVALID)"
           },
           "format": {
             "type": "integer",
@@ -7144,7 +7144,8 @@
               "primary",
               "standby",
               null
-            ]
+            ],
+            "description": "Signers only: primary or standby. null for builders and for revoked signers (cleared on revoke)."
           },
           "name": {
             "type": "string"
@@ -7680,13 +7681,14 @@
           "detail"
         ],
         "additionalProperties": false,
-        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed.",
+        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed.",
         "properties": {
           "code": {
             "type": "string",
             "enum": [
               "KEYSTORE_NOT_CONFIGURED",
               "KEYSTORE_LEGACY_FORMAT",
+              "KEYSTORE_RECORD_INVALID",
               "RELEASE_IDENTITY_NOT_CONFIGURED",
               "RELEASE_IDENTITY_MISMATCH",
               "PRIMARY_SIGNER_MISSING",

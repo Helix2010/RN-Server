@@ -72,7 +72,7 @@ ota：queued → claimed → running → succeeded
 | claimed/running → queued / failed | 回收定时器：10 分钟无构建心跳 | apk 且 `attempt < 3` 退回排队，否则判失败；ota 直接判失败 |
 | built → signing | 签名闸认领 | 只派 active 主签名闸；同租户同平台在途任务里 build 号最小；租户就绪且就绪项完全一致；`sign_attempt+1`、清空 `signed_object_key`。在发布序列锁里做 |
 | built → failed | 签名认领时发现被已有发布超过 | 构建期间手工上传了不低于它的版本：签出来也入不了库，不派，写 `failure_reason` 与审计 `build_job_sign_overtaken` |
-| signing → built | 签名闸 `/release`（暂不能签） | 不计 `sign_failures` |
+| signing → built | 签名闸 `/release`（暂不能签） | 不计 `sign_failures`；60 秒内不再派给同一台签名闸 |
 | signing → built / failed | 签名闸 `/reject` transient；回收定时器：5 分钟无签名心跳 | `sign_failures+1`，到 2 判失败 |
 | signing → failed | 签名闸 `/reject` violation；管理端 force-fail | — |
 | signing → succeeded | 签名闸 `/complete` | 先刷新签名心跳再复核；与写 `app_releases` 同一事务，事务里带共享锁重读发布身份与签名密钥，变了 409 `RELEASE_IDENTITY_CHANGED`；已 succeeded 且同一签名闸、同一签名编号、同一 sha256 按幂等返回 |

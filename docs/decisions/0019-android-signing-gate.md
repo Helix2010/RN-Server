@@ -23,14 +23,14 @@
 
 - 每次构建认领 `attempt+1`，每次签名认领 `sign_attempt+1`；机器的所有任务级请求带 `x-build-attempt` / `x-sign-attempt`，写入 SQL 条件带编号与机器 id，不匹配 409 `BUILD_ATTEMPT_STALE` / `SIGN_ATTEMPT_STALE`。未签名包、SBOM、已签名包的对象键含编号与每次上传一个的随机段，写键与校验编号在锁住任务行的同一个事务里；迟到或过期的上传只删自己写的对象，碰不到已被任务行或发布记录引用的键。`complete` 只从任务行记下的键取包，事务里再核对键没被重传替换、签名闸没在复核期间被吊销。
 - 回收是服务端独立定时器（每分钟，`RunBuildJobReaper`，随进程退出），不再挂在打包机认领上：`claimed/running` 10 分钟无心跳，安装包回 `queued`（`attempt` 到 3 判失败），热更新判失败；`signing` 5 分钟无心跳回 `built` 并 `sign_failures+1`。
-- `sign_failures` 单独一列：签名闸"暂不能签"（`release`，例如本机还没确认）不计数；心跳超时与"临时错误放弃"（`reject transient`）各加一，到 2 判失败；"违规"（`reject violation`）直接失败。三种结论都写进 `sign_outcome`（只保留最近一次）；**审计只写判失败的那一次**（违规 `build_job_sign_rejected`，临时错误或心跳超时到上限 `build_job_sign_failed`，actor `system-signer`）。暂不能签与没到上限的临时错误不写审计：签名闸每一轮轮询都可能报一次，写审计会刷屏，而 `sign_outcome` 已经说清楚最近一次为什么没签成。这里改的是文档（原先写成"三种结论都写审计"与实现不符），没有改实现。
+- `sign_failures` 单独一列：签名闸"暂不能签"（`release`，例如本机还没确认）不计数；心跳超时与"临时错误放弃"（`reject transient`）各加一，到 2 判失败；"违规"（`reject violation`）直接失败。三种结论都写进 `sign_outcome`（只保留最近一次）；**审计只写判失败的那一次**（违规 `build_job_sign_rejected`，临时错误或心跳超时到上限 `build_job_sign_failed`，actor `system-signer`）。暂不能签与没到上限的临时错误不写审计：签名闸每一轮轮询都可能报一次，写审计会刷屏，而 `sign_outcome` 已经说清楚最近一次为什么没签成。这里改的是文档（原先写成"三种结论都写审计"与实现不符），没有改实现。签名闸报"暂不能签"之后有 60 秒冷却（`signDeferralCooldown`）：`sign_outcome` 是本机在冷却期内说的 `deferred` 时，这条任务不再派给同一台签名闸，别的签名闸不受影响——否则认领、退回、再认领会空转（端到端实测每秒一百多次）。
 - `live_build_number` 生成列把 `built`、`signing` 算作占号，签名期间同一个 build 号不能再排一条。
 - 手工上传 Android 发布记录时，该租户该平台有 `built`/`signing` 任务就 409 `RELEASE_SIGNING_IN_FLIGHT`，免得手工包抢走签名闸正要用的版本号。任务还在排队或构建时手工上传照常放行；签名认领在同一把发布序列锁里比对已有发布，被超过的任务当场判失败、不派（签名闸会在本机记录里占掉派出去的 versionCode）。
 
 ### 3. 机器登记取代全局令牌
 
 - 平台级 `app_configs` 键 `build.machines`：每台机器一个令牌（`rnm_` + 32 字节 base64url，只存 sha256，原文只在新建响应里出现一次）、角色、主备、公钥与状态。`BUILD_AGENT_TOKEN` 删除。
-- 鉴权中间件按令牌 sha256 找机器，校验角色（构建机令牌调签名闸接口 403，反之亦然），`revoked` 401。每个请求主键查一次 `version, updated_at`，没变用缓存——吊销即时生效，又不必每次解析整份 JSON。只带旧头 `x-build-agent-token` 返回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`，旧打包机升级前看到的是"要升级"而不是"令牌错"。
+- 鉴权中间件按令牌 sha256 找机器，校验角色（构建机令牌调签名闸接口 403，反之亦然），`revoked` 401 `MACHINE_REVOKED`（令牌查无是 401 `MACHINE_AUTH_REQUIRED`；分开说，机器认出吊销就退出而不是一直重连）。每个请求主键查一次 `version, updated_at`，没变用缓存——吊销即时生效，又不必每次解析整份 JSON。只带旧头 `x-build-agent-token` 返回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`，旧打包机升级前看到的是"要升级"而不是"令牌错"。
 - 公钥由机器自己上报为待接受，平台管理员核对完整 64 位指纹后接受；接受签名闸时**必须**同时带从本机抄来的 Ed25519 指纹（缺了 400 `INVALID_MACHINE`，对不上 409 `MACHINE_KEY_MISMATCH`），否则偷到令牌的人能在待接受期间把真机的 X25519 与自己的 Ed25519 配成一对，此后的换钥证明就归他（安全评审 R2）。已 active 的机器换钥必须带当前私钥对 `machinekey.RotationMessage` 的签名，否则 403——偷到令牌不等于能换掉出处密钥。
 - 签名闸有两把钥：X25519 解密钥密文（其 sha256 是收件人指纹），Ed25519 签本机记录与换钥证明。构建机一把 Ed25519 出处密钥。
 - **主备只影响路由**。签名闸与离线工具不采信这份登记：签名闸只信本机记录，离线工具只加密给离线 pin 文件里的签名闸。服务端被攻破能做到的是"不派活、派给错的机器"，做不到"让签名闸签一个它不认的包"。
@@ -40,11 +40,12 @@
 - `build.keystore` 只收离线工具产出的 v3 上传文件（`signing/keystorebox`）：每台签名闸一份 X25519 密文，明文绑定租户、包名、证书指纹、别名与收件人列表。外层仍用 `STORAGE_MASTER_KEY` 加密。服务端打不开内层。
 - 收件人必须都是已登记、未吊销签名闸已接受的公钥，多余的拒收（`BUILD_KEYSTORE_RECIPIENT_UNKNOWN`），缺的只提示（`missingSigners`，只列 active 的签名闸）；与 `release.android` 在同一事务里各自带乐观锁写入。
 - 删除：服务端生成密钥（`/build-keystore/generate`）、v1 口令封装与 v2 打包机公钥封装的全部读写点、`internal/buildkeystore`、`cmd/build-keystore`、打包机公钥登记（`/platform/build-agent/public-key*`）、打包机的 `/keystore-checks`。库里的旧格式记录读出来是 `legacy=true`、不就绪，等租户上传 v3 时覆盖。
+- `build.keystore` 是 v3 但用不了（记录损坏、外层解不开、索引字段与密文文件对不上）时不是读库错误：控制台照常返回（`configured=true`、`ready=false`），就绪问题 `KEYSTORE_RECORD_INVALID`，排队 409 `SIGNER_NOT_READY`，签名闸检查接口不下发这个租户。
 - `build.keystore.check` 改为按机器 id 分键，`JSON_SET` 只改自己那一项——主备并发上报整行覆盖会丢掉对方的结论。
 
 ### 5. 就绪判断
 
-排队与签名认领用同一个函数：有 v3 密钥且与发布身份一致；有 active primary 签名闸且密钥发给了它；服务端算得出信任根；primary 对当前密钥版本报告了试解成功、本机确认、确认时的信任根摘要等于服务端当前摘要、试签成功。不满足时排队 409 `SIGNER_NOT_READY`，detail 逐条列出缺什么，问题体里另带 `readinessProblems`；控制台签名密钥页 `GET /v1/admin/build-keystore` 带同样的 `readinessProblems`（就绪时为空数组）。每条原因有固定 code（OpenAPI `SignerReadinessProblem`，测试保证服务端全集与契约枚举一致）：`KEYSTORE_NOT_CONFIGURED`、`KEYSTORE_LEGACY_FORMAT`、`RELEASE_IDENTITY_NOT_CONFIGURED`、`RELEASE_IDENTITY_MISMATCH`、`PRIMARY_SIGNER_MISSING`、`PRIMARY_SIGNER_NOT_RECIPIENT`、`APP_IDENTITY_INCOMPLETE`、`OTA_CERTIFICATE_NOT_CONFIGURED`、`API_BASE_URL_INVALID`、`TRUST_ROOTS_INVALID`、`PRIMARY_SIGNER_NOT_CHECKED`、`PRIMARY_SIGNER_DECRYPT_FAILED`、`PRIMARY_SIGNER_NOT_CONFIRMED`、`TRUST_ROOTS_CHANGED`、`PRIMARY_SIGNER_TRIAL_SIGN_PENDING`、`PRIMARY_SIGNER_TRIAL_SIGN_FAILED`。
+排队与签名认领用同一个函数：有 v3 密钥且与发布身份一致；有 active primary 签名闸且密钥发给了它；服务端算得出信任根；primary 对当前密钥版本报告了试解成功、本机确认、确认时的信任根摘要等于服务端当前摘要、试签成功。不满足时排队 409 `SIGNER_NOT_READY`，detail 逐条列出缺什么，问题体里另带 `readinessProblems`；控制台签名密钥页 `GET /v1/admin/build-keystore` 带同样的 `readinessProblems`（就绪时为空数组）。每条原因有固定 code（OpenAPI `SignerReadinessProblem`，测试保证服务端全集与契约枚举一致）：`KEYSTORE_NOT_CONFIGURED`、`KEYSTORE_LEGACY_FORMAT`、`KEYSTORE_RECORD_INVALID`、`RELEASE_IDENTITY_NOT_CONFIGURED`、`RELEASE_IDENTITY_MISMATCH`、`PRIMARY_SIGNER_MISSING`、`PRIMARY_SIGNER_NOT_RECIPIENT`、`APP_IDENTITY_INCOMPLETE`、`OTA_CERTIFICATE_NOT_CONFIGURED`、`API_BASE_URL_INVALID`、`TRUST_ROOTS_INVALID`、`PRIMARY_SIGNER_NOT_CHECKED`、`PRIMARY_SIGNER_DECRYPT_FAILED`、`PRIMARY_SIGNER_NOT_CONFIRMED`、`TRUST_ROOTS_CHANGED`、`PRIMARY_SIGNER_TRIAL_SIGN_PENDING`、`PRIMARY_SIGNER_TRIAL_SIGN_FAILED`。
 
 信任根摘要由 `signing/trustroots` 计算，服务端与签名闸共用：租户改了 `apiBaseUrl` 或 OTA 证书，摘要就变，在主签名闸重新 `confirm` 之前不能排队。App Links host 按 RN-App `app.config.ts` 的规则（`new URL(apiBaseUrl).host`）派生，有测试钉住。`apiBaseUrl` 在**保存打包配置时**就用 `trustroots.ValidateAPIBaseURL` 校验（去掉首尾空白与结尾 `/` 之后）：显式写默认端口 `:443`、大写域名、IP、带路径一律 400——WHATWG URL 会去掉 `:443`，同一个源两种写法会让服务端与签名闸对 host 与摘要得出不同结论，所以要求配置本身是唯一写法，而不是存进去再判不就绪。校验收紧之前存下的旧值在就绪判断里报 `API_BASE_URL_INVALID`。
 
