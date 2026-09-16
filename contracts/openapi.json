@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.21"
+    "version": "2026.09.22"
   },
   "paths": {
     "/v1/mobile/referral/me": {
@@ -1249,10 +1249,10 @@
             "description": "Verified release created from uploaded artifact (mandatory=true makes the update unskippable once this release is active)"
           },
           "409": {
-            "description": "RELEASE_SEQUENCE_BUSY / RELEASE_VERSION_NOT_INCREASING"
+            "description": "RELEASE_SEQUENCE_BUSY / RELEASE_VERSION_NOT_INCREASING / RELEASE_SIGNING_IN_FLIGHT (android: this tenant has a build waiting for or being signed by the signer; checked before download and again inside the release transaction)"
           },
           "422": {
-            "description": "RELEASE_FILE_INVALID, RELEASE_VERIFY_FAILED, RELEASE_EMBEDDED_CONFIG_INVALID, RELEASE_DEBUG_SIGNER, RELEASE_SIGNER_UNPINNED (production without release.android pin), RELEASE_PACKAGE_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_APPLICATION_ID_MISSING, RELEASE_IDENTITY_MISMATCH; every rejection is audited as release_rejected"
+            "description": "RELEASE_FILE_INVALID, RELEASE_VERIFY_FAILED, RELEASE_EMBEDDED_CONFIG_INVALID, RELEASE_DEBUG_SIGNER, RELEASE_SIGNER_RETIRED (a retired tenant signing certificate, refused forever), RELEASE_SIGNER_UNPINNED (production without release.android pin), RELEASE_PACKAGE_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_APPLICATION_ID_MISSING, RELEASE_IDENTITY_MISMATCH; every rejection is audited as release_rejected"
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored release.android pin is invalid), RELEASE_CREATE_FAILED"
@@ -2831,6 +2831,9 @@
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
+          },
+          "422": {
+            "description": "RELEASE_SIGNER_RETIRED: signerSha256 is a retired tenant signing certificate and can never be registered again"
           }
         }
       }
@@ -2965,26 +2968,93 @@
         "summary": "List build jobs for this tenant",
         "description": "Newest first, with server-side filtering and cursor pagination. Each item carries status, the resolved commit, the artifact sha256 and a bounded log tail. Filters include kind (apk/ota), platform, status, exact version and q (job id, version, commit, branch or builder). Also returns `next` — the version and build number to default the queue form to, per platform, worked out from both app_releases and the build jobs still queued or running; a tenant with no packages yet gets 1.0.0/1, otherwise the highest used version gets a patch bump and the build number is incremented. `gitRef` is the branch every build is pinned to; the console shows it read-only because the queue endpoint ignores whatever the request carries.",
         "parameters": [
-          { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["apk", "ota"] } },
-          { "name": "platform", "in": "query", "schema": { "type": "string", "enum": ["android", "ios"] } },
-          { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["queued", "claimed", "running", "succeeded", "failed", "canceled"] } },
-          { "name": "version", "in": "query", "schema": { "type": "string" } },
-          { "name": "q", "in": "query", "schema": { "type": "string" } },
-          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
+          {
+            "name": "kind",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "apk",
+                "ota"
+              ]
+            }
+          },
+          {
+            "name": "platform",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "claimed",
+                "running",
+                "built",
+                "signing",
+                "succeeded",
+                "failed",
+                "canceled"
+              ]
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Matches job id, version, git ref, commit, builder name, claimed machine id or signing machine id"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          }
         ],
         "responses": {
           "200": {
-            "description": "Build jobs"
+            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore"
           },
           "401": {
             "description": "Admin authentication required"
+          },
+          "422": {
+            "description": "INVALID_BUILD_FILTER"
           }
         }
       },
       "post": {
         "summary": "Queue a build",
-        "description": "kind defaults to \"apk\" (compile an installable package). kind=\"ota\" queues a hot-update build instead: it takes baseReleaseId and applyStrategy rather than version and buildNumber, needs no signing key on the build machine (OTA manifests are signed by the server when they are served), and produces a verified OTA revision that still has to be published by hand. An OTA job is refused when the tenant has no OTA signing key, when the base release carries no runtimeVersion, or when another OTA job for the same tenant and platform is still in flight (OTA_BUILD_ALREADY_QUEUED) - the queue is shared across tenants and OTA jobs have no build-number monotonicity to limit them. channel is never taken from the request: it is compiled into the base APK, so it comes from the tenant's composed identity.",
+        "description": "kind defaults to \"apk\" (compile an installable package). kind=\"ota\" queues a hot-update build instead: it takes baseReleaseId and applyStrategy rather than version and buildNumber, needs no signing key on the build machine (OTA manifests are signed by the server when they are served), and produces a verified OTA revision that still has to be published by hand. An OTA job is refused when the tenant has no OTA signing key, when the base release carries no runtimeVersion, or when another OTA job for the same tenant and platform is still in flight (OTA_BUILD_ALREADY_QUEUED) - the queue is shared across tenants and OTA jobs have no build-number monotonicity to limit them. channel is never taken from the request: it is compiled into the base APK, so it comes from the tenant's composed identity. An android apk job is refused with 409 SIGNER_NOT_READY unless the primary signer is ready for this tenant; after changing apiBaseUrl or the OTA key it stays refused until the primary signer re-confirms.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3006,7 +3076,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used. BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform, so the upload would be rejected after a full build BUILD_KEYSTORE_UNUSABLE: the build machine has already reported that it cannot open this tenant's sealed signing keystore, so the build would fail at unseal time after occupying the machine; the verdict is tied to the current keystore version and clears as soon as the keystore is replaced."
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE / APP_IDENTITY_DRIFT. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing. Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs."
           },
           "422": {
             "description": "OTA_BASE_RELEASE_INVALID: this release cannot be used as an OTA base - it is not verified/active, it has no runtimeVersion, or it has no recorded native fingerprint (built before the fingerprint was recorded, so there is no way to tell whether the update is JS-only). INVALID_OTA_APPLY_STRATEGY: applyStrategy must be next_launch or immediate."
@@ -3020,7 +3090,7 @@
         "description": "Includes the bounded log tail for failure triage.",
         "responses": {
           "200": {
-            "description": "Build job"
+            "description": "BuildJob"
           },
           "401": {
             "description": "Admin authentication required"
@@ -3033,8 +3103,8 @@
     },
     "/v1/admin/builds/{id}/cancel": {
       "post": {
-        "summary": "Cancel a queued or claimed build",
-        "description": "Only queued or claimed builds can be canceled. Canceling a running or finished build would make the status lie: the artifact may already exist and the process on the build machine does not stop.",
+        "summary": "Cancel a queued, claimed or built build",
+        "description": "Only queued or claimed jobs, and apk jobs that are built (delivered, waiting for the signer), can be canceled. Canceling a running build would make the status lie: the process on the builder does not stop. A signing job cannot be canceled because the signer may be signing it - use force-fail. A canceled claimed job makes the builder's next report fail with 409 BUILD_ATTEMPT_STALE. Audited as build_job_cancel.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3056,7 +3126,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_JOB_NOT_CANCELABLE"
+            "description": "BUILD_JOB_NOT_CANCELABLE: only queued, claimed or built builds can be canceled"
           }
         }
       }
@@ -3106,19 +3176,29 @@
     "/v1/admin/build-keystore": {
       "get": {
         "summary": "Android signing keystore status (metadata only)",
-        "description": "Never returns the sealed box itself — that goes only to the build agent. Alongside the key alias and keystore sha256 it returns `check` (pending | ok | failed: whether the build machine could actually open the box, since the server holds no passphrase and cannot tell on its own) `sealedTenantCount` (how many tenants platform-wide already have a keystore), and `agentKey` (whether a build machine has registered a public key, and its fingerprint — not a secret, and the tenant needs it to know whether a keystore can be created at all; the pending/accept workflow stays on the platform-only routes). The count is what lets the console tell the truth about the sealing passphrase: there is exactly one BUILD_KEYSTORE_PASSPHRASE per build machine, shared by every tenant, so from the second tenant onward the operator must enter the existing passphrase rather than invent one — pointing the machine at a new tenant's passphrase locks every earlier tenant out of its own signing key.",
+        "description": "Keystore status for this tenant (BuildKeystoreView). Never returns ciphertext. Lists which registered signers the keystore is sealed to, active signers it is missing, each signer's check (decrypt, local confirmation with trust roots digest, trial signing) for the current keystore version, whether the primary signer is ready, and the trust roots the server composed. legacy=true means the stored row is a retired passphrase or build-agent box: it is not usable and must be replaced by a v3 upload.",
         "responses": {
           "200": {
-            "description": "Keystore status"
+            "description": "BuildKeystoreView",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildKeystoreView"
+                }
+              }
+            }
           },
           "401": {
             "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "BUILD_KEYSTORE_CONFIG_INVALID"
           }
         }
       },
       "put": {
-        "summary": "Upload the sealed Android signing keystore",
-        "description": "Accepts a bundle produced by `build-keystore seal` on the operator's machine. The server validates the envelope shape and the KDF parameters, wraps it with the storage master key and stores it per tenant. It deliberately cannot decrypt the inner bundle: the Android signing key is never used by the server at runtime, and a leak of it cannot be remediated for direct distribution, so the server must not hold the ability to read it.",
+        "summary": "Upload the v3 Android signing keystore produced by the offline tool",
+        "description": "Accepts only rn-android-keystore-upload/v3 files from the offline build-keystore tool (v3 boxes sealed to signer X25519 keys). The server cannot open them; it checks the shape, that the file is for this tenant, that packageName and signerSha256 equal the file, that the certificate is not retired, and that every box is addressed to the accepted key of a registered signer that is not revoked (an extra box for anyone else is refused; a missing signer is only reported in missingSigners). The file is wrapped with the storage master key and stored together with release.android in one transaction (ADR-0016), each with its own optimistic lock.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3131,48 +3211,32 @@
         },
         "responses": {
           "200": {
-            "description": "Saved"
+            "description": "BuildKeystoreView plus releaseIdentityVersion",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildKeystoreView"
+                }
+              }
+            }
           },
           "400": {
-            "description": "INVALID_BUILD_KEYSTORE"
+            "description": "MALFORMED_BUILD_KEYSTORE, INVALID_BUILD_KEYSTORE (shape), INVALID_RELEASE_IDENTITY"
           },
           "401": {
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_KEYSTORE"
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY"
+          },
+          "422": {
+            "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED (not v3, including v1/v2 bodies), BUILD_KEYSTORE_RECIPIENT_UNKNOWN, BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH, RELEASE_SIGNER_RETIRED"
           },
           "500": {
-            "description": "BUILD_KEYSTORE_SAVE_FAILED"
-          }
-        }
-      }
-    },
-    "/v1/build-agent/keystore-checks": {
-      "get": {
-        "summary": "Sealed keystores this build machine has not verified yet",
-        "description": "The sealing passphrase exists only on the build machine, which is what makes storing signing keys in the database acceptable — and it also means the server cannot tell whether a freshly stored box was sealed with the right passphrase. Storing looks fine, the fingerprint is registered, the console shows it configured, and the first sign of trouble is a build failing at unseal time minutes later. So the one party that holds the passphrase verifies instead: this returns the sealed boxes whose current version has no verification result yet. Same credential and same payload as claiming a build, so the agent sees nothing new.",
-        "responses": {
-          "200": {
-            "description": "Boxes to verify"
+            "description": "BUILD_KEYSTORE_SAVE_FAILED, RELEASE_IDENTITY_SAVE_FAILED"
           },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
-          }
-        }
-      },
-      "post": {
-        "summary": "Report whether the build machine can open a sealed keystore",
-        "description": "Stores the result against the app_configs version of the keystore that was checked, so rewriting the keystore invalidates the verdict rather than letting a stale green one vouch for a new box. A result for a version that is no longer current is accepted and discarded (stored:false). The reported reason is shown in the console: it is trimmed to 300 characters, newlines removed, and never contains the passphrase.",
-        "responses": {
-          "200": {
-            "description": "Result stored, or discarded because the keystore changed meanwhile"
-          },
-          "400": {
-            "description": "INVALID_KEYSTORE_CHECK"
-          },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+          "503": {
+            "description": "MACHINE_REGISTRY_UNAVAILABLE"
           }
         }
       }
@@ -3180,20 +3244,32 @@
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
-        "description": "Atomically claims the oldest queued job for the requested platforms (FOR UPDATE SKIP LOCKED, so two agents never get the same job) and returns its parameters together with the tenant slug and the tenant OTA code signing certificate. The private key is never returned. icons is a list of file NAMES, not image bytes: the agent fetches each one from GET /v1/build-agent/jobs/{id}/icons/{name}. They were inlined as base64 until 2026-09-13, when real 2048x2048 icons made this response 5.1 MB, past the agent 1 MiB read cap - the truncated JSON could not be parsed, and because the row is marked claimed before the response is written, the job was stranded forever. Claiming also reaps jobs whose agent stopped reporting for longer than the heartbeat timeout, which is what releases their build numbers. Shipping the certificate with the job is what keeps the certificate compiled into the app in sync with the key the server signs with. Returns 204 when the queue is empty. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view plus attempt, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/BuildClaim"
+                "$ref": "#/components/schemas/BuilderClaim"
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Claimed build job with tenantSlug and otaCertificatePem"
+            "description": "Claimed job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildJob"
+                }
+              }
+            }
           },
           "204": {
             "description": "No queued build"
@@ -3201,8 +3277,17 @@
           "400": {
             "description": "INVALID_BUILD_CLAIM"
           },
+          "409": {
+            "description": "BUILDER_HAS_ACTIVE_JOB (body adds jobId and attempt), BUILDER_CLAIM_IN_PROGRESS, APP_IDENTITY_INCOMPLETE, OTA_BASE_RELEASE_INVALID"
+          },
           "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
@@ -3210,7 +3295,18 @@
     "/v1/build-agent/jobs/{id}/heartbeat": {
       "post": {
         "summary": "Report build progress",
-        "description": "Moves the job to running and stores a bounded log tail (at most 200 lines, 2000 bytes each). Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "description": "Moves the job to running and stores a bounded log tail (200 lines, 2000 bytes each).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -3222,25 +3318,42 @@
           }
         },
         "responses": {
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE: wrong attempt, not this machine, or the job is no longer claimed/running - stop working on the job"
+          },
           "204": {
             "description": "Recorded"
           },
           "400": {
-            "description": "INVALID_BUILD_PROGRESS"
+            "description": "INVALID_BUILD_PROGRESS, INVALID_BUILD_ATTEMPT"
           },
           "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
           },
-          "409": {
-            "description": "BUILD_JOB_NOT_RUNNING"
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
     },
     "/v1/build-agent/jobs/{id}/complete": {
       "post": {
-        "summary": "Report a successful build",
-        "description": "commitSha and artifactSha256 must be lowercase hex digests; the server records what was built, not how. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "summary": "Report an OTA build result",
+        "description": "OTA jobs only: the job moves to succeeded with the OTA revision id. apk jobs are delivered through /unsigned/upload, /sbom/upload and /built.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -3252,25 +3365,42 @@
           }
         },
         "responses": {
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (apk job)"
+          },
           "204": {
             "description": "Recorded"
           },
           "400": {
-            "description": "INVALID_BUILD_RESULT"
+            "description": "INVALID_BUILD_RESULT, INVALID_BUILD_ATTEMPT"
           },
           "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
           },
-          "409": {
-            "description": "BUILD_JOB_NOT_RUNNING"
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
     },
     "/v1/build-agent/jobs/{id}/fail": {
       "post": {
-        "summary": "Report a failed build",
-        "description": "failureReason is required: a failure with no reason shows up in the admin UI as failed with nothing to act on. Authenticated with x-build-agent-token, a credential kept separate from the admin key: a compromised build machine should yield the build queue, not the whole admin surface.",
+        "summary": "Report a build failure",
+        "description": "The commit is recorded when the builder got that far.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -3282,74 +3412,132 @@
           }
         },
         "responses": {
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE: wrong attempt, not this machine, or the job is no longer claimed/running - stop working on the job"
+          },
           "204": {
             "description": "Recorded"
           },
           "400": {
-            "description": "INVALID_BUILD_RESULT"
+            "description": "INVALID_BUILD_RESULT, INVALID_BUILD_ATTEMPT"
           },
           "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
           },
-          "409": {
-            "description": "BUILD_JOB_NOT_RUNNING"
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
     },
     "/v1/build-agent/jobs/{id}/artifact-uploads": {
       "post": {
-        "summary": "Create an artifact upload ticket for a running build",
-        "description": "Same ticket the admin upload flow issues, scoped to the job's tenant. The upload URL points at the build-agent channel because the agent holds no admin credential. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
-        "responses": {
-          "201": {
-            "description": "Upload ticket"
+        "summary": "Create an artifact upload ticket for a running build (retired)",
+        "description": "Retired. The builder can no longer create releases: installable packages are delivered unsigned and the signer creates the release. Always 409 BUILD_KIND_MISMATCH for a current claim.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
           },
-          "400": {
-            "description": "INVALID_ARTIFACT_UPLOAD"
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "responses": {
+          "409": {
+            "description": "BUILD_KIND_MISMATCH (or BUILD_ATTEMPT_STALE)"
           },
           "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
           },
-          "409": {
-            "description": "BUILD_JOB_NOT_RUNNING"
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
           },
-          "503": {
-            "description": "STORAGE_UNAVAILABLE"
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/v1/build-agent/jobs/{id}/artifact": {
       "put": {
-        "summary": "Upload the built artifact bytes",
-        "description": "Proxy-mode upload of the APK; direct mode uploads straight to object storage with the presigned URL from the ticket. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "summary": "Upload the built artifact bytes (retired)",
+        "description": "Retired. The builder can no longer create releases: installable packages are delivered unsigned and the signer creates the release. Always 409 BUILD_KIND_MISMATCH for a current claim.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "responses": {
-          "200": {
-            "description": "Stored"
+          "409": {
+            "description": "BUILD_KIND_MISMATCH (or BUILD_ATTEMPT_STALE)"
           },
           "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
           },
-          "409": {
-            "description": "BUILD_JOB_NOT_RUNNING"
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
-        }
+        },
+        "deprecated": true
       }
     },
     "/v1/build-agent/jobs/{id}/icons/{name}": {
       "get": {
         "summary": "Download one launcher icon for this build",
-        "description": "Returns the raw PNG for one of icon.png, android-icon-foreground.png, android-icon-background.png, android-icon-monochrome.png - the names the claim response lists in icons, which are also the paths app.config.ts reads. An unset background layer is generated here as a solid fill from identity.iconBackgroundColor, so a tenant only has to upload three. Any other name is 404, so the name cannot be used to read arbitrary files. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "description": "Returns the raw PNG for icon.png, android-icon-foreground.png, android-icon-background.png or android-icon-monochrome.png - the names listed in the claim. An unset background layer is generated as a solid fill from identity.iconBackgroundColor. Any other name is 404.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "responses": {
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE: wrong attempt, not this machine, or the job is no longer claimed/running - stop working on the job"
+          },
           "200": {
             "description": "image/png"
           },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
-          },
           "404": {
-            "description": "BUILD_ICON_NOT_FOUND"
+            "description": "BUILD_ICON_NOT_FOUND, BUILD_JOB_NOT_FOUND"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
@@ -3357,16 +3545,33 @@
     "/v1/build-agent/jobs/{id}/ota-uploads": {
       "post": {
         "summary": "Upload ticket for an OTA build job",
-        "description": "Same ticket as the console OTA upload, but baseReleaseId and channel come from the build job row rather than the request: they decide which devices get this package. The agent only sends fileName and size. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant. 409 BUILD_JOB_NOT_OTA when the job is an APK build.",
+        "description": "Same ticket as the console OTA upload, but baseReleaseId and channel come from the build job row rather than the request: they decide which devices get this package. The agent only sends fileName and size. The job id scopes the request to that job's tenant.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "responses": {
           "201": {
             "description": "Temporary OTA upload ticket"
           },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
-          },
           "409": {
-            "description": "BUILD_JOB_NOT_OTA or BUILD_JOB_NOT_RUNNING"
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an OTA job)"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
@@ -3375,111 +3580,115 @@
       "post": {
         "summary": "Create the OTA revision for a build job",
         "description": "Base release, channel, apply strategy and release notes are all taken from the build job row; the agent sends only the artifact token and the commit it built. Runs the same validation as the console upload path: manifest/runtime/applicationId binding, identity pinning (OTA_IDENTITY_MISMATCH) and the native fingerprint gate (OTA_NATIVE_CHANGED). The revision lands as verified - publishing stays a separate console action with its own reason and confirmation.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
         "responses": {
           "201": {
             "description": "Verified OTA revision created"
           },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
-          },
-          "409": {
-            "description": "BUILD_JOB_NOT_OTA or BUILD_JOB_NOT_RUNNING"
-          },
           "422": {
             "description": "OTA_IDENTITY_MISMATCH, OTA_NATIVE_CHANGED, OTA_BASE_FINGERPRINT_MISSING or the existing manifest errors"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an OTA job)"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
     },
     "/v1/build-agent/jobs/{id}/release": {
       "post": {
-        "summary": "Turn the uploaded artifact into a release record",
-        "description": "Platform, version, build number and release notes are all taken from the build job row, never from the request body: those define the artifact's identity and what users will read, and the job row already passed validation. Runs the same APK identity inspection, ETag pinning and signer fingerprint gate as a manual upload. Authenticated with x-build-agent-token; the job id scopes the request to that job's tenant.",
+        "summary": "Turn the uploaded artifact into a release record (retired)",
+        "description": "Retired. The builder can no longer create releases: installable packages are delivered unsigned and the signer creates the release. Always 409 BUILD_KIND_MISMATCH for a current claim.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "responses": {
+          "409": {
+            "description": "BUILD_KIND_MISMATCH (or BUILD_ATTEMPT_STALE)"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        },
+        "deprecated": true
+      }
+    },
+    "/v1/build-agent/public-key": {
+      "post": {
+        "summary": "Report this builder's provenance public key",
+        "description": "Stores the key as pending until a platform administrator accepts it. Re-reporting the accepted or the pending key is idempotent. An active builder reporting a different key must prove it with rotationSignature by the current key (403 MACHINE_KEY_ROTATION_UNPROVEN). A pending_key machine may call only this endpoint.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "required": [
-                  "artifactToken"
-                ],
-                "properties": {
-                  "artifactToken": {
-                    "type": "string"
-                  },
-                  "sbomToken": {
-                    "type": "string",
-                    "description": "Upload token for the CycloneDX SBOM the build agent produced for this artifact. Recorded on the release as file_metadata.sbom. Optional: a manually uploaded package has none."
-                  }
-                }
+                "$ref": "#/components/schemas/BuilderPublicKey"
               }
             }
           }
         },
         "responses": {
-          "201": {
-            "description": "Release created"
+          "200": {
+            "description": "Key status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineKeyStatus"
+                }
+              }
+            }
           },
           "400": {
-            "description": "INVALID_RELEASE"
-          },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
-          },
-          "409": {
-            "description": "BUILD_JOB_NOT_RUNNING"
-          },
-          "422": {
-            "description": "RELEASE_FILE_INVALID, RELEASE_IDENTITY_MISMATCH"
-          }
-        }
-      }
-    },
-    "/v1/build-agent/public-key": {
-      "post": {
-        "summary": "Register this build machine's public key",
-        "description": "The build agent generates an X25519 keypair on first start; the private key never leaves that machine. Signing keystores are encrypted to this public key, so nobody has to type a sealing passphrase — the previous design asked whoever was at the console for a platform-wide secret that protects every tenant's key, which a tenant cannot know and which even the platform operator mistyped three times. The key is pinned: the first registration is accepted, a later registration of a different key is only recorded as pending and needs a platform admin to accept it after checking the fingerprint. Without pinning, anyone holding the agent token could register their own public key and every keystore created afterwards would be encrypted to them.",
-        "responses": {
-          "200": {
-            "description": "registered | unchanged | pending_acceptance"
-          },
-          "400": {
-            "description": "INVALID_AGENT_KEY"
-          },
-          "401": {
-            "description": "BUILD_AGENT_AUTH_REQUIRED"
-          }
-        }
-      }
-    },
-    "/v1/admin/platform/build-agent/public-key": {
-      "get": {
-        "summary": "Which build machine key signing keystores are encrypted to",
-        "description": "Returns the pinned public key fingerprint and, when a build agent has reported a different one, the pending fingerprint waiting to be accepted. Platform admin only: the build machine is one per platform, not per tenant.",
-        "responses": {
-          "200": {
-            "description": "Current and pending build agent keys"
+            "description": "INVALID_MACHINE_KEY"
           },
           "403": {
-            "description": "Platform admin required"
-          }
-        }
-      }
-    },
-    "/v1/admin/platform/build-agent/public-key/accept": {
-      "post": {
-        "summary": "Accept a new build machine public key",
-        "description": "Requires the pending fingerprint to be typed back, which is the only evidence that someone actually checked it on the machine itself. Accepting does NOT re-encrypt existing keystores — the server has no plaintext and cannot — so every tenant's verification result is cleared, the agent re-checks each box with its new private key, and tenants whose keystore is now unopenable show up immediately instead of at their next build.",
-        "responses": {
-          "200": {
-            "description": "Accepted"
-          },
-          "400": {
-            "description": "INVALID_AGENT_KEY_ACCEPT"
+            "description": "MACHINE_KEY_ROTATION_UNPROVEN, MACHINE_ROLE_FORBIDDEN"
           },
           "409": {
-            "description": "NO_PENDING_AGENT_KEY, AGENT_KEY_FINGERPRINT_MISMATCH"
+            "description": "MACHINE_KEY_IN_USE, MACHINES_VERSION_CONFLICT"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
           }
         }
       }
@@ -3586,6 +3795,1028 @@
           }
         }
       }
+    },
+    "/v1/admin/builds/{id}/force-fail": {
+      "post": {
+        "summary": "Force-fail a build that is being signed",
+        "description": "Only apk jobs in signing. Use when the signer is stuck or gone; the signer's late reports (heartbeat, download, upload, complete, release, reject) are refused by status and sign attempt, so no release is created. Audited as build_job_force_fail.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/JobId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildJobCancel"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "BuildJob"
+          },
+          "400": {
+            "description": "INVALID_BUILD_JOB: reason and confirm=true are required"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "BUILD_JOB_NOT_FORCE_FAILABLE: only builds being signed can be force-failed"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/machines": {
+      "get": {
+        "summary": "List builders and signers",
+        "description": "The build.machines registry. Console acceptance only affects routing: signers and the offline tool trust their local records and the offline pin file.",
+        "responses": {
+          "200": {
+            "description": "Registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MachineView"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "500": {
+            "description": "MACHINE_REGISTRY_INVALID"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a builder or signer and issue its token",
+        "description": "The token (rnm_…) appears only in this response; it is never written to the audit log or any other response, and only its sha256 is stored. Lost tokens are replaced by revoking and creating a new machine. The new machine is pending_key until it reports its public key and a platform administrator accepts it. At most one signer that is not revoked can be primary.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "INVALID_MACHINE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "404": {
+            "description": "MACHINE_NOT_FOUND"
+          },
+          "409": {
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_NAME_TAKEN (another machine that is not revoked uses the name), SIGNER_PRIMARY_EXISTS, MACHINE_LIMIT_REACHED"
+          },
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "machine": {
+                      "$ref": "#/components/schemas/MachineView"
+                    },
+                    "token": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/machines/{id}/revoke": {
+      "post": {
+        "summary": "Revoke a machine",
+        "description": "Takes effect on the machine's next request (401).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineRevoke"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "INVALID_MACHINE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "404": {
+            "description": "MACHINE_NOT_FOUND"
+          },
+          "409": {
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_ALREADY_REVOKED"
+          },
+          "200": {
+            "description": "Revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "machine": {
+                      "$ref": "#/components/schemas/MachineView"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/machines/{id}/accept-key": {
+      "post": {
+        "summary": "Accept the public key a machine reported",
+        "description": "publicKeySha256 must equal the pending key (full 64-hex sha256 read on the machine). The machine becomes active; for a rotation the old key stays valid until this call.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineAcceptKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "INVALID_MACHINE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "404": {
+            "description": "MACHINE_NOT_FOUND"
+          },
+          "409": {
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_KEY_MISMATCH, MACHINE_KEY_NOT_PENDING, MACHINE_REVOKED, MACHINE_KEY_IN_USE"
+          },
+          "200": {
+            "description": "Accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "machine": {
+                      "$ref": "#/components/schemas/MachineView"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/machines/{id}/signer-role": {
+      "post": {
+        "summary": "Switch a signer between primary and standby",
+        "description": "Routing only: only the primary receives signing jobs. Setting primary demotes the previous primary to standby in the same write. Promote the standby on the machine itself (signer promote) first.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineSignerRole"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "INVALID_MACHINE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "404": {
+            "description": "MACHINE_NOT_FOUND"
+          },
+          "409": {
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_REVOKED"
+          },
+          "200": {
+            "description": "Registry after the switch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MachineView"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/unsigned/upload": {
+      "put": {
+        "summary": "Upload the unsigned package",
+        "description": "apk jobs only; limit ARTIFACT_MAX_SIZE_MB. The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/ and records key, size and sha256 in the same UPDATE that checks the attempt. The path ends in /upload so it is exempt from the database timeout.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "UPLOAD_EMPTY, UPLOAD_INTERRUPTED, INVALID_BUILD_ATTEMPT"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an apk job)"
+          },
+          "413": {
+            "description": "UPLOAD_TOO_LARGE"
+          },
+          "415": {
+            "description": "UPLOAD_CONTENT_TYPE_INVALID"
+          },
+          "424": {
+            "description": "UPLOAD_STORAGE_FAILED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          },
+          "200": {
+            "description": "Stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveredFile"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/sbom/upload": {
+      "put": {
+        "summary": "Upload the CycloneDX SBOM",
+        "description": "apk jobs only; limit 16 MiB; must be a CycloneDX JSON document (422 BUILD_SBOM_INVALID). The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/ and records key, size and sha256 in the same UPDATE that checks the attempt. The path ends in /upload so it is exempt from the database timeout.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "UPLOAD_EMPTY, UPLOAD_INTERRUPTED, INVALID_BUILD_ATTEMPT"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an apk job)"
+          },
+          "413": {
+            "description": "UPLOAD_TOO_LARGE"
+          },
+          "415": {
+            "description": "UPLOAD_CONTENT_TYPE_INVALID"
+          },
+          "424": {
+            "description": "UPLOAD_STORAGE_FAILED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          },
+          "200": {
+            "description": "Stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveredFile"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "BUILD_SBOM_INVALID"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/built": {
+      "post": {
+        "summary": "Deliver the unsigned package with provenance",
+        "description": "apk jobs only. The job moves to built (waiting for the primary signer). The server verifies the provenance signature with this machine's accepted key and that jobId, attempt, tenantSlug, packageName, versionCode (= buildNumber), versionName, unsignedSha256, unsignedSize, sbomSha256, nativeFingerprint, commitSha and builderId match the job row, the request and the uploaded files. The signer verifies it again against its own pinned builders.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildDelivery"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Delivered; job is built"
+          },
+          "400": {
+            "description": "INVALID_BUILD_RESULT, INVALID_BUILD_ATTEMPT"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH"
+          },
+          "422": {
+            "description": "BUILD_PROVENANCE_INVALID: bad signature, mismatching field (named in detail), or the unsigned package / SBOM were not uploaded under this attempt"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/ota-artifact": {
+      "put": {
+        "summary": "Proxy-upload the OTA package for an OTA build job",
+        "description": "Used when ARTIFACT_UPLOAD_MODE=proxy: the builder PUTs the package with the x-ota-artifact-token from /ota-uploads. This route is exempt from the database timeout by exact route match (it does not end in /upload).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          },
+          {
+            "name": "x-ota-artifact-token",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/zip": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored"
+          },
+          "401": {
+            "description": "INVALID_OTA_ARTIFACT_TOKEN or MACHINE_AUTH_REQUIRED"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE"
+          },
+          "411": {
+            "description": "OTA_UPLOAD_SIZE_MISMATCH"
+          },
+          "424": {
+            "description": "OTA_UPLOAD_FAILED"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/public-key": {
+      "post": {
+        "summary": "Report this signer's public keys",
+        "description": "Stores the X25519 (recipient) and Ed25519 (record signing) keys as pending until a platform administrator accepts them; idempotent for the accepted or pending pair. An active signer changing keys must sign the rotation with its current Ed25519 key (403 MACHINE_KEY_ROTATION_UNPROVEN); the old keys stay valid until acceptance.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignerPublicKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Key status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineKeyStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_MACHINE_KEY"
+          },
+          "403": {
+            "description": "MACHINE_KEY_ROTATION_UNPROVEN, MACHINE_ROLE_FORBIDDEN"
+          },
+          "409": {
+            "description": "MACHINE_KEY_IN_USE, MACHINES_VERSION_CONFLICT"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/keystore-checks": {
+      "get": {
+        "summary": "Keystores sealed to this signer",
+        "description": "Only boxes addressed to this signer's accepted X25519 key, with the trust roots and digest the server composes (null when the tenant has no OTA certificate or its identity is incomplete). Both primary and standby call it.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignerKeystoreChecks"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      },
+      "post": {
+        "summary": "Report decrypt, confirmation and trial-signing status",
+        "description": "Stored per machine id under build.keystore.check (format 2) with JSON_SET, so primary and standby never overwrite each other. Items for an unknown tenant slug or a keystore version that is no longer current are ignored. Changes are audited as build_keystore_check_update by system-signer.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignerCheckReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Stored"
+          },
+          "400": {
+            "description": "INVALID_KEYSTORE_CHECK"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/claim": {
+      "post": {
+        "summary": "Claim a build to sign",
+        "description": "Only the active primary signer gets jobs (anyone else: 204). Dispatches an apk job in built that is the lowest build number among the tenant's in-flight jobs (queued, claimed, running, built, signing) for that platform, whose tenant is ready (same judgement as SIGNER_NOT_READY) and for which the ready list contains an item exactly equal to the server's (tenantSlug, packageName, certificateSha256, trustRootsDigest). Claiming increments signAttempt and moves the job to signing. keyAlias and trustRoots are for comparison only.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignerClaim"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job to sign",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignerClaimResponse"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "Nothing to sign, or this signer is not the active primary"
+          },
+          "400": {
+            "description": "INVALID_SIGN_CLAIM"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/jobs/{id}/heartbeat": {
+      "post": {
+        "summary": "Signing heartbeat",
+        "description": "Without it for 5 minutes the server's reaper returns the job to built and counts a sign failure (two failures fail the job).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/SignAttempt"
+          }
+        ],
+        "responses": {
+          "409": {
+            "description": "SIGN_ATTEMPT_STALE: wrong sign attempt, not this signer, or the job is no longer signing - stop working on the job"
+          },
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "INVALID_SIGN_ATTEMPT"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/jobs/{id}/unsigned/download": {
+      "get": {
+        "summary": "Download the unsigned package",
+        "description": "Streams the package delivered by the builder with x-content-sha256 (computed by the server when receiving it; the signer recomputes it).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/SignAttempt"
+          }
+        ],
+        "responses": {
+          "409": {
+            "description": "SIGN_ATTEMPT_STALE, UNSIGNED_ARTIFACT_MISSING"
+          },
+          "200": {
+            "description": "application/octet-stream",
+            "headers": {
+              "x-content-sha256": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_SIGN_ATTEMPT"
+          },
+          "424": {
+            "description": "UNSIGNED_ARTIFACT_MISSING"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/jobs/{id}/signed/upload": {
+      "put": {
+        "summary": "Upload the signed package",
+        "description": "Streamed to tenants/<tenant>/build-jobs/<job>/s<signAttempt>/app-release.apk; the attempt is checked again after the stream and a stale upload is deleted.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/SignAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "UPLOAD_EMPTY, UPLOAD_INTERRUPTED, INVALID_SIGN_ATTEMPT"
+          },
+          "409": {
+            "description": "SIGN_ATTEMPT_STALE"
+          },
+          "413": {
+            "description": "UPLOAD_TOO_LARGE"
+          },
+          "415": {
+            "description": "UPLOAD_CONTENT_TYPE_INVALID"
+          },
+          "424": {
+            "description": "UPLOAD_STORAGE_FAILED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          },
+          "200": {
+            "description": "Stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveredFile"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/jobs/{id}/complete": {
+      "post": {
+        "summary": "Complete signing: create the release and finish the job atomically",
+        "description": "Outside the transaction the server reads the signed package back from storage and runs the same release checks as a manual upload: signer certificate = registered keystore certificate = certificateSha256, package name, versionName/versionCode = job, not the public debug key, not a retired certificate; unsignedSha256 and nativeFingerprint must match the builder delivery. Then, under the release sequence lock, one transaction locks the job row, checks status/signAttempt/machine, checks that version and build number increase, inserts app_releases (status verified, file_metadata adds unsignedSha256, sbom, nativeFingerprint, commitSha, commitSelfReported, buildJobId, builderId, signerMachineId), marks the job succeeded with release_id and artifact_sha256, and audits as system-signer. Idempotent: a succeeded job with the same signed sha256 returns the same releaseId. Exempt from the database timeout by exact route match.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/SignAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignComplete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Release created (or already created)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "releaseId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_SIGN_RESULT, INVALID_SIGN_ATTEMPT"
+          },
+          "409": {
+            "description": "SIGN_ATTEMPT_STALE, BUILD_KIND_MISMATCH, RELEASE_SEQUENCE_BUSY (retry), RELEASE_VERSION_NOT_INCREASING"
+          },
+          "422": {
+            "description": "SIGN_RESULT_MISMATCH, SIGNED_ARTIFACT_MISMATCH, RELEASE_SIGNER_MISMATCH, RELEASE_SIGNER_RETIRED, RELEASE_FILE_INVALID and the manual upload verification codes; audited as release_rejected"
+          },
+          "424": {
+            "description": "RELEASE_READ_FAILED, RELEASE_OBJECT_ETAG_MISSING"
+          },
+          "500": {
+            "description": "RELEASE_CREATE_FAILED (nothing was committed unless a retry reports the release)"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/jobs/{id}/release": {
+      "post": {
+        "summary": "Cannot sign yet",
+        "description": "The signer cannot sign this job yet (tenant not confirmed locally, trust roots changed and not re-confirmed, this machine is standby). The job returns to built, signFailures is unchanged and signOutcome records kind=deferred.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/SignAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignRelease"
+              }
+            }
+          }
+        },
+        "responses": {
+          "409": {
+            "description": "SIGN_ATTEMPT_STALE: wrong sign attempt, not this signer, or the job is no longer signing - stop working on the job"
+          },
+          "204": {
+            "description": "Returned to built"
+          },
+          "400": {
+            "description": "INVALID_SIGN_OUTCOME, INVALID_SIGN_ATTEMPT"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/signer/jobs/{id}/reject": {
+      "post": {
+        "summary": "Refuse to sign",
+        "description": "violation: a policy check failed; the job fails and is audited as build_job_sign_rejected. transient: a temporary error the signer gave up on; signFailures increases, at 2 the job fails (build_job_sign_failed), otherwise it returns to built.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/SignAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignReject"
+              }
+            }
+          }
+        },
+        "responses": {
+          "409": {
+            "description": "SIGN_ATTEMPT_STALE: wrong sign attempt, not this signer, or the job is no longer signing - stop working on the job"
+          },
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "INVALID_SIGN_OUTCOME, INVALID_SIGN_ATTEMPT"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing, unknown or revoked machine token"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3612,6 +4843,53 @@
         "required": true,
         "schema": {
           "type": "string"
+        }
+      },
+      "MachineToken": {
+        "name": "x-machine-token",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^rnm_[A-Za-z0-9_-]{43}$"
+        },
+        "description": "Per-machine token issued once when the machine is created in the console (POST /v1/admin/platform/machines). The server stores only its sha256 and checks the build.machines registry on every request (revocation takes effect immediately). Builder tokens are refused on /v1/signer (403 MACHINE_ROLE_FORBIDDEN) and signer tokens on /v1/build-agent. A request that only carries the retired x-build-agent-token gets 426 MACHINE_AUTH_UPGRADE_REQUIRED."
+      },
+      "BuildAttempt": {
+        "name": "x-build-attempt",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "description": "The attempt number returned by claim. Every builder report must carry it; when it no longer matches the job row (requeued by the reaper, reclaimed, canceled) or the job is not claimed by this machine, the server answers 409 BUILD_ATTEMPT_STALE and the builder must stop."
+      },
+      "SignAttempt": {
+        "name": "x-sign-attempt",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "description": "The signAttempt returned by the signer claim. Every signer report must carry it and come from the machine that claimed the job; otherwise 409 SIGN_ATTEMPT_STALE."
+      },
+      "JobId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "MachineId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^mch_[A-Za-z0-9_-]{4,64}$"
         }
       }
     },
@@ -4021,9 +5299,9 @@
           "uploadType": {
             "type": "string",
             "enum": [
-              "apk",
-              "ota"
-            ]
+              "apk"
+            ],
+            "description": "Only installable packages. OTA packages are produced by kind=ota build jobs; the console can no longer upload them."
           },
           "fileName": {
             "type": "string",
@@ -4769,30 +6047,6 @@
           }
         }
       },
-      "BuildClaim": {
-        "type": "object",
-        "required": [
-          "agent"
-        ],
-        "properties": {
-          "agent": {
-            "type": "string",
-            "maxLength": 120,
-            "description": "Self-reported build machine identity; recorded for triage only, never used for authorization"
-          },
-          "platforms": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "enum": [
-                "android",
-                "ios"
-              ]
-            },
-            "description": "Platforms this agent can build; empty means both"
-          }
-        }
-      },
       "BuildProgress": {
         "type": "object",
         "properties": {
@@ -4898,80 +6152,35 @@
           }
         }
       },
-      "SealedKeystore": {
-        "type": "object",
-        "required": [
-          "v",
-          "kdf",
-          "n",
-          "r",
-          "p",
-          "salt",
-          "nonce",
-          "ciphertext"
-        ],
-        "description": "scrypt + AES-256-GCM envelope produced on the operator's machine. The server checks the shape and refuses weakened KDF parameters, but never holds the passphrase.",
-        "properties": {
-          "v": {
-            "type": "integer",
-            "enum": [
-              1
-            ]
-          },
-          "kdf": {
-            "type": "string",
-            "enum": [
-              "scrypt"
-            ]
-          },
-          "n": {
-            "type": "integer",
-            "minimum": 65536
-          },
-          "r": {
-            "type": "integer",
-            "minimum": 8
-          },
-          "p": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "salt": {
-            "type": "string"
-          },
-          "nonce": {
-            "type": "string"
-          },
-          "ciphertext": {
-            "type": "string"
-          }
-        }
-      },
       "BuildKeystoreWrite": {
         "type": "object",
         "required": [
-          "sealed",
-          "keyAlias",
-          "keystoreSha256",
+          "upload",
+          "packageName",
+          "signerSha256",
           "expectedVersion",
+          "releaseIdentityExpectedVersion",
           "reason",
           "confirm"
         ],
+        "additionalProperties": false,
         "properties": {
-          "sealed": {
-            "$ref": "#/components/schemas/SealedKeystore"
+          "upload": {
+            "$ref": "#/components/schemas/KeystoreUpload"
           },
-          "keyAlias": {
+          "packageName": {
             "type": "string",
-            "maxLength": 120
+            "description": "Must equal upload.packageName; written to release.android in the same transaction"
           },
-          "keystoreSha256": {
+          "signerSha256": {
             "type": "string",
-            "minLength": 64,
-            "maxLength": 64,
-            "description": "sha256 of the keystore file, so operators can tell which key a tenant is set to sign with"
+            "description": "Must equal upload.certificateSha256; written to release.android in the same transaction"
           },
           "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "releaseIdentityExpectedVersion": {
             "type": "integer",
             "minimum": 0
           },
@@ -4981,21 +6190,6 @@
           },
           "confirm": {
             "type": "boolean"
-          },
-          "signerSha256": {
-            "type": "string",
-            "minLength": 64,
-            "maxLength": 64,
-            "description": "Certificate SHA-256 of the key inside the sealed bundle, computed by `build-keystore`. Present it together with packageName and releaseIdentityExpectedVersion and the server writes release.android in the same transaction, so there is never a window where the keystore has been rotated but the pinned fingerprint still names the old certificate."
-          },
-          "packageName": {
-            "type": "string",
-            "description": "Android applicationId to pin alongside signerSha256. Required whenever signerSha256 is present."
-          },
-          "releaseIdentityExpectedVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Optimistic lock for release.android. Required whenever packageName or signerSha256 is present; supplying only some of the three is refused rather than silently ignored."
           }
         }
       },
@@ -5065,6 +6259,1398 @@
           },
           "confirm": {
             "type": "boolean"
+          }
+        }
+      },
+      "OTARelease": {
+        "type": "object",
+        "description": "One OTA revision as returned by the console detail endpoint.",
+        "required": [
+          "id",
+          "baseReleaseId",
+          "baseVersion",
+          "baseBuildNumber",
+          "platform",
+          "channel",
+          "runtimeVersion",
+          "revision",
+          "updateId",
+          "releaseKind",
+          "applyStrategy",
+          "status",
+          "releaseNotes",
+          "createdBy"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "baseReleaseId": {
+            "type": "string"
+          },
+          "baseVersion": {
+            "type": "string"
+          },
+          "baseBuildNumber": {
+            "type": "integer"
+          },
+          "platform": {
+            "type": "string",
+            "enum": [
+              "android",
+              "ios"
+            ]
+          },
+          "channel": {
+            "type": "string"
+          },
+          "runtimeVersion": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "updateId": {
+            "type": "string"
+          },
+          "releaseKind": {
+            "type": "string"
+          },
+          "applyStrategy": {
+            "type": "string",
+            "enum": [
+              "next_launch",
+              "immediate"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "verified",
+              "active",
+              "canary",
+              "paused",
+              "superseded",
+              "rejected"
+            ]
+          },
+          "canaryInstallations": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "type": "string"
+            }
+          },
+          "manifestKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "manifestSha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "releaseNotes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "sourceCommitSha": {
+            "type": "string",
+            "nullable": true
+          },
+          "rejectionReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "verifiedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "publishedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "BuildJobSignOutcome": {
+        "type": "object",
+        "nullable": true,
+        "required": [
+          "kind",
+          "code",
+          "detail",
+          "machineId",
+          "at"
+        ],
+        "description": "The most recent reason a signer did not sign: deferred (cannot sign yet, returned to built, not counted), violation (policy failure, job failed), transient (temporary error or signing heartbeat timeout, counted in signFailures).",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "deferred",
+              "violation",
+              "transient"
+            ]
+          },
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "machineId": {
+            "type": "string",
+            "nullable": true
+          },
+          "at": {
+            "type": "string"
+          }
+        }
+      },
+      "BuildJob": {
+        "type": "object",
+        "description": "Build job view. It never carries provenance, object keys or any keystore material.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string",
+            "enum": [
+              "android",
+              "ios"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "apk",
+              "ota"
+            ]
+          },
+          "baseReleaseId": {
+            "type": "string",
+            "nullable": true
+          },
+          "channel": {
+            "type": "string",
+            "nullable": true
+          },
+          "applyStrategy": {
+            "type": "string",
+            "nullable": true
+          },
+          "otaReleaseId": {
+            "type": "string",
+            "nullable": true
+          },
+          "gitRef": {
+            "type": "string"
+          },
+          "commitSha": {
+            "type": "string",
+            "nullable": true
+          },
+          "version": {
+            "type": "string"
+          },
+          "buildNumber": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "claimed",
+              "running",
+              "built",
+              "signing",
+              "succeeded",
+              "failed",
+              "canceled"
+            ],
+            "description": "built = the builder delivered an unsigned package with provenance and it waits for the primary signer; signing = the primary signer claimed it. Both only occur on apk jobs."
+          },
+          "claimedBy": {
+            "type": "string",
+            "description": "Builder name from the machine registry",
+            "nullable": true
+          },
+          "claimedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "heartbeatAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "releaseId": {
+            "type": "string",
+            "nullable": true
+          },
+          "artifactSha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "logTail": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "failureReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "reason": {
+            "type": "string"
+          },
+          "releaseNotes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "attempt": {
+            "type": "integer",
+            "description": "Build claim counter; 0 = never claimed"
+          },
+          "claimedMachineId": {
+            "type": "string",
+            "nullable": true
+          },
+          "unsignedSha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "unsignedSize": {
+            "type": "integer",
+            "nullable": true
+          },
+          "sbomSha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "nativeFingerprint": {
+            "type": "string",
+            "nullable": true
+          },
+          "signAttempt": {
+            "type": "integer"
+          },
+          "signFailures": {
+            "type": "integer"
+          },
+          "signingMachineId": {
+            "type": "string",
+            "nullable": true
+          },
+          "signingMachineName": {
+            "type": "string",
+            "nullable": true
+          },
+          "signingClaimedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "signingHeartbeatAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "signOutcome": {
+            "$ref": "#/components/schemas/BuildJobSignOutcome"
+          },
+          "commitSelfReported": {
+            "type": "boolean",
+            "description": "Always true: the commit is reported by the builder and not verified by the server."
+          }
+        }
+      },
+      "BuilderClaim": {
+        "type": "object",
+        "required": [
+          "platforms",
+          "kinds"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "platforms": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "enum": [
+                "android",
+                "ios"
+              ]
+            }
+          },
+          "kinds": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "enum": [
+                "apk",
+                "ota"
+              ]
+            }
+          }
+        }
+      },
+      "BuilderPublicKey": {
+        "type": "object",
+        "required": [
+          "publicKey",
+          "rotationSignature"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "publicKey": {
+            "type": "string",
+            "description": "Standard base64 of the 32-byte Ed25519 provenance public key"
+          },
+          "rotationSignature": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required when the machine is already active and reports a different key: standard base64 Ed25519 signature by the CURRENT key over machinekey.RotationMessage(machineId, sha256(newKey), \"\")"
+          }
+        }
+      },
+      "SignerPublicKey": {
+        "type": "object",
+        "required": [
+          "x25519PublicKey",
+          "ed25519PublicKey",
+          "rotationSignature"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "x25519PublicKey": {
+            "type": "string",
+            "description": "Standard base64, 32 bytes; its sha256 is the keystore recipient fingerprint"
+          },
+          "ed25519PublicKey": {
+            "type": "string",
+            "description": "Standard base64, 32 bytes; signs the local records and key rotations"
+          },
+          "rotationSignature": {
+            "type": "string",
+            "nullable": true,
+            "description": "Required when the signer is already active and reports different keys: Ed25519 signature by the current ed25519 key over machinekey.RotationMessage(machineId, sha256(x25519), sha256(ed25519))"
+          }
+        }
+      },
+      "MachineKeyStatus": {
+        "type": "object",
+        "required": [
+          "status",
+          "publicKeySha256",
+          "pendingPublicKeySha256"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending_key",
+              "active"
+            ]
+          },
+          "publicKeySha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "ed25519PublicKeySha256": {
+            "type": "string",
+            "description": "Signers only",
+            "nullable": true
+          },
+          "pendingPublicKeySha256": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ProvenanceEnvelope": {
+        "type": "object",
+        "required": [
+          "statement",
+          "signature"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "statement": {
+            "type": "string",
+            "description": "Standard base64 of the raw JSON bytes of the rn-build-provenance v1 statement (signing/provenance)"
+          },
+          "signature": {
+            "type": "string",
+            "description": "Standard base64 Ed25519 signature over \"rn-build-provenance/v1\\n\" || statement bytes"
+          }
+        }
+      },
+      "BuildDelivery": {
+        "type": "object",
+        "required": [
+          "commitSha",
+          "nativeFingerprint",
+          "provenance",
+          "logTail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "commitSha": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "nativeFingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32,128}$"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/ProvenanceEnvelope"
+          },
+          "logTail": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "DeliveredFile": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "size"
+        ],
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Computed by the server while receiving the stream"
+          },
+          "size": {
+            "type": "integer"
+          }
+        }
+      },
+      "KeystoreBox": {
+        "type": "object",
+        "required": [
+          "v",
+          "alg",
+          "recipientSha256",
+          "epk",
+          "nonce",
+          "ct"
+        ],
+        "additionalProperties": false,
+        "description": "A v3 keystore ciphertext sealed to one signer (signing/keystorebox). The server cannot open it.",
+        "properties": {
+          "v": {
+            "type": "integer",
+            "enum": [
+              3
+            ]
+          },
+          "alg": {
+            "type": "string",
+            "enum": [
+              "x25519-hkdf-sha256-aes256gcm"
+            ]
+          },
+          "recipientSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "sha256 of the recipient signer X25519 public key"
+          },
+          "epk": {
+            "type": "string"
+          },
+          "nonce": {
+            "type": "string"
+          },
+          "ct": {
+            "type": "string"
+          }
+        }
+      },
+      "KeystoreUpload": {
+        "type": "object",
+        "required": [
+          "format",
+          "tenantSlug",
+          "packageName",
+          "keyAlias",
+          "certificateSha256",
+          "createdAt",
+          "boxes"
+        ],
+        "additionalProperties": false,
+        "description": "The file produced by the offline build-keystore tool, sealed only to the signers in the offline pin file.",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "rn-android-keystore-upload/v3"
+            ]
+          },
+          "tenantSlug": {
+            "type": "string"
+          },
+          "packageName": {
+            "type": "string"
+          },
+          "keyAlias": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+          },
+          "certificateSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "boxes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "items": {
+              "$ref": "#/components/schemas/KeystoreBox"
+            }
+          }
+        }
+      },
+      "TrustRoots": {
+        "type": "object",
+        "required": [
+          "apiBaseUrl",
+          "otaCertificateSha256",
+          "bootstrapSignerAddress",
+          "appLinksHosts",
+          "scheme",
+          "distributionChannel",
+          "applicationId"
+        ],
+        "description": "Trust roots compiled into the package (signing/trustroots), composed by the server from the tenant manifest and the current OTA certificate. Signers only use them for comparison; they confirm their own values locally.",
+        "properties": {
+          "apiBaseUrl": {
+            "type": "string"
+          },
+          "otaCertificateSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "bootstrapSignerAddress": {
+            "type": "string"
+          },
+          "appLinksHosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "scheme": {
+            "type": "string"
+          },
+          "distributionChannel": {
+            "type": "string"
+          },
+          "applicationId": {
+            "type": "string"
+          }
+        }
+      },
+      "SignerCheckView": {
+        "type": "object",
+        "nullable": true,
+        "properties": {
+          "keystoreVersion": {
+            "type": "integer"
+          },
+          "decrypt": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "failed"
+            ]
+          },
+          "confirmed": {
+            "type": "boolean"
+          },
+          "trustRootsCurrent": {
+            "type": "boolean"
+          },
+          "trialSign": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "ok",
+              "failed"
+            ]
+          },
+          "checkedAt": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "BuildKeystoreView": {
+        "type": "object",
+        "required": [
+          "configured",
+          "format",
+          "legacy",
+          "keyAlias",
+          "certificateSha256",
+          "packageName",
+          "version",
+          "updatedBy",
+          "updatedAt",
+          "recipients",
+          "missingSigners",
+          "signers",
+          "ready",
+          "trustRoots",
+          "trustRootsDigest"
+        ],
+        "properties": {
+          "configured": {
+            "type": "boolean",
+            "description": "A v3 keystore is stored"
+          },
+          "format": {
+            "type": "integer",
+            "nullable": true,
+            "enum": [
+              3
+            ]
+          },
+          "legacy": {
+            "type": "boolean",
+            "description": "The stored row is a retired format (passphrase or build-agent box); it counts as not configured and must be replaced"
+          },
+          "keyAlias": {
+            "type": "string",
+            "nullable": true
+          },
+          "certificateSha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "packageName": {
+            "type": "string",
+            "nullable": true
+          },
+          "version": {
+            "type": "integer"
+          },
+          "updatedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "updatedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "recipients": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "recipientSha256": {
+                  "type": "string"
+                },
+                "machineId": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "name": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "signerRole": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "missingSigners": {
+            "type": "array",
+            "description": "Active signers the keystore is not sealed to (a hint, not an error)",
+            "items": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "signerRole": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "signers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "machineId": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "signerRole": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "pending_key",
+                    "active"
+                  ]
+                },
+                "publicKeySha256": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "hasBox": {
+                  "type": "boolean"
+                },
+                "check": {
+                  "$ref": "#/components/schemas/SignerCheckView"
+                }
+              }
+            }
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Same judgement as the queue gate (SIGNER_NOT_READY) and the signer claim"
+          },
+          "trustRoots": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TrustRoots"
+              }
+            ],
+            "nullable": true
+          },
+          "trustRootsDigest": {
+            "type": "string",
+            "nullable": true
+          },
+          "releaseIdentityVersion": {
+            "type": "integer",
+            "description": "PUT only"
+          }
+        }
+      },
+      "MachineView": {
+        "type": "object",
+        "description": "Registry entry without the token digest and without raw public keys.",
+        "required": [
+          "id",
+          "role",
+          "signerRole",
+          "name",
+          "status",
+          "publicKeySha256",
+          "ed25519PublicKeySha256",
+          "pendingPublicKeySha256",
+          "pendingEd25519PublicKeySha256",
+          "pendingReportedAt",
+          "acceptedBy",
+          "acceptedAt",
+          "createdBy",
+          "createdAt",
+          "revokedBy",
+          "revokedAt",
+          "revokeReason"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "builder",
+              "signer"
+            ]
+          },
+          "signerRole": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "primary",
+              "standby",
+              null
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending_key",
+              "active",
+              "revoked"
+            ]
+          },
+          "publicKeySha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "ed25519PublicKeySha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "pendingPublicKeySha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "pendingEd25519PublicKeySha256": {
+            "type": "string",
+            "nullable": true
+          },
+          "pendingReportedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "acceptedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "acceptedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "revokedBy": {
+            "type": "string",
+            "nullable": true
+          },
+          "revokedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "revokeReason": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "MachineCreate": {
+        "type": "object",
+        "required": [
+          "role",
+          "name",
+          "signerRole",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "builder",
+              "signer"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{1,39}$"
+          },
+          "signerRole": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "primary",
+              "standby",
+              null
+            ]
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MachineRevoke": {
+        "type": "object",
+        "required": [
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MachineAcceptKey": {
+        "type": "object",
+        "required": [
+          "publicKeySha256",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "publicKeySha256": {
+            "type": "string",
+            "description": "Full 64-hex sha256 read on the machine itself (colons and upper case accepted)"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MachineSignerRole": {
+        "type": "object",
+        "required": [
+          "signerRole",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "signerRole": {
+            "type": "string",
+            "enum": [
+              "primary",
+              "standby"
+            ]
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SignerReadyItem": {
+        "type": "object",
+        "required": [
+          "tenantSlug",
+          "packageName",
+          "certificateSha256",
+          "trustRootsDigest"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "tenantSlug": {
+            "type": "string"
+          },
+          "packageName": {
+            "type": "string"
+          },
+          "certificateSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "trustRootsDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "SignerClaim": {
+        "type": "object",
+        "required": [
+          "ready"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "ready": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {
+              "$ref": "#/components/schemas/SignerReadyItem"
+            }
+          }
+        }
+      },
+      "SignerClaimResponse": {
+        "type": "object",
+        "required": [
+          "job",
+          "provenance",
+          "keystore",
+          "trustRoots",
+          "trustRootsDigest"
+        ],
+        "properties": {
+          "job": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "tenantSlug": {
+                "type": "string"
+              },
+              "platform": {
+                "type": "string",
+                "enum": [
+                  "android"
+                ]
+              },
+              "version": {
+                "type": "string"
+              },
+              "buildNumber": {
+                "type": "integer"
+              },
+              "attempt": {
+                "type": "integer"
+              },
+              "signAttempt": {
+                "type": "integer"
+              },
+              "commitSha": {
+                "type": "string"
+              },
+              "unsignedSha256": {
+                "type": "string"
+              },
+              "unsignedSize": {
+                "type": "integer"
+              },
+              "sbomSha256": {
+                "type": "string"
+              },
+              "nativeFingerprint": {
+                "type": "string"
+              }
+            }
+          },
+          "provenance": {
+            "type": "object",
+            "properties": {
+              "statement": {
+                "type": "string"
+              },
+              "signature": {
+                "type": "string"
+              },
+              "builderId": {
+                "type": "string"
+              },
+              "builderPublicKey": {
+                "type": "string"
+              },
+              "builderPublicKeySha256": {
+                "type": "string"
+              }
+            }
+          },
+          "keystore": {
+            "type": "object",
+            "properties": {
+              "keystoreVersion": {
+                "type": "integer"
+              },
+              "packageName": {
+                "type": "string"
+              },
+              "certificateSha256": {
+                "type": "string"
+              },
+              "keyAlias": {
+                "type": "string",
+                "description": "For comparison only; the signer uses the alias inside the box"
+              },
+              "box": {
+                "$ref": "#/components/schemas/KeystoreBox"
+              }
+            }
+          },
+          "trustRoots": {
+            "$ref": "#/components/schemas/TrustRoots"
+          },
+          "trustRootsDigest": {
+            "type": "string"
+          }
+        }
+      },
+      "SignerKeystoreChecks": {
+        "type": "object",
+        "required": [
+          "machineId",
+          "signerRole",
+          "items"
+        ],
+        "properties": {
+          "machineId": {
+            "type": "string"
+          },
+          "signerRole": {
+            "type": "string",
+            "nullable": true
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tenantSlug": {
+                  "type": "string"
+                },
+                "keystoreVersion": {
+                  "type": "integer"
+                },
+                "packageName": {
+                  "type": "string"
+                },
+                "certificateSha256": {
+                  "type": "string"
+                },
+                "keyAlias": {
+                  "type": "string"
+                },
+                "box": {
+                  "$ref": "#/components/schemas/KeystoreBox"
+                },
+                "trustRoots": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/TrustRoots"
+                    }
+                  ],
+                  "nullable": true
+                },
+                "trustRootsDigest": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "SignerCheckReport": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {
+              "type": "object",
+              "required": [
+                "tenantSlug",
+                "keystoreVersion",
+                "decrypt",
+                "confirmed",
+                "confirmedTrustRootsDigest",
+                "trialSign",
+                "error"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "tenantSlug": {
+                  "type": "string"
+                },
+                "keystoreVersion": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "decrypt": {
+                  "type": "string",
+                  "enum": [
+                    "ok",
+                    "failed"
+                  ]
+                },
+                "confirmed": {
+                  "type": "boolean"
+                },
+                "confirmedTrustRootsDigest": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$",
+                  "description": "Required when confirmed",
+                  "nullable": true
+                },
+                "trialSign": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "ok",
+                    "failed"
+                  ]
+                },
+                "error": {
+                  "type": "string",
+                  "maxLength": 300,
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "SignComplete": {
+        "type": "object",
+        "required": [
+          "signedSha256",
+          "signedSize",
+          "certificateSha256",
+          "unsignedSha256",
+          "nativeFingerprint"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "signedSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "signedSize": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "certificateSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "unsignedSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "nativeFingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32,128}$"
+          }
+        }
+      },
+      "SignRelease": {
+        "type": "object",
+        "required": [
+          "code",
+          "detail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "SignReject": {
+        "type": "object",
+        "required": [
+          "kind",
+          "code",
+          "detail"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "violation",
+              "transient"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+          },
+          "detail": {
+            "type": "string"
           }
         }
       }
