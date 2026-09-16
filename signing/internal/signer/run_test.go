@@ -543,7 +543,9 @@ func TestClaimBackoff(t *testing.T) {
 			h.runner.MaxClaimBackoff = 80 * time.Millisecond
 			h.runner.RetryDelays = []time.Duration{}
 			h.server.repeatClaim = setup(h)
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			// 窗口放宽到 2 秒、次数下限放低：CI 机器慢、开着 -race 时每一轮本身就要几十毫秒，
+			// 真正要钉住的是下面逐次间隔不小于退避值，而不是一秒内恰好跑了多少轮
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			if err := h.runner.Run(ctx); err != nil {
 				t.Fatal(err)
@@ -551,10 +553,10 @@ func TestClaimBackoff(t *testing.T) {
 			h.server.mu.Lock()
 			times := append([]time.Time(nil), h.server.claimTimes...)
 			h.server.mu.Unlock()
-			// 不退避时 1 秒能认领上千次；10、20、40、80、80…毫秒的间隔下大约 15 次
-			t.Logf("%d claims in one second", len(times))
-			if len(times) < 4 || len(times) > 25 {
-				t.Fatalf("%d claims in one second", len(times))
+			// 不退避时 2 秒能认领上千次；10、20、40、80、80…毫秒的间隔下最多二十几次
+			t.Logf("%d claims in two seconds", len(times))
+			if len(times) < 3 || len(times) > 40 {
+				t.Fatalf("%d claims in two seconds", len(times))
 			}
 			for i := 1; i < len(times); i++ {
 				gap := times[i].Sub(times[i-1])

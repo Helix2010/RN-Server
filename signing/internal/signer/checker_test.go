@@ -172,7 +172,16 @@ func TestSocketChecker(t *testing.T) {
 	if _, err := (SocketChecker{Path: socket, PeerUID: os.Getuid()}).Check(context.Background(), in, writeAPK(t, build.APK)); err == nil {
 		t.Fatal("a group-writable socket was used")
 	}
-	if got := served.Load(); got != before+1 {
-		t.Fatalf("connections after the rejected checks: %d, want %d (the uid check connects, the path check does not)", got, before+1)
+	// 数连接不能在拒绝之后立刻读计数：监听协程是异步 Accept 的，慢机器上（CI）计数还没加上。
+	// 改回 0600 再做一次正常检查——它要等监听协程 Accept 并回了结论才返回，而 Accept 按到达顺序，
+	// 所以它返回时，前面 uid 那次的连接一定已经计过数。uid 那次连了、路径那次没连，就恰好多 2。
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := (SocketChecker{Path: socket, PeerUID: os.Getuid()}).Check(context.Background(), in, writeAPK(t, build.APK)); err != nil || !v.OK {
+		t.Fatalf("verdict after restoring the socket mode %+v, %v", v, err)
+	}
+	if got := served.Load(); got != before+2 {
+		t.Fatalf("connections after the rejected checks: %d, want %d (the uid check connects, the path check does not)", got, before+2)
 	}
 }
