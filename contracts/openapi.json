@@ -3244,7 +3244,7 @@
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
-        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view plus attempt, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims.",
+        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view (its claimedMachineId is this builder's id, the builderId of the provenance statement) plus attempt, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -6676,11 +6676,16 @@
       "MachineKeyStatus": {
         "type": "object",
         "required": [
+          "machineId",
           "status",
           "publicKeySha256",
           "pendingPublicKeySha256"
         ],
         "properties": {
+          "machineId": {
+            "type": "string",
+            "description": "This machine's registry id; signed into machinekey.RotationMessage when rotating keys"
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -6701,7 +6706,8 @@
             "type": "string",
             "nullable": true
           }
-        }
+        },
+        "description": "Every sha256 is computed over the raw 32-byte public key (base64-decoded), lowercase hex."
       },
       "ProvenanceEnvelope": {
         "type": "object",

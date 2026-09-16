@@ -193,7 +193,11 @@ func TestDBMachineKeyRotationAndSignerRoles(t *testing.T) {
 	}
 	// 同一把：幂等
 	same := signerKey(f.primary, f.primary.X25519.PublicKey().Bytes(), f.primary.ed25519Public(), nil)
-	if same.Code != http.StatusOK || decodeBody(t, same)["pendingPublicKeySha256"] != nil {
+	sameBody := decodeBody(t, same)
+	// machineId 在响应里：换钥签名要把它签进去；公钥指纹按解码后的 32 字节原始公钥算
+	if same.Code != http.StatusOK || sameBody["pendingPublicKeySha256"] != nil || sameBody["machineId"] != f.primary.ID ||
+		sameBody["publicKeySha256"] != fingerprint.SHA256Hex(f.primary.X25519.PublicKey().Bytes()) ||
+		sameBody["ed25519PublicKeySha256"] != fingerprint.SHA256Hex(f.primary.ed25519Public()) {
 		t.Fatalf("re-registering the same key: %d %s", same.Code, same.Body.String())
 	}
 	next := newGateMachine(t, machineRoleSigner, "unused")

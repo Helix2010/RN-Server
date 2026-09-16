@@ -905,8 +905,11 @@ func (s *server) registerMachineKey(c *gin.Context, key reportedMachineKey, rota
 	problem(c, http.StatusConflict, "MACHINES_VERSION_CONFLICT", "The machine registry kept changing; retry")
 }
 
+// machineKeyResponse 带上 machineId：机器换钥时要把自己的 id 签进 machinekey.RotationMessage，
+// 而令牌里没有 id，登记公钥是它唯一能拿到 id 的接口。
 func machineKeyResponse(m buildMachine) gin.H {
 	out := gin.H{
+		"machineId":              m.ID,
 		"status":                 m.Status,
 		"publicKeySha256":        nullableString(string(m.PublicKeySHA256)),
 		"pendingPublicKeySha256": nil,
