@@ -1,6 +1,6 @@
 # 设计：Android 签名闸
 
-状态：草案（实现级），已过一轮三路对抗评审并修订（见文末「评审记录」）。2026-09-16
+状态：已实现，未发布（RN-Server / RN-Admin / RN-App 分支 `feat/signing-gate`）。设计过一轮三路对抗评审；实现后又过了三路对抗评审与本机端到端测试，实现中确认的偏离见文末「实现记录」。2026-09-16
 
 取代：`platform-backup-recovery-2026-09-15.md`（整个备份方案移除）
 相关：`build-service-2026-09-11.md`、`build-concurrency-2026-09-15.md`、ADR-0015、ADR-0016
@@ -183,7 +183,7 @@ sequenceDiagram
 
 4. 输入包没有任何签名（没有 APK Signing Block，没有 `META-INF/*.SF`、`*.RSA` 等）。未签名模式一旦失效会退回 debug 签名，这一条能当场发现。
 5. ZIP 里没有重复条目，中央目录与本地文件头一致，只有一个 `AndroidManifest.xml`。
-6. 对齐检查通过（`zipalign -c -P 16 4`，在检查进程里跑）。
+6. 对齐检查通过（规则等价 `zipalign -c -P 16 4`，在检查进程里用纯 Go 实现，不执行原生工具）。
 
 **身份与版本**
 
@@ -202,7 +202,7 @@ sequenceDiagram
 13. 内嵌 Expo 配置 `assets/app.config` 的 `extra.apiBaseUrl`、`extra.bootstrapSignerAddress`、`extra.applicationId`、`extra.distributionChannel`，以及 `updates.url`、`updates.enabled`。
 14. manifest meta-data `expo.modules.updates.CODE_SIGNING_CERTIFICATE` 的证书 sha256（即内嵌的 OTA 证书）。
 15. App Links 的 intent-filter host 集合与自定义 scheme。
-16. 原生指纹由检查进程从 `assets/fingerprint` 读出，与构建机上报值一致；发布记录用签名闸读出的值。
+16. 原生指纹以出处声明（构建控制进程签名）里的值为准，发布记录标注 `nativeFingerprintSource: builder-provenance`；包里若有 `assets/fingerprint`，必须与出处值一致。（实现时发现：包里没有 `assets/fingerprint`，`runtimeVersion` 走 appVersion 策略，签名闸无法从 APK 独立复核原生指纹。）
 
 **签名与复核**
 
@@ -554,7 +554,7 @@ OpenAPI（`contracts/openapi.json`）与契约版本随接口变化同步更新�
 | 初始化引导（改） | `onboarding/onboarding-page.tsx` | 签名一步以“主、备签名闸均已确认且主试签通过”为完成条件（现在只看 `keystore.data.configured`），删掉“密钥可以直接在控制台生成”等文案 |
 | 备份与恢复（删） | 平台维护 | 见下 |
 
-**打包任务页的改动要列全**：`api.ts` 里 `buildJobSchema.status` 的严格枚举加 `built`、`signing` 与新字段（**控制台先于服务端发布**，否则列表只要出现一行新状态整页报错）；`LIVE` 集合加新状态（否则待签名期间不自动刷新）；签名阶段用签名心跳判断陈旧；`build-status-legend.tsx` 的流转说明；`StatusPill` 状态映射与中英文案；打包机与签名闸两列；状态筛选；详情里的认领编号、签名编号、拒签原因；`built` 的取消与 `signing` 的强制判失败（确认弹层 + reason）。
+**打包任务页的改动要列全**：`api.ts` 里 `buildJobSchema.status` 的严格枚举加 `built`、`signing` 与新字段（**服务端先发、控制台紧跟**，且必须在任何安装包任务进入 `built` 之前上线；见「落地顺序」）；`LIVE` 集合加新状态（否则待签名期间不自动刷新）；签名阶段用签名心跳判断陈旧；`build-status-legend.tsx` 的流转说明；`StatusPill` 状态映射与中英文案；打包机与签名闸两列；状态筛选；详情里的认领编号、签名编号、拒签原因；`built` 的取消与 `signing` 的强制判失败（确认弹层 + reason）。
 
 **删除清单**：`platform-backup-page.tsx` 与 spec；`design-system/page-skeletons.tsx` 的 `PlatformBackupPageSkeleton`；`tokens.css` 里只给备份页用的样式（`.backup-*`、`.bucket-check*`、`.card-collapsed-summary`；`.fingerprint-value` 随组件挪走保留）；`api.ts` 里的备份接口与 schema、`buildAgentKey`、`acceptBuildAgentKey`、`acceptBackupSigningKey`、`generateBuildKeystore`、`generatedKeystoreSchema`；`admin-i18n.tsx` 里的备份文案与映射；`plugin.ts` 里的备份页注册。
 
@@ -598,16 +598,18 @@ OpenAPI（`contracts/openapi.json`）与契约版本随接口变化同步更新�
 
 ## 落地顺序
 
-1. **准备**（不影响现有发布）：桶的所有者导出备份对象清单并删除备份对象；关掉 `AMOS_DEPLOY_BUILD_AGENT`；`rn-foundation-apply` 冒烟改为非 root；离线机器、两个 U 盘、pin 文件模板就位。
-2. **控制台先发**：认识新状态枚举与新字段；「打包机与签名闸」页面先用现有 `/platform/build-agent/public-key*` 接口承接公钥接受，把 `AcceptKeyPanel` 从备份页挪过来。验证：打包任务页、平台维护页正常。
-3. **删除备份代码**（不删表）：服务端、构建机、控制台同步发布。验证：控制台无备份入口，服务端与构建机启动日志无备份相关报错。
-4. **删表迁移**：第 3 步稳定后单独发布。
-5. **新签名链路上线**（**安装包冻结窗口开始**，热更新照常）：按“控制台 → 服务端 → 构建机”的顺序发布新代码；新服务端对旧构建机返回明确的 426 而不是 401；人工部署主、备签名闸；平台管理员新建机器、发令牌；公钥写进 pin 文件并在控制台接受；在两台签名闸上 `trust-builder`。验证：`builder` 读不到签名闸与控制进程目录；伪造构建机交付被拒。
-6. **逐个租户重置密钥**：离线生成 → 打包保管 → 上传并登记 → 主、备 `signer confirm` → 主试签。验证：控制台显示主、备均已确认、主试签通过。
-7. **发布新签名的安装包**（**冻结窗口结束**），通知现有用户卸载重装、用助记词恢复。验证：模拟器上新包安装、钱包恢复、App Links 正常。
-8. **清理**：删除 `build.agent.recipient`、旧格式检查记录、amos 的 `agent-key` 与口令、GitHub 旧 secret、开发机上的旧原件；RN-App 正式签名模式相关脚本与文档确认已删。
+1. **准备**（不影响现有发布）：桶的所有者导出备份对象清单并删除备份对象；关掉 GitHub 变量 `AMOS_DEPLOY_BUILD_AGENT`；在 amos 上重跑 `setup-ci-deploy.sh`（`rn-foundation-apply` 已改）；离线机器、两个 U 盘、pin 文件模板就位；发布前确认没有排队中或构建中的安装包任务。
+2. **删除备份代码 + 新签名链路上线**（同一次发布，只含迁移 54；**安装包冻结窗口开始**，热更新照常）：
+   - 顺序：服务端 → 控制台紧跟（新控制台严格校验新字段，不能先于服务端；旧控制台遇到新服务端时打包任务页不受影响，但签名密钥区会显示错误，这个窗口应在几分钟内结束，且必须在任何任务进入 `built` 之前）→ 构建机人工部署（`build-agent`、`build-runner` 两个二进制，`rn-build-agent` 与 `builder` 两个用户，sudoers）。新服务端对旧构建机返回 426。
+   - 人工部署主、备签名闸；平台管理员新建机器、发令牌；公钥写进 pin 文件并在控制台接受；两台签名闸 `trust-builder`。
+   - 回滚：回到上一版二进制是安全的——备份表还在，迁移 54 只加列、放宽状态值。
+   - 验证：`builder` 读不到签名闸与控制进程目录；伪造构建机交付被拒；控制台无备份入口。
+3. **逐个租户重置密钥**：离线生成 → 打包保管 → 上传并登记 → 主、备 `signer confirm` → 主试签。验证：控制台「就绪」、不就绪原因为空，主、备均已确认、主试签通过。
+4. **发布新签名的安装包**（**冻结窗口结束**），通知现有用户卸载重装、用助记词恢复。验证：模拟器上新包安装、钱包恢复、App Links 正常。
+5. **第二次发布：迁移 55**（新链路稳定后单独发）：删 `platform_backups` 表与 `backup.bucket`、`backup.recipients`、`build.agent.backup-sign`、`build.agent.recipient`、旧格式 `build.keystore.check`。
+6. **清理**：amos 的 `agent-key` 与口令、GitHub 旧 secret、开发机上的旧原件；RN-App 正式签名模式相关脚本与文档确认已删。
 
-冻结窗口从第 5 步开始，到第 7 步第一个租户发出新包为止，期间出不了安装包。第 5 步之前的每一步都可以回滚到上一版二进制。第 5 步之后不回退到旧密钥（旧指纹永久拒绝），出问题只修复向前。
+冻结窗口从第 2 步开始，到第 4 步第一个租户发出新包为止，期间出不了安装包。第 2 步可以回滚到上一版二进制；第 3 步之后不回退到旧密钥（旧指纹永久拒绝），出问题只修复向前。
 
 ## 评审记录
 
@@ -668,3 +670,46 @@ OpenAPI（`contracts/openapi.json`）与契约版本随接口变化同步更新�
 - `apksigner` 默认丢弃输入包里已有的签名；策略仍要求输入包无签名，用来发现未签名模式失效。
 - 替换密文里未认证的 `kid` 无法把密文改投给别人，因为接收方公钥已进 HKDF 的 info；v3 仍把收件人放进附加数据，便于校验。
 - workflow 里已经没有真正引用 `ANDROID_RELEASE_*` secret，只剩注释；作废清单里仍删除这几个 secret。
+
+## 实现记录
+
+2026-09-16 按本设计完成实现（未发布）。代码在三个仓库的 `feat/signing-gate` 分支；签名闸与离线工具在 RN-Server `signing/`，部署文件在 `deploy/signer/`、`deploy/build-agent/`；决定记录见 ADR-0019。
+
+### 与设计的偏离
+
+| 设计原文 | 实现 | 理由 |
+| --- | --- | --- |
+| 签名闸一把本机 X25519 私钥 | X25519（解密钥密文，pin 文件与收件人用它的 sha256）+ Ed25519（给本机记录签名、换公钥证明、备验证主的记录） | X25519 不能签名；接受公钥时两把指纹都要手抄核对 |
+| `internal/apkinspect` 挪进 `signing/` | `internal/buildkeystore` 删除，换成 `signing/keystorebox`；`internal/apkinspect` 留在服务端 | `apkinspect` 依赖第三方库校验已签名包，而 `signing/` 只允许标准库；签名闸在 `signing/apk` 里另写纯 Go 解析器 |
+| 检查进程 `DynamicUser` 子进程 | systemd socket 激活（`Accept=yes`，每次检查一个 `DynamicUser`、无网络的实例），主进程经 socket 送“策略输入 + APK 字节”；本地测试用显式配置的子进程模式 | 非 root 的签名闸进程无法自己拉起 `DynamicUser` 实例 |
+| 策略第 6 条跑 `zipalign` | 纯 Go 实现等价规则 | 检查进程不执行原生解析工具 |
+| 策略第 16 条从 `assets/fingerprint` 复核原生指纹 | 以出处声明为准，发布记录标注来源；包里有该文件时仍比对一致性 | 真实包里没有这个文件，签名闸无法独立复核 |
+| 签名编号累计 2 次判失败 | `sign_attempt` 每次签名认领加一，只做编号防护；另加 `sign_failures` 计超时与临时错误，到 2 判失败；“暂不能签”不计数 | 编号防护与失败计数分开，语义清楚 |
+| 编号随请求体 | 编号走请求头 `x-build-attempt` / `x-sign-attempt` | 热更新几条接口复用管理端处理函数，不改请求体 |
+| 对象键含编号 | 对象键含编号加随机段，每次上传新键，事务里替换并删旧对象 | 评审发现迟到的上传会覆盖已被发布记录引用的对象 |
+| 构建机控制进程 `git worktree add` | 控制进程为每个任务建一个只含单个提交的独立仓库（`core.hooksPath=/dev/null`，不读系统与全局 git 配置） | 执行进程要跑 git；worktree 的 `.git` 指回裸库，执行进程就得能读裸库 |
+| pnpm 只读 store（不可行则每任务独立 store） | 每任务独立 store | 本机实测 pnpm 10 在只读 store 下仍要写 `projects/` 登记项 |
+| Gradle 只读依赖缓存由控制进程维护 | 只做了透传与权限检查，维护流程写进 README 未实现 | 维护流程需要在 amos 上实测；真正的防线是 RN-App 强制开启的依赖校验 |
+| 离线工具生成 `.p12` | 自己实现 PKCS#12（PBES2 + PBKDF2-HMAC-SHA256 + AES-256-CBC，SHA-256 MAC）；已有原件只接受这种格式 | `signing/` 不许第三方依赖，也不调用 keytool/openssl；老式 RC2/3DES 原件按 README 重新导出 |
+| `signer promote` 用备本机 pin 着的主公钥验证 | `promote --import` 时粘贴旧主的 Ed25519 完整指纹；新增 `--first` 用于第一台主 | 主公钥在建备时不一定已知 |
+| 落地顺序“控制台先发”、删备份与新链路分开发布 | 服务端先发、控制台紧跟；删备份代码与新链路同一次发布（只含迁移 54），删表迁移 55 单独第二次发布 | 新控制台严格校验新字段；回滚到旧二进制仍安全（见「落地顺序」） |
+| 手工上传安装包沿用上传门禁 | 收紧：租户有 v3 密钥时，发布身份必须等于密钥证书；手工上传的包证书必须是主签名闸对当前密钥版本试解通过并本机确认过的那张 | 评审发现租户管理员可改登记证书后手工上传自签包，绕过签名闸 |
+| 租户 `apiBaseUrl` 自由填写 | 写入时校验为规范 https 源（拒绝显式 `:443`、大写、IP、路径） | 服务端与签名闸、RN-App 对 App Links host 的推导必须只有一种写法 |
+| 排队门禁只报 `SIGNER_NOT_READY` | 视图与 409 问题体带 `readinessProblems`（固定枚举） | 控制台能说清还差哪一步 |
+| 构建机收到 `BUILDER_HAS_ACTIVE_JOB` | 立即把那条任务判失败，不等回收重排 | 重启后的构建机不知道那条任务做到哪一步 |
+| RN-App release 构建强制依赖校验 | 只对非 development 渠道强制 | 开发包链接 expo-dev-client 一系，依赖坐标与清单不是同一套 |
+
+### 实现中补上的防线（设计没写，评审或测试发现）
+
+- 构建控制进程向检出目录写文件时不跟随符号链接（main 上的符号链接能覆盖出处私钥）；带令牌的 HTTP 请求不跟随重定向。
+- 解析器对字符串池按偏移去重并设解码总量上限；先验出处签名与包的 sha256，再解析 APK；二进制 XML 字符串拒绝 NUL 与控制字符（多行 PEM 需要的 TAB/LF/CR 除外）；manifest 子元素与 expo-updates meta-data 走允许列表。
+- 签名闸 `complete` 在事务里重读发布身份与密钥记录；幂等重放只认同一台签名闸、同一签名编号。
+- 机器上报的自由文本入库前去掉控制字符与双向覆盖字符；装机密的结构体用白名单实现格式化输出。
+- 本机记录的截断与整目录回滚无法由哈希链发现，靠离线抄录行数与末行哈希核对（`deploy/signer/README.md` 第 8 节），这是运维硬性步骤。
+
+### 验证
+
+- 门禁：RN-Server `gofmt`、`go vet`、`go test -race`（带测试库与不带各一遍）、`signing/` 模块测试与 fuzz；RN-Admin `lint`、`typecheck`、`test`、`build`、`format:check`；RN-App `pnpm check`。CI 加了 MySQL 服务，签名闸的数据库测试不再在 CI 上跳过。
+- 集成：真实 anyfun 发布包剥掉签名后通过签名前检查第 2–16 条；apksigner 35.0.0 真签名并复核。
+- 本机端到端：假 S3 + 本地 MySQL + 服务端 + 构建控制进程（真执行进程，假 pnpm/node）+ 主备两台签名闸 + 离线工具，签出 10 个包并逐个复核证书；29 项负面演练（改库里的密文、证书、信任根，伪造构建机，冒充服务端，12 种违规包，吊销，提升备用，签名中途杀进程等）。
+- 未验证：amos 上的真实 Gradle/Expo 构建、`builder` 用户隔离与 systemd 硬化下的 JVM、模拟器安装与钱包恢复、热更新任务端到端。
