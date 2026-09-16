@@ -89,6 +89,52 @@ func TestDBTenantAdminCannotRepointTheReleaseIdentityAwayFromTheKeystore(t *test
 	}
 }
 
+// 库里 build.keystore 的外层索引被改过（KEYSTORE_RECORD_INVALID）时，不能拿篡改后的外层证书当依据：
+// 单独改发布身份 409 BUILD_KEYSTORE_RECORD_INVALID；手工上传闸按"没有可用密钥"拒绝。
+func TestDBReleaseIdentityCannotFollowATamperedKeystoreRecord(t *testing.T) {
+	f := newGateFixture(t, 116)
+	attacker := newAPKSigner(t)
+	var original []byte
+	if err := f.db.QueryRow(`SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, buildKeystoreConfigKey).Scan(&original); err != nil {
+		t.Fatal(err)
+	}
+	for name, tamper := range map[string]func(){
+		"outer certificate replaced": func() { f.setKeystoreValue(`JSON_SET(config_value,'$.certificateSha256',?)`, attacker.sha256()) },
+		"record malformed":           func() { f.setKeystoreValue(`JSON_SET(config_value,'$.unexpected',?)`, "field") },
+	} {
+		f.setKeystoreValue(`?`, string(original))
+		tamper()
+		if r := f.putIdentity(f.packageName, attacker.sha256()); r.Code != http.StatusConflict || problemCode(t, r) != "BUILD_KEYSTORE_RECORD_INVALID" {
+			t.Fatalf("%s: the identity followed a tampered keystore record: %d %s", name, r.Code, r.Body.String())
+		}
+		if r := f.putIdentity(f.packageName, f.apkSigner.sha256()); r.Code != http.StatusConflict || problemCode(t, r) != "BUILD_KEYSTORE_RECORD_INVALID" {
+			t.Fatalf("%s: an identity change was accepted while the keystore record is unusable: %d %s", name, r.Code, r.Body.String())
+		}
+	}
+	// 发布身份也被直接改成了篡改后的证书：手工上传闸不采信用不了的记录
+	var identity []byte
+	if err := f.db.QueryRow(`SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, releaseAndroidIdentityConfigKey).Scan(&identity); err != nil {
+		t.Fatal(err)
+	}
+	f.setKeystoreValue(`?`, string(original))
+	f.setKeystoreValue(`JSON_SET(config_value,'$.certificateSha256',?)`, attacker.sha256())
+	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=?,version=version+1 WHERE tenant_id=? AND config_key=?`,
+		strings.Replace(string(identity), f.apkSigner.sha256(), attacker.sha256(), 1), f.tenant, releaseAndroidIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.manualUpload(attacker, "9.9.9", 999); r.Code != http.StatusConflict || problemCode(t, r) != "RELEASE_KEYSTORE_NOT_CONFIGURED" || f.releaseCount() != 0 {
+		t.Fatalf("a manual upload trusted a tampered keystore record: %d %s", r.Code, r.Body.String())
+	}
+	// 恢复之后照常
+	f.setKeystoreValue(`?`, string(original))
+	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=?,version=version+1 WHERE tenant_id=? AND config_key=?`, identity, f.tenant, releaseAndroidIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.putIdentity(f.packageName, f.apkSigner.sha256()); r.Code != http.StatusOK {
+		t.Fatalf("the identity of a healthy keystore: %d %s", r.Code, r.Body.String())
+	}
+}
+
 // PoC-1b：用签名闸公开的 X25519 公钥封一份自己的 v3 密文（服务端打不开内层，照收），把登记证书
 // 连带换掉，再手工上传自签的包。主签名闸没有在本机确认这一版密钥，手工上传就拒绝并留审计；
 // 运维真的在签名闸上确认过之后才放行。

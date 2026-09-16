@@ -80,26 +80,33 @@ func (s *server) buildKeystoreStateFor(ctx context.Context, q rowQuerier, tenant
 		return state, err
 	}
 	state.Exists = true
+	return state, s.evaluateBuildKeystore(tenant, raw, &state)
+}
+
+// evaluateBuildKeystore 判断 build.keystore 这一行的值能不能用：旧格式标 Legacy，v3 记录损坏、外层
+// 解不开或索引字段与上传文件对不上标 Invalid，都不是错误。给已经自己读到这一行（例如事务里带锁读）
+// 的调用方用，判据与 buildKeystoreStateFor 一样。只有主密钥不可用才返回错误。
+func (s *server) evaluateBuildKeystore(tenant string, raw []byte, state *buildKeystoreState) error {
 	record, legacy, parseErr := parseBuildKeystoreValue(raw)
 	state.Legacy = legacy
 	switch {
 	case legacy:
-		return state, nil
+		return nil
 	case parseErr != nil:
 		state.Invalid = parseErr.Error()
-		return state, nil
+		return nil
 	}
 	state.Record = record
 	if s.secrets == nil {
-		return state, errors.New("storage master key is unavailable")
+		return errors.New("storage master key is unavailable")
 	}
 	upload, err := s.keystoreUploadFor(tenant, record)
 	if err != nil {
 		state.Invalid = err.Error()
-		return state, nil
+		return nil
 	}
 	state.Upload = &upload
-	return state, nil
+	return nil
 }
 
 // parseBuildKeystoreValue 解析 build.keystore 这一行的值。不是 format 3 的旧记录 legacy=true、不报错。

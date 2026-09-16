@@ -261,12 +261,21 @@ func (s *server) updateAndroidReleaseIdentity(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_SAVE_FAILED", "Unable to save release identity")
 		return
 	default:
-		record, legacy, err := parseBuildKeystoreValue(keystoreRaw)
-		if err != nil {
+		keystore := buildKeystoreState{Exists: true}
+		if err := s.evaluateBuildKeystore(tenantID(c), keystoreRaw, &keystore); err != nil {
 			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
 			return
 		}
-		if !legacy && (record.PackageName != value.PackageName || record.CertificateSHA256 != value.SignerSHA256) {
+		// v3 记录用不了（外层索引被改过、外层解不开、记录损坏）时不能拿它的外层字段当依据：
+		// 否则改了库里外层证书的人能顺势把发布身份也改成那张证书
+		if keystore.Invalid != "" {
+			slog.Warn("refusing a release identity change while build.keystore is unusable", "tenant", tenantID(c), "reason", keystore.Invalid)
+			problem(c, http.StatusConflict, "BUILD_KEYSTORE_RECORD_INVALID",
+				"The stored v3 signing keystore record cannot be used (malformed, cannot be unwrapped, or its fields differ from the uploaded file); upload the keystore again, which also sets the release identity")
+			return
+		}
+		record := keystore.Record
+		if !keystore.Legacy && (record.PackageName != value.PackageName || record.CertificateSHA256 != value.SignerSHA256) {
 			problem(c, http.StatusConflict, "RELEASE_IDENTITY_KEYSTORE_MISMATCH",
 				"This tenant has a v3 signing keystore; the Android release identity must be its package name and certificate. Upload a new keystore (which sets both) instead of changing the identity alone")
 			return

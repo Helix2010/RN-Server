@@ -65,7 +65,7 @@
 
 签名闸只管它自己签的包；手工上传（`POST /v1/admin/releases`）原来只和登记的发布身份比对。安全评审 R2 证明这是一条绕过签名闸的路：租户管理员（或拿到 `x-admin-key` 的人）可以把 `release.android` 的证书改成自己的，或者用签名闸公开的 X25519 公钥封一份自己的 v3 密文上传（服务端打不开内层，只能照收），然后手工上传自签的包。现在：
 
-- 租户有 v3 `build.keystore` 时，`PUT /v1/admin/release-identity/android` 的包名与证书必须就是密钥记录里的（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`），身份只能随 `PUT /v1/admin/build-keystore` 一起换。
+- 租户有 v3 `build.keystore` 时，`PUT /v1/admin/release-identity/android` 的包名与证书必须就是密钥记录里的（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`），身份只能随 `PUT /v1/admin/build-keystore` 一起换；v3 记录用不了（`KEYSTORE_RECORD_INVALID`，例如库里外层证书被改过）时不拿外层字段当依据，单独改身份 409 `BUILD_KEYSTORE_RECORD_INVALID`，手工上传闸按 `RELEASE_KEYSTORE_NOT_CONFIGURED` 拒绝。
 - Android 手工上传在发布序列锁的事务里再过一道闸（签名闸 `complete` 不走这里），任何一条不满足都是 409 并写审计 `release_rejected`：租户有 v3 密钥（`RELEASE_KEYSTORE_NOT_CONFIGURED`）；包的签名证书就是密钥记录里的证书（`RELEASE_SIGNER_KEYSTORE_MISMATCH`）；**主签名闸**对当前密钥版本报告 `decrypt=ok` 且 `confirmed=true`（`RELEASE_SIGNER_NOT_CONFIRMED`）。确认是运维在签名闸本机对照离线指纹做的，服务端改不了它。
 
 **结论：租户管理员账号被攻破时，手工上传只能发"签名闸本机确认过的证书"签的包。** 这是相对设计的一处收紧（设计里手工上传只受在途门禁约束），代价是没迁到签名闸的租户不能再手工上传 Android 包。

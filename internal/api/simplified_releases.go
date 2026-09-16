@@ -319,7 +319,7 @@ func (s *server) createReleaseFromArtifact(c *gin.Context) {
 				return &releaseRejection{Status: http.StatusConflict, Code: "RELEASE_SIGNING_IN_FLIGHT",
 					Detail: "A build for this platform is waiting for or being signed by the signer; wait for it to finish, or cancel it, before uploading a release by hand"}, nil
 			}
-			if rejection, err := manualAndroidReleaseGate(ctx, tx, tenantID(c), apkCertificate); err != nil || rejection != nil {
+			if rejection, err := s.manualAndroidReleaseGate(ctx, tx, tenantID(c), apkCertificate); err != nil || rejection != nil {
 				return rejection, err
 			}
 		}
@@ -466,7 +466,7 @@ func withCode(summary map[string]any, code string) map[string]any {
 //
 // 结果：租户管理员账号被攻破时，手工上传只能发"签名闸本机确认过的证书"签的包。
 // 在发布序列锁的事务里调用，带共享锁读密钥与检查记录，挡住并发的换密钥提交。
-func manualAndroidReleaseGate(ctx context.Context, tx *sql.Tx, tenant, apkCertificate string) (*releaseRejection, error) {
+func (s *server) manualAndroidReleaseGate(ctx context.Context, tx *sql.Tx, tenant, apkCertificate string) (*releaseRejection, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT config_key,config_value,version FROM app_configs WHERE tenant_id=? AND config_key IN (?,?) FOR SHARE`,
 		tenant, buildKeystoreConfigKey, buildKeystoreCheckConfigKey)
 	if err != nil {
@@ -495,13 +495,18 @@ func manualAndroidReleaseGate(ctx context.Context, tx *sql.Tx, tenant, apkCertif
 	if !exists {
 		return reject("RELEASE_KEYSTORE_NOT_CONFIGURED", "Android releases uploaded by hand require the tenant's v3 signing keystore to be registered and confirmed on the primary signer")
 	}
-	record, legacy, err := parseBuildKeystoreValue(keystoreRaw)
-	if err != nil {
+	keystore := buildKeystoreState{Exists: true}
+	if err := s.evaluateBuildKeystore(tenant, keystoreRaw, &keystore); err != nil {
 		return nil, err
 	}
-	if legacy {
+	if keystore.Legacy {
 		return reject("RELEASE_KEYSTORE_NOT_CONFIGURED", "The stored signing keystore is in a retired format; upload the v3 keystore before uploading releases by hand")
 	}
+	// 记录用不了时外层的证书字段不可信（可能被改过），不拿它比对
+	if keystore.Invalid != "" {
+		return reject("RELEASE_KEYSTORE_NOT_CONFIGURED", "The stored v3 signing keystore record cannot be used; upload the keystore again before uploading releases by hand")
+	}
+	record := keystore.Record
 	if record.CertificateSHA256 != apkCertificate {
 		return reject("RELEASE_SIGNER_KEYSTORE_MISMATCH", "The package is not signed with the certificate of the tenant's registered v3 signing keystore")
 	}

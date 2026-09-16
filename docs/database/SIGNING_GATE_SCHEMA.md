@@ -56,7 +56,7 @@
 - `sealed` 外层用 `STORAGE_MASTER_KEY` 加密（关联数据 `build-keystore/v3:<tenantId>`），里面是离线工具产出的 `rn-android-keystore-upload/v3` 文件（`signing/keystorebox.Upload`）：每个收件人一份 `x25519-hkdf-sha256-aes256gcm` 密文，明文绑定租户、包名、证书指纹、别名与收件人列表。服务端打不开内层。
 - `keyAlias`、`certificateSha256`、`packageName`、`tenantSlug`、`recipients`（排序）是从文件里抄出来的索引，读取时与文件逐项比对，不一致是数据事故。
 - v3 记录用不了（记录损坏、外层解不开、索引字段与文件对不上）时，读出来不报错，就绪问题 `KEYSTORE_RECORD_INVALID`，签名闸检查接口不下发；重新上传覆盖即可。
-- 写入（`PUT /v1/admin/build-keystore`）只收 v3：收件人必须都是已登记、非吊销签名闸已接受的 X25519 公钥（多余的拒收，缺的只提示）；`tenantSlug` 等于本租户；请求里的 `packageName`、`signerSha256` 与文件一致；证书不是作废的旧指纹。与 `release.android` 在同一事务里各自带乐观锁写入（ADR-0016）。有 v3 记录时，单独改 `release.android`（`PUT /v1/admin/release-identity/android`）只能写成与本记录相同的包名与证书（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`）。
+- 写入（`PUT /v1/admin/build-keystore`）只收 v3：收件人必须都是已登记、非吊销签名闸已接受的 X25519 公钥（多余的拒收，缺的只提示）；`tenantSlug` 等于本租户；请求里的 `packageName`、`signerSha256` 与文件一致；证书不是作废的旧指纹。与 `release.android` 在同一事务里各自带乐观锁写入（ADR-0016）。有 v3 记录时，单独改 `release.android`（`PUT /v1/admin/release-identity/android`）只能写成与本记录相同的包名与证书（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`）；v3 记录用不了时一律不许单独改（409 `BUILD_KEYSTORE_RECORD_INVALID`），手工上传按没有可用密钥拒绝。
 - **没有 `format:3` 的旧记录**（v1 口令封 `{"sealed","keyAlias","keystoreSha256"}`、v2 加密给打包机公钥）读出来当作"没有可用的签名密钥"：控制台显示 `legacy=true`，排队与签名认领一律不就绪，上传 v3 时带这一行的 `version` 覆盖。
 
 ## build.keystore.check（format 2）
