@@ -146,7 +146,9 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 
 对象存储的 endpoint / 桶 / 凭据**不在 env**：按租户存在 `app_configs.release.storage`，用 `STORAGE_MASTER_KEY` 加密，由管理端写入。
 
-**构建机与签名闸的令牌不在服务端 env**：原来全局共用的 `BUILD_AGENT_TOKEN` 已删除。每台构建机、每台签名闸在控制台「打包机与签名闸」新建时签发自己的令牌（`rnm_` 开头，只显示一次），放进那台机器自己的 env（构建机 `BUILD_AGENT_MACHINE_TOKEN`、签名闸 `SIGNER_MACHINE_TOKEN`）；服务端只在 `app_configs` 平台级 `build.machines` 里存令牌的 sha256，吊销即时生效。旧构建机还带着 `x-build-agent-token` 来请求时回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`。见 [ADR-0019](decisions/0019-android-signing-gate.md)。
+**构建机与签名闸的令牌不在服务端 env**：原来全局共用的 `BUILD_AGENT_TOKEN` 已删除。每台构建机、每台签名闸有自己的令牌（`rnm_` 开头），在那台机器自己的 env 里（构建机 `BUILD_AGENT_MACHINE_TOKEN`、签名闸 `SIGNER_MACHINE_TOKEN`）；服务端只在 `app_configs` 平台级 `build.machines` 里存令牌的 sha256，吊销即时生效。旧构建机还带着 `x-build-agent-token` 来请求时回 426 `MACHINE_AUTH_UPGRADE_REQUIRED`。见 [ADR-0019](decisions/0019-android-signing-gate.md)。
+
+自 [ADR-0020](decisions/0020-signing-gate-automation.md) 起，控制台新建机器只给一次性注册码与安装命令，令牌由机器在本机注册（`POST /v1/machine-setup/enroll`）时直接写进它的 env，不经过屏幕。新机器下载的安装包从服务器本地目录 `/opt/rn-foundation/machine-bundles/current/`（`manifest.json`、`signer.tar.gz`、`builder.tar.gz`，由部署脚本原子切换 `current` 软链）提供——这是部署约定，**不是配置项**，服务端 env 不新增键；目录不在时 `describe` 回 503 `MACHINE_BUNDLE_UNAVAILABLE`。
 
 ### 4.4 推送
 
