@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
@@ -151,6 +152,7 @@ type readinessProblem struct {
 const (
 	readinessKeystoreNotConfigured   = "KEYSTORE_NOT_CONFIGURED"
 	readinessKeystoreLegacyFormat    = "KEYSTORE_LEGACY_FORMAT"
+	readinessKeystoreRecordInvalid   = "KEYSTORE_RECORD_INVALID"
 	readinessReleaseIdentityMissing  = "RELEASE_IDENTITY_NOT_CONFIGURED"
 	readinessReleaseIdentityMismatch = "RELEASE_IDENTITY_MISMATCH"
 	readinessPrimarySignerMissing    = "PRIMARY_SIGNER_MISSING"
@@ -169,7 +171,7 @@ const (
 
 // readinessProblemCodes 按判断顺序列出全部枚举值（测试与 OpenAPI 对照用）。
 var readinessProblemCodes = []string{
-	readinessKeystoreNotConfigured, readinessKeystoreLegacyFormat, readinessReleaseIdentityMissing, readinessReleaseIdentityMismatch,
+	readinessKeystoreNotConfigured, readinessKeystoreLegacyFormat, readinessKeystoreRecordInvalid, readinessReleaseIdentityMissing, readinessReleaseIdentityMismatch,
 	readinessPrimarySignerMissing, readinessPrimarySignerNoBox, readinessAppIdentityIncomplete, readinessOTACertificateMissing,
 	readinessAPIBaseURLInvalid, readinessTrustRootsInvalid, readinessPrimaryCheckMissing, readinessPrimaryDecryptFailed,
 	readinessPrimaryNotConfirmed, readinessTrustRootsChanged, readinessPrimaryTrialSignPending, readinessPrimaryTrialSignFailed,
@@ -206,6 +208,9 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		add(readinessKeystoreNotConfigured, "还没有上传签名密钥（离线工具 build-keystore 产出的 v3 文件）")
 	case keystore.Legacy:
 		add(readinessKeystoreLegacyFormat, "库里是旧格式的签名密钥密文（签名闸上线前的口令封或打包机公钥封），需要按密钥重置流程离线生成并上传 v3 文件")
+	case keystore.Invalid != "":
+		slog.Warn("build.keystore record is unusable", "tenant", tenant, "reason", keystore.Invalid)
+		add(readinessKeystoreRecordInvalid, "库里的签名密钥记录用不了（记录损坏、外层解不开，或索引字段与密文文件对不上），不能交给签名闸；用离线工具产出的 v3 文件重新上传覆盖")
 	}
 	if keystore.configured() {
 		identity, err := s.androidReleaseIdentityRecord(ctx, tenant)
@@ -230,13 +235,9 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		add(readinessPrimarySignerMissing, "没有 active 的主签名闸（在「打包机与签名闸」登记主签名闸并接受它的公钥）")
 	}
 	if keystore.configured() {
-		upload, err := s.keystoreUploadFor(tenant, keystore.Record)
-		if err != nil {
-			return r, err
-		}
-		r.Upload = &upload
+		r.Upload = keystore.Upload
 		if hasPrimary {
-			if box, ok := boxFor(upload, string(primary.PublicKeySHA256)); ok {
+			if box, ok := boxFor(*keystore.Upload, string(primary.PublicKeySHA256)); ok {
 				r.Box = &box
 			} else {
 				add(readinessPrimarySignerNoBox, "签名密钥没有加密给主签名闸 "+primary.Name+"：把它加进离线 pin 文件，用离线工具重新 seal 并上传")

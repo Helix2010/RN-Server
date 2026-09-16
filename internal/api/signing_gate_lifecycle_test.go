@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -165,7 +166,8 @@ func TestDBAbandonedDeliveriesAreDeleted(t *testing.T) {
 	if exists(signedKey) || !exists(built.UnsignedObjectKey.String) || !exists(built.SBOMObjectKey.String) {
 		t.Fatal("a deferred signing must drop only the signed package")
 	}
-	// 重新签名认领时清掉行上残留的已签名包
+	// 重新签名认领时清掉行上残留的已签名包（先越过暂不能签的冷却期）
+	f.ageSignOutcome(requeued)
 	stale := "tenants/" + f.tenant + "/build-jobs/" + requeued + "/s1/stale/app-release.apk"
 	f.store.put(stale, []byte("signed"), "e")
 	f.setJob(requeued, "signed_object_key=?", stale)
@@ -277,5 +279,142 @@ func TestDBUnchangedKeystoreChecksAreNotRewritten(t *testing.T) {
 	f.reportCheck(f.primary, true, "pending")
 	if after, _ := version(); after != before+1 {
 		t.Fatalf("a changed check was not written: version %d -> %d", before, after)
+	}
+}
+
+// "暂不能签"之后冷却：冷却期内同一台签名闸领不到这条任务，别的签名闸照常能领，冷却过了再派回来。
+func TestDBDeferredSigningCoolsDownForThatSignerOnly(t *testing.T) {
+	f := newGateFixture(t, 106)
+	jobID := f.queueBuild("13.0.0", 1300)
+	f.deliverBuild(f.claimBuild())
+	release := func(machine gateMachine, attempt int) {
+		t.Helper()
+		if r := f.do(http.MethodPost, "/v1/signer/jobs/"+jobID+"/release", machine.Token, attemptHeaders(signAttemptHeader, attempt),
+			map[string]any{"code": "TENANT_NOT_CONFIRMED", "detail": "not confirmed here"}); r.Code != http.StatusNoContent {
+			t.Fatalf("release: %d %s", r.Code, r.Body.String())
+		}
+	}
+	if f.claimSign(f.primary) == nil {
+		t.Fatal("nothing to sign")
+	}
+	release(f.primary, 1)
+	for i := 0; i < 3; i++ {
+		if claimed := f.claimSign(f.primary); claimed != nil {
+			t.Fatalf("the signer that just deferred got the job back inside the cooldown: %v", claimed["job"])
+		}
+	}
+	if job := f.jobStatus(jobID); job.SignAttempt != 1 || job.Status != jobBuilt {
+		t.Fatalf("the cooldown must not burn sign attempts: %+v", job)
+	}
+	// 另一台签名闸（切成主）不受这台的冷却影响
+	f.writeMachines(f.builder.record(""), f.primary.record(signerRoleStandby), f.standby.record(signerRolePrimary))
+	f.reportCheck(f.standby, true, "ok")
+	claimed := f.claimSign(f.standby)
+	if claimed == nil || claimed["job"].(map[string]any)["id"] != jobID {
+		t.Fatalf("another signer was blocked by the first signer's cooldown: %v", claimed)
+	}
+	release(f.standby, 2)
+	if again := f.claimSign(f.standby); again != nil {
+		t.Fatalf("the second signer got the job back inside its own cooldown: %v", again["job"])
+	}
+	f.ageSignOutcome(jobID)
+	if after := f.claimSign(f.standby); after == nil || after["job"].(map[string]any)["signAttempt"] != float64(3) {
+		t.Fatalf("the job was not dispatched again after the cooldown: %v", after)
+	}
+}
+
+// build.keystore 记录用不了（只改了外层索引、外层解不开、记录本身损坏）：控制台照常返回、标成
+// 不就绪并给出 KEYSTORE_RECORD_INVALID；排队 409 SIGNER_NOT_READY；签名闸检查接口不下发这个租户。
+func TestDBUnusableKeystoreRecordIsANotReadyProblem(t *testing.T) {
+	f := newGateFixture(t, 107)
+	var original []byte
+	if err := f.db.QueryRow(`SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, buildKeystoreConfigKey).Scan(&original); err != nil {
+		t.Fatal(err)
+	}
+	corruptions := map[string]func(){
+		"outer certificate changed": func() {
+			f.setKeystoreValue(`JSON_SET(config_value,'$.certificateSha256',?)`, strings.Repeat("e", 64))
+		},
+		"outer box cannot be opened": func() {
+			f.setKeystoreValue(`JSON_SET(config_value,'$.sealed',?)`, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+		},
+		"record malformed": func() {
+			f.setKeystoreValue(`JSON_SET(config_value,'$.unexpected',?)`, "field")
+		},
+	}
+	for name, corrupt := range corruptions {
+		f.setKeystoreValue(`?`, string(original))
+		corrupt()
+		c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/build-keystore", nil)
+		f.s.getBuildKeystore(c)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: GET build-keystore %d %s", name, recorder.Code, recorder.Body.String())
+		}
+		view := decodeBody(t, recorder)
+		if view["configured"] != true || view["ready"] != false || !strings.Contains(recorder.Body.String(), `"code":"KEYSTORE_RECORD_INVALID"`) {
+			t.Fatalf("%s: view %s", name, recorder.Body.String())
+		}
+		c, recorder = testContext(t, f.tenant, http.MethodPost, "/v1/admin/builds", map[string]any{
+			"platform": "android", "gitRef": "main", "version": "14.0.0", "buildNumber": 1400, "reason": "corrupt keystore", "confirm": true,
+			"releaseNotes": map[string]any{"zh-CN": []string{"测试"}},
+		})
+		f.s.createBuildJob(c)
+		if recorder.Code != http.StatusConflict || problemCode(t, recorder) != "SIGNER_NOT_READY" || !strings.Contains(recorder.Body.String(), "KEYSTORE_RECORD_INVALID") {
+			t.Fatalf("%s: queue %d %s", name, recorder.Code, recorder.Body.String())
+		}
+		checks := f.do(http.MethodGet, "/v1/signer/keystore-checks", f.primary.Token, nil, nil)
+		if checks.Code != http.StatusOK || strings.Contains(checks.Body.String(), `"tenantSlug":"`+f.slug+`"`) {
+			t.Fatalf("%s: the signer was sent an unusable keystore: %d %s", name, checks.Code, checks.Body.String())
+		}
+	}
+	f.setKeystoreValue(`?`, string(original))
+	if checks := f.do(http.MethodGet, "/v1/signer/keystore-checks", f.primary.Token, nil, nil); !strings.Contains(checks.Body.String(), `"tenantSlug":"`+f.slug+`"`) {
+		t.Fatalf("the restored keystore is not sent to the signer: %s", checks.Body.String())
+	}
+}
+
+// 吊销的机器认得出自己被吊销：401 MACHINE_REVOKED（令牌查无仍是 MACHINE_AUTH_REQUIRED）；
+// 吊销签名闸时主备角色清空。
+func TestDBRevokedMachinesAreToldTheyAreRevoked(t *testing.T) {
+	f := newGateFixture(t, 108)
+	unknown := newGateMachine(t, machineRoleBuilder, "unknown")
+	if r := f.do(http.MethodPost, "/v1/build-agent/claim", unknown.Token, nil, map[string]any{"platforms": []string{"android"}, "kinds": []string{"apk"}}); r.Code != http.StatusUnauthorized || problemCode(t, r) != "MACHINE_AUTH_REQUIRED" {
+		t.Fatalf("an unknown token: %d %s", r.Code, r.Body.String())
+	}
+	revoke := func(id string) map[string]any {
+		t.Helper()
+		r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+id+"/revoke", map[string]any{"expectedVersion": registryVersion(t, f), "reason": "retired", "confirm": true})
+		if r.Code != http.StatusOK {
+			t.Fatalf("revoke %s: %d %s", id, r.Code, r.Body.String())
+		}
+		return decodeBody(t, r)["machine"].(map[string]any)
+	}
+	if view := revoke(f.primary.ID); view["status"] != machineStatusRevoked || view["signerRole"] != nil {
+		t.Fatalf("a revoked signer kept its signer role: %v", view)
+	}
+	revoke(f.builder.ID)
+	for name, r := range map[string]*httptest.ResponseRecorder{
+		"signer":                        f.do(http.MethodPost, "/v1/signer/claim", f.primary.Token, nil, map[string]any{"ready": []any{f.readyItem()}}),
+		"builder":                       f.do(http.MethodPost, "/v1/build-agent/claim", f.builder.Token, nil, map[string]any{"platforms": []string{"android"}, "kinds": []string{"apk"}}),
+		"builder on the signer channel": f.do(http.MethodGet, "/v1/signer/keystore-checks", f.builder.Token, nil, nil),
+	} {
+		if r.Code != http.StatusUnauthorized || problemCode(t, r) != "MACHINE_REVOKED" {
+			t.Fatalf("%s: %d %s", name, r.Code, r.Body.String())
+		}
+	}
+	// 切换主备之后登记里只有一条 primary
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+f.standby.ID+"/signer-role", map[string]any{
+		"signerRole": "primary", "expectedVersion": registryVersion(t, f), "reason": "promote", "confirm": true,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("promote: %d %s", r.Code, r.Body.String())
+	}
+	primaries := 0
+	for _, item := range decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil))["items"].([]any) {
+		if item.(map[string]any)["signerRole"] == signerRolePrimary {
+			primaries++
+		}
+	}
+	if primaries != 1 {
+		t.Fatalf("%d machines are listed as primary after revoking the old primary and promoting the standby", primaries)
 	}
 }

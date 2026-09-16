@@ -232,9 +232,10 @@ func TestDBSignCompleteIsAtomicUnderInjectedCrashes(t *testing.T) {
 	if n := countReleases(); n != 1 {
 		t.Fatalf("the retry created another release: %d", n)
 	}
-	// 另一个包（sha 不同）来完成一个已经 succeeded 的任务：不是幂等重试，是过期上报
+	// 同一次签名认领交来另一个包（sha 不同）完成一个已经 succeeded 的任务：不是幂等重试，是结果冲突，
+	// 已经落库的发布记录不会被替换
 	other := f.completeBody(append(append([]byte{}, signed...), 0), delivered.unsigned)
-	if r := f.do(http.MethodPost, "/v1/signer/jobs/"+jobID+"/complete", f.primary.Token, headers, other); r.Code != http.StatusConflict || problemCode(t, r) != "SIGN_ATTEMPT_STALE" {
+	if r := f.do(http.MethodPost, "/v1/signer/jobs/"+jobID+"/complete", f.primary.Token, headers, other); r.Code != http.StatusConflict || problemCode(t, r) != "SIGN_RESULT_CONFLICT" {
 		t.Fatalf("a different package completed a succeeded job: %d %s", r.Code, r.Body.String())
 	}
 }
@@ -324,6 +325,7 @@ func TestDBSignerReleaseAndReject(t *testing.T) {
 	if r := f.do(http.MethodPost, "/v1/signer/jobs/"+jobID+"/heartbeat", f.primary.Token, attemptHeaders(signAttemptHeader, 1), nil); r.Code != http.StatusConflict || problemCode(t, r) != "SIGN_ATTEMPT_STALE" {
 		t.Fatalf("a heartbeat after release: %d %s", r.Code, r.Body.String())
 	}
+	f.ageSignOutcome(jobID)
 	claimAndExpect(2)
 	if r := f.do(http.MethodPost, "/v1/signer/jobs/"+jobID+"/reject", f.primary.Token, attemptHeaders(signAttemptHeader, 2),
 		map[string]any{"kind": "transient", "code": "SERVER_UNAVAILABLE", "detail": "5xx"}); r.Code != http.StatusNoContent {

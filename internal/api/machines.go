@@ -194,7 +194,9 @@ func (d buildMachinesDoc) validate() error {
 			return fmt.Errorf("machine %s has a malformed or duplicated token digest", m.ID)
 		case m.Role == machineRoleBuilder && m.SignerRole != "":
 			return fmt.Errorf("builder %s carries a signer role", m.ID)
-		case m.Role == machineRoleSigner && m.SignerRole != signerRolePrimary && m.SignerRole != signerRoleStandby:
+		// 吊销的签名闸没有主备角色（吊销时置空；更早吊销的记录可能还留着原角色）
+		case m.Role == machineRoleSigner && m.SignerRole != signerRolePrimary && m.SignerRole != signerRoleStandby &&
+			!(m.Status == machineStatusRevoked && m.SignerRole == ""):
 			return fmt.Errorf("signer %s has no valid signer role", m.ID)
 		case m.Status == machineStatusActive && (m.PublicKey == "" || !fingerprint.Valid(string(m.PublicKeySHA256))):
 			return fmt.Errorf("active machine %s has no accepted key", m.ID)
@@ -329,8 +331,15 @@ func (s *server) machineAuth(role string, allowPendingKey bool) gin.HandlerFunc 
 			return
 		}
 		machine, ok := registry.byTokenSHA256(sha256Hex(token))
-		if !ok || machine.Status == machineStatusRevoked {
+		if !ok {
 			problem(c, http.StatusUnauthorized, "MACHINE_AUTH_REQUIRED", "Machine authentication required")
+			c.Abort()
+			return
+		}
+		// 吊销与"令牌不对"分开说：签名闸与构建机认出 MACHINE_REVOKED 就停止重试并退出，
+		// 而不是把它当成配置错误一直重连。令牌 sha256 本身就是凭据的证明，说出"已吊销"不泄露什么
+		if machine.Status == machineStatusRevoked {
+			problem(c, http.StatusUnauthorized, "MACHINE_REVOKED", "This machine has been revoked in the console; stop and ask a platform administrator")
 			c.Abort()
 			return
 		}
@@ -610,12 +619,14 @@ func (s *server) revokeMachine(c *gin.Context) {
 		if m.Status == machineStatusRevoked {
 			return http.StatusConflict, "MACHINE_ALREADY_REVOKED", "This machine is already revoked", nil
 		}
-		previous := m.Status
+		previous, previousSignerRole := m.Status, string(m.SignerRole)
 		m.Status = machineStatusRevoked
+		// 吊销的签名闸不再有主备角色：留着的话，切换主备之后登记里会同时出现两条 primary，其中一条已吊销
+		m.SignerRole = ""
 		m.RevokedBy, m.RevokedAt, m.RevokeReason = optString(actor(c)), optString(iso(now)), optString(reason)
 		revoked = *m
 		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_machine_revoke", machineAuditTargetType, m.ID, reason, requestID(c),
-			map[string]any{"machineId": m.ID, "role": m.Role, "name": m.Name, "signerRole": nullableString(string(m.SignerRole)), "previousStatus": previous,
+			map[string]any{"machineId": m.ID, "role": m.Role, "name": m.Name, "signerRole": nullableString(previousSignerRole), "previousStatus": previous,
 				"publicKeySha256": nullableString(string(m.PublicKeySHA256))})}
 	})
 	if !ok {

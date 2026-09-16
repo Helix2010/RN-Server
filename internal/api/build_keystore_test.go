@@ -355,6 +355,13 @@ func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 	}
 	expect(readinessOTACertificateMissing)
 
+	// 记录用不了：只改外层的证书指纹，与密文文件对不上
+	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=JSON_SET(config_value,'$.certificateSha256',?),version=version+1 WHERE tenant_id=? AND config_key=?`,
+		strings.Repeat("e", 64), f.tenant, buildKeystoreConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	expect(readinessKeystoreRecordInvalid)
+
 	// 旧格式、没有签名密钥
 	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=?,version=version+1 WHERE tenant_id=? AND config_key=?`,
 		`{"sealed":"eA==","keyAlias":"a","keystoreSha256":"`+strings.Repeat("b", 64)+`"}`, f.tenant, buildKeystoreConfigKey); err != nil {

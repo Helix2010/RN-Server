@@ -439,6 +439,20 @@ func (f *gateFixture) jobStatus(id string) buildJob {
 	return job
 }
 
+// setKeystoreValue 直接改库里 build.keystore 这一行（模拟记录被改坏），expression 用 ? 接 arg。
+func (f *gateFixture) setKeystoreValue(expression string, arg any) {
+	f.t.Helper()
+	if _, err := f.db.Exec(`UPDATE app_configs SET config_value=`+expression+`,version=version+1 WHERE tenant_id=? AND config_key=?`, arg, f.tenant, buildKeystoreConfigKey); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// ageSignOutcome 把最近一次没签成的时间往前拨，越过"暂不能签"的冷却期。
+func (f *gateFixture) ageSignOutcome(id string) {
+	f.t.Helper()
+	f.setJob(id, "sign_outcome=JSON_SET(sign_outcome,'$.at',?)", iso(time.Now().UTC().Add(-signDeferralCooldown-time.Second)))
+}
+
 func (f *gateFixture) setJob(id, assignments string, args ...any) {
 	f.t.Helper()
 	if _, err := f.db.Exec(`UPDATE build_jobs SET `+assignments+` WHERE id=?`, append(args, id)...); err != nil {

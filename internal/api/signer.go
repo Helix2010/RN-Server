@@ -37,6 +37,11 @@ const (
 	signerDetailMaxRunes = 500
 	signerErrorMaxRunes  = 300
 	apkContentType       = "application/vnd.android.package-archive"
+	// signDeferralCooldown：签名闸对一条任务说"暂不能签"（release，sign_outcome.kind=deferred）之后，
+	// 这么久之内不再把这条任务派给**同一台**签名闸。暂不能签的原因（本机没确认、信任根刚改）
+	// 不会在一秒内自己消失；不冷却的话签名闸认领、退回、再认领，端到端实测每秒一百多次，
+	// sign_attempt 半分钟涨到几千。别的签名闸不受影响。
+	signDeferralCooldown = 60 * time.Second
 )
 
 var signerCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{2,63}$`)
@@ -77,15 +82,15 @@ func (s *server) signerKeystoreChecks(c *gin.Context) {
 			slog.Error("skipping a tenant whose build.keystore cannot be read", "tenant", tenant, "error", err)
 			continue
 		}
+		if state.Invalid != "" {
+			// 记录用不了（控制台就绪问题 KEYSTORE_RECORD_INVALID）：不下发给签名闸，留一条日志
+			slog.Warn("not sending an unusable build.keystore to a signer", "tenant", tenant, "machineId", machine.ID, "reason", state.Invalid)
+			continue
+		}
 		if !state.configured() || !containsString(state.Record.Recipients, string(machine.PublicKeySHA256)) {
 			continue
 		}
-		upload, err := s.keystoreUploadFor(tenant, state.Record)
-		if err != nil {
-			slog.Error("skipping a tenant whose build.keystore cannot be unwrapped", "tenant", tenant, "error", err)
-			continue
-		}
-		box, ok := boxFor(upload, string(machine.PublicKeySHA256))
+		box, ok := boxFor(*state.Upload, string(machine.PublicKeySHA256))
 		if !ok {
 			continue
 		}
@@ -275,6 +280,9 @@ func (s *server) claimSigningJob(c *gin.Context) {
 		if err != nil {
 			continue
 		}
+		if deferredRecentlyBy(job, machine.ID, time.Now().UTC()) {
+			continue
+		}
 		response, ok := s.signingDispatch(ctx, job, machine, ready)
 		if !ok {
 			continue
@@ -293,6 +301,22 @@ func (s *server) claimSigningJob(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// deferredRecentlyBy：这条任务最近一次没签成的原因是这台签名闸在冷却期内说的"暂不能签"。
+func deferredRecentlyBy(job buildJob, machineID string, now time.Time) bool {
+	if len(job.SignOutcome) == 0 {
+		return false
+	}
+	var outcome buildJobSignOutcome
+	if json.Unmarshal(job.SignOutcome, &outcome) != nil || outcome.Kind != "deferred" || outcome.MachineID != machineID {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339Nano, outcome.At)
+	if err != nil {
+		return false
+	}
+	return now.Sub(at) < signDeferralCooldown
 }
 
 // claimForSigning 在发布序列锁（与手工上传、签名完成同一把）里认领一条签名任务：先比对已有
@@ -602,6 +626,12 @@ func (s *server) completeSigning(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"releaseId": job.ReleaseID.String})
 		return
 	}
+	// 同一台签名闸、同一次签名认领已经完成过，这次交来的却是另一个包：不是过期认领，而是
+	// 结果冲突——已经落库的发布记录是另一个 sha256，不会被替换
+	if job.Status == jobSucceeded && job.ReleaseID.Valid && job.SignAttempt == attempt && job.SigningMachineID.String == machine.ID {
+		problem(c, http.StatusConflict, "SIGN_RESULT_CONFLICT", "This signing claim already completed with a different signed package; the recorded release is not replaced")
+		return
+	}
 	if job.Status != jobSigning || job.SignAttempt != attempt || job.SigningMachineID.String != machine.ID {
 		problem(c, http.StatusConflict, "SIGN_ATTEMPT_STALE", "This signing claim is no longer current for this signer; stop working on the job")
 		return
@@ -730,6 +760,9 @@ func (s *server) completeSigning(c *gin.Context) {
 			lockedAttempt == attempt && lockedMachine.String == machine.ID {
 			releaseID = lockedRelease.String
 			return nil, nil
+		}
+		if status == jobSucceeded && lockedRelease.Valid && lockedAttempt == attempt && lockedMachine.String == machine.ID {
+			return &releaseRejection{Status: http.StatusConflict, Code: "SIGN_RESULT_CONFLICT", Detail: "This signing claim already completed with a different signed package; the recorded release is not replaced"}, nil
 		}
 		if status != jobSigning || lockedAttempt != attempt || lockedMachine.String != machine.ID {
 			return &releaseRejection{Status: http.StatusConflict, Code: "SIGN_ATTEMPT_STALE", Detail: "This signing claim is no longer current for this signer; stop working on the job"}, nil

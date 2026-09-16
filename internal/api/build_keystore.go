@@ -48,16 +48,23 @@ type buildKeystoreRecord struct {
 
 // buildKeystoreState 是这个租户 build.keystore 那一行的状态。
 type buildKeystoreState struct {
-	Exists    bool // 有这一行
-	Legacy    bool // 有这一行但不是 v3
-	Record    buildKeystoreRecord
+	Exists bool // 有这一行
+	Legacy bool // 有这一行但不是 v3
+	// Invalid 非空：是 v3 记录但用不了（记录本身损坏、外层解不开、索引字段与上传文件对不上），
+	// 值是原因（只进日志）。不当成读库错误：一个租户的记录坏了不能让控制台、排队 500
+	Invalid   string
+	Record    buildKeystoreRecord // Invalid 因记录本身损坏时为零值
+	Upload    *keystorebox.Upload // 只在 configured() 时有值
 	Version   int
 	UpdatedBy string
 	UpdatedAt time.Time
 }
 
 // configured：有可用的 v3 记录。
-func (k buildKeystoreState) configured() bool { return k.Exists && !k.Legacy }
+func (k buildKeystoreState) configured() bool { return k.Exists && !k.Legacy && k.Invalid == "" }
+
+// v3Record：这一行是 v3 格式（不论能不能用），控制台按"已配置"显示。
+func (k buildKeystoreState) v3Record() bool { return k.Exists && !k.Legacy }
 
 func buildKeystoreAAD(tenant string) string { return "build-keystore/v3:" + tenant }
 
@@ -73,8 +80,26 @@ func (s *server) buildKeystoreStateFor(ctx context.Context, q rowQuerier, tenant
 		return state, err
 	}
 	state.Exists = true
-	state.Record, state.Legacy, err = parseBuildKeystoreValue(raw)
-	return state, err
+	record, legacy, parseErr := parseBuildKeystoreValue(raw)
+	state.Legacy = legacy
+	switch {
+	case legacy:
+		return state, nil
+	case parseErr != nil:
+		state.Invalid = parseErr.Error()
+		return state, nil
+	}
+	state.Record = record
+	if s.secrets == nil {
+		return state, errors.New("storage master key is unavailable")
+	}
+	upload, err := s.keystoreUploadFor(tenant, record)
+	if err != nil {
+		state.Invalid = err.Error()
+		return state, nil
+	}
+	state.Upload = &upload
+	return state, nil
 }
 
 // parseBuildKeystoreValue 解析 build.keystore 这一行的值。不是 format 3 的旧记录 legacy=true、不报错。
@@ -195,7 +220,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 	}
 	keystore := readiness.Keystore
 	view := gin.H{
-		"configured": keystore.configured(), "format": nil, "legacy": keystore.Legacy,
+		"configured": keystore.v3Record(), "format": nil, "legacy": keystore.Legacy,
 		"keyAlias": nil, "certificateSha256": nil, "packageName": nil,
 		"version": keystore.Version, "updatedBy": nil, "updatedAt": nil,
 		"recipients": []gin.H{}, "missingSigners": []gin.H{}, "signers": []gin.H{},
@@ -208,7 +233,8 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		view["trustRoots"], view["trustRootsDigest"] = readiness.Roots, readiness.Digest
 	}
 	recipients := map[string]bool{}
-	if keystore.configured() {
+	// 记录能解析就把索引字段显示出来（即使外层解不开），便于看出是哪一份坏了
+	if keystore.v3Record() && keystore.Record.Format == buildKeystoreRecordFormat {
 		view["format"], view["keyAlias"] = keystore.Record.Format, keystore.Record.KeyAlias
 		view["certificateSha256"], view["packageName"] = keystore.Record.CertificateSHA256, keystore.Record.PackageName
 		items := []gin.H{}
