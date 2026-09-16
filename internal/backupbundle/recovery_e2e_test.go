@@ -420,7 +420,16 @@ func stageOpenedPackage(t *testing.T) (work, recoverPath, fingerprint string) {
 	if err := os.WriteFile(openLayer, []byte(extractOpenLayerScript(t, pkg.ReadmeFirst)), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	work = filepath.Join(dir, "work")
+	// 解到内存盘，和 README-FIRST 教的一样。recover.sh 会拒绝在普通磁盘上跑：
+	// 里面是全平台每个租户的签名密钥明文，而 SSD 上 rm 不等于擦除
+	if _, err := os.Stat("/dev/shm"); err != nil {
+		t.Skip("/dev/shm 不可用，跳过")
+	}
+	work, err = os.MkdirTemp("/dev/shm", "rnbk-test.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(work) })
 	runScript(t, openLayer, pkgPath, keyPaths[pair.Outer], filepath.Join(work, "L1"))
 	runScript(t, openLayer, filepath.Join(work, "L1", "inner.rnbk"),
 		keyPaths[pair.Inner], filepath.Join(work, "L2-agent"))

@@ -392,6 +392,22 @@ for d in "$L1" "$ROOT/L2-agent" "$ROOT/L2-server"; do
   [ -d "$d" ] || die "找不到 $d" "按 README-FIRST 第三步把三层各解到一个目录：L1、L2-agent、L2-server"
 done
 
+# $ROOT 里是全平台每个租户的签名密钥明文。它必须在内存盘上：普通磁盘上同机任何
+# 用户都可能读到，而且 SSD 上 rm 不等于擦除——删掉之后数据还在闪存里。
+# README-FIRST 教的是 mktemp -d /dev/shm/...，但脚本对调用者传什么进来不能想当然
+fstype=$(df -P -T "$ROOT" 2>/dev/null | awk 'NR==2{print $2}')
+case "$fstype" in
+  tmpfs|ramfs) ;;
+  *)
+    echo "!! $ROOT 在 $fstype 上，不是内存盘。"
+    echo "   这里面是全平台每个租户的签名密钥明文，落在普通磁盘上"
+    echo "   同机任何用户都可能读到，而且 SSD 上 rm 不等于擦除。"
+    echo "   建议按 README-FIRST 第三步重解到 /dev/shm 下再跑。"
+    read -r -p "   仍然继续？(yes/NO) " answer
+    [ "$answer" = "yes" ] || exit 1
+    ;;
+esac
+
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
