@@ -90,6 +90,8 @@ func TestNormalizeRejects(t *testing.T) {
 		"bad port":            func(r *Roots) { r.APIBaseURL = "https://api.anyfun.win:0" },
 		"empty port":          func(r *Roots) { r.APIBaseURL = "https://api.anyfun.win:" },
 		"leading zero port":   func(r *Roots) { r.APIBaseURL = "https://api.anyfun.win:0443" },
+		"explicit 443":        func(r *Roots) { r.APIBaseURL = "https://api.anyfun.win:443" },
+		"host with 443":       func(r *Roots) { r.AppLinksHosts = []string{"api.anyfun.win:443"} },
 		"escape sequence":     func(r *Roots) { r.APIBaseURL = "https://api.anyfun.win\x1b[2J" },
 		"non-ascii host":      func(r *Roots) { r.APIBaseURL = "https://аpi.anyfun.win" }, // 西里尔字母 а
 		"space":               func(r *Roots) { r.APIBaseURL = " https://api.anyfun.win" },
@@ -139,6 +141,11 @@ func TestDerivedValues(t *testing.T) {
 	}
 	if _, err := AppLinksHostFor("https://api.anyfun.win/"); err == nil {
 		t.Fatal("accepted a trailing slash")
+	}
+	// 显式默认端口拒绝，而不是改写：否则 AppLinksHostFor 会得出 "api.anyfun.win:443"，
+	// 而 RN-App（WHATWG URL）得出 "api.anyfun.win"
+	if _, err := AppLinksHostFor("https://api.anyfun.win:443"); err == nil {
+		t.Fatal("accepted an explicit default port")
 	}
 	withPort := anyfun()
 	withPort.APIBaseURL = "https://api.anyfun.win:8443"
