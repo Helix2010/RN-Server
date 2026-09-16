@@ -101,6 +101,18 @@ func TestBackupMetaAcceptsOrdinaryPaths(t *testing.T) {
 	}
 }
 
+// 库里的 slug 没有格式约束，线上就有 AnyFun。当初按「都是小写」定的规则让所有租户的密钥
+// 解开封好之后，整次备份死在上传这一步
+func TestBackupMetaAcceptsTheSlugsTenantsActuallyHave(t *testing.T) {
+	for _, slug := range []string{"AnyFun", "anyfun", "rwa_test2", "100000001", "predict-v2", "a.b"} {
+		meta := validPayloadMeta()
+		meta.Tenants[0].Slug = slug
+		if _, err := ParsePayloadMeta(encodePayloadMeta(t, meta)); err != nil {
+			t.Errorf("slug %q 应当被接受: %v", slug, err)
+		}
+	}
+}
+
 func TestBackupMetaFieldValidation(t *testing.T) {
 	cases := []struct {
 		name string
@@ -121,8 +133,18 @@ func TestBackupMetaFieldValidation(t *testing.T) {
 		}, "16 lowercase hex"},
 		{"no tenants", func(m *PayloadMeta) { m.Tenants = nil }, "tenants is empty"},
 		{"slug not slug-shaped", func(m *PayloadMeta) { m.Tenants[0].Slug = "Acme Corp" }, "slug"},
+		{"slug with a slash", func(m *PayloadMeta) { m.Tenants[0].Slug = "a/b" }, "slug"},
+		{"slug that walks up", func(m *PayloadMeta) { m.Tenants[0].Slug = ".." }, "slug"},
+		{"slug that looks like an option", func(m *PayloadMeta) { m.Tenants[0].Slug = "-rf" }, "slug"},
+		{"slug that hides itself", func(m *PayloadMeta) { m.Tenants[0].Slug = ".hidden" }, "slug"},
 		{"duplicate slug", func(m *PayloadMeta) {
 			m.Tenants = append(m.Tenants, m.Tenants[0])
+		}, "appears twice"},
+		// macOS 默认不分大小写：AnyFun 和 anyfun 会落进同一个目录
+		{"duplicate slug differing only in case", func(m *PayloadMeta) {
+			other := m.Tenants[0]
+			other.Slug = strings.ToUpper(other.Slug)
+			m.Tenants = append(m.Tenants, other)
 		}, "appears twice"},
 		{"no inner files", func(m *PayloadMeta) { m.InnerFiles = nil }, "innerFiles is empty"},
 		{"mode not octal", func(m *PayloadMeta) { m.InnerFiles[0].Mode = "rw-------" }, "mode"},

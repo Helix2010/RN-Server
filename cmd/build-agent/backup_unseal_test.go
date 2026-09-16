@@ -47,7 +47,8 @@ func TestUnsealKeystoresOpensBothFormats(t *testing.T) {
 		return sealedKeystoreItem{Tenant: tenant, Slug: slug, HasKeystore: true,
 			Version: sealed.Version, SealedKeystore: raw}
 	}
-	items := []sealedKeystoreItem{item("100000001", "old", v1), item("100000002", "new", v2)}
+	// 线上真有带大写的 slug
+	items := []sealedKeystoreItem{item("100000001", "AnyFun", v1), item("100000002", "new", v2)}
 
 	files, tenants, err := unsealKeystores(config{AgentPrivateKey: private, KeystorePassphrase: passphrase}, items)
 	if err != nil {
@@ -56,10 +57,16 @@ func TestUnsealKeystoresOpensBothFormats(t *testing.T) {
 	if len(tenants) != 2 {
 		t.Fatalf("两个租户都要进清单，得到 %d 个", len(tenants))
 	}
-	for _, slug := range []string{"old", "new"} {
+	for _, slug := range []string{"AnyFun", "new"} {
 		if got := string(files["keystores/"+slug+"/fingerprint.txt"]); got != generated.SignerSHA256 {
 			t.Errorf("%s 的证书指纹 = %q，想要 %q", slug, got, generated.SignerSHA256)
 		}
+	}
+
+	// 进不了目录名的 slug：一个盒子都不解就停
+	bad := []sealedKeystoreItem{item("100000003", "../escape", v2)}
+	if _, _, err := unsealKeystores(config{AgentPrivateKey: private}, bad); err == nil || !strings.Contains(err.Error(), "directory name") {
+		t.Fatalf("slug 进不了目录名时要先拒绝: %v", err)
 	}
 
 	// 本机没有旧口令：整次失败，并且点名是哪个租户、差的是哪个键

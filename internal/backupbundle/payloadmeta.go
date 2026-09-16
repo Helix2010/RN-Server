@@ -39,7 +39,13 @@ const (
 )
 
 var (
-	backupSlugPattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+	// 租户 slug 进内层 tar 的目录名（keystores/<slug>/）。库里的 slug 没有格式约束，
+	// 线上就有 AnyFun 这种带大写的——当初照「slug 都是小写」定成 ^[a-z0-9-]+$，
+	// 结果所有租户的密钥都解开封好之后，整次备份死在上传这一步。
+	//
+	// 放宽到大小写字母、数字和 . _ -，首字符必须是字母或数字：挡住 /、..、空白、
+	// shell 元字符，也挡住以 - 开头会被命令当成选项、以 . 开头会变成隐藏目录的写法
+	backupSlugPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
 	backupModePattern = regexp.MustCompile(`^0[0-7]{3}$`)
 	backupHexPattern  = regexp.MustCompile(`^[0-9a-f]+$`)
 	// backupOwnerPattern 是 user:group。它同样进 recover.sh
@@ -56,6 +62,12 @@ const backupUnsafeInPath = "$&|;<>()*?[]{}!#~" + // shell 元字符
 	"`" + // 命令替换
 	"\\" + // 反斜杠
 	"\n\r\t" // 空白，会让一行命令断成两条
+
+// ValidTenantSlug 说明这个 slug 能不能当备份包里的目录名。打包机在解密钥之前先查一遍，
+// 服务端收 meta 时再查一遍，两边同一条规则
+func ValidTenantSlug(slug string) bool {
+	return backupSlugPattern.MatchString(slug)
+}
 
 func ParsePayloadMeta(raw []byte) (PayloadMeta, error) {
 	if len(raw) > PayloadMetaMaxBytes {
@@ -96,13 +108,15 @@ func (m PayloadMeta) validate() error {
 	}
 	seen := map[string]bool{}
 	for i, tenant := range m.Tenants {
-		if !backupSlugPattern.MatchString(tenant.Slug) {
-			return fmt.Errorf("tenants[%d].slug %q must match ^[a-z0-9-]+$", i, tenant.Slug)
+		if !ValidTenantSlug(tenant.Slug) {
+			return fmt.Errorf("tenants[%d].slug %q must match %s", i, tenant.Slug, backupSlugPattern)
 		}
-		if seen[tenant.Slug] {
-			return fmt.Errorf("tenants[%d].slug %q appears twice", i, tenant.Slug)
+		// 按小写判重：持有人可能在 macOS 上解包，那里默认的文件系统不分大小写，
+		// AnyFun 和 anyfun 会落进同一个目录，后解的那把密钥悄悄盖掉前一把
+		if seen[strings.ToLower(tenant.Slug)] {
+			return fmt.Errorf("tenants[%d].slug %q appears twice (slugs are compared case-insensitively)", i, tenant.Slug)
 		}
-		seen[tenant.Slug] = true
+		seen[strings.ToLower(tenant.Slug)] = true
 		if err := checkBackupText(fmt.Sprintf("tenants[%d].domain", i), tenant.Domain, 253, false); err != nil {
 			return err
 		}

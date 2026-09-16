@@ -227,6 +227,13 @@ func slotIndex(slot string) int {
 func unsealKeystores(cfg config, items []sealedKeystoreItem) (map[string][]byte, []backupbundle.Tenant, error) {
 	files := map[string][]byte{}
 	tenants := make([]backupbundle.Tenant, 0, len(items))
+	// 先把 slug 全查一遍再解任何一个盒子：slug 要当目录名，服务端收 meta 时按同一条规则
+	// 拒收。不先查的话，要等全部租户的密钥都解开、封好、传到一半才知道白做了
+	for _, item := range items {
+		if !backupbundle.ValidTenantSlug(item.Slug) {
+			return nil, nil, fmt.Errorf("tenant %s: slug %q cannot be used as a directory name in the backup", item.Tenant, item.Slug)
+		}
+	}
 	for _, item := range items {
 		// 还没配签名密钥的租户：进清单，不进 keystores/。少了它，hasKeystore
 		// 恒为 true，设计 §12 第 2 级那条「清单对得上」就没法照着核
