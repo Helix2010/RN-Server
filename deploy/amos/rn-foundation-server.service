@@ -20,6 +20,10 @@ Type=simple
 User=rnfoundation
 Group=rnfoundation
 EnvironmentFile=/etc/rn-foundation.env
+# 平台备份要把这份配置原样收进包里，而这个进程以 rnfoundation 跑、读不到 0600 root 的
+# 文件。LoadCredential 让 systemd 以 root 读一份，放进只有本服务能读的
+# $CREDENTIALS_DIRECTORY（内存盘），文件本身保持 root 独读。扫链、迁移两个 unit 用不到，不加
+LoadCredential=rn-foundation.env:/etc/rn-foundation.env
 WorkingDirectory=/opt/rn-foundation
 ExecStart=/opt/rn-foundation/rn-server
 Restart=always

@@ -199,7 +199,7 @@ openssl rsa -in my-recovery.key -pubout | base64 -w0
 
 打包机侧**缺配置不会拒绝启动**——把备份做成构建的单点故障是负收益，而且第一次配置往往正好发生在恢复当天。但它会拒绝认领备份待办并上报原因，控制台上看得见。
 
-**服务端那一侧另有四个可选路径键**，用途同上：`BACKUP_SERVER_ENV_PATH`、`BACKUP_SERVER_UNIT_PATH`、`BACKUP_SERVER_NGINX_PATH`、`BACKUP_SERVER_TLS_CERT_PATH` / `BACKUP_SERVER_TLS_KEY_PATH`。前两项读不到直接判这次备份失败——安静地产出一个装不回去的包，比没有备份更糟，因为你以为自己有。
+**服务端那一侧另有四个可选路径键**，用途同上：`BACKUP_SERVER_ENV_PATH`、`BACKUP_SERVER_UNIT_PATH`、`BACKUP_SERVER_NGINX_PATH`、`BACKUP_SERVER_TLS_CERT_PATH` / `BACKUP_SERVER_TLS_KEY_PATH`。前两项读不到直接判这次备份失败——安静地产出一个装不回去的包，比没有备份更糟，因为你以为自己有。`BACKUP_SERVER_ENV_PATH` 不配时，优先读 systemd 交给本服务的那份（`$CREDENTIALS_DIRECTORY/rn-foundation.env`，unit 里的 `LoadCredential=` 提供），其次才是 `/etc/rn-foundation.env`——服务端以 `rnfoundation` 跑，读不到 root 独读的原文件。
 
 **核对身份**：恢复时用 `build-agent show-key` 打印本机的 agent-key 指纹（16 字符）和备份签名公钥指纹（64 字符），和包里 `manifest.json` 的对应字段比对。
 

@@ -352,10 +352,16 @@ func collectAgentFiles(cfg config) (map[string][]byte, error) {
 // 服务端拿它渲染 RECOVERY.md 和 recover.sh——**那两份东西里「哪个文件放到哪」
 // 就是这里生成的**，不是手写的散文。
 func buildInnerManifest(cfg config, files map[string][]byte) []backupbundle.FileEntry {
+	// 二进制放回它现在所在的位置：unit 的 ExecStart 指的就是这里。以前写死成
+	// /usr/local/bin/build-agent，而 amos 上装在 /opt/rn-build-agent/build-agent
+	binaryTarget, err := os.Executable()
+	if err != nil || binaryTarget == "" {
+		binaryTarget = "/opt/rn-build-agent/build-agent"
+	}
 	targets := map[string]struct{ target, mode, owner string }{
 		"agent-key":                      {filepath.Join(cfg.StateDir, agentKeyFileName), "0600", "builder:builder"},
 		"backup-signing.key":             {filepath.Join(cfg.StateDir, backupSigningKeyFileName), "0600", "builder:builder"},
-		"bin/build-agent":                {"/usr/local/bin/build-agent", "0755", "root:root"},
+		"bin/build-agent":                {binaryTarget, "0755", "root:root"},
 		"build-agent.env":                {"/etc/rn-build-agent.env", "0600", "root:root"},
 		"systemd/rn-build-agent.service": {"/etc/systemd/system/rn-build-agent.service", "0644", "root:root"},
 		"ssh/id_deploy":                  {"/home/builder/.ssh/id_deploy", "0600", "builder:builder"},

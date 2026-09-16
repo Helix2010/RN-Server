@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -49,6 +50,8 @@ type backupServerFile struct {
 	Mode     string
 	Owner    string
 	Critical bool
+	// Hint 接在读不到时的报错后面，告诉人该去改哪
+	Hint string
 }
 
 func (s *server) backupServerFiles() []backupServerFile {
@@ -65,11 +68,31 @@ func (s *server) backupServerFiles() []backupServerFile {
 	if err != nil {
 		self = ""
 	}
+	// 恢复时放回**它现在所在的位置**：unit 的 ExecStart 指的就是这里。以前写死成
+	// /opt/rn-foundation/bin/rn-server，而 amos 上装在 /opt/rn-foundation/rn-server——
+	// 照包恢复，二进制放到了 unit 找不到的地方，服务起不来
+	binaryTarget := self
+	if binaryTarget == "" {
+		binaryTarget = "/opt/rn-foundation/rn-server"
+	}
+	// 这个进程以 rnfoundation 跑，读不到 0600 root 的 /etc/rn-foundation.env。unit 用
+	// LoadCredential 让 systemd 以 root 读一份、放进只有本服务能读的 $CREDENTIALS_DIRECTORY
+	// （见 deploy/amos/rn-foundation-server.service），文件本身保持 root 独读。
+	// BACKUP_SERVER_ENV_PATH 显式配了就听它的
+	envSource := env("BACKUP_SERVER_ENV_PATH", "")
+	if envSource == "" {
+		envSource = "/etc/rn-foundation.env"
+		if dir := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY")); dir != "" {
+			envSource = filepath.Join(dir, "rn-foundation.env")
+		}
+	}
 	return []backupServerFile{
-		{Path: "rn-foundation.env", Source: env("BACKUP_SERVER_ENV_PATH", "/etc/rn-foundation.env"),
-			Target: "/etc/rn-foundation.env", Mode: "0600", Owner: "root:root", Critical: true},
+		{Path: "rn-foundation.env", Source: envSource,
+			Target: "/etc/rn-foundation.env", Mode: "0600", Owner: "root:root", Critical: true,
+			Hint: "the server runs as rnfoundation and cannot read a root-only file; its unit needs " +
+				"LoadCredential=rn-foundation.env:/etc/rn-foundation.env (see deploy/amos/rn-foundation-server.service)"},
 		{Path: "bin/rn-server", Source: self,
-			Target: "/opt/rn-foundation/bin/rn-server", Mode: "0755", Owner: "root:root", Critical: true},
+			Target: binaryTarget, Mode: "0755", Owner: "root:root", Critical: true},
 		{Path: "systemd/rn-foundation-server.service",
 			Source: env("BACKUP_SERVER_UNIT_PATH", "/etc/systemd/system/rn-foundation-server.service"),
 			Target: "/etc/systemd/system/rn-foundation-server.service", Mode: "0644", Owner: "root:root"},
@@ -96,6 +119,9 @@ func (s *server) collectServerPart(ctx context.Context) (map[string][]byte, []ba
 		}
 		body, err := os.ReadFile(want.Source)
 		if err != nil {
+			if want.Critical && want.Hint != "" && errors.Is(err, fs.ErrPermission) {
+				return nil, nil, fmt.Errorf("cannot read %s (%s): %w; %s", want.Path, want.Source, err, want.Hint)
+			}
 			if want.Critical {
 				return nil, nil, fmt.Errorf("cannot read %s (%s): %w", want.Path, want.Source, err)
 			}

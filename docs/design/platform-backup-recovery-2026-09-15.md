@@ -352,7 +352,7 @@ keystores/<租户slug>/fingerprint.txt        证书 SHA-256，核对用
 ```
 manifest.json                               内层自己的清单
 rn-foundation.env                           → /etc/rn-foundation.env，0600 root:root
-bin/rn-server                               正在跑的那个二进制，0755 root:root
+bin/rn-server                               正在跑的那个二进制，放回它当时所在的路径，0755 root:root
 systemd/rn-foundation-server.service        → /etc/systemd/system/
 nginx/rn-foundation.conf                    → nginx 站点目录
 tls/<域名>.crt + tls/<域名>.key             证书与私钥（§3）
@@ -362,6 +362,8 @@ db/build-config/<租户slug>.json             打包配置：应用身份、Fire
 db/build-icons/<租户slug>/<四张 png>        启动图标（缺了构建会失败在 ENOENT）
 db/release-identity/<租户slug>.json         发布身份：包名、签名指纹
 ```
+
+> 2026-09-16 实现注记：第一次真实备份暴露了两处和实机布局对不上的地方。① 服务端以 `rnfoundation` 跑，读不到 `0600 root` 的 `rn-foundation.env`，包产不出来。文件权限不放开：`rn-foundation-server.service` 加 `LoadCredential=rn-foundation.env:/etc/rn-foundation.env`，systemd 以 root 读一份放进只有本服务能读的 `$CREDENTIALS_DIRECTORY`，代码优先读那里。打包机那份 `rn-build-agent.env` 不进包（builder 会执行构建里的第三方脚本，那份保持 root 独读，缺失只记 warn）。② 两个二进制的恢复路径原先写死（`/opt/rn-foundation/bin/rn-server`、`/usr/local/bin/build-agent`），和 unit 的 `ExecStart` 对不上；改为放回产出备份时它实际所在的路径。
 
 `db/*` 只在**场景 B**（数据库也没了）用得上，场景 A 一个字都不要碰。§7 把两个场景拆开了。
 

@@ -246,3 +246,41 @@ func TestBackupPackageUploadRefusesToOverwrite(t *testing.T) {
 		}
 	})
 }
+
+// 恢复清单要和实机布局对得上。2026-09-16 第一次真实备份：以 rnfoundation 跑的服务端读不到
+// 0600 root 的 env；二进制的恢复路径写死在 bin/ 底下，和 unit 的 ExecStart 对不上——照包恢复，
+// 服务起不来
+func TestBackupServerFilesMatchHowTheServerActuallyRuns(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := func() map[string]backupServerFile {
+		found := map[string]backupServerFile{}
+		for _, file := range (&server{}).backupServerFiles() {
+			found[file.Path] = file
+		}
+		return found
+	}
+
+	t.Setenv("BACKUP_SERVER_ENV_PATH", "")
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	env := files()["rn-foundation.env"]
+	if env.Source != "/etc/rn-foundation.env" || env.Mode != "0600" || env.Owner != "root:root" || !env.Critical {
+		t.Errorf("没有 systemd 凭据时读原文件，恢复时按 0600 root:root 放回: %+v", env)
+	}
+	if binary := files()["bin/rn-server"]; binary.Target != self || binary.Source != self {
+		t.Errorf("二进制要放回它现在所在的位置 %s，得到 %+v", self, binary)
+	}
+
+	// unit 里的 LoadCredential 把文件交给本服务：优先读那一份，原文件保持 root 独读
+	t.Setenv("CREDENTIALS_DIRECTORY", "/run/credentials/rn-foundation-server.service")
+	if got := files()["rn-foundation.env"].Source; got != "/run/credentials/rn-foundation-server.service/rn-foundation.env" {
+		t.Errorf("有 systemd 凭据时应当读凭据目录里那份，得到 %s", got)
+	}
+	// 显式配了路径就听它的
+	t.Setenv("BACKUP_SERVER_ENV_PATH", "/srv/custom.env")
+	if got := files()["rn-foundation.env"].Source; got != "/srv/custom.env" {
+		t.Errorf("BACKUP_SERVER_ENV_PATH 应当优先，得到 %s", got)
+	}
+}

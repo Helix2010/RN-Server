@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -73,5 +74,28 @@ func TestUnsealKeystoresOpensBothFormats(t *testing.T) {
 	_, _, err = unsealKeystores(config{AgentPrivateKey: private}, items)
 	if err == nil || !strings.Contains(err.Error(), "100000001") || !strings.Contains(err.Error(), "BUILD_KEYSTORE_PASSPHRASE") {
 		t.Fatalf("缺旧口令时要点名租户和键: %v", err)
+	}
+}
+
+// 打包机二进制的恢复路径要是它现在所在的位置：unit 的 ExecStart 指的就是这里
+func TestInnerManifestPutsTheBinaryBackWhereItRuns(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := buildInnerManifest(config{StateDir: "/var/lib/rn-build-agent"},
+		map[string][]byte{"bin/build-agent": []byte("x"), "build-agent.env": []byte("y")})
+	for _, entry := range entries {
+		switch entry.Path {
+		case "bin/build-agent":
+			if entry.Target != self {
+				t.Errorf("二进制要放回 %s，得到 %s", self, entry.Target)
+			}
+		case "build-agent.env":
+			// 打包机那份保持 root 独读：builder 会执行构建里的第三方脚本
+			if entry.Mode != "0600" || entry.Owner != "root:root" {
+				t.Errorf("build-agent.env 要保持 0600 root:root，得到 %s %s", entry.Mode, entry.Owner)
+			}
+		}
 	}
 }
