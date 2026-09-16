@@ -51,6 +51,9 @@ jobs:
           cache: true
       - run: test -z "$(gofmt -l cmd internal signing)"
       - run: go vet ./...
+      # 这几个脚本以 root 跑在服务器上（install.sh 由服务端下发给新机器）：shellcheck 不过不发
+      - name: shellcheck
+        run: shellcheck internal/machinesetup/install.sh deploy/setup/build-bundles.sh deploy/amos/rn-foundation-apply
       - name: Wait for MySQL
         # 服务容器健康之后 mysqld 偶尔还在做首次初始化后的重启；真连上一次再跑测试，
         # 免得第一个包在连库上失败、被误读成代码问题
@@ -97,6 +100,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Build machine bundles
+        # 新机器安装包（签名闸、构建机），install.sh 从服务端下载。必须在工作区还干净时编（下一步会把二进制
+        # 写进仓库根目录）。归档可复现：这里打印的 sha256 就是运维装签名闸时 --expect-sha256 要核对的值
+        run: |
+          deploy/setup/build-bundles.sh "$RUNNER_TEMP/machine-bundles"
+          cd "$RUNNER_TEMP/machine-bundles"
+          echo "::notice title=新机器安装包 sha256::$(sha256sum signer.tar.gz builder.tar.gz | awk '{printf "%s %s; ", $2, $1}')"
 
       - name: Cross-compile for amos
         # 与 deploy/amos/deploy.sh 同一组参数。GOTOOLCHAIN=local：go.mod 固定了版本，
@@ -174,6 +185,26 @@ jobs:
         # 停服务、换二进制、跑迁移、健康检查、失败回滚都在 amos 那个脚本里。
         # 扫链（rn-foundation-indexer）跟着这一步一起换——同一个二进制
         run: ssh amos 'sudo /usr/local/sbin/rn-foundation-apply server'
+
+      # ---- 新机器安装包 ------------------------------------------------------
+      #
+      # 放在服务端之后：安装包出问题不挡服务端发布。rn-foundation-apply 只把三个文件拷成 root 的副本、
+      # 核对、原子切换 /opt/rn-foundation/machine-bundles/current，不执行其中任何东西。
+      # 已经在跑的签名闸与构建机不从这里升级。
+      - name: Upload machine bundles
+        run: |
+          if ! ssh amos 'grep -q "^bundles)" /usr/local/sbin/rn-foundation-apply'; then
+            echo "::error::amos 上的 rn-foundation-apply 还不认 bundles 子命令：在那台机器上重跑 deploy/amos/setup-ci-deploy.sh 更新它"
+            exit 1
+          fi
+          ssh amos "rm -rf '$STAGE/machine-bundles.part' && mkdir -p '$STAGE/machine-bundles.part'"
+          for f in manifest.json signer.tar.gz builder.tar.gz; do
+            ssh amos "cat > '$STAGE/machine-bundles.part/$f'" < "$RUNNER_TEMP/machine-bundles/$f"
+          done
+          ssh amos "rm -rf '$STAGE/machine-bundles' && mv '$STAGE/machine-bundles.part' '$STAGE/machine-bundles'"
+
+      - name: Apply machine bundles
+        run: ssh amos "sudo /usr/local/sbin/rn-foundation-apply bundles $GITHUB_SHA"
 
       # ---- 打包机 ----------------------------------------------------------
       #
