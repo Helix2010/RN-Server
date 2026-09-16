@@ -3,6 +3,7 @@ package objectstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -40,6 +41,9 @@ type Config struct {
 	SessionToken    string
 	ForcePathStyle  bool
 }
+
+// ErrObjectNotFound 表示对象确实不在桶里，而不是桶读不了。
+var ErrObjectNotFound = errors.New("object not found")
 
 type Client interface {
 	PresignPut(context.Context, string, string, int64, time.Duration) (string, map[string]string, error)
@@ -182,6 +186,13 @@ func (c *s3Client) Stat(ctx context.Context, key string) (ObjectInfo, error) {
 func (c *s3Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	output, err := c.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
 	if err != nil {
+		// 「这个键不存在」和「桶读不了」要分得开：调用方据此给出的话完全不同，
+		// 而把后者说成前者会在真出事那天把人引去查生命周期规则
+		var missing *types.NoSuchKey
+		var notFound *types.NotFound
+		if errors.As(err, &missing) || errors.As(err, &notFound) {
+			return nil, fmt.Errorf("read artifact: %w: %w", ErrObjectNotFound, err)
+		}
 		return nil, fmt.Errorf("read artifact: %w", err)
 	}
 	return output.Body, nil

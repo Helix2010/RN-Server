@@ -17,6 +17,12 @@ type Backup struct {
 	InstanceID string
 	// IntervalHours：0 = 关闭定时只留手动；否则 6–168
 	IntervalHours int
+	// RetentionDays 是桶上生命周期规则配的保留天数。**这里只是抄一份给控制台看**，
+	// 服务端不删任何对象——删除由桶自己的生命周期规则做。
+	//
+	// 0 = 没配。控制台显示「未设置」而不是假装知道：真出事那天点到一条过期的，
+	// 看到的是一句看不懂的 S3 NoSuchKey，那比没有这个字段更糟
+	RetentionDays int
 	Bucket        BackupBucket
 	// Recipients 按槽位顺序 A / B / C。三把缺一不可（§2.1：没有降级模式）
 	Recipients [backupcontainer.SlotCount]BackupRecipient
@@ -74,6 +80,7 @@ func (l *loader) backup(environment string) Backup {
 	cfg := Backup{
 		InstanceID:    strings.TrimSpace(os.Getenv("BACKUP_INSTANCE_ID")),
 		IntervalHours: l.integer("BACKUP_INTERVAL_HOURS", 0),
+		RetentionDays: l.integer("BACKUP_RETENTION_DAYS", 0),
 		Bucket: BackupBucket{
 			Endpoint:        strings.TrimSpace(os.Getenv("BACKUP_BUCKET_ENDPOINT")),
 			Region:          strings.TrimSpace(os.Getenv("BACKUP_BUCKET_REGION")),

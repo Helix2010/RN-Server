@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"github.com/Helix2010/RN-Server/internal/objectstore"
 	"io"
 	"log/slog"
 	"net/http"
@@ -86,6 +87,15 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		})
 	}
 
+	// 打包机公钥指纹。它和上面三把恢复公钥的指纹算法不同（16 字符 vs 64 字符），
+	// 设计 §2.2 特意要求分开显示——混在一起显示会让核对仪式失效
+	agentKeyView := gin.H{"registered": false, "fingerprint": nil, "algorithm": "X25519 公钥 sha256 前 16 字符"}
+	if record, err := s.buildAgentKey(ctx); err == nil && record != nil &&
+		record.Current.Fingerprint() != "" {
+		agentKeyView = gin.H{"registered": true, "fingerprint": record.Current.Fingerprint(),
+			"algorithm": "X25519 公钥 sha256 前 16 字符"}
+	}
+
 	signing := gin.H{"registered": false, "fingerprint": nil}
 	if record, err := s.backupSigningKeyRecord(ctx); err == nil && record != nil {
 		signing = gin.H{"registered": true, "fingerprint": record.Current.Fingerprint}
@@ -105,6 +115,13 @@ func (s *server) getBackupStatus(c *gin.Context) {
 		"intervalHours":    s.cfg.Backup.IntervalHours,
 		"bucket":           nullableString(s.cfg.Backup.Bucket.Bucket),
 		"bucketVersioning": s.backupBucketVersioning(),
+		// 保留期只是抄桶上生命周期规则的一份给人看。0 = 没配，控制台显示
+		// 「未设置」——比按一个猜出来的天数把按钮置灰诚实
+		"retentionDays": s.cfg.Backup.RetentionDays,
+		// 第四个指纹：打包机公钥。它是 16 字符的（buildkeystore 那套），
+		// 和上面三把 64 字符的**不是一回事**，所以单独一项、单独标注算法。
+		// 恢复时 build-agent show-key 要比对的正是它
+		"agentKey":         agentKeyView,
 		"recoverySlots":    slots,
 		"signingKey":       signing,
 		"consecutiveFails": failures,
@@ -265,9 +282,18 @@ func (s *server) downloadBackup(c *gin.Context) {
 	body, err := client.Get(c.Request.Context(), found.ObjectKey)
 	if err != nil {
 		// 行比对象活得久：生命周期删掉对象之后这一行还在。给一句看得懂的话，
-		// 而不是把 S3 的 NoSuchKey 原样吐出去
-		problem(c, http.StatusGone, "BACKUP_OBJECT_GONE",
-			"the object is no longer in the bucket; it is probably past the retention period")
+		// 而不是把 S3 的 NoSuchKey 原样吐出去。
+		//
+		// 但只有「确实没有这个对象」才说得上保留期。桶不可达、凭据过期、网络断
+		// 都会走到这里，此前一律显示「多半是过了保留期」——真出事那天这是一句会
+		// 把人带偏的文案：他会去查生命周期规则，而问题在凭据上。
+		if errors.Is(err, objectstore.ErrObjectNotFound) {
+			problem(c, http.StatusGone, "BACKUP_OBJECT_GONE",
+				"the object is no longer in the bucket; it is probably past the retention period")
+			return
+		}
+		problem(c, http.StatusFailedDependency, "BACKUP_BUCKET_UNREACHABLE",
+			"the bucket could not be read (this is not a retention problem): "+err.Error())
 		return
 	}
 	defer body.Close()

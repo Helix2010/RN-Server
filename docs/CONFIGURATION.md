@@ -160,6 +160,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BACKUP_RECOVERY_RECIPIENT_C` | 空 | 槽位 C，同上。三把**必须两两不同** |
 | `BACKUP_INSTANCE_ID` | 空 | 进对象键前缀，`^[a-z0-9-]{1,32}$`。**显式配，不要从主机名推导**——改名或在新机器上恢复之后前缀就变了，历史备份全部下载不到 |
 | `BACKUP_INTERVAL_HOURS` | `0` | `0` = 关闭定时只留手动；否则 **6–168**，建议 `24` |
+| `BACKUP_RETENTION_DAYS` | `0` | 桶上生命周期规则配的保留天数，**抄一份给控制台看**。服务端不删任何对象。`0` = 未设置，控制台显示「未设置」而不是按一个猜出来的天数把下载按钮置灰 |
 | `BACKUP_BUCKET_BUCKET` | 空 | 备份桶。**用独立的桶和独立凭据**，不要复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露 |
 | `BACKUP_BUCKET_REGION` | 空 | 备份桶所在区域 |
 | `BACKUP_BUCKET_ENDPOINT` | 空 | 自定义 endpoint（兼容 S3 的对象存储）。生产强制 https |
