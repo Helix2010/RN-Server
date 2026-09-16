@@ -51,6 +51,9 @@ func TestHappyPathSignsDeliversAndRecords(t *testing.T) {
 	if len(s.reports) != 1 || len(s.reports[0]) != 1 {
 		t.Fatalf("reports: %+v", s.reports)
 	}
+	if len(s.localRoles) != 1 || s.localRoles[0] != "primary" {
+		t.Fatalf("local roles reported: %v", s.localRoles)
+	}
 	rep := s.reports[0][0]
 	if rep.Decrypt != "ok" || !rep.Confirmed || rep.ConfirmedTrustRootsDigest == nil || *rep.ConfirmedTrustRootsDigest != h.digest || rep.TrialSign != "ok" || rep.Error != nil {
 		t.Fatalf("check report: %+v", rep)
@@ -121,9 +124,15 @@ func TestDeferredIsNotAViolation(t *testing.T) {
 		if len(h.server.claimBodies) != 0 {
 			t.Fatal("a standby called claim")
 		}
-		// 备照样试解、确认、试签并上报
-		if len(h.server.reports) != 1 || h.server.reports[0][0].TrialSign != "ok" {
-			t.Fatalf("standby reports: %+v", h.server.reports)
+		// 备照样试解、确认、试签并上报，并如实报告本机是备
+		if len(h.server.reports) != 1 || h.server.reports[0][0].TrialSign != "ok" || h.server.localRoles[0] != "standby" {
+			t.Fatalf("standby reports: %+v roles %v", h.server.reports, h.server.localRoles)
+		}
+		// 本机 promote 之后，下一轮上报就是主（控制台据此判断路由与本机角色是否一致）
+		must(t, h.store.SetRole(records.RoleChange{Role: records.RolePrimary, Mode: records.RoleModeInitial, Operator: "ops", Reason: "promoted"}))
+		must(t, h.runner.RunChecks(context.Background()))
+		if got := h.server.localRoles[len(h.server.localRoles)-1]; got != "primary" {
+			t.Fatalf("local role after promote: %v", h.server.localRoles)
 		}
 	})
 	t.Run("server roots differ so the tenant is not ready", func(t *testing.T) {

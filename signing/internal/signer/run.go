@@ -365,7 +365,13 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 		}
 	}
 	r.setReady(ready)
-	return r.retry(ctx, "report keystore checks", func(ctx context.Context) error { return r.API.ReportChecks(ctx, reports) })
+	// 每轮都带本机角色（本机记录没有角色记录时就是备）；在上报前读，promote 之后下一轮就反映出来
+	role, err := r.Store.Role()
+	if err != nil {
+		r.setReady(nil)
+		return &fatalError{err}
+	}
+	return r.retry(ctx, "report keystore checks", func(ctx context.Context) error { return r.API.ReportChecks(ctx, role.Role, reports) })
 }
 
 func (r *Runner) setReady(ready []ReadyItem) {

@@ -78,6 +78,9 @@ func TestConfirmWritesOperatorValuesAndReports(t *testing.T) {
 		c.ConfirmedBy != "ops-alice" || c.TrustRootsDigest != h.digest || !trustroots.Equal(c.TrustRoots, h.roots) || c.KeystoreVersion != 3 {
 		t.Fatalf("confirmation: %+v", c)
 	}
+	if roles := h.server.localRoles; len(roles) == 0 || roles[len(roles)-1] != "primary" {
+		t.Fatalf("confirm reported local roles %v", roles)
+	}
 	last := h.server.reports[len(h.server.reports)-1]
 	if len(last) != 1 || last[0].Decrypt != "ok" || !last[0].Confirmed || *last[0].ConfirmedTrustRootsDigest != h.digest || last[0].TrialSign != "pending" {
 		t.Fatalf("report: %+v", last)

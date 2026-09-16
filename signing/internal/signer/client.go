@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
+	"github.com/Helix2010/RN-Server/signing/records"
 	"github.com/Helix2010/RN-Server/signing/trustroots"
 )
 
@@ -115,7 +116,7 @@ func (e *ProtocolError) Error() string { return "server response violates the co
 type API interface {
 	RegisterKey(ctx context.Context, x25519Pub, ed25519Pub []byte) (KeyStatus, error)
 	KeystoreChecks(ctx context.Context) (ChecksResponse, error)
-	ReportChecks(ctx context.Context, items []CheckReport) error
+	ReportChecks(ctx context.Context, localRole records.Role, items []CheckReport) error
 	Claim(ctx context.Context, ready []ReadyItem) (*Claim, error)
 	Heartbeat(ctx context.Context, jobID string, signAttempt int) error
 	DownloadUnsigned(ctx context.Context, jobID string, signAttempt int, dst io.Writer, maxSize int64) (Download, error)
@@ -362,12 +363,16 @@ func (c *HTTPClient) KeystoreChecks(ctx context.Context) (ChecksResponse, error)
 	return out, err
 }
 
-// ReportChecks 上报试解、确认、试签状态。
-func (c *HTTPClient) ReportChecks(ctx context.Context, items []CheckReport) error {
+// ReportChecks 上报试解、确认、试签状态，以及本机记录里的当前角色（localRole）。
+// 控制台的主备路由与本机角色不一致时（例如控制台切了主，本机还没 promote），服务端据此判定不就绪。
+func (c *HTTPClient) ReportChecks(ctx context.Context, localRole records.Role, items []CheckReport) error {
+	if localRole != records.RolePrimary && localRole != records.RoleStandby {
+		return &ProtocolError{Msg: "local role must be primary or standby"}
+	}
 	if items == nil {
 		items = []CheckReport{}
 	}
-	_, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-checks", 0, map[string]any{"items": items}, nil)
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-checks", 0, map[string]any{"localRole": localRole, "items": items}, nil)
 	return err
 }
 

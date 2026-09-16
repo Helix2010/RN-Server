@@ -241,7 +241,11 @@ func Confirm(ctx context.Context, env OperatorEnv, tenantSlug string) error {
 	}
 	printf(t, "  ✓ written to trust.jsonl\n")
 	report := CheckReport{TenantSlug: tenantSlug, KeystoreVersion: item.KeystoreVersion, Decrypt: "ok", Confirmed: true, ConfirmedTrustRootsDigest: &digest, TrialSign: "pending"}
-	if err := env.API.ReportChecks(ctx, []CheckReport{report}); err != nil {
+	role, err := env.Store.Role()
+	if err != nil {
+		return err
+	}
+	if err := env.API.ReportChecks(ctx, role.Role, []CheckReport{report}); err != nil {
 		printf(t, "  ! reporting the confirmation to the server failed (%v); `signer run` reports it within a minute\n", cleanText(err.Error(), 200))
 	} else {
 		printf(t, "  ✓ reported to the server; `signer run` performs the trial signature next\n")
