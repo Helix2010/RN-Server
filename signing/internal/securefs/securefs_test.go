@@ -122,6 +122,54 @@ func TestCheckTrustedPath(t *testing.T) {
 	}
 }
 
+func TestCheckTrustedTree(t *testing.T) {
+	root := t.TempDir()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.Chmod(root, 0o755))
+	jdk := filepath.Join(root, "jdk")
+	lib := filepath.Join(jdk, "lib", "server")
+	must(os.MkdirAll(lib, 0o755))
+	must(os.Chmod(filepath.Join(jdk, "lib"), 0o755))
+	must(os.Chmod(lib, 0o755))
+	must(os.Chmod(jdk, 0o755))
+	so := filepath.Join(lib, "libjvm.so")
+	must(os.WriteFile(so, []byte("elf"), 0o644))
+	must(os.Chmod(so, 0o644))
+	must(os.Symlink("/usr/bin/env", filepath.Join(jdk, "lib", "outside")))
+	must(os.Symlink(filepath.Join(root, "missing"), filepath.Join(jdk, "lib", "dangling")))
+	if err := CheckTrustedTree(jdk); err != nil {
+		t.Fatalf("trusted tree rejected: %v", err)
+	}
+	// 树深处一个组可写的库文件就足以在签名闸里执行任意代码
+	must(os.Chmod(so, 0o664))
+	if err := CheckTrustedTree(jdk); err == nil {
+		t.Fatal("accepted a group-writable library deep inside the tree")
+	}
+	must(os.Chmod(so, 0o644))
+	untrusted := filepath.Join(root, "untrusted")
+	must(os.Mkdir(untrusted, 0o777))
+	must(os.Chmod(untrusted, 0o777))
+	must(os.WriteFile(filepath.Join(untrusted, "java.security"), []byte("x"), 0o644))
+	must(os.Symlink(filepath.Join(untrusted, "java.security"), filepath.Join(jdk, "lib", "security")))
+	if err := CheckTrustedTree(jdk); err == nil {
+		t.Fatal("accepted a symlink into a world-writable directory")
+	}
+}
+
+func TestCheckTmpfs(t *testing.T) {
+	if err := CheckTmpfs("/proc"); err == nil {
+		t.Fatal("/proc reported as tmpfs")
+	}
+	if err := CheckTmpfs("/dev/shm"); err != nil {
+		t.Skipf("no tmpfs at /dev/shm on this machine: %v", err)
+	}
+}
+
 func TestRemoveContentsAndLocks(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"a", "b/c"} {

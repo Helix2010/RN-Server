@@ -203,6 +203,47 @@ func checkTrustedComponent(path string, leaf bool) error {
 	return nil
 }
 
+// MaxTrustedTreeEntries 是 CheckTrustedTree 最多检查的目录项数（一个 JDK 通常几百项）。
+const MaxTrustedTreeEntries = 100_000
+
+// CheckTrustedTree 对目录 root 做 CheckTrustedPath，并要求它下面的每个文件与子目录都只能由
+// root 或当前用户修改；树里的符号链接按解析后的目标再做一次 CheckTrustedPath（可以指向树外，
+// 例如发行版 JDK 指向 /etc 的配置）。
+//
+// 用于 JAVA_HOME：java 进程会加载树里的 lib/*.so、lib/modules、conf/security 等文件，
+// 只查 bin/java 挡不住替换这些文件。
+func CheckTrustedTree(root string) error {
+	if err := CheckTrustedPath(root); err != nil {
+		return err
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	entries := 0
+	return filepath.WalkDir(resolved, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entries++; entries > MaxTrustedTreeEntries {
+			return fmt.Errorf("%s: more than %d entries", root, MaxTrustedTreeEntries)
+		}
+		if err := checkTrustedComponent(path, !d.IsDir()); err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			if err := CheckTrustedPath(path); err != nil {
+				// 悬空链接不会被加载，不算问题
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // RemoveContents 删除目录里的全部内容（目录本身保留）。用于清空运行时目录。
 func RemoveContents(dir string) error {
 	entries, err := os.ReadDir(dir)
