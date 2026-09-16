@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
-	"github.com/Helix2010/RN-Server/signing/ident"
 	"github.com/Helix2010/RN-Server/signing/internal/securefs"
 )
 
@@ -226,9 +225,6 @@ func (s *Store) Close() error {
 
 // Genesis 返回本机记录的 genesis。
 func (s *Store) Genesis() Genesis { return s.trust.v.genesis }
-
-// SetClock 替换时间来源（测试用）。
-func (s *Store) SetClock(now func() time.Time) { s.now = now }
 
 // refresh 读入并校验 offset 之后别的进程追加的行。调用方持有 s.mu；locked=true 表示
 // 调用方已经持有该文件的 flock。
@@ -812,6 +808,3 @@ func VerifyForeignSigned(raw []byte, pinnedEd25519SHA256 string) (Foreign, error
 	sort.Slice(out.Baselines, func(i, j int) bool { return out.Baselines[i].PackageName < out.Baselines[j].PackageName })
 	return out, nil
 }
-
-// ValidJobID 判断任务 id。
-func ValidJobID(s string) bool { return ident.ValidServerID(s) }
