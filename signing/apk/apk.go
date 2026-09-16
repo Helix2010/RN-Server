@@ -77,8 +77,11 @@ const (
 	CodeManifestMissing        = "MANIFEST_MISSING"
 	CodeManifestStructure      = "MANIFEST_STRUCTURE"
 	CodeManifestAttributeType  = "MANIFEST_ATTRIBUTE_TYPE"
-	CodeEmbeddedConfigInvalid  = "EMBEDDED_CONFIG_INVALID"
-	CodeEmbeddedConfigDupKey   = "EMBEDDED_CONFIG_DUPLICATE_KEY"
+	// CodeManifestElementNotAllowed：<manifest> / <application> 下出现允许列表之外的元素，
+	// 或任何位置出现 <key-sets> 等改变升级签名要求的元素。
+	CodeManifestElementNotAllowed = "MANIFEST_ELEMENT_NOT_ALLOWED"
+	CodeEmbeddedConfigInvalid     = "EMBEDDED_CONFIG_INVALID"
+	CodeEmbeddedConfigDupKey      = "EMBEDDED_CONFIG_DUPLICATE_KEY"
 )
 
 // 需要读的条目。

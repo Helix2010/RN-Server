@@ -81,6 +81,28 @@ var topLevelOnly = map[string]bool{
 	"uses-sdk": true, "application": true,
 }
 
+// manifestChildren 与 applicationChildren 是 <manifest>、<application> 直接子元素的允许列表。
+//
+// 用允许列表而不是"只提取认识的"：清单里有些元素不改我们检查的任何属性，却能改变包的
+// 安全性质。典型是 <key-sets> / <upgrade-key-set>——声明之后，设备接受由那组密钥签名的
+// 升级，不再要求原证书，等于把升级权交给另一把钥匙。还有 <instrumentation>、<overlay>、
+// <original-package>、<profileable> 等。不在列表里的一律拒签；确实需要时改这里并审阅。
+var manifestChildren = map[string]bool{
+	"uses-sdk": true, "uses-permission": true, "uses-permission-sdk-23": true, "uses-permission-sdk-m": true,
+	"permission": true, "permission-tree": true, "permission-group": true,
+	"queries": true, "application": true, "uses-feature": true, "supports-screens": true,
+}
+
+var applicationChildren = map[string]bool{
+	"activity": true, "activity-alias": true, "service": true, "receiver": true, "provider": true,
+	"meta-data": true, "uses-library": true, "uses-native-library": true,
+}
+
+// forbiddenAnywhere 在任何层级出现都拒签（允许列表之外再兜一层）。
+var forbiddenAnywhere = map[string]bool{
+	"key-sets": true, "key-set": true, "upgrade-key-set": true, "public-key": true,
+}
+
 func structuref(format string, args ...any) *Error {
 	return errorf(CodeManifestStructure, format, args...)
 }
@@ -220,6 +242,8 @@ func extractManifest(doc *axml.Document) (*Manifest, error) {
 			m.PermissionTrees++
 		case child.Name == "permission-group":
 			m.PermissionGroups++
+		case !manifestChildren[child.Name]:
+			return nil, errorf(CodeManifestElementNotAllowed, "<manifest> declares <%s>, which is not on the signing gate's element allow list", axml.Quote(child.Name))
 		case child.Name == "application":
 			applications++
 			if applications > 1 {
@@ -239,6 +263,9 @@ func extractManifest(doc *axml.Document) (*Manifest, error) {
 // checkPlacement 保证只该出现在顶层的元素没有藏在别处。
 func checkPlacement(el *axml.Element, depth int) error {
 	for _, child := range el.Children {
+		if forbiddenAnywhere[child.Name] {
+			return errorf(CodeManifestElementNotAllowed, "the manifest declares <%s>: signing key sets would let another key sign upgrades", child.Name)
+		}
 		if depth > 0 && topLevelOnly[child.Name] {
 			return structuref("<%s> must be a direct child of <manifest>, found inside <%s>", child.Name, axml.Quote(el.Name))
 		}
@@ -266,6 +293,8 @@ func extractApplication(el *axml.Element) (*Application, []IntentFilter, error) 
 	metaNames := map[string]bool{}
 	for _, child := range el.Children {
 		switch {
+		case !applicationChildren[child.Name]:
+			return nil, nil, errorf(CodeManifestElementNotAllowed, "<application> declares <%s>, which is not on the signing gate's element allow list", axml.Quote(child.Name))
 		case child.Name == "meta-data":
 			name, err := requiredName(child)
 			if err != nil {
