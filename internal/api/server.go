@@ -211,6 +211,10 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	backup.GET("", s.getBackupStatus)
 	backup.POST("/run", s.runBackupNow)
 	backup.PUT("/holders", s.updateBackupHolders)
+	// 桶在控制台上维护：换桶、轮凭据是平台管理员的日常运维，
+	// 不该需要改 env 再重启整个后端
+	backup.GET("/storage", s.getBackupStorage)
+	backup.PUT("/storage", s.updateBackupStorage)
 	backup.POST("/storage/test", s.testBackupBucket)
 	backup.POST("/:seq/force-fail", s.forceFailBackup)
 	// 口令换票、票换文件。下载必须走普通链接（包有几十 MB，让浏览器流式落盘），

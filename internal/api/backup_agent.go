@@ -501,7 +501,11 @@ func (s *server) failBackupRequest(c *gin.Context) {
 //
 // **独立的桶和独立凭据**，不复用产物桶：产物桶凭据泄露不该等于全平台签名密钥泄露。
 func (s *server) backupBucketClient() (objectstore.Client, error) {
-	bucket := s.cfg.Backup.Bucket
+	// 控制台上维护的那份优先，没有就回落到 env（见 backup_storage.go 开头）
+	bucket, _, err := s.resolveBackupBucket(context.Background())
+	if err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(bucket.Bucket) == "" {
 		return nil, errors.New("the backup bucket is not configured")
 	}

@@ -443,6 +443,16 @@ func (s *server) cacheBackupBucketVersioning(enabled bool) {
 	s.backupBucketVersioningOK = &enabled
 }
 
+// forgetBackupBucketVersioning 在桶换掉之后把缓存结论作废。
+//
+// 不清的话，控制台会拿着「上一个桶开着 versioning」的结论去描述新桶——
+// 而新桶多半还没开，那正是最需要提醒的时刻。
+func (s *server) forgetBackupBucketVersioning() {
+	s.backupBucketVersioningMu.Lock()
+	defer s.backupBucketVersioningMu.Unlock()
+	s.backupBucketVersioningOK = nil
+}
+
 func (s *server) backupBucketVersioning() any {
 	s.backupBucketVersioningMu.RLock()
 	defer s.backupBucketVersioningMu.RUnlock()
