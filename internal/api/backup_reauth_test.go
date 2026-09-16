@@ -39,7 +39,14 @@ func mustHashForTest(password string) string {
 // 而会话 TTL 默认 8 小时。没有这一道，一个被偷走的 cookie 在 8 小时内可以把桶里
 // 每一条 succeeded 记录的包逐个拉走——每一个包都是全平台每个租户的签名密钥。
 func TestDBBackupActionsRequireThePasswordAgain(t *testing.T) {
-	newServer := func() *server {
+	// 先在**父测试**里取一次：没有 RN_TEST_MYSQL_DSN 时 backupServer 会 t.Skip()，
+	// 而 Skip 是 runtime.Goexit。如果这件事发生在 t.Run 的子测试里、用的却是外层的
+	// t，Go 会报「subtest may have called FailNow on a parent test」并让整个包 FAIL。
+	// CI 上正是没有数据库的，所以这条不放在父测试里就是一次必然的红。
+	backupServer(t)
+
+	newServer := func(t *testing.T) *server {
+		t.Helper()
 		s := backupServer(t)
 		s.cfg = config.Config{
 			AdminPasswordHash: testAdminPasswordHash,
@@ -49,7 +56,7 @@ func TestDBBackupActionsRequireThePasswordAgain(t *testing.T) {
 	}
 
 	t.Run("跑一次：不给口令就拒绝", func(t *testing.T) {
-		s := newServer()
+		s := newServer(t)
 		c, recorder := testContext(t, platformTenantID, "POST", "/x",
 			map[string]any{"reason": "no password given", "confirm": true})
 		s.runBackupNow(c)
@@ -59,7 +66,7 @@ func TestDBBackupActionsRequireThePasswordAgain(t *testing.T) {
 	})
 
 	t.Run("跑一次：口令错了就拒绝", func(t *testing.T) {
-		s := newServer()
+		s := newServer(t)
 		c, recorder := testContext(t, platformTenantID, "POST", "/x",
 			map[string]any{"reason": "wrong password", "confirm": true, "password": "nope"})
 		s.runBackupNow(c)
@@ -69,7 +76,7 @@ func TestDBBackupActionsRequireThePasswordAgain(t *testing.T) {
 	})
 
 	t.Run("连续猜错要被限速", func(t *testing.T) {
-		s := newServer()
+		s := newServer(t)
 		var last int
 		for i := 0; i < backupReauthMaxTries+1; i++ {
 			c, recorder := testContext(t, platformTenantID, "POST", "/x",
