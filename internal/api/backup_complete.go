@@ -155,33 +155,130 @@ func (s *server) exportBackupDatabaseConfig(ctx context.Context) (map[string][]b
 	}
 	out["db/tenant-domain.json"] = domains
 
-	// 打包必需的库内配置：应用身份、图标、发布身份。
-	//
-	// 键名一律用各自模块的常量，不写字面量——写错一个字符的代价不是报错而是
-	// **静默导出 0 行**：备份照样 succeeded、控制台照样绿，直到恢复那天才发现
-	// 包里没有包名和签名指纹。这里已经这么栽过一次。
-	//
-	// build.keystore 不导：它是密文，明文已经在内层里了。
-	// push.fcm 也不导：secretbox 密文，没有 STORAGE_MASTER_KEY 也没用，
-	// 而构建要的 Firebase 配置在 build.android 的 googleServicesJson 里。
-	configs, err := dumpQueryAsJSON(ctx, s.db,
-		`SELECT tenant_id, config_key, config_value, version, updated_by, updated_at
-		   FROM app_configs
-		  WHERE config_key IN (?,?,?,?)
-		  ORDER BY tenant_id, config_key`,
-		buildConfigKey, buildIconsConfigKey,
-		releaseAndroidIdentityConfigKey, releaseIOSIdentityConfigKey)
+	slugs, err := backupTenantSlugs(ctx, s.db)
 	if err != nil {
-		return nil, fmt.Errorf("export build configs: %w", err)
+		return nil, fmt.Errorf("export tenant slugs: %w", err)
 	}
-	out["db/build-config.json"] = configs
+	if err := s.exportBackupTenantConfigs(ctx, out, slugs); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
-// dumpQueryAsJSON 把一条查询的结果导成 JSON 数组，键名用数据库列名。
+// backupTenantSlugs 把租户主键映射成 slug。包里的目录名用 slug——
+// 恢复的人要认得出哪个目录是哪个租户，一串数字他认不出来
+func backupTenantSlugs(ctx context.Context, db *sql.DB) (map[string]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, slug FROM tenants`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, slug string
+		if err := rows.Scan(&id, &slug); err != nil {
+			return nil, err
+		}
+		out[id] = slug
+	}
+	return out, rows.Err()
+}
+
+// exportBackupTenantConfigs 按设计 §4.5 的布局，每个租户一个文件：
 //
-// 表结构会变，而这份导出的用途是「在一台新机器上把打包配置补回去」——按列名原样
-// 出比手写一堆 struct 更抗变化，少一列也不会静默丢数据。
+//	db/build-config/<slug>.json       打包配置：应用身份、Firebase 配置
+//	db/build-icons/<slug>/<四张 png>  启动图标（缺了构建会失败在 ENOENT）
+//	db/release-identity/<slug>.json   发布身份：包名、签名指纹
+//
+// 不是一个扁平的大 JSON。理由在设计里写着：恢复的人要能一眼看出哪个租户缺什么，
+// 而图标要解码成 .png 落盘，好让人打开看一眼确认没错——base64 埋在 config_value
+// 里没人能确认。
+//
+// 键名一律用各模块的常量。写错一个字符的代价不是报错而是**静默导出 0 行**，
+// 这里已经栽过一次（release.identity.android 那次）。
+func (s *server) exportBackupTenantConfigs(ctx context.Context, out map[string][]byte, slugs map[string]string) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tenant_id, config_key, config_value FROM app_configs
+		  WHERE config_key IN (?,?,?,?) ORDER BY tenant_id, config_key`,
+		buildConfigKey, buildIconsConfigKey,
+		releaseAndroidIdentityConfigKey, releaseIOSIdentityConfigKey)
+	if err != nil {
+		return fmt.Errorf("export build configs: %w", err)
+	}
+	defer rows.Close()
+
+	identity := map[string]map[string]any{}
+	for rows.Next() {
+		var tenantID, key, value string
+		if err := rows.Scan(&tenantID, &key, &value); err != nil {
+			return fmt.Errorf("export build configs: %w", err)
+		}
+		slug := slugs[tenantID]
+		if slug == "" {
+			// 没有 tenants 行的孤儿配置。用 id 兜底而不是丢掉——
+			// 丢掉意味着恢复时这个租户的打包配置凭空消失
+			slug = tenantID
+		}
+		switch key {
+		case buildConfigKey:
+			out["db/build-config/"+slug+".json"] = []byte(value)
+		case buildIconsConfigKey:
+			if err := exportBackupIcons(out, slug, value); err != nil {
+				return fmt.Errorf("export icons for %s: %w", slug, err)
+			}
+		case releaseAndroidIdentityConfigKey, releaseIOSIdentityConfigKey:
+			if identity[slug] == nil {
+				identity[slug] = map[string]any{}
+			}
+			var parsed any
+			if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+				return fmt.Errorf("export release identity for %s: %w", slug, err)
+			}
+			platform := "android"
+			if key == releaseIOSIdentityConfigKey {
+				platform = "ios"
+			}
+			identity[slug][platform] = parsed
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("export build configs: %w", err)
+	}
+	for slug, record := range identity {
+		encoded, err := json.MarshalIndent(record, "", "  ")
+		if err != nil {
+			return err
+		}
+		out["db/release-identity/"+slug+".json"] = encoded
+	}
+	return nil
+}
+
+// exportBackupIcons 把四张图标解码成 .png 落盘。
+//
+// 设计原话：「解码成 .png 落盘是为了人能一眼确认没错」。埋在 config_value 里的
+// base64 谁也确认不了，而图标缺了构建会失败在 ENOENT——那是个很难往回查的错。
+func exportBackupIcons(out map[string][]byte, slug, value string) error {
+	var record map[string]struct {
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(value), &record); err != nil {
+		return err
+	}
+	for key, name := range buildIconFileNames {
+		item, ok := record[key]
+		if !ok || item.Data == "" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(item.Data)
+		if err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		out["db/build-icons/"+slug+"/"+name] = raw
+	}
+	return nil
+}
+
 func dumpQueryAsJSON(ctx context.Context, db *sql.DB, query string, args ...any) ([]byte, error) {
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -204,6 +301,7 @@ func dumpQueryAsJSON(ctx context.Context, db *sql.DB, query string, args ...any)
 		}
 		record := map[string]any{}
 		for i, name := range columns {
+			name = lowerCamel(name)
 			switch value := cells[i].(type) {
 			case nil:
 				record[name] = nil
@@ -221,6 +319,18 @@ func dumpQueryAsJSON(ctx context.Context, db *sql.DB, query string, args ...any)
 		return nil, err
 	}
 	return json.MarshalIndent(records, "", "  ")
+}
+
+// lowerCamel 把数据库列名转成小驼峰（设计 §4.5「键名用数据库列名的小驼峰形式」）。
+func lowerCamel(name string) string {
+	parts := strings.Split(name, "_")
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(parts[i][:1]) + parts[i][1:]
+	}
+	return strings.Join(parts, "")
 }
 
 // fileSink 把每一组包写到暂存目录的一个文件里。
