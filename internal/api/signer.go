@@ -143,14 +143,19 @@ func (s *server) signerCheckItem(ctx context.Context, machine buildMachine, tena
 		"tenantSlug": slug, "keystoreVersion": state.Version, "packageName": nil, "certificateSha256": nil, "keyAlias": nil, "box": nil,
 		"trustRoots": nil, "trustRootsDigest": nil, "publishedMaxBuildNumber": published,
 		"generator": nil, "generationSignature": nil, "generationRequestId": nil, "upload": nil, "generationRequest": nil,
+		// recipients/sealKind：主签名闸判断"本机信任的签名闸里有谁还不是收件人"（同证书重新封装），
+		// 备签名闸按 sealKind 决定验哪种签名（生成 / 重新封装）
+		"recipients": nil, "sealKind": nil,
 	}
 	if box != nil {
 		record := state.Record
 		item["tenantSlug"], item["packageName"], item["certificateSha256"], item["keyAlias"], item["box"] = record.TenantSlug, record.PackageName, record.CertificateSHA256, record.KeyAlias, *box
+		item["recipients"] = append([]string{}, record.Recipients...)
 		if record.Generator != nil {
 			item["generator"] = gin.H{"machineId": record.Generator.MachineID, "name": record.Generator.Name,
 				"ed25519PublicKey": record.Generator.Ed25519PublicKey, "ed25519PublicKeySha256": record.Generator.Ed25519PublicKeySHA256}
 			item["generationSignature"], item["generationRequestId"], item["upload"] = record.GenerationSignature, record.GenerationRequestID, *state.Upload
+			item["sealKind"] = sealKindOf(record)
 		}
 	}
 	roots, digest, problems, err := s.trustRootsWith(ctx, tenant, firstKeyPackage)

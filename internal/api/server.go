@@ -283,6 +283,7 @@ func (s *server) routes() *gin.Engine {
 	// 本机命令（trust-peer、trust-builder --builder、trust-recovery）取公钥显示用，签名闸不采信
 	gate.GET("/peers", s.signerPeers)
 	// 主签名闸交回生成的签名密钥，或报告这次生成做不了
+	gate.POST("/keystore-reseals", s.resealBuildKeystore)
 	gate.POST("/keystore-generations/:requestId", s.completeKeystoreGeneration)
 	gate.POST("/keystore-generations/:requestId/fail", s.failKeystoreGeneration)
 	gate.POST("/claim", s.claimSigningJob)

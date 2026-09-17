@@ -52,6 +52,20 @@ type buildKeystoreRecord struct {
 	Generator           *keystoreGenerator `json:"generator,omitempty"`
 	GenerationSignature string             `json:"generationSignature,omitempty"`
 	GenerationRequestID string             `json:"generationRequestId,omitempty"`
+	// SealKind 区分这份密钥是怎么落库的：空串（旧记录也读成空）是主签名闸生成，sealKindReseal 是主签名闸
+	// 把同一张证书重新封装给新的收件人（POST /v1/signer/keystore-reseals）。备签名闸按它决定验哪种签名
+	SealKind string `json:"sealKind,omitempty"`
+}
+
+// sealKindReseal 是 buildKeystoreRecord.SealKind 的"同证书重新封装"（生成是空串）。
+const sealKindReseal = "reseal"
+
+// sealKindOf 是下发给签名闸的 sealKind：旧记录没有这个字段，按"生成"读。
+func sealKindOf(record buildKeystoreRecord) string {
+	if record.SealKind == sealKindReseal {
+		return sealKindReseal
+	}
+	return "generation"
 }
 
 // keystoreGenerator 是生成这份密钥的主签名闸（交回那一刻的登记）。
@@ -181,6 +195,16 @@ func (r buildKeystoreRecord) validate() error {
 		if err != nil || len(public) != ed25519.PublicKeySize || fingerprint.SHA256Hex(public) != r.Generator.Ed25519PublicKeySHA256 {
 			return errors.New("generator.ed25519PublicKey does not match its sha256")
 		}
+		// 重新封装的 id 另有前缀，签名也是另一种消息（keystorebox.ResealMessage）：备签名闸按 sealKind 选验哪种
+		if (r.SealKind == sealKindReseal) != keystorebox.ValidResealID(r.GenerationRequestID) {
+			return errors.New("sealKind does not match the shape of generationRequestId")
+		}
+	}
+	switch {
+	case r.SealKind != "" && r.SealKind != sealKindReseal:
+		return errors.New("sealKind is unknown")
+	case r.SealKind != "" && !generated:
+		return errors.New("sealKind needs a generator")
 	}
 	return nil
 }
