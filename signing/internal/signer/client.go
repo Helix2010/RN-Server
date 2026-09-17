@@ -40,6 +40,11 @@ const (
 	codeUploadInterrupted   = "UPLOAD_INTERRUPTED"
 	// 交回生成的密钥：请求已不是 pending 或版本变了（服务端已把请求标 failed）
 	codeKeystoreGenerationStale = "KEYSTORE_GENERATION_STALE"
+	// 重新封装：版本已经变了（下一轮按新版本再看）、租户有待交回的生成请求（生成本来就会换收件人）、
+	// 同一租户 10 分钟内已经重新封装过（不原地重试，等本机的 10 分钟窗口）
+	codeKeystoreResealStale          = "KEYSTORE_RESEAL_STALE"
+	codeKeystoreGenerationInProgress = "KEYSTORE_GENERATION_IN_PROGRESS"
+	codeKeystoreResealRateLimited    = "KEYSTORE_RESEAL_RATE_LIMITED"
 )
 
 const (
@@ -69,6 +74,10 @@ func (e *APIError) Stale() bool {
 // Transient：可以原地重试的服务端错误（5xx、429、发布序列忙、上传存储失败或中断、
 // 签名包被更晚的上传取代）。
 func (e *APIError) Transient() bool {
+	if e.Code == codeKeystoreResealRateLimited {
+		// 服务端按租户限速的 429：原地重试只会再撞一次
+		return false
+	}
 	if e.Status >= 500 || e.Status == http.StatusTooManyRequests {
 		return true
 	}
@@ -124,6 +133,7 @@ type API interface {
 	Peers(ctx context.Context) (PeersResponse, error)
 	SubmitGeneration(ctx context.Context, requestID string, req GenerationSubmit) (GenerationResult, error)
 	FailGeneration(ctx context.Context, requestID, code, detail string) error
+	SubmitReseal(ctx context.Context, req ResealSubmit) (ResealResult, error)
 	Claim(ctx context.Context, ready []ReadyItem) (*Claim, error)
 	Heartbeat(ctx context.Context, jobID string, signAttempt int) error
 	DownloadUnsigned(ctx context.Context, jobID string, signAttempt int, dst io.Writer, maxSize int64) (Download, error)
@@ -169,7 +179,20 @@ type CheckItem struct {
 	// 签名闸按这些名字读；缺了就不自动接受（退回 signer confirm）。
 	GenerationRequestID *string             `json:"generationRequestId"`
 	Upload              *keystorebox.Upload `json:"upload"`
+	// SealKind 是有 Generator 时这份密钥怎么写进来的：generation（生成）或 reseal（同证书重新封装，
+	// GenerationRequestID 是重新封装 id、GenerationSignature 是重新封装签名）。自动化第一轮的服务端没有这个
+	// 字段（null）：按 generation 处理。它只决定按哪种签名去验，验过之后还要与密文里的 Generation.Kind 一致。
+	SealKind *string `json:"sealKind"`
+	// Recipients 是当前密钥全部收件人的 X25519 sha256（排序），有 Box 时下发。主签名闸只拿它判断
+	// "本机信任的收件人有没有缺"，不据此加任何收件人。
+	Recipients []string `json:"recipients"`
 }
+
+// CheckItem.SealKind 的取值。
+const (
+	sealKindGeneration = "generation"
+	sealKindReseal     = "reseal"
+)
 
 // GenerationRequest 是控制台发起的"生成签名密钥"。服务端的信任根只在首次信任时使用。
 type GenerationRequest struct {
@@ -258,6 +281,20 @@ type GenerationSubmit struct {
 type GeneratorRef struct {
 	MachineID              string `json:"machineId"`
 	Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
+}
+
+// ResealSubmit 是 POST /v1/signer/keystore-reseals 的请求体。
+type ResealSubmit struct {
+	TenantSlug      string             `json:"tenantSlug"`
+	KeystoreVersion int64              `json:"keystoreVersion"`
+	ResealID        string             `json:"resealId"`
+	Upload          keystorebox.Upload `json:"upload"`
+	Signature       string             `json:"signature"`
+}
+
+// ResealResult 是重新封装的 200 响应。
+type ResealResult struct {
+	KeystoreVersion int64 `json:"keystoreVersion"`
 }
 
 // GenerationResult 是交回生成结果的 200 响应。
@@ -531,6 +568,19 @@ func (c *HTTPClient) FailGeneration(ctx context.Context, requestID, code, detail
 	}
 	_, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-generations/"+requestID+"/fail", 0, map[string]string{"code": code, "detail": detail}, nil)
 	return err
+}
+
+// SubmitReseal 交回主签名闸重新封装的密钥（同一张证书，新的收件人）。
+func (c *HTTPClient) SubmitReseal(ctx context.Context, req ResealSubmit) (ResealResult, error) {
+	var out ResealResult
+	if !keystorebox.ValidResealID(req.ResealID) {
+		return out, &ProtocolError{Msg: "reseal id is malformed"}
+	}
+	status, err := c.doJSON(ctx, http.MethodPost, "/v1/signer/keystore-reseals", 0, req, &out)
+	if err == nil && status != http.StatusOK {
+		return out, &ProtocolError{Msg: "keystore reseal submit did not return 200"}
+	}
+	return out, err
 }
 
 // Claim 认领一条签名任务。没有活返回 nil。

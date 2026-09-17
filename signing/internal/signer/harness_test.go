@@ -133,6 +133,8 @@ type fakeServer struct {
 	submitCalls  int
 	submitStatus map[string]problem // requestId → 交回时返回的错误
 	failures     []call             // 生成失败上报（Job=requestId）
+	reseals      []ResealSubmit     // POST /v1/signer/keystore-reseals 收到的请求体（含失败的）
+	resealStatus []problem          // 依次返回的错误；用完回 200
 	describe     map[string]any     // POST /v1/machine-setup/describe 的响应；nil 时 404
 	enrollToken  string
 	enrolls      []map[string]string
@@ -156,6 +158,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 	mux.HandleFunc("GET /v1/signer/peers", f.getPeers)
 	mux.HandleFunc("POST /v1/signer/keystore-generations/{id}", f.submitGeneration)
 	mux.HandleFunc("POST /v1/signer/keystore-generations/{id}/fail", f.failGeneration)
+	mux.HandleFunc("POST /v1/signer/keystore-reseals", f.submitReseal)
 	setup := http.NewServeMux()
 	setup.HandleFunc("POST /v1/machine-setup/describe", f.describeCode)
 	setup.HandleFunc("POST /v1/machine-setup/enroll", f.enrollCode)
@@ -342,6 +345,39 @@ func (f *fakeServer) submitGeneration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"keystoreVersion": 7, "releaseIdentityVersion": 3})
+}
+
+// submitReseal 按约定 2.2 的字段名严格解码；五个字段缺一不可。按脚本依次返回错误，之后回 200（版本 +1）。
+func (f *fakeServer) submitReseal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TenantSlug      *string             `json:"tenantSlug"`
+		KeystoreVersion *int64              `json:"keystoreVersion"`
+		ResealID        *string             `json:"resealId"`
+		Upload          *keystorebox.Upload `json:"upload"`
+		Signature       *string             `json:"signature"`
+	}
+	if !f.decodeStrict(r, &body) {
+		problemJSON(w, 400, "BAD", "bad")
+		return
+	}
+	if body.TenantSlug == nil || body.KeystoreVersion == nil || body.ResealID == nil || body.Upload == nil || body.Signature == nil {
+		f.t.Errorf("keystore reseal submit is missing a field")
+		problemJSON(w, 400, "BAD", "missing fields")
+		return
+	}
+	if err := body.Upload.ValidateShape(); err != nil {
+		f.t.Errorf("resealed upload shape: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reseals = append(f.reseals, ResealSubmit{TenantSlug: *body.TenantSlug, KeystoreVersion: *body.KeystoreVersion, ResealID: *body.ResealID, Upload: *body.Upload, Signature: *body.Signature})
+	if len(f.resealStatus) > 0 {
+		p := f.resealStatus[0]
+		f.resealStatus = f.resealStatus[1:]
+		problemJSON(w, p.status, p.code, "scripted failure")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"keystoreVersion": *body.KeystoreVersion + 1})
 }
 
 func (f *fakeServer) failGeneration(w http.ResponseWriter, r *http.Request) {
@@ -665,6 +701,7 @@ type harness struct {
 }
 
 type harnessOptions struct {
+	name        string       // 本机机器名，默认 testMachine
 	role        records.Role // 默认主
 	noConfirm   bool
 	noBuilder   bool
@@ -681,17 +718,21 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 			t.Fatal(err)
 		}
 	}
-	keys, created, err := InitState(stateDir, testMachine)
+	name := opts.name
+	if name == "" {
+		name = testMachine
+	}
+	keys, created, err := InitState(stateDir, name)
 	if err != nil || !created {
 		t.Fatalf("InitState: %v %v", created, err)
 	}
-	_, store, err := OpenRecords(stateDir, testMachine)
+	_, store, err := OpenRecords(stateDir, name)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
 	h := &harness{t: t, keys: keys, store: store, builder: testfixture.NewBuilder(t), key: sharedTenantKey(t), logs: &syncBuffer{}}
-	h.cfg = Config{ServerURL: "http://127.0.0.1", MachineToken: testToken, Name: testMachine, StateDir: stateDir, RuntimeDir: runtimeDir,
+	h.cfg = Config{ServerURL: "http://127.0.0.1", MachineToken: testToken, Name: name, StateDir: stateDir, RuntimeDir: runtimeDir,
 		JavaHome: "/nonexistent", BuildToolsDir: "/nonexistent", CheckExec: "/nonexistent", MaxVersionCodeJump: 100, MaxVersionCode: 10_000_000}
 	if opts.role != records.RoleStandby {
 		must(t, store.SetRole(records.RoleChange{Role: records.RolePrimary, Mode: records.RoleModeInitial, Operator: "ops", Reason: "test primary"}))
