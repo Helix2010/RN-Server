@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -255,6 +256,33 @@ func androidPackageInUse(c *gin.Context) {
 		"Another tenant already uses this Android package name (release identity or signing key); every tenant's app needs its own package name")
 }
 
+// unsyncedRecipientSigners 是当前这一版密钥加密给了、服务端也还 active，却还没对这一版报 confirmed 的签名闸。
+//
+// 有这样的签名闸时先别换密钥：备签名闸自动接受新密钥的前提是"被取代的证书等于本机当前证书"，一轮检查里连换
+// 两把，中间那把它没看到，之后每一把都会被拒，只能人工 signer confirm（本地端到端实测）。
+// allowUnconfirmedSigners=true 是明确的例外（主签名闸被攻陷之类要立刻换密钥的情形）。
+func (s *server) unsyncedRecipientSigners(ctx context.Context, q rowQuerier, tenant string, registry buildMachinesDoc, keystore buildKeystoreState) ([]string, error) {
+	if !keystore.configured() {
+		return nil, nil
+	}
+	checks, err := s.keystoreChecksFor(ctx, q, tenant)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, recipient := range uploadRecipients(*keystore.Upload) {
+		machine, ok := registry.signerByRecipient(recipient)
+		if !ok || machine.Status != machineStatusActive {
+			continue
+		}
+		if check, ok := checks[machine.ID]; !ok || check.KeystoreVersion != keystore.Version || !check.Confirmed {
+			names = append(names, machine.Name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 // ---- 管理端：发起 ----
 
 func (s *server) generateBuildKeystore(c *gin.Context) {
@@ -264,6 +292,8 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 		ReleaseIdentityExpectedVersion *int   `json:"releaseIdentityExpectedVersion"`
 		Reason                         string `json:"reason"`
 		Confirm                        bool   `json:"confirm"`
+		// AllowUnconfirmedSigners：明知还有签名闸没确认当前这一版密钥也要换（见 unsyncedRecipientSigners）
+		AllowUnconfirmedSigners bool `json:"allowUnconfirmedSigners"`
 	}
 	if decode(c, &body) != nil {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_KEYSTORE_GENERATION", "packageName, expectedVersion, releaseIdentityExpectedVersion, reason and confirm=true are required")
@@ -366,6 +396,27 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 	if identityVersion != *body.ReleaseIdentityExpectedVersion {
 		problem(c, http.StatusConflict, "STALE_RELEASE_IDENTITY", "Release identity changed; refresh and retry")
 		return
+	}
+	// 还有签名闸没跟上当前这一版密钥时，先别换（版本已经在本事务里锁住，读到的就是要被取代的那一版）
+	if !body.AllowUnconfirmedSigners {
+		keystore, err := s.buildKeystoreStateFor(ctx, tx, tenant)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
+			return
+		}
+		unsynced, err := s.unsyncedRecipientSigners(ctx, tx, tenant, registry, keystore)
+		if err != nil {
+			slog.Error("cannot check whether every signer confirmed the current keystore", "tenant", tenant, "error", err)
+			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_FAILED", "Unable to check the signing gates")
+			return
+		}
+		if len(unsynced) > 0 {
+			problem(c, http.StatusConflict, "KEYSTORE_SIGNERS_NOT_IN_SYNC",
+				"These signing gates hold the current key but have not confirmed this version yet: "+strings.Join(unsynced, ", ")+
+					". Wait for them to confirm (or run signer confirm there), or revoke them, or resend with allowUnconfirmedSigners=true "+
+					"— they will then need a manual signer confirm before they can use the new key")
+			return
+		}
 	}
 	raw, requestVersion, err := configRowVersion(ctx, tx, tenant, buildKeystoreRequestConfigKey, true)
 	if err != nil {

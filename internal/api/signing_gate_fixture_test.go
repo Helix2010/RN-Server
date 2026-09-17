@@ -151,7 +151,10 @@ func newGateFixture(t *testing.T, seed int) *gateFixture {
 	f.router = s.routes()
 
 	f.uploadKeystore(f.primary, f.standby)
+	// 两台签名闸都对这一版报过检查结论：真实环境里备签名闸一个检查周期内就会跟上，而"还有签名闸没确认
+	// 当前这一版"是发起换密钥的阻断条件（unsyncedRecipientSigners）
 	f.reportCheck(f.primary, true, "ok")
+	f.reportCheck(f.standby, true, "ok")
 	return f
 }
 

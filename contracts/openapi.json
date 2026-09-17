@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.24"
+    "version": "2026.09.25"
   },
   "paths": {
     "/v1/mobile/referral/me": {
@@ -3281,7 +3281,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is neither stale nor timed out), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing), ANDROID_PACKAGE_IN_USE (another tenant's release.android or build.keystore already uses this package name - also for a tenant without a release identity, whose package name otherwise comes from the request; the detail does not name the tenant)"
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is neither stale nor timed out), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing), ANDROID_PACKAGE_IN_USE (another tenant's release.android or build.keystore already uses this package name - also for a tenant without a release identity, whose package name otherwise comes from the request; the detail does not name the tenant), KEYSTORE_SIGNERS_NOT_IN_SYNC (a signing gate that holds the current key has not confirmed this version yet; wait for it, run signer confirm there, revoke it, or resend with allowUnconfirmedSigners=true)"
           },
           "422": {
             "description": "KEYSTORE_PACKAGE_MISMATCH"
@@ -9378,6 +9378,10 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "allowUnconfirmedSigners": {
+            "type": "boolean",
+            "description": "Generate even though a signing gate that holds the current key has not confirmed this version yet (otherwise 409 KEYSTORE_SIGNERS_NOT_IN_SYNC). Those gates then need a manual signer confirm before they can use the new key: a standby only auto-accepts a key that supersedes the certificate it currently holds."
           }
         }
       }

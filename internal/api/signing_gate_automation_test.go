@@ -834,7 +834,9 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 			t.Fatalf("trust %s: %d %s", name, r.Code, r.Body.String())
 		}
 	}
+	// 夹具里两台签名闸都已经上报过一次信任列表；这里在本机新信任一把恢复公钥，看"变了才写"
 	trust := f.localTrust()
+	trust["recoveryKeys"] = []string{strings.Repeat("b", 64)}
 	version := registryVersion(t, f)
 	if r := report(trust); r.Code != http.StatusNoContent {
 		t.Fatalf("report: %d %s", r.Code, r.Body.String())
@@ -848,7 +850,7 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 		t.Fatalf("view of the reported trust: %v", view)
 	}
 	// 顺序不同、内容相同：不写
-	reordered := map[string]any{"signers": []any{trust["signers"].([]any)[1], trust["signers"].([]any)[0]}, "builders": trust["builders"], "recoveryKeys": []string{}}
+	reordered := map[string]any{"signers": []any{trust["signers"].([]any)[1], trust["signers"].([]any)[0]}, "builders": trust["builders"], "recoveryKeys": trust["recoveryKeys"]}
 	for i := 0; i < 3; i++ {
 		if r := report(reordered); r.Code != http.StatusNoContent {
 			t.Fatalf("repeat: %d %s", r.Code, r.Body.String())
@@ -867,8 +869,9 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 	}
 	var audits int
 	_ = f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=0 AND action='build_machine_trust_report' AND target_id=?`, f.standby.ID).Scan(&audits)
-	if audits != 2 {
-		t.Fatalf("trust changes audited %d times, want 2", audits)
+	// 3 次 = 夹具里的首次上报 + 这里的两次变化
+	if audits != 3 {
+		t.Fatalf("trust changes audited %d times, want 3", audits)
 	}
 }
 
@@ -1147,7 +1150,9 @@ func TestDBKeystoreGenerationHappyPathAndStateMachine(t *testing.T) {
 	if codes := readinessCodes(t, f); strings.Join(codes, ",") != readinessPrimaryCheckMissing {
 		t.Fatalf("readiness after a generated key: %v", codes)
 	}
-	// 完成之后可以再发起
+	// 完成之后，两台签名闸先确认这一版（换密钥的阻断条件），然后可以再发起
+	f.reportCheck(f.primary, true, "ok")
+	f.reportCheck(f.standby, true, "ok")
 	if r := f.generate(f.generateBody(f.packageName)); r.Code != http.StatusAccepted {
 		t.Fatalf("generate again after done: %d %s", r.Code, r.Body.String())
 	}
@@ -1238,7 +1243,10 @@ func TestDBKeystoreGenerationGoesStaleAndCanFail(t *testing.T) {
 	if f.auditCount(f.tenant, "build_keystore_generation_failed") != 1 {
 		t.Fatal("the stale request was not audited as failed")
 	}
-	// 过期的请求不挡新的；旧请求 id 交回 409（不是当前请求）
+	// 过期的请求不挡新的；旧请求 id 交回 409（不是当前请求）。
+	// 导入换掉了密钥版本，两台签名闸要先确认这一版才能再发起（unsyncedRecipientSigners）
+	f.reportCheck(f.primary, true, "ok")
+	f.reportCheck(f.standby, true, "ok")
 	second := f.generate(f.generateBody(f.packageName))
 	if second.Code != http.StatusAccepted {
 		t.Fatalf("generate after a stale request: %d %s", second.Code, second.Body.String())
@@ -1797,5 +1805,42 @@ func TestDBReportedTrustListsAreAlwaysArrays(t *testing.T) {
 		if !ok || list == nil || len(list) != 0 {
 			t.Fatalf("reportedTrust.%s must be an empty array, got %#v", key, reported[key])
 		}
+	}
+}
+
+// TestDBGenerationWaitsForSignersToConfirmTheCurrentKey：当前密钥加密给的 active 签名闸还没确认这一版时，
+// 再次发起生成返回 409；备签名闸确认之后放行；明确的 allowUnconfirmedSigners 也放行。
+//
+// 为什么要拦：备签名闸自动接受新密钥的前提是"被取代的证书等于本机当前证书"。一轮检查里连换两把，中间
+// 那把它没看到，之后每一把都会被拒，必须人工 signer confirm（本地端到端实测 N-standby-two-quick-rotations）。
+func TestDBGenerationWaitsForSignersToConfirmTheCurrentKey(t *testing.T) {
+	f := newGateFixture(t, 132)
+	f.registerRecoveryKey("recovery-2026")
+	// 备签名闸还没在本机确认这一版（解得开、但没 confirm）
+	f.reportCheck(f.standby, false, "pending")
+	r := f.generate(f.generateBody(f.packageName))
+	if r.Code != http.StatusConflict || problemCode(t, r) != "KEYSTORE_SIGNERS_NOT_IN_SYNC" {
+		t.Fatalf("generate while the standby has not confirmed: %d %s", r.Code, r.Body.String())
+	}
+	if !strings.Contains(r.Body.String(), f.standby.Name) {
+		t.Fatalf("the problem must name the signing gate: %s", r.Body.String())
+	}
+	// 明确要求仍然生成：放行
+	body := f.generateBody(f.packageName)
+	body["allowUnconfirmedSigners"] = true
+	accepted := f.generate(body)
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("generate with allowUnconfirmedSigners: %d %s", accepted.Code, accepted.Body.String())
+	}
+	// 把这条请求报失败，腾出位置再发起一次
+	requestID := decodeBody(t, accepted)["generationRequest"].(map[string]any)["requestId"].(string)
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-generations/"+requestID+"/fail", f.primary.Token, nil,
+		map[string]any{"code": "GENERATION_FAILED", "detail": "test"}); r.Code != http.StatusNoContent {
+		t.Fatalf("fail the pending request: %d %s", r.Code, r.Body.String())
+	}
+	// 备确认之后不再需要例外
+	f.reportCheck(f.standby, true, "ok")
+	if r := f.generate(f.generateBody(f.packageName)); r.Code != http.StatusAccepted {
+		t.Fatalf("generate once every signer confirmed: %d %s", r.Code, r.Body.String())
 	}
 }
