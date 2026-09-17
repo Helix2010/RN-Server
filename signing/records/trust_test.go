@@ -458,3 +458,33 @@ func TestPreFixEnrollRecordsAreRefused(t *testing.T) {
 		})
 	}
 }
+
+// 重新封装（ConfirmModePeerResealed）：新备按受信签名闸重新封装的同一张证书首次信任。确认人带封装者的名字；请求 id
+// 必须是 rsl_ 开头的重新封装 id（生成请求 id 不能冒充）；回放之后仍然读得出来。
+func TestPeerResealedConfirmation(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	resealed := autoConfirmation(t, certA, ConfirmModePeerResealed, "rsl_fixtureRESEAL000000001")
+	if resealed.ConfirmedBy != "auto:peer-resealed:amos-signer-a" {
+		t.Fatalf("confirmedBy %q", resealed.ConfirmedBy)
+	}
+	for name, mutate := range map[string]func(*Confirmation){
+		"generation request id":  func(c *Confirmation) { c.GenerationRequestID = "kgr_request0001" },
+		"short reseal id":        func(c *Confirmation) { c.GenerationRequestID = "rsl_short" },
+		"generated confirmedBy":  func(c *Confirmation) { c.ConfirmedBy = "auto:peer-generated:amos-signer-a" },
+		"another resealer named": func(c *Confirmation) { c.ConfirmedBy = "auto:peer-resealed:other" },
+	} {
+		bad := resealed
+		mutate(&bad)
+		if err := s.ConfirmAuto(bad, nil); err == nil {
+			t.Errorf("%s: ConfirmAuto accepted", name)
+		}
+	}
+	must(t, s.ConfirmAuto(resealed, nil))
+	s.Close()
+	s = f.open(t)
+	c, ok, err := s.ActiveConfirmation(pkg)
+	if err != nil || !ok || c.Mode != ConfirmModePeerResealed || c.GenerationRequestID != "rsl_fixtureRESEAL000000001" || c.GeneratorName != "amos-signer-a" {
+		t.Fatalf("after restart: %+v %v", c, err)
+	}
+}

@@ -58,6 +58,8 @@ var (
 	releaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 	// 与 keystorebox.ValidGenerationRequestID 同一条规则（records 不依赖 keystorebox）
 	generationRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	// 与 keystorebox.ValidResealID 同一条规则
+	resealIDPattern = regexp.MustCompile(`^rsl_[A-Za-z0-9_-]{22}$`)
 )
 
 // RoleChange 记录本机角色变化。
@@ -261,14 +263,18 @@ const (
 	ConfirmModeRegenerated = "regenerated"
 	// ConfirmModePeerGenerated：本机信任的另一台签名闸生成、生成签名验证通过的密钥（首次信任或沿用信任根）。
 	ConfirmModePeerGenerated = "peer-generated"
+	// ConfirmModePeerResealed：本机信任的另一台签名闸把它已确认的同一张证书重新封装给本机、重新封装签名验证通过；
+	// 本机对这个包名原本没有任何确认（后加的签名闸），按封装者写进密文的确认参数首次信任。GenerationRequestID 是
+	// 重新封装 id（rsl_…）。
+	ConfirmModePeerResealed = "peer-resealed"
 
 	autoConfirmedByPrefix = "auto:"
 )
 
 // AutoConfirmedBy 返回自动确认写进 confirmedBy 的值：auto:first-generation、auto:regenerated、
-// auto:peer-generated:<生成者机器名>。运维名不允许冒号，两者不会混淆。
+// auto:peer-generated:<生成者机器名>、auto:peer-resealed:<封装者机器名>。运维名不允许冒号，两者不会混淆。
 func AutoConfirmedBy(mode, generatorName string) string {
-	if mode == ConfirmModePeerGenerated {
+	if mode == ConfirmModePeerGenerated || mode == ConfirmModePeerResealed {
 		return autoConfirmedByPrefix + mode + ":" + generatorName
 	}
 	return autoConfirmedByPrefix + mode
@@ -301,10 +307,12 @@ func (c Confirmation) validate() error {
 		if c.GenerationRequestID != "" || c.GeneratorName != "" || c.GeneratorEd25519SHA256 != "" {
 			return errors.New("an operator confirmation must not carry generation fields")
 		}
-	case ConfirmModeFirstGeneration, ConfirmModeRegenerated, ConfirmModePeerGenerated:
+	case ConfirmModeFirstGeneration, ConfirmModeRegenerated, ConfirmModePeerGenerated, ConfirmModePeerResealed:
 		switch {
 		case !generationRequestIDPattern.MatchString(c.GenerationRequestID):
 			return errors.New("generationRequestId is malformed")
+		case c.Mode == ConfirmModePeerResealed && !resealIDPattern.MatchString(c.GenerationRequestID):
+			return errors.New("generationRequestId of a resealed confirmation must be a reseal id (rsl_…)")
 		case !ident.ValidMachineName(c.GeneratorName):
 			return errors.New("generatorName is malformed")
 		case !fingerprint.Valid(c.GeneratorEd25519SHA256):

@@ -111,13 +111,25 @@ type Generation struct {
 	MinSDK                  int64 `json:"minSdk"`
 	TargetSDK               int64 `json:"targetSdk"`
 	FirstSignMaxVersionCode int64 `json:"firstSignMaxVersionCode"`
-	// SupersedesCertificateSHA256 是生成时生成者本机对这个包名有效确认的证书；首次生成为空串
+	// SupersedesCertificateSHA256 是生成时生成者本机对这个包名有效确认的证书；首次生成为空串。
+	// 重新封装（Kind=reseal）时等于证书本身
 	SupersedesCertificateSHA256 string `json:"supersedesCertificateSha256"`
+	// Kind 区分这份明文是怎么来的：空串是签名闸生成（JSON 里不出现这个键，与加这个字段之前逐字节相同），
+	// GenerationKindReseal 是主签名闸把已确认的同一张证书重新封装给新的收件人。它在密文里、被签名覆盖：
+	// 服务端不能把一次重新封装当成生成（或者反过来）交给别的签名闸
+	Kind string `json:"kind,omitempty"`
 }
+
+// GenerationKindReseal 是 Generation.Kind 的"同证书重新封装"。
+const GenerationKindReseal = "reseal"
 
 // Validate 检查生成参数的格式（取值下限由签名闸本机记录再校验）。
 func (g Generation) Validate() error {
 	switch {
+	case g.Kind != "" && g.Kind != GenerationKindReseal:
+		return errors.New("generation.kind must be empty or " + GenerationKindReseal)
+	case g.Kind == GenerationKindReseal && g.SupersedesCertificateSHA256 == "":
+		return errors.New("generation.supersedesCertificateSha256 of a reseal must be the certificate itself")
 	case !fingerprint.Valid(g.TrustRootsDigest):
 		return errors.New("generation.trustRootsDigest must be 64 lowercase hex characters")
 	case g.MinSDK < 1 || g.MinSDK > 1000 || g.TargetSDK < g.MinSDK || g.TargetSDK > 1000:
@@ -161,8 +173,8 @@ type Upload struct {
 func (p Plaintext) String() string {
 	generation := "none"
 	if g := p.Generation; g != nil {
-		generation = fmt.Sprintf("{trustRootsDigest=%q minSdk=%d targetSdk=%d firstSignMaxVersionCode=%d supersedesCertificateSha256=%q}",
-			g.TrustRootsDigest, g.MinSDK, g.TargetSDK, g.FirstSignMaxVersionCode, g.SupersedesCertificateSHA256)
+		generation = fmt.Sprintf("{trustRootsDigest=%q minSdk=%d targetSdk=%d firstSignMaxVersionCode=%d supersedesCertificateSha256=%q kind=%q}",
+			g.TrustRootsDigest, g.MinSDK, g.TargetSDK, g.FirstSignMaxVersionCode, g.SupersedesCertificateSHA256, g.Kind)
 	}
 	return fmt.Sprintf("keystorebox.Plaintext{purpose=%q tenantSlug=%q packageName=%q certificateSha256=%q keyAlias=%q recipients=%q createdAt=%q generation=%s p12=[redacted] storePassword=[redacted] keyPassword=[redacted]}",
 		p.Purpose, p.TenantSlug, p.PackageName, p.CertificateSHA256, p.KeyAlias, p.Recipients, p.CreatedAt, generation)
@@ -185,6 +197,7 @@ func (p Plaintext) LogValue() slog.Value {
 		slog.Any("recipients", p.Recipients),
 		slog.String("createdAt", p.CreatedAt),
 		slog.Bool("generated", p.Generation != nil),
+		slog.Bool("resealed", p.Generation != nil && p.Generation.Kind == GenerationKindReseal),
 	)
 }
 
@@ -236,8 +249,13 @@ func (p Plaintext) Validate() error {
 		if err := p.Generation.Validate(); err != nil {
 			return err
 		}
-		if p.Generation.SupersedesCertificateSHA256 == p.CertificateSHA256 {
+		// 生成换的是证书，替换的必然是另一张；重新封装不换证书，"替换"的就是它自己
+		resealed := p.Generation.Kind == GenerationKindReseal
+		switch {
+		case !resealed && p.Generation.SupersedesCertificateSHA256 == p.CertificateSHA256:
 			return errors.New("generation.supersedesCertificateSha256 must differ from certificateSha256")
+		case resealed && p.Generation.SupersedesCertificateSHA256 != p.CertificateSHA256:
+			return errors.New("generation.supersedesCertificateSha256 of a reseal must equal certificateSha256")
 		}
 	}
 	return nil

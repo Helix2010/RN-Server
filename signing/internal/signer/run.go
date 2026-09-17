@@ -76,6 +76,8 @@ type Runner struct {
 	MaxClaimBackoff time.Duration
 	// KeyBits 是生成租户签名密钥的 RSA 位数；0 表示 4096（测试用 2048 提速）。
 	KeyBits int
+	// Now 为 nil 时用 time.Now。只用于重新封装的节奏（每个租户 10 分钟至多尝试一次），测试注入。
+	Now func() time.Time
 
 	mu         sync.Mutex
 	ready      []ReadyItem
@@ -86,6 +88,8 @@ type Runner struct {
 	checksDue bool
 	// generationsDone：本进程已经处理完（交回、报失败或服务端说已过期）的生成请求
 	generationsDone map[string]bool
+	// resealAttempts：本进程里每个租户最近一次尝试重新封装的时间（Now 的时钟）
+	resealAttempts map[string]time.Time
 
 	// 认领退避：没有签完交付（暂不能签、临时错误、违规、过期）之后，至少隔一个 PollInterval 才再认领；
 	// 同一任务连续没签完，间隔按 PollInterval×2^(n-1) 翻倍，封顶 MaxClaimBackoff。签完交付清零。
@@ -134,6 +138,9 @@ func (r *Runner) defaults() {
 	}
 	if r.generationsDone == nil {
 		r.generationsDone = map[string]bool{}
+	}
+	if r.resealAttempts == nil {
+		r.resealAttempts = map[string]time.Time{}
 	}
 }
 
@@ -354,8 +361,8 @@ func (f *fatalError) Error() string { return f.err.Error() }
 
 // ---- 试解、确认状态、试签 ----
 
-// RunChecks 取回发给本机的密文，逐份试解、查本机确认（签名闸生成的密钥按规则自动确认）、试签，
-// 上报并更新就绪列表；然后处理发给本机（主）的生成请求。
+// RunChecks 取回发给本机的密文，逐份试解、查本机确认（签名闸生成或重新封装的密钥按规则自动确认）、试签，
+// 上报并更新就绪列表；然后处理发给本机（主）的生成请求，最后（本机是主时）把缺了本机信任收件人的密钥重新封装。
 func (r *Runner) RunChecks(ctx context.Context) error {
 	r.defaults()
 	resp, err := r.API.KeystoreChecks(ctx)
@@ -363,9 +370,16 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 		r.setReady(nil)
 		return err
 	}
+	// 每轮都带本机角色（本机记录没有角色记录时就是备）；在上报前读，promote 之后下一轮就反映出来
+	role, err := r.Store.Role()
+	if err != nil {
+		r.setReady(nil)
+		return &fatalError{err}
+	}
 	reports := []CheckReport{}
 	var ready []ReadyItem
 	var generations []CheckItem
+	var reseals []resealCandidate
 	for _, item := range resp.Items {
 		if item.GenerationRequest != nil {
 			generations = append(generations, item)
@@ -374,7 +388,7 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 			// 还没有发给本机的密钥（新租户等生成、或密钥没加密给本机）：没有可上报的试解结果
 			continue
 		}
-		report, readyItem, err := r.checkItem(ctx, item)
+		report, readyItem, candidate, err := r.checkItem(ctx, item, role.Role)
 		if err != nil {
 			r.setReady(nil)
 			return &fatalError{err}
@@ -385,16 +399,23 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 		if readyItem != nil {
 			ready = append(ready, *readyItem)
 		}
+		if candidate != nil {
+			candidate.report = len(reports) - 1
+			reseals = append(reseals, *candidate)
+		}
 	}
 	r.setReady(ready)
-	// 每轮都带本机角色（本机记录没有角色记录时就是备）；在上报前读，promote 之后下一轮就反映出来
-	role, err := r.Store.Role()
+	trust, err := LocalTrust(r.Keys, r.Store)
 	if err != nil {
 		r.setReady(nil)
 		return &fatalError{err}
 	}
-	trust, err := LocalTrust(r.Keys, r.Store)
+	// 在上报之前决定要不要重新封装：本机信任的恢复公钥一把都用不了时，原因要写进这一轮的检查结论
+	plans, err := r.planReseals(ctx, reseals, reports)
 	if err != nil {
+		if IsTokenRejected(err) {
+			return err
+		}
 		r.setReady(nil)
 		return &fatalError{err}
 	}
@@ -404,6 +425,11 @@ func (r *Runner) RunChecks(ctx context.Context) error {
 	}
 	for _, item := range generations {
 		if err := r.processGeneration(ctx, resp.MachineID, item); err != nil {
+			return err
+		}
+	}
+	for _, plan := range plans {
+		if err := r.reseal(ctx, plan); err != nil {
 			return err
 		}
 	}
@@ -435,17 +461,19 @@ func (r *Runner) Ready() []ReadyItem {
 	return append([]ReadyItem(nil), r.ready...)
 }
 
-func (r *Runner) checkItem(ctx context.Context, item CheckItem) (*CheckReport, *ReadyItem, error) {
+// checkItem 试解、确认、试签一项。本机是主、这张证书本机已确认、服务端信任根与确认一致时，还返回一个重新封装的
+// 候选（要不要真的重新封装由 planReseals 决定）。
+func (r *Runner) checkItem(ctx context.Context, item CheckItem, role records.Role) (*CheckReport, *ReadyItem, *resealCandidate, error) {
 	if !ident.ValidTenantSlug(item.TenantSlug) {
 		// 服务端会忽略不认识的 slug，这一项无从上报；不回显原值
 		r.Log.Warn("the server sent a keystore check item with a malformed tenant slug; skipping it")
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	report := &CheckReport{TenantSlug: item.TenantSlug, KeystoreVersion: item.KeystoreVersion, Decrypt: "failed", TrialSign: "pending"}
-	fail := func(msg string) (*CheckReport, *ReadyItem, error) {
+	fail := func(msg string) (*CheckReport, *ReadyItem, *resealCandidate, error) {
 		m := cleanText(msg, 300)
 		report.Error = &m
-		return report, nil, nil
+		return report, nil, nil, nil
 	}
 	switch {
 	case item.KeystoreVersion < 0:
@@ -464,40 +492,49 @@ func (r *Runner) checkItem(ctx context.Context, item CheckItem) (*CheckReport, *
 	report.Decrypt = "ok"
 	conf, ok, err := r.Store.Confirmation(item.PackageName, item.CertificateSHA256)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if !ok || conf.TenantSlug != item.TenantSlug {
 		accepted, reason, err := r.acceptGenerated(item, material)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if accepted == nil {
 			if reason != "" {
-				r.Log.Warn("a generated keystore was not accepted automatically", "tenant", item.TenantSlug, "reason", reason)
+				r.Log.Warn("a generated or resealed keystore was not accepted automatically", "tenant", item.TenantSlug, "reason", reason)
 				m := cleanText(reason, 300)
 				report.Error = &m
 			}
-			return report, nil, nil
+			return report, nil, nil, nil
 		}
 		conf = *accepted
 	}
 	report.Confirmed = true
 	digest := conf.TrustRootsDigest
 	report.ConfirmedTrustRootsDigest = &digest
+	trustRootsCurrent := item.TrustRootsDigest != nil && *item.TrustRootsDigest == conf.TrustRootsDigest
+
+	// 重新封装的候选（设计「同证书重新封装」条件 1–3）：本机是主；本机对这个租户、包名、证书有当前有效确认，服务端的
+	// 信任根摘要等于确认的（信任根有待确认的变更时不动）；自己那份解开了、外层字段与租户项一致。有待交回的生成请求时
+	// 不动：生成本来就会换收件人。不看试签结果：重新封装不改变这把密钥能不能用
+	var candidate *resealCandidate
+	if role == records.RolePrimary && item.GenerationRequest == nil && item.Recipients != nil && trustRootsCurrent && material.Plain.KeyAlias == item.KeyAlias {
+		candidate = &resealCandidate{item: item, material: material, conf: conf, report: -1}
+	}
 
 	trial := r.trialSign(ctx, item, material, conf)
 	if !trial.ok {
 		report.TrialSign = "failed"
 		msg := cleanText(trial.msg, 300)
 		report.Error = &msg
-		return report, nil, nil
+		return report, nil, candidate, nil
 	}
 	report.TrialSign = "ok"
-	if item.TrustRootsDigest == nil || *item.TrustRootsDigest != conf.TrustRootsDigest {
+	if !trustRootsCurrent {
 		// 服务端的信任根与本机确认值不同：不就绪，等运维重新确认
-		return report, nil, nil
+		return report, nil, candidate, nil
 	}
-	return report, &ReadyItem{TenantSlug: conf.TenantSlug, PackageName: conf.PackageName, CertificateSHA256: conf.CertificateSHA256, TrustRootsDigest: conf.TrustRootsDigest}, nil
+	return report, &ReadyItem{TenantSlug: conf.TenantSlug, PackageName: conf.PackageName, CertificateSHA256: conf.CertificateSHA256, TrustRootsDigest: conf.TrustRootsDigest}, candidate, nil
 }
 
 func (r *Runner) trialSign(ctx context.Context, item CheckItem, material keystoreMaterial, conf records.Confirmation) trialResult {
