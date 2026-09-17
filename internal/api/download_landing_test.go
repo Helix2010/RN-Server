@@ -25,6 +25,32 @@ func TestDownloadLandingPlatformFallsBackToShowingBoth(t *testing.T) {
 	}
 }
 
+// 「这个租户做不做这个平台」与「这个访客该看哪个按钮」是两件事。混在一起会出一个
+// 安静的错：UA 判成 iOS 而租户只做 Android 时，兜底把两个都打开，于是一个被关掉的
+// 平台也跟着有了可用的下载按钮。
+func TestDownloadLandingVisibilityNeverShowsADisabledPlatform(t *testing.T) {
+	for name, tc := range map[string]struct {
+		guess                      string
+		iosEnabled, androidEnabled bool
+		wantIOS, wantAndroid       bool
+	}{
+		"两端都开、认出 iOS":           {"ios", true, true, true, false},
+		"两端都开、认出 Android":       {"android", true, true, false, true},
+		"两端都开、认不出":              {"", true, true, true, true},
+		"只做 Android、来的是 iPhone": {"ios", false, true, false, true},
+		"只做 iOS、来的是 Android":    {"android", true, false, true, false},
+		"只做 Android、认不出":        {"", false, true, false, true},
+		// 两个都没开：仍然渲染页面（地址印在海报上），两个按钮都置灰
+		"两端都没开": {"ios", false, false, true, true},
+	} {
+		gotIOS, gotAndroid := downloadLandingVisibility(tc.guess, tc.iosEnabled, tc.androidEnabled)
+		if gotIOS != tc.wantIOS || gotAndroid != tc.wantAndroid {
+			t.Errorf("%s: ios=%v android=%v, want ios=%v android=%v",
+				name, gotIOS, gotAndroid, tc.wantIOS, tc.wantAndroid)
+		}
+	}
+}
+
 // 没配安装入口时按钮置灰而不是消失、更不是 404：这个地址会被印在海报上。
 func TestDownloadLandingTemplateGreysOutMissingEntryPoints(t *testing.T) {
 	var out strings.Builder

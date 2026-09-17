@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -116,6 +117,12 @@ func validateIOSInstallURL(raw string) error {
 		strings.Trim(parsed.Path, "/") == "" {
 		return errors.New("installUrl must be an https link under testflight.apple.com or apps.apple.com, including its path")
 	}
+	// `https://evil.com@testflight.apple.com/join/x` 真正会打开的确实是 Apple，但这个
+	// 字符串会原样出现在管理端、二维码和 App 的更新按钮上，读起来像是去 evil.com。
+	// 分发入口没有任何用得上 userinfo 的场景，直接拒掉。
+	if parsed.User != nil {
+		return errors.New("installUrl must not carry a user@ part")
+	}
 	return nil
 }
 
@@ -168,11 +175,19 @@ func (s *server) iosReleaseIdentityRecord(ctx context.Context, tenant string) (*
 	return &record, nil
 }
 
-// iosInstallURL 是 bootstrap 与公开落地页要的那一个字符串。读不出来就当没配：
-// 这条链路上"没有安装入口"是一个正常状态，不是错误。
+// iosInstallURL 是 bootstrap 与公开落地页要的那一个字符串。
+//
+// 没配就是没配（record == nil），这条链路上"没有安装入口"是一个正常状态。但**读坏了
+// 不是**：那会让所有 iOS 用户静默地拿不到更新按钮，而症状与"运营还没填"一模一样。
+// 所以这两种情况在返回值上一样、在日志里不一样。
 func (s *server) iosInstallURL(ctx context.Context, tenant string) string {
 	record, err := s.iosReleaseIdentityRecord(ctx, tenant)
-	if err != nil || record == nil {
+	if err != nil {
+		slog.Error("release.ios cannot be read; iOS clients get no install entry point",
+			"tenant", tenant, "error", err)
+		return ""
+	}
+	if record == nil {
 		return ""
 	}
 	return record.Value.InstallURL

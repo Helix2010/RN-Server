@@ -139,6 +139,12 @@ func (s *server) completeIOSBuildJob(c *gin.Context) {
 			releaseID = lockedRelease.String
 			return nil, nil
 		}
+		// 同一次认领已经完成过，但这次报的是另一份产物（有人重跑了构建，或手工调了接口）。
+		// 说成"认领已过期"会把人引去查任务状态，而真正发生的是"这条任务已经有结果了"
+		if status == jobSucceeded && lockedRelease.Valid && lockedAttempt == job.Attempt && lockedMachine.String == machine.ID {
+			return &releaseRejection{Status: http.StatusConflict, Code: "IOS_RESULT_CONFLICT",
+				Detail: "This claim already completed with a different package; the recorded release is not replaced"}, nil
+		}
 		if !buildJobTransitionAllowed(eventBuilderIOSRelease, jobKindAPK, status) ||
 			lockedAttempt != job.Attempt || lockedMachine.String != machine.ID {
 			return &releaseRejection{Status: http.StatusConflict, Code: "BUILD_ATTEMPT_STALE",

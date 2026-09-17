@@ -173,11 +173,17 @@ func (m buildMachine) canBuild(platform string) bool {
 	return containsString(m.buildPlatforms(), platform)
 }
 
-// hasLiveBuilderFor 回答"现在有没有一台没被吊销的构建机能构建这个平台"。
+// hasLiveBuilderFor 回答"现在有没有一台**能认领**这个平台的构建机"。
 // 排队时用它：让"没有 Mac"在点下按钮的那一刻就说出来，而不是排成一条永远没人认领的任务。
+//
+// 只算 active。这不是保守，是判据本身：pending_enrollment 还没有令牌、pending_key 的
+// 公钥还没被接受，两者都过不了认领时的鉴权。把它们算进来，这道闸就会在"机器还在装"
+// 这个最常见的窗口里放行一条没人能领的任务。
+//
+// 这道闸是尽力而为的：一台 active 但已经关机的机器同样领不到，那件事这里看不出来。
 func (d buildMachinesDoc) hasLiveBuilderFor(platform string) bool {
 	for _, m := range d.Machines {
-		if m.Role == machineRoleBuilder && m.Status != machineStatusRevoked && m.canBuild(platform) {
+		if m.Role == machineRoleBuilder && m.Status == machineStatusActive && m.canBuild(platform) {
 			return true
 		}
 	}

@@ -47,9 +47,9 @@ func TestNormalizeBuildPlatforms(t *testing.T) {
 	}
 }
 
-// 排队时的判据：有没有一台**没被吊销**的构建机能干这个平台。
-// 吊销的机器不算——它的令牌已经作废，认领不了任何东西。
-func TestHasLiveBuilderForSkipsRevokedAndSigners(t *testing.T) {
+// 排队时的判据：有没有一台**能认领**的构建机能干这个平台。
+// 吊销的、还没装完的都不算——它们都过不了认领时的鉴权。
+func TestHasLiveBuilderForOnlyCountsMachinesThatCanClaim(t *testing.T) {
 	doc := buildMachinesDoc{Machines: []buildMachine{
 		{ID: "mch_a", Role: machineRoleBuilder, Status: machineStatusActive},
 		{ID: "mch_b", Role: machineRoleBuilder, Status: machineStatusRevoked, Platforms: []string{buildPlatformIOS}},
@@ -61,12 +61,19 @@ func TestHasLiveBuilderForSkipsRevokedAndSigners(t *testing.T) {
 	if doc.hasLiveBuilderFor(buildPlatformIOS) {
 		t.Fatal("a revoked mac must not make ios look available")
 	}
-	// 还没注册完的机器也算：它已经登记了，运营正在装，任务可以先排着
+	// 还在装的机器不算：它还没有令牌，过不了认领时的鉴权。把它算进来，这道闸就会
+	// 在"机器还在装"这个最常见的窗口里放行一条没人能领的任务
 	doc.Machines = append(doc.Machines, buildMachine{
 		ID: "mch_d", Role: machineRoleBuilder, Status: machineStatusPendingEnrollment, Platforms: []string{buildPlatformIOS},
 	})
+	if doc.hasLiveBuilderFor(buildPlatformIOS) {
+		t.Fatal("a mac that has not finished enrolling cannot claim anything")
+	}
+	doc.Machines = append(doc.Machines, buildMachine{
+		ID: "mch_e", Role: machineRoleBuilder, Status: machineStatusActive, Platforms: []string{buildPlatformIOS},
+	})
 	if !doc.hasLiveBuilderFor(buildPlatformIOS) {
-		t.Fatal("a mac that is being enrolled must make ios available")
+		t.Fatal("an active mac must make ios available")
 	}
 }
 

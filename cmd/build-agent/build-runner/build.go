@@ -136,6 +136,13 @@ func (j job) buildAPK(ctx context.Context) error {
 // 门禁在 RN-App 的 scripts/build-ios-release.mjs 里：bundle id、版本、CFBundleVersion、
 // 内嵌 extra.buildNumber、OTA 请求头、权限文案、applinks entitlement 逐条核对。
 // 这里只负责跑它、确认产物在、交回去。
+//
+// **第一台 Mac 上大概率先撞这一条**：子进程的 HOME 被改成了这次任务自己的目录
+// （jobspec.jobPathEnv，为的是 Gradle / pnpm 的缓存隔离），而 macOS 的签名身份在
+// **登录钥匙串**里，路径是 $HOME/Library/Keychains——HOME 一换，codesign 就找不到
+// 证书。这条在 Linux 上验不出来，所以没有先写一个没跑过的修法。真机上按这个顺序试：
+// 先把签名身份导进一个独立钥匙串并在机器安装时 `security list-keychains` 加进搜索
+// 列表（隔离仍然成立），不行再考虑 iOS 任务不改写 HOME。
 func (j job) buildIPA(ctx context.Context) error {
 	app := j.layout.App()
 	if err := j.run(ctx, "pnpm", "install", "--frozen-lockfile"); err != nil {
@@ -156,6 +163,8 @@ func (j job) buildIPA(ctx context.Context) error {
 	if err := copyFile(artifact, j.layout.OutFile(jobspec.IPAFileName), 0o640); err != nil {
 		return fmt.Errorf("cannot hand over the iOS package: %w", err)
 	}
+	// 报的是"这次有没有要求上传"，而它等于"有没有传成功"：上传失败的话上面那条
+	// pnpm 会非零退出，整个任务已经判失败，走不到这里
 	return j.writeResult(jobspec.Result{
 		Version: jobspec.ResultVersion, Kind: jobspec.KindAPK,
 		UploadedToAppStoreConnect: j.spec.IOSUpload,

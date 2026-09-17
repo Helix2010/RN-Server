@@ -590,3 +590,12 @@ Android 那套是给签名闸验货用的：构建机交未签名包，签名闸
 ### 10.3 还没有被验证的部分
 
 打包机的 iOS 路径在这台 Linux 上只能用假 `pnpm` 跑通协议（领取 → 写 spec → 交付 `.ipa` → `/ios-release`）。**真正的 `xcodebuild` 一行都没跑过**：archive、`-exportArchive`、`-allowProvisioningUpdates` 自动申请描述文件、`codesign -d --entitlements`、`plutil -convert json`、`xcrun altool --upload-app` 全部要在第一台 Mac 上验（阶段 1 第 9 条）。
+
+**已经能预判的一条**：执行进程给子进程的 `HOME` 被改成了这次任务自己的目录（`jobspec.jobPathEnv`，为的是 Gradle 与 pnpm 的缓存隔离），而 macOS 的签名身份在**登录钥匙串**里、路径是 `$HOME/Library/Keychains`。HOME 一换，`codesign` 就找不到证书——这几乎肯定是第一台 Mac 上撞到的第一个错。
+
+没有先写一个没跑过的修法，因为这件事在 Linux 上验不出来，而"看起来对的修法"会把问题藏到更远的地方。真机上按这个顺序试：
+
+1. 把签名身份导进一台机器专用的独立钥匙串，在机器安装时用 `security list-keychains -s` 加进搜索列表并解锁（缓存隔离仍然成立，只是签名材料不在任务目录里）；
+2. 不行再考虑 iOS 任务不改写 `HOME`——那会让 pnpm 缓存回到用户主目录，隔离性变差，所以是退路不是首选。
+
+这条也是 §4.8 末尾「macOS 上的执行进程隔离要单独准备钥匙串」那句话的具体内容。

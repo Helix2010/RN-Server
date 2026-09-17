@@ -133,6 +133,8 @@ func TestIOSInstallURLOnlyAcceptsApplesOwnEntryPoints(t *testing.T) {
 		"只有斜杠":       "https://testflight.apple.com/",
 		"自定义 scheme": "itms-beta://testflight.apple.com/join/ABCD1234",
 		"太长":         "https://testflight.apple.com/join/" + strings.Repeat("A", 260),
+		// 真正打开的确实是 Apple，但这个字符串会原样印进二维码、出现在 App 的更新按钮上
+		"带 userinfo": "https://evil.example@testflight.apple.com/join/ABCD1234",
 	} {
 		if err := validateIOSInstallURL(url); err == nil {
 			t.Fatalf("%s: expected a rejection for %q", name, url)

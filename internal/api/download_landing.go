@@ -90,37 +90,48 @@ func downloadLandingPlatform(userAgent string) string {
 	}
 }
 
-func (s *server) downloadLandingPage(c *gin.Context) {
-	ctx := c.Request.Context()
-	tenant := tenantID(c)
-	guess := downloadLandingPlatform(c.GetHeader("User-Agent"))
-	showIOS := guess == "" || guess == "ios"
-	showAndroid := guess == "" || guess == "android"
-
-	// 平台没在 release.platforms 里开启，就连置灰的按钮都不要出现：那不是"还没发
-	// 版"，是这个租户根本不做这个平台
-	if showIOS {
-		if enabled, err := s.platformEnabled(ctx, tenant, "ios"); err != nil || !enabled {
-			showIOS = false
-		}
+// downloadLandingVisibility 决定这次要显示哪些按钮。
+//
+// 两个概念不能混：`enabled` 是"这个租户做不做这个平台"（release.platforms），
+// `show` 是"这个访客该看到哪个按钮"。混在一起会出一个安静的错——UA 判成 iOS 而这个
+// 租户只做 Android 时，兜底会把两个都打开，于是**一个被租户关掉的平台也跟着有了
+// 可用的下载按钮**。所以兜底只在开启的平台之间做。
+func downloadLandingVisibility(guess string, iosEnabled, androidEnabled bool) (showIOS, showAndroid bool) {
+	showIOS = iosEnabled && (guess == "" || guess == "ios")
+	showAndroid = androidEnabled && (guess == "" || guess == "android")
+	// UA 指向的那个平台这个租户不做：把它做的那些显示出来，而不是给一张空卡片
+	if !showIOS && !showAndroid {
+		showIOS, showAndroid = iosEnabled, androidEnabled
 	}
-	if showAndroid {
-		if enabled, err := s.platformEnabled(ctx, tenant, "android"); err != nil || !enabled {
-			showAndroid = false
-		}
-	}
-	// 两个都不开放时仍然渲染页面（会是一张只有标题的卡片）。见文件头：这个地址
-	// 被印在物料上，任何情况下都不该是 404。
+	// 两个都不做：仍然渲染页面，两个按钮都置灰。见文件头——这个地址被印在物料上，
+	// 任何情况下都不该是 404
 	if !showIOS && !showAndroid {
 		showIOS, showAndroid = true, true
 	}
+	return showIOS, showAndroid
+}
+
+func (s *server) downloadLandingPage(c *gin.Context) {
+	ctx := c.Request.Context()
+	tenant := tenantID(c)
+	// 读不出配置按"不做这个平台"算：置灰一个其实可用的按钮，比给出一个点了没反应的好
+	iosEnabled, err := s.platformEnabled(ctx, tenant, "ios")
+	if err != nil {
+		iosEnabled = false
+	}
+	androidEnabled, err := s.platformEnabled(ctx, tenant, "android")
+	if err != nil {
+		androidEnabled = false
+	}
+	showIOS, showAndroid := downloadLandingVisibility(
+		downloadLandingPlatform(c.GetHeader("User-Agent")), iosEnabled, androidEnabled)
 
 	iosURL := ""
-	if showIOS {
+	if iosEnabled && showIOS {
 		iosURL = s.iosInstallURL(ctx, tenant)
 	}
 	androidURL := ""
-	if showAndroid && s.hasPublicRelease(ctx, tenant, "android") {
+	if androidEnabled && showAndroid && s.hasPublicRelease(ctx, tenant, "android") {
 		// 带上 platform：那条路由缺参数时默认 android，但依赖默认值等于把这个页面
 		// 的正确性寄托在别处的一行兜底上
 		androidURL = s.absoluteURL(c, "/v1/public/releases/latest/download?platform=android")

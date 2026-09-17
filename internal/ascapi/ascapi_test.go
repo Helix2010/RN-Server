@@ -105,8 +105,12 @@ func TestParsePrivateKeyRejectsThingsThatAreNotAnASCKey(t *testing.T) {
 // 私钥不能出现在日志、错误、格式化输出里。一次 %v 就够把这把钥匙交出去。
 func TestKeyNeverPrintsThePrivateKey(t *testing.T) {
 	key := testKey(t)
+	// 这里就是要走 fmt 的各个动词，验的是"随手一个 %v/%s/%#v 也不会漏"，
+	// 所以不能换成 key.String()——那会绕开被测的那条路径。
+	//lint:ignore S1025 走的就是 fmt 动词这条路径，换成 String() 就不是这个测试了
+	viaVerbS := fmt.Sprintf("%s", key)
 	for _, rendered := range []string{
-		fmt.Sprintf("%v", key), fmt.Sprintf("%s", key), fmt.Sprintf("%#v", key),
+		fmt.Sprintf("%v", key), viaVerbS, fmt.Sprintf("%#v", key),
 		key.LogValue().String(),
 	} {
 		if strings.Contains(rendered, "PRIVATE KEY") || strings.Contains(rendered, key.PrivateKeyPEM) {
