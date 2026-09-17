@@ -512,7 +512,7 @@ func TestStandbyAcceptsOnlyTrustedGenerators(t *testing.T) {
 		opts.role = records.RoleStandby
 		h := newHarness(t, opts)
 		primary := newPeerMachine(t, "amos-signer-main", "mch_signerM0001")
-		must(t, h.store.TrustPeer(primary.trust(records.TrustModeEnrollFirstTrust)))
+		must(t, h.store.TrustPeer(primary.trust(records.TrustModeOperator)))
 		return h, primary
 	}
 	serve := func(t *testing.T, h *harness, g GeneratedKeystore, requestID string, p peerMachine, roots trustroots.Roots) {

@@ -26,7 +26,11 @@ const (
 
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 && os.Args[1] == "enroll-init" {
-		// rootHost.Init 以 "<可执行文件> enroll-init" 启动子进程
+		// rootHost.Init 以 "<可执行文件> enroll-init" 启动子进程；注册码不能传进降权的子进程
+		if _, ok := os.LookupEnv(EnvEnrollmentCode); ok {
+			fmt.Fprintf(os.Stderr, "enroll-init inherited %s\n", EnvEnrollmentCode)
+			os.Exit(3)
+		}
 		os.Exit(EnrollInitMain(os.Stdin, os.Stdout, os.Stderr))
 	}
 	// RSA 生成在 -race 下很慢：生成密钥的测试从一个小密钥池里轮流取（相邻两次一定不同）

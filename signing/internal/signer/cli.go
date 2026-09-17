@@ -18,8 +18,9 @@ import (
 )
 
 const usageText = `用法 / usage:
-  signer enroll         --server URL --code rne_… --env-file FILE --recovery-sha256 HEX [--name-check NAME]
-                                            新机器注册（install.sh 以 root 执行）
+  signer enroll         --server URL [--code rne_…] --env-file FILE --recovery-sha256 HEX [--name-check NAME]
+                                            新机器注册（install.sh 以 root 执行；注册码也可放在环境变量
+                                            RN_ENROLLMENT_CODE 里，不进进程参数）。本机一律从备开始
   signer run            [--env-file FILE]   签名闸主进程（systemd 启动）
   signer show-key       [--env-file FILE]   打印本机公钥与 pin 文件片段（只读）
   signer confirm        --tenant SLUG [--env-file FILE]
@@ -120,8 +121,11 @@ func Main(args []string, stdin *os.File, stdout, stderr io.Writer, getenv func(s
 	}
 	if cmd == "enroll" {
 		// enroll 自己读写 env 文件（里面还没有令牌），不走下面的配置加载
-		err := Enroll(context.Background(), EnrollOptions{ServerURL: *server, Code: *code, EnvFile: *envFile, RecoverySHA256: *recoverySHA, NameCheck: *nameCheck},
-			NewHTTPClient(*server, "", newTransport()), newRootHost(), stdout)
+		enrollCode, err := enrollmentCode(*code, getenv)
+		if err == nil {
+			err = Enroll(context.Background(), EnrollOptions{ServerURL: *server, Code: enrollCode, EnvFile: *envFile, RecoverySHA256: *recoverySHA, NameCheck: *nameCheck},
+				NewHTTPClient(*server, "", newTransport()), newRootHost(), stdout)
+		}
 		if err != nil {
 			fmt.Fprintln(stderr, "错误:", cleanText(err.Error(), 2000))
 		}
