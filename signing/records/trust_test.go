@@ -406,6 +406,30 @@ func TestPromoteRevokesThePreviousPrimary(t *testing.T) {
 	}
 }
 
+// 评审 P2-1：首次信任按租户判断。租户在本机确认过（任何包名，含已被取代的确认）就不再首次信任。
+func TestTenantConfirmedPackage(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	if _, ok, err := s.TenantConfirmedPackage("AnyFun"); ok || err != nil {
+		t.Fatalf("a fresh record knows the tenant: %v %v", ok, err)
+	}
+	must(t, s.Confirm(confirmation(t)))
+	// 这个包名后来确认给了另一个租户：AnyFun 仍算确认过
+	moved := confirmation(t)
+	moved.TenantSlug, moved.CertificateSHA256 = "Predict", certB
+	must(t, s.Confirm(moved))
+	s.Close()
+	s = f.open(t)
+	for tenant, want := range map[string]string{"AnyFun": pkg, "Predict": pkg} {
+		if got, ok, err := s.TenantConfirmedPackage(tenant); !ok || err != nil || got != want {
+			t.Errorf("%s: %q %v %v", tenant, got, ok, err)
+		}
+	}
+	if _, ok, _ := s.TenantConfirmedPackage("Other"); ok {
+		t.Fatal("an unknown tenant is reported as confirmed")
+	}
+}
+
 // 修复之前的 enroll 写过「注册即为主」与「首次信任服务端给的主」（只在开发环境出现过）：这两种记录现在
 // 校验不过，签名闸拒绝启动，按新机器重装，不会带着服务端定下的主或信任继续运行。
 func TestPreFixEnrollRecordsAreRefused(t *testing.T) {

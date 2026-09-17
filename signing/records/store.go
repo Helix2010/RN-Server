@@ -134,6 +134,8 @@ type trustState struct {
 	certificates map[string]map[string]bool
 	peers        map[string]PeerTrust     // 按机器名
 	recovery     map[string]RecoveryTrust // 按公钥指纹
+	// tenants 是每个确认过的租户最后一次确认的包名（含已被取代的确认）：首次信任只对本机从没确认过的租户
+	tenants map[string]string
 }
 
 type signedState struct {
@@ -151,6 +153,7 @@ func newTrustState() *trustState {
 		certificates:  map[string]map[string]bool{},
 		peers:         map[string]PeerTrust{},
 		recovery:      map[string]RecoveryTrust{},
+		tenants:       map[string]string{},
 	}
 }
 
@@ -178,6 +181,9 @@ func (ts *trustState) clone() *trustState {
 	}
 	for k, v := range ts.recovery {
 		out.recovery[k] = v
+	}
+	for k, v := range ts.tenants {
+		out.tenants[k] = v
 	}
 	return out
 }
@@ -612,6 +618,12 @@ func sameConfirmation(a, b Confirmation) bool {
 		a.GeneratorName == b.GeneratorName && a.GeneratorEd25519SHA256 == b.GeneratorEd25519SHA256 && a.ConfirmedAt == b.ConfirmedAt
 }
 
+// TenantConfirmedPackage 报告这个租户是否在本机确认过（任何包名，含已被取代的确认），返回最后一次确认的包名。
+func (s *Store) TenantConfirmedPackage(tenantSlug string) (packageName string, ok bool, err error) {
+	err = s.read(s.trust, func() { packageName, ok = s.ts.tenants[tenantSlug] })
+	return packageName, ok, err
+}
+
 // CertificateSeen 报告这张证书是否为这个包名确认过（含已被取代的确认）。
 func (s *Store) CertificateSeen(packageName, certificateSHA256 string) (bool, error) {
 	var out bool
@@ -1027,6 +1039,7 @@ func applyTrust(ts *trustState, e entry) error {
 			ts.certificates[c.PackageName] = map[string]bool{}
 		}
 		ts.certificates[c.PackageName][c.CertificateSHA256] = true
+		ts.tenants[c.TenantSlug] = c.PackageName
 	case typePeer:
 		var p PeerTrust
 		if err := strictUnmarshal(e.Data, &p); err != nil {
