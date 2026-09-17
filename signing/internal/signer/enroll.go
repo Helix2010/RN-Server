@@ -33,6 +33,12 @@ import (
 // 运维命令都拒绝使用这个状态目录；再次执行 enroll 会清掉重来（那套密钥没有令牌，不会被服务端接受）。
 const enrollMarkerFile = "enroll.incomplete"
 
+// EnvEnrollmentCode 是 signer enroll 读注册码的环境变量（install.sh 用它，注册码不进进程参数）。
+const EnvEnrollmentCode = "RN_ENROLLMENT_CODE"
+
+// installedSignerPath 是 install.sh 安装 signer 的位置（打印下一步命令用）。
+const installedSignerPath = "/opt/rn-signer/bin/signer"
+
 // errEnrollPending：状态目录里的注册没完成。
 var errEnrollPending = errors.New("this signing gate's enrollment did not finish (enroll.incomplete); run the install command (signer enroll) again")
 
@@ -45,7 +51,8 @@ type EnrollOptions struct {
 	NameCheck      string
 }
 
-// DescribeResponse 是 POST /v1/machine-setup/describe 的响应（签名闸用到的部分）。
+// DescribeResponse 是 POST /v1/machine-setup/describe 的响应（签名闸用到的部分）。SignerRole 与 PrimarySigner
+// 只用来打印下一步提示：本机角色一律写备，签名闸之间的信任只由本机 trust-peer 写入。
 type DescribeResponse struct {
 	MachineID     string            `json:"machineId"`
 	Name          string            `json:"name"`
@@ -55,14 +62,11 @@ type DescribeResponse struct {
 	PrimarySigner *PrimarySigner    `json:"primarySigner"`
 }
 
-// PrimarySigner 是 describe 给备签名闸的当前主签名闸（首次信任）。
+// PrimarySigner 是 describe 给备签名闸的当前主签名闸。只读机器名用于提示；服务端给的公钥与指纹不读、不上屏
+// （运维要从主签名闸本机抄指纹）。
 type PrimarySigner struct {
-	MachineID              string `json:"machineId"`
-	Name                   string `json:"name"`
-	X25519PublicKey        string `json:"x25519PublicKey"`
-	X25519PublicKeySHA256  string `json:"x25519PublicKeySha256"`
-	Ed25519PublicKey       string `json:"ed25519PublicKey"`
-	Ed25519PublicKeySHA256 string `json:"ed25519PublicKeySha256"`
+	MachineID string `json:"machineId"`
+	Name      string `json:"name"`
 }
 
 // EnrollResponse 是 POST /v1/machine-setup/enroll 的响应。Token 是机密：格式化输出不含它。
@@ -108,14 +112,13 @@ func (c *HTTPClient) Enroll(ctx context.Context, code string, x25519Pub, ed25519
 
 // ---- 以签名闸用户身份做的那一步（enroll-init）----
 
-// enrollInitRequest 是 root 进程交给签名闸用户子进程的请求（stdin，一行 JSON）。
+// enrollInitRequest 是 root 进程交给签名闸用户子进程的请求（stdin，一行 JSON）。没有角色与受信签名闸：
+// 本机记录一律从备开始，不信任任何签名闸。
 type enrollInitRequest struct {
 	Probe    bool                   `json:"probe"`
 	StateDir string                 `json:"stateDir"`
 	Name     string                 `json:"name"`
-	Role     records.Role           `json:"role"`
 	Recovery *records.RecoveryTrust `json:"recovery"`
-	Primary  *records.PeerTrust     `json:"primary"`
 }
 
 // enrollInitResult 是子进程的回答（stdout，一行 JSON）。
@@ -138,7 +141,8 @@ func (r enrollInitResult) keys() (x, ed []byte, err error) {
 	return x, ed, nil
 }
 
-// runEnrollInit 在签名闸用户身份下执行：探测状态目录，或生成本机密钥与初始记录（留下 enroll 标记）。
+// runEnrollInit 在签名闸用户身份下执行：探测状态目录，或生成本机密钥与初始记录（角色备、受信恢复公钥；
+// 留下 enroll 标记）。
 func runEnrollInit(req enrollInitRequest) (enrollInitResult, error) {
 	if !filepath.IsAbs(req.StateDir) || filepath.Clean(req.StateDir) != req.StateDir {
 		return enrollInitResult{}, errors.New("state directory must be an absolute clean path")
@@ -220,17 +224,12 @@ func runEnrollInit(req enrollInitRequest) (enrollInitResult, error) {
 		return enrollInitResult{}, err
 	}
 	defer store.Close()
-	if err := store.SetRole(records.RoleChange{Role: req.Role, Mode: records.RoleModeEnroll, Operator: records.EnrollOperator,
-		Reason: "initial role from the server at enrollment"}); err != nil {
+	if err := store.SetRole(records.RoleChange{Role: records.RoleStandby, Mode: records.RoleModeEnroll, Operator: records.EnrollOperator,
+		Reason: "new signing gate: standby until signer promote on this machine"}); err != nil {
 		return enrollInitResult{}, err
 	}
 	if req.Recovery != nil {
 		if err := store.TrustRecovery(*req.Recovery); err != nil {
-			return enrollInitResult{}, err
-		}
-	}
-	if req.Primary != nil {
-		if err := store.TrustPeer(*req.Primary); err != nil {
 			return enrollInitResult{}, err
 		}
 	}
@@ -472,18 +471,37 @@ func updateEnvFile(raw []byte, values map[string]string) []byte {
 
 // ---- signer enroll ----
 
-// Enroll 是 signer enroll（约定第 4 节）：
+// enrollmentCode 取注册码：--code，或环境变量 RN_ENROLLMENT_CODE（install.sh 用后者，注册码不进进程参数、
+// 不进 ps）。两者都给且不同就拒绝。环境变量读完就从本进程环境里删掉；以签名闸用户身份启动的 enroll-init
+// 子进程本来就只拿到固定的 PATH、LANG。（/proc/<pid>/environ 仍是启动时的内容，只有 root 与同一用户读得到。）
+func enrollmentCode(flagCode string, getenv func(string) string) (string, error) {
+	envCode := getenv(EnvEnrollmentCode)
+	_ = os.Unsetenv(EnvEnrollmentCode)
+	switch {
+	case envCode != "" && flagCode != "" && envCode != flagCode:
+		// 不回显注册码
+		return "", fmt.Errorf("--code and %s hold different enrollment codes; give the code only once", EnvEnrollmentCode)
+	case envCode != "":
+		return envCode, nil
+	}
+	return flagCode, nil
+}
+
+// Enroll 是 signer enroll（约定第 4 节，按「信任只在签名闸本机确认」收紧）：
 //
-//	核对 env 与状态目录 → 已注册就幂等退出 → describe → 核对恢复公钥 sha256 与主备 →
-//	以签名闸用户身份生成本机密钥、写初始角色、恢复公钥、首次信任的主签名闸（留 enroll 标记）→
-//	enroll 换令牌 → 原子替换 env（令牌不经过屏幕）→ 清标记 → 打印机器名与完整指纹。
+//	核对 env 与状态目录 → 已注册就幂等退出 → describe → 核对恢复公钥 sha256 →
+//	以签名闸用户身份生成本机密钥、写初始角色（一律是备）与恢复公钥（留 enroll 标记）→
+//	enroll 换令牌 → 原子替换 env（令牌不经过屏幕）→ 清标记 → 打印机器名、完整指纹与下一步。
+//
+// 服务端给的主备与主签名闸只用于提示：服务端被攻破时不能让新机器本机为主（绕过 promote、与现有主各签
+// 同一个 versionCode），也不能让备从此自动接受它指定的「主」生成的密钥。
 func Enroll(ctx context.Context, opts EnrollOptions, api SetupAPI, host enrollHost, stdout io.Writer) error {
 	if err := validateServerURL(opts.ServerURL); err != nil {
 		return fmt.Errorf("--server %q: %v", opts.ServerURL, err)
 	}
 	if !machinekey.ValidEnrollmentCode(opts.Code) {
 		// 不回显注册码
-		return errors.New("--code is not an enrollment code (rne_ followed by 43 base64url characters); copy the install command from the console again")
+		return fmt.Errorf("the enrollment code (--code or %s) is not an enrollment code (rne_ followed by 43 base64url characters); copy the install command from the console again", EnvEnrollmentCode)
 	}
 	if !filepath.IsAbs(opts.EnvFile) || filepath.Clean(opts.EnvFile) != opts.EnvFile {
 		return errors.New("--env-file must be an absolute clean path such as /etc/rn-signer-<instance>.env")
@@ -536,7 +554,7 @@ func Enroll(ctx context.Context, opts EnrollOptions, api SetupAPI, host enrollHo
 			return fmt.Errorf("%s names machine %s, but the local records belong to %s", opts.EnvFile, values[EnvName], probe.Name)
 		}
 		fmt.Fprintf(stdout, "signing gate %s is already enrolled; nothing to do\n", probe.Name)
-		return printEnrolled(stdout, probe, "", "", "")
+		return printEnrolled(stdout, probe, "")
 	case probe.State == "initialized":
 		return fmt.Errorf("%s already holds machine keys and local records but %s has no machine token; enroll only initializes a new signing gate", stateDir, opts.EnvFile)
 	}
@@ -577,19 +595,13 @@ func Enroll(ctx context.Context, opts EnrollOptions, api SetupAPI, host enrollHo
 	if recoveryTrust == nil {
 		return fmt.Errorf("the server has no recovery key with SHA-256 %s; check the value from the password manager, or register recovery-public.json in the console first", recoverySHA)
 	}
-	var primaryTrust *records.PeerTrust
-	if signerRole == string(records.RoleStandby) && desc.PrimarySigner != nil {
-		p := desc.PrimarySigner
-		v, err := verifyPeerSigner(PeerSigner{MachineID: p.MachineID, Name: p.Name, Status: "active", X25519PublicKey: p.X25519PublicKey,
-			X25519PublicKeySHA256: p.X25519PublicKeySHA256, Ed25519PublicKey: p.Ed25519PublicKey, Ed25519PublicKeySHA256: p.Ed25519PublicKeySHA256})
-		if err != nil || p.Name == desc.Name {
-			return &ProtocolError{Msg: "describe returned a malformed primary signing gate"}
-		}
-		primaryTrust = &records.PeerTrust{Name: v.Name, X25519PublicKeySHA256: v.X25519PublicKeySHA256, Ed25519PublicKeySHA256: v.Ed25519PublicKeySHA256,
-			Mode: records.TrustModeEnrollFirstTrust, Operator: records.EnrollOperator, Note: "first trust: the server's primary signing gate at enrollment"}
+	// 服务端说的当前主签名闸：只取机器名打印提示（不合格就当没有），不写记录
+	primaryName := ""
+	if p := desc.PrimarySigner; p != nil && ident.ValidMachineName(p.Name) && p.Name != desc.Name {
+		primaryName = p.Name
 	}
 
-	initResult, err := host.Init(acct, enrollInitRequest{StateDir: stateDir, Name: desc.Name, Role: records.Role(signerRole), Recovery: recoveryTrust, Primary: primaryTrust})
+	initResult, err := host.Init(acct, enrollInitRequest{StateDir: stateDir, Name: desc.Name, Recovery: recoveryTrust})
 	if err != nil {
 		return err
 	}
@@ -620,15 +632,15 @@ func Enroll(ctx context.Context, opts EnrollOptions, api SetupAPI, host enrollHo
 	if err := securefs.SyncDir(stateDir); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "enrolled signing gate %s (machine id %s, %s, local role %s)\n", desc.Name, desc.MachineID, cleanText(enrolled.Status, 40), signerRole)
-	primaryLine := ""
-	if primaryTrust != nil {
-		primaryLine = fmt.Sprintf("%s (x25519 %s, ed25519 %s; first trust from the server — compare with that machine's fingerprints)", primaryTrust.Name, primaryTrust.X25519PublicKeySHA256, primaryTrust.Ed25519PublicKeySHA256)
+	fmt.Fprintf(stdout, "enrolled signing gate %s (machine id %s, %s, local role standby)\n", desc.Name, desc.MachineID, cleanText(enrolled.Status, 40))
+	if err := printEnrolled(stdout, initResult, recoveryTrust.Name+" "+recoverySHA); err != nil {
+		return err
 	}
-	return printEnrolled(stdout, initResult, signerRole, recoveryTrust.Name+" "+recoverySHA, primaryLine)
+	printEnrollNextSteps(stdout, enrollNextSteps{name: desc.Name, consoleRole: signerRole, primaryName: primaryName, user: acct.Name, envFile: opts.EnvFile})
+	return nil
 }
 
-func printEnrolled(w io.Writer, r enrollInitResult, role, recoveryLine, primaryLine string) error {
+func printEnrolled(w io.Writer, r enrollInitResult, recoveryLine string) error {
 	x, ed, err := r.keys()
 	if err != nil {
 		return err
@@ -637,15 +649,38 @@ func printEnrolled(w io.Writer, r enrollInitResult, role, recoveryLine, primaryL
 	if recoveryLine != "" {
 		fmt.Fprintf(w, "  recovery key:    %s\n", recoveryLine)
 	}
-	if primaryLine != "" {
-		fmt.Fprintf(w, "  trusts primary:  %s\n", primaryLine)
-	}
-	fmt.Fprintf(w, "next: accept this machine in the console (compare both fingerprints above).\n")
-	switch role {
-	case string(records.RoleStandby):
-		fmt.Fprintf(w, "      On the primary signing gate run `signer trust-peer --peer %s` and paste these fingerprints,\n      so that new keystores are also encrypted to this machine.\n", r.Name)
-	case string(records.RolePrimary):
-		fmt.Fprintf(w, "      On every standby signing gate run `signer trust-peer --peer %s` and paste these fingerprints;\n      on this machine run `signer trust-peer` for each standby and `signer trust-builder --builder <name>` for each builder.\n", r.Name)
-	}
 	return nil
+}
+
+// enrollNextSteps 是注册后打印的下一步。consoleRole、primaryName 来自服务端，只决定提示的内容。
+type enrollNextSteps struct {
+	name, consoleRole, primaryName, user, envFile string
+}
+
+func printEnrollNextSteps(w io.Writer, n enrollNextSteps) {
+	cmd := func(args string) string {
+		return fmt.Sprintf("sudo -u %s %s %s --env-file %s", n.user, installedSignerPath, args, n.envFile)
+	}
+	fmt.Fprintf(w, "\nThis machine is a standby in its local records. The console's primary/standby only routes jobs;\n"+
+		"only `signer promote` on this machine makes it primary, and it trusts signing gates only through `signer trust-peer` here.\n")
+	fmt.Fprintf(w, "next:\n  1. Accept this machine in the console (compare both fingerprints above digit by digit).\n")
+	if n.consoleRole == string(records.RolePrimary) {
+		fmt.Fprintf(w, "  2. The console registered this machine as the primary. If it is the platform's first primary signing gate,\n"+
+			"     stop its service and run on this machine:\n       %s\n"+
+			"     If it replaces an existing primary, promote with --import or --manual instead (README section 9).\n", cmd("promote --first"))
+		fmt.Fprintf(w, "  3. On this machine trust each builder and each standby:\n       %s\n       %s\n"+
+			"     On every standby run `signer trust-peer --peer %s` and paste the fingerprints above.\n",
+			cmd("trust-builder --builder <builder name>"), cmd("trust-peer --peer <standby name>"), n.name)
+		return
+	}
+	if n.primaryName != "" {
+		fmt.Fprintf(w, "  2. Trust the primary on this machine, pasting the fingerprints printed on the primary itself\n"+
+			"     (its install output or `signer show-key` there), never the console's:\n       %s\n", cmd("trust-peer --peer "+n.primaryName))
+	} else {
+		fmt.Fprintf(w, "  2. The server reports no primary signing gate yet: install the primary first, then trust it on this machine:\n       %s\n",
+			cmd("trust-peer --peer <primary name>"))
+	}
+	fmt.Fprintf(w, "  3. On the primary signing gate run `signer trust-peer --peer %s` and paste the fingerprints above,\n"+
+		"     so that new keystores are also encrypted to this machine.\n  4. On this machine trust each builder:\n       %s\n",
+		n.name, cmd("trust-builder --builder <builder name>"))
 }

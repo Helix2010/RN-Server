@@ -184,16 +184,27 @@ func readNewPassphrase(source passphraseSource) ([]byte, error) {
 
 // ---- recover ----
 
+// recoverKeystore 用离线恢复私钥解开导出的密文文件。
+//
+// 恢复公钥是公开的：谁都能把自己的密钥封给它、冒充控制台导出的文件，文件本身证明不了来源。离线锚点是
+// 已发布 App 的证书：--expect-certificate-sha256 必填（取 RN-App 仓库 git 历史里 tenant.json 的
+// signerSha256，或已发布 APK / 已安装设备上 apksigner verify --print-certs 读出的值，不取控制台），
+// 密文文件与解出的原件里的证书不是它就拒绝，不写任何文件。
 func recoverKeystore(args []string, stdout, stderr io.Writer) int {
 	set := flag.NewFlagSet("recover", flag.ContinueOnError)
 	keyPath := set.String("recovery-key", "", "恢复私钥文件 recovery-private.key")
 	uploadPath := set.String("upload", "", "控制台导出的密文文件")
 	outDir := set.String("out-dir", "", "原件目录，必须不存在")
+	expectCert := set.String("expect-certificate-sha256", "", "已发布 App 的签名证书 SHA-256（RN-App tenant.json 的 signerSha256 或 apksigner --print-certs，不取控制台）")
 	if err := parseFlags(set, args, stderr); err != nil {
 		return report(stderr, err)
 	}
-	if *keyPath == "" || *uploadPath == "" || *outDir == "" {
-		return report(stderr, usageError{msg: "缺少必填参数 --recovery-key、--upload、--out-dir"})
+	if *keyPath == "" || *uploadPath == "" || *outDir == "" || *expectCert == "" {
+		return report(stderr, usageError{msg: "缺少必填参数 --recovery-key、--upload、--out-dir、--expect-certificate-sha256"})
+	}
+	published, ok := fingerprint.Normalize(*expectCert)
+	if !ok {
+		return report(stderr, errors.New("--expect-certificate-sha256 必须是完整的 64 位十六进制 SHA-256（apksigner 的小写写法或 keytool 带冒号的写法都行）"))
 	}
 	keyRaw, err := readLimited(*keyPath, recovery.MaxFileSize)
 	if err != nil {
@@ -210,6 +221,10 @@ func recoverKeystore(args []string, stdout, stderr io.Writer) int {
 	upload, err := keystorebox.ParseUpload(uploadRaw)
 	if err != nil {
 		return report(stderr, fmt.Errorf("密文文件不合格: %v", err))
+	}
+	if upload.CertificateSHA256 != published {
+		return report(stderr, fmt.Errorf("密文文件记录的证书 SHA-256 是 %s，不是已发布 App 的 %s（--expect-certificate-sha256）。这份文件不是已发布 App 的签名密钥，不导出",
+			upload.CertificateSHA256, published))
 	}
 	box, ok := upload.BoxFor(privFile.X25519PublicKeySHA256)
 	if !ok {
@@ -265,6 +280,9 @@ func recoverKeystore(args []string, stdout, stderr io.Writer) int {
 		return report(stderr, fmt.Errorf("解开的 PKCS#12 原件用它的口令与别名打不开: %v", err))
 	}
 	certSHA := pkcs12.CertificateSHA256(entry)
+	if certSHA != published {
+		return report(stderr, fmt.Errorf("原件里的证书 SHA-256 是 %s，不是已发布 App 的 %s（--expect-certificate-sha256）。有人用公开的恢复公钥封了另一把密钥，不导出", certSHA, published))
+	}
 	if certSHA != upload.CertificateSHA256 {
 		return report(stderr, fmt.Errorf("原件里的证书 SHA-256 是 %s，与密文文件记录的 %s 不一致，不导出", certSHA, upload.CertificateSHA256))
 	}
@@ -305,7 +323,7 @@ func recoverKeystore(args []string, stdout, stderr io.Writer) int {
 租户:          %s
 包名:          %s
 别名:          %s
-证书 SHA-256:  %s （与密文文件一致）
+证书 SHA-256:  %s （与 --expect-certificate-sha256、密文文件一致）
 生成时间:      %s
 密文收件人:    %d 个
 
@@ -315,10 +333,9 @@ func recoverKeystore(args []string, stdout, stderr io.Writer) int {
   证书:          %s
 
 接下来:
-  1. 核对上面的证书 SHA-256 与密码管理器里记的一致。
-  2. 用 build-keystore seal --pins <新的 pin 文件> --p12 %s --password-file %s --tenant %s --package %s
+  1. 用 build-keystore seal --pins <新的 pin 文件> --p12 %s --password-file %s --tenant %s --package %s
      重新加密给新的签名闸，在控制台「导入已有密钥（高级）」上传，并在每台签名闸上 signer confirm。
-  3. 用完按「原件与配置机密的保管」处理本目录，擦除这台机器上的明文副本。
+  2. 用完按「原件与配置机密的保管」处理本目录，擦除这台机器上的明文副本。
 `, plain.TenantSlug, plain.PackageName, plain.KeyAlias, certSHA, plain.CreatedAt, len(plain.Recipients),
 		files.p12, files.password, files.cert, files.p12, files.password, plain.TenantSlug, plain.PackageName)
 	return 0

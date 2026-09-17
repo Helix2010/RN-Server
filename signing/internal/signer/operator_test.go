@@ -320,11 +320,17 @@ func oldPrimary(t *testing.T) (signedPath string, ed25519SHA string) {
 func TestPromoteImport(t *testing.T) {
 	path, oldSHA := oldPrimary(t)
 	h := newHarness(t, harnessOptions{role: records.RoleStandby})
+	// 备为了验证生成签名信任着旧主；另有一台受信的签名闸不受影响
+	must(t, h.store.TrustPeer(records.PeerTrust{Name: "amos-signer-old", X25519PublicKeySHA256: testfixture.Hex64('4'), Ed25519PublicKeySHA256: oldSHA, Mode: records.TrustModeOperator, Operator: "ops"}))
+	must(t, h.store.TrustPeer(records.PeerTrust{Name: "amos-signer-c", X25519PublicKeySHA256: testfixture.Hex64('5'), Ed25519PublicKeySHA256: testfixture.Hex64('6'), Mode: records.TrustModeOperator, Operator: "ops"}))
 	if err := Promote(h.operatorEnv(newTerm("ops-carol", "old primary is gone", testfixture.Hex64('7'))), PromoteImport, path); err == nil {
 		t.Fatal("imported with a fingerprint that is not the old primary's")
 	}
 	if role, _ := h.store.Role(); role.Role != records.RoleStandby {
 		t.Fatal("a failed import changed the role")
+	}
+	if peers, _ := h.store.TrustedPeers(); len(peers) != 2 {
+		t.Fatal("a failed import revoked a signing gate")
 	}
 	if err := Promote(h.operatorEnv(newTerm("ops-carol", "old primary is gone", h.keys.Ed25519SHA256())), PromoteImport, path); err == nil {
 		t.Fatal("imported this machine's own key")
@@ -344,6 +350,15 @@ func TestPromoteImport(t *testing.T) {
 	if !strings.Contains(term.out.String(), "3 reservations (2 not completed), highest versionCode 48") || !strings.Contains(term.out.String(), "last line sha256") {
 		t.Fatalf("import summary:\n%s", term.out.String())
 	}
+	// 评审 P1-3：被取代的旧主从本机信任里撤销（提示在输入机器名确认之前显示）
+	out := term.out.String()
+	notice := strings.Index(out, "amos-signer-old")
+	if peers, _ := h.store.TrustedPeers(); len(peers) != 1 || peers[0].Name != "amos-signer-c" {
+		t.Fatalf("the superseded primary is still trusted: %+v", peers)
+	}
+	if notice < 0 || notice > strings.Index(out, "Type this machine's name") || !strings.Contains(out, "reinstall it as a new machine") {
+		t.Fatalf("promote output does not announce the revocation first:\n%s", out)
+	}
 	// 旧主签出 47 没完成：新主能续签同一任务，签名状态随导入保留（不能释放），别的任务签不了 47
 	existing, err := h.store.Reserve(records.Reservation{JobID: "bld_oldPRIMARY0002", SignAttempt: 2, TenantSlug: "AnyFun", PackageName: testfixture.PackageName,
 		CertificateSHA256: h.key.CertificateSHA256, VersionCode: 47, UnsignedSHA256: testfixture.Hex64('2')}, testLimits)
@@ -360,9 +375,24 @@ func TestPromoteImport(t *testing.T) {
 
 func TestPromoteManualAndFirst(t *testing.T) {
 	h := newHarness(t, harnessOptions{role: records.RoleStandby})
-	term := newTerm("ops-dave", "old primary lost", "52", "", testMachine)
+	oldEd := testfixture.Hex64('7')
+	must(t, h.store.TrustPeer(records.PeerTrust{Name: "amos-signer-old", X25519PublicKeySHA256: testfixture.Hex64('4'), Ed25519PublicKeySHA256: oldEd, Mode: records.TrustModeOperator, Operator: "ops"}))
+	term := newTerm("ops-dave", "old primary lost", "52", oldEd, testMachine)
 	if err := Promote(h.operatorEnv(term), PromoteManual, ""); err != nil {
 		t.Fatalf("manual: %v\n%s", err, term.out.String())
+	}
+	if peers, _ := h.store.TrustedPeers(); len(peers) != 0 {
+		t.Fatalf("promote --manual with the old primary's fingerprint kept trusting it: %+v", peers)
+	}
+	// 没给旧主指纹：不猜，列出受信签名闸，提示运维自己撤销
+	noPrev := newHarness(t, harnessOptions{role: records.RoleStandby})
+	must(t, noPrev.store.TrustPeer(records.PeerTrust{Name: "amos-signer-old", X25519PublicKeySHA256: testfixture.Hex64('4'), Ed25519PublicKeySHA256: oldEd, Mode: records.TrustModeOperator, Operator: "ops"}))
+	noPrevTerm := newTerm("ops-dave", "old primary lost", "52", "", testMachine)
+	if err := Promote(noPrev.operatorEnv(noPrevTerm), PromoteManual, ""); err != nil {
+		t.Fatalf("manual without the old primary: %v", err)
+	}
+	if peers, _ := noPrev.store.TrustedPeers(); len(peers) != 1 || !strings.Contains(noPrevTerm.out.String(), "trust-peer --revoke --peer amos-signer-old") {
+		t.Fatalf("peers %+v output:\n%s", peers, noPrevTerm.out.String())
 	}
 	view, _ := h.store.SignedState(testfixture.PackageName, h.key.CertificateSHA256, "bld_x0000001", testfixture.Hex64('1'))
 	if !view.HasMax || view.Max != 52 {
@@ -387,6 +417,25 @@ func TestPromoteManualAndFirst(t *testing.T) {
 	must(t, withHistory.store.SetBaseline(records.Baseline{PackageName: testfixture.PackageName, CertificateSHA256: withHistory.key.CertificateSHA256, MaxVersionCode: 3, Operator: "ops"}))
 	if err := Promote(withHistory.operatorEnv(newTerm("ops", "first primary", testMachine)), PromoteFirst, ""); err == nil {
 		t.Fatal("--first accepted a machine with signing history")
+	}
+
+	// 本机接受过别的签名闸生成的密钥：之前有过主，--first 会跳过它的签名记录
+	followed := newHarness(t, harnessOptions{role: records.RoleStandby, noConfirm: true})
+	p := newPeerMachine(t, "amos-signer-main", "mch_signerM0001")
+	must(t, followed.store.TrustPeer(p.trust(records.TrustModeOperator)))
+	g := generateFor(t, "kgr_followed00001", p.ed, binding(followed.digest, 140, ""), followed.keys.X25519PublicKey())
+	followed.server.items = []map[string]any{followed.generatedItem(g, "kgr_followed00001", p.name, p.id, p.edPub(), followed.roots)}
+	followed.useGeneratedKey(g)
+	must(t, followed.runner.RunChecks(context.Background()))
+	if conf, _, _ := followed.store.ActiveConfirmation(testfixture.PackageName); conf.Mode != records.ConfirmModePeerGenerated {
+		t.Fatalf("setup: %+v", conf)
+	}
+	err := Promote(followed.operatorEnv(newTerm("ops", "first primary", testMachine)), PromoteFirst, "")
+	if err == nil || !strings.Contains(err.Error(), "amos-signer-main") || !strings.Contains(err.Error(), "--import") {
+		t.Fatalf("--first on a standby that followed a primary: %v", err)
+	}
+	if role, _ := followed.store.Role(); role.Role != records.RoleStandby {
+		t.Fatal("a refused --first changed the role")
 	}
 }
 

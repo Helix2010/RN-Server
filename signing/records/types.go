@@ -42,7 +42,8 @@ const (
 	RoleModeInitial    = "initial"     // 第一台主，之前没有主
 	RoleModeImportFile = "import-file" // 导入了旧主的 signed.jsonl
 	RoleModeManual     = "manual"      // 旧主目录没了，运维逐包输入已签最大 versionCode
-	// RoleModeEnroll：新机器 signer enroll 时按服务端给的主备写入的初始角色（只写在全新的本机记录里）
+	// RoleModeEnroll：新机器 signer enroll 写在全新本机记录里的初始角色，一律是备。服务端（控制台）登记的
+	// 主备只决定路由，不写进本机记录：主只由本机 signer promote 产生（--first、--import、--manual）。
 	RoleModeEnroll = "enroll"
 )
 
@@ -75,6 +76,9 @@ func (r RoleChange) validate() error {
 	}
 	switch r.Mode {
 	case RoleModeEnroll:
+		if r.Role != RoleStandby {
+			return errors.New("an enrollment role record must be standby: only signer promote on this machine makes it primary")
+		}
 		if r.PreviousPrimaryEd25519SHA256 != "" {
 			return errors.New("an enrollment role record must not name a previous primary")
 		}
@@ -132,17 +136,18 @@ func (b builderRevoke) validate() error {
 }
 
 // 信任签名闸与恢复公钥的来源（PeerTrust.Mode、RecoveryTrust.Mode）。
+//
+// 签名闸之间的信任只有运维在本机 trust-peer 这一个来源：signer enroll 不信任服务端给的任何签名闸。
+// 修复之前的开发版本写过 mode "enroll-first-trust"（注册备时首次信任服务端给的主），这种记录现在校验不过。
 const (
 	// TrustModeOperator：运维在本机粘贴完整指纹，与服务端的值比对一致后写入。
 	TrustModeOperator = "operator"
-	// TrustModeEnroll：signer enroll 时按运维在安装命令里给的 --recovery-sha256 核对服务端的恢复公钥后写入。
+	// TrustModeEnroll：signer enroll 时按运维在安装命令里给的 --recovery-sha256 核对服务端的恢复公钥后写入（只用于恢复公钥）。
 	TrustModeEnroll = "enroll"
-	// TrustModeEnrollFirstTrust：注册备签名闸时首次信任服务端给的当前主签名闸（设计「首次信任」）。
-	TrustModeEnrollFirstTrust = "enroll-first-trust"
 )
 
 // PeerTrust 是一台受信的签名闸（不含本机：本机默认信任自己）。主签名闸生成密钥时只加密给
-// 本机与这些签名闸；备签名闸只接受这些签名闸（或本机）签过生成签名的密钥。
+// 本机与这些签名闸；备签名闸只接受这些签名闸（或本机）签过生成签名的密钥，主签名闸只接受本机签的。
 type PeerTrust struct {
 	Name                   string `json:"name"`
 	X25519PublicKeySHA256  string `json:"x25519PublicKeySha256"`
@@ -161,8 +166,8 @@ func (p PeerTrust) validate() error {
 		return errors.New("x25519PublicKeySha256 must be 64 lowercase hex characters")
 	case !fingerprint.Valid(p.Ed25519PublicKeySHA256):
 		return errors.New("ed25519PublicKeySha256 must be 64 lowercase hex characters")
-	case p.Mode != TrustModeOperator && p.Mode != TrustModeEnrollFirstTrust:
-		return errors.New("mode must be operator or enroll-first-trust")
+	case p.Mode != TrustModeOperator:
+		return errors.New("mode must be operator (a signing gate is trusted only by signer trust-peer on this machine)")
 	case !operatorPattern.MatchString(p.Operator):
 		return errors.New("operator must match ^[A-Za-z0-9._@-]{1,64}$")
 	case p.Note != "" && !validText(p.Note, 512):
@@ -170,6 +175,9 @@ func (p PeerTrust) validate() error {
 	}
 	return nil
 }
+
+// SupersededPrimaryReason 是提升为主时自动撤销旧主信任的原因。
+const SupersededPrimaryReason = "被本机提升取代 / superseded when this signing gate was promoted"
 
 type peerRevoke struct {
 	Name     string `json:"name"`

@@ -152,6 +152,8 @@ func (h inProcessHost) Init(_ enrollAccount, req enrollInitRequest) (enrollInitR
 func TestEnrollStandby(t *testing.T) {
 	f := newEnrollFixture(t, "standby")
 	f.exec = true
+	// 注册码走环境变量时，降权执行的 enroll-init 子进程拿不到它（TestMain 在子进程里核对）
+	t.Setenv(EnvEnrollmentCode, testEnrollCode)
 	out, err := f.enroll(f.opts())
 	if err != nil {
 		t.Fatalf("Enroll: %v\n%s", err, out)
@@ -184,10 +186,15 @@ func TestEnrollStandby(t *testing.T) {
 		t.Fatalf("OpenRecords after enroll: %v", err)
 	}
 	defer store.Close()
-	for _, want := range []string{"amos-signer-c", keys.X25519SHA256(), keys.Ed25519SHA256(), f.recovery.view.X25519PublicKeySHA256, f.primary.edSHA(), "trust-peer --peer amos-signer-c"} {
+	for _, want := range []string{"amos-signer-c", keys.X25519SHA256(), keys.Ed25519SHA256(), f.recovery.view.X25519PublicKeySHA256,
+		"trust-peer --peer amos-signer-a", "trust-peer --peer amos-signer-c"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("enroll output lacks %q:\n%s", want, out)
 		}
+	}
+	// 主签名闸的指纹要从那台机器上抄，不从服务端给的值上屏
+	if strings.Contains(out, f.primary.edSHA()) || strings.Contains(out, f.primary.xSHA()) {
+		t.Fatalf("enroll printed the server's fingerprints for the primary:\n%s", out)
 	}
 	if len(f.server.enrolls) != 1 || f.server.enrolls[0]["x25519PublicKey"] != base64.StdEncoding.EncodeToString(keys.X25519PublicKey()) ||
 		f.server.enrolls[0]["ed25519PublicKey"] != base64.StdEncoding.EncodeToString(keys.Ed25519PublicKey()) {
@@ -198,7 +205,7 @@ func TestEnrollStandby(t *testing.T) {
 	peers, _ := store.TrustedPeers()
 	if role.Role != records.RoleStandby || role.Mode != records.RoleModeEnroll ||
 		len(rec) != 1 || rec[0].X25519PublicKeySHA256 != f.recovery.view.X25519PublicKeySHA256 || rec[0].Mode != records.TrustModeEnroll ||
-		len(peers) != 1 || peers[0].Name != "amos-signer-a" || peers[0].Ed25519PublicKeySHA256 != f.primary.edSHA() || peers[0].Mode != records.TrustModeEnrollFirstTrust {
+		len(peers) != 0 {
 		t.Fatalf("records: role %+v recovery %+v peers %+v", role, rec, peers)
 	}
 	if _, created, err := InitState(f.stateDir, "amos-signer-c"); err != nil || created {
@@ -212,26 +219,113 @@ func TestEnrollStandby(t *testing.T) {
 	}
 }
 
-func TestEnrollPrimaryAndRefusals(t *testing.T) {
-	t.Run("primary", func(t *testing.T) {
-		f := newEnrollFixture(t, "primary")
-		opts := f.opts()
-		opts.NameCheck = "amos-signer-c"
-		if out, err := f.enroll(opts); err != nil {
-			t.Fatalf("Enroll: %v\n%s", err, out)
-		}
-		_, store, err := OpenRecords(f.stateDir, "amos-signer-c")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer store.Close()
-		role, _ := store.Role()
-		peers, _ := store.TrustedPeers()
-		if role.Role != records.RolePrimary || role.Mode != records.RoleModeEnroll || len(peers) != 0 {
-			t.Fatalf("role %+v peers %+v", role, peers)
-		}
-	})
+// 评审 P1-1、P1-2（TestReviewSecondLocalPrimaryCanReuseVersionCode）：服务端说这台是主、给了一台主签名闸，
+// enroll 照样只写本机备、不信任任何签名闸。主只由本机 promote 产生，签名闸之间的信任只由本机 trust-peer 写入。
+func TestEnrollIgnoresTheServersRoleAndPrimary(t *testing.T) {
+	cases := map[string]struct {
+		signerRole string
+		mutate     func(*enrollFixture)
+		want       []string
+		notWant    []string
+	}{
+		"console says primary": {signerRole: "primary",
+			want: []string{"registered this machine as the primary", "promote --first", "trust-builder --builder"}},
+		"console says standby": {signerRole: "standby",
+			want: []string{"trust-peer --peer amos-signer-a", "trust-peer --peer amos-signer-c"}},
+		"standby before any primary": {signerRole: "standby", mutate: func(f *enrollFixture) { f.server.describe["primarySigner"] = nil },
+			want: []string{"no primary signing gate yet", "install the primary first"}, notWant: []string{"trust-peer --peer amos-signer-a"}},
+		"primary names itself": {signerRole: "standby", mutate: func(f *enrollFixture) {
+			f.server.describe["primarySigner"].(map[string]any)["name"] = "amos-signer-c"
+		}, notWant: []string{"trust-peer --peer amos-signer-a"}},
+		"primary key mismatch": {signerRole: "standby", mutate: func(f *enrollFixture) {
+			f.server.describe["primarySigner"].(map[string]any)["ed25519PublicKeySha256"] = strings.Repeat("cd", 32)
+		}, want: []string{"trust-peer --peer amos-signer-a"}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newEnrollFixture(t, c.signerRole)
+			if c.mutate != nil {
+				c.mutate(f)
+			}
+			opts := f.opts()
+			opts.NameCheck = "amos-signer-c"
+			out, err := f.enroll(opts)
+			if err != nil {
+				t.Fatalf("Enroll: %v\n%s", err, out)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output lacks %q:\n%s", w, out)
+				}
+			}
+			for _, w := range append(c.notWant, f.primary.edSHA(), f.primary.xSHA()) {
+				if strings.Contains(out, w) {
+					t.Errorf("output contains %q:\n%s", w, out)
+				}
+			}
+			keys, store, err := OpenRecords(f.stateDir, "amos-signer-c")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			role, _ := store.Role()
+			peers, _ := store.TrustedPeers()
+			if role.Role != records.RoleStandby || role.Mode != records.RoleModeEnroll || len(peers) != 0 {
+				t.Fatalf("role %+v peers %+v", role, peers)
+			}
+			// 平台第一台主：在本机 promote --first，接在 enroll 写的备记录后面
+			if c.signerRole == "primary" {
+				env := OperatorEnv{Keys: keys, Store: store}
+				term := newTerm("ops-erin", "first primary signing gate", "amos-signer-c")
+				env.Term = term
+				if err := Promote(env, PromoteFirst, ""); err != nil {
+					t.Fatalf("promote --first after enroll: %v\n%s", err, term.out.String())
+				}
+				if role, _ := store.Role(); role.Role != records.RolePrimary || role.Mode != records.RoleModeInitial {
+					t.Fatalf("role after promote --first: %+v", role)
+				}
+			}
+		})
+	}
+}
 
+// 评审 P2-b：注册码可以走环境变量 RN_ENROLLMENT_CODE（不进进程参数）；与 --code 同时给且不同就拒绝；
+// 读完从本进程环境里清掉。
+func TestEnrollCodeFromTheEnvironment(t *testing.T) {
+	other := "rne_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA"
+	run := func(args ...string) (int, string) {
+		var stdout, stderr bytes.Buffer
+		// --env-file 故意给相对路径：在碰 root 与网络之前失败，只看注册码的取值
+		code := Main(append([]string{"enroll", "--server", "https://api.example.com", "--env-file", "relative.env", "--recovery-sha256", strings.Repeat("ab", 32)}, args...),
+			os.Stdin, &stdout, &stderr, os.Getenv)
+		return code, stdout.String() + stderr.String()
+	}
+	t.Setenv(EnvEnrollmentCode, testEnrollCode)
+	code, out := run("--code", other)
+	if code != 1 || !strings.Contains(out, EnvEnrollmentCode) || strings.Contains(out, testEnrollCode) || strings.Contains(out, other) {
+		t.Fatalf("different --code and %s: exit %d\n%s", EnvEnrollmentCode, code, out)
+	}
+	if v, ok := os.LookupEnv(EnvEnrollmentCode); ok {
+		t.Fatalf("%s is still in the environment (%d characters)", EnvEnrollmentCode, len(v))
+	}
+	for name, args := range map[string][]string{"environment only": nil, "same value in both": {"--code", testEnrollCode}} {
+		t.Setenv(EnvEnrollmentCode, testEnrollCode)
+		code, out := run(args...)
+		// 注册码被接受，往下走到 --env-file 的检查
+		if code != 1 || !strings.Contains(out, "--env-file must be an absolute clean path") || strings.Contains(out, testEnrollCode) {
+			t.Errorf("%s: exit %d\n%s", name, code, out)
+		}
+		if _, ok := os.LookupEnv(EnvEnrollmentCode); ok {
+			t.Errorf("%s: %s is still in the environment", name, EnvEnrollmentCode)
+		}
+	}
+	os.Unsetenv(EnvEnrollmentCode)
+	if code, out := run(); code != 1 || !strings.Contains(out, "not an enrollment code") {
+		t.Fatalf("no code at all: exit %d\n%s", code, out)
+	}
+}
+
+func TestEnrollRefusals(t *testing.T) {
 	refusals := map[string]struct {
 		mutate func(*enrollFixture, *EnrollOptions)
 		want   string
@@ -248,12 +342,6 @@ func TestEnrollPrimaryAndRefusals(t *testing.T) {
 		"env world readable": {func(f *enrollFixture, o *EnrollOptions) {
 			must(t, os.Chmod(f.envFile, 0o644))
 		}, "permissions"},
-		"primary names itself": {func(f *enrollFixture, o *EnrollOptions) {
-			f.server.describe["primarySigner"].(map[string]any)["name"] = "amos-signer-c"
-		}, "malformed primary"},
-		"primary key mismatch": {func(f *enrollFixture, o *EnrollOptions) {
-			f.server.describe["primarySigner"].(map[string]any)["ed25519PublicKeySha256"] = strings.Repeat("cd", 32)
-		}, "malformed primary"},
 	}
 	for name, c := range refusals {
 		t.Run(name, func(t *testing.T) {
@@ -337,8 +425,8 @@ func TestEnrollInterruptedBeforeTheToken(t *testing.T) {
 	if base64.StdEncoding.EncodeToString(keys.X25519PublicKey()) == firstKeys {
 		t.Fatal("the interrupted enrollment's keys were reused")
 	}
-	if peers, _ := store.TrustedPeers(); len(peers) != 1 {
-		t.Fatalf("records after re-enrollment: %+v", peers)
+	if role, _ := store.Role(); role.Role != records.RoleStandby || role.Mode != records.RoleModeEnroll {
+		t.Fatalf("records after re-enrollment: %+v", role)
 	}
 }
 

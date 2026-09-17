@@ -59,6 +59,7 @@ const usageText = `用法:
                         --tenant <slug> --package <包名> [--alias <别名>] [--out <上传文件>]
   build-keystore recovery-key create --out <目录> --name <恢复密钥名>
   build-keystore recover --recovery-key <recovery-private.key> --upload <导出的密文文件> --out-dir <目录>
+                         --expect-certificate-sha256 <已发布 App 的证书 SHA-256，不取控制台>
 
 只在离线机器上运行。create/seal 的收件人只来自 pin 文件；口令只写进 0600 的文件，不打印。
 recovery-key create 与 recover 的口令只从交互终端输入（不回显），标准输入不是终端时拒绝。`

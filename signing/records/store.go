@@ -134,6 +134,8 @@ type trustState struct {
 	certificates map[string]map[string]bool
 	peers        map[string]PeerTrust     // 按机器名
 	recovery     map[string]RecoveryTrust // 按公钥指纹
+	// tenants 是每个确认过的租户最后一次确认的包名（含已被取代的确认）：首次信任只对本机从没确认过的租户
+	tenants map[string]string
 }
 
 type signedState struct {
@@ -151,6 +153,7 @@ func newTrustState() *trustState {
 		certificates:  map[string]map[string]bool{},
 		peers:         map[string]PeerTrust{},
 		recovery:      map[string]RecoveryTrust{},
+		tenants:       map[string]string{},
 	}
 }
 
@@ -178,6 +181,9 @@ func (ts *trustState) clone() *trustState {
 	}
 	for k, v := range ts.recovery {
 		out.recovery[k] = v
+	}
+	for k, v := range ts.tenants {
+		out.tenants[k] = v
 	}
 	return out
 }
@@ -460,6 +466,38 @@ func (s *Store) SetRole(r RoleChange) error {
 	return s.append(s.trust, typeRole, r, nil)
 }
 
+// Promote 写入提升为主的角色记录（signer promote）。r.PreviousPrimaryEd25519SHA256 非空时，本机受信签名闸里
+// 用这把 Ed25519 公钥的那台（被取代的旧主）在同一次写入里先撤销，原因 SupersededPrimaryReason：旧主以后
+// 被攻破、服务端把它报成 active，新密钥也不再加密给它，它签的生成也不再被接受。返回撤销的机器名。
+func (s *Store) Promote(r RoleChange) (revoked []string, err error) {
+	if r.Role != RolePrimary {
+		return nil, errors.New("records: promote writes a primary role")
+	}
+	if err := r.validate(); err != nil {
+		return nil, fmt.Errorf("records: role: %w", err)
+	}
+	err = s.appendRecords(s.trust, func() ([]pending, error) {
+		revoked = nil
+		var items []pending
+		if r.PreviousPrimaryEd25519SHA256 != "" {
+			for _, p := range s.ts.peers {
+				if p.Ed25519PublicKeySHA256 == r.PreviousPrimaryEd25519SHA256 {
+					revoked = append(revoked, p.Name)
+				}
+			}
+			sort.Strings(revoked)
+			for _, name := range revoked {
+				items = append(items, pending{typePeerRevoke, peerRevoke{Name: name, Operator: r.Operator, Reason: SupersededPrimaryReason}})
+			}
+		}
+		return append(items, pending{typeRole, r}), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return revoked, nil
+}
+
 // TrustBuilder 写入（或更新）一台受信构建机。
 func (s *Store) TrustBuilder(b BuilderTrust) error {
 	if err := b.validate(); err != nil {
@@ -541,8 +579,10 @@ func (s *Store) Confirmations() ([]Confirmation, error) {
 }
 
 // ConfirmAuto 写入一条签名闸自动确认（Mode 非空）。在记录锁里复核：该包名当前有效的确认必须仍是
-// expectedPrevious（nil 表示当时没有确认；比较租户、证书与信任根摘要），证书在本机没为这个包名
-// 确认过。已经写过完全相同的确认（同一包名、证书、生成请求）时幂等返回 nil。
+// expectedPrevious（nil 表示当时没有确认），而且逐字段相同——租户、证书、信任根摘要、SDK 下限、首签上限、
+// 别名、确认人与确认时间都算：计划时读到之后运维又 confirm 过（哪怕值没变），就 ErrConfirmationChanged，
+// 由调用方下一轮按新值重算，不拿旧计划覆盖运维刚写的值。证书在本机没为这个包名确认过。
+// 已经写过完全相同的确认（同一包名、证书、生成请求）时幂等返回 nil。
 func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) error {
 	if c.Mode == "" {
 		return errors.New("records: ConfirmAuto needs an automatic confirmation mode")
@@ -559,8 +599,7 @@ func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) erro
 		switch {
 		case expectedPrevious == nil && has, expectedPrevious != nil && !has:
 			return nil, ErrConfirmationChanged
-		case has && (current.TenantSlug != expectedPrevious.TenantSlug || current.CertificateSHA256 != expectedPrevious.CertificateSHA256 ||
-			current.TrustRootsDigest != expectedPrevious.TrustRootsDigest):
+		case has && !sameConfirmation(current, *expectedPrevious):
 			return nil, ErrConfirmationChanged
 		}
 		if s.ts.certificates[c.PackageName][c.CertificateSHA256] {
@@ -568,6 +607,21 @@ func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) erro
 		}
 		return []pending{{typeTenant, c}}, nil
 	})
+}
+
+// sameConfirmation 逐字段比较两条确认。信任根按摘要比较：每条确认写入与回放时都校验过摘要与信任根一致。
+func sameConfirmation(a, b Confirmation) bool {
+	return a.TenantSlug == b.TenantSlug && a.PackageName == b.PackageName && a.CertificateSHA256 == b.CertificateSHA256 &&
+		a.KeyAlias == b.KeyAlias && a.KeystoreVersion == b.KeystoreVersion && a.TrustRootsDigest == b.TrustRootsDigest &&
+		a.MinSDK == b.MinSDK && a.TargetSDK == b.TargetSDK && a.FirstSignMaxVersionCode == b.FirstSignMaxVersionCode &&
+		a.ConfirmedBy == b.ConfirmedBy && a.Mode == b.Mode && a.GenerationRequestID == b.GenerationRequestID &&
+		a.GeneratorName == b.GeneratorName && a.GeneratorEd25519SHA256 == b.GeneratorEd25519SHA256 && a.ConfirmedAt == b.ConfirmedAt
+}
+
+// TenantConfirmedPackage 报告这个租户是否在本机确认过（任何包名，含已被取代的确认），返回最后一次确认的包名。
+func (s *Store) TenantConfirmedPackage(tenantSlug string) (packageName string, ok bool, err error) {
+	err = s.read(s.trust, func() { packageName, ok = s.ts.tenants[tenantSlug] })
+	return packageName, ok, err
 }
 
 // CertificateSeen 报告这张证书是否为这个包名确认过（含已被取代的确认）。
@@ -985,6 +1039,7 @@ func applyTrust(ts *trustState, e entry) error {
 			ts.certificates[c.PackageName] = map[string]bool{}
 		}
 		ts.certificates[c.PackageName][c.CertificateSHA256] = true
+		ts.tenants[c.TenantSlug] = c.PackageName
 	case typePeer:
 		var p PeerTrust
 		if err := strictUnmarshal(e.Data, &p); err != nil {

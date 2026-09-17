@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -27,13 +28,15 @@ func TestPeerTrustLifecycle(t *testing.T) {
 	must(t, s.TrustPeer(peer()))
 	g := s.Genesis()
 	for name, p := range map[string]PeerTrust{
-		"own name":        {Name: g.MachineName, X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
-		"own ed25519":     {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: g.Ed25519PublicKeySHA256, Mode: TrustModeOperator, Operator: "ops"},
-		"own x25519":      {Name: "other-signer", X25519PublicKeySHA256: g.X25519PublicKeySHA256, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
-		"same keys":       {Name: "other-signer", X25519PublicKeySHA256: shaPeerX, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
-		"bad mode":        {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: "server", Operator: "ops"},
-		"bad fingerprint": {Name: "other-signer", X25519PublicKeySHA256: strings.ToUpper(certA), Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
-		"bad operator":    {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "auto:x"},
+		"own name":    {Name: g.MachineName, X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
+		"own ed25519": {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: g.Ed25519PublicKeySHA256, Mode: TrustModeOperator, Operator: "ops"},
+		"own x25519":  {Name: "other-signer", X25519PublicKeySHA256: g.X25519PublicKeySHA256, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
+		"same keys":   {Name: "other-signer", X25519PublicKeySHA256: shaPeerX, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
+		"bad mode":    {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: "server", Operator: "ops"},
+		// 评审 P1-2：enroll 不再首次信任服务端给的主，这个来源不再合法
+		"enroll first trust": {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: "enroll-first-trust", Operator: EnrollOperator},
+		"bad fingerprint":    {Name: "other-signer", X25519PublicKeySHA256: strings.ToUpper(certA), Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "ops"},
+		"bad operator":       {Name: "other-signer", X25519PublicKeySHA256: shaTwo, Ed25519PublicKeySHA256: shaSign, Mode: TrustModeOperator, Operator: "auto:x"},
 	} {
 		if err := s.TrustPeer(p); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -41,12 +44,12 @@ func TestPeerTrustLifecycle(t *testing.T) {
 	}
 	// 同名重新信任（机器重装换了密钥）取代旧的
 	replaced := peer()
-	replaced.X25519PublicKeySHA256, replaced.Ed25519PublicKeySHA256, replaced.Mode = shaTwo, shaSign, TrustModeEnrollFirstTrust
+	replaced.X25519PublicKeySHA256, replaced.Ed25519PublicKeySHA256, replaced.Note = shaTwo, shaSign, "reinstalled"
 	must(t, s.TrustPeer(replaced))
 	s.Close()
 	s = f.open(t)
 	peers, err := s.TrustedPeers()
-	if err != nil || len(peers) != 1 || peers[0].X25519PublicKeySHA256 != shaTwo || peers[0].Mode != TrustModeEnrollFirstTrust || peers[0].At == "" {
+	if err != nil || len(peers) != 1 || peers[0].X25519PublicKeySHA256 != shaTwo || peers[0].Note != "reinstalled" || peers[0].At == "" {
 		t.Fatalf("peers after restart: %+v %v", peers, err)
 	}
 	if err := s.RevokePeer("amos-signer-c", "ops", "never trusted"); err == nil {
@@ -70,7 +73,7 @@ func TestRecoveryTrustLifecycle(t *testing.T) {
 	if err := s.TrustRecovery(RecoveryTrust{Name: "x", X25519PublicKeySHA256: shaRecov, Mode: TrustModeOperator, Operator: "ops"}); err == nil {
 		t.Fatal("accepted a malformed name")
 	}
-	if err := s.TrustRecovery(RecoveryTrust{Name: "platform-recovery", X25519PublicKeySHA256: shaRecov, Mode: TrustModeEnrollFirstTrust, Operator: "ops"}); err == nil {
+	if err := s.TrustRecovery(RecoveryTrust{Name: "platform-recovery", X25519PublicKeySHA256: shaRecov, Mode: "enroll-first-trust", Operator: "ops"}); err == nil {
 		t.Fatal("accepted the peer-only first-trust mode for a recovery key")
 	}
 	must(t, s.RevokeRecovery(shaRecov, "ops-bob", "replaced by recovery 2"))
@@ -120,13 +123,19 @@ func TestAutoConfirmation(t *testing.T) {
 	if fileSize(t, filepath.Join(f.dir, TrustFileName)) != trustLines {
 		t.Fatal("a refused automatic confirmation wrote a record")
 	}
-	must(t, s.ConfirmAuto(regenerated, &first))
+	// 调用方传的是计划时从本机记录读到的那一份（带确认时间），不是自己拼的
+	if err := s.ConfirmAuto(regenerated, &first); !errors.Is(err, ErrConfirmationChanged) {
+		t.Fatalf("expected previous without the recorded fields: %v", err)
+	}
+	planned, _, _ := s.ActiveConfirmation(pkg)
+	must(t, s.ConfirmAuto(regenerated, &planned))
 	if seen, _ := s.CertificateSeen(pkg, certA); !seen {
 		t.Fatal("the superseded certificate is not remembered")
 	}
 	// 被取代的证书不能自动确认回去（重放旧的生成）
 	back := autoConfirmation(t, certA, ConfirmModePeerGenerated, "kgr_request0003")
-	if err := s.ConfirmAuto(back, &regenerated); !errors.Is(err, ErrCertificateSeen) {
+	current, _, _ := s.ActiveConfirmation(pkg)
+	if err := s.ConfirmAuto(back, &current); !errors.Is(err, ErrCertificateSeen) {
 		t.Fatalf("switching back to a superseded certificate: %v", err)
 	}
 	// 运维 confirm 可以
@@ -203,6 +212,10 @@ func TestEnrollRoleAndPackageMax(t *testing.T) {
 	s := f.open(t)
 	if err := s.SetRole(RoleChange{Role: RolePrimary, Mode: RoleModeEnroll, PreviousPrimaryEd25519SHA256: shaTwo, Operator: EnrollOperator, Reason: "enrolled"}); err == nil {
 		t.Fatal("an enrollment role named a previous primary")
+	}
+	// 评审 P1-1：注册只能写本机备；主只由本机 promote 产生
+	if err := s.SetRole(RoleChange{Role: RolePrimary, Mode: RoleModeEnroll, Operator: EnrollOperator, Reason: "enrolled"}); err == nil {
+		t.Fatal("an enrollment role record made this machine primary")
 	}
 	must(t, s.SetRole(RoleChange{Role: RoleStandby, Mode: RoleModeEnroll, Operator: EnrollOperator, Reason: "enrolled as standby"}))
 	if r, _ := s.Role(); r.Role != RoleStandby || r.Mode != RoleModeEnroll {
@@ -298,4 +311,150 @@ func copyLegacyState(t *testing.T) string {
 		must(t, os.WriteFile(filepath.Join(dir, name), raw, 0o600))
 	}
 	return dir
+}
+
+// 评审 P2-7：自动确认在记录锁里复核的不只是租户、证书、摘要。计划时读到的 SDK 下限、首签上限等任何一项
+// 在这期间被运维 confirm 改过（哪怕只收紧了一项），都要 ErrConfirmationChanged，下一轮按新值重算，
+// 不能拿旧计划把运维刚收紧的值写回去。
+func TestAutoConfirmationRechecksEveryPlannedParameter(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	manual := confirmation(t)
+	must(t, s.Confirm(manual))
+	planned, ok, err := s.ActiveConfirmation(pkg)
+	if err != nil || !ok {
+		t.Fatalf("active confirmation: %v %v", ok, err)
+	}
+	next := autoConfirmation(t, certB, ConfirmModeRegenerated, "kgr_request0009")
+	for name, mutate := range map[string]func(*Confirmation){
+		"minSdk raised":          func(c *Confirmation) { c.MinSDK = 26 },
+		"targetSdk raised":       func(c *Confirmation) { c.TargetSDK = 34 },
+		"first-sign cap lowered": func(c *Confirmation) { c.FirstSignMaxVersionCode = 10 },
+		"key alias":              func(c *Confirmation) { c.KeyAlias = "anyfun-release-2" },
+		"re-confirmed unchanged": func(c *Confirmation) {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newFixture(t)
+			s := g.open(t)
+			must(t, s.Confirm(manual))
+			planned, _, _ := s.ActiveConfirmation(pkg)
+			// 运维在自动确认计划之后又 confirm 了一次
+			concurrent := manual
+			mutate(&concurrent)
+			s.now = func() time.Time { return time.Now().Add(time.Second) }
+			must(t, s.Confirm(concurrent))
+			before := fileSize(t, filepath.Join(g.dir, TrustFileName))
+			if err := s.ConfirmAuto(next, &planned); !errors.Is(err, ErrConfirmationChanged) {
+				t.Fatalf("ConfirmAuto over a changed confirmation: %v", err)
+			}
+			if fileSize(t, filepath.Join(g.dir, TrustFileName)) != before {
+				t.Fatal("a refused automatic confirmation wrote a record")
+			}
+			if c, _, _ := s.ActiveConfirmation(pkg); c.CertificateSHA256 != certA || c.MinSDK != concurrent.MinSDK || c.FirstSignMaxVersionCode != concurrent.FirstSignMaxVersionCode {
+				t.Fatalf("the operator's confirmation was replaced: %+v", c)
+			}
+		})
+	}
+	// 没有并发写：同一份计划照常写入
+	must(t, s.ConfirmAuto(next, &planned))
+}
+
+// 评审 P1-3：提升为主时，本机受信签名闸里用旧主 Ed25519 的那台在同一次写入里撤销；旧主被攻破、服务端把它
+// 报成 active，新密钥也不再加密给它、它签的生成也不再被接受。
+func TestPromoteRevokesThePreviousPrimary(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	old := peer()
+	other := PeerTrust{Name: "amos-signer-c", X25519PublicKeySHA256: shaRecov, Ed25519PublicKeySHA256: shaRecov2, Mode: TrustModeOperator, Operator: "ops"}
+	must(t, s.TrustPeer(old))
+	must(t, s.TrustPeer(other))
+	if _, err := s.Promote(RoleChange{Role: RoleStandby, Mode: RoleModeManual, Operator: "ops", Reason: "not a promotion"}); err == nil {
+		t.Fatal("Promote wrote a standby role")
+	}
+	before := fileSize(t, filepath.Join(f.dir, TrustFileName))
+	if _, err := s.Promote(RoleChange{Role: RolePrimary, Mode: RoleModeImportFile, Operator: "ops", Reason: "x"}); err == nil {
+		t.Fatal("Promote accepted an invalid role change")
+	}
+	if fileSize(t, filepath.Join(f.dir, TrustFileName)) != before {
+		t.Fatal("a refused promotion wrote a record")
+	}
+	revoked, err := s.Promote(RoleChange{Role: RolePrimary, Mode: RoleModeImportFile, PreviousPrimaryEd25519SHA256: old.Ed25519PublicKeySHA256, Operator: "ops-carol", Reason: "old primary disk failed"})
+	if err != nil || len(revoked) != 1 || revoked[0] != old.Name {
+		t.Fatalf("Promote: %v revoked %v", err, revoked)
+	}
+	s.Close()
+	s = f.open(t)
+	role, _ := s.Role()
+	peers, _ := s.TrustedPeers()
+	if role.Role != RolePrimary || role.PreviousPrimaryEd25519SHA256 != old.Ed25519PublicKeySHA256 || len(peers) != 1 || peers[0].Name != other.Name {
+		t.Fatalf("after restart: role %+v peers %+v", role, peers)
+	}
+	raw, _ := os.ReadFile(filepath.Join(f.dir, TrustFileName))
+	if !strings.Contains(string(raw), `"type":"peer-revoke"`) || !strings.Contains(string(raw), "被本机提升取代") {
+		t.Fatalf("no peer-revoke record naming the promotion:\n%s", raw)
+	}
+
+	// 旧主不在本机信任里、或者没给旧主指纹：只写角色
+	g := newFixture(t)
+	s2 := g.open(t)
+	must(t, s2.TrustPeer(other))
+	if revoked, err := s2.Promote(RoleChange{Role: RolePrimary, Mode: RoleModeManual, PreviousPrimaryEd25519SHA256: shaSign, Operator: "ops", Reason: "old primary lost"}); err != nil || len(revoked) != 0 {
+		t.Fatalf("Promote without a trusted old primary: %v %v", revoked, err)
+	}
+	if peers, _ := s2.TrustedPeers(); len(peers) != 1 {
+		t.Fatalf("revoked a signing gate that was not the old primary: %+v", peers)
+	}
+}
+
+// 评审 P2-1：首次信任按租户判断。租户在本机确认过（任何包名，含已被取代的确认）就不再首次信任。
+func TestTenantConfirmedPackage(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	if _, ok, err := s.TenantConfirmedPackage("AnyFun"); ok || err != nil {
+		t.Fatalf("a fresh record knows the tenant: %v %v", ok, err)
+	}
+	must(t, s.Confirm(confirmation(t)))
+	// 这个包名后来确认给了另一个租户：AnyFun 仍算确认过
+	moved := confirmation(t)
+	moved.TenantSlug, moved.CertificateSHA256 = "Predict", certB
+	must(t, s.Confirm(moved))
+	s.Close()
+	s = f.open(t)
+	for tenant, want := range map[string]string{"AnyFun": pkg, "Predict": pkg} {
+		if got, ok, err := s.TenantConfirmedPackage(tenant); !ok || err != nil || got != want {
+			t.Errorf("%s: %q %v %v", tenant, got, ok, err)
+		}
+	}
+	if _, ok, _ := s.TenantConfirmedPackage("Other"); ok {
+		t.Fatal("an unknown tenant is reported as confirmed")
+	}
+}
+
+// 修复之前的 enroll 写过「注册即为主」与「首次信任服务端给的主」（只在开发环境出现过）：这两种记录现在
+// 校验不过，签名闸拒绝启动，按新机器重装，不会带着服务端定下的主或信任继续运行。
+func TestPreFixEnrollRecordsAreRefused(t *testing.T) {
+	for name, rec := range map[string]struct {
+		typ  string
+		data any
+	}{
+		"enrolled as primary": {typeRole, RoleChange{Role: RolePrimary, Mode: RoleModeEnroll, Operator: EnrollOperator, Reason: "initial role from the server at enrollment"}},
+		"first-trusted primary": {typePeer, PeerTrust{Name: "amos-signer-b", X25519PublicKeySHA256: shaPeerX, Ed25519PublicKeySHA256: shaPeerEd,
+			Mode: "enroll-first-trust", Operator: EnrollOperator, Note: "first trust: the server's primary signing gate at enrollment"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			s := f.open(t)
+			raw, err := encodeLine(kindTrust, s.trust.v.seq, s.trust.v.tail, time.Now(), rec.typ, rec.data, f.priv)
+			must(t, err)
+			s.Close()
+			file, err := os.OpenFile(filepath.Join(f.dir, TrustFileName), os.O_WRONLY|os.O_APPEND, 0)
+			must(t, err)
+			_, err = file.Write(append(raw, '\n'))
+			must(t, err)
+			must(t, file.Close())
+			if _, err := Open(f.dir, f.priv); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Open over a pre-fix enroll record: %v", err)
+			}
+		})
+	}
 }

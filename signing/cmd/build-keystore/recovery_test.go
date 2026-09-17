@@ -4,6 +4,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/Helix2010/RN-Server/signing/pkcs12"
 	"github.com/Helix2010/RN-Server/signing/recovery"
+	"github.com/Helix2010/RN-Server/signing/releasekey"
 )
 
 const testRecoveryPassphrase = "offline recovery passphrase 2026"
@@ -107,8 +109,11 @@ func TestRecoveryKeyRoundTripWithSignerGeneration(t *testing.T) {
 	must(t, os.WriteFile(uploadPath, exported, 0o600))
 
 	outDir := filepath.Join(work, "recovered")
+	// 已发布 App 的证书（取值与离线记录一致，apksigner 的输出是小写，keytool 的是带冒号大写，都接受）
+	published := generated.CertificateSHA256
 	withPassphrases(t, testRecoveryPassphrase)
-	code, stdout, stderr = runTool("recover", "--recovery-key", privPath, "--upload", uploadPath, "--out-dir", outDir)
+	code, stdout, stderr = runTool("recover", "--recovery-key", privPath, "--upload", uploadPath, "--out-dir", outDir,
+		"--expect-certificate-sha256", colonUpper(published))
 	if code != 0 {
 		t.Fatalf("recover exit %d: %s", code, stderr)
 	}
@@ -147,7 +152,7 @@ func TestRecoveryKeyRoundTripWithSignerGeneration(t *testing.T) {
 	t.Run("wrong passphrase", func(t *testing.T) {
 		out := filepath.Join(work, "wrong")
 		withPassphrases(t, "not the recovery passphrase")
-		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", uploadPath, "--out-dir", out)
+		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", uploadPath, "--out-dir", out, "--expect-certificate-sha256", published)
 		if code != 1 || !strings.Contains(stderr, "口令不对") {
 			t.Fatalf("exit %d: %s", code, stderr)
 		}
@@ -158,7 +163,7 @@ func TestRecoveryKeyRoundTripWithSignerGeneration(t *testing.T) {
 
 	t.Run("existing out dir", func(t *testing.T) {
 		src := withPassphrases(t, testRecoveryPassphrase)
-		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", uploadPath, "--out-dir", outDir)
+		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", uploadPath, "--out-dir", outDir, "--expect-certificate-sha256", published)
 		if code != 1 || !strings.Contains(stderr, "已经存在") || len(src.prompts) != 0 {
 			t.Fatalf("exit %d prompts %d: %s", code, len(src.prompts), stderr)
 		}
@@ -176,8 +181,27 @@ func TestRecoveryKeyRoundTripWithSignerGeneration(t *testing.T) {
 		path := filepath.Join(work, "signer-only.json")
 		must(t, os.WriteFile(path, raw, 0o600))
 		src := withPassphrases(t, testRecoveryPassphrase)
-		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", path, "--out-dir", filepath.Join(work, "x"))
+		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", path, "--out-dir", filepath.Join(work, "x"), "--expect-certificate-sha256", onlySigner.CertificateSHA256)
 		if code != 1 || !strings.Contains(stderr, "没有加密给恢复密钥") || !strings.Contains(stderr, pub.X25519PublicKeySHA256) || len(src.prompts) != 0 {
+			t.Fatalf("exit %d: %s", code, stderr)
+		}
+	})
+
+	// 服务端导出时只留发给恢复公钥的那份密文（其余 Box 去掉），明文里的收件人列表仍是全部
+	t.Run("export holds only the recovery box", func(t *testing.T) {
+		recoveryOnly := generated.Upload
+		box, ok := recoveryOnly.BoxFor(pub.X25519PublicKeySHA256)
+		if !ok {
+			t.Fatal("no recovery box")
+		}
+		recoveryOnly.Boxes = []keystorebox.Box{box}
+		raw, _ := json.Marshal(recoveryOnly)
+		path := filepath.Join(work, "recovery-only.json")
+		must(t, os.WriteFile(path, raw, 0o600))
+		withPassphrases(t, testRecoveryPassphrase)
+		out := filepath.Join(work, "recovery-only-out")
+		code, stdout, stderr := runTool("recover", "--recovery-key", privPath, "--upload", path, "--out-dir", out, "--expect-certificate-sha256", published)
+		if code != 0 || !strings.Contains(stdout, published) {
 			t.Fatalf("exit %d: %s", code, stderr)
 		}
 	})
@@ -190,7 +214,7 @@ func TestRecoveryKeyRoundTripWithSignerGeneration(t *testing.T) {
 		must(t, os.WriteFile(path, raw, 0o600))
 		withPassphrases(t, testRecoveryPassphrase)
 		out := filepath.Join(work, "tampered-out")
-		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", path, "--out-dir", out)
+		code, _, stderr := runTool("recover", "--recovery-key", privPath, "--upload", path, "--out-dir", out, "--expect-certificate-sha256", tampered.CertificateSHA256)
 		if code != 1 || !strings.Contains(stderr, "不一致") {
 			t.Fatalf("exit %d: %s", code, stderr)
 		}
@@ -283,4 +307,88 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func colonUpper(hex string) string {
+	var parts []string
+	for i := 0; i < len(hex); i += 2 {
+		parts = append(parts, strings.ToUpper(hex[i:i+2]))
+	}
+	return strings.Join(parts, ":")
+}
+
+// 评审 P1-4（TestReviewRecoverAcceptsAttackerSealedUpload）：恢复公钥是公开的，谁都能把自己的密钥封给它、
+// 冒充控制台导出的密文文件。recover 以已发布 App 的证书 sha256 为离线锚点：必须给出
+// --expect-certificate-sha256，解出的证书不是它就拒绝，不写任何文件。
+func TestRecoverRequiresThePublishedCertificate(t *testing.T) {
+	work := t.TempDir()
+	pub, priv, err := recovery.Generate("platform-recovery", []byte(testRecoveryPassphrase), time.Now(), recovery.MinScryptN)
+	must(t, err)
+	privRaw, _ := recovery.Encode(priv)
+	privPath := filepath.Join(work, "recovery-private.key")
+	must(t, os.WriteFile(privPath, privRaw, 0o600))
+	recoveryPub, _ := pub.PublicKey()
+
+	// 已发布的 App 用的是签名闸生成的真密钥
+	_, generator, _ := ed25519.GenerateKey(rand.Reader)
+	real, err := signer.GenerateKeystore(signer.GenerateParams{RequestID: "kgr_published01", TenantSlug: "AnyFun", PackageName: "com.anyfun.foundation",
+		KeyAlias: "anyfun-release", Recipients: [][]byte{recoveryPub}, Generator: generator, KeyBits: 2048, Now: time.Now()})
+	must(t, err)
+	published := real.CertificateSHA256
+
+	// 攻击者：自己生成密钥，只知道恢复公钥（公开信息）
+	attackerKey, err := releasekey.Generate(releasekey.Params{Alias: "anyfun-release", CommonName: "AnyFun Android Release", KeyBits: 2048, ValidityYears: 30})
+	must(t, err)
+	created := time.Now().UTC().Truncate(time.Second).Format(time.RFC3339)
+	sealAttacker := func(t *testing.T, innerCert, outerCert string) string {
+		t.Helper()
+		plain := keystorebox.Plaintext{Purpose: keystorebox.Purpose, TenantSlug: "AnyFun", PackageName: "com.anyfun.foundation",
+			CertificateSHA256: innerCert, KeyAlias: "anyfun-release", Recipients: []string{pub.X25519PublicKeySHA256},
+			CreatedAt: created, P12Base64: base64.StdEncoding.EncodeToString(attackerKey.PKCS12), StorePassword: attackerKey.Password, KeyPassword: attackerKey.Password}
+		box, err := keystorebox.Seal(plain, recoveryPub)
+		must(t, err)
+		upload := keystorebox.Upload{Format: keystorebox.UploadFormat, TenantSlug: "AnyFun", PackageName: "com.anyfun.foundation", KeyAlias: "anyfun-release",
+			CertificateSHA256: outerCert, CreatedAt: created, Boxes: []keystorebox.Box{box}}
+		raw, _ := json.MarshalIndent(upload, "", "  ")
+		path := filepath.Join(work, "AnyFun-keystore-"+outerCert[:8]+innerCert[:8]+".json")
+		must(t, os.WriteFile(path, raw, 0o600))
+		return path
+	}
+
+	cases := map[string]struct {
+		upload  func(t *testing.T) string
+		prompts int
+		want    string
+	}{
+		// 外层字段如实写攻击者的证书：不问口令就拒绝
+		"attacker key, honest outer fields": {func(t *testing.T) string {
+			return sealAttacker(t, attackerKey.CertificateSHA256, attackerKey.CertificateSHA256)
+		}, 0, published},
+		// 外层与明文都冒充已发布的证书：解开后按原件里真正的证书拒绝
+		"attacker key claiming the published certificate": {func(t *testing.T) string { return sealAttacker(t, published, published) }, 1, attackerKey.CertificateSHA256},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			src := withPassphrases(t, testRecoveryPassphrase)
+			out := filepath.Join(work, "out-"+strings.ReplaceAll(name, " ", "-"))
+			code, stdout, stderr := runTool("recover", "--recovery-key", privPath, "--upload", c.upload(t), "--out-dir", out, "--expect-certificate-sha256", published)
+			if code != 1 || !strings.Contains(stderr, c.want) || len(src.prompts) != c.prompts {
+				t.Fatalf("exit %d prompts %d\nstdout: %s\nstderr: %s", code, len(src.prompts), stdout, stderr)
+			}
+			if _, err := os.Stat(out); err == nil {
+				t.Fatal("recover wrote an out dir for an upload that is not the published key")
+			}
+		})
+	}
+
+	t.Run("the flag is required", func(t *testing.T) {
+		src := withPassphrases(t, testRecoveryPassphrase)
+		path := sealAttacker(t, attackerKey.CertificateSHA256, attackerKey.CertificateSHA256)
+		for _, extra := range [][]string{nil, {"--expect-certificate-sha256", "abcd"}} {
+			args := append([]string{"recover", "--recovery-key", privPath, "--upload", path, "--out-dir", filepath.Join(work, "flag")}, extra...)
+			if code, _, stderr := runTool(args...); code == 0 || !strings.Contains(stderr, "--expect-certificate-sha256") || len(src.prompts) != 0 {
+				t.Fatalf("%v: exit %d: %s", extra, code, stderr)
+			}
+		}
+	})
 }
