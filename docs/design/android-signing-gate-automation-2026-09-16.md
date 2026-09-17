@@ -40,13 +40,18 @@
 
 | 服务端或数据库被攻破后，攻击者能不能… | 原设计 | 本设计 | 为什么 |
 | --- | --- | --- | --- |
-| 解开或偷走已有租户的签名密钥 | 不能 | 不能 | 密钥只加密给签名闸本机信任的签名闸与离线恢复公钥；新增收件人要在签名闸本机确认 |
-| 让签名闸改用别的密钥签已有租户 | 不能 | 不能 | 本机记录按包名记着证书；新证书只接受本机或本机信任的签名闸生成的 |
+| 解开或偷走已有租户的签名密钥 | 不能 | 不能 | 密钥只加密给签名闸本机信任的签名闸与离线恢复公钥；新增收件人要在签名闸本机确认；被取代的旧主随 `promote` 从本机信任里撤销 |
+| 让签名闸改用别的密钥签已有租户 | 不能 | 不能 | 本机记录按包名记着证书；新证书只接受本机或本机信任的签名闸生成的，本机是主时只接受自己生成的 |
 | 让签名闸签指向攻击者服务端的包（已有租户） | 不能 | 不能 | 信任根变化要在签名闸本机重新确认 |
 | 让签名闸签伪造构建机交付的包 | 不能 | 不能 | 构建机信任仍在签名闸本机确认 |
 | 版本号乱签、同一 versionCode 签两个包 | 不能 | 不能 | 本机记录，不变 |
-| **新租户第一次生成密钥时，写入错误的信任根** | 不能 | **能** | 新租户的信任根在第一次生成时直接取服务端的值（首次信任） |
+| 让新机器的本机记录直接成为主签名闸 | 不适用 | 不能 | 注册一律写本机备；主只由本机 `promote --first`/`--import` 产生（本轮收紧，见「实现记录与偏离」） |
+| 让某台签名闸信任攻击者指定的签名闸或恢复公钥 | 不适用 | 不能 | `trust-peer`/`trust-recovery` 都要在本机粘贴指纹比对；注册不再自动信任服务端给的主（本轮收紧） |
+| 冒充“服务端导出的密文文件”让运维恢复出攻击者的密钥 | 不适用 | 不能 | `build-keystore recover` 必须给 `--expect-certificate-sha256`，取值来自 RN-App 仓库 `tenants/<slug>/tenant.json` 或已发布 APK（本轮收紧） |
+| **新租户第一次生成密钥时，写入错误的信任根** | 不能 | **能** | 租户在签名闸本机从没确认过时，信任根直接取服务端的值（首次信任）；已确认过的租户换包名会被拒 |
 | **让签名闸无意义地换一把新密钥（老用户升不上去）** | 不能 | **能** | 控制台一键换密钥；新密钥仍由签名闸生成、攻击者拿不到，后果是拒绝服务 |
+| **把 `publishedMaxBuildNumber` 抬高，让新证书首签就逼近版本号上限** | 不适用 | **能** | 首签上限取服务端的值，后果是此后发不了新版本（拒绝服务） |
+| **扣住或乱序下发生成结果，让新备签名闸停在旧证书上** | 不适用 | **能** | 新备只按收到的第一份生成首次信任；现象是备与主证书不一致，要人工 `signer confirm`（拒绝服务） |
 | **在新机器安装时下发篡改过的程序** | 不适用 | **能** | 安装包从服务端下载；只影响此后新装的机器，已在运行的签名闸不受影响 |
 
 ## 总体流程
@@ -60,7 +65,8 @@ flowchart LR
     c1["控制台：新建机器<br/>得到一次性安装命令"] --> s1["服务器本机：执行安装命令<br/>下载、安装、生成本机密钥、注册、启动"]
     s1 --> c2["控制台：点「接受」"]
     c2 --> p1{"签名闸？"}
-    p1 -->|"是，且平台已有签名闸"| t1["已有主签名闸本机：<br/>signer trust-peer（粘贴新机器指纹）"]
+    p1 -->|"平台第一台主"| t0["本机：signer promote --first<br/>（注册只写本机备）"]
+    p1 -->|"备签名闸"| t1["主本机：signer trust-peer（粘贴新机器指纹）<br/>备本机：signer trust-peer 主"]
     p1 -->|"构建机"| t2["每台签名闸本机：<br/>signer trust-builder"]
   end
   subgraph key["每个租户换密钥"]
@@ -87,7 +93,9 @@ flowchart LR
   - 平台管理员在控制台「平台维护 → 签名闸恢复密钥」粘贴 `recovery-public.json` 的内容。
   - 服务端存进 `app_configs` 平台级键 `build.recovery.recipients`（公钥与完整 sha256，可多把）。
 - **签名闸本机信任**：安装命令带 `--recovery-sha256 <指纹>`，由运维从密码管理器粘贴，不取控制台的值。签名闸从服务端取公钥，核对 sha256 一致后写进本机记录。以后要新增或更换恢复公钥，在签名闸本机执行 `signer trust-recovery`。
-- **恢复**：离线工具新增 `build-keystore recover --recovery-key <文件> --upload <服务端导出的密文文件>`，解开发给恢复公钥的那份密文，得到 `.p12` 与口令文件。之后按原设计 `seal` 流程重新加密给新签名闸。控制台提供“导出密文文件”。
+- **恢复**：离线工具新增 `build-keystore recover --recovery-key <文件> --upload <服务端导出的密文文件> --expect-certificate-sha256 <64hex>`，解开发给恢复公钥的那份密文，得到 `.p12` 与口令文件。之后按原设计 `seal` 流程重新加密给新签名闸。控制台提供“导出密文文件”，导出的文件**只含发给未吊销恢复公钥的那几份密文**（签名闸那几份不导出：吊销但没擦盘的签名闸私钥加上一次导出就能解开密钥）。
+  - `--expect-certificate-sha256` 必填：恢复公钥是公开的，攻击者也能用它封装自己的密钥冒充导出文件。取值来自 **RN-App 仓库 `tenants/<slug>/tenant.json` 的 `signerSha256`**（git 历史里的值，不取控制台显示的值），或从已安装设备、已发布 APK 用 `apksigner verify --print-certs` 读。
+  - 首次生成密钥后更新 `tenant.json` 时，证书 sha256 取**主签名闸本机** `signer list` 的输出，不取控制台。
 
 ## 2. 新机器：一条命令 + 控制台接受
 
@@ -121,10 +129,10 @@ flowchart LR
      - `/opt/rn-signer`、root 自有的 apksigner 副本；
      - 由模板渲染出 `rn-signer-<实例>.service`、`rn-signer-<实例>-check.socket`、`rn-signer-<实例>-check@.service`。
    - **构建机**：`rn-build-agent`、`builder` 两个用户，目录、sudoers、unit。从旧结构迁移的逻辑沿用 `1-install.sh`。
-5. **注册**：执行 `signer enroll --server <API> --code <注册码> --env-file /etc/rn-signer-<实例>.env [--recovery-sha256 …]`，构建机是 `build-agent enroll …`。程序做这几件事：
+5. **注册**：执行 `signer enroll --server <API> --env-file /etc/rn-signer-<实例>.env [--recovery-sha256 …]`，注册码经环境变量 `RN_ENROLLMENT_CODE` 传入（`--code` 仍兼容，但会出现在 `ps` 里）；构建机是 `build-agent enroll …`。程序做这几件事：
    - 生成本机密钥；
    - 调 `POST /v1/machine-setup/enroll {code, 公钥…}`，拿到长期机器令牌，**直接写进 env 文件**，不经屏幕；
-   - 按服务端给的主备，写入本机初始角色（只在全新机器上生效，已有记录时拒绝）；
+   - 写入本机初始角色，**一律是备**（只在全新机器上生效，已有记录时拒绝）。控制台登记为主的机器，要在本机停服务后 `signer promote --first`（平台第一台主）或 `--import`（替换旧主）再启动；describe 里的 `signerRole`、`primarySigner` 只用于提示；
    - 签名闸额外核对恢复公钥 sha256，并写进本机记录。
 6. **启动服务**：打印机器名、完整指纹，以及下一步提示：去控制台接受；签名闸或构建机还要在已有签名闸上执行 `trust-peer` 或 `trust-builder`。
 
@@ -144,11 +152,11 @@ flowchart LR
   ```
   signer trust-peer --peer <机器名>
   ```
-  程序从服务端取这台签名闸已接受的公钥，显示出来；运维粘贴新机器安装输出里的完整 X25519 与 Ed25519 指纹，程序比对一致后写进本机记录。
-- 备签名闸信任主签名闸（用来验证生成签名）的方式：
-  - 装备签名闸时，`signer enroll` 从服务端取当前主签名闸已接受的公钥，**首次信任**写进本机记录；
-  - 之后要更换主签名闸，在备上执行 `trust-peer`。
-- 两台签名闸在同一台机器上（开发阶段 amos）时，`trust-peer` 可以一次对两个实例执行。
+  程序从服务端取这台签名闸已接受的公钥；运维粘贴新机器安装输出里的完整 X25519 与 Ed25519 指纹，比对一致后才写进本机记录、也才显示指纹（不让人照着屏幕抄）。
+- 备签名闸信任主签名闸（用来验证生成签名）的方式：**在备本机执行 `signer trust-peer --peer <主机器名>`**，指纹取主签名闸本机 `signer show-key`（或它的安装输出）。
+  注册**不会**自动信任服务端给的主：只改数据库的攻击者，本来可以在备注册那一刻把「主」换成自己的公钥，此后备会自动接受它签的生成（本轮收紧，见「实现记录与偏离」）。
+- 换主签名闸时：新主本机 `promote --import`（会自动撤销对旧主的本机信任），其余备执行 `trust-peer --revoke` 撤销旧主、`trust-peer` 信任新主。
+- 两台签名闸在同一台机器上（开发阶段 amos）时，两个实例分别执行 `trust-peer`（一条命令处理两个实例没有实现）。
 
 ### 构建机信任：`signer trust-builder`
 
@@ -186,7 +194,8 @@ flowchart LR
 - 在 `run` 循环里处理 `generationRequest`，只有本机角色是主时处理。
 - 生成：
   - 用 `releasekey.Generate` 生成 RSA 4096 证书和 PKCS#12；明文只在内存里。
-  - 按包名首次信任信任根：本机对这个包名没有确认记录时，用服务端 `trustRoots` 写入确认记录，确认人记为 `auto:first-generation`，minSdk/targetSdk 下限取 24/28；首签 versionCode 上限：本机对这个包名有签名历史时取历史最大 versionCode 加 100，没有历史时取服务端该平台已发布的最大 build 号加 100（首次信任）；
+  - 按**租户**首次信任信任根：本机对这个租户（不只是这个包名）从没有过确认记录时，用服务端 `trustRoots` 写入确认记录，确认人记为 `auto:first-generation`，minSdk/targetSdk 下限取 24/28；首签 versionCode 上限：本机对这个包名有签名历史时取历史最大 versionCode 加 100，没有历史时取服务端该平台已发布的最大 build 号加 100（首次信任，服务端可借此造成拒绝服务）；
+  - 本机对这个租户确认过别的包名时，不走首次信任，回报 `TRUST_ROOTS_CHANGED`；
   - 本机对这个包名已有确认记录、而服务端的信任根摘要与记录不同时，不生成，回报 `TRUST_ROOTS_CHANGED`，要求先在本机 `confirm`；
   - 已有确认记录且摘要相同时，沿用原有信任根，只把证书换成新生成的，确认记录注明 `auto:regenerated`。
 - 加密：用 v3 box 加密给本机信任的所有签名闸（含本机），以及本机信任的全部恢复公钥。本机没有信任任何恢复公钥时不生成，回报 `RECOVERY_KEY_NOT_PINNED`。
@@ -195,10 +204,16 @@ flowchart LR
 ### 备签名闸
 
 在 `keystore-checks` 里拿到新密文时：
-1. 服务端下发 `generator` 与 `signature`（存在 `build.keystore` 记录里）；
-2. 生成者必须是本机信任的签名闸，且签名有效；
+1. 服务端下发 `generator`、`generationSignature`、`generationRequestId` 与完整 `upload`（存在 `build.keystore` 记录里）；缺任何一项都不自动接受；
+2. 生成者必须是本机 `trust-peer` 过的签名闸，且生成签名有效；**本机是主时只接受自己签的生成**，别人签的退回人工 `confirm`；
 3. 解开 box，核对证书与上传文件一致；
-4. 按主签名闸同样的规则写确认记录（首次信任或沿用原有信任根），确认人记为 `auto:peer-generated:<主签名闸机器名>`。
+4. 确认参数取**密文里绑定的** `generation`（信任根摘要、minSdk/targetSdk、首签上限、被取代的证书），不取服务端下发的值：
+   - 本机已有确认：被取代的证书必须等于本机当前证书（服务端不能重放更早的一次生成）；
+   - 本机没有确认：服务端下发的信任根摘要必须等于绑定的摘要（服务端不能给新备另一套信任根），且本机对这个租户没有确认过别的包名；
+   - 写入前逐字段复核计划参数，其间有任何写入就重算；
+   - 确认人记为 `auto:peer-generated:<主签名闸机器名>`。
+
+已知限制：新备只按收到的**第一份**生成首次信任。备离线期间主连换两把、或服务端扣住中间那把时，备停在旧证书上，要人工 `signer confirm`。服务端侧的缓解：当前密钥的收件人里还有 active 签名闸没确认这一版时，发起换密钥返回 409 `KEYSTORE_SIGNERS_NOT_IN_SYNC`，控制台要明确勾选「仍然生成」才继续。
 
 没有生成签名的密文（离线导入的）仍然走原来的 `signer confirm`。
 
@@ -290,7 +305,7 @@ amos 上已经按手工流程装好 `amos-signer-a`、`amos-signer-b`、`amos-bu
 
 ## 实现记录与偏离
 
-2026-09-17 按实现与对抗评审补记。接口以 `contracts/openapi.json`（2026.09.24）为准，决策与理由见 ADR-0020。
+2026-09-17 按实现与对抗评审补记。接口以 `contracts/openapi.json`（2026.09.25）为准，决策与理由见 ADR-0020。
 
 ### 服务端
 
@@ -310,3 +325,11 @@ amos 上已经按手工流程装好 `amos-signer-a`、`amos-signer-b`、`amos-bu
 - **`trust-peer` / `trust-builder`**：第 2 节写"程序从服务端取公钥显示出来，运维粘贴指纹比对"。实际上程序先只显示机器信息（名称、机器 id、服务端登记的主备），不先显示指纹；运维粘贴从那台机器安装输出（或它本机 `signer show-key`）抄来的完整指纹，与服务端已接受的一致才写入，写入之后才把指纹打出来——免得运维照着屏幕上服务端给的值抄一遍当作核对。
 - **unit 模板不写死 `IPAddressDeny`**：API 地址因机器而异，模板里只写注释，上线后用 drop-in 收紧到 API 与 DNS 解析器地址（amos 现有的 a/b unit 仍写死 localhost）。
 - **安装脚本位置与前提**：第 2 节写源文件放在 `deploy/setup/install.sh`，实际在 `internal/machinesetup/install.sh`（`go:embed` 进服务端）。比第 2 节多了两处：签名闸可选 `--apksigner-jar <路径>`（指定 Android build-tools 35.0.0 的 `apksigner.jar`，按 sha256 核对；不指定时在常见 SDK 位置找）；前提检查多了 `python3`（脚本用它按形状校验、解析服务端的 describe 回答与 problem code，不把服务端给的字符串交给 shell）。
+- **本机角色与首次信任收紧**（对抗评审后改的，第 2 节正文已同步）：`enroll` 一律写本机备、忽略 describe 里的 `signerRole`；主只由本机 `promote --first`/`--import` 产生，且 `--first` 拒绝已经接受过别的签名闸生成密钥的机器。备**不再**在注册时自动信任服务端给的主，要在本机 `trust-peer`。`promote --import` 会自动撤销对被取代的旧主的本机信任（旧主若要重用，按新机器重装再 `trust-peer`）。修复前开发版写下的这两类记录（注册即为主、`enroll-first-trust`）新版签名闸回放时直接拒绝。
+- **`recover` 必须核对证书**：见第 1 节。攻击者可以用公开的恢复公钥封装自己的密钥冒充导出文件，`recover` 自己验证不了来源，锚点放在 RN-App 仓库与已发布 APK 上。
+- **换密钥的同步闸**：当前密钥的收件人里还有 active 签名闸没确认这一版时，`POST /v1/admin/build-keystore/generate` 返回 409 `KEYSTORE_SIGNERS_NOT_IN_SYNC`；控制台勾选「仍然生成」（`allowUnconfirmedSigners=true`）才继续，勾选项写明没跟上的签名闸之后要人工 `signer confirm`。本地端到端实测：备签名闸在线，但一轮检查里连换两把密钥，它此后每一把都会拒绝。
+- **上报的信任列表始终是数组**：空列表曾被存成 `null`，控制台按数组校验，整份机器列表读不出来。上报时归一化成 `[]`，视图层对旧数据兜底。
+- **注册码经环境变量**：`RN_ENROLLMENT_CODE`（`--code` 仍兼容）。`curl … | sudo bash -s -- --code …` 这一层挡不住，本机其他用户能从 `ps` 与 sudo 日志读到；后果是这次注册被抢注失败（控制台仍要人工比对指纹后接受），重发注册码即可。手册写明要在没有其他不受信本机用户的机器上执行。
+- **旧结构迁移重建仓库镜像与 `~/.ssh`**：旧结构里 `/var/lib/rn-build-agent` 是 `builder` 的家目录，仓库镜像与 `~/.ssh` 都曾归它可写，而控制进程 `git fetch` 会读仓库本地配置（`core.sshCommand`、`remote.*.uploadpack`、`include.path` 等都能执行命令）与 `~/.ssh/config`。迁移时旧镜像整个留存、以 `rn-build-agent` 重新克隆，`~/.ssh` 只保留 deploy key 并用脚本固定的 GitHub 主机公钥重写 `known_hosts`；控制进程另外固定 `GIT_SSH_COMMAND`（`-F /dev/null` + 固定 `known_hosts`），并在 fetch 前按白名单核对镜像配置与结构，不符就让任务失败。deploy key 私钥曾对 `builder` 可读，建议在 GitHub 上换一把。
+- **install.sh 以 root 运行时的隔离**：`python3` 一律 `-I`（隔离模式，当前目录与 `PYTHON*` 环境变量都不进 `sys.path`），脚本开头固定工作目录、`umask` 与 `PATH`；否则运维在 `/tmp` 里执行安装时，本机任何用户预先放一个 `json.py` 就能以 root 执行。
+- **`build-agent enroll` 建出处密钥**：用 `os.OpenRoot` 在状态目录内创建，不跟随路径前缀上的符号链接（否则 `rn-build-agent` 若已被攻陷，可让 root 把密钥文件建进任意 root-only 目录）。
