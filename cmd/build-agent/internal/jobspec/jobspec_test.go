@@ -119,7 +119,7 @@ func drop(env []string, key string) []string {
 func validSpec(t *testing.T, layout Layout) Spec {
 	t.Helper()
 	return Spec{
-		Version: SpecVersion, JobID: layout.JobID, Kind: KindAPK, TenantDirectory: "anyfun",
+		Version: SpecVersion, JobID: layout.JobID, Kind: KindAPK, Platform: PlatformAndroid, TenantDirectory: "anyfun",
 		AppVersion: "1.3.7", BuildNumber: 33, CommitSHA: strings.Repeat("a", 40), Env: testEnv(t, layout),
 	}
 }
@@ -159,7 +159,16 @@ func TestSpecValidateRefusesMismatches(t *testing.T) {
 		"tenant escape":     func(s *Spec) { s.TenantDirectory = "../etc" },
 		"commit":            func(s *Spec) { s.CommitSHA = "HEAD" },
 		"apk with ota args": func(s *Spec) { s.OTA = &OTAArgs{} },
-		"ota without args":  func(s *Spec) { s.Kind = KindOTA },
+		"no platform":       func(s *Spec) { s.Platform = "" },
+		"unknown platform":  func(s *Spec) { s.Platform = "harmony" },
+		// 热更新包与平台无关，由 Android 那台机器构建
+		"ota on ios": func(s *Spec) {
+			s.Platform = PlatformIOS
+			s.Kind = KindOTA
+			s.OTA = &OTAArgs{Channel: "production", ApplyStrategy: "next_launch", RuntimeVersion: "1.3.7",
+				APIBaseURL: "https://api.anyfun.win", ApplicationID: "dex-mobile"}
+		},
+		"ota without args": func(s *Spec) { s.Kind = KindOTA },
 		"tenant env differs": func(s *Spec) {
 			s.Env = replace(s.Env, "EXPO_PUBLIC_TENANT", "other")
 		},
@@ -179,7 +188,7 @@ func TestSpecValidateRefusesMismatches(t *testing.T) {
 
 func TestResultIsCheckedPerKind(t *testing.T) {
 	good := `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `"}`
-	if _, err := DecodeResult(strings.NewReader(good), KindAPK); err != nil {
+	if _, err := DecodeResult(strings.NewReader(good), KindAPK, PlatformAndroid); err != nil {
 		t.Fatalf("a valid result was refused: %v", err)
 	}
 	for name, doc := range map[string]string{
@@ -187,9 +196,26 @@ func TestResultIsCheckedPerKind(t *testing.T) {
 		"fingerprint not hex":     `{"v":1,"kind":"apk","nativeFingerprint":"$(id)"}`,
 		"unknown field":           `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `","artifact":"/etc/passwd"}`,
 		"kind mismatch":           `{"v":1,"kind":"ota"}`,
+		// 上传标记只属于 iOS
+		"android reports an upload": `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `","uploadedToAppStoreConnect":true}`,
 	} {
-		if _, err := DecodeResult(strings.NewReader(doc), KindAPK); err == nil {
+		if _, err := DecodeResult(strings.NewReader(doc), KindAPK, PlatformAndroid); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+// iOS 的安装包没有原生指纹：那套是签名闸复核未签名包用的，而 iOS 没有签名闸这一环。
+func TestIOSResultCarriesNoNativeFingerprint(t *testing.T) {
+	if _, err := DecodeResult(strings.NewReader(`{"v":1,"kind":"apk"}`), KindAPK, PlatformIOS); err != nil {
+		t.Fatalf("a valid ios result was refused: %v", err)
+	}
+	parsed, err := DecodeResult(strings.NewReader(`{"v":1,"kind":"apk","uploadedToAppStoreConnect":true}`), KindAPK, PlatformIOS)
+	if err != nil || !parsed.UploadedToAppStoreConnect {
+		t.Fatalf("the upload flag must survive: %#v %v", parsed, err)
+	}
+	withFingerprint := `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `"}`
+	if _, err := DecodeResult(strings.NewReader(withFingerprint), KindAPK, PlatformIOS); err == nil {
+		t.Fatal("an ios result carrying a native fingerprint was accepted")
 	}
 }

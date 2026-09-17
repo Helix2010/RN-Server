@@ -151,15 +151,20 @@ func TestPrepareWorktreeBuildsTheSameEnvironmentForAPKAndOTA(t *testing.T) {
 // 服务端下发的字段先校验再动磁盘
 func TestValidateClaimedJobRefusesUnsafeFields(t *testing.T) {
 	for name, mutate := range map[string]func(map[string]any){
-		"no attempt":        func(b map[string]any) { delete(b, "attempt") },
-		"other branch":      func(b map[string]any) { b["gitRef"] = "release/x" },
-		"option injection":  func(b map[string]any) { b["gitRef"] = "--upload-pack=touch /tmp/x" },
-		"tenant escape":     func(b map[string]any) { b["tenantDirectory"] = "../../etc" },
-		"tenant slash":      func(b map[string]any) { b["tenantDirectory"] = "a/b" },
-		"job id escape":     func(b map[string]any) { b["id"] = "../bld_x" },
-		"version in path":   func(b map[string]any) { b["version"] = "1.0/../../x" },
-		"no machine id":     func(b map[string]any) { delete(b, "claimedMachineId") },
-		"ios":               func(b map[string]any) { b["platform"] = "ios" },
+		"no attempt":       func(b map[string]any) { delete(b, "attempt") },
+		"other branch":     func(b map[string]any) { b["gitRef"] = "release/x" },
+		"option injection": func(b map[string]any) { b["gitRef"] = "--upload-pack=touch /tmp/x" },
+		"tenant escape":    func(b map[string]any) { b["tenantDirectory"] = "../../etc" },
+		"tenant slash":     func(b map[string]any) { b["tenantDirectory"] = "a/b" },
+		"job id escape":    func(b map[string]any) { b["id"] = "../bld_x" },
+		"version in path":  func(b map[string]any) { b["version"] = "1.0/../../x" },
+		"no machine id":    func(b map[string]any) { delete(b, "claimedMachineId") },
+		"unknown platform": func(b map[string]any) { b["platform"] = "harmony" },
+		// 热更新包与平台无关，由 Android 那台机器构建；iOS 只做安装包
+		"ios ota": func(b map[string]any) {
+			b["platform"] = "ios"
+			b["kind"] = "ota"
+		},
 		"unknown kind":      func(b map[string]any) { b["kind"] = "script" },
 		"no ota cert":       func(b map[string]any) { b["otaCertificatePem"] = nil },
 		"zero build number": func(b map[string]any) { b["buildNumber"] = 0 },
@@ -177,6 +182,13 @@ func TestValidateClaimedJobRefusesUnsafeFields(t *testing.T) {
 	}
 	if err := validateClaimedJob(mustClaimedJob(t, claimBody("bld_validJOB0001", "apk"))); err != nil {
 		t.Fatalf("a valid job was refused: %v", err)
+	}
+	// iOS 的安装包任务是合法的：这台机器认不认它由 BUILD_AGENT_PLATFORMS 和
+	// 服务端的登记决定，不由这里决定
+	ios := claimBody("bld_validJOB0001", "apk")
+	ios["platform"] = "ios"
+	if err := validateClaimedJob(mustClaimedJob(t, ios)); err != nil {
+		t.Fatalf("an ios package job was refused: %v", err)
 	}
 }
 

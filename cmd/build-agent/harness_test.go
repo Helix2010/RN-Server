@@ -237,6 +237,8 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("png-from-server"))
 	case strings.HasSuffix(path, "/ota-release"):
 		_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]any{"id": "ota_rel0001"}})
+	case strings.HasSuffix(path, "/ios-release"):
+		_ = json.NewEncoder(w).Encode(map[string]any{"releaseId": "rel_ios00000001"})
 	case strings.HasSuffix(path, "/built"), strings.HasSuffix(path, "/fail"), strings.HasSuffix(path, "/complete"):
 		w.WriteHeader(http.StatusNoContent)
 	default:

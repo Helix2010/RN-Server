@@ -83,7 +83,7 @@ func spoolOutput(layout jobspec.Layout, name, spoolDir string, limit int64) (spo
 }
 
 // readResult 读执行进程写的 result.json（同样按不可信数据处理）。
-func readResult(layout jobspec.Layout, kind jobspec.Kind) (jobspec.Result, error) {
+func readResult(layout jobspec.Layout, kind jobspec.Kind, platform string) (jobspec.Result, error) {
 	in, err := os.OpenFile(layout.OutFile(jobspec.ResultFileName), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return jobspec.Result{}, fmt.Errorf("the build runner wrote no result: %w", err)
@@ -96,7 +96,7 @@ func readResult(layout jobspec.Layout, kind jobspec.Kind) (jobspec.Result, error
 	if !info.Mode().IsRegular() {
 		return jobspec.Result{}, errors.New("the build runner result is not a regular file")
 	}
-	result, err := jobspec.DecodeResult(in, kind)
+	result, err := jobspec.DecodeResult(in, kind, platform)
 	if err != nil {
 		return result, fmt.Errorf("the build runner result is refused: %w", err)
 	}

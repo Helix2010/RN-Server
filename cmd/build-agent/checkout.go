@@ -42,8 +42,11 @@ func validateClaimedJob(job claimedJob) error {
 		return errors.New("the job id is malformed")
 	case job.Attempt < 1:
 		return errors.New("the job carries no attempt number")
-	case job.Platform != "android":
-		return fmt.Errorf("this build machine only builds android, got %q", firstRunes(job.Platform, 16))
+	case !jobspec.ValidPlatform(job.Platform):
+		return fmt.Errorf("unknown target platform %q", firstRunes(job.Platform, 16))
+	case job.Platform == jobspec.PlatformIOS && job.Kind != string(jobspec.KindAPK):
+		// 热更新包与平台无关，由 Android 那台机器构建
+		return errors.New("only installable-package jobs are built on ios")
 	case job.Kind != string(jobspec.KindAPK) && job.Kind != string(jobspec.KindOTA):
 		return fmt.Errorf("unknown job kind %q", firstRunes(job.Kind, 16))
 	case job.GitRef != buildBranch:
@@ -170,6 +173,8 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		Version:         jobspec.SpecVersion,
 		JobID:           job.ID,
 		Kind:            jobspec.Kind(job.Kind),
+		Platform:        job.Platform,
+		IOSUpload:       job.Platform == jobspec.PlatformIOS && a.cfg.IOSUpload,
 		TenantDirectory: job.TenantDirectory,
 		AppVersion:      job.Version,
 		BuildNumber:     job.BuildNumber,

@@ -1,6 +1,6 @@
 # 设计：iOS TestFlight 分发（租户自有 Apple 开发者账号）
 
-状态：Draft（2026-09-17）。跨 RN-App / RN-Server / RN-Admin 三个仓库。
+状态：阶段 0–1 已实现（2026-09-17），未推送。跨 RN-App / RN-Server / RN-Admin 三个仓库。实现记录与偏离见 §10。
 
 这是 `docs/design/build-service-2026-09-11.md:180`（「iOS：需要 macOS 构建机与签名身份，另排」）那一条的落地方案。不改动该文档确立的安全论证——服务端不下发命令、签名材料不经服务端、任务只带参数——但 iOS 的签名模型与 Android 不同，见 §4.2 与 §8.4。
 
@@ -258,7 +258,9 @@ if platform == "ios" && distribution == "store" {
 
 #### 4.5.3 排队时就拒掉无人认领的 iOS 安装包任务
 
-在 `createBuildJob`（`build_jobs.go:288`）加闸，与 OTA 那侧（`build_ota_jobs.go:82-86`）对称：iOS 打包机上线之前，`platform=ios` 的 **apk** 任务直接 422，文案说明「iOS 构建链路尚未上线」。否则一条任务永久占住队列和 build 号（§3.2.1）。
+在 `createBuildJob` 加闸，与 OTA 那侧（`build_ota_jobs.go` 的「打包机只做 android」）对称。否则一条任务永久占住队列和 build 号（§3.2.1）。
+
+**判据不写成「iOS 不行」，写成登记**（实现时的修正，见 §4.8）：iOS 打包机就是一台装了 Xcode 的 Mac，接进来之后这里不该还硬编码着平台名。所以闸的条件是「`build.machines` 里有没有一台没被吊销、且声明能构建这个平台的构建机」，没有就 409 `NO_BUILDER_FOR_PLATFORM` 并指路去登记。
 
 这条与 TestFlight 无关，是现在就该修的存量缺陷。
 
@@ -389,6 +391,43 @@ TestFlight 包的 `distributionChannel` 用 `store`，不新增 `testflight` 枚
 
 代价要写明：`update.full.channel` 在 TF 包上报的是 `store`，运营在管理端看不出区别。如果将来 TF 与正式商店需要**不同的更新策略**（比如 TF 用户要更激进的强更节奏），那时再加枚举，不在现在加。
 
+### 4.8 多台 Mac：任务路由靠登记，不靠自报
+
+阶段一只有一台 Mac，但「只有一台」不该被写进代码——换一台机器、加一台机器都是常态，而队列是跨租户的，一台配错的机器能把别人的发布一起拖住。
+
+做法是给 `build.machines` 的构建机加一个 `platforms`（空 = `["android"]`，加这个字段之前登记的构建机全是 Linux）：
+
+| 位置 | 规则 |
+| --- | --- |
+| 排队（`createBuildJob`） | 没有一台没被吊销、能构建这个平台的构建机 → 409，不排 |
+| 认领（`claimBuildJob`） | 代理自报的 `platforms` 与登记**求交集**：自报只能收窄，不能扩张 |
+| 改能力（`POST /machines/:id/platforms`） | `expectedVersion` + `reason` + `confirm`，进审计 |
+| 代理自己（`BUILD_AGENT_PLATFORMS`） | 认 `android` / `ios`；声明 `ios` 但不是 macOS 时**启动即失败** |
+
+「自报只能收窄」这一条是关键。一台没装 Xcode 的机器报了 `ios`，领走的任务只会失败、退回排队、再被它领走——一个自愈不了的循环。登记由平台管理员维护，自报只是「我这次想干什么」。
+
+**Mac 不在公网不构成障碍**：打包机本来就是拉模型（本机令牌 + 轮询认领），只需要出站到服务端。反过来服务端不需要、也没有任何办法主动连它——这正是 `build-service-2026-09-11.md` 立的那条「服务端不下发命令」。
+
+**还没做的一块**：`machine_setup.go` 生成的安装命令是 Linux + systemd 的。Mac 上目前要人工装（放二进制、写 launchd plist、准备 `BUILD_AGENT_*` 环境）。另外 macOS 上的执行进程隔离（`BUILD_AGENT_RUNNER_USER`）要给那个用户单独准备签名身份的钥匙串，没有就只能用 `-`（与控制进程同用户），而那正是 §8.4 说的那个风险。
+
+### 4.9 iOS 安装包任务的生命周期
+
+Android 是 `queued → claimed → running → built（待签名）→ signing → succeeded`。**iOS 是 `queued → claimed → running → succeeded`**，中间没有待签名这个状态。
+
+原因只有一条：`xcodebuild -exportArchive` 导出的那一刻签名就已经发生了，没有「未签名包」这种东西可以交给签名闸。签名闸的认领 SQL 本来就带 `platform='android'`，所以 iOS 任务真要走到 `built` 会永远停在那里——`/built` 因此对 iOS 关掉，改走 `POST /v1/build-agent/jobs/:id/ios-release`。
+
+| | Android | iOS |
+| --- | --- | --- |
+| 交付物 | 未签名 APK + SBOM，上传服务端 | 已签名 `.ipa`，**不上传** |
+| 出处签名 | 必须，签名闸据此验货 | 无——没有签名闸这一环 |
+| 原生指纹 | 必须 | 无 |
+| 发布记录 | 有产物、有 sha256 | 无产物，`file_size` / `sha256` 为 NULL |
+| 结束状态 | `succeeded`（签名闸写） | `succeeded`（构建机写） |
+
+`.ipa` 不上传，是因为用户装的那一份是 Apple 重签、瘦身之后的东西（§4.5.4）。它的摘要仍然记进 `file_metadata`，标 `ipaSelfReported`，只当审计凭证。
+
+上传 App Store Connect 由**这台 Mac 自己**决定（`BUILD_AGENT_IOS_UPLOAD`，默认关），用的是机器本地的 ASC 凭证，不是服务端保管的那把——上传是对外可见的动作，包进了 ASC 就撤不回来，这个决定该留在装机器的人手里。服务端那把（`ios.asc`）只读，两者可以是不同的 Key。
+
 ## 5. 90 天时钟
 
 这是本方案唯一的周期性运营负担，单列一节免得被当成脚注。
@@ -404,29 +443,33 @@ TestFlight 包的 `distributionChannel` 用 `store`，不新增 `testflight` 枚
 
 ## 6. 分阶段任务
 
-**阶段 0（现在就能做，不需要 Mac）**
+本节的勾选状态以 2026-09-17 的实现为准，详见 §10。
 
-1. `build_jobs.go` 拒掉 iOS 安装包任务（§4.5.3）——存量缺陷；
-2. RN-App 的 iOS 配置补齐：`associatedDomains`、Face ID 文案、`appleTeamId` 进 tenant.json 及配套闸（§4.4 第 3、4、6、7 条）；
-3. AASA 补 `/app/invite/` 路径（§3.2.3）；
-4. `release.ios` 增 `installUrl` + bootstrap iOS actionUrl（§4.5.1、§4.5.2）+ 更新弹窗的 iOS 文案；
-5. 公开落地页 `/app/download`，邀请页改指它（§4.5.5）；
-6. 管理端 iOS 段（§4.6）。
+**阶段 0（不需要 Mac）——已完成**
 
-**阶段 1（拿到 Mac 与租户 ASC Key）**
+1. ✅ `build_jobs.go` 拒掉没人能构建的平台（§4.5.3，判据换成了登记，见 §4.8）；
+2. ✅ RN-App 的 iOS 配置补齐：`associatedDomains`、Face ID 文案、`appleTeamId`（经 `release.ios` 进合成的 tenant.json）及配套闸；
+3. ✅ AASA 补 `/app/invite/*`；
+4. ✅ `release.ios` 增 `installUrl` + bootstrap iOS actionUrl + 更新弹窗的 iOS 文案；
+5. ✅ 公开落地页 `/app/download`，邀请页改指它；
+6. ✅ 管理端 iOS 段（§4.6），含 `ios.asc` 与只读同步。
 
-7. `scripts/build-ios-release.mjs`：prebuild（`EXPO_OS=ios`）→ archive → export → 产物门禁；
-8. 出第一个 build，上传 ASC，内部测试组装机验证：冷启动、bootstrap、深链回跳、Face ID、推送、OTA（重点验 §3.2.2 修没修对）。
+**阶段 1（需要 Mac）——代码已就位，等第一台机器**
+
+7. ✅ `scripts/build-ios-release.mjs`：prebuild（`EXPO_OS=ios`）→ archive → export → 产物门禁；门禁逻辑是纯函数，单测不需要 Mac；
+8. ✅ 打包机的 iOS 路径（`BUILD_AGENT_PLATFORMS=ios`）与 `POST /jobs/:id/ios-release`（§4.9），端到端测试用假 `pnpm` 跑通；
+9. ⬜ **在真机上跑一遍**：出第一个 build，上传 ASC，内部测试组装机验证——冷启动、bootstrap、深链回跳、Face ID、推送、OTA（重点验 §3.2.2 修没修对）。这一条没有替代品，下面全部依赖它。
 
 **阶段 2（TestFlight 对外）**
 
-9. 出口合规答复落地（§8.2），Beta App Review 资料（演示账号、功能说明）；
-10. 外部测试组 + 公开链接 + 扫码动线端到端；
-11. iOS 发布记录登记路径（§4.5.4）与 90 天告警。
+10. ⬜ 出口合规答复落地（§8.2），Beta App Review 资料（演示账号、功能说明）；
+11. ⬜ 外部测试组 + 公开链接 + 扫码动线端到端；
+12. ⬜ 90 天告警：`buildExpiresAt` 已经落库并在管理端提醒（§4.6），还缺一条到期前的主动通知。
 
-**阶段 3（可选）**
+**阶段 3**
 
-12. iOS build-agent 接入 build_jobs，iOS 签名安全模型单列设计。
+13. ⬜ macOS 上的机器安装流程（`machine_setup.go` 目前只出 Linux + systemd 的命令，见 §4.8 末尾）；
+14. ⬜ iOS 签名安全模型单列设计（§8.4）。
 
 ## 7. 验证清单
 
@@ -510,3 +553,40 @@ expo-updates 在 TF 包里能用，但 Apple 的 2.5.2 / 3.3 要求热更新不�
 1. iOS 的 `latestVersion` 阶段二是否改由发布记录驱动（今天 Android direct 走 `visibleSimplifiedRelease`，iOS 走运营手填）；
 2. ~~TF build 过期日是否拉进控制台~~ **已决**（2026-09-17）：见 §4.6——服务端按租户加密保管 ASC Key 与它保管 OTA 私钥、FCM 服务账号是同构的，不是新的信任边界；同时保留不交 Key 的模式 B 作为默认路径；
 3. 上架 App Store 之后 TF 与商店并存时的渠道语义（§4.7 的枚举问题会在那时重新打开）。
+
+## 10. 实现记录与偏离（2026-09-17）
+
+代码分别在三个从 `origin/main` 开的 worktree 上，**本地提交、未推送**。
+
+| 仓库 | 内容 |
+| --- | --- |
+| RN-Server | `release.ios` 扩字段、bootstrap iOS actionUrl、`/app/download`、AASA 补路径、构建机平台能力、iOS 任务生命周期、`internal/ascapi`、`ios.asc` 与只读同步、契约 |
+| RN-App | `app.config.ts` 的 iOS 段、`pnpm ios:release` 与产物门禁、`pnpm asc:check`、更新弹窗的 TestFlight 文案 |
+| RN-Admin | 「iOS 打包与分发」页、打包机的可构建平台 |
+
+### 10.1 与设计不一致的地方
+
+**1. 阶段 3 的「iOS 接进 build_jobs」提前到了阶段 1。**
+原计划是先在一台 Mac 上手工跑通、固化成脚本，阶段三再接队列。提前的理由是需求变了：要支持**多台 Mac**，而「多台」只有在队列路由里才有意义——手工脚本没有「派给谁」这个问题。§4.2 选自有 Mac 而不是 EAS 的论据本来就是「复用 build_jobs、发布记录、SBOM」，所以这是把既定方向的时间点挪前，不是换方向。手工路径仍然在：`pnpm ios:release <slug>` 可以脱离队列单独跑。
+
+**2. iOS 任务没有出处签名（provenance）。**
+Android 那套是给签名闸验货用的：构建机交未签名包，签名闸只认自己 pin 的构建机签的声明。iOS 没有签名闸这一环，出处声明会变成一个没有消费者的审计装饰。§8.4 已经把 iOS 的安全模型留给单独一节，这条一并留到那时定。
+
+**3. §4.5.3 的闸从「iOS 一律 422」改成「没有能构建这个平台的机器才拒」。**
+理由见 §4.8：判据写成登记而不是平台名，iOS 打包机上线之后这里不用再改一次。
+
+**4. `tenants/anyfun/tenant.json` 没有填 `appleTeamId`。**
+字段与校验都在，值还空着——App Store Connect API 查不到 Team ID，只能从 developer.apple.com 的 Membership 页抄。真正的构建走的是服务端合成的那份清单（来自 `release.ios`），所以这不阻断队列里的构建，只阻断在本机手工跑 `pnpm ios:release`。
+
+### 10.2 实现期间复核过的事实
+
+在 `origin/main`（比本地主检出新 148 个提交）上重新验了一遍 §3.2 的三条，全部仍然成立：
+
+- `EXPO_PUBLIC_TENANT=anyfun pnpm exec expo config --json` → `extra.buildNumber = "46"`，而 `ios.buildNumber = "9"`；`updates.requestHeaders["x-build-number"] = "46"`；
+- `ios` 段只有 `supportsTablet` / `bundleIdentifier` / `buildNumber`，没有 `associatedDomains`；
+- `android.permissions` 里没有 `USE_BIOMETRIC` / `USE_FINGERPRINT`，说明 `expo-local-authentication` 的 config plugin 从来没被应用过——Face ID 文案确实是缺的。
+- `@expo/cli` 的 `build/src/prebuild/` 与 `build/src/export/` 里没有任何一处写 `EXPO_OS`，所以「CLI 不会替我们设」这条判断在 SDK 57 上仍然成立。
+
+### 10.3 还没有被验证的部分
+
+打包机的 iOS 路径在这台 Linux 上只能用假 `pnpm` 跑通协议（领取 → 写 spec → 交付 `.ipa` → `/ios-release`）。**真正的 `xcodebuild` 一行都没跑过**：archive、`-exportArchive`、`-allowProvisioningUpdates` 自动申请描述文件、`codesign -d --entitlements`、`plutil -convert json`、`xcrun altool --upload-app` 全部要在第一台 Mac 上验（阶段 1 第 9 条）。

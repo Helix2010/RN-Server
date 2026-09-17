@@ -51,7 +51,7 @@ func prepareJobDir(t *testing.T, root, jobID string, kind jobspec.Kind, tools fa
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := jobspec.Spec{Version: jobspec.SpecVersion, JobID: jobID, Kind: kind, TenantDirectory: "anyfun",
+	spec := jobspec.Spec{Version: jobspec.SpecVersion, JobID: jobID, Kind: kind, Platform: jobspec.PlatformAndroid, TenantDirectory: "anyfun",
 		AppVersion: "1.3.7", BuildNumber: 33, CommitSHA: commit, Env: env}
 	if kind == jobspec.KindOTA {
 		spec.OTA = &jobspec.OTAArgs{Channel: "production", ApplyStrategy: "next_launch", RuntimeVersion: "1.3.7",
@@ -194,7 +194,7 @@ func TestBuildAPKHandsOverOutputsAndChildrenSeeOnlyTheSpecEnvironment(t *testing
 		t.Fatal(err)
 	}
 	defer result.Close()
-	parsed, err := jobspec.DecodeResult(result, jobspec.KindAPK)
+	parsed, err := jobspec.DecodeResult(result, jobspec.KindAPK, jobspec.PlatformAndroid)
 	if err != nil || parsed.NativeFingerprint != fakebuild.NativeFingerprint {
 		t.Fatalf("result = %+v, %v", parsed, err)
 	}

@@ -57,6 +57,9 @@ func build(ctx context.Context, out io.Writer, who identity, flags runnerFlags) 
 	j := job{out: out, layout: layout, spec: spec}
 	switch spec.Kind {
 	case jobspec.KindAPK:
+		if spec.Platform == jobspec.PlatformIOS {
+			return j.buildIPA(ctx)
+		}
 		return j.buildAPK(ctx)
 	case jobspec.KindOTA:
 		return j.buildOTA(ctx)
@@ -122,6 +125,41 @@ func (j job) buildAPK(ctx context.Context) error {
 		return fmt.Errorf("cannot hand over the SBOM: %w", err)
 	}
 	return j.writeResult(jobspec.Result{Version: jobspec.ResultVersion, Kind: jobspec.KindAPK, NativeFingerprint: fingerprint})
+}
+
+// buildIPA 出一个 iOS 安装包。
+//
+// 与 buildAPK 的三点不同，都来自"iOS 的签名与构建分不开"（设计 ios-testflight §4.2）：
+// 产物是**已签名**的（xcodebuild -exportArchive 那一刻签名就发生了）、没有 SBOM 交给
+// 签名闸复核、也不算原生指纹（那是签名闸复核未签名包用的）。
+//
+// 门禁在 RN-App 的 scripts/build-ios-release.mjs 里：bundle id、版本、CFBundleVersion、
+// 内嵌 extra.buildNumber、OTA 请求头、权限文案、applinks entitlement 逐条核对。
+// 这里只负责跑它、确认产物在、交回去。
+func (j job) buildIPA(ctx context.Context) error {
+	app := j.layout.App()
+	if err := j.run(ctx, "pnpm", "install", "--frozen-lockfile"); err != nil {
+		return err
+	}
+	args := []string{"ios:release", j.spec.TenantDirectory}
+	if j.spec.IOSUpload {
+		args = append(args, "--upload")
+	}
+	if err := j.run(ctx, "pnpm", args...); err != nil {
+		return err
+	}
+	name := jobspec.IPAArtifactName(j.spec.TenantDirectory, j.spec.AppVersion, j.spec.BuildNumber)
+	artifact := filepath.Join(app, "artifacts", name)
+	if info, err := os.Lstat(artifact); err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("the build reported success but artifacts/%s is not there", name)
+	}
+	if err := copyFile(artifact, j.layout.OutFile(jobspec.IPAFileName), 0o640); err != nil {
+		return fmt.Errorf("cannot hand over the iOS package: %w", err)
+	}
+	return j.writeResult(jobspec.Result{
+		Version: jobspec.ResultVersion, Kind: jobspec.KindAPK,
+		UploadedToAppStoreConnect: j.spec.IOSUpload,
+	})
 }
 
 func (j job) buildOTA(ctx context.Context) error {

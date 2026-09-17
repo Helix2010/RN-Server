@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +30,8 @@ type config struct {
 	// StateDir 放 Ed25519 出处密钥与上传前的产物副本，只有控制进程用户能读（0700）。
 	StateDir  string
 	Platforms []string
+	// IOSUpload：构建完之后把 .ipa 传进 App Store Connect。默认关。
+	IOSUpload bool
 	Timeout   time.Duration
 	PollEvery time.Duration
 	// Runner 是执行进程二进制的绝对路径；RunnerUser 是经 sudo 切换到的用户。
@@ -63,6 +66,25 @@ var (
 	// shellSafePathPattern：这些路径会拼进 GIT_SSH_COMMAND（git 经 sh -c 执行它），只许不需要引号的字符
 	shellSafePathPattern = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
 )
+
+func containsPlatform(platforms []string, want string) bool {
+	for _, platform := range platforms {
+		if platform == want {
+			return true
+		}
+	}
+	return false
+}
+
+// iosUploadEnabled 只认明确的真值。写错的开关按关处理：多出一个没传上去的包，
+// 比在没人预期的时候往 App Store Connect 推一个包好收场。
+func iosUploadEnabled(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
 
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -145,16 +167,29 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("BUILD_AGENT_RUNNER_USER must be a user name, or - for local testing without sudo (got %q)", cfg.RunnerUser)
 	}
 
+	// 自报的平台只能**收窄**登记里的能力：服务端认领时与 build.machines 求交集，
+	// 这里写了 ios 而机器没被登记成能构建 iOS，那条任务照样不会派过来。
 	for _, p := range strings.Split(envOr("BUILD_AGENT_PLATFORMS", "android"), ",") {
-		if p = strings.ToLower(strings.TrimSpace(p)); p == "android" {
+		p = strings.ToLower(strings.TrimSpace(p))
+		switch p {
+		case jobspec.PlatformAndroid, jobspec.PlatformIOS:
 			cfg.Platforms = append(cfg.Platforms, p)
-		} else if p != "" {
-			return cfg, fmt.Errorf("BUILD_AGENT_PLATFORMS: this build machine only builds android (got %q)", p)
+		case "":
+		default:
+			return cfg, fmt.Errorf("BUILD_AGENT_PLATFORMS must name android and/or ios (got %q)", p)
 		}
 	}
 	if len(cfg.Platforms) == 0 {
-		return cfg, errors.New("BUILD_AGENT_PLATFORMS must name android")
+		return cfg, errors.New("BUILD_AGENT_PLATFORMS must name android and/or ios")
 	}
+	// iOS 只能在 macOS 上构建。让它在启动时就说清楚，而不是领到任务、检出完仓库、
+	// 装完依赖，才在 xcodebuild 那一步失败——那时这条任务已经占了这台机器十几分钟
+	if containsPlatform(cfg.Platforms, jobspec.PlatformIOS) && runtime.GOOS != "darwin" {
+		return cfg, fmt.Errorf("BUILD_AGENT_PLATFORMS names ios but this machine runs %s; iOS packages need macOS with Xcode", runtime.GOOS)
+	}
+	// 上传 TestFlight 是一个对外可见的动作，所以由装这台机器的人显式打开，
+	// 不由"排了一条 iOS 任务"隐含决定。关着时照样出包，只是停在这台机器上。
+	cfg.IOSUpload = iosUploadEnabled(envOr("BUILD_AGENT_IOS_UPLOAD", ""))
 	raw := envOr("BUILD_AGENT_TIMEOUT_MINUTES", "45")
 	minutes, err := strconv.Atoi(raw)
 	if err != nil || minutes < 1 || minutes > 480 {

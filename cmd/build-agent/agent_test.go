@@ -21,6 +21,9 @@ func baseTenant() map[string]any {
 		"signerSha256":           "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694",
 		"version":                "1.3.7",
 		"androidVersionCode":     float64(33),
+		"iosBundleId":            "com.anyfun.foundation",
+		"iosBuildNumber":         "33",
+		"appleTeamId":            "AB12CD34EF",
 	}
 }
 

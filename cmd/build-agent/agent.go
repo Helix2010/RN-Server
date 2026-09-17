@@ -302,17 +302,19 @@ func (a *agent) buildAndDeliver(ctx context.Context, job claimedJob, buf *logBuf
 	if err := context.Cause(ctx); err != nil {
 		return prepared.Commit, err
 	}
-	switch prepared.Spec.Kind {
-	case jobspec.KindAPK:
+	switch {
+	case prepared.Spec.Kind == jobspec.KindAPK && prepared.Spec.Platform == jobspec.PlatformIOS:
+		return prepared.Commit, a.deliverIPA(ctx, job, prepared, buf)
+	case prepared.Spec.Kind == jobspec.KindAPK:
 		return prepared.Commit, a.deliverAPK(ctx, job, prepared, buf)
-	case jobspec.KindOTA:
+	case prepared.Spec.Kind == jobspec.KindOTA:
 		return prepared.Commit, a.deliverOTA(ctx, job, prepared, buf)
 	}
 	return prepared.Commit, errors.New("unknown job kind")
 }
 
 func (a *agent) deliverAPK(ctx context.Context, job claimedJob, prepared preparedJob, buf *logBuffer) error {
-	result, err := readResult(prepared.Layout, jobspec.KindAPK)
+	result, err := readResult(prepared.Layout, jobspec.KindAPK, jobspec.PlatformAndroid)
 	if err != nil {
 		return err
 	}
@@ -382,8 +384,42 @@ func (a *agent) deliverAPK(ctx context.Context, job claimedJob, prepared prepare
 	return nil
 }
 
+// deliverIPA 交付 iOS 安装包任务。
+//
+// 与 Android 那条的三点不同，每一条都来自"iOS 的签名与构建分不开"（设计 §4.2）：
+//
+//  1. **产物不上传**。xcodebuild 导出的 .ipa 已经签好名，而用户装的那一份是 Apple
+//     重签、瘦身之后的东西——把这一份当发布产物存起来，只会让发布记录的 sha256 变成
+//     一个对不上任何东西的值。这里只算一遍摘要记进审计；
+//  2. **没有出处签名**。那套是给签名闸验货用的，iOS 没有签名闸这一环；
+//  3. **一步到 succeeded**，不经过 built / signing。
+func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared preparedJob, buf *logBuffer) error {
+	result, err := readResult(prepared.Layout, jobspec.KindAPK, jobspec.PlatformIOS)
+	if err != nil {
+		return err
+	}
+	ipa, err := spoolOutput(prepared.Layout, jobspec.IPAFileName, a.spoolDir(job.ID), jobspec.MaxIPASize)
+	if err != nil {
+		return err
+	}
+	buf.add(fmt.Sprintf("ipa %d bytes, sha256 %s", ipa.Size, ipa.SHA256))
+	if result.UploadedToAppStoreConnect {
+		buf.add("uploaded to App Store Connect")
+	} else {
+		buf.add("not uploaded: this machine is not configured to upload (BUILD_AGENT_IOS_UPLOAD)")
+	}
+	if err := withRetry(ctx, buf, "result report", 8, func(ctx context.Context) error {
+		return a.api.iosRelease(ctx, job, prepared.Commit, ipa.SHA256, ipa.Size, result.UploadedToAppStoreConnect, buf.snapshot())
+	}); err != nil {
+		return fmt.Errorf("the iOS package was built but the job could not be completed: %w", err)
+	}
+	a.log.Info("ios package delivered", "job", job.ID, "ipaSha256", ipa.SHA256,
+		"uploaded", result.UploadedToAppStoreConnect)
+	return nil
+}
+
 func (a *agent) deliverOTA(ctx context.Context, job claimedJob, prepared preparedJob, buf *logBuffer) error {
-	if _, err := readResult(prepared.Layout, jobspec.KindOTA); err != nil {
+	if _, err := readResult(prepared.Layout, jobspec.KindOTA, jobspec.PlatformAndroid); err != nil {
 		return err
 	}
 	pkg, err := spoolOutput(prepared.Layout, jobspec.OTAFileName, a.spoolDir(job.ID), jobspec.MaxOTASize)

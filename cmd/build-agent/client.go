@@ -147,6 +147,8 @@ type claimedJob struct {
 func (j claimedJob) APIBaseURL() string    { return j.tenantField("apiBaseUrl") }
 func (j claimedJob) ApplicationID() string { return j.tenantField("applicationId") }
 func (j claimedJob) PackageName() string   { return j.tenantField("androidPackage") }
+func (j claimedJob) BundleID() string      { return j.tenantField("iosBundleId") }
+func (j claimedJob) AppleTeamID() string   { return j.tenantField("appleTeamId") }
 
 func (j claimedJob) tenantField(name string) string {
 	var fields map[string]any
@@ -404,6 +406,26 @@ func (c *client) fail(ctx context.Context, jobID string, attempt int, reason, co
 func (c *client) complete(ctx context.Context, job claimedJob, commit, digest, releaseID string, logTail []string) error {
 	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/complete"), job.Attempt, map[string]any{
 		"commitSha": commit, "artifactSha256": digest, "releaseId": releaseID, "logTail": nonNil(logTail),
+	})
+	return err
+}
+
+// iosRelease 交付 iOS 安装包任务的结果：落一条无产物的发布记录，任务转 succeeded。
+//
+// 产物本身不上传：TestFlight 的包在 Apple 那边，而且不是这一份（Apple 会重签、瘦身）。
+// 这里报的摘要是自报的审计凭证，服务端记成 ipaSelfReported，不当分发凭证用。
+// 上报的身份取服务端下发的那份 tenant.json——服务端会拿它和任务行、release.ios 再对一遍，
+// 两端分属不同信任域，各按自己那份记录把一次。
+func (c *client) iosRelease(ctx context.Context, job claimedJob, commit, digest string, size int64, uploaded bool, logTail []string) error {
+	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/ios-release"), job.Attempt, map[string]any{
+		"commitSha":                 commit,
+		"ipaSha256":                 digest,
+		"ipaSize":                   size,
+		"bundleId":                  job.BundleID(),
+		"shortVersion":              job.Version,
+		"buildNumber":               job.BuildNumber,
+		"uploadedToAppStoreConnect": uploaded,
+		"logTail":                   nonNil(logTail),
 	})
 	return err
 }

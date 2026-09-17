@@ -40,6 +40,11 @@ const (
 	UnsignedFileName = "app-release-unsigned.apk"
 	SBOMFileName     = "sbom.cdx.json"
 	OTAFileName      = "ota.zip"
+	// iOS 的产物是一个**已签名**的 .ipa：签名在 xcodebuild -exportArchive 里就发生了，
+	// 没有"未签名包交给签名闸"这一步（设计 ios-testflight-distribution §4.2）。
+	// 它不上传服务端——TestFlight 的包在 Apple 那边，而且不是这一份（Apple 会重签、瘦身）。
+	// 交到 out/ 只为让控制进程自己算一遍摘要记进审计，以及让人能在机器上找到它。
+	IPAFileName = "app-release.ipa"
 
 	// 执行进程检出副本里的相对路径。它们会进 expo config，从而进原生指纹，所以只能是相对的。
 	OTACertificateRelPath = "./ota-certificate.pem"
@@ -50,7 +55,17 @@ const (
 	MaxUnsignedSize = 2 << 30
 	MaxSBOMSize     = 16 << 20
 	MaxOTASize      = 2 << 30
+	MaxIPASize      = 2 << 30
 )
+
+// 目标平台。与服务端 build_jobs.platform 同一套取值。
+const (
+	PlatformAndroid = "android"
+	PlatformIOS     = "ios"
+)
+
+// ValidPlatform 只认 android 与 ios。
+func ValidPlatform(p string) bool { return p == PlatformAndroid || p == PlatformIOS }
 
 // Kind 是任务种类。
 type Kind string
@@ -150,7 +165,11 @@ func (l Layout) OutFile(name string) string { return filepath.Join(l.Out(), name
 // ---- 子进程环境白名单 ----
 
 // 机器级变量：值来自控制进程自己的环境（systemd unit / env 文件），是这台机器的拓扑，不是机密。
-var machineEnvKeys = []string{"PATH", "LANG", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_RO_DEP_CACHE"}
+// ASC_KEY_ID / ASC_ISSUER_ID 是上传 TestFlight 用的标识，不是机密——真正的机密是 .p8，
+// 它留在这台 Mac 的 ~/.appstoreconnect/private_keys/ 下，由 altool 自己去找，既不经过
+// 服务端也不进这个环境。
+var machineEnvKeys = []string{"PATH", "LANG", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_RO_DEP_CACHE",
+	"ASC_KEY_ID", "ASC_ISSUER_ID"}
 
 // MachineEnvKeys 返回机器级变量名的副本。
 func MachineEnvKeys() []string { return append([]string(nil), machineEnvKeys...) }
@@ -313,15 +332,22 @@ type OTAArgs struct {
 
 // Spec 是控制进程写给执行进程的任务说明。
 type Spec struct {
-	Version         int      `json:"v"`
-	JobID           string   `json:"jobId"`
-	Kind            Kind     `json:"kind"`
-	TenantDirectory string   `json:"tenantDirectory"`
-	AppVersion      string   `json:"version"`
-	BuildNumber     int      `json:"buildNumber"`
-	CommitSHA       string   `json:"commitSha"`
-	OTA             *OTAArgs `json:"ota"`
-	Env             []string `json:"env"`
+	Version int    `json:"v"`
+	JobID   string `json:"jobId"`
+	Kind    Kind   `json:"kind"`
+	// Platform 决定执行进程走哪条构建路径。安装包任务在 Android 上出未签名 APK + SBOM，
+	// 在 iOS 上出一个已签名的 .ipa——两者的交付物、后续状态流转都不一样
+	Platform        string `json:"platform"`
+	TenantDirectory string `json:"tenantDirectory"`
+	AppVersion      string `json:"version"`
+	BuildNumber     int    `json:"buildNumber"`
+	CommitSHA       string `json:"commitSha"`
+	// IOSUpload：构建完把 .ipa 传进 App Store Connect。由装这台 Mac 的人在
+	// BUILD_AGENT_IOS_UPLOAD 里打开，不由"排了一条 iOS 任务"隐含决定——上传是一个
+	// 对外可见的动作，包一旦进了 ASC 就撤不回来，只能再出一个 build 顶掉它
+	IOSUpload bool     `json:"iosUpload,omitempty"`
+	OTA       *OTAArgs `json:"ota"`
+	Env       []string `json:"env"`
 }
 
 // SpecVersion 是 Spec.Version 唯一允许的值。
@@ -334,6 +360,13 @@ func (s Spec) Validate(l Layout) error {
 		return fmt.Errorf("spec v must be %d", SpecVersion)
 	case s.JobID != l.JobID:
 		return errors.New("spec jobId does not match the job directory")
+	case !ValidPlatform(s.Platform):
+		return errors.New("spec platform must be android or ios")
+	case s.Platform == PlatformIOS && s.Kind != KindAPK:
+		// 热更新包与平台无关，由 Android 那台机器构建；iOS 只做安装包
+		return errors.New("only installable-package jobs are built on ios")
+	case s.IOSUpload && s.Platform != PlatformIOS:
+		return errors.New("only an ios job uploads to App Store Connect")
 	case !ValidTenantDirectory(s.TenantDirectory):
 		return errors.New("spec tenantDirectory is malformed")
 	case !ValidVersion(s.AppVersion):
@@ -404,33 +437,42 @@ type Result struct {
 	Version           int    `json:"v"`
 	Kind              Kind   `json:"kind"`
 	NativeFingerprint string `json:"nativeFingerprint,omitempty"`
+	// UploadedToAppStoreConnect 只用于 iOS：这次有没有真的把 .ipa 传上去。
+	// "包打出来了"和"TestFlight 上有这一版"是两件事，运营要能分辨
+	UploadedToAppStoreConnect bool `json:"uploadedToAppStoreConnect,omitempty"`
 }
 
 // ResultVersion 是 Result.Version 唯一允许的值。
 const ResultVersion = 1
 
-// Validate 按任务种类校验结果。
-func (r Result) Validate(kind Kind) error {
+// Validate 按任务种类与平台校验结果。
+//
+// 原生指纹只有 Android 的安装包才有：它是签名闸复核未签名包用的，而 iOS 没有签名闸
+// 这一环（签名在 Mac 上的 xcodebuild 里就发生了）。
+func (r Result) Validate(kind Kind, platform string) error {
+	androidPackage := kind == KindAPK && platform == PlatformAndroid
 	switch {
 	case r.Version != ResultVersion:
 		return fmt.Errorf("result v must be %d", ResultVersion)
 	case r.Kind != kind:
 		return errors.New("result kind does not match the job")
-	case kind == KindAPK && !ValidNativeFingerprint(r.NativeFingerprint):
+	case androidPackage && !ValidNativeFingerprint(r.NativeFingerprint):
 		return errors.New("result nativeFingerprint must be 32-128 lowercase hex characters")
-	case kind == KindOTA && r.NativeFingerprint != "":
-		return errors.New("an ota result carries no native fingerprint")
+	case !androidPackage && r.NativeFingerprint != "":
+		return errors.New("only an android installable-package result carries a native fingerprint")
+	case r.UploadedToAppStoreConnect && platform != PlatformIOS:
+		return errors.New("only an ios result reports an App Store Connect upload")
 	}
 	return nil
 }
 
 // DecodeResult 严格解析结果并校验。
-func DecodeResult(r io.Reader, kind Kind) (Result, error) {
+func DecodeResult(r io.Reader, kind Kind, platform string) (Result, error) {
 	var out Result
 	if err := decodeStrict(r, MaxResultSize, &out); err != nil {
 		return Result{}, err
 	}
-	return out, out.Validate(kind)
+	return out, out.Validate(kind, platform)
 }
 
 func decodeStrict(r io.Reader, limit int64, out any) error {
@@ -456,4 +498,10 @@ func decodeStrict(r io.Reader, limit int64, out any) error {
 // （scripts/build-android-release.mjs）。SBOM 里的 rn-app:artifact 属性写的也是它。
 func ArtifactName(tenantDirectory, version string, buildNumber int) string {
 	return fmt.Sprintf("%s-%s-build%d-release-unsigned.apk", tenantDirectory, version, buildNumber)
+}
+
+// IPAArtifactName 是 RN-App scripts/build-ios-release.mjs 写进 artifacts/ 的文件名。
+// 两边必须一致：执行进程按这个名字去找产物，找不到就判这次构建没出东西。
+func IPAArtifactName(tenantDirectory, version string, buildNumber int) string {
+	return fmt.Sprintf("%s-%s-build%d.ipa", tenantDirectory, version, buildNumber)
 }

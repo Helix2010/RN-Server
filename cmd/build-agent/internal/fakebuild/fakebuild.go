@@ -34,9 +34,10 @@ type Tools struct {
 	Sleep string
 	// Linger 存在时，假 pnpm install 留下一个握着标准输出的后台进程（睡 1800 秒），PID 写进 <Record>/linger.pid
 	Linger string
-	// APK 与 OTA 是假产物的内容
+	// APK、OTA 与 IPA 是假产物的内容
 	APK []byte
 	OTA []byte
+	IPA []byte
 }
 
 // Install 在 dir 下造出 bin/pnpm、bin/node 与记录目录。
@@ -49,6 +50,8 @@ func Install(t *testing.T, dir string) Tools {
 		Linger: filepath.Join(dir, "linger-on-install"),
 		APK:    APKWithCertificate(t, CertificatePEM),
 		OTA:    []byte("PK\x05\x06" + strings.Repeat("\x00", 18)),
+		// .ipa 对构建机是不透明的：它既不解析也不上传，只算一遍摘要交给服务端记账
+		IPA: []byte("fake-ipa-" + strings.Repeat("0", 64)),
 	}
 	for _, d := range []string{tools.Bin, tools.Record} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -57,10 +60,14 @@ func Install(t *testing.T, dir string) Tools {
 	}
 	apkFixture := filepath.Join(dir, "fixture.apk")
 	otaFixture := filepath.Join(dir, "fixture-ota.zip")
+	ipaFixture := filepath.Join(dir, "fixture.ipa")
 	if err := os.WriteFile(apkFixture, tools.APK, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(otaFixture, tools.OTA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ipaFixture, tools.IPA, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	pnpm := fmt.Sprintf(`#!/bin/sh
@@ -86,6 +93,19 @@ android:release)
   cp %[4]q "artifacts/$2-$version-build$code-release-unsigned.apk"
   echo "Android unsigned release APK written"
   ;;
+ios:release)
+  record ios-release
+  shift
+  slug="$1"; shift
+  upload=no
+  for arg in "$@"; do if [ "$arg" = "--upload" ]; then upload=yes; fi; done
+  echo "$upload" > %[1]q/ios-upload.txt
+  version=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "tenants/$slug/tenant.json")
+  build=$(sed -n 's/.*"iosBuildNumber": *"\([^"]*\)".*/\1/p' "tenants/$slug/tenant.json")
+  mkdir -p artifacts
+  cp %[7]q "artifacts/$slug-$version-build$build.ipa"
+  echo "iOS release IPA written"
+  ;;
 ota:build)
   record ota-build
   out=""
@@ -101,7 +121,7 @@ ota:build)
   exit 3
   ;;
 esac
-`, tools.Record, tools.Sleep, NativeFingerprint, apkFixture, otaFixture, tools.Linger)
+`, tools.Record, tools.Sleep, NativeFingerprint, apkFixture, otaFixture, tools.Linger, ipaFixture)
 	node := fmt.Sprintf(`#!/bin/sh
 set -eu
 env > %[1]q/sbom.env
