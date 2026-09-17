@@ -266,7 +266,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		"version": keystore.Version, "updatedBy": nil, "updatedAt": nil,
 		"recipients": []gin.H{}, "missingSigners": []gin.H{}, "signers": []gin.H{},
 		"ready": readiness.Ready, "readinessProblems": readiness.problemList(), "trustRoots": nil, "trustRootsDigest": nil,
-		"generationRequest": nil, "generator": nil, "recoveryRecipients": []string{},
+		"generationRequest": nil, "generator": nil, "recoveryRecipients": []string{}, "revokedRecoveryRecipients": []string{},
 	}
 	if readiness.Generation != nil {
 		view["generationRequest"] = readiness.Generation.view()
@@ -289,12 +289,16 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		if err != nil {
 			return nil, err
 		}
-		// 恢复收件人：密钥里加密给了哪几把登记过的恢复公钥（吊销了的也算——密文已经发给它了）
-		recoveryRecipients := []string{}
+		// 恢复收件人：密钥里加密给了哪几把登记过的恢复公钥（吊销了的也算——密文已经发给它了）；其中已吊销的
+		// 单独列出来，全部吊销了这把密钥就没有可用的离线恢复（导出也会被拒）
+		recoveryRecipients, revokedRecoveryRecipients := []string{}, []string{}
 		items := []gin.H{}
 		for _, recipient := range keystore.Record.Recipients {
-			if _, ok := recoveryKeys.Doc.anyBySHA256(recipient); ok {
+			if key, ok := recoveryKeys.Doc.anyBySHA256(recipient); ok {
 				recoveryRecipients = append(recoveryRecipients, recipient)
+				if key.revoked() {
+					revokedRecoveryRecipients = append(revokedRecoveryRecipients, recipient)
+				}
 			}
 			recipients[recipient] = true
 			item := gin.H{"recipientSha256": recipient, "machineId": nil, "name": nil, "signerRole": nil}
@@ -303,7 +307,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 			}
 			items = append(items, item)
 		}
-		view["recipients"], view["recoveryRecipients"] = items, recoveryRecipients
+		view["recipients"], view["recoveryRecipients"], view["revokedRecoveryRecipients"] = items, recoveryRecipients, revokedRecoveryRecipients
 	}
 	checks, err := s.keystoreChecksFor(ctx, s.db, tenant)
 	if err != nil {

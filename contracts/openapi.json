@@ -7611,7 +7611,8 @@
           "trustRootsDigest",
           "generationRequest",
           "generator",
-          "recoveryRecipients"
+          "recoveryRecipients",
+          "revokedRecoveryRecipients"
         ],
         "properties": {
           "configured": {
@@ -7796,6 +7797,14 @@
               "pattern": "^[0-9a-f]{64}$"
             },
             "description": "Recipients of the current key that are registered recovery keys (revoked ones included)"
+          },
+          "revokedRecoveryRecipients": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "description": "The subset of recoveryRecipients whose recovery key has been revoked since (same order). When it equals recoveryRecipients the key has no usable offline recovery: export answers 409 and a new recovery key should be registered before generating a new key. Empty array when none."
           }
         }
       },

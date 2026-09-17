@@ -216,6 +216,18 @@ func (f *gateFixture) storedGenerationRequest() keystoreGenerationRequest {
 	return *request
 }
 
+// revokeRecoveryKey 以平台管理员身份吊销一把恢复公钥。
+func (f *gateFixture) revokeRecoveryKey(id string) {
+	f.t.Helper()
+	snapshot, err := readRecoveryKeys(context.Background(), f.db, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/recovery-keys/"+id+"/revoke", map[string]any{"expectedVersion": snapshot.Version, "reason": "rotated", "confirm": true}); r.Code != http.StatusOK {
+		f.t.Fatalf("revoke recovery key: %d %s", r.Code, r.Body.String())
+	}
+}
+
 func (f *gateFixture) auditCount(tenant, action string) int {
 	f.t.Helper()
 	var count int
@@ -1331,6 +1343,49 @@ func TestDBKeystoreGenerationTimesOut(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("a timed-out first generation: %v", readiness.Problems)
+	}
+}
+
+// 恢复公钥吊销之后，已有密钥视图里仍然列着它（密文已经发给它了），但要看得出哪几把已吊销：
+// revokedRecoveryRecipients 是 recoveryRecipients 里已吊销的子集。
+func TestDBKeystoreViewMarksRevokedRecoveryRecipients(t *testing.T) {
+	f := newGateFixture(t, 135)
+	if view := f.keystoreView(); len(view["recoveryRecipients"].([]any)) != 0 || view["revokedRecoveryRecipients"] == nil || len(view["revokedRecoveryRecipients"].([]any)) != 0 {
+		t.Fatalf("a keystore without recovery recipients: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+	first := f.registerRecoveryKey("recovery-one")
+	second := f.registerRecoveryKey("recovery-two")
+	keystoreVersion, identityVersion := f.keystoreVersions()
+	upload := f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(),
+		first.Private.PublicKey().Bytes(), second.Private.PublicKey().Bytes())
+	if saved := f.saveKeystoreRequest(map[string]any{"upload": upload, "packageName": f.packageName, "signerSha256": f.apkSigner.sha256(),
+		"expectedVersion": keystoreVersion, "releaseIdentityExpectedVersion": identityVersion, "reason": "import with two recovery keys", "confirm": true}); saved.Code != http.StatusOK {
+		t.Fatalf("import: %d %s", saved.Code, saved.Body.String())
+	} else if revoked := decodeBody(t, saved)["revokedRecoveryRecipients"]; revoked == nil || len(revoked.([]any)) != 0 {
+		t.Fatalf("the save response must carry revokedRecoveryRecipients too: %v", revoked)
+	}
+	sorted := []string{first.SHA256, second.SHA256}
+	sort.Strings(sorted)
+	joined := func(values []any) string {
+		out := []string{}
+		for _, v := range values {
+			out = append(out, v.(string))
+		}
+		return strings.Join(out, ",")
+	}
+	view := f.keystoreView()
+	if joined(view["recoveryRecipients"].([]any)) != strings.Join(sorted, ",") || len(view["revokedRecoveryRecipients"].([]any)) != 0 {
+		t.Fatalf("two live recovery recipients: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+	f.revokeRecoveryKey(first.ID)
+	view = f.keystoreView()
+	if joined(view["recoveryRecipients"].([]any)) != strings.Join(sorted, ",") || joined(view["revokedRecoveryRecipients"].([]any)) != first.SHA256 {
+		t.Fatalf("one revoked recovery recipient: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+	f.revokeRecoveryKey(second.ID)
+	view = f.keystoreView()
+	if joined(view["recoveryRecipients"].([]any)) != strings.Join(sorted, ",") || joined(view["revokedRecoveryRecipients"].([]any)) != strings.Join(sorted, ",") {
+		t.Fatalf("every recovery recipient revoked: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
 	}
 }
 
