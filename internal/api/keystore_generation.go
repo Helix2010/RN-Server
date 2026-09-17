@@ -30,7 +30,8 @@ import (
 //     在本机生成 RSA 4096 证书与 PKCS#12，加密给本机信任的签名闸与恢复公钥，用本机 Ed25519 对
 //     keystorebox.GenerationMessage 签名，交回 POST /v1/signer/keystore-generations/:requestId。
 //  3. 服务端一个事务：请求仍未完成且两个版本都没变；调用者是 active 的路由主签名闸、签名用它登记的
-//     Ed25519 公钥验过；上传文件按导入的全部规则校验，收件人里至少一把登记的恢复公钥；写 build.keystore
+//     Ed25519 公钥验过；上传文件按导入的全部规则校验，收件人里至少一把登记的恢复公钥、而且有发给主签名闸
+//     自己的密文；写 build.keystore
 //     （带生成者与签名）、release.android（ADR-0016 的同事务），请求标 done。
 //
 // 服务端被攻破时能做到的是"让签名闸无意义地换一把新密钥"（拒绝服务）与"新租户第一次生成时写入错误的
@@ -528,6 +529,13 @@ func (s *server) completeKeystoreGeneration(c *gin.Context) {
 	if recoveryRecipients == 0 {
 		problem(c, http.StatusUnprocessableEntity, "KEYSTORE_RECOVERY_RECIPIENT_MISSING",
 			"A generated key must also be sealed to at least one registered, unrevoked offline recovery key")
+		return
+	}
+	// 必须有发给生成者自己（当前接受的 X25519 公钥）的密文：收下一份主签名闸自己解不开的密钥，发布身份
+	// 就换成了新证书，而主签名闸再也拿不到这个租户（就绪永远 PRIMARY_SIGNER_NOT_RECIPIENT），只能靠离线恢复
+	if _, ok := boxFor(upload, string(generator.PublicKeySHA256)); !ok {
+		problem(c, http.StatusUnprocessableEntity, "KEYSTORE_PRIMARY_RECIPIENT_MISSING",
+			"A generated key must be sealed to the generating primary signer's own accepted X25519 key ("+string(generator.PublicKeySHA256)+")")
 		return
 	}
 	record, err := s.sealKeystoreRecord(tenant, upload)

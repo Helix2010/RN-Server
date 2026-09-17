@@ -1040,13 +1040,16 @@ func TestDBGeneratedKeysNeedARecoveryRecipientAndKnownRecipients(t *testing.T) {
 		upload keystorebox.Upload
 		code   string
 	}{
-		"signers only":             {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, standbyX), "KEYSTORE_RECOVERY_RECIPIENT_MISSING"},
-		"revoked recovery key":     {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, revoked.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
-		"unregistered recipient":   {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes(), stranger.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
-		"another tenant":           {f.sealedUpload("other-tenant", f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_TENANT_MISMATCH"},
-		"another package":          {f.sealedUpload(f.slug, "com.other.app", alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_IDENTITY_MISMATCH"},
-		"retired certificate":      {f.sealedUpload(f.slug, f.packageName, alias, "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694", primaryX, recoveryKey.Private.PublicKey().Bytes()), "RELEASE_SIGNER_RETIRED"},
-		"public debug certificate": {f.sealedUpload(f.slug, f.packageName, alias, reactNativeDebugSignerSHA256, primaryX, recoveryKey.Private.PublicKey().Bytes()), "INVALID_RELEASE_IDENTITY"},
+		"signers only": {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, standbyX), "KEYSTORE_RECOVERY_RECIPIENT_MISSING"},
+		// 没有发给主签名闸自己的密文：收下的话发布身份换成新证书，而主签名闸再也拿不到这个租户
+		"not sealed to the primary": {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), standbyX, recoveryKey.Private.PublicKey().Bytes()), "KEYSTORE_PRIMARY_RECIPIENT_MISSING"},
+		"recovery key only":         {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), recoveryKey.Private.PublicKey().Bytes()), "KEYSTORE_PRIMARY_RECIPIENT_MISSING"},
+		"revoked recovery key":      {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, revoked.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
+		"unregistered recipient":    {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes(), stranger.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
+		"another tenant":            {f.sealedUpload("other-tenant", f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_TENANT_MISMATCH"},
+		"another package":           {f.sealedUpload(f.slug, "com.other.app", alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_IDENTITY_MISMATCH"},
+		"retired certificate":       {f.sealedUpload(f.slug, f.packageName, alias, "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694", primaryX, recoveryKey.Private.PublicKey().Bytes()), "RELEASE_SIGNER_RETIRED"},
+		"public debug certificate":  {f.sealedUpload(f.slug, f.packageName, alias, reactNativeDebugSignerSHA256, primaryX, recoveryKey.Private.PublicKey().Bytes()), "INVALID_RELEASE_IDENTITY"},
 	} {
 		if r := f.deliver(f.primary, requestID, tc.upload, f.primary.ID, f.primary.Ed25519); r.Code != http.StatusUnprocessableEntity || problemCode(t, r) != tc.code {
 			t.Fatalf("%s: %d %s", name, r.Code, r.Body.String())
@@ -1063,7 +1066,10 @@ func TestDBGeneratedKeysNeedARecoveryRecipientAndKnownRecipients(t *testing.T) {
 	if got := f.storedGenerationRequest(); got.Status != generationPending {
 		t.Fatalf("refused deliveries changed the request: %+v", got)
 	}
-	// 至少一把恢复公钥即可，不要求加密给备签名闸
+	if state, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant); state.Record.Generator != nil {
+		t.Fatalf("a refused delivery replaced the keystore: %+v", state.Record)
+	}
+	// 至少一把恢复公钥、加上主签名闸自己即可，不要求加密给备签名闸
 	if r := f.deliver(f.primary, requestID, f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), f.primary.ID, f.primary.Ed25519); r.Code != http.StatusOK {
 		t.Fatalf("a key sealed to the primary and the recovery key: %d %s", r.Code, r.Body.String())
 	}
