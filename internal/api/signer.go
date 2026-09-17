@@ -312,6 +312,20 @@ type reportedTrustedBuilder struct {
 	Ed25519SHA256 string `json:"ed25519Sha256"`
 }
 
+// withArrays 把三个列表里的 nil 换成空数组，只在渲染视图时用（库里可能有修复前写下的 null）。
+func (t machineReportedTrust) withArrays() machineReportedTrust {
+	if t.Signers == nil {
+		t.Signers = []reportedTrustedSigner{}
+	}
+	if t.Builders == nil {
+		t.Builders = []reportedTrustedBuilder{}
+	}
+	if t.RecoveryKeys == nil {
+		t.RecoveryKeys = []string{}
+	}
+	return t
+}
+
 // normalize 校验形状并排序：同一份信任列表不管签名闸按什么顺序报，存下来都一样，"只在变化时写"才成立。
 func (t machineReportedTrust) normalize() (machineReportedTrust, error) {
 	if t.Signers == nil || t.Builders == nil || t.RecoveryKeys == nil {
@@ -320,10 +334,12 @@ func (t machineReportedTrust) normalize() (machineReportedTrust, error) {
 	if len(t.Signers) > maxRegisteredMachines || len(t.Builders) > maxRegisteredMachines || len(t.RecoveryKeys) > maxRecoveryKeys {
 		return t, errors.New("too many entries")
 	}
+	// 空列表要存成 []，不能是 nil：机器视图里 reportedTrust 的三个字段按约定是数组，
+	// 控制台按数组校验整份机器列表，出现 null 会把整页顶掉（本地端到端实测）
 	out := machineReportedTrust{
-		Signers:      append([]reportedTrustedSigner(nil), t.Signers...),
-		Builders:     append([]reportedTrustedBuilder(nil), t.Builders...),
-		RecoveryKeys: append([]string(nil), t.RecoveryKeys...),
+		Signers:      append(make([]reportedTrustedSigner, 0, len(t.Signers)), t.Signers...),
+		Builders:     append(make([]reportedTrustedBuilder, 0, len(t.Builders)), t.Builders...),
+		RecoveryKeys: append(make([]string, 0, len(t.RecoveryKeys)), t.RecoveryKeys...),
 	}
 	for _, signer := range out.Signers {
 		if !ident.ValidMachineName(signer.Name) || !fingerprint.Valid(signer.X25519SHA256) || !fingerprint.Valid(signer.Ed25519SHA256) {

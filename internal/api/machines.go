@@ -513,7 +513,9 @@ func machineView(m buildMachine) gin.H {
 		view["enrollmentExpiresAt"] = m.Enrollment.ExpiresAt
 	}
 	if m.ReportedTrust != nil {
-		view["reportedTrust"] = m.ReportedTrust
+		// 库里可能还留着修复前写下的行：空列表存成了 null。视图这一层兜底，
+		// 免得控制台按数组校验时整份机器列表都读不出来
+		view["reportedTrust"] = m.ReportedTrust.withArrays()
 	}
 	if m.Pending != nil {
 		view["pendingPublicKeySha256"] = m.Pending.PublicKeySHA256

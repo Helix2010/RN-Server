@@ -1774,3 +1774,28 @@ func TestGenerationRequestEffectiveStatus(t *testing.T) {
 		t.Fatalf("a well-formed request: %v", err)
 	}
 }
+
+// TestDBReportedTrustListsAreAlwaysArrays：签名闸报空的信任列表时，机器视图里的三个字段必须是 []，
+// 不能是 null。约定 3.4 与 OpenAPI 都写的是数组，控制台按数组校验整份机器列表，出现 null 会把整页顶掉。
+func TestDBReportedTrustListsAreAlwaysArrays(t *testing.T) {
+	f := newGateFixture(t, 131)
+	keystoreVersion, _ := f.keystoreVersions()
+	item := map[string]any{"tenantSlug": f.slug, "keystoreVersion": keystoreVersion, "decrypt": "ok", "confirmed": true,
+		"confirmedTrustRootsDigest": f.currentDigest(), "trialSign": "ok", "error": nil}
+	empty := map[string]any{"signers": []any{}, "builders": []any{}, "recoveryKeys": []string{}}
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.standby.Token, nil,
+		map[string]any{"localRole": "standby", "trust": empty, "items": []any{item}}); r.Code != http.StatusNoContent {
+		t.Fatalf("report: %d %s", r.Code, r.Body.String())
+	}
+	view := f.machineView(f.standby.ID)
+	reported, _ := view["reportedTrust"].(map[string]any)
+	if reported == nil {
+		t.Fatalf("view of the reported trust: %v", view)
+	}
+	for _, key := range []string{"signers", "builders", "recoveryKeys"} {
+		list, ok := reported[key].([]any)
+		if !ok || list == nil || len(list) != 0 {
+			t.Fatalf("reportedTrust.%s must be an empty array, got %#v", key, reported[key])
+		}
+	}
+}
