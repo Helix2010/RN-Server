@@ -4912,7 +4912,7 @@
             "description": "Stored"
           },
           "400": {
-            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole, or a missing or malformed trust)"
+            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole, or a malformed trust)"
           },
           "401": {
             "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
@@ -7953,13 +7953,13 @@
               }
             ],
             "nullable": true,
-            "description": "Signers only: what this signer's local record trusts, as it last reported (POST /v1/signer/keystore-checks trust). Display only (e.g. the primary does not trust the standby yet, so new keys will not be sealed to it); signers never take it from the server. null = never reported."
+            "description": "Signers only: what this signer's local record trusts, as it last reported (POST /v1/signer/keystore-checks trust). Display only (e.g. the primary does not trust the standby yet, so new keys will not be sealed to it); signers never take it from the server. null = not reported: never reported, or the latest report came from a signer version that does not send trust."
           },
           "reportedTrustAt": {
             "type": "string",
             "format": "date-time",
             "nullable": true,
-            "description": "When reportedTrust last changed; null = never reported"
+            "description": "When reportedTrust last changed; null while reportedTrust is null"
           }
         }
       },
@@ -8361,7 +8361,6 @@
         "type": "object",
         "required": [
           "localRole",
-          "trust",
           "items"
         ],
         "additionalProperties": false,
@@ -8380,7 +8379,7 @@
                 "$ref": "#/components/schemas/SignerReportedTrust"
               }
             ],
-            "description": "Required on every report: the signers (including this one), builders and recovery keys this signer's local record trusts. Stored on the machine as reportedTrust/reportedTrustAt (build_machine_trust_report audit), written only when it changes."
+            "description": "Sent on every report by current signers: the signers (including this one), builders and recovery keys this signer's local record trusts. Stored on the machine as reportedTrust/reportedTrustAt (build_machine_trust_report audit), written only when it changes. Optional for signers released before the automation (they do not know the field): a report without trust (or with trust null) is accepted as usual - localRole and the items are recorded - and sets reportedTrust and reportedTrustAt to null, meaning this signer version does not report its trust (not 'trusts nothing'); the console shows it as not reported. Nothing but console hints reads reportedTrust, so signing and readiness do not depend on it."
           },
           "items": {
             "type": "array",

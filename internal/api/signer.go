@@ -193,7 +193,9 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 	var body struct {
 		// LocalRole 是签名闸本机记录里的角色，每轮都带；签名闸与服务端同一次发布，缺了就是 400
 		LocalRole *string `json:"localRole"`
-		// Trust 是签名闸本机记录里的信任列表，每轮都带（同上）
+		// Trust 是签名闸本机记录里的信任列表，新版本每轮都带。可以缺：迁移时 CI 先把服务端推上线，旧签名闸
+		// 二进制要等人工升级，那几个小时里它的检查结论与就绪不能停更。缺了就把登记里的 reportedTrust 记成
+		// null（"这个版本不上报信任"，不保留旧值），控制台显示为未上报；它只用来提示，没有判断依赖它
 		Trust *machineReportedTrust `json:"trust"`
 		Items []signerCheckReport   `json:"items"`
 	}
@@ -205,14 +207,14 @@ func (s *server) reportSignerKeystoreChecks(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "localRole (primary or standby, from this signer's local record) is required")
 		return
 	}
-	if body.Trust == nil {
-		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "trust (the signers, builders and recovery keys this signer's local record trusts) is required")
-		return
-	}
-	trust, err := body.Trust.normalize()
-	if err != nil {
-		problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "trust is malformed: "+err.Error())
-		return
+	var trust *machineReportedTrust
+	if body.Trust != nil {
+		normalized, err := body.Trust.normalize()
+		if err != nil {
+			problem(c, http.StatusBadRequest, "INVALID_KEYSTORE_CHECK", "trust is malformed: "+err.Error())
+			return
+		}
+		trust = &normalized
 	}
 	for _, item := range body.Items {
 		digestOK := item.ConfirmedTrustRootsDigest == nil || fingerprint.Valid(*item.ConfirmedTrustRootsDigest)
@@ -360,8 +362,9 @@ func (t *machineReportedTrust) equal(other *machineReportedTrust) bool {
 
 // recordSignerLocalState 把签名闸报的本机角色与信任列表记进 build.machines 它自己那一项。两样都没变
 // 就不写（每轮轮询都会报，写一次加一次 version，控制台上正在编辑的机器登记就会不停地版本冲突）；
-// 变了合成一次写，各自写审计；并发写冲突时重读重试。
-func (s *server) recordSignerLocalState(c *gin.Context, machine buildMachine, role string, trust machineReportedTrust, now time.Time) error {
+// 变了合成一次写，各自写审计；并发写冲突时重读重试。trust 为 nil（旧版本签名闸不上报）时 reportedTrust 与
+// reportedTrustAt 记成 null。
+func (s *server) recordSignerLocalState(c *gin.Context, machine buildMachine, role string, trust *machineReportedTrust, now time.Time) error {
 	ctx := c.Request.Context()
 	for attempt := 0; attempt < machineWriteRetries; attempt++ {
 		snapshot, err := readMachineRegistry(ctx, s.db, false)
@@ -374,7 +377,7 @@ func (s *server) recordSignerLocalState(c *gin.Context, machine buildMachine, ro
 		}
 		m := &snapshot.Doc.Machines[index]
 		roleChanged := string(m.ReportedLocalRole) != role
-		trustChanged := !m.ReportedTrust.equal(&trust)
+		trustChanged := !m.ReportedTrust.equal(trust)
 		if !roleChanged && !trustChanged {
 			return nil
 		}
@@ -388,11 +391,16 @@ func (s *server) recordSignerLocalState(c *gin.Context, machine buildMachine, ro
 					"signerRole": nullableString(string(m.SignerRole))}))
 		}
 		if trustChanged {
-			reported := trust
-			m.ReportedTrust, m.ReportedTrustAt = &reported, optString(iso(now))
+			reason := "a signer reported a change of its local trust"
+			if trust == nil {
+				m.ReportedTrust, m.ReportedTrustAt = nil, ""
+				reason = "a signer reported without its local trust (an older signer version); the reported trust is cleared"
+			} else {
+				reported := *trust
+				m.ReportedTrust, m.ReportedTrustAt = &reported, optString(iso(now))
+			}
 			events = append(events, newAudit(platformTenantID, signerActor, "build_machine_trust_report", machineAuditTargetType, machine.ID,
-				"a signer reported a change of its local trust", requestID(c),
-				map[string]any{"machineId": machine.ID, "name": machine.Name, "reportedTrust": reported}))
+				reason, requestID(c), map[string]any{"machineId": machine.ID, "name": machine.Name, "reportedTrust": m.ReportedTrust}))
 		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {

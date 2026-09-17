@@ -834,9 +834,6 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 			t.Fatalf("trust %s: %d %s", name, r.Code, r.Body.String())
 		}
 	}
-	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.standby.Token, nil, map[string]any{"localRole": "standby", "items": []any{}}); r.Code != http.StatusBadRequest {
-		t.Fatalf("a report without trust: %d %s", r.Code, r.Body.String())
-	}
 	trust := f.localTrust()
 	version := registryVersion(t, f)
 	if r := report(trust); r.Code != http.StatusNoContent {
@@ -872,6 +869,83 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 	_ = f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=0 AND action='build_machine_trust_report' AND target_id=?`, f.standby.ID).Scan(&audits)
 	if audits != 2 {
 		t.Fatalf("trust changes audited %d times, want 2", audits)
+	}
+}
+
+// 迁移窗口：CI 先把新服务端推上线，旧签名闸二进制要等人工升级。旧签名闸的上报没有 trust（它不认识这个字段）：
+// 照常收下本机角色与检查结论，reportedTrust/reportedTrustAt 记成 null（这个版本不上报信任，不保留旧值），
+// 已有密钥照常就绪——不能因为缺了 trust 就停签，也不能把 null 当成"信任了谁"。
+func TestDBSignerReportsWithoutTrustFromAnOlderSignerAreAccepted(t *testing.T) {
+	f := newGateFixture(t, 141)
+	if record := f.machineRecord(f.primary.ID); record.ReportedTrust == nil {
+		t.Fatal("the fixture's primary should have reported its trust already")
+	}
+	keystoreVersion, _ := f.keystoreVersions()
+	item := func(trialSign string, failure any) map[string]any {
+		return map[string]any{"tenantSlug": f.slug, "keystoreVersion": keystoreVersion, "decrypt": "ok", "confirmed": true,
+			"confirmedTrustRootsDigest": f.currentDigest(), "trialSign": trialSign, "error": failure}
+	}
+	// 旧签名闸的请求体原样：只有 localRole 与 items
+	legacyReport := func(localRole string, items ...any) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": localRole, "items": items})
+	}
+	trustAudits := func() int {
+		t.Helper()
+		var count int
+		if err := f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=0 AND action='build_machine_trust_report' AND target_id=?`, f.primary.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	auditsBefore := trustAudits()
+	if r := legacyReport("primary", item("failed", "trial signing failed on the old binary")); r.Code != http.StatusNoContent {
+		t.Fatalf("an older signer's report without trust: %d %s", r.Code, r.Body.String())
+	}
+	record := f.machineRecord(f.primary.ID)
+	if record.ReportedTrust != nil || record.ReportedTrustAt != "" || record.ReportedLocalRole != signerRolePrimary {
+		t.Fatalf("a report without trust must clear reportedTrust and keep the local role: %+v %q", record.ReportedTrust, record.ReportedTrustAt)
+	}
+	if view := f.machineView(f.primary.ID); view["reportedTrust"] != nil || view["reportedTrustAt"] != nil {
+		t.Fatalf("the console view of a signer that does not report trust: %v", view)
+	}
+	if trustAudits() != auditsBefore+1 {
+		t.Fatal("clearing the reported trust was not audited exactly once")
+	}
+	// 检查结论照常记下（试签失败 → 不就绪），改回通过又就绪
+	checks, err := f.s.keystoreChecksFor(t.Context(), f.db, f.tenant)
+	if err != nil || checks[f.primary.ID].TrialSign != "failed" {
+		t.Fatalf("the check result of a report without trust: %+v %v", checks[f.primary.ID], err)
+	}
+	if codes := readinessCodes(t, f); strings.Join(codes, ",") != readinessPrimaryTrialSignFailed {
+		t.Fatalf("readiness after a failed trial sign reported without trust: %v", codes)
+	}
+	version := registryVersion(t, f)
+	for i := 0; i < 3; i++ {
+		if r := legacyReport("primary", item("ok", nil)); r.Code != http.StatusNoContent {
+			t.Fatalf("repeat: %d %s", r.Code, r.Body.String())
+		}
+	}
+	if codes := readinessCodes(t, f); len(codes) != 0 {
+		t.Fatalf("a signer that does not report trust stopped a configured tenant: %v", codes)
+	}
+	if after := registryVersion(t, f); after != version || trustAudits() != auditsBefore+1 {
+		t.Fatalf("repeated reports without trust rewrote the registry: %d -> %d", version, after)
+	}
+	// 本机角色照常记下
+	if r := legacyReport("standby", item("ok", nil)); r.Code != http.StatusNoContent {
+		t.Fatalf("report a local role change without trust: %d %s", r.Code, r.Body.String())
+	}
+	if record := f.machineRecord(f.primary.ID); record.ReportedLocalRole != signerRoleStandby {
+		t.Fatalf("the local role of a report without trust was not recorded: %+v", record)
+	}
+	// 显式 null 与缺字段一样；升级之后带上 trust 就又记下
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": "primary", "trust": nil, "items": []any{item("ok", nil)}}); r.Code != http.StatusNoContent {
+		t.Fatalf("a report with trust null: %d %s", r.Code, r.Body.String())
+	}
+	f.reportCheck(f.primary, true, "ok")
+	if record := f.machineRecord(f.primary.ID); record.ReportedTrust == nil || record.ReportedTrustAt == "" || len(record.ReportedTrust.Signers) != 2 {
+		t.Fatalf("an upgraded signer's trust report: %+v", record.ReportedTrust)
 	}
 }
 
