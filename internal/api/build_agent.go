@@ -727,6 +727,13 @@ func (s *server) markBuildJobBuilt(c *gin.Context) {
 		problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH", "Only installable-package builds are delivered to the signer")
 		return
 	}
+	// iOS 没有"未签名包"这个东西可以交付：签名在 Mac 上的 xcodebuild 里就发生了。
+	// 放过去的话任务会停在 built，而签名闸的认领带着 platform='android'，永远不会来领它
+	if job.Platform != buildPlatformAndroid {
+		problem(c, http.StatusConflict, "BUILD_PLATFORM_MISMATCH",
+			"Only Android builds are delivered to the signer; iOS builds report to /ios-release")
+		return
+	}
 	machine, _ := machineFromContext(c)
 	var body struct {
 		CommitSHA         string              `json:"commitSha"`

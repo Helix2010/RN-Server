@@ -569,6 +569,19 @@ func (s *server) withReleaseSequence(ctx context.Context, tenant, platform strin
 	return nil, tx.Commit()
 }
 
+// nullableSizeValue 把"没有产物"写成 NULL 而不是 0。
+//
+// 产物托管在 Apple 的 iOS 发布记录没有大小也没有摘要（见 ios_build_release.go）。
+// 写 0 和空串的话，`size` 会在接口上变成一个看起来有意义的 0、`sha256` 变成一个
+// 64 位校验会失败的空串——两者都不是"不知道"。真实产物不可能是 0 字节，所以这个
+// 映射没有歧义。
+func nullableSizeValue(size int64) any {
+	if size <= 0 {
+		return nil
+	}
+	return size
+}
+
 // releaseInsert 是一条要写进 app_releases 的发布记录。
 type releaseInsert struct {
 	ID, Tenant, Platform, Version string
@@ -632,7 +645,8 @@ func insertReleaseInTx(ctx context.Context, tx *sql.Tx, r releaseInsert, now tim
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO app_releases(id,tenant_id,platform,version,build_number,runtime_version,status,release_notes,object_key,file_name,content_type,expected_size,file_size,sha256,file_metadata,mandatory,verified_at,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Tenant, r.Platform, r.Version, r.BuildNumber, r.RuntimeVersion, "verified", notes, r.ObjectKey, r.FileName, r.ContentType, r.ExpectedSize, r.FileSize, r.SHA256, rawMetadata, r.Mandatory, now, r.Actor, now, now); err != nil {
+		r.ID, r.Tenant, r.Platform, r.Version, r.BuildNumber, r.RuntimeVersion, "verified", notes, r.ObjectKey, r.FileName, r.ContentType, r.ExpectedSize,
+		nullableSizeValue(r.FileSize), sqlNullableString(r.SHA256), rawMetadata, r.Mandatory, now, r.Actor, now, now); err != nil {
 		return nil, err
 	}
 	summary := map[string]any{"platform": r.Platform, "version": r.Version, "buildNumber": r.BuildNumber, "mandatory": r.Mandatory}
@@ -877,6 +891,14 @@ func (s *server) publicReleaseDownload(c *gin.Context) {
 	if err != nil {
 		s.noteCanaryDownloadRefused(c, c.Param("id"), audience)
 		problem(c, 404, "RELEASE_NOT_FOUND", "Published release not found")
+		return
+	}
+	// 产物托管在 Apple 的发布记录（iOS/TestFlight）没有对象可下。走下去的话会拿一个
+	// 空的 object_key 去问对象存储，报出来的是"读不到发布包"——那句话会让人去查存储，
+	// 而真正的答案是"这条记录本来就没有包，安装入口是 TestFlight 链接"。
+	if iosHostedReleaseMetadata(rawMetadata) {
+		problem(c, http.StatusNotFound, "RELEASE_HOSTED_EXTERNALLY",
+			"这一版的安装包托管在 App Store Connect，没有可下载的产物；安装入口见 /app/download")
 		return
 	}
 	client, _, err := s.storageClientForTenant(c.Request.Context(), tenantID(c))

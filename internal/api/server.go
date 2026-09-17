@@ -46,6 +46,9 @@ type server struct {
 	// verifyFCM 真去 Google 换一次访问令牌。做成字段是因为保存推送凭据这条路
 	// **必须**联网验证（见 pushcreds.Verify 的注释），而测试不该联网。
 	verifyFCM func(context.Context, pushcreds.ServiceAccount) error
+	// ascBaseURL 覆盖 App Store Connect 的地址；空 = Apple 的正式地址。只有测试会设——
+	// 这条链路必须真调一次 Apple 才算验证通过（见 ascapi.Client.Verify），而测试不该联网
+	ascBaseURL string
 	// adminIPs 限制 x-admin-key 自动化通道的来源；nil = 未配置，不限制
 	adminIPs *ipAllowlist
 	// diagnosticIPs 是一键上报按来源 IP 的小时窗口计数；零值可用
@@ -269,6 +272,8 @@ func (s *server) routes() *gin.Engine {
 	builder.PUT("/jobs/:id/unsigned/upload", s.builderJobScope(s.uploadUnsignedArtifact))
 	builder.PUT("/jobs/:id/sbom/upload", s.builderJobScope(s.uploadBuildSBOM))
 	builder.POST("/jobs/:id/built", s.builderJobScope(s.markBuildJobBuilt))
+	// iOS 安装包：没有未签名产物要交付，构建机直接报结果（设计 ios-testflight §4.5.4）
+	builder.POST("/jobs/:id/ios-release", s.builderJobScope(s.completeIOSBuildJob))
 	// 安装包旧的交付路径：构建机不再能落发布记录
 	builder.POST("/jobs/:id/artifact-uploads", s.builderJobScope(s.retiredAPKArtifactRoute))
 	builder.PUT("/jobs/:id/artifact", s.builderJobScope(s.retiredAPKArtifactRoute))
@@ -372,6 +377,14 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)
 	group.GET("/release-identity/ios", s.getIOSReleaseIdentity)
 	group.PUT("/release-identity/ios", s.updateIOSReleaseIdentity)
+	// App Store Connect 接入（模式 A）。没装密钥的租户走模式 B，只填分发入口——
+	// 扫码分发与 App 内更新入口只需要那一个字符串（设计 ios-testflight §4.6）
+	group.GET("/ios/asc-credentials", s.getIOSASCCredentials)
+	group.PUT("/ios/asc-credentials", s.updateIOSASCCredentials)
+	group.DELETE("/ios/asc-credentials", s.deleteIOSASCCredentials)
+	// 只读同步：拉 build 与测试组，回写公开链接与过期日。提审、开关公开链接、
+	// 增删测试员永远由人在 ASC 上点（§4.6.6）
+	group.POST("/ios/testflight/sync", s.syncIOSTestFlight)
 	group.GET("/ota/signing-key", s.getOTASigningKey)
 	group.PUT("/ota/signing-key", s.updateOTASigningKey)
 	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)

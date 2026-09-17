@@ -4,7 +4,9 @@ import "strings"
 
 // 打包任务的状态机（设计 android-signing-gate-2026-09-16「构建任务的状态与字段」、ADR 0019）。
 //
-// 安装包任务：queued → claimed → running → built（待签名）→ signing（签名中）→ succeeded。
+// 安装包任务（Android）：queued → claimed → running → built（待签名）→ signing（签名中）→ succeeded。
+// 安装包任务（iOS）：queued → claimed → running → succeeded——签名在 Mac 上的
+// xcodebuild 里就发生了，没有未签名产物可以交给签名闸（见 ios_build_release.go）。
 // 热更新任务不经过签名闸：queued → claimed → running → succeeded。
 //
 // **所有按状态判断的 SQL 都从这张表取状态集合**，不在各处手写字面量。签名闸上线之前
@@ -32,11 +34,15 @@ var buildJobStatuses = []string{jobQueued, jobClaimed, jobRunning, jobBuilt, job
 
 // 状态机里的事件。名字只在这个文件和测试里用，不进库、不进接口。
 const (
-	eventBuilderClaim      = "builder.claim"
-	eventBuilderHeartbeat  = "builder.heartbeat"
-	eventBuilderFail       = "builder.fail"
-	eventBuilderBuilt      = "builder.built"
-	eventBuilderComplete   = "builder.complete"
+	eventBuilderClaim     = "builder.claim"
+	eventBuilderHeartbeat = "builder.heartbeat"
+	eventBuilderFail      = "builder.fail"
+	eventBuilderBuilt     = "builder.built"
+	eventBuilderComplete  = "builder.complete"
+	// iOS 安装包：Mac 上 xcodebuild 导出的那一刻签名就已经发生，没有未签名产物可以
+	// 交给签名闸，所以它一步到 succeeded，不经过 built / signing（signer.go 的认领
+	// 本来就带 platform='android'）。事件按 kind 归到 apk 下，平台条件在处理函数里
+	eventBuilderIOSRelease = "builder.ios-release"
 	eventDispatchFail      = "server.dispatch-fail"
 	eventReapBuild         = "reaper.build-timeout"
 	eventAdminCancel       = "admin.cancel"
@@ -73,6 +79,7 @@ var buildJobTransitions = []buildJobTransition{
 	{eventBuilderFail, []string{jobKindAPK, jobKindOTA}, []string{jobClaimed, jobRunning}, []string{jobFailed}},
 	{eventBuilderBuilt, []string{jobKindAPK}, []string{jobClaimed, jobRunning}, []string{jobBuilt}},
 	{eventBuilderComplete, []string{jobKindOTA}, []string{jobClaimed, jobRunning}, []string{jobSucceeded}},
+	{eventBuilderIOSRelease, []string{jobKindAPK}, []string{jobClaimed, jobRunning}, []string{jobSucceeded}},
 	// 认领那一刻就发现缺配置（租户被删、身份不全、基线失效）：当场判失败放出队列
 	{eventDispatchFail, []string{jobKindAPK, jobKindOTA}, []string{jobClaimed}, []string{jobFailed}},
 	{eventReapBuild, []string{jobKindAPK}, []string{jobClaimed, jobRunning}, []string{jobQueued, jobFailed}},
