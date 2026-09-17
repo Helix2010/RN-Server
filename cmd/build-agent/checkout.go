@@ -427,7 +427,7 @@ func (a *agent) gitEnv() []string {
 func (c config) sshCommand() string {
 	return "ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i " + c.SSHKey +
 		" -o UserKnownHostsFile=" + c.KnownHosts + " -o GlobalKnownHostsFile=/dev/null" +
-		" -o StrictHostKeyChecking=yes -o BatchMode=yes"
+		" -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15"
 }
 
 // gitSafetyConfig 是控制进程每条 git 命令都带的配置。

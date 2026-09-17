@@ -547,7 +547,7 @@ func TestControllerGitPinsSSH(t *testing.T) {
 	a := rig.agent
 	env := strings.Join(a.gitEnv(), "\n")
 	want := "GIT_SSH_COMMAND=ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i " + a.cfg.SSHKey +
-		" -o UserKnownHostsFile=" + a.cfg.KnownHosts + " -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes"
+		" -o UserKnownHostsFile=" + a.cfg.KnownHosts + " -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15"
 	if !strings.Contains(env, "\n"+want+"\n") && !strings.HasSuffix(env, "\n"+want) {
 		t.Fatalf("git environment lacks the pinned ssh command:\n%s", env)
 	}

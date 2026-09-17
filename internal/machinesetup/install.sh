@@ -893,7 +893,7 @@ restore_legacy_deploy_key() {
 # fetch 仓库镜像用的 ssh：不读任何 ssh 配置，只用 deploy key，主机公钥只认 root 所有的固定 known_hosts。
 # 与控制进程（cmd/build-agent/checkout.go 的 sshCommand）一致。
 agent_ssh_command() {
-  printf 'ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i %s -o UserKnownHostsFile=%s -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes' \
+  printf 'ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i %s -o UserKnownHostsFile=%s -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15' \
     "$AGENT_HOME/.ssh/id_ed25519" "$AGENT_KNOWN_HOSTS"
 }
 
