@@ -29,7 +29,25 @@
 # 机密：机器令牌只由 enroll 程序写进 env 文件，这个脚本从不读取、打印它；注册码经 stdin 交给 curl，
 # 不放进 curl 的命令行参数。
 set -euo pipefail
-umask 022
+# 以 root 执行：当前目录、umask、PATH 与环境一律换成固定的，之后调用的程序（python3、java、git、tar、
+# sha256sum……）不从执行者所在的目录（例如任何人都能写的 /tmp）或继承来的环境变量里加载任何东西。
+# 装出来的文件都用 install -m 显式给权限，umask 只兜底脚本自己写的临时文件。
+cd /
+umask 077
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HOME=/root
+export PATH HOME
+# 导出的环境变量只留这几个（代理留着：curl 要经它连服务端）；从环境导入的 shell 函数一律丢掉
+for _name in $(compgen -e); do
+  case "$_name" in
+    PATH | HOME | TERM | LANG | LC_* | http_proxy | https_proxy | no_proxy | HTTP_PROXY | HTTPS_PROXY | NO_PROXY) ;;
+    *) unset "$_name" 2>/dev/null || true ;;
+  esac
+done
+for _name in $(compgen -A function); do
+  unset -f "$_name"
+done
+unset _name
 
 readonly SETUP_ROOT=/var/lib/rn-machine-setup
 # 签名闸实例名：系统用户 rn-signer-<实例> 受 Linux 用户名 32 字符上限，所以最多 22 个字符（与服务端对签名闸机器名的限制一致）
@@ -48,6 +66,8 @@ readonly AGENT_HOME=/var/lib/rn-build-agent
 readonly AGENT_ENV=/etc/rn-build-agent.env
 readonly AGENT_STATE=/var/lib/rn-build-agent/state
 readonly AGENT_MIRROR=/var/lib/rn-build-agent/repos/rn-app.git
+# 控制进程 fetch 时唯一认的 GitHub 主机公钥文件：root 所有，rn-build-agent 改不了（BUILD_AGENT_SSH_KNOWN_HOSTS 的默认值）
+readonly AGENT_KNOWN_HOSTS=/opt/rn-build-agent/github_known_hosts
 
 SERVER="" CODE="" RECOVERY_SHA256="" EXPECT_SHA256="" INSTANCE="" APKSIGNER_JAR=""
 CURL_PROTO="=https"
@@ -58,7 +78,12 @@ RECOVERY_KEYS=""
 # describe 这次是不是真的查到了（yes），还是注册码已经无效、用的是本机缓存（no）
 DESCRIBED_LIVE=no
 LEGACY_MIGRATED=no
+LEGACY_HOME=""
 MIRROR_READY=no
+# 签名闸出站地址：--server 是回环或 IP 字面量时渲染 drop-in 收紧，PINNED=yes；是域名时留给运维手工加
+SIGNER_NETWORK_PINNED=no
+SIGNER_NETWORK_DROPIN=""
+SIGNER_NETWORK_ALLOW=""
 
 step() { printf '\n== %s\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
@@ -142,7 +167,8 @@ normalize_sha256() {
 }
 
 curl_api() {
-  curl --silent --show-error --proto "$CURL_PROTO" --connect-timeout 15 "$@"
+  # -q 必须是第一个参数：不读 ~/.curlrc
+  curl -q --silent --show-error --proto "$CURL_PROTO" --connect-timeout 15 "$@"
 }
 
 sha256_of() {
@@ -236,7 +262,8 @@ describe() {
 
 # 服务端 Problem Details 里的 code（只取形状合法的，别的不打印）
 problem_code() {
-  python3 - "$1" <<'PY' 2>/dev/null || printf 'no problem code'
+  # python3 一律 -I（隔离模式）：sys.path 里没有当前目录与用户 site-packages，也不读 PYTHON* 环境变量
+  python3 -I - "$1" <<'PY' 2>/dev/null || printf 'no problem code'
 import json, re, sys
 try:
     code = json.load(open(sys.argv[1])).get("code", "")
@@ -249,7 +276,7 @@ PY
 # 校验 describe 的回答并输出 KEY=VALUE 行。每个值都按形状校验过，只含安全字符；文件清单写进
 # 同目录的 files.sha256（sha256sum -c 的格式）。服务端给的字符串不进 eval，不原样打印。
 parse_description() {
-  python3 - "$1" "$WORK/files.sha256" <<'PY'
+  python3 -I - "$1" "$WORK/files.sha256" <<'PY'
 import json, re, sys
 
 def fail(what):
@@ -348,7 +375,8 @@ resolve_target() {
 java_is_17() { # $1 = JAVA_HOME
   local version
   [ -x "$1/bin/java" ] || return 1
-  version="$("$1/bin/java" -version 2>&1)" || return 1
+  # 空环境（不吃 JAVA_TOOL_OPTIONS 之类），不往 /tmp/hsperfdata_root 写性能计数文件
+  version="$(env -i "$1/bin/java" -XX:-UsePerfData -version 2>&1)" || return 1
   [[ "$version" == *'version "17'* ]]
 }
 
@@ -547,6 +575,60 @@ wait_active() {
 
 # ---- 4–6. 签名闸 ----------------------------------------------------------------------------
 
+# is_ipv4：点分四段、每段 0–255
+is_ipv4() {
+  local ip="$1" seg
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  local IFS=.
+  for seg in $ip; do
+    [ "$seg" -le 255 ] || return 1
+  done
+  return 0
+}
+
+# is_ipv6：只认十六进制与冒号（够用来判 IP 字面量，不做完整合法性校验）
+is_ipv6() { [[ "$1" =~ ^[0-9A-Fa-f:]+$ && "$1" == *:* ]]; }
+
+# render_signer_network_dropin：--server 是回环或 IP 字面量时，渲染
+# /etc/systemd/system/<unit>.service.d/network.conf，把签名闸的出站地址收紧到该地址（模板已去掉写死的
+# IPAddress*）。是域名时不渲染（还需要 DNS 解析器地址，因机器而异），留给运维手工加，并在“下一步”提示。
+# 只在这个函数里判定 SIGNER_NETWORK_PINNED，两处（下一步、note）都读它。
+render_signer_network_dropin() {
+  local unit="$1" host allow dropin
+  host="${SERVER#*://}"
+  host="${host%%/*}"
+  case "$host" in
+  \[*\]*)
+    host="${host#\[}"
+    host="${host%%\]*}"
+    ;;
+  *:*) host="${host%:*}" ;;
+  esac
+  case "$host" in
+  localhost | 127.0.0.1 | ::1) allow="127.0.0.1/32 ::1/128" ;;
+  *)
+    if is_ipv4 "$host"; then
+      allow="$host/32"
+    elif is_ipv6 "$host"; then
+      allow="$host/128"
+    else
+      # 域名：签名闸还要连 DNS 解析器，地址因机器而异，不猜
+      SIGNER_NETWORK_PINNED=no
+      return 0
+    fi
+    ;;
+  esac
+  dropin="/etc/systemd/system/$unit.service.d"
+  install -d -o root -g root -m 0755 "$dropin"
+  printf '# install.sh 按 --server 渲染：只允许连服务端与回环。域名部署要改成 API 与 DNS 解析器地址。\n[Service]\nIPAddressDeny=any\nIPAddressAllow=%s\n' \
+    "$allow" >"$WORK/network.conf"
+  put_file "$WORK/network.conf" "$dropin/network.conf" root root 0644
+  systemctl daemon-reload
+  SIGNER_NETWORK_PINNED=yes
+  SIGNER_NETWORK_DROPIN="$dropin/network.conf"
+  SIGNER_NETWORK_ALLOW="$allow"
+}
+
 install_signer() {
   local user="rn-signer-$INSTANCE" env="/etc/rn-signer-$INSTANCE.env" unit="rn-signer-$INSTANCE"
   local templates="$BUNDLE/templates" rendered="$CACHE/rendered" name enrolled=no
@@ -624,15 +706,16 @@ install_signer() {
     fi
   fi
 
+  # 出站地址：--server 是回环或 IP 字面量时直接渲染 drop-in 收紧；是域名时留给运维手工加（见下一步）
+  render_signer_network_dropin "$unit"
+
+  # 注册：已注册时也照样调一次。signer enroll 是幂等的——已有令牌就不连服务端，只清掉可能残留的
+  # enroll.incomplete 标记（否则 signer run 会因为它拒绝启动，而且再没有别的机会清掉）。
   step "注册"
-  if [ "$enrolled" = yes ]; then
-    note "已注册，跳过"
-  else
-    /opt/rn-signer/bin/signer enroll --server "$SERVER" --code "$CODE" --env-file "$env" \
-      --recovery-sha256 "$RECOVERY_SHA256" --name-check "$MACHINE_NAME" ||
-      die "signer enroll 失败（见上面的输出）。修好之后重新执行同一条命令"
-    has_machine_token "$env" SIGNER_MACHINE_TOKEN || die "signer enroll 报告成功，但 $env 里没有机器令牌"
-  fi
+  RN_ENROLLMENT_CODE="$CODE" /opt/rn-signer/bin/signer enroll --server "$SERVER" --env-file "$env" \
+    --recovery-sha256 "$RECOVERY_SHA256" --name-check "$MACHINE_NAME" ||
+    die "signer enroll 失败（见上面的输出）。修好之后重新执行同一条命令"
+  has_machine_token "$env" SIGNER_MACHINE_TOKEN || die "signer enroll 报告成功，但 $env 里没有机器令牌"
   # 记下这个注册码落在哪个实例上：之后不带 --instance 重复执行时用它
   printf '%s\n' "$INSTANCE" >"$CACHE/instance"
 
@@ -644,30 +727,55 @@ install_signer() {
   step "本机身份（公开信息：控制台接受与 trust-peer 时逐位核对）"
   sudo -u "$user" /opt/rn-signer/bin/signer show-key --env-file "$env" || warn "signer show-key 失败"
 
+  # signer enroll 已经按控制台登记的主/备、以及服务端有没有主，打印了完整的下一步命令。
+  # 这里只补 install.sh 自己负责的两条：出站地址（域名时要手工加）、以及把关键动作汇总一遍。
   local here="sudo -u $user /opt/rn-signer/bin/signer"
-  step "下一步"
+  step "下一步（signer enroll 上面已打印详细命令，这里是要点）"
   cat <<NEXT
    1. 控制台「平台维护 → 打包机与签名闸」：$MACHINE_NAME 显示的 X25519 与 Ed25519 完整指纹与上面一致后，点「接受」。
+      本机记录里这台一律是「备」：控制台的主/备只决定派活。
 NEXT
-  if [ "$SIGNER_ROLE" = standby ]; then
+  if [ "$SIGNER_ROLE" = primary ]; then
     cat <<NEXT
-   2. 登上主签名闸${PRIMARY_NAME:+ $PRIMARY_NAME} 那台机器，让它信任这台备签名闸（粘贴上面的两个完整指纹）：
-        sudo -u rn-signer-<主签名闸实例> /opt/rn-signer/bin/signer trust-peer --peer $MACHINE_NAME --env-file /etc/rn-signer-<主签名闸实例>.env
-      实例名默认就是机器名${PRIMARY_NAME:+（rn-signer-$PRIMARY_NAME）}；amos 上手工部署的两台是 rn-signer-a、rn-signer-b。
-      这台备签名闸注册时已经首次信任了当时的主签名闸${PRIMARY_NAME:+ $PRIMARY_NAME}。
+   2. 控制台把这台登记为「主」。若它是平台的第一台主签名闸，在本机把它提升为主（promote 要运行锁，先停服务）：
+        systemctl stop $unit.service
+        $here promote --first --env-file $env
+        systemctl start $unit.service
+      若是替换旧主，改用 --import 或 --manual（见 /opt/rn-signer/README.md 第 9 节），不要用 --first。
+   3. 让每台备签名闸信任这台主（在每台备本机，指纹取本机 show-key 上面那两行）：
+        sudo -u rn-signer-<备实例> /opt/rn-signer/bin/signer trust-peer --peer $MACHINE_NAME --env-file /etc/rn-signer-<备实例>.env
+      并在这台机器上信任每台备：$here trust-peer --peer <备签名闸机器名> --env-file $env
+NEXT
+  elif [ -n "$PRIMARY_NAME" ]; then
+    cat <<NEXT
+   2. 在这台机器上信任主签名闸 $PRIMARY_NAME（指纹取主签名闸本机 show-key 或它的安装输出，不要取控制台的）：
+        $here trust-peer --peer $PRIMARY_NAME --env-file $env
+      并登上主签名闸，让它信任这台备（粘贴上面这台的两个完整指纹）：
+        sudo -u rn-signer-<主实例> /opt/rn-signer/bin/signer trust-peer --peer $MACHINE_NAME --env-file /etc/rn-signer-<主实例>.env
+      实例名默认就是机器名；amos 上手工部署的两台是 rn-signer-a、rn-signer-b。
 NEXT
   else
     cat <<NEXT
-   2. 平台已有备签名闸时，让它们信任这台主签名闸（在每台备签名闸本机，粘贴上面的两个完整指纹）：
-        sudo -u rn-signer-<备签名闸实例> /opt/rn-signer/bin/signer trust-peer --peer $MACHINE_NAME --env-file /etc/rn-signer-<备签名闸实例>.env
-      并在这台机器上信任它们：$here trust-peer --peer <备签名闸机器名> --env-file $env
+   2. 服务端还没有主签名闸：先装主签名闸，再在这台机器上信任它：
+        $here trust-peer --peer <主签名闸机器名> --env-file $env
 NEXT
   fi
   cat <<NEXT
-   3. 在这台机器上信任每台构建机（粘贴构建机安装输出里的出处公钥完整 sha256）：
+   4. 在这台机器上信任每台构建机（粘贴构建机安装输出里的出处公钥完整 sha256）：
         $here trust-builder --builder <构建机机器名> --env-file $env
-   4. 签名闸的出站地址：unit 默认不限制；按 /opt/rn-signer/README.md 加 drop-in 收紧到 API 与 DNS 解析器地址。
 NEXT
+  if [ "$SIGNER_NETWORK_PINNED" = yes ]; then
+    note "出站地址已按 --server 收紧：$SIGNER_NETWORK_DROPIN（IPAddressDeny=any + 允许 $SIGNER_NETWORK_ALLOW）"
+  else
+    cat <<NEXT
+   5. 【上线必做】收紧出站地址：--server 是域名，install.sh 没有替你写 drop-in。装完手工加
+        /etc/systemd/system/$unit.service.d/network.conf
+        [Service]
+        IPAddressDeny=any
+        IPAddressAllow=<API 地址> <DNS 解析器地址>
+      然后 systemctl daemon-reload && systemctl restart $unit.service（见 /opt/rn-signer/README.md）。
+NEXT
+  fi
 }
 
 # ---- 4–6. 构建机 ----------------------------------------------------------------------------
@@ -686,14 +794,39 @@ builder_is_legacy() {
   [ -e "$AGENT_HOME/agent-key" ] || [ -e "$AGENT_HOME/backup-signing.key" ]
 }
 
-# 从改造前的结构迁移（沿用 deploy/amos/signing-gate-rollout/1-install.sh）：停旧进程、留存旧配置与密钥、
-# 清掉 builder 写过的缓存。留存目录 root 0700，新链路稳定后按上线手册销毁。
+# 以 rn-build-agent 身份执行。rn-build-agent 自己的目录树里的操作一律用它，root 不去碰：
+# 那些路径的任何一段都可能被它换成符号链接（例如机器令牌被清空后重新注册，控制进程此前跑过任务）。
+as_agent() {
+  sudo -u rn-build-agent -- "$@"
+}
+
+# 留存目录里的新名字：同一天重复迁移时不覆盖上次留下的
+legacy_name() {
+  local path="$1"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    path="$path.$(date -u +%H%M%S%N)"
+  fi
+  printf '%s' "$path"
+}
+
+# 从改造前的结构迁移：停旧进程、留存旧配置与密钥、清掉 builder 写过的缓存。
+#
+# 旧结构里 builder 的家目录就是 /var/lib/rn-build-agent：仓库镜像、~/.ssh、别的点文件都曾归 builder 可写，
+# 而控制进程 git fetch 会读镜像的本地配置、ssh 会读 ~/.ssh/config 与 known_hosts。所以家目录整个挪进留存目录，
+# 新家目录从空的建起：仓库镜像以 rn-build-agent 重新克隆，deploy key 只取回两个文件（restore_legacy_deploy_key），
+# known_hosts 按脚本里固定的主机公钥重写。留存目录 root 0700，新链路稳定后按上线手册销毁。
 migrate_legacy_builder() {
   local legacy f i
   legacy="/root/rn-build-agent-legacy-$(date -u +%Y-%m-%d)"
   step "从旧结构迁移构建机（旧文件留存在 $legacy）"
   systemctl stop rn-build-agent 2>/dev/null || true
   if id builder >/dev/null 2>&1; then
+    # 先去掉 builder 的 crontab（留一份），免得杀完进程又被 cron 拉起来
+    if command -v crontab >/dev/null 2>&1 && crontab -l -u builder >/dev/null 2>&1; then
+      install -d -o root -g root -m 0700 "$legacy"
+      crontab -l -u builder >"$(legacy_name "$legacy/builder.crontab")" 2>/dev/null || true
+      crontab -r -u builder 2>/dev/null || true
+    fi
     pkill -KILL -u builder 2>/dev/null || true
     for i in $(seq 1 30); do
       pgrep -u builder >/dev/null 2>&1 || break
@@ -703,11 +836,7 @@ migrate_legacy_builder() {
   fi
   install -d -o root -g root -m 0700 "$legacy"
   if [ -f "$AGENT_ENV" ]; then
-    if [ -e "$legacy/rn-build-agent.env" ]; then
-      mv "$AGENT_ENV" "$legacy/rn-build-agent.env.$(date -u +%H%M%S)"
-    else
-      mv "$AGENT_ENV" "$legacy/rn-build-agent.env"
-    fi
+    mv "$AGENT_ENV" "$(legacy_name "$legacy/rn-build-agent.env")"
     note "旧 $AGENT_ENV 移进留存目录（含旧令牌，不再使用）"
   fi
   if [ -f /etc/systemd/system/rn-build-agent.service ] && [ ! -e "$legacy/rn-build-agent.service" ]; then
@@ -716,24 +845,62 @@ migrate_legacy_builder() {
   if [ -f /opt/rn-build-agent/build-agent ] && [ ! -e "$legacy/build-agent.previous" ]; then
     cp -a /opt/rn-build-agent/build-agent "$legacy/build-agent.previous"
   fi
-  for f in agent-key backup-signing.key .gitconfig; do
-    if [ -e "$AGENT_HOME/$f" ]; then
-      mv "$AGENT_HOME/$f" "$legacy/"
-    fi
-  done
-  # builder 写过的缓存与工作区按被下毒处理
-  rm -rf "$AGENT_HOME/.android" "$AGENT_HOME/.cache" "$AGENT_HOME/.expo" "$AGENT_HOME/.kotlin" \
-    "$AGENT_HOME/.local" "$AGENT_HOME/.npm" "$AGENT_HOME/workspace" \
-    /var/cache/rn-build-agent/gradle /var/cache/rn-build-agent/pnpm-store
+  if [ -d "$AGENT_HOME" ] && [ ! -L "$AGENT_HOME" ]; then
+    for f in agent-key backup-signing.key .gitconfig; do
+      if [ -e "$AGENT_HOME/$f" ] || [ -L "$AGENT_HOME/$f" ]; then
+        mv "$AGENT_HOME/$f" "$(legacy_name "$legacy/$f")"
+      fi
+    done
+    # builder 写过的缓存与工作区按被下毒处理：删掉（不值得留存，体积也大）
+    rm -rf "$AGENT_HOME/.android" "$AGENT_HOME/.cache" "$AGENT_HOME/.expo" "$AGENT_HOME/.gradle" "$AGENT_HOME/.kotlin" \
+      "$AGENT_HOME/.local" "$AGENT_HOME/.m2" "$AGENT_HOME/.npm" "$AGENT_HOME/.pnpm-store" "$AGENT_HOME/workspace"
+    # 剩下的（仓库镜像、~/.ssh、其余点文件）整个挪走
+    LEGACY_HOME="$(legacy_name "$legacy/home")"
+    mv "$AGENT_HOME" "$LEGACY_HOME"
+    note "旧家目录（仓库镜像、~/.ssh 等）移进 $LEGACY_HOME；仓库镜像稍后以 rn-build-agent 重新克隆"
+  fi
+  rm -rf /var/cache/rn-build-agent/gradle /var/cache/rn-build-agent/pnpm-store
   if id builder >/dev/null 2>&1; then
     find /tmp /var/tmp /dev/shm -maxdepth 1 -user builder -exec rm -rf {} + 2>/dev/null || true
   fi
   LEGACY_MIGRATED=yes
 }
 
+# 迁移时取回旧 deploy key：只要 id_ed25519 与 id_ed25519.pub 两个普通文件（不是符号链接、不属于 root、
+# 公钥与私钥配对），属主改成 rn-build-agent。别的（config、known_hosts、authorized_keys……）都留在留存目录。
+# 取不回来就生成新的 deploy key（下一步会提示加到 GitHub）。
+restore_legacy_deploy_key() {
+  local from="$LEGACY_HOME/.ssh" name src private="$AGENT_HOME/.ssh/id_ed25519"
+  [ -n "$LEGACY_HOME" ] && [ -d "$from" ] && [ ! -L "$from" ] || return 0
+  for name in id_ed25519 id_ed25519.pub; do
+    src="$from/$name"
+    if [ ! -f "$src" ] || [ -L "$src" ] || [ "$(stat -c %u "$src")" = 0 ] || [ "$(stat -c %s "$src")" -gt 16384 ]; then
+      [ ! -e "$src" ] || warn "旧的 $src 不是 builder 的普通小文件，不沿用；会生成新的 deploy key"
+      return 0
+    fi
+  done
+  install -o rn-build-agent -g rn-build-agent -m 0600 "$from/id_ed25519" "$private"
+  install -o rn-build-agent -g rn-build-agent -m 0644 "$from/id_ed25519.pub" "$private.pub"
+  if [ "$(as_agent ssh-keygen -y -f "$private" 2>/dev/null | awk '{ print $1, $2 }')" != "$(awk '{ print $1, $2 }' "$private.pub")" ]; then
+    rm -f "$private" "$private.pub"
+    warn "旧 deploy key 的公钥与私钥对不上，不沿用；会生成新的 deploy key"
+    return 0
+  fi
+  note "沿用旧的 GitHub deploy key（只取回 id_ed25519 与 id_ed25519.pub；旧 ~/.ssh 的其余文件留在 $from）"
+  warn "这把 deploy key 的私钥曾经对 builder 可读：建议在 GitHub 上换一把（见 SIGNING_GATE_ROLLOUT.md「重建仓库镜像与 ~/.ssh」）"
+}
+
+# fetch 仓库镜像用的 ssh：不读任何 ssh 配置，只用 deploy key，主机公钥只认 root 所有的固定 known_hosts。
+# 与控制进程（cmd/build-agent/checkout.go 的 sshCommand）一致。
+agent_ssh_command() {
+  printf 'ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i %s -o UserKnownHostsFile=%s -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15' \
+    "$AGENT_HOME/.ssh/id_ed25519" "$AGENT_KNOWN_HOSTS"
+}
+
 install_builder() {
   local enrolled=no had_deploy_key=no name
   has_machine_token "$AGENT_ENV" BUILD_AGENT_MACHINE_TOKEN && enrolled=yes
+  printf '%s\n' "$GITHUB_KNOWN_HOST" >"$WORK/github_known_hosts"
 
   step "安装构建机"
   if [ "$enrolled" = yes ]; then
@@ -742,6 +909,12 @@ install_builder() {
     report_file "$BUNDLE/bin/build-runner" /opt/rn-build-agent/build-runner
     report_file "$BUNDLE/rn-build-agent.service" /etc/systemd/system/rn-build-agent.service
     report_file "$BUNDLE/rn-build-agent.sudoers" /etc/sudoers.d/rn-build-agent
+    # 固定 known_hosts 是新版控制进程 fetch 的前提：没有就补上，有但内容不同只报告
+    if [ -f "$AGENT_KNOWN_HOSTS" ]; then
+      report_file "$WORK/github_known_hosts" "$AGENT_KNOWN_HOSTS"
+    else
+      put_file "$WORK/github_known_hosts" "$AGENT_KNOWN_HOSTS" root root 0644
+    fi
   else
     if builder_is_legacy; then
       migrate_legacy_builder
@@ -761,21 +934,26 @@ install_builder() {
       note "已建系统用户 builder"
     fi
     for f in /etc/cron.deny /etc/at.deny; do
-      touch "$f"
+      # 显式 0644：crontab 是 setgid 程序，读不到 deny 文件时 Debian 的 cron 按“允许”处理
+      [ -e "$f" ] || install -o root -g root -m 0644 /dev/null "$f"
       grep -qx builder "$f" || printf 'builder\n' >>"$f"
     done
 
+    # 家目录本身由 root 建（它在 root 所有的 /var/lib 下），里面的目录以 rn-build-agent 建
+    install -d -o rn-build-agent -g rn-build-agent -m 0700 "$AGENT_HOME"
+    as_agent install -d -m 0700 "$AGENT_HOME/.ssh" "$AGENT_STATE" "$AGENT_HOME/repos"
     if [ "$LEGACY_MIGRATED" = yes ]; then
-      chown -R rn-build-agent:rn-build-agent "$AGENT_HOME"
+      restore_legacy_deploy_key
     fi
-    install -d -o rn-build-agent -g rn-build-agent -m 0700 "$AGENT_HOME" "$AGENT_HOME/.ssh" "$AGENT_STATE" \
-      "$AGENT_HOME/repos"
-    [ ! -d "$AGENT_MIRROR" ] || chmod 0700 "$AGENT_MIRROR"
+    # 旧的 known_hosts 不沿用：按脚本里固定的 GitHub 主机公钥重写（控制进程不读它，用的是下面 root 所有的那份）
+    # shellcheck disable=SC2016  # $1、$2 由 sh -c 展开
+    as_agent sh -c 'umask 077 && printf "%s\n" "$1" >"$2.new" && mv -f "$2.new" "$2"' sh "$GITHUB_KNOWN_HOST" "$AGENT_HOME/.ssh/known_hosts"
     install -d -o rn-build-agent -g rn-build-jobs -m 2750 /var/lib/rn-build-jobs
     install -d -o root -g root -m 0755 /opt/rn-build-agent
 
     put_file "$BUNDLE/bin/build-agent" /opt/rn-build-agent/build-agent root root 0755
     put_file "$BUNDLE/bin/build-runner" /opt/rn-build-agent/build-runner root root 0755
+    put_file "$WORK/github_known_hosts" "$AGENT_KNOWN_HOSTS" root root 0644
     visudo -cf "$BUNDLE/rn-build-agent.sudoers" >/dev/null || die "安装包里的 sudoers 语法检查没过"
     put_file "$BUNDLE/rn-build-agent.sudoers" /etc/sudoers.d/rn-build-agent root root 0440
     put_file "$BUNDLE/rn-build-agent.service" /etc/systemd/system/rn-build-agent.service root root 0644
@@ -794,51 +972,46 @@ install_builder() {
     [ "$code" = 2 ] || die "build-agent 空环境冒烟退出码 $code，应为 2"
     code=0
     setpriv --reuid="$builder_uid" --regid="$builder_gid" --clear-groups --no-new-privs \
-      /opt/rn-build-agent/build-runner >/dev/null 2>&1 || code=$?
+      env -i /opt/rn-build-agent/build-runner >/dev/null 2>&1 || code=$?
     [ "$code" = 2 ] || die "build-runner 无参数冒烟退出码 $code，应为 2"
     note "冒烟通过：build-agent、build-runner 都以 2 退出"
   fi
 
   step "GitHub 只读 deploy key 与仓库镜像"
-  if [ -d "$AGENT_MIRROR" ]; then
+  if as_agent test -d "$AGENT_MIRROR"; then
     MIRROR_READY=yes
     note "仓库镜像已存在：$AGENT_MIRROR"
   else
-    if [ -f "$AGENT_HOME/.ssh/id_ed25519" ]; then
+    if as_agent test -f "$AGENT_HOME/.ssh/id_ed25519"; then
       had_deploy_key=yes
     else
-      sudo -u rn-build-agent ssh-keygen -q -t ed25519 -N "" -C "rn-build-agent@$(hostname)" -f "$AGENT_HOME/.ssh/id_ed25519"
+      as_agent ssh-keygen -q -t ed25519 -N "" -C "rn-build-agent@$(hostname)" -f "$AGENT_HOME/.ssh/id_ed25519"
       note "已生成 deploy key（要先加到 GitHub，见下一步）"
     fi
-    if ! grep -qxF "$GITHUB_KNOWN_HOST" "$AGENT_HOME/.ssh/known_hosts" 2>/dev/null; then
-      printf '%s\n' "$GITHUB_KNOWN_HOST" >>"$AGENT_HOME/.ssh/known_hosts"
-      chown rn-build-agent:rn-build-agent "$AGENT_HOME/.ssh/known_hosts"
-      chmod 0600 "$AGENT_HOME/.ssh/known_hosts"
-    fi
     if [ "$had_deploy_key" = yes ]; then
-      note "克隆仓库镜像（deploy key 要已经加到 GitHub）"
-      if sudo -u rn-build-agent env HOME="$AGENT_HOME" \
-        GIT_SSH_COMMAND="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$AGENT_HOME/.ssh/known_hosts -i $AGENT_HOME/.ssh/id_ed25519" \
-        git clone --quiet --mirror "$APP_REPO_URL" "$AGENT_MIRROR.part"; then
-        mv "$AGENT_MIRROR.part" "$AGENT_MIRROR"
-        chmod 0700 "$AGENT_MIRROR"
+      note "以 rn-build-agent 克隆仓库镜像（deploy key 要已经加到 GitHub）"
+      as_agent rm -rf "$AGENT_MIRROR.part"
+      # 与控制进程同样的防护：不读系统与全局 git 配置、不跑 hook、只许 ssh、空模板
+      if as_agent env -i PATH="$SERVICE_PATH" HOME="$AGENT_HOME" LANG=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(agent_ssh_command)" \
+        git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.ssh.allow=always \
+        clone --quiet --mirror --template= "$APP_REPO_URL" "$AGENT_MIRROR.part" &&
+        as_agent chmod 0700 "$AGENT_MIRROR.part" && as_agent mv -T "$AGENT_MIRROR.part" "$AGENT_MIRROR"; then
         MIRROR_READY=yes
         note "仓库镜像已就位"
       else
-        rm -rf "$AGENT_MIRROR.part"
+        as_agent rm -rf "$AGENT_MIRROR.part"
         warn "克隆失败：deploy key 多半还没加到 GitHub（见下一步第 1 条）"
       fi
     fi
   fi
 
+  # 注册：已注册时也照样调一次（幂等——已有令牌就不连服务端、直接核对本机密钥）。注册码经环境变量
+  # RN_ENROLLMENT_CODE 交给它，不进进程参数（本机其他用户读得到 /proc/<pid>/cmdline 与 sudo 日志）。
   step "注册"
-  if [ "$enrolled" = yes ]; then
-    note "已注册，跳过"
-  else
-    /opt/rn-build-agent/build-agent enroll --server "$SERVER" --code "$CODE" --env-file "$AGENT_ENV" --state-dir "$AGENT_STATE" ||
-      die "build-agent enroll 失败（见上面的输出）。修好之后重新执行同一条命令"
-    has_machine_token "$AGENT_ENV" BUILD_AGENT_MACHINE_TOKEN || die "build-agent enroll 报告成功，但 $AGENT_ENV 里没有机器令牌"
-  fi
+  RN_ENROLLMENT_CODE="$CODE" /opt/rn-build-agent/build-agent enroll --server "$SERVER" --env-file "$AGENT_ENV" --state-dir "$AGENT_STATE" ||
+    die "build-agent enroll 失败（见上面的输出）。修好之后重新执行同一条命令"
+  has_machine_token "$AGENT_ENV" BUILD_AGENT_MACHINE_TOKEN || die "build-agent enroll 报告成功，但 $AGENT_ENV 里没有机器令牌"
 
   step "启动"
   systemctl enable --quiet rn-build-agent
@@ -865,7 +1038,7 @@ install_builder() {
   if [ "$MIRROR_READY" != yes ]; then
     cat <<NEXT
    $n. 把这台机器的 deploy key 加到 GitHub 仓库 Helix2010/RN-App → Settings → Deploy keys（只读，不勾 write access）：
-        $(cat "$AGENT_HOME/.ssh/id_ed25519.pub")
+        $(as_agent cat "$AGENT_HOME/.ssh/id_ed25519.pub")
       然后重新执行同一条安装命令（会克隆仓库镜像，其余步骤跳过）。
 NEXT
     n=$((n + 1))

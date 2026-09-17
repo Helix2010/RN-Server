@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,9 +52,8 @@ func TestCheckoutNeverRunsRepositoryHooks(t *testing.T) {
 	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
-	// 仓库配置里指一个 hooksPath 也不能生效
-	fakebuild.Git(t, rig.bare, "config", "core.hooksPath", customHooks)
-
+	// 仓库配置里指一个 hooksPath：fetch 之前就被镜像核对拒掉（见 TestCheckoutRefusesAnUntrustedMirror）；
+	// 这里只看裸库 hooks/ 目录里的 hook
 	commitMore(`{"name":"real"}`)
 	head := fakebuild.Git(t, source, "rev-parse", "HEAD")
 	job := claimBody("bld_hooksJOB0001", "apk")
@@ -373,5 +373,249 @@ func TestControllerGitNeverStartsBackgroundMaintenance(t *testing.T) {
 	cmd := a.gitCommand(context.Background(), "", "fetch", "--all")
 	if got := strings.Join(cmd.Args, " "); !strings.Contains(got, "-c maintenance.auto=false") || !strings.HasSuffix(got, "fetch --all") {
 		t.Fatalf("git command line = %q", got)
+	}
+}
+
+// 改造前的构建机上仓库镜像归 builder 可写：它的配置与目录结构在 fetch 之前按白名单核对，
+// 不合规的镜像整个任务失败，不 fetch、不执行里面的任何东西，也不自动修。
+func TestCheckoutRefusesAnUntrustedMirror(t *testing.T) {
+	type poison func(t *testing.T, bare, marker string)
+	gitConfig := func(args ...string) poison {
+		return func(t *testing.T, bare, marker string) {
+			for i := range args {
+				args[i] = strings.ReplaceAll(args[i], "MARKER", marker)
+			}
+			fakebuild.Git(t, bare, append([]string{"config"}, args...)...)
+		}
+	}
+	writeFile := func(name, content string) poison {
+		return func(t *testing.T, bare, marker string) {
+			path := filepath.Join(bare, name)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(strings.ReplaceAll(content, "MARKER", marker)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cases := map[string]poison{
+		"core.sshCommand":          gitConfig("core.sshCommand", "touch MARKER; ssh"),
+		"core.hooksPath":           gitConfig("core.hooksPath", "/tmp"),
+		"remote.origin.uploadpack": gitConfig("remote.origin.uploadpack", "touch MARKER; git-upload-pack"),
+		"remote.origin.vcs":        gitConfig("remote.origin.vcs", "evil"),
+		"credential.helper":        gitConfig("credential.helper", "!touch MARKER"),
+		"url insteadOf":            gitConfig("url./elsewhere/.insteadOf", "/"),
+		"a second remote":          gitConfig("remote.evil.url", "/elsewhere"),
+		"a second origin url":      gitConfig("--add", "remote.origin.url", "/elsewhere"),
+		"not bare":                 gitConfig("core.bare", "false"),
+		"include.path": func(t *testing.T, bare, marker string) {
+			included := filepath.Join(t.TempDir(), "included")
+			if err := os.WriteFile(included, []byte("[core]\n\tsshCommand = touch "+marker+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fakebuild.Git(t, bare, "config", "include.path", included)
+		},
+		"includeIf": func(t *testing.T, bare, marker string) {
+			fakebuild.Git(t, bare, "config", "includeIf.gitdir:/.path", filepath.Join(t.TempDir(), "included"))
+		},
+		"branches/x":              writeFile("branches/x", "/elsewhere\n"),
+		"remotes/origin":          writeFile("remotes/origin", "URL: /elsewhere\nPull: refs/heads/main:refs/heads/main\n"),
+		"objects/info/alternates": writeFile("objects/info/alternates", "/elsewhere/objects\n"),
+		"info/attributes":         writeFile("info/attributes", "* filter=evil\n"),
+		"info/grafts":             writeFile("info/grafts", "0000000000000000000000000000000000000000\n"),
+		".git gitfile":            writeFile(".git", "gitdir: /elsewhere\n"),
+		"commondir":               writeFile("commondir", "/elsewhere\n"),
+		"config.worktree":         writeFile("config.worktree", "[core]\n\tsshCommand = touch MARKER\n"),
+		"config is a symlink": func(t *testing.T, bare, marker string) {
+			copied := filepath.Join(t.TempDir(), "config")
+			raw, err := os.ReadFile(filepath.Join(bare, "config"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(copied, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(bare, "config")); err != nil {
+				t.Fatal(err)
+			}
+			mustSymlink(t, copied, filepath.Join(bare, "config"))
+		},
+		"group-writable mirror": func(t *testing.T, bare, marker string) {
+			if err := os.Chmod(bare, 0o770); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"group-writable config": func(t *testing.T, bare, marker string) {
+			if err := os.Chmod(filepath.Join(bare, "config"), 0o660); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, apply := range cases {
+		t.Run(name, func(t *testing.T) {
+			rig := newRig(t)
+			marker := filepath.Join(t.TempDir(), "ran")
+			apply(t, rig.bare, marker)
+			buf := newLogBuffer(newRedactor())
+			prepared, err := rig.agent.prepareWorktree(context.Background(), mustClaimedJob(t, claimBody("bld_poisonJOB001", "apk")), buf)
+			if err == nil {
+				t.Fatal("an untrusted mirror was fetched")
+			}
+			if !errors.Is(err, errUntrustedMirror) || !strings.Contains(err.Error(), "SIGNING_GATE_ROLLOUT.md") {
+				t.Fatalf("refused for another reason: %v", err)
+			}
+			if strings.Contains(strings.Join(buf.snapshot(), "\n"), "fetch") {
+				t.Fatalf("git fetch ran before the mirror was checked:\n%s", strings.Join(buf.snapshot(), "\n"))
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("the mirror's configuration ran a command")
+			}
+			rig.agent.cleanupJob(prepared.Layout)
+		})
+	}
+}
+
+// 对照：不核对镜像时 remote.origin.uploadpack 确实会被 fetch 执行，上面的“没执行”才有意义
+func TestUntrustedMirrorControlRunsTheUploadPackCommand(t *testing.T) {
+	rig := newRig(t)
+	marker := filepath.Join(t.TempDir(), "ran")
+	fakebuild.Git(t, rig.bare, "config", "remote.origin.uploadpack", "touch "+marker+"; git-upload-pack")
+	fakebuild.Git(t, rig.bare, "fetch", "origin")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the control fetch did not run remote.origin.uploadpack, so the refusal test proves nothing: %v", err)
+	}
+}
+
+// git clone --mirror 产生的镜像（默认模板带 hooks 样例、info/exclude、description；空模板什么都不带）通过核对
+func TestCheckoutAcceptsACleanMirror(t *testing.T) {
+	rig := newRig(t)
+	if err := rig.agent.checkMirror(context.Background()); err != nil {
+		t.Fatalf("a mirror cloned with the default template was refused: %v", err)
+	}
+	source := filepath.Join(filepath.Dir(rig.bare), "source")
+	bare := filepath.Join(t.TempDir(), "rn-app.git")
+	fakebuild.Git(t, filepath.Dir(bare), "clone", "-q", "--mirror", "--template=", source, bare)
+	rig.agent.cfg.Repo = bare
+	if err := os.Chmod(bare, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(bare, "config"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(bare, "branches"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.agent.prepareWorktree(context.Background(), mustClaimedJob(t, claimBody("bld_cleanMIRROR1", "apk")), newLogBuffer(newRedactor())); err != nil {
+		t.Fatalf("a mirror cloned with an empty template was refused: %v", err)
+	}
+}
+
+// 仓库镜像的 fetch 只放行生产里的 ssh：本地路径与 ext:: 这类传输一律不许，镜像配置里的 url 改不了这一点
+func TestMirrorFetchOnlyAllowsSSH(t *testing.T) {
+	rig := newRig(t)
+	a := rig.agent
+	a.mirrorProtocol = newAgent(a.cfg, a.keys).mirrorProtocol
+	if a.mirrorProtocol != "ssh" {
+		t.Fatalf("the production mirror protocol is %q", a.mirrorProtocol)
+	}
+	cmd := a.gitCommandAllowing(context.Background(), "", a.mirrorProtocol, "fetch")
+	if got := strings.Join(cmd.Args, " "); !strings.Contains(got, "-c protocol.allow=never -c protocol.ssh.allow=always fetch") {
+		t.Fatalf("mirror fetch command line = %q", got)
+	}
+	// 本地路径的 origin（测试镜像就是）走 file 协议：被拒
+	buf := newLogBuffer(newRedactor())
+	if _, err := a.prepareWorktree(context.Background(), mustClaimedJob(t, claimBody("bld_protoFILE001", "apk")), buf); err == nil ||
+		!strings.Contains(strings.Join(buf.snapshot(), "\n"), "not allowed") {
+		t.Fatalf("a file:// origin was fetched with only ssh allowed: %v\n%s", err, strings.Join(buf.snapshot(), "\n"))
+	}
+	// ext:: 能直接执行命令：被拒，命令没跑
+	marker := filepath.Join(t.TempDir(), "ran")
+	fakebuild.Git(t, rig.bare, "config", "remote.origin.url", "ext::sh -c touch% "+marker)
+	if _, err := a.prepareWorktree(context.Background(), mustClaimedJob(t, claimBody("bld_protoEXT0001", "apk")), newLogBuffer(newRedactor())); err == nil {
+		t.Fatal("an ext:: origin was fetched")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("an ext:: origin ran a command")
+	}
+}
+
+// ssh 由 GIT_SSH_COMMAND 固定：不读任何 ssh 配置、只用 deploy key、主机公钥只认固定 known_hosts。
+// 用一个记录参数的假 ssh 实跑一次 fetch，证明它优先于仓库配置里的 core.sshCommand。
+func TestControllerGitPinsSSH(t *testing.T) {
+	rig := newRig(t)
+	a := rig.agent
+	env := strings.Join(a.gitEnv(), "\n")
+	want := "GIT_SSH_COMMAND=ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i " + a.cfg.SSHKey +
+		" -o UserKnownHostsFile=" + a.cfg.KnownHosts + " -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15"
+	if !strings.Contains(env, "\n"+want+"\n") && !strings.HasSuffix(env, "\n"+want) {
+		t.Fatalf("git environment lacks the pinned ssh command:\n%s", env)
+	}
+
+	bin := t.TempDir()
+	recorded := filepath.Join(t.TempDir(), "ssh-args")
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + recorded + "\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.cfg.MachineEnv["PATH"] = bin + ":" + a.cfg.MachineEnv["PATH"]
+	marker := filepath.Join(t.TempDir(), "ran")
+	fakebuild.Git(t, rig.bare, "config", "core.sshCommand", "touch "+marker+"; ssh")
+	fakebuild.Git(t, rig.bare, "config", "remote.origin.url", "git@github.com:Helix2010/RN-App.git")
+	_ = a.gitCommandAllowing(context.Background(), "", "ssh", "--git-dir="+rig.bare, "fetch", "origin").Run()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("core.sshCommand from the mirror's config ran")
+	}
+	raw, err := os.ReadFile(recorded)
+	if err != nil {
+		t.Fatalf("the pinned ssh was not used: %v", err)
+	}
+	args := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-F /dev/null", "-o IdentitiesOnly=yes", "-i " + a.cfg.SSHKey, "-o UserKnownHostsFile=" + a.cfg.KnownHosts, "-o StrictHostKeyChecking=yes", "git@github.com"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ssh ran without %q: %v", want, args)
+		}
+	}
+}
+
+// 固定 known_hosts 必须属于 root（测试里是当前用户）、是普通文件、它和所在目录组与其他人都不可写
+func TestCheckoutRefusesAnUnsafeKnownHostsFile(t *testing.T) {
+	for name, mutate := range map[string]func(t *testing.T, a *agent){
+		"missing": func(t *testing.T, a *agent) {
+			if err := os.Remove(a.cfg.KnownHosts); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"group-writable": func(t *testing.T, a *agent) {
+			if err := os.Chmod(a.cfg.KnownHosts, 0o664); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"group-writable directory": func(t *testing.T, a *agent) {
+			if err := os.Chmod(filepath.Dir(a.cfg.KnownHosts), 0o775); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink": func(t *testing.T, a *agent) {
+			link := a.cfg.KnownHosts + ".link"
+			mustSymlink(t, a.cfg.KnownHosts, link)
+			a.cfg.KnownHosts = link
+		},
+		"another owner": func(t *testing.T, a *agent) { a.knownHostsOwner = os.Geteuid() + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newRig(t)
+			mutate(t, rig.agent)
+			buf := newLogBuffer(newRedactor())
+			prepared, err := rig.agent.prepareWorktree(context.Background(), mustClaimedJob(t, claimBody("bld_knownHOSTS01", "apk")), buf)
+			if err == nil || !strings.Contains(err.Error(), rig.agent.cfg.KnownHosts) && !strings.Contains(err.Error(), filepath.Dir(rig.agent.cfg.KnownHosts)) {
+				t.Fatalf("an unsafe known_hosts was accepted: %v", err)
+			}
+			if strings.Contains(strings.Join(buf.snapshot(), "\n"), "fetch") {
+				t.Fatal("git fetch ran before the known_hosts file was checked")
+			}
+			rig.agent.cleanupJob(prepared.Layout)
+		})
 	}
 }

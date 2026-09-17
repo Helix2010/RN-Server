@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -29,6 +31,104 @@ func TestInstallScriptIsEmbedded(t *testing.T) {
 	// curl … | bash：最后一行之前的东西必须全部是定义，main 放在最后才执行
 	if !bytes.HasSuffix(InstallScript, []byte("\nmain \"$@\"\nexit\n")) {
 		t.Fatal("install.sh must end with main \"$@\" followed by exit")
+	}
+}
+
+// 以 root 执行的脚本里，python3 一律带 -I：否则 `python3 -` 把当前目录放进 sys.path，运维在 /tmp 里
+// 执行时，本机任何用户放在那里的 json.py 会以 root 身份运行。
+func TestScriptsRunPythonIsolated(t *testing.T) {
+	pythonCall := regexp.MustCompile(`\bpython3\b`)
+	for _, path := range []string{"install.sh", "../../deploy/setup/build-bundles.sh", "../../deploy/amos/merge-env.sh"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		for i, line := range strings.Split(string(raw), "\n") {
+			code := strings.TrimSpace(line)
+			if strings.HasPrefix(code, "#") || strings.HasPrefix(code, "need_commands ") {
+				continue
+			}
+			for _, loc := range pythonCall.FindAllStringIndex(line, -1) {
+				calls++
+				if !strings.HasPrefix(line[loc[1]:], " -I ") {
+					t.Errorf("%s:%d runs python3 without -I: %s", path, i+1, code)
+				}
+			}
+		}
+		if calls == 0 {
+			t.Errorf("%s: no python3 call found; update this test", path)
+		}
+	}
+}
+
+// 脚本一开始就离开当前目录、收紧 umask、固定 PATH，并清掉继承来的环境与函数
+func TestInstallScriptPinsDirectoryUmaskAndEnvironment(t *testing.T) {
+	head, _, ok := bytes.Cut(InstallScript, []byte("\nreadonly "))
+	if !ok {
+		t.Fatal("install.sh has no readonly constants")
+	}
+	for _, want := range []string{"\nset -euo pipefail\n", "\ncd /\n", "\numask 077\n", "\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n", "compgen -e", "unset -f"} {
+		if !bytes.Contains(head, []byte(want)) {
+			t.Errorf("install.sh does not start with %q", strings.TrimSpace(want))
+		}
+	}
+	if bytes.Contains(InstallScript, []byte("umask 022")) {
+		t.Error("install.sh still widens the umask")
+	}
+}
+
+// 行为上也核对一遍：当前目录里有 json.py、环境里有 PYTHONPATH，problem_code 照样只用标准库。
+// 先证明这个 Python 不加防护时确实会导入当前目录的 json.py，否则“没导入”说明不了什么。
+func TestInstallScriptPythonIgnoresTheCurrentDirectory(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not available")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not available")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "shadowed")
+	if err := os.WriteFile(filepath.Join(dir, "json.py"), []byte("open("+strconv.Quote(marker)+", 'w').write('ran')\nraise SystemExit(0)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := filepath.Join(t.TempDir(), "problem.json")
+	if err := os.WriteFile(body, []byte(`{"code":"MACHINE_BUNDLE_UNAVAILABLE"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	control := exec.Command(python, "-", body)
+	control.Dir = dir
+	control.Stdin = strings.NewReader("import json\n")
+	_ = control.Run()
+	if _, err := os.Stat(marker); err != nil {
+		t.Skipf("this python3 does not import json.py from the current directory, so the test would prove nothing: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	// 去掉末尾的 main 调用，只定义函数，然后调 problem_code
+	script, ok := bytes.CutSuffix(InstallScript, []byte("\nmain \"$@\"\nexit\n"))
+	if !ok {
+		t.Fatal("install.sh does not end with main")
+	}
+	script = append(script, []byte("\nproblem_code \"$1\"\n")...)
+	cmd := exec.Command(bash, "-s", "--", body)
+	cmd.Dir = dir
+	cmd.Stdin = bytes.NewReader(script)
+	cmd.Env = []string{"PATH=" + filepath.Dir(python) + ":/usr/bin:/bin", "PYTHONPATH=" + dir, "PYTHONSTARTUP=" + filepath.Join(dir, "json.py")}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("problem_code failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("install.sh's python3 imported json.py from the current directory or PYTHONPATH")
+	}
+	if string(out) != "MACHINE_BUNDLE_UNAVAILABLE" {
+		t.Fatalf("problem_code printed %q", out)
 	}
 }
 

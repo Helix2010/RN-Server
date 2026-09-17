@@ -43,6 +43,9 @@ const (
 	envKeyMachineToken        = "BUILD_AGENT_MACHINE_TOKEN"
 	envKeyStateDir            = "BUILD_AGENT_STATE_DIR"
 	maxEnvFileBytes           = 1 << 20
+	// envEnrollmentCode：install.sh 经这个环境变量交注册码，不放进进程参数——本机其他用户能从
+	// /proc/<pid>/cmdline 与 sudo 日志读到参数，环境（/proc/<pid>/environ）只有本用户与 root 能读。
+	envEnrollmentCode = "RN_ENROLLMENT_CODE"
 )
 
 var enrollmentCodePattern = regexp.MustCompile(`^rne_[A-Za-z0-9_-]{43}$`)
@@ -119,6 +122,16 @@ func parseEnrollFlags(args []string, stderr io.Writer) (enrollOptions, bool) {
 		fmt.Fprintln(stderr, "enroll takes no positional arguments")
 		return opts, false
 	}
+	// 注册码优先从环境变量取（install.sh 用它，不进进程参数）；--code 保留兼容，两者都给且不同即拒绝。
+	// 读完从本进程环境里删掉，之后 fork 的子进程拿不到。
+	if envCode := os.Getenv(envEnrollmentCode); envCode != "" {
+		_ = os.Unsetenv(envEnrollmentCode)
+		if opts.code != "" && opts.code != envCode {
+			fmt.Fprintf(stderr, "--code and %s hold different enrollment codes; give the code only once\n", envEnrollmentCode)
+			return opts, false
+		}
+		opts.code = envCode
+	}
 	opts.server = strings.TrimRight(strings.TrimSpace(opts.server), "/")
 	if err := checkEnrollServer(opts.server); err != nil {
 		fmt.Fprintln(stderr, err)
@@ -172,17 +185,20 @@ func runEnroll(ctx context.Context, opts enrollOptions, httpClient *http.Client,
 	if dir, ok := envValue(lines, envKeyStateDir); ok && dir != opts.stateDir {
 		return fmt.Errorf("%s says %s=%s but --state-dir is %s; they must be the same directory", opts.envFile, envKeyStateDir, dir, opts.stateDir)
 	}
-	uid, gid, err := stateDirOwner(opts.stateDir)
+	// 打开状态目录，之后对密钥文件的读写都在这个 fd 之下解析：rn-build-agent 若已被攻陷，在 describe
+	// 慢响应期间把 state 换成软链，也只会把这个 fd 指到它自己名下的目录（属主校验会拒绝 root 名下的目录），
+	// 而不能让 root 在任意 root-only 目录里建文件再 chown（评审 P2-a）。
+	stateRoot, uid, gid, err := openStateDir(opts.stateDir)
 	if err != nil {
 		return err
 	}
-	keyPath := filepath.Join(opts.stateDir, provenanceKeyFile)
+	defer stateRoot.Close()
 
 	if token, _ := envValue(lines, envKeyMachineToken); token != "" {
 		if !machineTokenPattern.MatchString(token) {
 			return fmt.Errorf("%s has a %s that is not a machine token (%d characters); fix or empty it before enrolling", opts.envFile, envKeyMachineToken, len(token))
 		}
-		key, err := readKeyFileFor(keyPath, keyOwner(uid))
+		key, err := readKeyFileInRoot(stateRoot, provenanceKeyFile, keyOwner(uid))
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("%s already has a machine token, but %s has no provenance key: this machine's identity is gone. Revoke it in the console, empty %s, and enroll a new machine", opts.envFile, opts.stateDir, envKeyMachineToken)
 		}
@@ -206,7 +222,7 @@ func runEnroll(ctx context.Context, opts enrollOptions, httpClient *http.Client,
 		return errors.New("the server described the machine with a malformed name or id")
 	}
 
-	key, created, err := ensureProvenanceKey(keyPath, uid, gid)
+	key, created, err := ensureProvenanceKeyInRoot(stateRoot, uid, gid)
 	if err != nil {
 		return err
 	}
@@ -271,36 +287,58 @@ func runEnroll(ctx context.Context, opts enrollOptions, httpClient *http.Client,
 	return nil
 }
 
-// stateDirOwner 决定出处密钥属于谁。非 root 运行（开发、测试）时就是自己，目录没有就建；
-// root 运行时是状态目录的属主，目录必须已经由 install.sh 建好、属于构建控制进程用户而不是 root。
-func stateDirOwner(dir string) (int, int, error) {
+// openStateDir 打开状态目录并决定出处密钥属于谁，返回一个 os.Root：之后所有密钥文件操作都在这个 fd
+// 之下解析（openat），不会被目录路径里任何一段事后换成的软链带出去。
+//
+// 非 root 运行（开发、测试）时密钥属于当前用户（uid 返回 -1），目录没有就建；root 运行时属于状态目录
+// 的属主，目录必须已经由 install.sh 建好、属于构建控制进程用户而不是 root。属主用**打开后的目录 fd**
+// 校验（root.Stat(".")），而不是打开前 Lstat 的路径：即使 dir 是指向别处的软链，这里看到的也是它真正
+// 指向的目录，指向 root 名下的目录会被拒。
+func openStateDir(dir string) (*os.Root, int, int, error) {
 	if os.Geteuid() != 0 {
 		if err := ensureStateDir(dir, true); err != nil {
-			return 0, 0, err
+			return nil, 0, 0, err
 		}
-		return -1, -1, nil
+	} else if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		return nil, 0, 0, fmt.Errorf("%s does not exist: create it for the build agent user first (install -d -o rn-build-agent -g rn-build-agent -m 0700 %s)", dir, dir)
+	} else if err != nil {
+		return nil, 0, 0, err
 	}
-	info, err := os.Lstat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return 0, 0, fmt.Errorf("%s does not exist: create it for the build agent user first (install -d -o rn-build-agent -g rn-build-agent -m 0700 %s)", dir, dir)
-	}
+	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return 0, 0, err
+		return nil, 0, 0, err
+	}
+	info, err := root.Stat(".")
+	if err != nil {
+		root.Close()
+		return nil, 0, 0, err
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, 0, fmt.Errorf("cannot read the owner of %s", dir)
+		root.Close()
+		return nil, 0, 0, fmt.Errorf("cannot read the owner of %s", dir)
 	}
-	if st.Uid == 0 {
-		return 0, 0, fmt.Errorf("%s belongs to root; it must belong to the user the build agent runs as (rn-build-agent)", dir)
+	owner := int(st.Uid)
+	if os.Geteuid() != 0 {
+		// 开发、测试：目录属于当前用户；密钥也归当前用户（uid -1）
+		if err := checkPrivateFor(dir, info, true, os.Geteuid()); err != nil {
+			root.Close()
+			return nil, 0, 0, err
+		}
+		return root, -1, -1, nil
 	}
-	if err := checkPrivateFor(dir, info, true, int(st.Uid)); err != nil {
-		return 0, 0, err
+	if owner == 0 {
+		root.Close()
+		return nil, 0, 0, fmt.Errorf("%s belongs to root; it must belong to the user the build agent runs as (rn-build-agent)", dir)
 	}
-	return int(st.Uid), int(st.Gid), nil
+	if err := checkPrivateFor(dir, info, true, owner); err != nil {
+		root.Close()
+		return nil, 0, 0, err
+	}
+	return root, owner, int(st.Gid), nil
 }
 
-// keyOwner 把 stateDirOwner 的 -1（属于当前用户）换成真正的 uid。
+// keyOwner 把 openStateDir 的 -1（属于当前用户）换成真正的 uid。
 func keyOwner(uid int) int {
 	if uid < 0 {
 		return os.Geteuid()
@@ -308,16 +346,16 @@ func keyOwner(uid int) int {
 	return uid
 }
 
-// ensureProvenanceKey 读出已有的出处密钥，没有就生成。uid 小于 0 表示属于当前用户。
-func ensureProvenanceKey(path string, uid, gid int) (machineKey, bool, error) {
-	key, err := readKeyFileFor(path, keyOwner(uid))
+// ensureProvenanceKeyInRoot 在已打开的状态目录里读出已有的出处密钥，没有就生成。uid 小于 0 表示属于当前用户。
+func ensureProvenanceKeyInRoot(root *os.Root, uid, gid int) (machineKey, bool, error) {
+	key, err := readKeyFileInRoot(root, provenanceKeyFile, keyOwner(uid))
 	if err == nil {
 		return key, false, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		return machineKey{}, false, err
 	}
-	key, err = createKeyFileFor(path, uid, gid)
+	key, err = createKeyFileInRoot(root, provenanceKeyFile, uid, gid)
 	if err != nil {
 		return machineKey{}, false, fmt.Errorf("cannot create the provenance key: %w", err)
 	}

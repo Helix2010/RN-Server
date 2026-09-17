@@ -342,6 +342,12 @@ func newRig(t *testing.T) *testRig {
 	root := t.TempDir()
 	tools := fakebuild.Install(t, filepath.Join(root, "tools"))
 	bare, commit := fakebuild.SourceRepo(t, filepath.Join(root, "repo"), "anyfun")
+	// 与 install.sh 克隆出的镜像一样：只有控制进程用户能写（控制进程 fetch 前核对）
+	for path, mode := range map[string]os.FileMode{bare: 0o700, filepath.Join(bare, "config"): 0o600} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
 	server := newFakeServer(t)
 	cfg := config{
 		Server:       server.srv.URL,
@@ -355,6 +361,14 @@ func newRig(t *testing.T) *testRig {
 		Runner:       runnerBinary,
 		RunnerUser:   directRunner,
 		MachineEnv:   map[string]string{"PATH": tools.PATH(), "LANG": "C.UTF-8"},
+		SSHKey:       filepath.Join(root, "ssh", "id_ed25519"),
+		KnownHosts:   filepath.Join(root, "ssh", "github_known_hosts"),
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.KnownHosts), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.KnownHosts, []byte("github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.MkdirAll(cfg.Workspace, 0o750); err != nil {
 		t.Fatal(err)
@@ -364,6 +378,9 @@ func newRig(t *testing.T) *testRig {
 		t.Fatal(err)
 	}
 	a := newAgent(cfg, keys)
+	// 测试的镜像从本地路径取；固定 known_hosts 属于当前用户
+	a.mirrorProtocol = "file"
+	a.knownHostsOwner = os.Geteuid()
 	a.heartbeatEvery = 50 * time.Millisecond
 	a.reportDelay = time.Millisecond
 	return &testRig{server: server, tools: tools, agent: a, commit: commit, bare: bare}

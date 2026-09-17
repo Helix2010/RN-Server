@@ -94,6 +94,17 @@ func runAgent() int {
 	// 上一条命留下的任务目录：硬杀时收尾那一步执行不到。这一刻手上没有任务，凡是在任务根目录里的都是孤儿。
 	a.pruneOrphans()
 
+	// 仓库镜像与固定 known_hosts 每个任务 fetch 之前都会核对；启动时先核对一次，升级后看日志就知道，
+	// 不用等第一个任务失败。不合规不退出：镜像还没克隆（新机器 deploy key 没加到 GitHub）时也要能登记公钥。
+	if err := a.checkKnownHosts(); err != nil {
+		slog.Error("builds will fail until this is fixed", "error", err)
+	}
+	if _, err := os.Lstat(cfg.Repo); err == nil {
+		if err := a.checkMirror(ctx); err != nil {
+			slog.Error("builds will fail until this is fixed", "error", err)
+		}
+	}
+
 	slog.Info("build agent started", "server", cfg.Server, "platforms", cfg.Platforms,
 		"jobsRoot", cfg.Workspace, "runner", cfg.Runner, "runnerUser", cfg.RunnerUser,
 		"runnerSeparated", cfg.runnerSeparated(), "provenancePublicKeySha256", keys.current.sha256)

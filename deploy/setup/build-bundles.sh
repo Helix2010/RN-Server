@@ -58,7 +58,7 @@ for role in signer builder; do
   mv -f "$OUT/$role.tar.gz.part" "$OUT/$role.tar.gz"
 done
 
-python3 - "$STAGE" "$OUT" "$COMMIT" <<'PY'
+python3 -I - "$STAGE" "$OUT" "$COMMIT" <<'PY'
 import hashlib, json, os, sys
 
 stage, out, commit = sys.argv[1:4]

@@ -37,7 +37,17 @@ type config struct {
 	RunnerUser string
 	// MachineEnv 是交给执行进程的机器级变量（PATH、JAVA_HOME 等），只取 jobspec 白名单里的键。
 	MachineEnv map[string]string
+	// SSHKey 是 GitHub 只读 deploy key 的私钥；KnownHosts 是 root 所有、控制进程改不了的固定
+	// known_hosts（install.sh 装到 /opt/rn-build-agent/github_known_hosts）。控制进程 fetch 仓库镜像时
+	// 只用这两个文件，不读 ~/.ssh/config、~/.ssh/known_hosts（见 checkout.go gitEnv）。
+	SSHKey     string
+	KnownHosts string
 }
+
+const (
+	defaultSSHKey     = "/var/lib/rn-build-agent/.ssh/id_ed25519"
+	defaultKnownHosts = "/opt/rn-build-agent/github_known_hosts"
+)
 
 // directRunner 是 BUILD_AGENT_RUNNER_USER 的特殊值：不经 sudo。
 const directRunner = "-"
@@ -47,6 +57,8 @@ func (c config) runnerSeparated() bool { return c.RunnerUser != directRunner }
 var (
 	machineTokenPattern = regexp.MustCompile(`^rnm_[A-Za-z0-9_-]{43}$`)
 	unixUserPattern     = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+	// shellSafePathPattern：这些路径会拼进 GIT_SSH_COMMAND（git 经 sh -c 执行它），只许不需要引号的字符
+	shellSafePathPattern = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
 )
 
 func envOr(key, fallback string) string {
@@ -67,6 +79,8 @@ func loadConfig() (config, error) {
 		Runner:       envOr("BUILD_AGENT_RUNNER", "/opt/rn-build-agent/build-runner"),
 		RunnerUser:   envOr("BUILD_AGENT_RUNNER_USER", "builder"),
 		MachineEnv:   map[string]string{},
+		SSHKey:       envOr("BUILD_AGENT_SSH_KEY", defaultSSHKey),
+		KnownHosts:   envOr("BUILD_AGENT_SSH_KNOWN_HOSTS", defaultKnownHosts),
 	}
 	// 作废的机密先挡：它们留在 env 文件里就是一份没人管的秘密
 	if os.Getenv("BUILD_KEYSTORE_PASSPHRASE") != "" {
@@ -102,6 +116,11 @@ func loadConfig() (config, error) {
 	} {
 		if !filepath.IsAbs(value) || filepath.Clean(value) != value {
 			return cfg, fmt.Errorf("%s must be a clean absolute path (got %q)", key, value)
+		}
+	}
+	for key, value := range map[string]string{"BUILD_AGENT_SSH_KEY": cfg.SSHKey, "BUILD_AGENT_SSH_KNOWN_HOSTS": cfg.KnownHosts} {
+		if filepath.Clean(value) != value || !shellSafePathPattern.MatchString(value) {
+			return cfg, fmt.Errorf("%s must be a clean absolute path of letters, digits and ._-/ (got %q)", key, value)
 		}
 	}
 	if err := jobspec.ValidRoot(cfg.Workspace); err != nil {

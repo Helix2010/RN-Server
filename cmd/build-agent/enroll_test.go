@@ -267,6 +267,62 @@ func TestEnrollIsANoOpOnAnEnrolledMachine(t *testing.T) {
 	}
 }
 
+// 评审 P2-a：enroll 以 root 建出处密钥时，rn-build-agent 若已被攻陷，可趁 describe 慢响应把状态目录
+// 或密钥文件换成软链，让 root 把文件建到 root-only 目录再 chown。密钥的读写都在打开后的状态目录 fd
+// 之下解析，逃逸的软链写不出去。这里测非 root 可测的部分：路径里的软链与不安全目录被拒、密钥名是逃逸
+// 软链时不写穿。
+func TestEnrollKeyCreationStaysWithinTheStateDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this part is for the non-root path; the root TOCTOU needs a second uid")
+	}
+	t.Run("the key file name is a symlink escaping the state dir", func(t *testing.T) {
+		server := newFakeSetupServer(t)
+		x := newEnrollFixture(t, server.URL)
+		if err := os.MkdirAll(x.opts.stateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		outside := filepath.Join(t.TempDir(), "escaped")
+		if err := os.Symlink(outside, filepath.Join(x.opts.stateDir, provenanceKeyFile)); err != nil {
+			t.Fatal(err)
+		}
+		if err := x.run(t); err == nil {
+			t.Fatal("enroll created the key through an escaping symlink")
+		}
+		if _, err := os.Stat(outside); err == nil {
+			t.Fatal("a file was created outside the state directory through a symlink")
+		}
+	})
+	t.Run("the state dir is a symlink to a world-accessible directory", func(t *testing.T) {
+		server := newFakeSetupServer(t)
+		x := newEnrollFixture(t, server.URL)
+		target := filepath.Join(t.TempDir(), "loose")
+		if err := os.Mkdir(target, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, x.opts.stateDir); err != nil {
+			t.Fatal(err)
+		}
+		before := server.called()
+		err := x.run(t)
+		if err == nil || (!strings.Contains(err.Error(), "must not be a symlink") && !strings.Contains(err.Error(), "group and others must have no access")) {
+			t.Fatalf("an unsafe state directory was accepted: %v", err)
+		}
+		if len(server.called()) != len(before) {
+			t.Fatal("the server was contacted before the state directory was checked")
+		}
+	})
+	t.Run("a clean state dir still works", func(t *testing.T) {
+		server := newFakeSetupServer(t)
+		x := newEnrollFixture(t, server.URL)
+		if err := x.run(t); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(x.opts.stateDir, provenanceKeyFile)); err != nil {
+			t.Fatalf("the provenance key was not created: %v", err)
+		}
+	})
+}
+
 func TestEnrollRefusesBeforeUsingTheCode(t *testing.T) {
 	cases := map[string]struct {
 		setup   func(t *testing.T, server *fakeSetupServer, x *enrollFixture)
@@ -426,6 +482,47 @@ func TestEnrollFlags(t *testing.T) {
 			t.Errorf("%s rejected: %v", server, err)
 		}
 	}
+}
+
+// 评审 P2-b：注册码可走环境变量 RN_ENROLLMENT_CODE（不进进程参数）；读完从本进程环境删掉；
+// 与 --code 同时给且不同即拒绝。
+func TestEnrollCodeFromEnvironment(t *testing.T) {
+	base := []string{"--server", "https://api.example.com"}
+	t.Run("env supplies the code, no --code", func(t *testing.T) {
+		t.Setenv(envEnrollmentCode, testEnrollCode)
+		var stderr bytes.Buffer
+		opts, ok := parseEnrollFlags(base, &stderr)
+		if !ok || opts.code != testEnrollCode {
+			t.Fatalf("env code not used: %v %q %s", ok, opts.code, stderr.String())
+		}
+		if os.Getenv(envEnrollmentCode) != "" {
+			t.Fatal("the code was left in the environment for child processes")
+		}
+	})
+	t.Run("env and matching --code", func(t *testing.T) {
+		t.Setenv(envEnrollmentCode, testEnrollCode)
+		var stderr bytes.Buffer
+		if _, ok := parseEnrollFlags(append(append([]string{}, base...), "--code", testEnrollCode), &stderr); !ok {
+			t.Fatalf("a matching --code was rejected: %s", stderr.String())
+		}
+	})
+	t.Run("env and a different --code is refused without echoing", func(t *testing.T) {
+		t.Setenv(envEnrollmentCode, testEnrollCode)
+		var stderr bytes.Buffer
+		if _, ok := parseEnrollFlags(append(append([]string{}, base...), "--code", "rne_"+sentinelSecret), &stderr); ok {
+			t.Fatal("two different codes were accepted")
+		}
+		if strings.Contains(stderr.String(), sentinelSecret) || strings.Contains(stderr.String(), testEnrollCode) {
+			t.Fatal("a code was echoed")
+		}
+	})
+	t.Run("no code anywhere is refused", func(t *testing.T) {
+		os.Unsetenv(envEnrollmentCode)
+		var stderr bytes.Buffer
+		if _, ok := parseEnrollFlags(base, &stderr); ok {
+			t.Fatal("enroll ran with no code")
+		}
+	})
 }
 
 // Go 里的默认值与 deploy/build-agent/rn-build-agent.env.example 一致：示例是运维看的，程序写的是这里

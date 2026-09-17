@@ -152,6 +152,66 @@ func createKeyFileFor(path string, uid, gid int) (machineKey, error) {
 	return newMachineKey(ed25519.NewKeyFromSeed(seed)), nil
 }
 
+// createKeyFileInRoot 在已打开的状态目录（os.Root，fd 已定住）里生成新私钥：即使目录里的名字被换成
+// 逃逸到 root-only 目录的软链，openat 也只在这个 fd 之下解析，不会写穿出去（enroll 以 root 运行时用）。
+// uid 不小于 0 时把文件交给 uid:gid。
+func createKeyFileInRoot(root *os.Root, name string, uid, gid int) (machineKey, error) {
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return machineKey{}, err
+	}
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return machineKey{}, err
+	}
+	cleanup := func(err error) (machineKey, error) {
+		file.Close()
+		_ = root.Remove(name)
+		return machineKey{}, err
+	}
+	if uid >= 0 {
+		if err := file.Chown(uid, gid); err != nil {
+			return cleanup(err)
+		}
+	}
+	if _, err := file.WriteString(base64.StdEncoding.EncodeToString(seed) + "\n"); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Sync(); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Close(); err != nil {
+		_ = root.Remove(name)
+		return machineKey{}, err
+	}
+	return newMachineKey(ed25519.NewKeyFromSeed(seed)), nil
+}
+
+// readKeyFileInRoot 从已打开的状态目录读一把私钥，核对文件属主与权限。文件不在返回 fs.ErrNotExist。
+func readKeyFileInRoot(root *os.Root, name string, uid int) (machineKey, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return machineKey{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return machineKey{}, err
+	}
+	if err := checkPrivateFor(name, info, false, uid); err != nil {
+		return machineKey{}, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, 4096))
+	if err != nil {
+		return machineKey{}, err
+	}
+	seed, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(string(raw)))
+	if err != nil || len(seed) != ed25519.SeedSize {
+		return machineKey{}, fmt.Errorf("%s is not a provenance key file", name)
+	}
+	return newMachineKey(ed25519.NewKeyFromSeed(seed)), nil
+}
+
 // keyring 是当前出处密钥，以及（运维执行过 rotate-key 时）待换上的下一把。
 type keyring struct {
 	dir     string

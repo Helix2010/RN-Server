@@ -35,19 +35,26 @@ type agent struct {
 	keyCheckedAt   time.Time
 	keyCheckEvery  time.Duration
 	lastKeyMessage string
+
+	// mirrorProtocol 是 fetch 仓库镜像时唯一放行的传输协议（生产里是 ssh；测试的镜像从本地路径取，是 file）。
+	// knownHostsOwner 是固定 known_hosts 必须的属主（生产里是 root）。两者都不来自配置。
+	mirrorProtocol  string
+	knownHostsOwner int
 }
 
 func newAgent(cfg config, keys *keyring) *agent {
 	return &agent{
-		cfg:            cfg,
-		api:            newClient(cfg),
-		keys:           keys,
-		red:            newRedactor(),
-		log:            slog.Default(),
-		heartbeatEvery: 30 * time.Second,
-		reportDelay:    2 * time.Second,
-		now:            time.Now,
-		keyCheckEvery:  10 * time.Minute,
+		cfg:             cfg,
+		api:             newClient(cfg),
+		keys:            keys,
+		red:             newRedactor(),
+		log:             slog.Default(),
+		heartbeatEvery:  30 * time.Second,
+		reportDelay:     2 * time.Second,
+		now:             time.Now,
+		keyCheckEvery:   10 * time.Minute,
+		mirrorProtocol:  "ssh",
+		knownHostsOwner: rootUID,
 	}
 }
 

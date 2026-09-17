@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,13 +221,24 @@ func checkTenantFileMatchesJob(job claimedJob) error {
 // 整个过程不执行仓库里的任何东西：hooksPath 指向 /dev/null（裸库里的 hook、fetch 时的
 // reference-transaction、checkout 时的 post-checkout 都不跑），不读系统与全局 git 配置
 // （filter、fsmonitor 等能执行命令的配置只可能来自那里），新仓库用空模板。
+//
+// 仓库镜像自己的配置也不信：改造前的构建机上它归 builder 可写，core.sshCommand、include.path、
+// remote.origin.uploadpack 这类键都能让 fetch 执行命令或改道。fetch 之前按白名单核对（checkMirror），
+// ssh 的参数由环境变量固定（gitEnv），传输协议只放行这一步要用的那一个。
 func (a *agent) checkoutMain(ctx context.Context, dst string, buf *logBuffer) (string, error) {
 	gitCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
-	if err := a.git(gitCtx, buf, "", "-C", a.cfg.Repo, "fetch", "--all", "--prune"); err != nil {
+	if err := a.checkKnownHosts(); err != nil {
 		return "", err
 	}
-	sha, err := a.gitOutput(gitCtx, "-C", a.cfg.Repo, "rev-parse", "--verify", "--end-of-options", buildBranchRef+"^{commit}")
+	if err := a.checkMirror(gitCtx); err != nil {
+		return "", err
+	}
+	gitDir := "--git-dir=" + a.cfg.Repo
+	if err := a.gitAllowing(gitCtx, buf, "", a.mirrorProtocol, gitDir, "fetch", "--prune", "origin"); err != nil {
+		return "", err
+	}
+	sha, err := a.gitOutput(gitCtx, gitDir, "rev-parse", "--verify", "--end-of-options", buildBranchRef+"^{commit}")
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve %s in the build machine's repository: %w", buildBranchRef, err)
 	}
@@ -236,7 +248,8 @@ func (a *agent) checkoutMain(ctx context.Context, dst string, buf *logBuffer) (s
 	if err := a.git(gitCtx, buf, "", "init", "--quiet", "--template=", dst); err != nil {
 		return "", err
 	}
-	if err := a.git(gitCtx, buf, dst, "fetch", "--quiet", "--no-tags", "--depth=1", "file://"+a.cfg.Repo, buildBranchRef); err != nil {
+	// 从本机镜像取：只放行 file 协议
+	if err := a.gitAllowing(gitCtx, buf, dst, "file", "fetch", "--quiet", "--no-tags", "--depth=1", "file://"+a.cfg.Repo, buildBranchRef); err != nil {
 		return "", err
 	}
 	fetched, err := a.gitOutput(gitCtx, "-C", dst, "rev-parse", "--verify", "--end-of-options", "FETCH_HEAD^{commit}")
@@ -260,7 +273,143 @@ func (a *agent) checkoutMain(ctx context.Context, dst string, buf *logBuffer) (s
 	return sha, nil
 }
 
+// errUntrustedMirror：仓库镜像的配置或目录结构不是 git clone --mirror 产生的样子。不自动修：
+// 它可能是改造前 builder 写进去的，按手册挪走、以 rn-build-agent 重新克隆。
+var errUntrustedMirror = errors.New("镜像配置不可信")
+
+// mirrorConfigKeys 是仓库镜像 config 里允许出现的键：git clone --mirror 实际写出的那几个
+// （git 2.34 与 2.55 实测；tagopt 是新版本写的）。git config --list 输出的节名与键名是小写的，
+// 子节（origin）保留原样。别的任何键都拒绝。
+var mirrorConfigKeys = map[string]bool{
+	"core.repositoryformatversion": true,
+	"core.filemode":                true,
+	"core.bare":                    true,
+	"core.logallrefupdates":        true,
+	"remote.origin.url":            true,
+	"remote.origin.fetch":          true,
+	"remote.origin.mirror":         true,
+	"remote.origin.tagopt":         true,
+}
+
+// mirrorForbiddenEntries 是镜像目录里不许存在的东西：
+//   - .git、commondir：git-upload-pack 与 git 自己会顺着它们去读另一个仓库（连同那边的配置）
+//   - config.worktree：另一份配置
+//   - objects/info/alternates、http-alternates：从别处借对象
+//   - info/attributes、info/grafts：改变文件内容的过滤与改写历史
+//
+// branches/、remotes/ 是旧式的远端定义，只许是空目录（git 2.34 的模板会建空的 branches/）。
+var (
+	mirrorForbiddenEntries = []string{".git", "commondir", "config.worktree", "objects/info/alternates", "objects/info/http-alternates", "info/attributes", "info/grafts"}
+	mirrorEmptyDirs        = []string{"branches", "remotes"}
+)
+
+// checkMirror 在 fetch 之前核对仓库镜像。
+func (a *agent) checkMirror(ctx context.Context) error {
+	untrusted := func(format string, args ...any) error {
+		return fmt.Errorf("%w：构建机的仓库镜像 %s %s，没有 fetch。按 deploy/amos/SIGNING_GATE_ROLLOUT.md「重建仓库镜像与 ~/.ssh」把它挪走、以 rn-build-agent 重新克隆",
+			errUntrustedMirror, a.cfg.Repo, fmt.Sprintf(format, args...))
+	}
+	repo := a.cfg.Repo
+	info, err := os.Lstat(repo)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("the build machine has no repository mirror at %s yet: add its deploy key to GitHub and run the install command again (it clones the mirror)", repo)
+	}
+	if err != nil {
+		return err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	switch {
+	case info.Mode()&fs.ModeSymlink != 0 || !info.IsDir():
+		return untrusted("不是真实目录")
+	case !ok || int(st.Uid) != os.Geteuid():
+		return untrusted("不属于构建控制进程用户")
+	case info.Mode().Perm()&0o022 != 0:
+		return untrusted("组或其他人可写")
+	}
+	config, err := os.Lstat(filepath.Join(repo, "config"))
+	if err != nil || !config.Mode().IsRegular() {
+		return untrusted("的 config 不是普通文件")
+	}
+	if st, ok := config.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Geteuid() || config.Mode().Perm()&0o022 != 0 {
+		return untrusted("的 config 不属于构建控制进程用户，或组与其他人可写")
+	}
+	for _, name := range mirrorForbiddenEntries {
+		if _, err := os.Lstat(filepath.Join(repo, name)); err == nil {
+			return untrusted("里有 %s", name)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	for _, name := range mirrorEmptyDirs {
+		entries, err := os.ReadDir(filepath.Join(repo, name))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return untrusted("的 %s 读不了（%v）", name, err)
+		}
+		if len(entries) > 0 {
+			return untrusted("的 %s/ 不是空的（旧式远端定义）", name)
+		}
+	}
+
+	// 用 git 自己的解析器读：与 fetch 看到的完全一致（大小写、续行、子节写法）。--no-includes 不跟随 include.path
+	cmd := a.gitCommand(ctx, "", "config", "--file", filepath.Join(repo, "config"), "--no-includes", "--null", "--list")
+	out, err := cmd.Output()
+	if err != nil {
+		return untrusted("的 config 解析不了")
+	}
+	seen := map[string]int{}
+	for _, entry := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
+		if entry == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(entry, "\n")
+		if !mirrorConfigKeys[key] {
+			return untrusted("的 config 里有不允许的键 %q", firstRunes(key, 64))
+		}
+		seen[key]++
+		switch {
+		case key == "core.bare" && value != "true":
+			return untrusted("不是裸仓库（core.bare=%q）", firstRunes(value, 16))
+		case key != "remote.origin.fetch" && seen[key] > 1:
+			return untrusted("的 config 里 %s 出现了不止一次", key)
+		}
+	}
+	if seen["remote.origin.url"] != 1 {
+		return untrusted("的 config 里没有 remote.origin.url")
+	}
+	return nil
+}
+
+// rootUID 是固定 known_hosts 文件必须的属主：root。控制进程自己改不了它。
+const rootUID = 0
+
+// checkKnownHosts 核对 fetch 用的 known_hosts：root（测试里是 a.knownHostsOwner）所有的普通文件，
+// 它和所在目录组与其他人都不可写。
+func (a *agent) checkKnownHosts() error {
+	path := a.cfg.KnownHosts
+	for _, p := range []string{path, filepath.Dir(path)} {
+		info, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("the pinned GitHub known_hosts %s is not usable (%w): install it as described in deploy/amos/SIGNING_GATE_ROLLOUT.md", path, err)
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		wantDir := p != path
+		switch {
+		case info.Mode()&fs.ModeSymlink != 0 || info.IsDir() != wantDir || (!wantDir && !info.Mode().IsRegular()):
+			return fmt.Errorf("%s must be a regular file in a real directory, not a symlink: install the pinned GitHub known_hosts as described in deploy/amos/SIGNING_GATE_ROLLOUT.md", p)
+		case !ok || int(st.Uid) != a.knownHostsOwner:
+			return fmt.Errorf("%s must belong to root so the build agent cannot change which host key GitHub must have", p)
+		case info.Mode().Perm()&0o022 != 0:
+			return fmt.Errorf("%s must not be writable by group or others", p)
+		}
+	}
+	return nil
+}
+
 // gitEnv 是控制进程调用 git 的环境：不带令牌，不读系统和全局配置。
+//
+// GIT_SSH_COMMAND 优先于仓库配置里的 core.sshCommand：ssh 不读任何配置文件（-F /dev/null，
+// 连 /etc/ssh/ssh_config 也不读），只用 deploy key，主机公钥只认 root 所有的固定 known_hosts。
+// GIT_NO_REPLACE_OBJECTS：refs/replace/ 不能把检出的对象换掉。
 func (a *agent) gitEnv() []string {
 	return []string{
 		"PATH=" + a.cfg.MachineEnv["PATH"],
@@ -269,7 +418,16 @@ func (a *agent) gitEnv() []string {
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_NO_REPLACE_OBJECTS=1",
+		"GIT_SSH_COMMAND=" + a.cfg.sshCommand(),
 	}
+}
+
+// sshCommand 是 fetch 仓库镜像时 git 执行的 ssh（经 sh -c；路径在 loadConfig 里校验过只含安全字符）。
+func (c config) sshCommand() string {
+	return "ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i " + c.SSHKey +
+		" -o UserKnownHostsFile=" + c.KnownHosts + " -o GlobalKnownHostsFile=/dev/null" +
+		" -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15"
 }
 
 // gitSafetyConfig 是控制进程每条 git 命令都带的配置。
@@ -278,16 +436,27 @@ func (a *agent) gitEnv() []string {
 // （git 2.55 实测），它在 fetch 返回之后才去建锁文件、写 objects/。控制进程紧接着就把检出交给
 // 执行进程复制、任务结束时整棵删掉，后台进程还在往里写，删除报 "directory not empty"、复制
 // 可能撞上一闪而过的锁文件（压测里出现过）。构建机上的仓库用完即删，不需要自动维护。
+//
+// protocol.allow=never：默认不许任何传输；要联网或读本机仓库的那一步用 gitAllowing 单独放行一个协议。
 var gitSafetyConfig = []string{
 	"-c", "core.hooksPath=/dev/null",
 	"-c", "core.fsmonitor=false",
-	"-c", "protocol.file.allow=always",
 	"-c", "maintenance.auto=false",
 	"-c", "gc.auto=0",
+	"-c", "protocol.allow=never",
 }
 
 func (a *agent) gitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
-	full := append(append([]string(nil), gitSafetyConfig...), args...)
+	return a.gitCommandAllowing(ctx, dir, "", args...)
+}
+
+// gitCommandAllowing 同 gitCommand，另外放行一个传输协议（空表示不放行）。
+func (a *agent) gitCommandAllowing(ctx context.Context, dir, protocol string, args ...string) *exec.Cmd {
+	full := append([]string(nil), gitSafetyConfig...)
+	if protocol != "" {
+		full = append(full, "-c", "protocol."+protocol+".allow=always")
+	}
+	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Env = a.gitEnv()
 	cmd.Dir = dir
@@ -301,17 +470,31 @@ func (a *agent) gitCommand(ctx context.Context, dir string, args ...string) *exe
 }
 
 func (a *agent) git(ctx context.Context, buf *logBuffer, dir string, args ...string) error {
+	return a.gitAllowing(ctx, buf, dir, "", args...)
+}
+
+func (a *agent) gitAllowing(ctx context.Context, buf *logBuffer, dir, protocol string, args ...string) error {
 	buf.add("$ git " + strings.Join(args, " "))
-	cmd := a.gitCommand(ctx, dir, args...)
+	cmd := a.gitCommandAllowing(ctx, dir, protocol, args...)
 	lines := newLineWriter(buf, nil)
 	cmd.Stdout = lines
 	cmd.Stderr = lines
 	err := cmd.Run()
 	lines.Close()
 	if err != nil {
-		return fmt.Errorf("git %s failed: %w", args[0], err)
+		return fmt.Errorf("git %s failed: %w", gitSubcommand(args), err)
 	}
 	return nil
+}
+
+// gitSubcommand 取出参数里的子命令名（跳过 --git-dir= 之类的全局选项），用于报错。
+func gitSubcommand(args []string) string {
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			return arg
+		}
+	}
+	return strings.Join(args, " ")
 }
 
 func (a *agent) gitOutput(ctx context.Context, args ...string) (string, error) {

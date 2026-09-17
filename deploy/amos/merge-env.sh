@@ -20,7 +20,7 @@ while IFS= read -r line; do
   [ -n "$line" ] || continue
   key="${line%%=*}"
   # 用 python 做替换而不是 sed：值里可能有 / & $ 等会把 sed 表达式打断的字符
-  KEY="$key" LINE="$line" python3 - "$TMP" <<'PY'
+  KEY="$key" LINE="$line" python3 -I - "$TMP" <<'PY'
 import os, sys
 path = sys.argv[1]
 key, line = os.environ["KEY"], os.environ["LINE"]
