@@ -176,6 +176,9 @@ func (p PeerTrust) validate() error {
 	return nil
 }
 
+// SupersededPrimaryReason 是提升为主时自动撤销旧主信任的原因。
+const SupersededPrimaryReason = "被本机提升取代 / superseded when this signing gate was promoted"
+
 type peerRevoke struct {
 	Name     string `json:"name"`
 	Operator string `json:"operator"`

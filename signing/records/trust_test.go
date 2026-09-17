@@ -307,6 +307,53 @@ func copyLegacyState(t *testing.T) string {
 	return dir
 }
 
+// 评审 P1-3：提升为主时，本机受信签名闸里用旧主 Ed25519 的那台在同一次写入里撤销；旧主被攻破、服务端把它
+// 报成 active，新密钥也不再加密给它、它签的生成也不再被接受。
+func TestPromoteRevokesThePreviousPrimary(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	old := peer()
+	other := PeerTrust{Name: "amos-signer-c", X25519PublicKeySHA256: shaRecov, Ed25519PublicKeySHA256: shaRecov2, Mode: TrustModeOperator, Operator: "ops"}
+	must(t, s.TrustPeer(old))
+	must(t, s.TrustPeer(other))
+	if _, err := s.Promote(RoleChange{Role: RoleStandby, Mode: RoleModeManual, Operator: "ops", Reason: "not a promotion"}); err == nil {
+		t.Fatal("Promote wrote a standby role")
+	}
+	before := fileSize(t, filepath.Join(f.dir, TrustFileName))
+	if _, err := s.Promote(RoleChange{Role: RolePrimary, Mode: RoleModeImportFile, Operator: "ops", Reason: "x"}); err == nil {
+		t.Fatal("Promote accepted an invalid role change")
+	}
+	if fileSize(t, filepath.Join(f.dir, TrustFileName)) != before {
+		t.Fatal("a refused promotion wrote a record")
+	}
+	revoked, err := s.Promote(RoleChange{Role: RolePrimary, Mode: RoleModeImportFile, PreviousPrimaryEd25519SHA256: old.Ed25519PublicKeySHA256, Operator: "ops-carol", Reason: "old primary disk failed"})
+	if err != nil || len(revoked) != 1 || revoked[0] != old.Name {
+		t.Fatalf("Promote: %v revoked %v", err, revoked)
+	}
+	s.Close()
+	s = f.open(t)
+	role, _ := s.Role()
+	peers, _ := s.TrustedPeers()
+	if role.Role != RolePrimary || role.PreviousPrimaryEd25519SHA256 != old.Ed25519PublicKeySHA256 || len(peers) != 1 || peers[0].Name != other.Name {
+		t.Fatalf("after restart: role %+v peers %+v", role, peers)
+	}
+	raw, _ := os.ReadFile(filepath.Join(f.dir, TrustFileName))
+	if !strings.Contains(string(raw), `"type":"peer-revoke"`) || !strings.Contains(string(raw), "被本机提升取代") {
+		t.Fatalf("no peer-revoke record naming the promotion:\n%s", raw)
+	}
+
+	// 旧主不在本机信任里、或者没给旧主指纹：只写角色
+	g := newFixture(t)
+	s2 := g.open(t)
+	must(t, s2.TrustPeer(other))
+	if revoked, err := s2.Promote(RoleChange{Role: RolePrimary, Mode: RoleModeManual, PreviousPrimaryEd25519SHA256: shaSign, Operator: "ops", Reason: "old primary lost"}); err != nil || len(revoked) != 0 {
+		t.Fatalf("Promote without a trusted old primary: %v %v", revoked, err)
+	}
+	if peers, _ := s2.TrustedPeers(); len(peers) != 1 {
+		t.Fatalf("revoked a signing gate that was not the old primary: %+v", peers)
+	}
+}
+
 // 修复之前的 enroll 写过「注册即为主」与「首次信任服务端给的主」（只在开发环境出现过）：这两种记录现在
 // 校验不过，签名闸拒绝启动，按新机器重装，不会带着服务端定下的主或信任继续运行。
 func TestPreFixEnrollRecordsAreRefused(t *testing.T) {

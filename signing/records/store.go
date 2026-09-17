@@ -460,6 +460,38 @@ func (s *Store) SetRole(r RoleChange) error {
 	return s.append(s.trust, typeRole, r, nil)
 }
 
+// Promote 写入提升为主的角色记录（signer promote）。r.PreviousPrimaryEd25519SHA256 非空时，本机受信签名闸里
+// 用这把 Ed25519 公钥的那台（被取代的旧主）在同一次写入里先撤销，原因 SupersededPrimaryReason：旧主以后
+// 被攻破、服务端把它报成 active，新密钥也不再加密给它，它签的生成也不再被接受。返回撤销的机器名。
+func (s *Store) Promote(r RoleChange) (revoked []string, err error) {
+	if r.Role != RolePrimary {
+		return nil, errors.New("records: promote writes a primary role")
+	}
+	if err := r.validate(); err != nil {
+		return nil, fmt.Errorf("records: role: %w", err)
+	}
+	err = s.appendRecords(s.trust, func() ([]pending, error) {
+		revoked = nil
+		var items []pending
+		if r.PreviousPrimaryEd25519SHA256 != "" {
+			for _, p := range s.ts.peers {
+				if p.Ed25519PublicKeySHA256 == r.PreviousPrimaryEd25519SHA256 {
+					revoked = append(revoked, p.Name)
+				}
+			}
+			sort.Strings(revoked)
+			for _, name := range revoked {
+				items = append(items, pending{typePeerRevoke, peerRevoke{Name: name, Operator: r.Operator, Reason: SupersededPrimaryReason}})
+			}
+		}
+		return append(items, pending{typeRole, r}), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return revoked, nil
+}
+
 // TrustBuilder 写入（或更新）一台受信构建机。
 func (s *Store) TrustBuilder(b BuilderTrust) error {
 	if err := b.validate(); err != nil {
