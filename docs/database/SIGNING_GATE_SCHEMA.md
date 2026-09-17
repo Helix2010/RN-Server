@@ -40,7 +40,7 @@
 | `status` | `pending_enrollment` = 控制台新建之后、机器用注册码注册之前（没有令牌、没有公钥）；`pending_key` = 已注册（或 ADR-0020 之前手工新建）、公钥还没被接受，只能调各自的 public-key 接口；`active`；`revoked` = 吊销，令牌下一次请求就 401 `MACHINE_REVOKED`（查无令牌是 `MACHINE_AUTH_REQUIRED`），签名闸的 `signerRole` 同时置为 null |
 | `tokenSha256` | 机器令牌（`rnm_` + 32 字节 base64url）的 sha256。令牌原文只出现在 `POST /v1/machine-setup/enroll` 的响应里（ADR-0020 之前是新建接口的响应），不进审计、不进日志。还没注册过的机器（`pending_enrollment`，或没注册就被吊销）为空串 |
 | `enrollment` | 一次性注册码：`codeSha256` 是注册码（`rne_` + 32 字节 base64url）的 sha256，原文只出现在新建与重发的响应里；`expiresAt` = 签发后 60 分钟（UTC）；`issuedBy`/`issuedAt` 签发人与时间；`usedAt` = 注册成功的时间，null = 未用。重发整体替换（旧码作废）。null = 手工流程登记的机器 |
-| `reportedTrust` / `reportedTrustAt` | 仅签名闸：它在 `POST /v1/signer/keystore-checks` 的 `trust` 里报的本机信任列表（信任的签名闸含本机、构建机、恢复公钥 sha256，排序后存）与最近一次变化的时间；只在变化时写（审计 `build_machine_trust_report`）。只给控制台提示用，签名闸不采信。null = 从未上报 |
+| `reportedTrust` / `reportedTrustAt` | 仅签名闸：它在 `POST /v1/signer/keystore-checks` 的 `trust` 里报的本机信任列表（信任的签名闸含本机、构建机、恢复公钥 sha256，排序后存）与最近一次变化的时间；只在变化时写（审计 `build_machine_trust_report`）。只给控制台提示用，签名闸不采信。null = 没有上报：从未上报，或最近一次上报来自不带 `trust` 的旧版本签名闸（那次上报把它清成 null，不保留旧值） |
 | `publicKey` / `publicKeySha256` | 已接受的主公钥。构建机：Ed25519 出处公钥；签名闸：X25519 收件人公钥（sha256 就是密文的 `recipientSha256`） |
 | `ed25519PublicKey` / `ed25519PublicKeySha256` | 仅签名闸：记录签名与换钥证明用的 Ed25519 公钥 |
 | `reportedLocalRole` / `reportedLocalRoleAt` | 仅签名闸：它在 `POST /v1/signer/keystore-checks` 里报的本机角色（本机记录说了算）与这个值最近一次变化的时间；只在值变化时写（写审计 `build_machine_local_role_report`）。null = 从未上报。控制台的 `signerRole` 是 primary 而这里不是 primary 时，就绪问题 `PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH` |
@@ -88,11 +88,11 @@
 ```
 
 - `generator`、`generationSignature`、`generationRequestId`（ADR-0020）只在密钥由主签名闸生成并交回时有，三者同时出现或同时没有；离线导入的记录没有这三个键。`generator` 是交回那一刻登记里的主签名闸与它的 Ed25519 公钥；`generationSignature` 是它对 `keystorebox.GenerationMessage(generationRequestId, Upload)` 的签名。服务端交回时验过，签名闸（备签名闸）自己再验，并且只认本机信任的生成者。
-- `recipients` 里除了签名闸的 X25519 公钥 sha256，还可以有登记过的恢复公钥 sha256（控制台视图的 `recoveryRecipients`）。
+- `recipients` 里除了签名闸的 X25519 公钥 sha256，还可以有登记过的恢复公钥 sha256（控制台视图的 `recoveryRecipients`，其中已吊销的另列在 `revokedRecoveryRecipients`）。导出（`GET /v1/admin/build-keystore/export`）只给发给未吊销恢复公钥的那几份密文。
 - `sealed` 外层用 `STORAGE_MASTER_KEY` 加密（关联数据 `build-keystore/v3:<tenantId>`），里面是离线工具产出的 `rn-android-keystore-upload/v3` 文件（`signing/keystorebox.Upload`）：每个收件人一份 `x25519-hkdf-sha256-aes256gcm` 密文，明文绑定租户、包名、证书指纹、别名与收件人列表。服务端打不开内层。
 - `keyAlias`、`certificateSha256`、`packageName`、`tenantSlug`、`recipients`（排序）是从文件里抄出来的索引，读取时与文件逐项比对，不一致是数据事故。
 - v3 记录用不了（记录损坏、外层解不开、索引字段与文件对不上）时，读出来不报错，就绪问题 `KEYSTORE_RECORD_INVALID`，签名闸检查接口不下发；重新上传覆盖即可。
-- 写入有两条路：导入（`PUT /v1/admin/build-keystore`）与主签名闸交回（`POST /v1/signer/keystore-generations/:requestId`，见下一节）。只收 v3：收件人必须都是已登记、非吊销签名闸已接受的 X25519 公钥或登记过、未吊销的恢复公钥（多余的拒收，缺的签名闸只提示；交回的密钥还必须至少含一把恢复公钥，导入不强制）；`tenantSlug` 等于本租户；请求里的 `packageName`、`signerSha256` 与文件一致；证书不是作废的旧指纹。与 `release.android` 在同一事务里各自带乐观锁写入（ADR-0016）。有 v3 记录时，单独改 `release.android`（`PUT /v1/admin/release-identity/android`）只能写成与本记录相同的包名与证书（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`）；v3 记录用不了时一律不许单独改（409 `BUILD_KEYSTORE_RECORD_INVALID`），手工上传按没有可用密钥拒绝。
+- 写入有两条路：导入（`PUT /v1/admin/build-keystore`）与主签名闸交回（`POST /v1/signer/keystore-generations/:requestId`，见下一节）。只收 v3：收件人必须都是已登记、非吊销签名闸已接受的 X25519 公钥或登记过、未吊销的恢复公钥（多余的拒收，缺的签名闸只提示；交回的密钥还必须至少含一把恢复公钥、并且有发给主签名闸自己的密文，导入不强制）；`tenantSlug` 等于本租户；包名不是别的租户 `release.android` 或 `build.keystore` 在用的（尽早报错，签名闸本机才是把关的）；请求里的 `packageName`、`signerSha256` 与文件一致；证书不是作废的旧指纹。与 `release.android` 在同一事务里各自带乐观锁写入（ADR-0016）。有 v3 记录时，单独改 `release.android`（`PUT /v1/admin/release-identity/android`）只能写成与本记录相同的包名与证书（409 `RELEASE_IDENTITY_KEYSTORE_MISMATCH`）；v3 记录用不了时一律不许单独改（409 `BUILD_KEYSTORE_RECORD_INVALID`），手工上传按没有可用密钥拒绝。
 - **没有 `format:3` 的旧记录**（v1 口令封 `{"sealed","keyAlias","keystoreSha256"}`、v2 加密给打包机公钥）读出来当作"没有可用的签名密钥"：控制台显示 `legacy=true`，排队与签名认领一律不就绪，上传 v3 时带这一行的 `version` 覆盖。
 
 ## build.keystore.request
@@ -109,12 +109,12 @@
 | `alias` | keystore 别名，`<slug 小写>-release`（规范成 `^[A-Za-z0-9._-]{1,64}$`） |
 | `requestedBy` / `requestedAt` | 发起人与时间（UTC） |
 | `keystoreVersion` / `releaseIdentityVersion` | 发起时 `build.keystore` 与 `release.android` 两行的 `version`（没有那一行为 0）。交回时两个都必须没变 |
-| `status` | `pending` 等主签名闸；`done` 已交回并落库；`failed` 签名闸报失败或交回时发现版本已变 |
-| `error` | `failed` 时有：签名闸报的 `code`（`TRUST_ROOTS_CHANGED`、`RECOVERY_KEY_NOT_PINNED`、`NOT_LOCAL_PRIMARY`、`GENERATION_FAILED`……）与清洗过的 `detail`（≤500 字符），或服务端判的 `KEYSTORE_GENERATION_STALE` |
+| `status` | `pending` 等主签名闸；`done` 已交回并落库；`failed` 签名闸报失败，或交回、报失败时发现版本已变或已超时 |
+| `error` | `failed` 时有：签名闸报的 `code`（`TRUST_ROOTS_CHANGED`、`RECOVERY_KEY_NOT_PINNED`、`NOT_LOCAL_PRIMARY`、`GENERATION_FAILED`……）与清洗过的 `detail`（≤500 字符），或服务端判的 `KEYSTORE_GENERATION_STALE`（版本变了）、`KEYSTORE_GENERATION_TIMED_OUT`（`requestedAt` 起超过 30 分钟） |
 | `completedAt` | 变成 `done`/`failed` 的时间；`pending` 为 null |
 
 - 每个租户一行、只保留最近一次；同时最多一条 `pending`（409 `KEYSTORE_GENERATION_IN_PROGRESS`）。
-- **读取时推导过期**：`pending` 而两个版本任一已变（有人导入了密钥或改了发布身份）按 `failed` + `KEYSTORE_GENERATION_STALE` 处理——不再下发给主签名闸、不挡新的请求、控制台与就绪都这么显示。交回这种请求时 409 并把 `failed` 写回库。
+- **读取时推导过期与超时**：`pending` 而两个版本任一已变（有人导入了密钥或改了发布身份）按 `failed` + `KEYSTORE_GENERATION_STALE` 处理；`pending` 超过 30 分钟（服务端时钟）按 `failed` + `KEYSTORE_GENERATION_TIMED_OUT` 处理（两者都成立时报前者）——不再下发给主签名闸、不挡新的请求、控制台与就绪都这么显示。交回或报失败时 409 `KEYSTORE_GENERATION_STALE` 并把推导出的 `failed` 写回库（`completedAt` 在这之前为 null）。
 - 读路径上这一行读不出来（记录被改坏）：记日志、按"没有请求"处理，不挡这个租户已有密钥的检查、就绪与签名；再次发起时覆盖它。
 - 交回在一个事务里按 `build.keystore` → `release.android` → `build.keystore.request` 的顺序带 `FOR UPDATE` 读（与发起、导入同序），写密钥、发布身份，请求标 `done`；审计 `build_keystore_generated` 与 `release_identity_update`（`system-signer`）。发起审计 `build_keystore_generation_request`，失败审计 `build_keystore_generation_failed`。同一请求、同一签名的重试按成功返回。
 

@@ -287,3 +287,26 @@ amos 上已经按手工流程装好 `amos-signer-a`、`amos-signer-b`、`amos-bu
   - 登记多余签名闸，新密钥不会加密给它；
   - 伪造生成签名，备签名闸拒绝；
   - 改信任根，主签名闸拒绝生成。
+
+## 实现记录与偏离
+
+2026-09-17 按实现与对抗评审补记。接口以 `contracts/openapi.json`（2026.09.24）为准，决策与理由见 ADR-0020。
+
+### 服务端
+
+- **就绪问题码的范围**：第 4 节新增的 `RECOVERY_KEY_NOT_CONFIGURED`、`KEYSTORE_GENERATION_PENDING`、`KEYSTORE_GENERATION_FAILED` 只在租户**还没有可用的 v3 密钥**时出现。已有可用密钥的租户换密钥期间照常用旧密钥签；生成中、生成失败只在「签名密钥」一节的生成状态里显示，不算不就绪（否则一次没成功的换密钥会把正在出包的租户卡死，而且没有取消入口）。
+- **包名**：第 3 节说包名必须等于 App 身份的 `androidPackage`。实际比的是 `release.android` 的包名；还没有发布身份的新租户生成时包名取请求里的，不受 `androidPackage` 约束，交回时与证书一起写进 `release.android`。但包名不能是别的租户 `release.android` 或 `build.keystore` 在用的：发起生成与导入都 409 `ANDROID_PACKAGE_IN_USE`（不说是哪个租户）。签名闸本机按包名把关本来也会拒绝，这里是提前报错、免得白白生成。
+- **重发注册码**：对已吊销的机器 409 `MACHINE_REVOKED`（已注册的仍是 `MACHINE_ALREADY_ENROLLED`）；重发签名闸的注册码与新建一样要求平台有未吊销的恢复公钥（409 `RECOVERY_KEY_NOT_CONFIGURED`，旧码不作废）。
+- **待生成请求 30 分钟超时**：只按版本号推导失败时，主签名闸离线或信任根算不出来（不下发）的请求会永远 `pending`、再点生成永远 409。现在 `pending` 超过 30 分钟（服务端时钟）读的时候就推导为 `failed` + `KEYSTORE_GENERATION_TIMED_OUT`，可以重新发起；下发、就绪、控制台、再次发起、交回与失败报告走同一个判断，超时之后才到的交回与失败报告 409 `KEYSTORE_GENERATION_STALE` 并把超时写回库。
+- **交回必须包含主签名闸自己的密文**：收件人里没有生成者当前接受的 X25519 公钥 → 422 `KEYSTORE_PRIMARY_RECIPIENT_MISSING`。否则交回成功后发布身份换成新证书，主签名闸却解不开这个租户，就绪永远 `PRIMARY_SIGNER_NOT_RECIPIENT`。
+- **导出只含恢复收件人的密文**：第 1 节「恢复」只说"控制台提供导出密文文件"。导出文件只保留发给未吊销恢复公钥的 box（没有 → 409 `BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT`），发给签名闸的不带：租户管理员都能导出，带上的话一台被吊销但没擦盘的签名闸私钥加上任何一次导出就能解开密钥。`build-keystore recover` 只解发给恢复公钥的那份、核对明文与外层字段，不校验生成签名，不受影响。导出与审计同一个事务，审计写不进去就不导出。恢复路径仍是 导出 → `recover` → `seal` → 导入。
+- **吊销恢复公钥后的视图**：`GET /v1/admin/build-keystore` 的 `recoveryRecipients` 仍含已吊销的恢复公钥，另加 `revokedRecoveryRecipients`（其中已吊销的子集）；全部吊销时控制台提示这把密钥已没有可用的离线恢复。
+- **`trust` 可以缺**：第 4 节的 `reportedTrust` 由签名闸每轮上报。迁移时 CI 先把服务端推上线、签名闸二进制人工升级，中间几个小时里旧签名闸不带 `trust`：上报照常收下（本机角色与检查结论照常更新），`reportedTrust` 记成 null，控制台显示为未上报。
+- **panic 日志**：服务端不再用 `gin.Recovery()`（debug 模式下会把 `x-enrollment-code`、`x-machine-token` 等请求头原样打进日志），panic 只记 panic 值、路由模板、request id 与堆栈。
+
+### 签名闸与安装（已知偏离）
+
+- **生成确认参数绑进密文**：主签名闸把本机确认的信任根摘要、minSdk/targetSdk 下限、首签 versionCode 上限与被替换的证书（`keystorebox.Generation`）写进密文明文，被生成签名覆盖。备签名闸按它核对，而不是像第 3 节写的"按主签名闸同样的规则"自己再算一遍：服务端既不能给备签名闸另一套信任根，也不能把更早的一次生成重放回来。代价：备签名闸离线期间主签名闸**连续换了两次密钥**时，第二次替换的证书不是备签名闸本机当前的证书，备签名闸不会自动接受，要在它本机人工 `signer confirm`。
+- **`trust-peer` / `trust-builder`**：第 2 节写"程序从服务端取公钥显示出来，运维粘贴指纹比对"。实际上程序先只显示机器信息（名称、机器 id、服务端登记的主备），不先显示指纹；运维粘贴从那台机器安装输出（或它本机 `signer show-key`）抄来的完整指纹，与服务端已接受的一致才写入，写入之后才把指纹打出来——免得运维照着屏幕上服务端给的值抄一遍当作核对。
+- **unit 模板不写死 `IPAddressDeny`**：API 地址因机器而异，模板里只写注释，上线后用 drop-in 收紧到 API 与 DNS 解析器地址（amos 现有的 a/b unit 仍写死 localhost）。
+- **安装脚本位置与前提**：第 2 节写源文件放在 `deploy/setup/install.sh`，实际在 `internal/machinesetup/install.sh`（`go:embed` 进服务端）。比第 2 节多了两处：签名闸可选 `--apksigner-jar <路径>`（指定 Android build-tools 35.0.0 的 `apksigner.jar`，按 sha256 核对；不指定时在常见 SDK 位置找）；前提检查多了 `python3`（脚本用它按形状校验、解析服务端的 describe 回答与 problem code，不把服务端给的字符串交给 shell）。
