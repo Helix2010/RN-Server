@@ -221,7 +221,7 @@ sudo bash install.sh --server https://api.anyfun.win --code rne_… \
 | --- | --- |
 | 平台第一台主签名闸 | 控制台接受、登记为主后，在这台机器上把它提升为主（`promote` 要运行锁，先停服务）：`systemctl stop rn-signer-<实例>` → `sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer promote --first --env-file /etc/rn-signer-<实例>.env` → `systemctl start rn-signer-<实例>` |
 | 替换旧主的新主 | **不要用 `--first`**：按 `deploy/signer/README.md` 第 9 节用 `promote --import`（旧主状态目录还在）或 `--manual`；再让每台备 `trust-peer --peer <新主>`、新主 `trust-peer --peer <每台备>` |
-| 备签名闸 | 在这台备本机信任主：`sudo -u rn-signer-<备实例> /opt/rn-signer/bin/signer trust-peer --peer <主机器名> --env-file /etc/rn-signer-<备实例>.env`（指纹取**主签名闸本机** `signer show-key` 或它的安装输出，不取控制台）；并在主签名闸本机 `trust-peer --peer <新备机器名>`，粘贴这台备的 X25519 与 Ed25519 完整指纹 |
+| 备签名闸 | 在这台备本机信任主：`sudo -u rn-signer-<备实例> /opt/rn-signer/bin/signer trust-peer --peer <主机器名> --env-file /etc/rn-signer-<备实例>.env`（指纹取**主签名闸本机** `signer show-key` 或它的安装输出，不取控制台）；并在主签名闸本机 `trust-peer --peer <新备机器名>`，粘贴这台备的 X25519 与 Ed25519 完整指纹。两个方向都做完之后，已有租户的密钥由主签名闸在下一轮自动重新封装给它（同一张证书，不换证书、不用离线恢复），控制台「签名密钥」一节里它那一行会从「缺」变成有密文 |
 | 任何签名闸 | 这台签名闸本机，对每台构建机：`sudo -u rn-signer-<实例> /opt/rn-signer/bin/signer trust-builder --builder <构建机机器名> --env-file /etc/rn-signer-<实例>.env`，粘贴构建机的出处公钥 sha256 |
 | 构建机 | 每台签名闸本机：同上一行的 `trust-builder --builder <新构建机机器名>` |
 
@@ -468,7 +468,7 @@ sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-peer --peer amos-signer-a --
 | `KEYSTORE_RECORD_INVALID` | 库里的记录被改过或损坏：先查审计。已经有用户装了这把证书签的包时，按第 4 节用恢复密钥找回原件后导入（保留证书）；还没发过包才可以直接重新生成 |
 | `RELEASE_IDENTITY_MISMATCH` | 发布身份与密钥不一致：查审计弄清谁改了什么。不要为此换证书；按第 4 节导入同一把密钥会重新登记发布身份 |
 | `PRIMARY_SIGNER_MISSING` | 控制台没有已接受的主签名闸：第 2 节 |
-| `PRIMARY_SIGNER_NOT_RECIPIENT` | 密钥没有加密给当前主签名闸（例如换主之前旧主没有 `trust-peer` 它）：按第 4 节用恢复密钥找回原件、加密给新主后导入，证书不变。重新生成会换证书，老用户升不上去 |
+| `PRIMARY_SIGNER_NOT_RECIPIENT` | 密钥没有加密给当前主签名闸（例如换主之前旧主没有 `trust-peer` 它）：主签名闸自己解不开就重新封装不了，按第 4 节用恢复密钥找回原件、加密给新主后导入，证书不变。重新生成会换证书，老用户升不上去。备签名闸缺密文不用这样处理：两边 `trust-peer` 之后主会自动重新封装 |
 | `PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH` | 控制台是主、签名闸本机不是主：那台签名闸上 `signer promote`，或把路由切回 |
 | `OTA_CERTIFICATE_NOT_CONFIGURED` / `APP_IDENTITY_INCOMPLETE` / `API_BASE_URL_INVALID` / `TRUST_ROOTS_INVALID` | 补齐或改正租户的 OTA 签名密钥与打包配置 |
 | `PRIMARY_SIGNER_NOT_CHECKED` / `PRIMARY_SIGNER_TRIAL_SIGN_PENDING` | 等主签名闸下一轮检查（约一分钟） |
