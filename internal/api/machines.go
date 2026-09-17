@@ -173,6 +173,21 @@ func (m buildMachine) canBuild(platform string) bool {
 	return containsString(m.buildPlatforms(), platform)
 }
 
+// viewPlatforms 是 machineView 里的那一份，**恒为数组，永远不是 null**。
+//
+// buildPlatforms 对签名闸返回 nil（Go 里"不适用"就该是 nil），而 nil 切片序列化成
+// JSON 的 null。控制台按 z.array 解析这个字段，zod 的 .default([]) 只在 undefined
+// 时生效、对 null 不生效——于是一台签名闸就能让**整份机器登记**读不出来，页面上是
+// 「无法读取机器登记」，看不出是哪个字段。2026-09-17 上线后当场撞到。
+//
+// 教训记在这里：这个字段的契约是"给浏览器的 JSON"，不是"Go 里的返回值"。
+func viewPlatforms(m buildMachine) []string {
+	if platforms := m.buildPlatforms(); platforms != nil {
+		return platforms
+	}
+	return []string{}
+}
+
 // hasLiveBuilderFor 回答"现在有没有一台**能认领**这个平台的构建机"。
 // 排队时用它：让"没有 Mac"在点下按钮的那一刻就说出来，而不是排成一条永远没人认领的任务。
 //
@@ -560,7 +575,7 @@ func machineView(m buildMachine) gin.H {
 		"id":                            m.ID,
 		"role":                          m.Role,
 		"signerRole":                    nullableString(string(m.SignerRole)),
-		"platforms":                     m.buildPlatforms(),
+		"platforms":                     viewPlatforms(m),
 		"name":                          m.Name,
 		"status":                        m.Status,
 		"publicKeySha256":               nullableString(string(m.PublicKeySHA256)),

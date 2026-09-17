@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,39 @@ func TestBuildPlatformsDefaultsToAndroid(t *testing.T) {
 	// 签名闸什么都不构建
 	if got := (buildMachine{Role: machineRoleSigner}).buildPlatforms(); got != nil {
 		t.Fatalf("a signer builds nothing, got %v", got)
+	}
+}
+
+// 这个字段的契约是"给浏览器的 JSON"，不是"Go 里的返回值"。
+//
+// 上一版断言的是 buildPlatforms() 对签名闸返回 nil——而 nil 切片序列化成 null，
+// 控制台按 z.array 解析（zod 的 .default([]) 不管 null），于是一台签名闸就让整份
+// 机器登记读不出来。断言必须落在序列化之后。
+func TestMachineViewNeverSerialisesPlatformsAsNull(t *testing.T) {
+	for name, machine := range map[string]buildMachine{
+		"签名闸":      {ID: "mch_a", Role: machineRoleSigner, SignerRole: signerRolePrimary, Name: "sg"},
+		"没标平台的构建机": {ID: "mch_b", Role: machineRoleBuilder, Name: "b1"},
+		"标了平台的构建机": {ID: "mch_c", Role: machineRoleBuilder, Name: "b2", Platforms: []string{buildPlatformIOS}},
+		"吊销的签名闸":   {ID: "mch_d", Role: machineRoleSigner, Status: machineStatusRevoked, Name: "sg2"},
+	} {
+		raw, err := json.Marshal(machineView(machine))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		var decoded struct {
+			Platforms *[]string `json:"platforms"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if decoded.Platforms == nil {
+			t.Fatalf("%s: platforms serialised as null, which breaks the console's array parse: %s", name, raw)
+		}
+	}
+	// 内容仍然是对的
+	raw, _ := json.Marshal(machineView(buildMachine{ID: "mch_e", Role: machineRoleBuilder, Name: "b3"}))
+	if !strings.Contains(string(raw), `"platforms":["android"]`) {
+		t.Fatalf("an unmarked builder must still read as android: %s", raw)
 	}
 }
 
