@@ -86,6 +86,13 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 	if err := validateClaimedJob(job); err != nil {
 		return prepared, err
 	}
+	// 不做没要过的活。领取请求里只报了本机能构建的平台，服务端还会与登记求交集——
+	// 派过来一条别的平台只可能是服务端的 bug 或库被人改过，那时该当场停下，而不是
+	// 在这台机器上试着跑一条它根本跑不了的构建（Linux 上没有 xcodebuild）。
+	if !containsPlatform(a.cfg.Platforms, job.Platform) {
+		return prepared, fmt.Errorf("this machine did not ask for %s builds (BUILD_AGENT_PLATFORMS=%s)",
+			job.Platform, strings.Join(a.cfg.Platforms, ","))
+	}
 	layout, err := jobspec.NewLayout(a.cfg.Workspace, job.ID)
 	if err != nil {
 		return prepared, err
