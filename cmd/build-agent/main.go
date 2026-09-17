@@ -105,6 +105,10 @@ func runAgent() int {
 		}
 	}
 
+	if cfg.MirrorProtocol != "ssh" {
+		slog.Warn("BUILD_AGENT_MIRROR_PROTOCOL is not ssh: the repository mirror is fetched over another transport. Only for local testing",
+			"protocol", cfg.MirrorProtocol)
+	}
 	slog.Info("build agent started", "server", cfg.Server, "platforms", cfg.Platforms,
 		"jobsRoot", cfg.Workspace, "runner", cfg.Runner, "runnerUser", cfg.RunnerUser,
 		"runnerSeparated", cfg.runnerSeparated(), "provenancePublicKeySha256", keys.current.sha256)

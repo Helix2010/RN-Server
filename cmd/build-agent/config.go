@@ -42,6 +42,9 @@ type config struct {
 	// 只用这两个文件，不读 ~/.ssh/config、~/.ssh/known_hosts（见 checkout.go gitEnv）。
 	SSHKey     string
 	KnownHosts string
+	// MirrorProtocol 是 fetch 仓库镜像时唯一放行的传输协议。生产是 ssh（默认），
+	// 只有本机测试用的假镜像（remote.origin.url 是本地路径）才设成 file，启动时会告警。
+	MirrorProtocol string
 }
 
 const (
@@ -70,17 +73,18 @@ func envOr(key, fallback string) string {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		Server:       strings.TrimRight(envOr("BUILD_AGENT_SERVER", ""), "/"),
-		MachineToken: envOr("BUILD_AGENT_MACHINE_TOKEN", ""),
-		Repo:         envOr("BUILD_AGENT_REPO", ""),
-		Workspace:    envOr("BUILD_AGENT_WORKSPACE", ""),
-		StateDir:     envOr("BUILD_AGENT_STATE_DIR", ""),
-		PollEvery:    10 * time.Second,
-		Runner:       envOr("BUILD_AGENT_RUNNER", "/opt/rn-build-agent/build-runner"),
-		RunnerUser:   envOr("BUILD_AGENT_RUNNER_USER", "builder"),
-		MachineEnv:   map[string]string{},
-		SSHKey:       envOr("BUILD_AGENT_SSH_KEY", defaultSSHKey),
-		KnownHosts:   envOr("BUILD_AGENT_SSH_KNOWN_HOSTS", defaultKnownHosts),
+		Server:         strings.TrimRight(envOr("BUILD_AGENT_SERVER", ""), "/"),
+		MachineToken:   envOr("BUILD_AGENT_MACHINE_TOKEN", ""),
+		Repo:           envOr("BUILD_AGENT_REPO", ""),
+		Workspace:      envOr("BUILD_AGENT_WORKSPACE", ""),
+		StateDir:       envOr("BUILD_AGENT_STATE_DIR", ""),
+		PollEvery:      10 * time.Second,
+		Runner:         envOr("BUILD_AGENT_RUNNER", "/opt/rn-build-agent/build-runner"),
+		RunnerUser:     envOr("BUILD_AGENT_RUNNER_USER", "builder"),
+		MachineEnv:     map[string]string{},
+		SSHKey:         envOr("BUILD_AGENT_SSH_KEY", defaultSSHKey),
+		KnownHosts:     envOr("BUILD_AGENT_SSH_KNOWN_HOSTS", defaultKnownHosts),
+		MirrorProtocol: envOr("BUILD_AGENT_MIRROR_PROTOCOL", "ssh"),
 	}
 	// 作废的机密先挡：它们留在 env 文件里就是一份没人管的秘密
 	if os.Getenv("BUILD_KEYSTORE_PASSPHRASE") != "" {
@@ -122,6 +126,9 @@ func loadConfig() (config, error) {
 		if filepath.Clean(value) != value || !shellSafePathPattern.MatchString(value) {
 			return cfg, fmt.Errorf("%s must be a clean absolute path of letters, digits and ._-/ (got %q)", key, value)
 		}
+	}
+	if cfg.MirrorProtocol != "ssh" && cfg.MirrorProtocol != "file" {
+		return cfg, fmt.Errorf("BUILD_AGENT_MIRROR_PROTOCOL must be ssh (production) or file (a local test mirror), got %q", cfg.MirrorProtocol)
 	}
 	if err := jobspec.ValidRoot(cfg.Workspace); err != nil {
 		return cfg, fmt.Errorf("BUILD_AGENT_WORKSPACE: %w", err)

@@ -37,6 +37,7 @@ type agent struct {
 	lastKeyMessage string
 
 	// mirrorProtocol 是 fetch 仓库镜像时唯一放行的传输协议（生产里是 ssh；测试的镜像从本地路径取，是 file）。
+	// 空值一律当 ssh：配置没设、或者构造 agent 的地方没填，都要落在最严的那一档。
 	// knownHostsOwner 是固定 known_hosts 必须的属主（生产里是 root）。两者都不来自配置。
 	mirrorProtocol  string
 	knownHostsOwner int
@@ -53,7 +54,7 @@ func newAgent(cfg config, keys *keyring) *agent {
 		reportDelay:     2 * time.Second,
 		now:             time.Now,
 		keyCheckEvery:   10 * time.Minute,
-		mirrorProtocol:  "ssh",
+		mirrorProtocol:  mirrorProtocolOr(cfg.MirrorProtocol),
 		knownHostsOwner: rootUID,
 	}
 }
@@ -456,4 +457,12 @@ func (a *agent) report(ctx context.Context, jobID, what string, send func(contex
 		}
 	}
 	a.log.Error("gave up reporting the "+what+" after repeated failures", "job", jobID)
+}
+
+// mirrorProtocolOr：空值落回生产默认 ssh。
+func mirrorProtocolOr(p string) string {
+	if p == "" {
+		return "ssh"
+	}
+	return p
 }
