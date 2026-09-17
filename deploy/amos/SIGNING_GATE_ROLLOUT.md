@@ -384,8 +384,11 @@ sudo -u rn-build-agent env HOME=/var/lib/rn-build-agent \
   GIT_SSH_COMMAND='ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i /var/lib/rn-build-agent/.ssh/id_ed25519 -o UserKnownHostsFile=/opt/rn-build-agent/github_known_hosts -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=15' \
   git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.ssh.allow=always \
   clone --quiet --mirror --template= git@github.com:Helix2010/RN-App.git /var/lib/rn-build-agent/repos/rn-app.git.part
+# git clone 按当前 umask 建文件：默认 umask 002 时 config 会是组可写，新控制进程据此判"镜像配置不可信"、拒绝 fetch
 sudo -u rn-build-agent chmod 0700 /var/lib/rn-build-agent/repos/rn-app.git.part
+sudo -u rn-build-agent chmod -R go-w /var/lib/rn-build-agent/repos/rn-app.git.part
 sudo -u rn-build-agent mv -T /var/lib/rn-build-agent/repos/rn-app.git.part /var/lib/rn-build-agent/repos/rn-app.git
+ls -l /var/lib/rn-build-agent/repos/rn-app.git/config   # 不能有 g+w / o+w
 
 # 3) 换两个程序；重启会先做完手上的构建（这一步之前服务已停）
 sudo cp -a /opt/rn-build-agent/build-agent /root/build-agent.prev

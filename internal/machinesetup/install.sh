@@ -996,7 +996,8 @@ install_builder() {
         GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(agent_ssh_command)" \
         git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.ssh.allow=always \
         clone --quiet --mirror --template= "$APP_REPO_URL" "$AGENT_MIRROR.part" &&
-        as_agent chmod 0700 "$AGENT_MIRROR.part" && as_agent mv -T "$AGENT_MIRROR.part" "$AGENT_MIRROR"; then
+        as_agent chmod 0700 "$AGENT_MIRROR.part" && as_agent chmod -R go-w "$AGENT_MIRROR.part" &&
+        as_agent mv -T "$AGENT_MIRROR.part" "$AGENT_MIRROR"; then
         MIRROR_READY=yes
         note "仓库镜像已就位"
       else
