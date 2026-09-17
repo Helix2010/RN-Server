@@ -2842,7 +2842,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Tenant iOS release identity pin: {configured, identity{appleTeamId, bundleId}|null, version, updatedBy, updatedAt}"
+            "description": "Tenant iOS release identity and install entry point: {configured, identity{appleTeamId, bundleId, installUrl, installUrlSource(manual|synced), buildExpiresAt}|null, version, updatedBy, updatedAt}"
           },
           "401": {
             "description": "Admin authentication required"
@@ -5508,6 +5508,183 @@
           }
         }
       }
+    },
+    "/v1/admin/ios/asc-credentials": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "{configured, credentials{issuerId, keyId, appId, verifiedAt}|null, version, updatedBy, updatedAt}. The .p8 private key is never returned"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "IOS_ASC_CONFIG_INVALID"
+          }
+        }
+      },
+      "put": {
+        "description": "Install or replace the tenant App Store Connect API key. The server signs a JWT with it and looks up the App record for this tenant's bundle id, requiring exactly one match, before saving; it may take a few seconds",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IOSASCCredentialsWrite"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved credentials (same shape as GET)"
+          },
+          "400": {
+            "description": "INVALID_IOS_ASC: issuerId/keyId/privateKey empty, missing reason or confirm"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_IOS_ASC, IOS_IDENTITY_INCOMPLETE (register appleTeamId and bundleId first)"
+          },
+          "413": {
+            "description": "IOS_ASC_KEY_TOO_LARGE"
+          },
+          "422": {
+            "description": "INVALID_IOS_ASC: not a PKCS#8 EC private key"
+          },
+          "424": {
+            "description": "IOS_ASC_KEY_REJECTED: Apple refused the key, or no App matches this bundle id"
+          },
+          "503": {
+            "description": "STORAGE_MASTER_KEY_REQUIRED"
+          }
+        }
+      },
+      "delete": {
+        "description": "Remove the stored key and fall back to self-serve mode. The key stays valid at Apple until revoked there",
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{configured:false, reminder}"
+          },
+          "400": {
+            "description": "INVALID_IOS_ASC: reason is required"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "IOS_ASC_NOT_FOUND"
+          }
+        }
+      }
+    },
+    "/v1/admin/ios/testflight/sync": {
+      "post": {
+        "description": "Read-only sync from App Store Connect: builds, tester groups, the external public link and the current build's expiry, written back into release.ios. Never creates groups, opens public links, submits for review or changes testers",
+        "parameters": [
+          {
+            "name": "overrideManual",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true"
+              ]
+            },
+            "description": "Overwrite a hand-entered installUrl with what App Store Connect reports"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{appId, builds[], groups[], installUrl, buildExpiresAt, changed, changes, conflict}"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "IOS_ASC_NOT_CONFIGURED (self-serve mode), IOS_IDENTITY_INCOMPLETE"
+          },
+          "424": {
+            "description": "IOS_ASC_SYNC_FAILED: App Store Connect refused the key or is unreachable"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/machines/{id}/platforms": {
+      "post": {
+        "description": "Change which platforms a builder may build. This changes job routing: the platforms a builder reports when claiming are intersected with this list, so a builder can narrow but never widen them",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "platforms",
+                  "expectedVersion",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "platforms": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "android",
+                        "ios"
+                      ]
+                    }
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{version, machine}"
+          },
+          "400": {
+            "description": "INVALID_MACHINE: unknown platform, empty list, missing reason or confirm"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "MACHINE_NOT_FOUND"
+          },
+          "409": {
+            "description": "MACHINE_NOT_A_BUILDER, MACHINE_REVOKED, STALE_MACHINE_REGISTRY"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -6617,6 +6794,14 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "installUrl": {
+            "type": "string",
+            "description": "TestFlight public link or App Store page. Empty means not published yet. Only https under testflight.apple.com or apps.apple.com, path required, at most 255 characters"
+          },
+          "buildExpiresAt": {
+            "type": "string",
+            "description": "RFC3339 expiry of the current TestFlight build (upload + 90 days). Empty means unknown"
           }
         }
       },
@@ -9499,6 +9684,42 @@
           "allowUnconfirmedSigners": {
             "type": "boolean",
             "description": "Generate even though a signing gate that holds the current key has not confirmed this version yet (otherwise 409 KEYSTORE_SIGNERS_NOT_IN_SYNC). Those gates then need a manual signer confirm before they can use the new key: a standby only auto-accepts a key that supersedes the certificate it currently holds."
+          }
+        }
+      },
+      "IOSASCCredentialsWrite": {
+        "type": "object",
+        "required": [
+          "issuerId",
+          "keyId",
+          "privateKey",
+          "expectedVersion",
+          "reason",
+          "confirm"
+        ],
+        "properties": {
+          "issuerId": {
+            "type": "string",
+            "description": "App Store Connect issuer id (UUID), public information"
+          },
+          "keyId": {
+            "type": "string",
+            "description": "App Store Connect key id (10 characters), public information"
+          },
+          "privateKey": {
+            "type": "string",
+            "description": "The AuthKey_<KeyID>.p8 contents, raw PEM or base64. Stored encrypted with STORAGE_MASTER_KEY and never returned"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 3
+          },
+          "confirm": {
+            "type": "boolean"
           }
         }
       }
