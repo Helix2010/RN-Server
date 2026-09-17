@@ -236,6 +236,25 @@ func writeTenantConfig(ctx context.Context, tx *sql.Tx, tenant, key string, valu
 	return affected == 1, nil
 }
 
+// androidPackageUsedByAnotherTenant：别的租户的发布身份（release.android）或签名密钥记录（build.keystore）已经用着
+// 这个包名。只用来尽早报错（发起生成、导入），不是约束：真正按包名把关的是签名闸本机记录。
+func androidPackageUsedByAnotherTenant(ctx context.Context, q rowQuerier, tenant, packageName string) (bool, error) {
+	var one int
+	err := q.QueryRowContext(ctx,
+		`SELECT 1 FROM app_configs WHERE config_key IN (?,?) AND tenant_id<>? AND tenant_id<>? AND JSON_UNQUOTE(JSON_EXTRACT(config_value,'$.packageName'))=? LIMIT 1`,
+		releaseAndroidIdentityConfigKey, buildKeystoreConfigKey, tenant, platformTenantID, packageName).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// androidPackageInUse 不说是哪个租户：租户管理员不该从这里知道别的租户的身份。
+func androidPackageInUse(c *gin.Context) {
+	problem(c, http.StatusConflict, "ANDROID_PACKAGE_IN_USE",
+		"Another tenant already uses this Android package name (release identity or signing key); every tenant's app needs its own package name")
+}
+
 // ---- 管理端：发起 ----
 
 func (s *server) generateBuildKeystore(c *gin.Context) {
@@ -275,6 +294,15 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 	if identity != nil && identity.Value.PackageName != packageName {
 		problem(c, http.StatusUnprocessableEntity, "KEYSTORE_PACKAGE_MISMATCH",
 			fmt.Sprintf("packageName must be this tenant's Android package %q", identity.Value.PackageName))
+		return
+	}
+	// 包名跨租户唯一。签名闸本机按包名记确认，别的租户在用的包名它本来也会拒绝；在这里说，免得白白生成
+	if inUse, err := androidPackageUsedByAnotherTenant(ctx, s.db, tenant, packageName); err != nil {
+		slog.Error("cannot check whether another tenant uses the package name", "tenant", tenant, "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_FAILED", "Unable to check the package name")
+		return
+	} else if inUse {
+		androidPackageInUse(c)
 		return
 	}
 	recoveryKeys, err := readRecoveryKeys(ctx, s.db, false)

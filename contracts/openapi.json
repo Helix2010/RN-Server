@@ -3227,7 +3227,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY"
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, ANDROID_PACKAGE_IN_USE (another tenant's release.android or build.keystore already uses this package name; the detail does not name the tenant)"
           },
           "422": {
             "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED (not v3, including v1/v2 bodies), BUILD_KEYSTORE_RECIPIENT_UNKNOWN (neither an unrevoked signer's accepted key nor an unrevoked recovery key), BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH, RELEASE_SIGNER_RETIRED"
@@ -3244,7 +3244,7 @@
     "/v1/admin/build-keystore/generate": {
       "post": {
         "summary": "Generate a new signing key on the primary signer",
-        "description": "Records a key generation request (tenant app_configs build.keystore.request, audited as build_keystore_generation_request) for the primary signer to pick up; the key is generated, sealed and signed on the signer and delivered through POST /v1/signer/keystore-generations/{requestId}. packageName must be the tenant's Android package (release.android) when one is registered; a tenant without release.android generates for the given package and gets release.android written on delivery. The key alias is <slug lowercased>-release. Replacing an existing key changes the certificate: installed apps cannot upgrade. Progress: generationRequest in GET /v1/admin/build-keystore.",
+        "description": "Records a key generation request (tenant app_configs build.keystore.request, audited as build_keystore_generation_request) for the primary signer to pick up; the key is generated, sealed and signed on the signer and delivered through POST /v1/signer/keystore-generations/{requestId}. packageName must be the tenant's Android package (release.android) when one is registered; a tenant without release.android generates for the given package and gets release.android written on delivery. Either way the package name must not be used by another tenant's release.android or build.keystore (409 ANDROID_PACKAGE_IN_USE; signers refuse such a package anyway, this only fails early). The key alias is <slug lowercased>-release. Replacing an existing key changes the certificate: installed apps cannot upgrade. Progress: generationRequest in GET /v1/admin/build-keystore.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3281,7 +3281,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is neither stale nor timed out), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing)"
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is neither stale nor timed out), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing), ANDROID_PACKAGE_IN_USE (another tenant's release.android or build.keystore already uses this package name - also for a tenant without a release identity, whose package name otherwise comes from the request; the detail does not name the tenant)"
           },
           "422": {
             "description": "KEYSTORE_PACKAGE_MISMATCH"

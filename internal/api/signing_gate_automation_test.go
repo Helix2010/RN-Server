@@ -228,6 +228,20 @@ func (f *gateFixture) revokeRecoveryKey(id string) {
 	}
 }
 
+// storedGenerationRequestOrNil 读这个租户的生成请求；没有返回 nil。
+func (f *gateFixture) storedGenerationRequestOrNil() *keystoreGenerationRequest {
+	f.t.Helper()
+	raw, _, err := configRowVersion(context.Background(), f.db, f.tenant, buildKeystoreRequestConfigKey, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	request, err := parseGenerationRequest(raw)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return request
+}
+
 func (f *gateFixture) auditCount(tenant, action string) int {
 	f.t.Helper()
 	var count int
@@ -1377,6 +1391,74 @@ func TestDBKeystoreGenerationTimesOut(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("a timed-out first generation: %v", readiness.Problems)
+	}
+}
+
+// 包名跨租户唯一：别的租户的发布身份（release.android）或签名密钥记录（build.keystore）已经用着这个包名时，
+// 发起生成与导入都尽早 409 ANDROID_PACKAGE_IN_USE（签名闸本机按包名记确认，本来也会拒绝；这里免得白白生成）。
+// 报错不说是哪个租户；本租户自己的记录不算冲突。
+func TestDBAndroidPackageInUseByAnotherTenantIsRefusedEarly(t *testing.T) {
+	f := newGateFixture(t, 137)
+	f.registerRecoveryKey("platform-recovery")
+	seedOther := func(seed int, key string, value any) string {
+		t.Helper()
+		tenant := testTenant(seed)
+		raw, _ := json.Marshal(value)
+		if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,'tester',UTC_TIMESTAMP(3))`, tenant, key, raw); err != nil {
+			t.Fatalf("seed %s for tenant %s: %v", key, tenant, err)
+		}
+		// 这几个"别的租户"只有配置行、没有租户行：用完删掉，不留给别的用例
+		t.Cleanup(func() { _, _ = f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, tenant, key) })
+		return tenant
+	}
+	certificate := f.apkSigner.sha256()
+	importPackage := func(packageName string) *httptest.ResponseRecorder {
+		t.Helper()
+		keystoreVersion, identityVersion := f.keystoreVersions()
+		return f.saveKeystoreRequest(map[string]any{"upload": f.keystoreUpload(f.slug, packageName, certificate, f.primary), "packageName": packageName,
+			"signerSha256": certificate, "expectedVersion": keystoreVersion, "releaseIdentityExpectedVersion": identityVersion, "reason": "import", "confirm": true})
+	}
+	inUse := func(name string, r *httptest.ResponseRecorder, otherTenant string) {
+		t.Helper()
+		if r.Code != http.StatusConflict || problemCode(t, r) != "ANDROID_PACKAGE_IN_USE" || strings.Contains(r.Body.String(), otherTenant) {
+			t.Fatalf("%s: %d %s", name, r.Code, r.Body.String())
+		}
+	}
+
+	// 别的租户的发布身份与本租户同一个包名（库里已经冲突）：本租户既不能生成也不能导入
+	sharing := seedOther(138, releaseAndroidIdentityConfigKey, androidReleaseIdentity{PackageName: f.packageName, SignerSHA256: newCertificateSHA256()})
+	inUse("generate for a package another tenant's release identity uses", f.generate(f.generateBody(f.packageName)), sharing)
+	inUse("import for a package another tenant's release identity uses", importPackage(f.packageName), sharing)
+	if got := f.storedGenerationRequestOrNil(); got != nil {
+		t.Fatalf("a refused generation recorded a request: %+v", got)
+	}
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, sharing, releaseAndroidIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	// 本租户自己的发布身份与密钥不算冲突
+	if r := importPackage(f.packageName); r.Code != http.StatusOK {
+		t.Fatalf("import for this tenant's own package: %d %s", r.Code, r.Body.String())
+	}
+
+	identityPackage := "com.gate.inuse.identity" + uniqueSuffix()
+	keystorePackage := "com.gate.inuse.keystore" + uniqueSuffix()
+	withIdentity := seedOther(139, releaseAndroidIdentityConfigKey, androidReleaseIdentity{PackageName: identityPackage, SignerSHA256: newCertificateSHA256()})
+	withKeystore := seedOther(140, buildKeystoreConfigKey, buildKeystoreRecord{Format: buildKeystoreRecordFormat, Sealed: "c2VhbGVk", KeyAlias: "release",
+		CertificateSHA256: newCertificateSHA256(), PackageName: keystorePackage, TenantSlug: "other-tenant", Recipients: []string{f.primary.recipient()}})
+	inUse("import for another tenant's release identity package", importPackage(identityPackage), withIdentity)
+	inUse("import for another tenant's keystore package", importPackage(keystorePackage), withKeystore)
+
+	// 还没有发布身份的新租户：包名取请求里的，同样不能是别的租户在用的
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key IN (?,?,?)`, f.tenant, buildKeystoreConfigKey, releaseAndroidIdentityConfigKey, buildKeystoreCheckConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	first := func(packageName string) *httptest.ResponseRecorder {
+		return f.generate(map[string]any{"packageName": packageName, "expectedVersion": 0, "releaseIdentityExpectedVersion": 0, "reason": "first key", "confirm": true})
+	}
+	inUse("first generation for another tenant's release identity package", first(identityPackage), withIdentity)
+	inUse("first generation for another tenant's keystore package", first(keystorePackage), withKeystore)
+	if r := first("com.gate.inuse.free" + uniqueSuffix()); r.Code != http.StatusAccepted {
+		t.Fatalf("first generation for a free package: %d %s", r.Code, r.Body.String())
 	}
 }
 

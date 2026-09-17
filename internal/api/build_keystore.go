@@ -412,6 +412,14 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 			"packageName and signerSha256 must equal the package name and certificate fingerprint inside the keystore file")
 		return
 	}
+	if inUse, err := androidPackageUsedByAnotherTenant(ctx, s.db, tenantID(c), identity.PackageName); err != nil {
+		slog.Error("cannot check whether another tenant uses the package name", "tenant", tenantID(c), "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to check the package name")
+		return
+	} else if inUse {
+		androidPackageInUse(c)
+		return
+	}
 	registry, err := s.machineRegistry(ctx)
 	if err != nil {
 		problem(c, http.StatusServiceUnavailable, "MACHINE_REGISTRY_UNAVAILABLE", "Machine registry cannot be read")
