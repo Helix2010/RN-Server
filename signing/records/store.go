@@ -573,8 +573,10 @@ func (s *Store) Confirmations() ([]Confirmation, error) {
 }
 
 // ConfirmAuto 写入一条签名闸自动确认（Mode 非空）。在记录锁里复核：该包名当前有效的确认必须仍是
-// expectedPrevious（nil 表示当时没有确认；比较租户、证书与信任根摘要），证书在本机没为这个包名
-// 确认过。已经写过完全相同的确认（同一包名、证书、生成请求）时幂等返回 nil。
+// expectedPrevious（nil 表示当时没有确认），而且逐字段相同——租户、证书、信任根摘要、SDK 下限、首签上限、
+// 别名、确认人与确认时间都算：计划时读到之后运维又 confirm 过（哪怕值没变），就 ErrConfirmationChanged，
+// 由调用方下一轮按新值重算，不拿旧计划覆盖运维刚写的值。证书在本机没为这个包名确认过。
+// 已经写过完全相同的确认（同一包名、证书、生成请求）时幂等返回 nil。
 func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) error {
 	if c.Mode == "" {
 		return errors.New("records: ConfirmAuto needs an automatic confirmation mode")
@@ -591,8 +593,7 @@ func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) erro
 		switch {
 		case expectedPrevious == nil && has, expectedPrevious != nil && !has:
 			return nil, ErrConfirmationChanged
-		case has && (current.TenantSlug != expectedPrevious.TenantSlug || current.CertificateSHA256 != expectedPrevious.CertificateSHA256 ||
-			current.TrustRootsDigest != expectedPrevious.TrustRootsDigest):
+		case has && !sameConfirmation(current, *expectedPrevious):
 			return nil, ErrConfirmationChanged
 		}
 		if s.ts.certificates[c.PackageName][c.CertificateSHA256] {
@@ -600,6 +601,15 @@ func (s *Store) ConfirmAuto(c Confirmation, expectedPrevious *Confirmation) erro
 		}
 		return []pending{{typeTenant, c}}, nil
 	})
+}
+
+// sameConfirmation 逐字段比较两条确认。信任根按摘要比较：每条确认写入与回放时都校验过摘要与信任根一致。
+func sameConfirmation(a, b Confirmation) bool {
+	return a.TenantSlug == b.TenantSlug && a.PackageName == b.PackageName && a.CertificateSHA256 == b.CertificateSHA256 &&
+		a.KeyAlias == b.KeyAlias && a.KeystoreVersion == b.KeystoreVersion && a.TrustRootsDigest == b.TrustRootsDigest &&
+		a.MinSDK == b.MinSDK && a.TargetSDK == b.TargetSDK && a.FirstSignMaxVersionCode == b.FirstSignMaxVersionCode &&
+		a.ConfirmedBy == b.ConfirmedBy && a.Mode == b.Mode && a.GenerationRequestID == b.GenerationRequestID &&
+		a.GeneratorName == b.GeneratorName && a.GeneratorEd25519SHA256 == b.GeneratorEd25519SHA256 && a.ConfirmedAt == b.ConfirmedAt
 }
 
 // CertificateSeen 报告这张证书是否为这个包名确认过（含已被取代的确认）。

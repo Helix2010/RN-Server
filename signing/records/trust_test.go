@@ -123,13 +123,19 @@ func TestAutoConfirmation(t *testing.T) {
 	if fileSize(t, filepath.Join(f.dir, TrustFileName)) != trustLines {
 		t.Fatal("a refused automatic confirmation wrote a record")
 	}
-	must(t, s.ConfirmAuto(regenerated, &first))
+	// 调用方传的是计划时从本机记录读到的那一份（带确认时间），不是自己拼的
+	if err := s.ConfirmAuto(regenerated, &first); !errors.Is(err, ErrConfirmationChanged) {
+		t.Fatalf("expected previous without the recorded fields: %v", err)
+	}
+	planned, _, _ := s.ActiveConfirmation(pkg)
+	must(t, s.ConfirmAuto(regenerated, &planned))
 	if seen, _ := s.CertificateSeen(pkg, certA); !seen {
 		t.Fatal("the superseded certificate is not remembered")
 	}
 	// 被取代的证书不能自动确认回去（重放旧的生成）
 	back := autoConfirmation(t, certA, ConfirmModePeerGenerated, "kgr_request0003")
-	if err := s.ConfirmAuto(back, &regenerated); !errors.Is(err, ErrCertificateSeen) {
+	current, _, _ := s.ActiveConfirmation(pkg)
+	if err := s.ConfirmAuto(back, &current); !errors.Is(err, ErrCertificateSeen) {
 		t.Fatalf("switching back to a superseded certificate: %v", err)
 	}
 	// 运维 confirm 可以
@@ -305,6 +311,52 @@ func copyLegacyState(t *testing.T) string {
 		must(t, os.WriteFile(filepath.Join(dir, name), raw, 0o600))
 	}
 	return dir
+}
+
+// 评审 P2-7：自动确认在记录锁里复核的不只是租户、证书、摘要。计划时读到的 SDK 下限、首签上限等任何一项
+// 在这期间被运维 confirm 改过（哪怕只收紧了一项），都要 ErrConfirmationChanged，下一轮按新值重算，
+// 不能拿旧计划把运维刚收紧的值写回去。
+func TestAutoConfirmationRechecksEveryPlannedParameter(t *testing.T) {
+	f := newFixture(t)
+	s := f.open(t)
+	manual := confirmation(t)
+	must(t, s.Confirm(manual))
+	planned, ok, err := s.ActiveConfirmation(pkg)
+	if err != nil || !ok {
+		t.Fatalf("active confirmation: %v %v", ok, err)
+	}
+	next := autoConfirmation(t, certB, ConfirmModeRegenerated, "kgr_request0009")
+	for name, mutate := range map[string]func(*Confirmation){
+		"minSdk raised":          func(c *Confirmation) { c.MinSDK = 26 },
+		"targetSdk raised":       func(c *Confirmation) { c.TargetSDK = 34 },
+		"first-sign cap lowered": func(c *Confirmation) { c.FirstSignMaxVersionCode = 10 },
+		"key alias":              func(c *Confirmation) { c.KeyAlias = "anyfun-release-2" },
+		"re-confirmed unchanged": func(c *Confirmation) {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newFixture(t)
+			s := g.open(t)
+			must(t, s.Confirm(manual))
+			planned, _, _ := s.ActiveConfirmation(pkg)
+			// 运维在自动确认计划之后又 confirm 了一次
+			concurrent := manual
+			mutate(&concurrent)
+			s.now = func() time.Time { return time.Now().Add(time.Second) }
+			must(t, s.Confirm(concurrent))
+			before := fileSize(t, filepath.Join(g.dir, TrustFileName))
+			if err := s.ConfirmAuto(next, &planned); !errors.Is(err, ErrConfirmationChanged) {
+				t.Fatalf("ConfirmAuto over a changed confirmation: %v", err)
+			}
+			if fileSize(t, filepath.Join(g.dir, TrustFileName)) != before {
+				t.Fatal("a refused automatic confirmation wrote a record")
+			}
+			if c, _, _ := s.ActiveConfirmation(pkg); c.CertificateSHA256 != certA || c.MinSDK != concurrent.MinSDK || c.FirstSignMaxVersionCode != concurrent.FirstSignMaxVersionCode {
+				t.Fatalf("the operator's confirmation was replaced: %+v", c)
+			}
+		})
+	}
+	// 没有并发写：同一份计划照常写入
+	must(t, s.ConfirmAuto(next, &planned))
 }
 
 // 评审 P1-3：提升为主时，本机受信签名闸里用旧主 Ed25519 的那台在同一次写入里撤销；旧主被攻破、服务端把它
