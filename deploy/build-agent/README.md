@@ -148,8 +148,9 @@ builder 能写的地方只有当前任务的 `work/`、`out/` 与 `/tmp` 一类�
   - 装两个程序、sudoers（visudo 校验）、unit；
   - 冒烟：以 builder、空环境跑两个程序，都必须以 2 退出。
 - **仓库镜像**：
-  - GitHub 只读 deploy key 没有就生成；known_hosts 写入 GitHub 公布的 ed25519 主机公钥（固定在脚本里，不用 ssh-keyscan）；
-  - 已有 deploy key 且还没有镜像时，以 rn-build-agent 身份 `git clone --mirror`。
+  - GitHub 只读 deploy key 没有就生成；固定 known_hosts 写到 `/opt/rn-build-agent/github_known_hosts`（root 所有、rn-build-agent 改不了，控制进程 fetch 时只认它），内容是 GitHub 公布的 ed25519 主机公钥（固定在脚本里，不用 ssh-keyscan）；
+  - 已有 deploy key 且还没有镜像时，以 rn-build-agent 身份 `git clone --mirror`（空模板、只许 ssh、不跑 hook）。
+  - 控制进程每次 fetch 前核对镜像：目录与 `config` 属于 rn-build-agent、组与其他人不可写，`config` 只允许 `git clone --mirror` 写出的键（`core.*`、`remote.origin.url/fetch/mirror/tagopt`），不允许 `branches/`、`remotes/`、`objects/info/alternates`、`info/attributes` 等；`GIT_SSH_COMMAND` 固定只用 deploy key 与固定 known_hosts，传输协议 fetch 远端只放行 ssh。不符就整个任务失败并提示按手册重建，不自动修。
 - **注册**：`build-agent enroll`（见「身份登记」）。
 - **启动**：`systemctl enable` 并重启 `rn-build-agent`，等常驻进程写出 `runner-mode.json` 后打印 `show-key`。
 
@@ -160,7 +161,7 @@ builder 能写的地方只有当前任务的 `work/`、`out/` 与 `/tmp` 一类�
 
 ## 身份登记
 
-1. **注册**：`build-agent enroll --server <API 源> --code rne_… --env-file /etc/rn-build-agent.env --state-dir /var/lib/rn-build-agent/state`，由 install.sh 以 root 调用。
+1. **注册**：`build-agent enroll --server <API 源> --env-file /etc/rn-build-agent.env --state-dir /var/lib/rn-build-agent/state`，由 install.sh 以 root 调用。注册码经环境变量 `RN_ENROLLMENT_CODE` 交给它（不进进程参数，本机其他用户读不到；`--code` 仍兼容，两者都给必须相同）。
    1. describe：注册码必须属于一台构建机，这一步不消耗注册码。
    2. 出处密钥：已有就复用（核对属主与权限），没有就生成。以 root 运行时密钥交给状态目录的属主 rn-build-agent；状态目录属于 root 时拒绝。
    3. 先在 `/etc` 建好临时文件。
