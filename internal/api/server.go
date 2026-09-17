@@ -219,6 +219,9 @@ func (s *server) routes() *gin.Engine {
 	platform.POST("/machines/:id/revoke", s.revokeMachine)
 	platform.POST("/machines/:id/accept-key", s.acceptMachineKey)
 	platform.POST("/machines/:id/signer-role", s.setSignerRole)
+	// 构建机能构建哪些平台。改它等于改任务路由：给没装 Xcode 的机器加上 ios，
+	// iOS 任务会被它领走、失败、退回排队、再被它领走
+	platform.POST("/machines/:id/platforms", s.setMachinePlatforms)
 	// 重发注册码（旧码作废），只对还没注册的机器
 	platform.POST("/machines/:id/enrollment", s.reissueEnrollment)
 	// 平台离线恢复公钥（build.recovery.recipients）：签名闸生成的密钥都要加密给它，签名闸本机另外 pin

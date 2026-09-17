@@ -27,6 +27,8 @@ var (
 	packagePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$`)
 	sha256Pattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	addressPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
+	// Apple 开发者团队号：10 位大写字母数字，与服务端 release_identity_apple.go 同一条
+	appleTeamPattern = regexp.MustCompile(`^[A-Z0-9]{10}$`)
 )
 
 // React Native 模板自带的 debug keystore 的证书指纹。它的私钥在每一台装了 RN 的
@@ -91,6 +93,15 @@ func validateTenantFile(manifest map[string]any) error {
 	}
 	if code, ok := manifest["androidVersionCode"].(float64); !ok || code < 1 {
 		return fmt.Errorf("androidVersionCode must be a positive integer")
+	}
+	// Apple Team ID 只有配了 iOS 发布身份的租户才有，所以可以缺；有就必须是那 10 位。
+	// iOS 任务缺它的话构建会在 xcodebuild 那一步失败，那时已经检出、装完依赖——
+	// iOS 构建路径自己在开工前再要求一次，这里只管格式。
+	if value, present := manifest["appleTeamId"]; present {
+		team, ok := value.(string)
+		if !ok || !appleTeamPattern.MatchString(team) {
+			return fmt.Errorf("appleTeamId %v is not a 10-character Apple Developer Team ID", value)
+		}
 	}
 	return nil
 }

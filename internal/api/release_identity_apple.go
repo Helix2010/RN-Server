@@ -340,3 +340,28 @@ func (s *server) wellKnownAppleAppSiteAssociation(c *gin.Context) {
 	c.Header("Cache-Control", "public, max-age=3600")
 	c.JSON(http.StatusOK, appleAppSiteAssociation(record.Value))
 }
+
+// iosBuildIdentityProblem 回答"这个租户现在能不能出一个 iOS 包"，能就返回空串。
+//
+// 单独一条而不是并进 composeTenantManifest：那份清单是两个平台共用的，把 iOS 的
+// 必填项加进去会让**Android** 的构建因为"没配 Apple Team ID"排不进队列。
+//
+// 检查放在排队那一刻（createBuildJob）与认领那一刻（claimBuildJob）各一次：前者让
+// 运营当场看见缺什么，后者兜住"排队之后有人把配置删了"——队列是跨租户的，一条注定
+// 失败的任务占着构建机，拖的是所有人。
+func (s *server) iosBuildIdentityProblem(ctx context.Context, tenant string) string {
+	record, err := s.iosReleaseIdentityRecord(ctx, tenant)
+	if err != nil {
+		return "存着的 release.ios 配置读不出来：" + err.Error()
+	}
+	if record == nil {
+		return "这个租户还没有登记 iOS 发布身份（Apple Team ID 与 bundle id）。到「iOS 打包与分发 → 应用身份」登记后再排队。"
+	}
+	if strings.TrimSpace(record.Value.AppleTeamID) == "" {
+		return "iOS 发布身份缺 Apple Team ID：构建时要拿它做 DEVELOPMENT_TEAM，缺了 xcodebuild 签不了名。"
+	}
+	if strings.TrimSpace(record.Value.BundleID) == "" {
+		return "iOS 发布身份缺 bundle id。"
+	}
+	return ""
+}

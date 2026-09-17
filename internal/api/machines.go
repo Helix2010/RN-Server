@@ -41,6 +41,10 @@ const (
 	machineRoleBuilder = "builder"
 	machineRoleSigner  = "signer"
 
+	// 构建机的平台能力。与 build_jobs.platform 同一套取值
+	buildPlatformAndroid = "android"
+	buildPlatformIOS     = "ios"
+
 	signerRolePrimary = "primary"
 	signerRoleStandby = "standby"
 
@@ -113,9 +117,17 @@ type machinePendingKey struct {
 // 构建机：publicKey 是 Ed25519 出处公钥，ed25519* 恒为空。
 // 签名闸：publicKey 是 X25519（收件人），ed25519PublicKey 用于本机记录签名与换钥证明。
 type buildMachine struct {
-	ID                     string             `json:"id"`
-	Role                   string             `json:"role"`
-	SignerRole             optString          `json:"signerRole"`
+	ID         string    `json:"id"`
+	Role       string    `json:"role"`
+	SignerRole optString `json:"signerRole"`
+	// Platforms 是这台构建机能构建的平台（仅 builder）。**登记说了算，机器自报只能收窄**：
+	// 认领时代理报的 platforms 与这里求交集，报了 ios 的 Linux 机器领不到 iOS 任务。
+	//
+	// 为什么必须存在登记里而不是只信自报：iOS 任务要求一台装了 Xcode 的 Mac，而队列是
+	// 跨租户的——一台配错的机器领走 iOS 任务、失败、退回排队、再领走，会把这个租户的
+	// 发布卡在一个自愈不了的循环里。空 = ["android"]：签名闸上线之前登记的构建机全是
+	// Linux，不能因为加了这个字段就把它们变成"什么都不能构建"。
+	Platforms              []string           `json:"platforms,omitempty"`
 	Name                   string             `json:"name"`
 	Status                 string             `json:"status"`
 	TokenSHA256            string             `json:"tokenSha256"`
@@ -143,6 +155,56 @@ type buildMachine struct {
 	// 最近一次变化的时间。只用于控制台提示，签名闸不采信服务端。只在值变化时写；null = 从未上报
 	ReportedTrust   *machineReportedTrust `json:"reportedTrust"`
 	ReportedTrustAt optString             `json:"reportedTrustAt"`
+}
+
+// buildPlatforms 是这台机器实际能构建的平台。空值按 ["android"] 读，理由见
+// buildMachine.Platforms 的注释。签名闸不构建任何东西，返回空。
+func (m buildMachine) buildPlatforms() []string {
+	if m.Role != machineRoleBuilder {
+		return nil
+	}
+	if len(m.Platforms) == 0 {
+		return []string{buildPlatformAndroid}
+	}
+	return m.Platforms
+}
+
+func (m buildMachine) canBuild(platform string) bool {
+	return containsString(m.buildPlatforms(), platform)
+}
+
+// hasLiveBuilderFor 回答"现在有没有一台没被吊销的构建机能构建这个平台"。
+// 排队时用它：让"没有 Mac"在点下按钮的那一刻就说出来，而不是排成一条永远没人认领的任务。
+func (d buildMachinesDoc) hasLiveBuilderFor(platform string) bool {
+	for _, m := range d.Machines {
+		if m.Role == machineRoleBuilder && m.Status != machineStatusRevoked && m.canBuild(platform) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeBuildPlatforms 去重、按固定顺序排列，并校验取值。
+// 顺序固定是为了让审计里的前后对比不会因为顺序不同而显示成一次改动。
+func normalizeBuildPlatforms(values []string) ([]string, error) {
+	seen := map[string]bool{}
+	for _, value := range values {
+		platform := strings.ToLower(strings.TrimSpace(value))
+		if platform != buildPlatformAndroid && platform != buildPlatformIOS {
+			return nil, fmt.Errorf("platforms must be android or ios, got %q", value)
+		}
+		seen[platform] = true
+	}
+	out := []string{}
+	for _, platform := range []string{buildPlatformAndroid, buildPlatformIOS} {
+		if seen[platform] {
+			out = append(out, platform)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("a builder must be able to build at least one platform")
+	}
+	return out, nil
 }
 
 // machineEnrollment 是一台机器的一次性注册码状态。注册码原文只出现在新建与重发的响应里。
@@ -247,6 +309,10 @@ func (d buildMachinesDoc) validate() error {
 			return fmt.Errorf("machine %s reports signer trust but is not a signer", m.ID)
 		case m.Role == machineRoleBuilder && m.SignerRole != "":
 			return fmt.Errorf("builder %s carries a signer role", m.ID)
+		case m.Role == machineRoleSigner && len(m.Platforms) > 0:
+			return fmt.Errorf("signer %s carries build platforms", m.ID)
+		case m.Role == machineRoleBuilder && len(m.Platforms) > 0 && !validBuildPlatforms(m.Platforms):
+			return fmt.Errorf("builder %s has invalid build platforms", m.ID)
 		// 吊销的签名闸没有主备角色（吊销时置空；更早吊销的记录可能还留着原角色）
 		case m.Role == machineRoleSigner && m.SignerRole != signerRolePrimary && m.SignerRole != signerRoleStandby &&
 			!(m.Status == machineStatusRevoked && m.SignerRole == ""):
@@ -488,6 +554,7 @@ func machineView(m buildMachine) gin.H {
 		"id":                            m.ID,
 		"role":                          m.Role,
 		"signerRole":                    nullableString(string(m.SignerRole)),
+		"platforms":                     m.buildPlatforms(),
 		"name":                          m.Name,
 		"status":                        m.Status,
 		"publicKeySha256":               nullableString(string(m.PublicKeySHA256)),
@@ -608,9 +675,10 @@ func (s *server) mutateMachines(c *gin.Context, expectedVersion int, mutate func
 
 func (s *server) createMachine(c *gin.Context) {
 	var body struct {
-		Role       string  `json:"role"`
-		Name       string  `json:"name"`
-		SignerRole *string `json:"signerRole"`
+		Role       string   `json:"role"`
+		Name       string   `json:"name"`
+		SignerRole *string  `json:"signerRole"`
+		Platforms  []string `json:"platforms"`
 		machineWriteCommon
 	}
 	if decode(c, &body) != nil || !body.valid() {
@@ -622,6 +690,22 @@ func (s *server) createMachine(c *gin.Context) {
 	signerRole := ""
 	if body.SignerRole != nil {
 		signerRole = strings.TrimSpace(*body.SignerRole)
+	}
+	// 平台能力：不传按 android（登记这个字段之前的全部构建机都是 Linux）。
+	// 一台 Mac 建成 ["ios"] 或 ["android","ios"] 都行——两个平台都能构建的机器是合法的，
+	// 只是今天没人这么装
+	platforms := []string{buildPlatformAndroid}
+	if len(body.Platforms) > 0 {
+		normalized, err := normalizeBuildPlatforms(body.Platforms)
+		if err != nil {
+			problem(c, http.StatusBadRequest, "INVALID_MACHINE", err.Error())
+			return
+		}
+		platforms = normalized
+	}
+	if role == machineRoleSigner && len(body.Platforms) > 0 {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "a signer builds nothing; omit platforms")
+		return
 	}
 	switch {
 	case role != machineRoleBuilder && role != machineRoleSigner:
@@ -684,10 +768,14 @@ func (s *server) createMachine(c *gin.Context) {
 			Status: machineStatusPendingEnrollment, Enrollment: newMachineEnrollment(code, actor(c), now),
 			CreatedBy: actor(c), CreatedAt: iso(now),
 		}
+		if role == machineRoleBuilder {
+			created.Platforms = platforms
+		}
 		doc.Machines = append(doc.Machines, created)
 		// 审计记机器身份与注册码有效期，不记注册码也不记它的 sha256
 		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_machine_create", machineAuditTargetType, created.ID, reason, requestID(c),
-			map[string]any{"machineId": created.ID, "role": role, "name": name, "signerRole": nullableString(signerRole), "enrollmentExpiresAt": created.Enrollment.ExpiresAt})}
+			map[string]any{"machineId": created.ID, "role": role, "name": name, "signerRole": nullableString(signerRole),
+				"platforms": created.buildPlatforms(), "enrollmentExpiresAt": created.Enrollment.ExpiresAt})}
 	})
 	if !ok {
 		return
@@ -1104,4 +1192,67 @@ func machineKeyResponse(m buildMachine) gin.H {
 		out["ed25519PublicKeySha256"] = nullableString(string(m.Ed25519PublicKeySHA256))
 	}
 	return out
+}
+
+// validBuildPlatforms 只做取值检查，不做归一化：登记里的值是写入时归一化过的，
+// 读到不合法的值说明有人直接改了库，那时该拒绝而不是纠正。
+func validBuildPlatforms(values []string) bool {
+	normalized, err := normalizeBuildPlatforms(values)
+	if err != nil || len(normalized) != len(values) {
+		return false
+	}
+	for i, value := range values {
+		if normalized[i] != value {
+			return false
+		}
+	}
+	return true
+}
+
+// setMachinePlatforms 改一台构建机能构建的平台。
+//
+// 这是一个会改变**任务路由**的操作：给一台没装 Xcode 的机器加上 ios，iOS 任务就会
+// 被它领走、失败、退回排队、再被它领走——一个自愈不了的循环，而队列是跨租户的。
+// 所以和其它登记改动一样要 expectedVersion + reason + confirm 并落审计。
+//
+// 反过来收窄能力是安全的：正在跑的那条任务不受影响（认领已经发生），下一轮不再派给它。
+func (s *server) setMachinePlatforms(c *gin.Context) {
+	var body struct {
+		Platforms []string `json:"platforms"`
+		machineWriteCommon
+	}
+	if decode(c, &body) != nil || !body.valid() {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "platforms, expectedVersion, reason (at least 3 characters) and confirm=true are required")
+		return
+	}
+	platforms, err := normalizeBuildPlatforms(body.Platforms)
+	if err != nil {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", err.Error())
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	reason := strings.TrimSpace(body.Reason)
+	var updated buildMachine
+	snapshot, ok := s.mutateMachines(c, *body.ExpectedVersion, func(doc *buildMachinesDoc, _ time.Time) (int, string, string, []auditEvent) {
+		index, found := doc.find(id)
+		if !found {
+			return http.StatusNotFound, "MACHINE_NOT_FOUND", "No machine with this id is registered", nil
+		}
+		machine := doc.Machines[index]
+		if machine.Role != machineRoleBuilder {
+			return http.StatusConflict, "MACHINE_NOT_A_BUILDER", "Only builders have build platforms", nil
+		}
+		if machine.Status == machineStatusRevoked {
+			return http.StatusConflict, "MACHINE_REVOKED", "A revoked machine claims nothing; create a new one", nil
+		}
+		previous := machine.buildPlatforms()
+		doc.Machines[index].Platforms = platforms
+		updated = doc.Machines[index]
+		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_machine_platforms", machineAuditTargetType, id, reason, requestID(c),
+			map[string]any{"machineId": id, "name": machine.Name, "platforms": platforms, "previous": previous})}
+	})
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"version": snapshot.Version, "machine": machineView(updated)})
 }

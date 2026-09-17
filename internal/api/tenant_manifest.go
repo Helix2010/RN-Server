@@ -26,11 +26,14 @@ import (
 // 身份，version 与 androidVersionCode 来自这次任务。这样"控制台里换了密钥、
 // tenant.json 忘了改"这类漂移在结构上就不存在了。
 type tenantManifest struct {
-	Slug                   string     `json:"slug"`
-	AppName                string     `json:"appName"`
-	Scheme                 string     `json:"scheme"`
-	AndroidPackage         string     `json:"androidPackage"`
-	IOSBundleID            string     `json:"iosBundleId"`
+	Slug           string `json:"slug"`
+	AppName        string `json:"appName"`
+	Scheme         string `json:"scheme"`
+	AndroidPackage string `json:"androidPackage"`
+	IOSBundleID    string `json:"iosBundleId"`
+	// AppleTeamID 只有配了 iOS 发布身份的租户才有。iOS 构建拿它当 DEVELOPMENT_TEAM，
+	// Android 构建看都不看——省略比发一个空串好，空串会让 RN-App 那侧的格式校验失败
+	AppleTeamID            string     `json:"appleTeamId,omitempty"`
 	APIBaseURL             string     `json:"apiBaseUrl"`
 	BootstrapSignerAddress string     `json:"bootstrapSignerAddress"`
 	ApplicationID          string     `json:"applicationId"`
@@ -160,14 +163,18 @@ func (s *server) composeTenantManifest(ctx context.Context, tenant string, cfg b
 	if background == "" {
 		background = defaultIconBackground
 	}
-	// iOS 还没有流水线，但字段必须在：app.config.ts 读不到会直接抛。配了 iOS 发布
-	// 身份就用它的 bundleId，没配就沿用 Android 包名——同一个反向域名是这套 App 的
-	// 现状，不是规则，iOS 上线时该显式配
+	// 配了 iOS 发布身份就用它的 bundleId 与 Team ID，没配就沿用 Android 包名——同一个
+	// 反向域名是这套 App 的现状，不是规则。字段必须在：app.config.ts 读不到会直接抛。
+	// 排 iOS 任务之前还会单独核一遍（iosBuildIdentityProblem），这里只负责合成
 	bundleID := strings.TrimSpace(release.Value.PackageName)
+	appleTeamID := ""
 	if ios, err := s.iosReleaseIdentityRecord(ctx, tenant); err != nil {
 		return tenantManifest{}, err
-	} else if ios != nil && strings.TrimSpace(ios.Value.BundleID) != "" {
-		bundleID = strings.TrimSpace(ios.Value.BundleID)
+	} else if ios != nil {
+		if strings.TrimSpace(ios.Value.BundleID) != "" {
+			bundleID = strings.TrimSpace(ios.Value.BundleID)
+		}
+		appleTeamID = strings.TrimSpace(ios.Value.AppleTeamID)
 	}
 
 	return tenantManifest{
@@ -176,6 +183,7 @@ func (s *server) composeTenantManifest(ctx context.Context, tenant string, cfg b
 		Scheme:                 strings.TrimSpace(identity.Scheme),
 		AndroidPackage:         strings.TrimSpace(release.Value.PackageName),
 		IOSBundleID:            bundleID,
+		AppleTeamID:            appleTeamID,
 		APIBaseURL:             strings.TrimRight(strings.TrimSpace(identity.APIBaseURL), "/"),
 		BootstrapSignerAddress: signer.Value.Address,
 		ApplicationID:          tenantApplicationID,

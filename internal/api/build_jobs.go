@@ -439,6 +439,34 @@ func (s *server) createBuildJob(c *gin.Context) {
 			"这次构建会改变 App 身份（"+strings.Join(drift, "；")+"）：装着当前版本的设备无法覆盖升级，只能卸载重装。确认确实要换身份后再排队。")
 		return
 	}
+	// 没有一台能构建这个平台的机器，就别把任务排进去。
+	//
+	// 这条闸是对称于 OTA 那侧（build_ota_jobs.go 的「打包机只做 android」）补上的，
+	// 但判据换成了登记而不是硬编码的平台名：iOS 打包机是一台装了 Xcode 的 Mac，接进来
+	// 之后这里不该还写着"iOS 不行"。
+	//
+	// 不加这道闸的后果不是"任务失败"，而是"任务永远 queued"——reapStaleBuildJobs 只回收
+	// claimed/running，一条没人认领的任务不会被回收，却**占着一个 build 号**
+	// （生成列 live_build_number 把 queued 也算活着），于是这个租户这个平台后面的每一次
+	// 排队都要跳过它。
+	registry, err := s.machineRegistry(c.Request.Context())
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to read the machine registry")
+		return
+	}
+	if !registry.hasLiveBuilderFor(platform) {
+		problem(c, http.StatusConflict, "NO_BUILDER_FOR_PLATFORM",
+			"没有登记任何能构建 "+platform+" 的构建机，排进去的任务不会有人认领。"+
+				"到「平台维护 → 构建机」登记一台并勾上这个平台（iOS 需要一台装了 Xcode 的 Mac）。")
+		return
+	}
+	// iOS 的签名身份不在签名闸上，在那台 Mac 的钥匙串里，所以它有自己的一套必填项
+	if platform == buildPlatformIOS {
+		if detail := s.iosBuildIdentityProblem(c.Request.Context(), tenantID(c)); detail != "" {
+			problem(c, http.StatusConflict, "IOS_IDENTITY_INCOMPLETE", detail)
+			return
+		}
+	}
 	// 主签名闸没有就绪，这个包出得来也签不了——别让它占构建机，停在「待签名」里。
 	// 判据与签名认领用的是同一个函数（signerReadinessFor）：两边说法不一致时，
 	// 排进去的任务会永远等不到签名闸。租户改了 apiBaseUrl 或 OTA 密钥之后，在主签名闸

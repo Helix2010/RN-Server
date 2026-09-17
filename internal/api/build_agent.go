@@ -91,15 +91,30 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
 		return
 	}
+	// 自报的平台只能**收窄**登记里的能力，不能扩张它：一台没装 Xcode 的 Linux 机器
+	// 报了 ios，领走的 iOS 任务只会失败、退回排队、再被它领走——一个自愈不了的循环，
+	// 而队列是跨租户的。登记是平台管理员维护的，自报只是"我这次想干什么"。
+	capable := machine.buildPlatforms()
 	args := []any{}
+	claimed := []string{}
 	for _, p := range body.Platforms {
-		if p != "android" && p != "ios" {
+		if p != buildPlatformAndroid && p != buildPlatformIOS {
 			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms must be android or ios")
 			return
 		}
+		if !containsString(capable, p) {
+			continue
+		}
+		claimed = append(claimed, p)
 		args = append(args, p)
 	}
-	platformPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(body.Platforms)), ",")
+	if len(claimed) == 0 {
+		problemWith(c, http.StatusConflict, "MACHINE_PLATFORM_NOT_REGISTERED",
+			"This machine is not registered to build any of the platforms it asked for; a platform admin changes that in the console",
+			gin.H{"requested": body.Platforms, "registered": capable})
+		return
+	}
+	platformPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(claimed)), ",")
 	for _, k := range body.Kinds {
 		if k != jobKindAPK && k != jobKindOTA {
 			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "kinds must be apk or ota")
@@ -262,6 +277,14 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		}
 		problem(c, http.StatusInternalServerError, "APP_IDENTITY_INVALID", "Unable to compose the tenant app identity")
 		return
+	}
+	// 排队之后有人把 iOS 身份删了：当场判失败，别让这条任务占着 Mac 跑一趟必然失败的构建
+	if job.Platform == buildPlatformIOS {
+		if detail := s.iosBuildIdentityProblem(ctx, job.TenantID); detail != "" {
+			s.markBuildJobFailed(ctx, job, detail)
+			problem(c, http.StatusConflict, "IOS_IDENTITY_INCOMPLETE", detail)
+			return
+		}
 	}
 	view["tenantFile"] = manifest
 	// OTA 证书两种任务都要：它编进包里的 expo-updates 配置，也因此进原生指纹。
