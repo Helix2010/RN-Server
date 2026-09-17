@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# 【已被取代】新机器用服务端下发的 internal/machinesetup/install.sh（安装包由 deploy/setup/build-bundles.sh 构建），
-# 手册见 deploy/amos/SIGNING_GATE_ROLLOUT.md。这个脚本只为 amos 的首次手工上线保留，amos 迁移完成后删除，不要再用于新机器。
+# 【已被取代，请勿再用】新机器用服务端下发的 internal/machinesetup/install.sh（安装包由 deploy/setup/build-bundles.sh
+# 构建），手册见 deploy/amos/SIGNING_GATE_ROLLOUT.md。这个脚本只记录 amos 2026-09-16 首次手工上线做过什么。
+#
+# 【安全提醒】这里的构建机迁移做法已过时，**不要再用它做 amos 的升级迁移**：它保留了 builder 写过的仓库镜像
+# 与 ~/.ssh（只 chown、不重建），而控制进程 git fetch 会读镜像本地配置、ssh 会读 ~/.ssh/config——builder 曾能写它们。
+# 升级到会校验镜像的新构建机二进制时，按 SIGNING_GATE_ROLLOUT.md 第 5.1 节「重建构建机仓库镜像与 ~/.ssh、装固定
+# known_hosts」重建（旧镜像与旧 ~/.ssh 整棵移进留存目录、以 rn-build-agent 重新克隆、known_hosts 用固定主机公钥重写）。
 # 签名闸上线 · 第 1 步（amos，root，不涉及任何令牌）：迁移构建机到两个用户、安装签名闸与 CI 收口脚本。
 #   sudo bash 1-install.sh <部署包目录>      部署包由 0-bundle.sh 在开发机上生成后 scp 过来
 # 可重复执行。旧构建机的配置、二进制、agent-key 留存在 /root/rn-build-agent-legacy-<日期>/，回滚用。
