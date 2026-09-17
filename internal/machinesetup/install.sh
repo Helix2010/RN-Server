@@ -29,7 +29,25 @@
 # 机密：机器令牌只由 enroll 程序写进 env 文件，这个脚本从不读取、打印它；注册码经 stdin 交给 curl，
 # 不放进 curl 的命令行参数。
 set -euo pipefail
-umask 022
+# 以 root 执行：当前目录、umask、PATH 与环境一律换成固定的，之后调用的程序（python3、java、git、tar、
+# sha256sum……）不从执行者所在的目录（例如任何人都能写的 /tmp）或继承来的环境变量里加载任何东西。
+# 装出来的文件都用 install -m 显式给权限，umask 只兜底脚本自己写的临时文件。
+cd /
+umask 077
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+HOME=/root
+export PATH HOME
+# 导出的环境变量只留这几个（代理留着：curl 要经它连服务端）；从环境导入的 shell 函数一律丢掉
+for _name in $(compgen -e); do
+  case "$_name" in
+    PATH | HOME | TERM | LANG | LC_* | http_proxy | https_proxy | no_proxy | HTTP_PROXY | HTTPS_PROXY | NO_PROXY) ;;
+    *) unset "$_name" 2>/dev/null || true ;;
+  esac
+done
+for _name in $(compgen -A function); do
+  unset -f "$_name"
+done
+unset _name
 
 readonly SETUP_ROOT=/var/lib/rn-machine-setup
 # 签名闸实例名：系统用户 rn-signer-<实例> 受 Linux 用户名 32 字符上限，所以最多 22 个字符（与服务端对签名闸机器名的限制一致）
@@ -142,7 +160,8 @@ normalize_sha256() {
 }
 
 curl_api() {
-  curl --silent --show-error --proto "$CURL_PROTO" --connect-timeout 15 "$@"
+  # -q 必须是第一个参数：不读 ~/.curlrc
+  curl -q --silent --show-error --proto "$CURL_PROTO" --connect-timeout 15 "$@"
 }
 
 sha256_of() {
@@ -236,7 +255,8 @@ describe() {
 
 # 服务端 Problem Details 里的 code（只取形状合法的，别的不打印）
 problem_code() {
-  python3 - "$1" <<'PY' 2>/dev/null || printf 'no problem code'
+  # python3 一律 -I（隔离模式）：sys.path 里没有当前目录与用户 site-packages，也不读 PYTHON* 环境变量
+  python3 -I - "$1" <<'PY' 2>/dev/null || printf 'no problem code'
 import json, re, sys
 try:
     code = json.load(open(sys.argv[1])).get("code", "")
@@ -249,7 +269,7 @@ PY
 # 校验 describe 的回答并输出 KEY=VALUE 行。每个值都按形状校验过，只含安全字符；文件清单写进
 # 同目录的 files.sha256（sha256sum -c 的格式）。服务端给的字符串不进 eval，不原样打印。
 parse_description() {
-  python3 - "$1" "$WORK/files.sha256" <<'PY'
+  python3 -I - "$1" "$WORK/files.sha256" <<'PY'
 import json, re, sys
 
 def fail(what):
@@ -348,7 +368,8 @@ resolve_target() {
 java_is_17() { # $1 = JAVA_HOME
   local version
   [ -x "$1/bin/java" ] || return 1
-  version="$("$1/bin/java" -version 2>&1)" || return 1
+  # 空环境（不吃 JAVA_TOOL_OPTIONS 之类），不往 /tmp/hsperfdata_root 写性能计数文件
+  version="$(env -i "$1/bin/java" -XX:-UsePerfData -version 2>&1)" || return 1
   [[ "$version" == *'version "17'* ]]
 }
 
@@ -761,7 +782,8 @@ install_builder() {
       note "已建系统用户 builder"
     fi
     for f in /etc/cron.deny /etc/at.deny; do
-      touch "$f"
+      # 显式 0644：crontab 是 setgid 程序，读不到 deny 文件时 Debian 的 cron 按“允许”处理
+      [ -e "$f" ] || install -o root -g root -m 0644 /dev/null "$f"
       grep -qx builder "$f" || printf 'builder\n' >>"$f"
     done
 
