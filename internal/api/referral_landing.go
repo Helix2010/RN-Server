@@ -66,9 +66,11 @@ func (s *server) referralLandingPage(c *gin.Context) {
 	c.Status(http.StatusOK)
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	_ = referralLandingTemplate.Execute(c.Writer, map[string]string{
-		"AppName":     s.tenantDisplayName(c),
-		"Code":        referral.Format(code),
-		"DownloadURL": "/v1/public/releases/latest/download",
+		"AppName": s.tenantDisplayName(c),
+		"Code":    referral.Format(code),
+		// 指公开下载落地页而不是直接指安装包：那条路由缺 platform 参数时默认
+		// android，于是 iOS 用户扫邀请码拿到的是一个 APK
+		"DownloadURL": "/app/download",
 	})
 }
 

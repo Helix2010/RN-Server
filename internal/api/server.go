@@ -186,6 +186,9 @@ func (s *server) routes() *gin.Engine {
 	// 邀请落地页。没装 App 的人从这里拿到邀请码与下载引导；装了且系统校验通过的
 	// 会被 App Links 直接唤起，走不到这里。与上面那条共用同一个限流计数器
 	r.GET("/app/invite/:code", s.domainTenantScope(), s.referralLandingPage)
+	// 公开下载落地页。海报与二维码印的是这一条：它按 UA 把 iOS 导去 TestFlight、
+	// 把 Android 导去直装包，一个二维码管两端（设计 ios-testflight §4.5.5）
+	r.GET("/app/download", s.domainTenantScope(), s.downloadLandingPage)
 	r.GET("/v1/mobile/languages/:languageCode/document", s.mobileLanguageDocument)
 	r.GET("/v1/mobile/branding/assets/:id", s.domainTenantScope(), s.brandingAsset)
 	r.GET("/v1/ota/manifest", s.domainTenantScope(), s.otaManifest)
@@ -1912,6 +1915,16 @@ func (s *server) bootstrap(c *gin.Context) {
 				installedSigner = s.installedReleaseSigner(c.Request.Context(), tenant.ID, platform, version, buildNumber)
 			}
 		}
+	}
+	// iOS 的安装入口是租户在 App Store Connect 上开的 TestFlight 公开链接（或商店
+	// 页面），由运营登记在 release.ios。产物不在我们手里，所以 releaseId / sha256 /
+	// size 保持为 null——编一个出来就是撒谎，而它们正是"应用内直装"那条分支的判据。
+	//
+	// 只给 store，不给 mdm：MDM 是受管设备的分发通道，把 TestFlight 链接发给它是
+	// 错配。没有这一段时 iOS 的 actionUrl 永远是空串，一旦触发强更，更新弹窗会落到
+	// "强制更新但没有按钮"的分支上，用户没有任何出路。
+	if platform == "ios" && distribution == "store" {
+		actionURL = s.iosInstallURL(c.Request.Context(), tenant.ID)
 	}
 
 	// 商店 / MDM 渠道拿不到直装包，但运营勾的"强制升级"仍然要生效：
