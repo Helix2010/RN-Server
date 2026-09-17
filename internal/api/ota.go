@@ -127,7 +127,7 @@ func (s *server) listOTAReleases(c *gin.Context) {
 		return
 	}
 	query := where.and(page.after)
-	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.canary_installations,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM `+from+` WHERE `+query.sql()+` ORDER BY o.revision DESC, o.created_at DESC, o.id DESC LIMIT ?`, append(query.args, page.limit+1)...)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.base_release_id,o.platform,o.channel,o.runtime_version,o.revision,o.update_id,o.release_kind,o.apply_strategy,o.status,o.canary_installations,o.manifest_sha256,o.release_notes,o.source_commit_sha,o.rejection_reason,o.created_by,o.verified_at,o.published_at,o.created_at,o.updated_at, a.version,a.build_number FROM `+from+` WHERE `+query.sql()+` ORDER BY o.created_at DESC, o.id DESC LIMIT ?`, append(query.args, page.limit+1)...)
 	if err != nil {
 		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
 		return
@@ -152,7 +152,7 @@ func (s *server) listOTAReleases(c *gin.Context) {
 			return
 		}
 		items = append(items, gin.H{"id": id, "baseReleaseId": base, "baseVersion": baseVersion, "baseBuildNumber": baseBuild, "platform": p, "channel": channel, "runtimeVersion": runtime, "revision": revision, "updateId": updateID, "releaseKind": kind, "applyStrategy": applyStrategy, "status": st, "canaryInstallations": canaryAudienceForStatus(st, audience), "manifestSha256": nullableString(sha.String), "releaseNotes": noteValue, "sourceCommitSha": nullableString(source.String), "rejectionReason": nullableString(rejection.String), "createdBy": creator, "verifiedAt": nullableOTAFieldTime(verified), "publishedAt": nullableOTAFieldTime(published), "createdAt": nullableOTAFieldTime(created), "updatedAt": nullableOTAFieldTime(updated)})
-		cursors = append(cursors, encodeListCursor(revision, created.Time, id))
+		cursors = append(cursors, encodeListCursor(created.Time, id))
 	}
 	if err := rows.Err(); err != nil {
 		problem(c, 500, "OTA_QUERY_FAILED", "Unable to load OTA releases")
@@ -180,7 +180,10 @@ func parseOTAListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, stri
 	}
 	addExactFilter(c, &where, "channel", "o.channel")
 	addExactFilter(c, &where, "baseReleaseId", "o.base_release_id")
-	page, invalid := parseListPage(c, sortKey{"o.revision", cursorUint}, sortKey{"o.created_at", cursorTime}, sortKey{"o.id", cursorText})
+	// 按发布时间倒序，不按 revision：revision 是 (tenant, platform, channel, runtime_version)
+	// 分组内的递增序号（uq_ota_revision），跨分组比大小没有业务含义——多个 runtime 并存时
+	// 列表会按"第几次改"分层排，基线版本号和时间两列都不单调，最近发的反而排在中间。
+	page, invalid := parseListPage(c, sortKey{"o.created_at", cursorTime}, sortKey{"o.id", cursorText})
 	return where, page, invalid
 }
 

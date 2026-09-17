@@ -204,9 +204,10 @@ func TestDBOTAListPagesAndOffersEveryBaseAsAFilter(t *testing.T) {
 		return recorder
 	}
 	key := listField("id")
-	// revision 相同的两条按 created_at 倒序
+	// 按发布时间倒序，不按 revision：s1 是 staging 的第 1 版、p2 是 production 的第 2 版，
+	// revision 跨分组没有可比性，s1 比 p2 晚发就排在它前面
 	keys, total := pageThrough(t, call, "", key)
-	assertListKeys(t, "all", keys, total, []string{otaID("p3"), otaID("p2"), otaID("s1"), otaID("p1")}, 4)
+	assertListKeys(t, "all", keys, total, []string{otaID("p3"), otaID("s1"), otaID("p2"), otaID("p1")}, 4)
 	keys, total = pageThrough(t, call, "baseReleaseId="+baseID("old"), key)
 	assertListKeys(t, "base", keys, total, []string{otaID("p2"), otaID("p1")}, 2)
 	keys, total = pageThrough(t, call, "channel=staging", key)
