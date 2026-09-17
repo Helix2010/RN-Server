@@ -266,7 +266,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		"version": keystore.Version, "updatedBy": nil, "updatedAt": nil,
 		"recipients": []gin.H{}, "missingSigners": []gin.H{}, "signers": []gin.H{},
 		"ready": readiness.Ready, "readinessProblems": readiness.problemList(), "trustRoots": nil, "trustRootsDigest": nil,
-		"generationRequest": nil, "generator": nil, "recoveryRecipients": []string{},
+		"generationRequest": nil, "generator": nil, "recoveryRecipients": []string{}, "revokedRecoveryRecipients": []string{},
 	}
 	if readiness.Generation != nil {
 		view["generationRequest"] = readiness.Generation.view()
@@ -289,12 +289,16 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		if err != nil {
 			return nil, err
 		}
-		// 恢复收件人：密钥里加密给了哪几把登记过的恢复公钥（吊销了的也算——密文已经发给它了）
-		recoveryRecipients := []string{}
+		// 恢复收件人：密钥里加密给了哪几把登记过的恢复公钥（吊销了的也算——密文已经发给它了）；其中已吊销的
+		// 单独列出来，全部吊销了这把密钥就没有可用的离线恢复（导出也会被拒）
+		recoveryRecipients, revokedRecoveryRecipients := []string{}, []string{}
 		items := []gin.H{}
 		for _, recipient := range keystore.Record.Recipients {
-			if _, ok := recoveryKeys.Doc.anyBySHA256(recipient); ok {
+			if key, ok := recoveryKeys.Doc.anyBySHA256(recipient); ok {
 				recoveryRecipients = append(recoveryRecipients, recipient)
+				if key.revoked() {
+					revokedRecoveryRecipients = append(revokedRecoveryRecipients, recipient)
+				}
 			}
 			recipients[recipient] = true
 			item := gin.H{"recipientSha256": recipient, "machineId": nil, "name": nil, "signerRole": nil}
@@ -303,7 +307,7 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 			}
 			items = append(items, item)
 		}
-		view["recipients"], view["recoveryRecipients"] = items, recoveryRecipients
+		view["recipients"], view["recoveryRecipients"], view["revokedRecoveryRecipients"] = items, recoveryRecipients, revokedRecoveryRecipients
 	}
 	checks, err := s.keystoreChecksFor(ctx, s.db, tenant)
 	if err != nil {
@@ -406,6 +410,14 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 	if upload.PackageName != identity.PackageName || upload.CertificateSHA256 != identity.SignerSHA256 {
 		problem(c, http.StatusUnprocessableEntity, "BUILD_KEYSTORE_IDENTITY_MISMATCH",
 			"packageName and signerSha256 must equal the package name and certificate fingerprint inside the keystore file")
+		return
+	}
+	if inUse, err := androidPackageUsedByAnotherTenant(ctx, s.db, tenantID(c), identity.PackageName); err != nil {
+		slog.Error("cannot check whether another tenant uses the package name", "tenant", tenantID(c), "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to check the package name")
+		return
+	} else if inUse {
+		androidPackageInUse(c)
 		return
 	}
 	registry, err := s.machineRegistry(ctx)
@@ -548,11 +560,22 @@ func (s *server) sealKeystoreRecord(tenant string, upload keystorebox.Upload) (b
 	}, nil
 }
 
-// exportBuildKeystore GET /v1/admin/build-keystore/export：下载当前密钥的上传文件（纯密文，服务端与
-// 租户管理员都打不开），给离线工具 build-keystore recover 用恢复私钥解开。写审计。
+// exportBuildKeystore GET /v1/admin/build-keystore/export：下载当前密钥的上传文件给离线工具 build-keystore
+// recover 用恢复私钥解开。只带发给未吊销恢复公钥的密文：发给签名闸的那几份不带——租户管理员都能导出，
+// 带上的话，一台被吊销但没擦盘的签名闸私钥加上任何一次导出就能解开密钥。recover 只解发给恢复公钥的那份、
+// 核对明文与外层字段，不校验生成签名，所以裁掉别的 box 不影响它。
+//
+// 审计与读密钥在同一个事务里，审计写不进去就不导出（导出的是密钥的密文，不能有没留痕的一次）。
 func (s *server) exportBuildKeystore(c *gin.Context) {
 	ctx := c.Request.Context()
-	state, err := s.buildKeystoreStateFor(ctx, s.db, tenantID(c))
+	tenant := tenantID(c)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_EXPORT_FAILED", "Unable to export the keystore file")
+		return
+	}
+	defer tx.Rollback()
+	state, err := s.buildKeystoreStateFor(ctx, tx, tenant)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
 		return
@@ -561,15 +584,43 @@ func (s *server) exportBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusNotFound, "BUILD_KEYSTORE_NOT_CONFIGURED", "This tenant has no usable v3 signing keystore to export")
 		return
 	}
-	raw, err := json.MarshalIndent(state.Upload, "", "  ")
+	recoveryKeys, err := readRecoveryKeys(ctx, tx, false)
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Unable to serialise the keystore file")
+		problem(c, http.StatusServiceUnavailable, "RECOVERY_KEYS_UNAVAILABLE", "Recovery keys cannot be read")
 		return
 	}
-	s.auditNow(newAudit(tenantID(c), actor(c), "build_keystore_exported", "app-config", buildKeystoreConfigKey,
+	exported := *state.Upload
+	exported.Boxes = []keystorebox.Box{}
+	recipients := []string{}
+	for _, box := range state.Upload.Boxes {
+		if _, ok := recoveryKeys.Doc.liveBySHA256(box.RecipientSHA256); ok {
+			exported.Boxes = append(exported.Boxes, box)
+			recipients = append(recipients, box.RecipientSHA256)
+		}
+	}
+	if len(exported.Boxes) == 0 {
+		problem(c, http.StatusConflict, "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT",
+			"The current key is not sealed to any registered, unrevoked offline recovery key, so there is nothing to export for offline recovery")
+		return
+	}
+	raw, err := json.MarshalIndent(exported, "", "  ")
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_EXPORT_FAILED", "Unable to serialise the keystore file")
+		return
+	}
+	event := newAudit(tenant, actor(c), "build_keystore_exported", "app-config", buildKeystoreConfigKey,
 		"the sealed keystore file was exported for offline recovery", requestID(c),
 		map[string]any{"keystoreVersion": state.Version, "keyAlias": state.Record.KeyAlias, "certificateSha256": state.Record.CertificateSHA256,
-			"packageName": state.Record.PackageName, "recipients": state.Record.Recipients}))
+			"packageName": state.Record.PackageName, "recipients": recipients})
+	if err := insertAudit(ctx, tx, event); err != nil {
+		slog.Error("refusing to export a keystore whose audit cannot be written", "tenant", tenant, "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_EXPORT_FAILED", "Unable to record the export audit; nothing was exported")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_EXPORT_FAILED", "Unable to record the export audit; nothing was exported")
+		return
+	}
 	fileName := fmt.Sprintf("%s-keystore-v%d.json", strings.ToLower(state.Record.TenantSlug), state.Version)
 	c.Header("Content-Disposition", `attachment; filename="`+fileName+`"`)
 	c.Header("Cache-Control", "no-store")

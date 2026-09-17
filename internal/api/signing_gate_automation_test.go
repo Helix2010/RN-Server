@@ -216,6 +216,32 @@ func (f *gateFixture) storedGenerationRequest() keystoreGenerationRequest {
 	return *request
 }
 
+// revokeRecoveryKey 以平台管理员身份吊销一把恢复公钥。
+func (f *gateFixture) revokeRecoveryKey(id string) {
+	f.t.Helper()
+	snapshot, err := readRecoveryKeys(context.Background(), f.db, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/recovery-keys/"+id+"/revoke", map[string]any{"expectedVersion": snapshot.Version, "reason": "rotated", "confirm": true}); r.Code != http.StatusOK {
+		f.t.Fatalf("revoke recovery key: %d %s", r.Code, r.Body.String())
+	}
+}
+
+// storedGenerationRequestOrNil 读这个租户的生成请求；没有返回 nil。
+func (f *gateFixture) storedGenerationRequestOrNil() *keystoreGenerationRequest {
+	f.t.Helper()
+	raw, _, err := configRowVersion(context.Background(), f.db, f.tenant, buildKeystoreRequestConfigKey, false)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	request, err := parseGenerationRequest(raw)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return request
+}
+
 func (f *gateFixture) auditCount(tenant, action string) int {
 	f.t.Helper()
 	var count int
@@ -572,6 +598,40 @@ func pendingMachines(f *gateFixture) []buildMachine {
 	return out
 }
 
+// 重发签名闸的注册码与新建是同一条前提：平台没有未吊销的恢复公钥时 409 RECOVERY_KEY_NOT_CONFIGURED（装出来的
+// 签名闸什么也生成不了），旧码不作废；构建机不受影响；已吊销的机器仍然先报 MACHINE_REVOKED。
+func TestDBSignerEnrollmentReissueNeedsARecoveryKey(t *testing.T) {
+	f := newGateFixture(t, 136)
+	recoveryKey := f.registerRecoveryKey("platform-recovery")
+	signerID, signerCode := f.createMachine(machineRoleSigner, "signer-re-"+uniqueSuffix(), signerRoleStandby)
+	builderID, _ := f.createMachine(machineRoleBuilder, "builder-re-"+uniqueSuffix(), nil)
+	revokedID, _ := f.createMachine(machineRoleSigner, "signer-rv-"+uniqueSuffix(), signerRoleStandby)
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+revokedID+"/revoke", map[string]any{"expectedVersion": registryVersion(t, f), "reason": "not needed", "confirm": true}); r.Code != http.StatusOK {
+		t.Fatalf("revoke: %d %s", r.Code, r.Body.String())
+	}
+	reissue := func(id string) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+id+"/enrollment", map[string]any{"expectedVersion": registryVersion(t, f), "reason": "the code expired", "confirm": true})
+	}
+	f.revokeRecoveryKey(recoveryKey.ID)
+	if r := reissue(signerID); r.Code != http.StatusConflict || problemCode(t, r) != "RECOVERY_KEY_NOT_CONFIGURED" {
+		t.Fatalf("reissue for a signer without a recovery key: %d %s", r.Code, r.Body.String())
+	}
+	if record := f.machineRecord(signerID); record.Enrollment == nil || record.Enrollment.CodeSHA256 != sha256Hex(signerCode) {
+		t.Fatalf("a refused reissue replaced the code: %+v", record.Enrollment)
+	}
+	if r := reissue(builderID); r.Code != http.StatusOK {
+		t.Fatalf("reissue for a builder without a recovery key: %d %s", r.Code, r.Body.String())
+	}
+	if r := reissue(revokedID); r.Code != http.StatusConflict || problemCode(t, r) != "MACHINE_REVOKED" {
+		t.Fatalf("reissue for a revoked signer: %d %s", r.Code, r.Body.String())
+	}
+	f.registerRecoveryKey("platform-recovery-2")
+	if r := reissue(signerID); r.Code != http.StatusOK {
+		t.Fatalf("reissue for a signer once a recovery key is registered again: %d %s", r.Code, r.Body.String())
+	}
+}
+
 // 新建签名闸要求平台已登记恢复公钥；安装命令由服务端拼好，签名闸带恢复公钥占位。
 func TestDBSignerCreationNeedsARecoveryKeyAndTheInstallCommandIsComposed(t *testing.T) {
 	f := newGateFixture(t, 124)
@@ -774,9 +834,6 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 			t.Fatalf("trust %s: %d %s", name, r.Code, r.Body.String())
 		}
 	}
-	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.standby.Token, nil, map[string]any{"localRole": "standby", "items": []any{}}); r.Code != http.StatusBadRequest {
-		t.Fatalf("a report without trust: %d %s", r.Code, r.Body.String())
-	}
 	trust := f.localTrust()
 	version := registryVersion(t, f)
 	if r := report(trust); r.Code != http.StatusNoContent {
@@ -812,6 +869,83 @@ func TestDBReportedTrustIsWrittenOnlyWhenItChanges(t *testing.T) {
 	_ = f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=0 AND action='build_machine_trust_report' AND target_id=?`, f.standby.ID).Scan(&audits)
 	if audits != 2 {
 		t.Fatalf("trust changes audited %d times, want 2", audits)
+	}
+}
+
+// 迁移窗口：CI 先把新服务端推上线，旧签名闸二进制要等人工升级。旧签名闸的上报没有 trust（它不认识这个字段）：
+// 照常收下本机角色与检查结论，reportedTrust/reportedTrustAt 记成 null（这个版本不上报信任，不保留旧值），
+// 已有密钥照常就绪——不能因为缺了 trust 就停签，也不能把 null 当成"信任了谁"。
+func TestDBSignerReportsWithoutTrustFromAnOlderSignerAreAccepted(t *testing.T) {
+	f := newGateFixture(t, 141)
+	if record := f.machineRecord(f.primary.ID); record.ReportedTrust == nil {
+		t.Fatal("the fixture's primary should have reported its trust already")
+	}
+	keystoreVersion, _ := f.keystoreVersions()
+	item := func(trialSign string, failure any) map[string]any {
+		return map[string]any{"tenantSlug": f.slug, "keystoreVersion": keystoreVersion, "decrypt": "ok", "confirmed": true,
+			"confirmedTrustRootsDigest": f.currentDigest(), "trialSign": trialSign, "error": failure}
+	}
+	// 旧签名闸的请求体原样：只有 localRole 与 items
+	legacyReport := func(localRole string, items ...any) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": localRole, "items": items})
+	}
+	trustAudits := func() int {
+		t.Helper()
+		var count int
+		if err := f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=0 AND action='build_machine_trust_report' AND target_id=?`, f.primary.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	auditsBefore := trustAudits()
+	if r := legacyReport("primary", item("failed", "trial signing failed on the old binary")); r.Code != http.StatusNoContent {
+		t.Fatalf("an older signer's report without trust: %d %s", r.Code, r.Body.String())
+	}
+	record := f.machineRecord(f.primary.ID)
+	if record.ReportedTrust != nil || record.ReportedTrustAt != "" || record.ReportedLocalRole != signerRolePrimary {
+		t.Fatalf("a report without trust must clear reportedTrust and keep the local role: %+v %q", record.ReportedTrust, record.ReportedTrustAt)
+	}
+	if view := f.machineView(f.primary.ID); view["reportedTrust"] != nil || view["reportedTrustAt"] != nil {
+		t.Fatalf("the console view of a signer that does not report trust: %v", view)
+	}
+	if trustAudits() != auditsBefore+1 {
+		t.Fatal("clearing the reported trust was not audited exactly once")
+	}
+	// 检查结论照常记下（试签失败 → 不就绪），改回通过又就绪
+	checks, err := f.s.keystoreChecksFor(t.Context(), f.db, f.tenant)
+	if err != nil || checks[f.primary.ID].TrialSign != "failed" {
+		t.Fatalf("the check result of a report without trust: %+v %v", checks[f.primary.ID], err)
+	}
+	if codes := readinessCodes(t, f); strings.Join(codes, ",") != readinessPrimaryTrialSignFailed {
+		t.Fatalf("readiness after a failed trial sign reported without trust: %v", codes)
+	}
+	version := registryVersion(t, f)
+	for i := 0; i < 3; i++ {
+		if r := legacyReport("primary", item("ok", nil)); r.Code != http.StatusNoContent {
+			t.Fatalf("repeat: %d %s", r.Code, r.Body.String())
+		}
+	}
+	if codes := readinessCodes(t, f); len(codes) != 0 {
+		t.Fatalf("a signer that does not report trust stopped a configured tenant: %v", codes)
+	}
+	if after := registryVersion(t, f); after != version || trustAudits() != auditsBefore+1 {
+		t.Fatalf("repeated reports without trust rewrote the registry: %d -> %d", version, after)
+	}
+	// 本机角色照常记下
+	if r := legacyReport("standby", item("ok", nil)); r.Code != http.StatusNoContent {
+		t.Fatalf("report a local role change without trust: %d %s", r.Code, r.Body.String())
+	}
+	if record := f.machineRecord(f.primary.ID); record.ReportedLocalRole != signerRoleStandby {
+		t.Fatalf("the local role of a report without trust was not recorded: %+v", record)
+	}
+	// 显式 null 与缺字段一样；升级之后带上 trust 就又记下
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-checks", f.primary.Token, nil, map[string]any{"localRole": "primary", "trust": nil, "items": []any{item("ok", nil)}}); r.Code != http.StatusNoContent {
+		t.Fatalf("a report with trust null: %d %s", r.Code, r.Body.String())
+	}
+	f.reportCheck(f.primary, true, "ok")
+	if record := f.machineRecord(f.primary.ID); record.ReportedTrust == nil || record.ReportedTrustAt == "" || len(record.ReportedTrust.Signers) != 2 {
+		t.Fatalf("an upgraded signer's trust report: %+v", record.ReportedTrust)
 	}
 }
 
@@ -1040,13 +1174,16 @@ func TestDBGeneratedKeysNeedARecoveryRecipientAndKnownRecipients(t *testing.T) {
 		upload keystorebox.Upload
 		code   string
 	}{
-		"signers only":             {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, standbyX), "KEYSTORE_RECOVERY_RECIPIENT_MISSING"},
-		"revoked recovery key":     {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, revoked.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
-		"unregistered recipient":   {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes(), stranger.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
-		"another tenant":           {f.sealedUpload("other-tenant", f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_TENANT_MISMATCH"},
-		"another package":          {f.sealedUpload(f.slug, "com.other.app", alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_IDENTITY_MISMATCH"},
-		"retired certificate":      {f.sealedUpload(f.slug, f.packageName, alias, "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694", primaryX, recoveryKey.Private.PublicKey().Bytes()), "RELEASE_SIGNER_RETIRED"},
-		"public debug certificate": {f.sealedUpload(f.slug, f.packageName, alias, reactNativeDebugSignerSHA256, primaryX, recoveryKey.Private.PublicKey().Bytes()), "INVALID_RELEASE_IDENTITY"},
+		"signers only": {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, standbyX), "KEYSTORE_RECOVERY_RECIPIENT_MISSING"},
+		// 没有发给主签名闸自己的密文：收下的话发布身份换成新证书，而主签名闸再也拿不到这个租户
+		"not sealed to the primary": {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), standbyX, recoveryKey.Private.PublicKey().Bytes()), "KEYSTORE_PRIMARY_RECIPIENT_MISSING"},
+		"recovery key only":         {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), recoveryKey.Private.PublicKey().Bytes()), "KEYSTORE_PRIMARY_RECIPIENT_MISSING"},
+		"revoked recovery key":      {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, revoked.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
+		"unregistered recipient":    {f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes(), stranger.PublicKey().Bytes()), "BUILD_KEYSTORE_RECIPIENT_UNKNOWN"},
+		"another tenant":            {f.sealedUpload("other-tenant", f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_TENANT_MISMATCH"},
+		"another package":           {f.sealedUpload(f.slug, "com.other.app", alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), "BUILD_KEYSTORE_IDENTITY_MISMATCH"},
+		"retired certificate":       {f.sealedUpload(f.slug, f.packageName, alias, "1a5d9fb446e2f4c8e1aa464a02b14248a265ea9c554f83eb01ec94886329e694", primaryX, recoveryKey.Private.PublicKey().Bytes()), "RELEASE_SIGNER_RETIRED"},
+		"public debug certificate":  {f.sealedUpload(f.slug, f.packageName, alias, reactNativeDebugSignerSHA256, primaryX, recoveryKey.Private.PublicKey().Bytes()), "INVALID_RELEASE_IDENTITY"},
 	} {
 		if r := f.deliver(f.primary, requestID, tc.upload, f.primary.ID, f.primary.Ed25519); r.Code != http.StatusUnprocessableEntity || problemCode(t, r) != tc.code {
 			t.Fatalf("%s: %d %s", name, r.Code, r.Body.String())
@@ -1063,7 +1200,10 @@ func TestDBGeneratedKeysNeedARecoveryRecipientAndKnownRecipients(t *testing.T) {
 	if got := f.storedGenerationRequest(); got.Status != generationPending {
 		t.Fatalf("refused deliveries changed the request: %+v", got)
 	}
-	// 至少一把恢复公钥即可，不要求加密给备签名闸
+	if state, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant); state.Record.Generator != nil {
+		t.Fatalf("a refused delivery replaced the keystore: %+v", state.Record)
+	}
+	// 至少一把恢复公钥、加上主签名闸自己即可，不要求加密给备签名闸
 	if r := f.deliver(f.primary, requestID, f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), primaryX, recoveryKey.Private.PublicKey().Bytes()), f.primary.ID, f.primary.Ed25519); r.Code != http.StatusOK {
 		t.Fatalf("a key sealed to the primary and the recovery key: %d %s", r.Code, r.Body.String())
 	}
@@ -1219,52 +1359,328 @@ func TestDBFirstKeyGenerationForATenantWithoutReleaseIdentity(t *testing.T) {
 	}
 }
 
-// 导出：当前密钥的密文文件原样下载、写审计；没有可用密钥 404。导入可以带恢复收件人，但不强制。
-func TestDBKeystoreExportAndImportWithRecoveryRecipients(t *testing.T) {
+// 主签名闸离线、或者一直算不出信任根时，请求不能永远挂着：超过 30 分钟（服务端时钟）读的时候就按
+// KEYSTORE_GENERATION_TIMED_OUT 失败——不再下发、不挡新的请求、控制台与就绪这样显示；超时之后才到的
+// 交回与失败报告按"请求不再 pending"409，并把超时写回库、审计一次。
+func TestDBKeystoreGenerationTimesOut(t *testing.T) {
+	f := newGateFixture(t, 134)
+	recoveryKey := f.registerRecoveryKey("platform-recovery")
+	base := time.Now().UTC()
+	now := base
+	f.s.clock = func() time.Time { return now }
+	alias := defaultGenerationAlias(f.slug)
+	requestAt := func() string {
+		t.Helper()
+		r := f.generate(f.generateBody(f.packageName))
+		if r.Code != http.StatusAccepted {
+			t.Fatalf("generate at %s: %d %s", now, r.Code, r.Body.String())
+		}
+		return decodeBody(t, r)["generationRequest"].(map[string]any)["requestId"].(string)
+	}
+	first := requestAt()
+	if stored := f.storedGenerationRequest(); stored.RequestedAt != iso(base) {
+		t.Fatalf("requestedAt does not come from the server clock: %+v", stored)
+	}
+
+	// 还没到 30 分钟：照常挂着、照常下发、再点生成 409
+	now = base.Add(generationTimeout - time.Minute)
+	if got := f.keystoreView()["generationRequest"].(map[string]any); got["status"] != generationPending {
+		t.Fatalf("a request within the timeout: %v", got)
+	}
+	if item := f.checkItem(f.primary); item["generationRequest"] == nil {
+		t.Fatalf("a request within the timeout is not delivered: %v", item)
+	}
+	if r := f.generate(f.generateBody(f.packageName)); r.Code != http.StatusConflict || problemCode(t, r) != "KEYSTORE_GENERATION_IN_PROGRESS" {
+		t.Fatalf("generate while a request is pending: %d %s", r.Code, r.Body.String())
+	}
+
+	// 过了 30 分钟：读的时候就是失败（库里不改），不下发
+	now = base.Add(generationTimeout + time.Minute)
+	got := f.keystoreView()["generationRequest"].(map[string]any)
+	if failure, _ := got["error"].(map[string]any); got["status"] != generationFailed || failure["code"] != generationTimedOutCode ||
+		!strings.Contains(failure["detail"].(string), "30 分钟") {
+		t.Fatalf("a timed-out request in the view: %v", got)
+	}
+	if item := f.checkItem(f.primary); item["generationRequest"] != nil {
+		t.Fatalf("a timed-out request is still delivered: %v", item)
+	}
+	if stored := f.storedGenerationRequest(); stored.Status != generationPending {
+		t.Fatalf("reading a timed-out request wrote it back: %+v", stored)
+	}
+	// 已有可用密钥：超时不影响就绪
+	if codes := readinessCodes(t, f); len(codes) != 0 {
+		t.Fatalf("a timed-out regeneration made a configured tenant unready: %v", codes)
+	}
+
+	// 超时之后才交回：409 KEYSTORE_GENERATION_STALE（签名闸据此丢弃），超时写回库，密钥不变
+	before, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant)
+	upload := f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), f.primary.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
+	if r := f.deliver(f.primary, first, upload, f.primary.ID, f.primary.Ed25519); r.Code != http.StatusConflict || problemCode(t, r) != generationStaleCode {
+		t.Fatalf("delivering a timed-out request: %d %s", r.Code, r.Body.String())
+	}
+	if stored := f.storedGenerationRequest(); stored.Status != generationFailed || stored.Error == nil || stored.Error.Code != generationTimedOutCode || stored.CompletedAt != optString(iso(now)) {
+		t.Fatalf("a timed-out delivery must be recorded as timed out: %+v", stored)
+	}
+	if after, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant); after.Version != before.Version || after.Record.CertificateSHA256 != before.Record.CertificateSHA256 {
+		t.Fatalf("a timed-out delivery replaced the keystore: %+v", after.Record)
+	}
+	if f.auditCount(f.tenant, "build_keystore_generation_failed") != 1 {
+		t.Fatal("the timed-out delivery was not audited as failed exactly once")
+	}
+
+	// 超时的请求不挡新的；新的超时之后报失败：同样 409，超时写回库
+	second := requestAt()
+	now = now.Add(generationTimeout + time.Second)
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-generations/"+second+"/fail", f.primary.Token, nil, map[string]any{"code": "TRUST_ROOTS_CHANGED", "detail": "late"}); r.Code != http.StatusConflict || problemCode(t, r) != generationStaleCode {
+		t.Fatalf("reporting a failure after the timeout: %d %s", r.Code, r.Body.String())
+	}
+	if stored := f.storedGenerationRequest(); stored.RequestID != second || stored.Status != generationFailed || stored.Error == nil || stored.Error.Code != generationTimedOutCode {
+		t.Fatalf("a failure reported after the timeout: %+v", stored)
+	}
+	if f.auditCount(f.tenant, "build_keystore_generation_failed") != 2 {
+		t.Fatal("the timed-out failure report was not audited")
+	}
+
+	// 还没有密钥的租户：超时就是就绪问题 KEYSTORE_GENERATION_FAILED，带上超时的原因
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key IN (?,?,?)`, f.tenant, buildKeystoreConfigKey, releaseAndroidIdentityConfigKey, buildKeystoreCheckConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.generate(map[string]any{"packageName": f.packageName, "expectedVersion": 0, "releaseIdentityExpectedVersion": 0, "reason": "first key", "confirm": true}); r.Code != http.StatusAccepted {
+		t.Fatalf("first generate: %d %s", r.Code, r.Body.String())
+	}
+	if codes := readinessCodes(t, f); !containsString(codes, readinessGenerationPending) {
+		t.Fatalf("readiness of a fresh first generation: %v", codes)
+	}
+	now = now.Add(generationTimeout + time.Second)
+	readiness, err := f.s.signerReadinessFor(t.Context(), f.tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range readiness.Problems {
+		if p.Code == readinessGenerationPending {
+			t.Fatalf("a timed-out first generation is still pending: %v", readiness.Problems)
+		}
+		found = found || (p.Code == readinessGenerationFailed && strings.Contains(p.Detail, generationTimedOutCode))
+	}
+	if !found {
+		t.Fatalf("a timed-out first generation: %v", readiness.Problems)
+	}
+}
+
+// 包名跨租户唯一：别的租户的发布身份（release.android）或签名密钥记录（build.keystore）已经用着这个包名时，
+// 发起生成与导入都尽早 409 ANDROID_PACKAGE_IN_USE（签名闸本机按包名记确认，本来也会拒绝；这里免得白白生成）。
+// 报错不说是哪个租户；本租户自己的记录不算冲突。
+func TestDBAndroidPackageInUseByAnotherTenantIsRefusedEarly(t *testing.T) {
+	f := newGateFixture(t, 137)
+	f.registerRecoveryKey("platform-recovery")
+	seedOther := func(seed int, key string, value any) string {
+		t.Helper()
+		tenant := testTenant(seed)
+		raw, _ := json.Marshal(value)
+		if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,'tester',UTC_TIMESTAMP(3))`, tenant, key, raw); err != nil {
+			t.Fatalf("seed %s for tenant %s: %v", key, tenant, err)
+		}
+		// 这几个"别的租户"只有配置行、没有租户行：用完删掉，不留给别的用例
+		t.Cleanup(func() { _, _ = f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, tenant, key) })
+		return tenant
+	}
+	certificate := f.apkSigner.sha256()
+	importPackage := func(packageName string) *httptest.ResponseRecorder {
+		t.Helper()
+		keystoreVersion, identityVersion := f.keystoreVersions()
+		return f.saveKeystoreRequest(map[string]any{"upload": f.keystoreUpload(f.slug, packageName, certificate, f.primary), "packageName": packageName,
+			"signerSha256": certificate, "expectedVersion": keystoreVersion, "releaseIdentityExpectedVersion": identityVersion, "reason": "import", "confirm": true})
+	}
+	inUse := func(name string, r *httptest.ResponseRecorder, otherTenant string) {
+		t.Helper()
+		if r.Code != http.StatusConflict || problemCode(t, r) != "ANDROID_PACKAGE_IN_USE" || strings.Contains(r.Body.String(), otherTenant) {
+			t.Fatalf("%s: %d %s", name, r.Code, r.Body.String())
+		}
+	}
+
+	// 别的租户的发布身份与本租户同一个包名（库里已经冲突）：本租户既不能生成也不能导入
+	sharing := seedOther(138, releaseAndroidIdentityConfigKey, androidReleaseIdentity{PackageName: f.packageName, SignerSHA256: newCertificateSHA256()})
+	inUse("generate for a package another tenant's release identity uses", f.generate(f.generateBody(f.packageName)), sharing)
+	inUse("import for a package another tenant's release identity uses", importPackage(f.packageName), sharing)
+	if got := f.storedGenerationRequestOrNil(); got != nil {
+		t.Fatalf("a refused generation recorded a request: %+v", got)
+	}
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, sharing, releaseAndroidIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	// 本租户自己的发布身份与密钥不算冲突
+	if r := importPackage(f.packageName); r.Code != http.StatusOK {
+		t.Fatalf("import for this tenant's own package: %d %s", r.Code, r.Body.String())
+	}
+
+	identityPackage := "com.gate.inuse.identity" + uniqueSuffix()
+	keystorePackage := "com.gate.inuse.keystore" + uniqueSuffix()
+	withIdentity := seedOther(139, releaseAndroidIdentityConfigKey, androidReleaseIdentity{PackageName: identityPackage, SignerSHA256: newCertificateSHA256()})
+	withKeystore := seedOther(140, buildKeystoreConfigKey, buildKeystoreRecord{Format: buildKeystoreRecordFormat, Sealed: "c2VhbGVk", KeyAlias: "release",
+		CertificateSHA256: newCertificateSHA256(), PackageName: keystorePackage, TenantSlug: "other-tenant", Recipients: []string{f.primary.recipient()}})
+	inUse("import for another tenant's release identity package", importPackage(identityPackage), withIdentity)
+	inUse("import for another tenant's keystore package", importPackage(keystorePackage), withKeystore)
+
+	// 还没有发布身份的新租户：包名取请求里的，同样不能是别的租户在用的
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key IN (?,?,?)`, f.tenant, buildKeystoreConfigKey, releaseAndroidIdentityConfigKey, buildKeystoreCheckConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	first := func(packageName string) *httptest.ResponseRecorder {
+		return f.generate(map[string]any{"packageName": packageName, "expectedVersion": 0, "releaseIdentityExpectedVersion": 0, "reason": "first key", "confirm": true})
+	}
+	inUse("first generation for another tenant's release identity package", first(identityPackage), withIdentity)
+	inUse("first generation for another tenant's keystore package", first(keystorePackage), withKeystore)
+	if r := first("com.gate.inuse.free" + uniqueSuffix()); r.Code != http.StatusAccepted {
+		t.Fatalf("first generation for a free package: %d %s", r.Code, r.Body.String())
+	}
+}
+
+// 恢复公钥吊销之后，已有密钥视图里仍然列着它（密文已经发给它了），但要看得出哪几把已吊销：
+// revokedRecoveryRecipients 是 recoveryRecipients 里已吊销的子集。
+func TestDBKeystoreViewMarksRevokedRecoveryRecipients(t *testing.T) {
+	f := newGateFixture(t, 135)
+	if view := f.keystoreView(); len(view["recoveryRecipients"].([]any)) != 0 || view["revokedRecoveryRecipients"] == nil || len(view["revokedRecoveryRecipients"].([]any)) != 0 {
+		t.Fatalf("a keystore without recovery recipients: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+	first := f.registerRecoveryKey("recovery-one")
+	second := f.registerRecoveryKey("recovery-two")
+	keystoreVersion, identityVersion := f.keystoreVersions()
+	upload := f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(),
+		first.Private.PublicKey().Bytes(), second.Private.PublicKey().Bytes())
+	if saved := f.saveKeystoreRequest(map[string]any{"upload": upload, "packageName": f.packageName, "signerSha256": f.apkSigner.sha256(),
+		"expectedVersion": keystoreVersion, "releaseIdentityExpectedVersion": identityVersion, "reason": "import with two recovery keys", "confirm": true}); saved.Code != http.StatusOK {
+		t.Fatalf("import: %d %s", saved.Code, saved.Body.String())
+	} else if revoked := decodeBody(t, saved)["revokedRecoveryRecipients"]; revoked == nil || len(revoked.([]any)) != 0 {
+		t.Fatalf("the save response must carry revokedRecoveryRecipients too: %v", revoked)
+	}
+	sorted := []string{first.SHA256, second.SHA256}
+	sort.Strings(sorted)
+	joined := func(values []any) string {
+		out := []string{}
+		for _, v := range values {
+			out = append(out, v.(string))
+		}
+		return strings.Join(out, ",")
+	}
+	view := f.keystoreView()
+	if joined(view["recoveryRecipients"].([]any)) != strings.Join(sorted, ",") || len(view["revokedRecoveryRecipients"].([]any)) != 0 {
+		t.Fatalf("two live recovery recipients: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+	f.revokeRecoveryKey(first.ID)
+	view = f.keystoreView()
+	if joined(view["recoveryRecipients"].([]any)) != strings.Join(sorted, ",") || joined(view["revokedRecoveryRecipients"].([]any)) != first.SHA256 {
+		t.Fatalf("one revoked recovery recipient: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+	f.revokeRecoveryKey(second.ID)
+	view = f.keystoreView()
+	if joined(view["recoveryRecipients"].([]any)) != strings.Join(sorted, ",") || joined(view["revokedRecoveryRecipients"].([]any)) != strings.Join(sorted, ",") {
+		t.Fatalf("every recovery recipient revoked: %v / %v", view["recoveryRecipients"], view["revokedRecoveryRecipients"])
+	}
+}
+
+// 导出只带发给未吊销恢复公钥的密文（发给签名闸的不带：吊销了没擦盘的签名闸私钥加上任何一次导出就能解开），
+// 与审计同一个事务，审计写不进去就不导出；没有可用的恢复收件人 409，没有可用密钥 404。导出的文件离线工具
+// build-keystore recover 照样能用（它只解发给恢复公钥的那份、核对明文与外层字段）。导入可以带恢复收件人，但不强制。
+func TestDBKeystoreExportCarriesOnlyRecoveryBoxes(t *testing.T) {
 	f := newGateFixture(t, 133)
-	export := func() *httptest.ResponseRecorder {
+	export := func(requestID string) *httptest.ResponseRecorder {
 		c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/build-keystore/export", nil)
+		if requestID != "" {
+			c.Set("requestId", requestID)
+		}
 		f.s.exportBuildKeystore(c)
 		return recorder
 	}
-	r := export()
-	state, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant)
-	var exported keystorebox.Upload
-	if r.Code != http.StatusOK || json.Unmarshal(r.Body.Bytes(), &exported) != nil || !strings.Contains(r.Header().Get("Content-Disposition"), "attachment") {
-		t.Fatalf("export: %d %s", r.Code, r.Body.String())
+	// 夹具的密钥只发给了两台签名闸：没有可导出的东西
+	if r := export(""); r.Code != http.StatusConflict || problemCode(t, r) != "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT" || strings.Contains(r.Body.String(), f.primary.recipient()) {
+		t.Fatalf("export of a key without recovery recipients: %d %s", r.Code, r.Body.String())
 	}
-	parsed, err := keystorebox.ParseUpload(r.Body.Bytes())
-	want, _ := json.Marshal(state.Upload)
-	got, _ := json.Marshal(parsed)
-	if err != nil || !bytes.Equal(want, got) {
-		t.Fatalf("the exported file differs from the stored upload: %v", err)
-	}
-	if f.auditCount(f.tenant, "build_keystore_exported") != 1 {
-		t.Fatal("the export was not audited")
+	if f.auditCount(f.tenant, "build_keystore_exported") != 0 {
+		t.Fatal("a refused export was audited as exported")
 	}
 
 	recoveryKey := f.registerRecoveryKey("platform-recovery")
-	keystoreVersion, identityVersion := f.keystoreVersions()
 	importBody := func(upload keystorebox.Upload) map[string]any {
+		keystoreVersion, identityVersion := f.keystoreVersions()
 		return map[string]any{"upload": upload, "packageName": f.packageName, "signerSha256": f.apkSigner.sha256(),
 			"expectedVersion": keystoreVersion, "releaseIdentityExpectedVersion": identityVersion, "reason": "import with recovery", "confirm": true}
 	}
-	withRecovery := f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
+	withRecovery := f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(),
+		f.standby.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
 	if saved := f.saveKeystoreRequest(importBody(withRecovery)); saved.Code != http.StatusOK {
 		t.Fatalf("import with a recovery recipient: %d %s", saved.Code, saved.Body.String())
 	} else if recipients := decodeBody(t, saved)["recoveryRecipients"].([]any); len(recipients) != 1 || recipients[0] != recoveryKey.SHA256 {
 		t.Fatalf("recovery recipients after import: %v", recipients)
 	}
-	keystoreVersion, identityVersion = f.keystoreVersions()
 	stranger, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	if saved := f.saveKeystoreRequest(importBody(f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(), stranger.PublicKey().Bytes()))); saved.Code != http.StatusUnprocessableEntity || problemCode(t, saved) != "BUILD_KEYSTORE_RECIPIENT_UNKNOWN" {
 		t.Fatalf("import with an unknown recipient: %d %s", saved.Code, saved.Body.String())
 	}
 
+	r := export("")
+	state, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant)
+	if r.Code != http.StatusOK || !strings.Contains(r.Header().Get("Content-Disposition"), "attachment") || r.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("export: %d %s", r.Code, r.Body.String())
+	}
+	parsed, err := keystorebox.ParseUpload(r.Body.Bytes())
+	if err != nil {
+		t.Fatalf("the exported file is not an upload the offline tool accepts: %v", err)
+	}
+	want := *state.Upload
+	want.Boxes = nil
+	for _, box := range state.Upload.Boxes {
+		if box.RecipientSHA256 == recoveryKey.SHA256 {
+			want.Boxes = append(want.Boxes, box)
+		}
+	}
+	wantJSON, _ := json.Marshal(want)
+	gotJSON, _ := json.Marshal(parsed)
+	if len(parsed.Boxes) != 1 || !bytes.Equal(wantJSON, gotJSON) {
+		t.Fatalf("the export must be the stored upload with only the recovery box: %s", r.Body.String())
+	}
+	for _, signer := range []gateMachine{f.primary, f.standby} {
+		if strings.Contains(r.Body.String(), signer.recipient()) {
+			t.Fatalf("the export carries a box for signer %s", signer.Name)
+		}
+	}
+	// 离线恢复照样解得开（recover 的做法：按恢复公钥取 box、解开、明文与外层字段一致）
+	box, ok := parsed.BoxFor(recoveryKey.SHA256)
+	if !ok {
+		t.Fatal("the export has no box for the recovery key")
+	}
+	plaintext, err := keystorebox.Open(box, recoveryKey.Private.Bytes())
+	if err != nil || plaintext.PackageName != parsed.PackageName || plaintext.CertificateSHA256 != parsed.CertificateSHA256 ||
+		plaintext.KeyAlias != parsed.KeyAlias || plaintext.TenantSlug != parsed.TenantSlug || plaintext.CreatedAt != parsed.CreatedAt {
+		t.Fatalf("the recovery key cannot recover the exported file: %v", err)
+	}
+	var summary string
+	if err := f.db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='build_keystore_exported'`, f.tenant).Scan(&summary); err != nil {
+		t.Fatalf("the export was not audited exactly once: %v", err)
+	}
+	if !strings.Contains(summary, recoveryKey.SHA256) || strings.Contains(summary, f.primary.recipient()) {
+		t.Fatalf("the export audit must list the exported recipients: %s", summary)
+	}
+
+	// 审计写不进去（request_id 超过列宽）：500，什么都不给
+	if r := export(strings.Repeat("r", 200)); r.Code != http.StatusInternalServerError || problemCode(t, r) != "BUILD_KEYSTORE_EXPORT_FAILED" ||
+		strings.Contains(r.Body.String(), recoveryKey.SHA256) || strings.Contains(r.Body.String(), box.Ciphertext) || r.Header().Get("Content-Disposition") != "" {
+		t.Fatalf("an export whose audit cannot be written: %d %s", r.Code, r.Body.String())
+	}
+	if f.auditCount(f.tenant, "build_keystore_exported") != 1 {
+		t.Fatal("a failed export left an audit row")
+	}
+
+	// 恢复公钥吊销之后，这份密文就没有可以导出的收件人了
+	f.revokeRecoveryKey(recoveryKey.ID)
+	if r := export(""); r.Code != http.StatusConflict || problemCode(t, r) != "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT" || strings.Contains(r.Body.String(), box.Ciphertext) {
+		t.Fatalf("export after the recovery key was revoked: %d %s", r.Code, r.Body.String())
+	}
+
 	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, buildKeystoreConfigKey); err != nil {
 		t.Fatal(err)
 	}
-	if r := export(); r.Code != http.StatusNotFound || problemCode(t, r) != "BUILD_KEYSTORE_NOT_CONFIGURED" {
+	if r := export(""); r.Code != http.StatusNotFound || problemCode(t, r) != "BUILD_KEYSTORE_NOT_CONFIGURED" {
 		t.Fatalf("export without a keystore: %d %s", r.Code, r.Body.String())
 	}
 }
@@ -1317,19 +1733,44 @@ func TestDefaultGenerationAliasIsAValidAlias(t *testing.T) {
 	}
 }
 
-// 生成请求记录的状态推导：发起之后两个版本任何一个变了，挂着的请求算失败（过期）；完成、失败的不变。
+// 生成请求记录的状态推导：发起之后两个版本任何一个变了，挂着的请求算失败（过期）；挂了超过 30 分钟算失败
+// （超时，版本变了优先报过期）；完成、失败的不变。
 func TestGenerationRequestEffectiveStatus(t *testing.T) {
-	pending := keystoreGenerationRequest{Status: generationPending, KeystoreVersion: 3, ReleaseIdentityVersion: 5}
-	if got := pending.effective(3, 5); got.Status != generationPending || got.Error != nil {
+	requestedAt := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	fresh := requestedAt.Add(generationTimeout - time.Millisecond)
+	pending := keystoreGenerationRequest{Status: generationPending, KeystoreVersion: 3, ReleaseIdentityVersion: 5, RequestedAt: iso(requestedAt)}
+	if got := pending.effective(3, 5, fresh); got.Status != generationPending || got.Error != nil {
 		t.Fatalf("an untouched pending request: %+v", got)
 	}
+	if got := pending.effective(3, 5, requestedAt.Add(generationTimeout)); got.Status != generationPending {
+		t.Fatalf("a request exactly at the timeout is still pending: %+v", got)
+	}
 	for _, versions := range [][2]int{{4, 5}, {3, 6}, {0, 0}} {
-		if got := pending.effective(versions[0], versions[1]); got.Status != generationFailed || got.Error == nil || got.Error.Code != generationStaleCode {
-			t.Fatalf("versions %v: %+v", versions, got)
+		for _, now := range []time.Time{fresh, requestedAt.Add(time.Hour)} {
+			if got := pending.effective(versions[0], versions[1], now); got.Status != generationFailed || got.Error == nil || got.Error.Code != generationStaleCode {
+				t.Fatalf("versions %v at %s: %+v", versions, now, got)
+			}
 		}
 	}
-	done := keystoreGenerationRequest{Status: generationDone, KeystoreVersion: 3, ReleaseIdentityVersion: 5}
-	if got := done.effective(4, 6); got.Status != generationDone {
+	timedOut := pending.effective(3, 5, requestedAt.Add(generationTimeout+time.Millisecond))
+	if timedOut.Status != generationFailed || timedOut.Error == nil || timedOut.Error.Code != generationTimedOutCode ||
+		!strings.Contains(timedOut.Error.Detail, "30 分钟") || !strings.Contains(timedOut.Error.Detail, "重新发起") {
+		t.Fatalf("a request pending for longer than the timeout: %+v", timedOut)
+	}
+	if pending.Status != generationPending || pending.Error != nil {
+		t.Fatalf("effective changed the stored request: %+v", pending)
+	}
+	done := keystoreGenerationRequest{Status: generationDone, KeystoreVersion: 3, ReleaseIdentityVersion: 5, RequestedAt: iso(requestedAt)}
+	if got := done.effective(4, 6, requestedAt.Add(time.Hour)); got.Status != generationDone {
 		t.Fatalf("a done request: %+v", got)
+	}
+	// 发起时间读不出来的记录读的时候就当坏记录（errGenerationRequestInvalid），不会走到推导
+	malformed := keystoreGenerationRequest{RequestID: "kgr_" + randomID(16), PackageName: "com.example.app", Alias: "release", RequestedAt: "yesterday", Status: generationPending}
+	if err := malformed.validate(); err == nil {
+		t.Fatal("a request with an unreadable requestedAt passed validation")
+	}
+	malformed.RequestedAt = iso(requestedAt)
+	if err := malformed.validate(); err != nil {
+		t.Fatalf("a well-formed request: %v", err)
 	}
 }

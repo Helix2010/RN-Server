@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.23"
+    "version": "2026.09.24"
   },
   "paths": {
     "/v1/mobile/referral/me": {
@@ -3227,7 +3227,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY"
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, ANDROID_PACKAGE_IN_USE (another tenant's release.android or build.keystore already uses this package name; the detail does not name the tenant)"
           },
           "422": {
             "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED (not v3, including v1/v2 bodies), BUILD_KEYSTORE_RECIPIENT_UNKNOWN (neither an unrevoked signer's accepted key nor an unrevoked recovery key), BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH, RELEASE_SIGNER_RETIRED"
@@ -3244,7 +3244,7 @@
     "/v1/admin/build-keystore/generate": {
       "post": {
         "summary": "Generate a new signing key on the primary signer",
-        "description": "Records a key generation request (tenant app_configs build.keystore.request, audited as build_keystore_generation_request) for the primary signer to pick up; the key is generated, sealed and signed on the signer and delivered through POST /v1/signer/keystore-generations/{requestId}. packageName must be the tenant's Android package (release.android) when one is registered; a tenant without release.android generates for the given package and gets release.android written on delivery. The key alias is <slug lowercased>-release. Replacing an existing key changes the certificate: installed apps cannot upgrade. Progress: generationRequest in GET /v1/admin/build-keystore.",
+        "description": "Records a key generation request (tenant app_configs build.keystore.request, audited as build_keystore_generation_request) for the primary signer to pick up; the key is generated, sealed and signed on the signer and delivered through POST /v1/signer/keystore-generations/{requestId}. packageName must be the tenant's Android package (release.android) when one is registered; a tenant without release.android generates for the given package and gets release.android written on delivery. Either way the package name must not be used by another tenant's release.android or build.keystore (409 ANDROID_PACKAGE_IN_USE; signers refuse such a package anyway, this only fails early). The key alias is <slug lowercased>-release. Replacing an existing key changes the certificate: installed apps cannot upgrade. Progress: generationRequest in GET /v1/admin/build-keystore.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3281,7 +3281,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is not stale), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing)"
+            "description": "STALE_BUILD_KEYSTORE, STALE_RELEASE_IDENTITY, KEYSTORE_GENERATION_IN_PROGRESS (a pending request that is neither stale nor timed out), RECOVERY_KEY_NOT_CONFIGURED, PRIMARY_SIGNER_MISSING, KEYSTORE_TRUST_ROOTS_UNAVAILABLE (the trust roots cannot be composed: detail lists what is missing), ANDROID_PACKAGE_IN_USE (another tenant's release.android or build.keystore already uses this package name - also for a tenant without a release identity, whose package name otherwise comes from the request; the detail does not name the tenant)"
           },
           "422": {
             "description": "KEYSTORE_PACKAGE_MISMATCH"
@@ -3298,7 +3298,7 @@
     "/v1/admin/build-keystore/export": {
       "get": {
         "summary": "Export the sealed keystore file for offline recovery",
-        "description": "The current upload file (KeystoreUpload, ciphertext only: nobody but the recipient signers and recovery key holders can open it) as a JSON attachment, for build-keystore recover. Audited as build_keystore_exported.",
+        "description": "The current upload file (KeystoreUpload) as a JSON attachment for build-keystore recover, carrying only the boxes sealed to registered, unrevoked offline recovery keys: the boxes for signers are left out, so a revoked signer's leftover private key cannot open an exported file. The outer fields are the stored ones; the generation signature is not part of the file and recover does not need it. Read and audit (build_keystore_exported, listing the exported recipients) happen in one transaction: when the audit cannot be written nothing is exported.",
         "responses": {
           "200": {
             "description": "Attachment <slug>-keystore-v<version>.json",
@@ -3316,8 +3316,14 @@
           "404": {
             "description": "BUILD_KEYSTORE_NOT_CONFIGURED (no usable v3 keystore)"
           },
+          "409": {
+            "description": "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT: the current key has no box for a registered, unrevoked recovery key (imported without one, or every recovery recipient has been revoked; see revokedRecoveryRecipients)"
+          },
           "500": {
-            "description": "BUILD_KEYSTORE_CONFIG_INVALID"
+            "description": "BUILD_KEYSTORE_CONFIG_INVALID, BUILD_KEYSTORE_EXPORT_FAILED (including an audit that cannot be written; nothing is exported)"
+          },
+          "503": {
+            "description": "RECOVERY_KEYS_UNAVAILABLE"
           }
         }
       }
@@ -4181,7 +4187,7 @@
     "/v1/admin/platform/machines/{id}/enrollment": {
       "post": {
         "summary": "Reissue a machine's enrollment code",
-        "description": "Issues a new one-time code (60 minutes) and invalidates the previous one at once. Only for machines still pending_enrollment. Audited as build_machine_enrollment_reissue without the code.",
+        "description": "Issues a new one-time code (60 minutes) and invalidates the previous one at once. Only for machines still pending_enrollment. For a signer the platform must have an unrevoked offline recovery key, as when creating one (409 RECOVERY_KEY_NOT_CONFIGURED; the previous code stays valid). Audited as build_machine_enrollment_reissue without the code.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineId"
@@ -4237,7 +4243,10 @@
             "description": "MACHINE_NOT_FOUND"
           },
           "409": {
-            "description": "MACHINES_VERSION_CONFLICT, MACHINE_ALREADY_ENROLLED (pending_key or active), MACHINE_REVOKED"
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_ALREADY_ENROLLED (pending_key or active), MACHINE_REVOKED, RECOVERY_KEY_NOT_CONFIGURED (a signer and no unrevoked recovery key is registered)"
+          },
+          "500": {
+            "description": "MACHINE_SAVE_FAILED, MACHINE_REGISTRY_INVALID, RECOVERY_KEYS_INVALID (a signer and build.recovery.recipients cannot be read)"
           }
         }
       }
@@ -4903,7 +4912,7 @@
             "description": "Stored"
           },
           "400": {
-            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole, or a missing or malformed trust)"
+            "description": "INVALID_KEYSTORE_CHECK (including a missing or unknown localRole, or a malformed trust)"
           },
           "401": {
             "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
@@ -4955,7 +4964,7 @@
     "/v1/signer/keystore-generations/{requestId}": {
       "post": {
         "summary": "Deliver a key generated by the primary signer",
-        "description": "One transaction with build.keystore, release.android and build.keystore.request locked: the caller must be the active routed primary and generator.machineId itself (and its registered Ed25519 sha256); the request must be pending with build.keystore and release.android at the versions recorded when it was made (otherwise it is marked failed with KEYSTORE_GENERATION_STALE and 409); the signature is verified with the registered Ed25519 key; the upload passes every rule of PUT /v1/admin/build-keystore (format, tenant slug, package name and alias of the request, retired or debug certificates, recipients) where recipients may be accepted keys of unrevoked signers or unrevoked recovery keys and at least one recovery key is required. Writes build.keystore (with generator, generationSignature, generationRequestId) and release.android, marks the request done, audits build_keystore_generated and release_identity_update (system-signer). A retry with the same signature after success returns 200 with the same versions.",
+        "description": "One transaction with build.keystore, release.android and build.keystore.request locked: the caller must be the active routed primary and generator.machineId itself (and its registered Ed25519 sha256); the request must be pending with build.keystore and release.android at the versions recorded when it was made and requested no more than 30 minutes ago by the server clock (otherwise it is marked failed with KEYSTORE_GENERATION_STALE or KEYSTORE_GENERATION_TIMED_OUT and the answer is 409 KEYSTORE_GENERATION_STALE); the signature is verified with the registered Ed25519 key; the upload passes every rule of PUT /v1/admin/build-keystore (format, tenant slug, package name and alias of the request, retired or debug certificates, recipients) where recipients may be accepted keys of unrevoked signers or unrevoked recovery keys, at least one recovery key is required and one box must be sealed to the generating primary's own accepted X25519 key (otherwise the release identity would move to a certificate the primary cannot open). Writes build.keystore (with generator, generationSignature, generationRequestId) and release.android, marks the request done, audits build_keystore_generated and release_identity_update (system-signer). A retry with the same signature after success returns 200 with the same versions.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -5004,10 +5013,10 @@
             "description": "KEYSTORE_GENERATOR_NOT_PRIMARY (not the active routed primary, or generator is not the caller); MACHINE_ROLE_FORBIDDEN; MACHINE_KEY_NOT_ACCEPTED"
           },
           "409": {
-            "description": "KEYSTORE_GENERATION_STALE: not the tenant's current pending request, or build.keystore / release.android changed since (the request is then marked failed) - discard the generated key"
+            "description": "KEYSTORE_GENERATION_STALE: not the tenant's current pending request, or build.keystore / release.android changed since, or the request has been pending for more than 30 minutes (the request is then marked failed with error.code KEYSTORE_GENERATION_STALE or KEYSTORE_GENERATION_TIMED_OUT) - discard the generated key"
           },
           "422": {
-            "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED, KEYSTORE_GENERATION_SIGNATURE_INVALID, BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH (package name or alias differ from the request), RELEASE_SIGNER_RETIRED, INVALID_RELEASE_IDENTITY (debug certificate), BUILD_KEYSTORE_RECIPIENT_UNKNOWN, KEYSTORE_RECOVERY_RECIPIENT_MISSING"
+            "description": "BUILD_KEYSTORE_FORMAT_UNSUPPORTED, KEYSTORE_GENERATION_SIGNATURE_INVALID, BUILD_KEYSTORE_TENANT_MISMATCH, BUILD_KEYSTORE_IDENTITY_MISMATCH (package name or alias differ from the request), RELEASE_SIGNER_RETIRED, INVALID_RELEASE_IDENTITY (debug certificate), BUILD_KEYSTORE_RECIPIENT_UNKNOWN, KEYSTORE_RECOVERY_RECIPIENT_MISSING, KEYSTORE_PRIMARY_RECIPIENT_MISSING (no box for the generating primary signer's own accepted X25519 key)"
           },
           "500": {
             "description": "BUILD_KEYSTORE_GENERATION_SAVE_FAILED, MACHINE_REGISTRY_INVALID"
@@ -5027,7 +5036,7 @@
     "/v1/signer/keystore-generations/{requestId}/fail": {
       "post": {
         "summary": "Report that the primary signer cannot generate this key",
-        "description": "Marks the pending request failed with {code, detail} (detail sanitized like other machine text) and audits build_keystore_generation_failed. Only the active routed primary.",
+        "description": "Marks the pending request failed with {code, detail} (detail sanitized like other machine text) and audits build_keystore_generation_failed. Only the active routed primary. A request that is stale or timed out by the same rule as delivery is marked failed with that derived code instead (not the reported one) and answered 409.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -5057,7 +5066,7 @@
             "description": "KEYSTORE_GENERATOR_NOT_PRIMARY; MACHINE_ROLE_FORBIDDEN; MACHINE_KEY_NOT_ACCEPTED"
           },
           "409": {
-            "description": "KEYSTORE_GENERATION_STALE: not the tenant's current pending request"
+            "description": "KEYSTORE_GENERATION_STALE: not the tenant's current pending request, or it is stale or has been pending for more than 30 minutes (then marked failed with the derived code)"
           },
           "500": {
             "description": "BUILD_KEYSTORE_GENERATION_SAVE_FAILED"
@@ -7611,7 +7620,8 @@
           "trustRootsDigest",
           "generationRequest",
           "generator",
-          "recoveryRecipients"
+          "recoveryRecipients",
+          "revokedRecoveryRecipients"
         ],
         "properties": {
           "configured": {
@@ -7796,6 +7806,14 @@
               "pattern": "^[0-9a-f]{64}$"
             },
             "description": "Recipients of the current key that are registered recovery keys (revoked ones included)"
+          },
+          "revokedRecoveryRecipients": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "description": "The subset of recoveryRecipients whose recovery key has been revoked since (same order). When it equals recoveryRecipients the key has no usable offline recovery: export answers 409 and a new recovery key should be registered before generating a new key. Empty array when none."
           }
         }
       },
@@ -7935,13 +7953,13 @@
               }
             ],
             "nullable": true,
-            "description": "Signers only: what this signer's local record trusts, as it last reported (POST /v1/signer/keystore-checks trust). Display only (e.g. the primary does not trust the standby yet, so new keys will not be sealed to it); signers never take it from the server. null = never reported."
+            "description": "Signers only: what this signer's local record trusts, as it last reported (POST /v1/signer/keystore-checks trust). Display only (e.g. the primary does not trust the standby yet, so new keys will not be sealed to it); signers never take it from the server. null = not reported: never reported, or the latest report came from a signer version that does not send trust."
           },
           "reportedTrustAt": {
             "type": "string",
             "format": "date-time",
             "nullable": true,
-            "description": "When reportedTrust last changed; null = never reported"
+            "description": "When reportedTrust last changed; null while reportedTrust is null"
           }
         }
       },
@@ -8343,7 +8361,6 @@
         "type": "object",
         "required": [
           "localRole",
-          "trust",
           "items"
         ],
         "additionalProperties": false,
@@ -8362,7 +8379,7 @@
                 "$ref": "#/components/schemas/SignerReportedTrust"
               }
             ],
-            "description": "Required on every report: the signers (including this one), builders and recovery keys this signer's local record trusts. Stored on the machine as reportedTrust/reportedTrustAt (build_machine_trust_report audit), written only when it changes."
+            "description": "Sent on every report by current signers: the signers (including this one), builders and recovery keys this signer's local record trusts. Stored on the machine as reportedTrust/reportedTrustAt (build_machine_trust_report audit), written only when it changes. Optional for signers released before the automation (they do not know the field): a report without trust (or with trust null) is accepted as usual - localRole and the items are recorded - and sets reportedTrust and reportedTrustAt to null, meaning this signer version does not report its trust (not 'trusts nothing'); the console shows it as not reported. Nothing but console hints reads reportedTrust, so signing and readiness do not depend on it."
           },
           "items": {
             "type": "array",
@@ -8505,7 +8522,7 @@
           "detail"
         ],
         "additionalProperties": false,
-        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH: the primary signer in the console has never reported its local role or its local record still says standby (it was not promoted on the machine), so it will not claim jobs; promote it on the machine or switch the console back. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed. The last three only appear while the tenant has no usable v3 keystore (they explain why there is no key yet; a tenant with a usable key keeps signing with it while a replacement is generated): RECOVERY_KEY_NOT_CONFIGURED: the platform has no unrevoked offline recovery key, so no key can be generated. KEYSTORE_GENERATION_PENDING: a generation request waits for the primary signer. KEYSTORE_GENERATION_FAILED: the latest generation request failed; detail carries the signer's code (e.g. TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, PEER_NOT_TRUSTED) or KEYSTORE_GENERATION_STALE.",
+        "description": "One reason the primary signer cannot sign for this tenant yet. code is a fixed enum the console maps to a fix-it entry; detail is a human sentence that may name a machine or quote the signer's error. KEYSTORE_NOT_CONFIGURED: no build.keystore. KEYSTORE_LEGACY_FORMAT: build.keystore is a pre-signing-gate record (v1 passphrase box or v2 build-agent box); reset and upload v3. KEYSTORE_RECORD_INVALID: build.keystore is a v3 record that cannot be used (the record is malformed, the outer box cannot be opened, or its index fields differ from the stored upload); the keystore view still reports configured=true, the queue gate answers SIGNER_NOT_READY and the signer keystore checks omit the tenant - upload the v3 file again. RELEASE_IDENTITY_NOT_CONFIGURED / RELEASE_IDENTITY_MISMATCH: release.android is missing or differs from the keystore's package name or certificate. PRIMARY_SIGNER_MISSING: no active primary signer is registered. PRIMARY_SIGNER_NOT_RECIPIENT: the v3 keystore has no box for the primary signer. PRIMARY_SIGNER_LOCAL_ROLE_MISMATCH: the primary signer in the console has never reported its local role or its local record still says standby (it was not promoted on the machine), so it will not claim jobs; promote it on the machine or switch the console back. APP_IDENTITY_INCOMPLETE: tenant.json cannot be composed (missing app parameters, bootstrap signer address, release identity). OTA_CERTIFICATE_NOT_CONFIGURED: no ota.signing, so trust roots cannot be composed. API_BASE_URL_INVALID: the stored apiBaseUrl is not a canonical https origin (e.g. an explicit :443 saved before write-time validation). TRUST_ROOTS_INVALID: the composed trust roots do not normalize (e.g. scheme http/https). PRIMARY_SIGNER_NOT_CHECKED: the primary has not reported a check for the current keystore version. PRIMARY_SIGNER_DECRYPT_FAILED: its trial decryption failed. PRIMARY_SIGNER_NOT_CONFIRMED: not confirmed on the machine (signer confirm). TRUST_ROOTS_CHANGED: confirmed, but with a trust roots digest that is no longer current. PRIMARY_SIGNER_TRIAL_SIGN_PENDING / PRIMARY_SIGNER_TRIAL_SIGN_FAILED: the trial signing has not passed yet / failed. The last three only appear while the tenant has no usable v3 keystore (they explain why there is no key yet; a tenant with a usable key keeps signing with it while a replacement is generated): RECOVERY_KEY_NOT_CONFIGURED: the platform has no unrevoked offline recovery key, so no key can be generated. KEYSTORE_GENERATION_PENDING: a generation request waits for the primary signer. KEYSTORE_GENERATION_FAILED: the latest generation request failed; detail carries the signer's code (e.g. TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, PEER_NOT_TRUSTED), KEYSTORE_GENERATION_STALE or KEYSTORE_GENERATION_TIMED_OUT (pending for more than 30 minutes).",
         "properties": {
           "code": {
             "type": "string",
@@ -9071,7 +9088,7 @@
               "done",
               "failed"
             ],
-            "description": "A pending request whose build.keystore or release.android version changed since it was made is reported as failed with error.code KEYSTORE_GENERATION_STALE (derived on read)."
+            "description": "Derived on read with the server clock: a pending request whose build.keystore or release.android version changed since it was made is reported as failed with error.code KEYSTORE_GENERATION_STALE; one still pending more than 30 minutes after requestedAt (the primary signer is offline, not upgraded, or the trust roots cannot be composed) is reported as failed with error.code KEYSTORE_GENERATION_TIMED_OUT and can be requested again. completedAt stays null until a late delivery or failure report writes the derived failure back."
           },
           "packageName": {
             "type": "string"
@@ -9101,7 +9118,7 @@
             "properties": {
               "code": {
                 "type": "string",
-                "description": "What the primary signer reported (TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, NOT_LOCAL_PRIMARY, PEER_NOT_TRUSTED, GENERATION_FAILED, …) or KEYSTORE_GENERATION_STALE"
+                "description": "What the primary signer reported (TRUST_ROOTS_CHANGED, RECOVERY_KEY_NOT_PINNED, NOT_LOCAL_PRIMARY, PEER_NOT_TRUSTED, GENERATION_FAILED, …), or KEYSTORE_GENERATION_STALE / KEYSTORE_GENERATION_TIMED_OUT derived by the server"
               },
               "detail": {
                 "type": "string"

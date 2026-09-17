@@ -30,7 +30,8 @@ import (
 //     在本机生成 RSA 4096 证书与 PKCS#12，加密给本机信任的签名闸与恢复公钥，用本机 Ed25519 对
 //     keystorebox.GenerationMessage 签名，交回 POST /v1/signer/keystore-generations/:requestId。
 //  3. 服务端一个事务：请求仍未完成且两个版本都没变；调用者是 active 的路由主签名闸、签名用它登记的
-//     Ed25519 公钥验过；上传文件按导入的全部规则校验，收件人里至少一把登记的恢复公钥；写 build.keystore
+//     Ed25519 公钥验过；上传文件按导入的全部规则校验，收件人里至少一把登记的恢复公钥、而且有发给主签名闸
+//     自己的密文；写 build.keystore
 //     （带生成者与签名）、release.android（ADR-0016 的同事务），请求标 done。
 //
 // 服务端被攻破时能做到的是"让签名闸无意义地换一把新密钥"（拒绝服务）与"新租户第一次生成时写入错误的
@@ -46,7 +47,13 @@ const (
 
 	// generationStaleCode 是服务端自己判出来的失败：发起之后签名密钥或发布身份被改过（导入、换身份），
 	// 这次请求按发起时的版本生成出来也落不了库
-	generationStaleCode      = "KEYSTORE_GENERATION_STALE"
+	generationStaleCode = "KEYSTORE_GENERATION_STALE"
+	// generationTimedOutCode 也是服务端自己判出来的失败：请求挂了超过 generationTimeout，主签名闸既没交回
+	// 也没报失败（离线、没升级、信任根算不出来所以没下发……）。不判的话再点生成永远 409
+	generationTimedOutCode = "KEYSTORE_GENERATION_TIMED_OUT"
+	// generationTimeout 按服务端时钟从 requestedAt 算。主签名闸每分钟检查一次，生成一把 RSA 4096 十几秒，
+	// 30 分钟足够宽裕；超过了就让人重新发起，而不是无限期等
+	generationTimeout        = 30 * time.Minute
 	generationDetailMaxRunes = 500
 	// generationAliasSuffix：别名默认 <slug 小写>-release
 	generationAliasSuffix = "-release"
@@ -90,18 +97,38 @@ func (r keystoreGenerationRequest) validate() error {
 	case (r.Status == generationFailed) != (r.Error != nil):
 		return errors.New("error must be set exactly when failed")
 	}
+	if _, err := time.Parse(time.RFC3339Nano, r.RequestedAt); err != nil {
+		return errors.New("requestedAt is not an RFC3339 timestamp")
+	}
 	return nil
 }
 
-// effective 是这条请求现在的状态：发起之后 build.keystore 或 release.android 的版本变了，还挂着的请求
-// 按发起时的版本交回必然 409，这里直接当作失败（KEYSTORE_GENERATION_STALE）。只在读取时推导，不回写：
-// 下发、就绪、控制台、再次发起用的都是这一个判断。
-func (r keystoreGenerationRequest) effective(keystoreVersion, identityVersion int) keystoreGenerationRequest {
-	if r.Status == generationPending && (r.KeystoreVersion != keystoreVersion || r.ReleaseIdentityVersion != identityVersion) {
+// effective 是这条请求现在（now，服务端时钟）的状态。还挂着的请求在两种情况下直接当作失败：
+//   - 发起之后 build.keystore 或 release.android 的版本变了：按发起时的版本交回必然 409（KEYSTORE_GENERATION_STALE）；
+//   - 从 requestedAt 起挂了超过 generationTimeout（KEYSTORE_GENERATION_TIMED_OUT）。
+//
+// 两者都成立时报版本变了（更具体）。下发、就绪、控制台、再次发起、交回与失败报告用的都是这一个判断；
+// 读路径只推导、不回写，只有交回与失败报告在自己的事务里把推导出的失败写回库（不引入定时器）。
+func (r keystoreGenerationRequest) effective(keystoreVersion, identityVersion int, now time.Time) keystoreGenerationRequest {
+	if r.Status != generationPending {
+		return r
+	}
+	switch {
+	case r.KeystoreVersion != keystoreVersion || r.ReleaseIdentityVersion != identityVersion:
 		r.Status = generationFailed
 		r.Error = &keystoreGenerationError{Code: generationStaleCode, Detail: "发起生成之后签名密钥或发布身份被改过（导入了密钥或改了发布身份），这次生成作废；需要的话重新发起"}
+	case r.timedOut(now):
+		r.Status = generationFailed
+		r.Error = &keystoreGenerationError{Code: generationTimedOutCode, Detail: fmt.Sprintf(
+			"主签名闸 %d 分钟内没有交回（可能离线或信任根不全），这次生成作废；可以重新发起", int(generationTimeout/time.Minute))}
 	}
 	return r
+}
+
+// timedOut：从 requestedAt 起已经超过 generationTimeout。requestedAt 读不出来的记录过不了 validate，走不到这里。
+func (r keystoreGenerationRequest) timedOut(now time.Time) bool {
+	requestedAt, err := time.Parse(time.RFC3339Nano, r.RequestedAt)
+	return err == nil && now.Sub(requestedAt) > generationTimeout
 }
 
 // view 是 GenerationRequestView。
@@ -170,7 +197,7 @@ func (s *server) generationRequestFor(ctx context.Context, q rowQuerier, tenant 
 	if err != nil {
 		return nil, err
 	}
-	effective := request.effective(keystoreVersion, identityVersion)
+	effective := request.effective(keystoreVersion, identityVersion, s.now())
 	return &effective, nil
 }
 
@@ -207,6 +234,25 @@ func writeTenantConfig(ctx context.Context, tx *sql.Tx, tenant, key string, valu
 		return false, errors.New("cannot tell whether the write applied")
 	}
 	return affected == 1, nil
+}
+
+// androidPackageUsedByAnotherTenant：别的租户的发布身份（release.android）或签名密钥记录（build.keystore）已经用着
+// 这个包名。只用来尽早报错（发起生成、导入），不是约束：真正按包名把关的是签名闸本机记录。
+func androidPackageUsedByAnotherTenant(ctx context.Context, q rowQuerier, tenant, packageName string) (bool, error) {
+	var one int
+	err := q.QueryRowContext(ctx,
+		`SELECT 1 FROM app_configs WHERE config_key IN (?,?) AND tenant_id<>? AND tenant_id<>? AND JSON_UNQUOTE(JSON_EXTRACT(config_value,'$.packageName'))=? LIMIT 1`,
+		releaseAndroidIdentityConfigKey, buildKeystoreConfigKey, tenant, platformTenantID, packageName).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// androidPackageInUse 不说是哪个租户：租户管理员不该从这里知道别的租户的身份。
+func androidPackageInUse(c *gin.Context) {
+	problem(c, http.StatusConflict, "ANDROID_PACKAGE_IN_USE",
+		"Another tenant already uses this Android package name (release identity or signing key); every tenant's app needs its own package name")
 }
 
 // ---- 管理端：发起 ----
@@ -250,6 +296,15 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 			fmt.Sprintf("packageName must be this tenant's Android package %q", identity.Value.PackageName))
 		return
 	}
+	// 包名跨租户唯一。签名闸本机按包名记确认，别的租户在用的包名它本来也会拒绝；在这里说，免得白白生成
+	if inUse, err := androidPackageUsedByAnotherTenant(ctx, s.db, tenant, packageName); err != nil {
+		slog.Error("cannot check whether another tenant uses the package name", "tenant", tenant, "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_FAILED", "Unable to check the package name")
+		return
+	} else if inUse {
+		androidPackageInUse(c)
+		return
+	}
 	recoveryKeys, err := readRecoveryKeys(ctx, s.db, false)
 	if err != nil {
 		problem(c, http.StatusServiceUnavailable, "RECOVERY_KEYS_UNAVAILABLE", "Recovery keys cannot be read")
@@ -281,7 +336,7 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusConflict, "KEYSTORE_TRUST_ROOTS_UNAVAILABLE", strings.Join(details, "；"))
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	request := keystoreGenerationRequest{
 		RequestID: generationRequestIDPrefix + "_" + randomID(16), PackageName: packageName, Alias: defaultGenerationAlias(slug),
 		RequestedBy: actor(c), RequestedAt: iso(now), KeystoreVersion: *body.ExpectedVersion, ReleaseIdentityVersion: *body.ReleaseIdentityExpectedVersion,
@@ -321,7 +376,7 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 	if err != nil {
 		// 坏掉的请求记录不挡新的请求：覆盖它，留日志
 		slog.Error("overwriting an unreadable build.keystore.request", "tenant", tenant, "error", err)
-	} else if previous != nil && previous.effective(keystoreVersion, identityVersion).Status == generationPending {
+	} else if previous != nil && previous.effective(keystoreVersion, identityVersion, now).Status == generationPending {
 		problem(c, http.StatusConflict, "KEYSTORE_GENERATION_IN_PROGRESS", "A key generation for this tenant is still waiting for the primary signer")
 		return
 	}
@@ -365,7 +420,7 @@ func (s *server) generationTenantFor(ctx context.Context, requestID string) (str
 
 func generationStale(c *gin.Context) {
 	problem(c, http.StatusConflict, generationStaleCode,
-		"This key generation request is no longer waiting for this key (completed, failed, replaced, or the keystore or release identity changed since); discard the generated key")
+		"This key generation request is no longer waiting for this key (completed, failed, replaced, timed out, or the keystore or release identity changed since); discard the generated key")
 }
 
 // requirePrimaryGenerator：生成者只能是 active 的路由主签名闸，而且就是调用者本机。
@@ -426,7 +481,7 @@ func (s *server) completeKeystoreGeneration(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to resolve the tenant")
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to store the generated key")
@@ -478,14 +533,9 @@ func (s *server) completeKeystoreGeneration(c *gin.Context) {
 		generationStale(c)
 		return
 	}
-	if request.KeystoreVersion != keystoreVersion || request.ReleaseIdentityVersion != identityVersion {
-		failed := request.effective(keystoreVersion, identityVersion)
-		failed.CompletedAt = optString(iso(now))
-		if s.storeGenerationOutcome(ctx, c, tx, tenant, failed, requestVersion, generator, now) != nil || tx.Commit() != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to record the stale generation request")
-			return
-		}
-		generationStale(c)
+	// 版本变了或者超时了：这份密钥落不了库。把推导出的失败写回，签名闸按 409 丢弃它
+	if failed := request.effective(keystoreVersion, identityVersion, now); failed.Status != generationPending {
+		s.recordDerivedGenerationFailure(ctx, c, tx, tenant, failed, requestVersion, generator, now)
 		return
 	}
 	public, err := base64.StdEncoding.Strict().DecodeString(string(generator.Ed25519PublicKey))
@@ -528,6 +578,13 @@ func (s *server) completeKeystoreGeneration(c *gin.Context) {
 	if recoveryRecipients == 0 {
 		problem(c, http.StatusUnprocessableEntity, "KEYSTORE_RECOVERY_RECIPIENT_MISSING",
 			"A generated key must also be sealed to at least one registered, unrevoked offline recovery key")
+		return
+	}
+	// 必须有发给生成者自己（当前接受的 X25519 公钥）的密文：收下一份主签名闸自己解不开的密钥，发布身份
+	// 就换成了新证书，而主签名闸再也拿不到这个租户（就绪永远 PRIMARY_SIGNER_NOT_RECIPIENT），只能靠离线恢复
+	if _, ok := boxFor(upload, string(generator.PublicKeySHA256)); !ok {
+		problem(c, http.StatusUnprocessableEntity, "KEYSTORE_PRIMARY_RECIPIENT_MISSING",
+			"A generated key must be sealed to the generating primary signer's own accepted X25519 key ("+string(generator.PublicKeySHA256)+")")
 		return
 	}
 	record, err := s.sealKeystoreRecord(tenant, upload)
@@ -585,6 +642,17 @@ func (s *server) completeKeystoreGeneration(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"keystoreVersion": keystoreVersion + 1, "releaseIdentityVersion": identityVersion + 1})
 }
 
+// recordDerivedGenerationFailure 在调用方的事务里把 effective 推导出的失败（过期、超时）写回库并提交，
+// 回 409 KEYSTORE_GENERATION_STALE。
+func (s *server) recordDerivedGenerationFailure(ctx context.Context, c *gin.Context, tx *sql.Tx, tenant string, failed keystoreGenerationRequest, version int, generator buildMachine, now time.Time) {
+	failed.CompletedAt = optString(iso(now))
+	if s.storeGenerationOutcome(ctx, c, tx, tenant, failed, version, generator, now) != nil || tx.Commit() != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to record the expired generation request")
+		return
+	}
+	generationStale(c)
+}
+
 // storeGenerationOutcome 在调用方的事务里写回请求的最终状态；失败时同时写审计 build_keystore_generation_failed。
 func (s *server) storeGenerationOutcome(ctx context.Context, c *gin.Context, tx *sql.Tx, tenant string, request keystoreGenerationRequest, version int, generator buildMachine, now time.Time) error {
 	value, _ := json.Marshal(request)
@@ -632,13 +700,24 @@ func (s *server) failKeystoreGeneration(c *gin.Context) {
 		generationStale(c)
 		return
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to record the failure")
 		return
 	}
 	defer tx.Rollback()
+	// 加锁顺序与发起、交回一致：build.keystore → release.android → build.keystore.request
+	_, keystoreVersion, err := configRowVersion(ctx, tx, tenant, buildKeystoreConfigKey, true)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to record the failure")
+		return
+	}
+	_, identityVersion, err := configRowVersion(ctx, tx, tenant, releaseAndroidIdentityConfigKey, true)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to record the failure")
+		return
+	}
 	raw, version, err := configRowVersion(ctx, tx, tenant, buildKeystoreRequestConfigKey, true)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_GENERATION_SAVE_FAILED", "Unable to record the failure")
@@ -657,6 +736,11 @@ func (s *server) failKeystoreGeneration(c *gin.Context) {
 	generator, ok := requirePrimaryGenerator(registry.Doc, self, self.ID, "")
 	if !ok {
 		generatorNotPrimary(c)
+		return
+	}
+	// 与交回同一个判断：已经过期或超时的请求不再收签名闸的失败原因，把推导出的失败写回
+	if derived := request.effective(keystoreVersion, identityVersion, now); derived.Status != generationPending {
+		s.recordDerivedGenerationFailure(ctx, c, tx, tenant, derived, version, generator, now)
 		return
 	}
 	failed := *request
