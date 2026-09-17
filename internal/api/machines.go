@@ -710,6 +710,9 @@ func (s *server) reissueEnrollment(c *gin.Context) {
 	}
 	id := strings.TrimSpace(c.Param("id"))
 	reason := strings.TrimSpace(body.Reason)
+	// 签名闸与新建同一条前提（见 createMachine）：没有未吊销的恢复公钥，装出来的签名闸什么也生成不了。
+	// 角色要在登记里查到机器之后才知道，所以先读、读失败也只挡签名闸
+	recovery, recoveryErr := readRecoveryKeys(c.Request.Context(), s.db, false)
 	var reissued buildMachine
 	snapshot, ok := s.mutateMachines(c, *body.ExpectedVersion, func(doc *buildMachinesDoc, now time.Time) (int, string, string, []auditEvent) {
 		index, found := doc.find(id)
@@ -723,6 +726,16 @@ func (s *server) reissueEnrollment(c *gin.Context) {
 			return http.StatusConflict, "MACHINE_REVOKED", "A revoked machine cannot be enrolled; create a new one", nil
 		default:
 			return http.StatusConflict, "MACHINE_ALREADY_ENROLLED", "This machine has already enrolled; a new enrollment code would not be accepted", nil
+		}
+		if m.Role == machineRoleSigner {
+			switch {
+			case recoveryErr != nil:
+				slog.Error("cannot read the recovery keys", "error", recoveryErr)
+				return http.StatusInternalServerError, "RECOVERY_KEYS_INVALID", "Stored build.recovery.recipients configuration cannot be read", nil
+			case len(recovery.Doc.live()) == 0:
+				return http.StatusConflict, "RECOVERY_KEY_NOT_CONFIGURED",
+					"Register the platform's offline recovery public key (Platform maintenance → signing-gate recovery key) before reissuing a signer's install command", nil
+			}
 		}
 		previousExpiresAt := m.Enrollment.ExpiresAt
 		m.Enrollment = newMachineEnrollment(code, actor(c), now)

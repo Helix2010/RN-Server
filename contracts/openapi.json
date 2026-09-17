@@ -4181,7 +4181,7 @@
     "/v1/admin/platform/machines/{id}/enrollment": {
       "post": {
         "summary": "Reissue a machine's enrollment code",
-        "description": "Issues a new one-time code (60 minutes) and invalidates the previous one at once. Only for machines still pending_enrollment. Audited as build_machine_enrollment_reissue without the code.",
+        "description": "Issues a new one-time code (60 minutes) and invalidates the previous one at once. Only for machines still pending_enrollment. For a signer the platform must have an unrevoked offline recovery key, as when creating one (409 RECOVERY_KEY_NOT_CONFIGURED; the previous code stays valid). Audited as build_machine_enrollment_reissue without the code.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineId"
@@ -4237,7 +4237,10 @@
             "description": "MACHINE_NOT_FOUND"
           },
           "409": {
-            "description": "MACHINES_VERSION_CONFLICT, MACHINE_ALREADY_ENROLLED (pending_key or active), MACHINE_REVOKED"
+            "description": "MACHINES_VERSION_CONFLICT, MACHINE_ALREADY_ENROLLED (pending_key or active), MACHINE_REVOKED, RECOVERY_KEY_NOT_CONFIGURED (a signer and no unrevoked recovery key is registered)"
+          },
+          "500": {
+            "description": "MACHINE_SAVE_FAILED, MACHINE_REGISTRY_INVALID, RECOVERY_KEYS_INVALID (a signer and build.recovery.recipients cannot be read)"
           }
         }
       }

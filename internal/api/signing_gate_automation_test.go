@@ -584,6 +584,40 @@ func pendingMachines(f *gateFixture) []buildMachine {
 	return out
 }
 
+// 重发签名闸的注册码与新建是同一条前提：平台没有未吊销的恢复公钥时 409 RECOVERY_KEY_NOT_CONFIGURED（装出来的
+// 签名闸什么也生成不了），旧码不作废；构建机不受影响；已吊销的机器仍然先报 MACHINE_REVOKED。
+func TestDBSignerEnrollmentReissueNeedsARecoveryKey(t *testing.T) {
+	f := newGateFixture(t, 136)
+	recoveryKey := f.registerRecoveryKey("platform-recovery")
+	signerID, signerCode := f.createMachine(machineRoleSigner, "signer-re-"+uniqueSuffix(), signerRoleStandby)
+	builderID, _ := f.createMachine(machineRoleBuilder, "builder-re-"+uniqueSuffix(), nil)
+	revokedID, _ := f.createMachine(machineRoleSigner, "signer-rv-"+uniqueSuffix(), signerRoleStandby)
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+revokedID+"/revoke", map[string]any{"expectedVersion": registryVersion(t, f), "reason": "not needed", "confirm": true}); r.Code != http.StatusOK {
+		t.Fatalf("revoke: %d %s", r.Code, r.Body.String())
+	}
+	reissue := func(id string) *httptest.ResponseRecorder {
+		t.Helper()
+		return f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+id+"/enrollment", map[string]any{"expectedVersion": registryVersion(t, f), "reason": "the code expired", "confirm": true})
+	}
+	f.revokeRecoveryKey(recoveryKey.ID)
+	if r := reissue(signerID); r.Code != http.StatusConflict || problemCode(t, r) != "RECOVERY_KEY_NOT_CONFIGURED" {
+		t.Fatalf("reissue for a signer without a recovery key: %d %s", r.Code, r.Body.String())
+	}
+	if record := f.machineRecord(signerID); record.Enrollment == nil || record.Enrollment.CodeSHA256 != sha256Hex(signerCode) {
+		t.Fatalf("a refused reissue replaced the code: %+v", record.Enrollment)
+	}
+	if r := reissue(builderID); r.Code != http.StatusOK {
+		t.Fatalf("reissue for a builder without a recovery key: %d %s", r.Code, r.Body.String())
+	}
+	if r := reissue(revokedID); r.Code != http.StatusConflict || problemCode(t, r) != "MACHINE_REVOKED" {
+		t.Fatalf("reissue for a revoked signer: %d %s", r.Code, r.Body.String())
+	}
+	f.registerRecoveryKey("platform-recovery-2")
+	if r := reissue(signerID); r.Code != http.StatusOK {
+		t.Fatalf("reissue for a signer once a recovery key is registered again: %d %s", r.Code, r.Body.String())
+	}
+}
+
 // 新建签名闸要求平台已登记恢复公钥；安装命令由服务端拼好，签名闸带恢复公钥占位。
 func TestDBSignerCreationNeedsARecoveryKeyAndTheInstallCommandIsComposed(t *testing.T) {
 	f := newGateFixture(t, 124)
