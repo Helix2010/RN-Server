@@ -3298,7 +3298,7 @@
     "/v1/admin/build-keystore/export": {
       "get": {
         "summary": "Export the sealed keystore file for offline recovery",
-        "description": "The current upload file (KeystoreUpload, ciphertext only: nobody but the recipient signers and recovery key holders can open it) as a JSON attachment, for build-keystore recover. Audited as build_keystore_exported.",
+        "description": "The current upload file (KeystoreUpload) as a JSON attachment for build-keystore recover, carrying only the boxes sealed to registered, unrevoked offline recovery keys: the boxes for signers are left out, so a revoked signer's leftover private key cannot open an exported file. The outer fields are the stored ones; the generation signature is not part of the file and recover does not need it. Read and audit (build_keystore_exported, listing the exported recipients) happen in one transaction: when the audit cannot be written nothing is exported.",
         "responses": {
           "200": {
             "description": "Attachment <slug>-keystore-v<version>.json",
@@ -3316,8 +3316,14 @@
           "404": {
             "description": "BUILD_KEYSTORE_NOT_CONFIGURED (no usable v3 keystore)"
           },
+          "409": {
+            "description": "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT: the current key has no box for a registered, unrevoked recovery key (imported without one, or every recovery recipient has been revoked; see revokedRecoveryRecipients)"
+          },
           "500": {
-            "description": "BUILD_KEYSTORE_CONFIG_INVALID"
+            "description": "BUILD_KEYSTORE_CONFIG_INVALID, BUILD_KEYSTORE_EXPORT_FAILED (including an audit that cannot be written; nothing is exported)"
+          },
+          "503": {
+            "description": "RECOVERY_KEYS_UNAVAILABLE"
           }
         }
       }

@@ -1505,52 +1505,108 @@ func TestDBKeystoreViewMarksRevokedRecoveryRecipients(t *testing.T) {
 	}
 }
 
-// 导出：当前密钥的密文文件原样下载、写审计；没有可用密钥 404。导入可以带恢复收件人，但不强制。
-func TestDBKeystoreExportAndImportWithRecoveryRecipients(t *testing.T) {
+// 导出只带发给未吊销恢复公钥的密文（发给签名闸的不带：吊销了没擦盘的签名闸私钥加上任何一次导出就能解开），
+// 与审计同一个事务，审计写不进去就不导出；没有可用的恢复收件人 409，没有可用密钥 404。导出的文件离线工具
+// build-keystore recover 照样能用（它只解发给恢复公钥的那份、核对明文与外层字段）。导入可以带恢复收件人，但不强制。
+func TestDBKeystoreExportCarriesOnlyRecoveryBoxes(t *testing.T) {
 	f := newGateFixture(t, 133)
-	export := func() *httptest.ResponseRecorder {
+	export := func(requestID string) *httptest.ResponseRecorder {
 		c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/build-keystore/export", nil)
+		if requestID != "" {
+			c.Set("requestId", requestID)
+		}
 		f.s.exportBuildKeystore(c)
 		return recorder
 	}
-	r := export()
-	state, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant)
-	var exported keystorebox.Upload
-	if r.Code != http.StatusOK || json.Unmarshal(r.Body.Bytes(), &exported) != nil || !strings.Contains(r.Header().Get("Content-Disposition"), "attachment") {
-		t.Fatalf("export: %d %s", r.Code, r.Body.String())
+	// 夹具的密钥只发给了两台签名闸：没有可导出的东西
+	if r := export(""); r.Code != http.StatusConflict || problemCode(t, r) != "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT" || strings.Contains(r.Body.String(), f.primary.recipient()) {
+		t.Fatalf("export of a key without recovery recipients: %d %s", r.Code, r.Body.String())
 	}
-	parsed, err := keystorebox.ParseUpload(r.Body.Bytes())
-	want, _ := json.Marshal(state.Upload)
-	got, _ := json.Marshal(parsed)
-	if err != nil || !bytes.Equal(want, got) {
-		t.Fatalf("the exported file differs from the stored upload: %v", err)
-	}
-	if f.auditCount(f.tenant, "build_keystore_exported") != 1 {
-		t.Fatal("the export was not audited")
+	if f.auditCount(f.tenant, "build_keystore_exported") != 0 {
+		t.Fatal("a refused export was audited as exported")
 	}
 
 	recoveryKey := f.registerRecoveryKey("platform-recovery")
-	keystoreVersion, identityVersion := f.keystoreVersions()
 	importBody := func(upload keystorebox.Upload) map[string]any {
+		keystoreVersion, identityVersion := f.keystoreVersions()
 		return map[string]any{"upload": upload, "packageName": f.packageName, "signerSha256": f.apkSigner.sha256(),
 			"expectedVersion": keystoreVersion, "releaseIdentityExpectedVersion": identityVersion, "reason": "import with recovery", "confirm": true}
 	}
-	withRecovery := f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
+	withRecovery := f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(),
+		f.standby.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
 	if saved := f.saveKeystoreRequest(importBody(withRecovery)); saved.Code != http.StatusOK {
 		t.Fatalf("import with a recovery recipient: %d %s", saved.Code, saved.Body.String())
 	} else if recipients := decodeBody(t, saved)["recoveryRecipients"].([]any); len(recipients) != 1 || recipients[0] != recoveryKey.SHA256 {
 		t.Fatalf("recovery recipients after import: %v", recipients)
 	}
-	keystoreVersion, identityVersion = f.keystoreVersions()
 	stranger, _ := ecdh.X25519().GenerateKey(rand.Reader)
 	if saved := f.saveKeystoreRequest(importBody(f.sealedUpload(f.slug, f.packageName, "release", f.apkSigner.sha256(), f.primary.X25519.PublicKey().Bytes(), stranger.PublicKey().Bytes()))); saved.Code != http.StatusUnprocessableEntity || problemCode(t, saved) != "BUILD_KEYSTORE_RECIPIENT_UNKNOWN" {
 		t.Fatalf("import with an unknown recipient: %d %s", saved.Code, saved.Body.String())
 	}
 
+	r := export("")
+	state, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant)
+	if r.Code != http.StatusOK || !strings.Contains(r.Header().Get("Content-Disposition"), "attachment") || r.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("export: %d %s", r.Code, r.Body.String())
+	}
+	parsed, err := keystorebox.ParseUpload(r.Body.Bytes())
+	if err != nil {
+		t.Fatalf("the exported file is not an upload the offline tool accepts: %v", err)
+	}
+	want := *state.Upload
+	want.Boxes = nil
+	for _, box := range state.Upload.Boxes {
+		if box.RecipientSHA256 == recoveryKey.SHA256 {
+			want.Boxes = append(want.Boxes, box)
+		}
+	}
+	wantJSON, _ := json.Marshal(want)
+	gotJSON, _ := json.Marshal(parsed)
+	if len(parsed.Boxes) != 1 || !bytes.Equal(wantJSON, gotJSON) {
+		t.Fatalf("the export must be the stored upload with only the recovery box: %s", r.Body.String())
+	}
+	for _, signer := range []gateMachine{f.primary, f.standby} {
+		if strings.Contains(r.Body.String(), signer.recipient()) {
+			t.Fatalf("the export carries a box for signer %s", signer.Name)
+		}
+	}
+	// 离线恢复照样解得开（recover 的做法：按恢复公钥取 box、解开、明文与外层字段一致）
+	box, ok := parsed.BoxFor(recoveryKey.SHA256)
+	if !ok {
+		t.Fatal("the export has no box for the recovery key")
+	}
+	plaintext, err := keystorebox.Open(box, recoveryKey.Private.Bytes())
+	if err != nil || plaintext.PackageName != parsed.PackageName || plaintext.CertificateSHA256 != parsed.CertificateSHA256 ||
+		plaintext.KeyAlias != parsed.KeyAlias || plaintext.TenantSlug != parsed.TenantSlug || plaintext.CreatedAt != parsed.CreatedAt {
+		t.Fatalf("the recovery key cannot recover the exported file: %v", err)
+	}
+	var summary string
+	if err := f.db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='build_keystore_exported'`, f.tenant).Scan(&summary); err != nil {
+		t.Fatalf("the export was not audited exactly once: %v", err)
+	}
+	if !strings.Contains(summary, recoveryKey.SHA256) || strings.Contains(summary, f.primary.recipient()) {
+		t.Fatalf("the export audit must list the exported recipients: %s", summary)
+	}
+
+	// 审计写不进去（request_id 超过列宽）：500，什么都不给
+	if r := export(strings.Repeat("r", 200)); r.Code != http.StatusInternalServerError || problemCode(t, r) != "BUILD_KEYSTORE_EXPORT_FAILED" ||
+		strings.Contains(r.Body.String(), recoveryKey.SHA256) || strings.Contains(r.Body.String(), box.Ciphertext) || r.Header().Get("Content-Disposition") != "" {
+		t.Fatalf("an export whose audit cannot be written: %d %s", r.Code, r.Body.String())
+	}
+	if f.auditCount(f.tenant, "build_keystore_exported") != 1 {
+		t.Fatal("a failed export left an audit row")
+	}
+
+	// 恢复公钥吊销之后，这份密文就没有可以导出的收件人了
+	f.revokeRecoveryKey(recoveryKey.ID)
+	if r := export(""); r.Code != http.StatusConflict || problemCode(t, r) != "BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT" || strings.Contains(r.Body.String(), box.Ciphertext) {
+		t.Fatalf("export after the recovery key was revoked: %d %s", r.Code, r.Body.String())
+	}
+
 	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, buildKeystoreConfigKey); err != nil {
 		t.Fatal(err)
 	}
-	if r := export(); r.Code != http.StatusNotFound || problemCode(t, r) != "BUILD_KEYSTORE_NOT_CONFIGURED" {
+	if r := export(""); r.Code != http.StatusNotFound || problemCode(t, r) != "BUILD_KEYSTORE_NOT_CONFIGURED" {
 		t.Fatalf("export without a keystore: %d %s", r.Code, r.Body.String())
 	}
 }
