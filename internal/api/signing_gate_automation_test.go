@@ -1225,6 +1225,115 @@ func TestDBFirstKeyGenerationForATenantWithoutReleaseIdentity(t *testing.T) {
 	}
 }
 
+// 主签名闸离线、或者一直算不出信任根时，请求不能永远挂着：超过 30 分钟（服务端时钟）读的时候就按
+// KEYSTORE_GENERATION_TIMED_OUT 失败——不再下发、不挡新的请求、控制台与就绪这样显示；超时之后才到的
+// 交回与失败报告按"请求不再 pending"409，并把超时写回库、审计一次。
+func TestDBKeystoreGenerationTimesOut(t *testing.T) {
+	f := newGateFixture(t, 134)
+	recoveryKey := f.registerRecoveryKey("platform-recovery")
+	base := time.Now().UTC()
+	now := base
+	f.s.clock = func() time.Time { return now }
+	alias := defaultGenerationAlias(f.slug)
+	requestAt := func() string {
+		t.Helper()
+		r := f.generate(f.generateBody(f.packageName))
+		if r.Code != http.StatusAccepted {
+			t.Fatalf("generate at %s: %d %s", now, r.Code, r.Body.String())
+		}
+		return decodeBody(t, r)["generationRequest"].(map[string]any)["requestId"].(string)
+	}
+	first := requestAt()
+	if stored := f.storedGenerationRequest(); stored.RequestedAt != iso(base) {
+		t.Fatalf("requestedAt does not come from the server clock: %+v", stored)
+	}
+
+	// 还没到 30 分钟：照常挂着、照常下发、再点生成 409
+	now = base.Add(generationTimeout - time.Minute)
+	if got := f.keystoreView()["generationRequest"].(map[string]any); got["status"] != generationPending {
+		t.Fatalf("a request within the timeout: %v", got)
+	}
+	if item := f.checkItem(f.primary); item["generationRequest"] == nil {
+		t.Fatalf("a request within the timeout is not delivered: %v", item)
+	}
+	if r := f.generate(f.generateBody(f.packageName)); r.Code != http.StatusConflict || problemCode(t, r) != "KEYSTORE_GENERATION_IN_PROGRESS" {
+		t.Fatalf("generate while a request is pending: %d %s", r.Code, r.Body.String())
+	}
+
+	// 过了 30 分钟：读的时候就是失败（库里不改），不下发
+	now = base.Add(generationTimeout + time.Minute)
+	got := f.keystoreView()["generationRequest"].(map[string]any)
+	if failure, _ := got["error"].(map[string]any); got["status"] != generationFailed || failure["code"] != generationTimedOutCode ||
+		!strings.Contains(failure["detail"].(string), "30 分钟") {
+		t.Fatalf("a timed-out request in the view: %v", got)
+	}
+	if item := f.checkItem(f.primary); item["generationRequest"] != nil {
+		t.Fatalf("a timed-out request is still delivered: %v", item)
+	}
+	if stored := f.storedGenerationRequest(); stored.Status != generationPending {
+		t.Fatalf("reading a timed-out request wrote it back: %+v", stored)
+	}
+	// 已有可用密钥：超时不影响就绪
+	if codes := readinessCodes(t, f); len(codes) != 0 {
+		t.Fatalf("a timed-out regeneration made a configured tenant unready: %v", codes)
+	}
+
+	// 超时之后才交回：409 KEYSTORE_GENERATION_STALE（签名闸据此丢弃），超时写回库，密钥不变
+	before, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant)
+	upload := f.sealedUpload(f.slug, f.packageName, alias, newCertificateSHA256(), f.primary.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
+	if r := f.deliver(f.primary, first, upload, f.primary.ID, f.primary.Ed25519); r.Code != http.StatusConflict || problemCode(t, r) != generationStaleCode {
+		t.Fatalf("delivering a timed-out request: %d %s", r.Code, r.Body.String())
+	}
+	if stored := f.storedGenerationRequest(); stored.Status != generationFailed || stored.Error == nil || stored.Error.Code != generationTimedOutCode || stored.CompletedAt != optString(iso(now)) {
+		t.Fatalf("a timed-out delivery must be recorded as timed out: %+v", stored)
+	}
+	if after, _ := f.s.buildKeystoreStateFor(t.Context(), f.db, f.tenant); after.Version != before.Version || after.Record.CertificateSHA256 != before.Record.CertificateSHA256 {
+		t.Fatalf("a timed-out delivery replaced the keystore: %+v", after.Record)
+	}
+	if f.auditCount(f.tenant, "build_keystore_generation_failed") != 1 {
+		t.Fatal("the timed-out delivery was not audited as failed exactly once")
+	}
+
+	// 超时的请求不挡新的；新的超时之后报失败：同样 409，超时写回库
+	second := requestAt()
+	now = now.Add(generationTimeout + time.Second)
+	if r := f.do(http.MethodPost, "/v1/signer/keystore-generations/"+second+"/fail", f.primary.Token, nil, map[string]any{"code": "TRUST_ROOTS_CHANGED", "detail": "late"}); r.Code != http.StatusConflict || problemCode(t, r) != generationStaleCode {
+		t.Fatalf("reporting a failure after the timeout: %d %s", r.Code, r.Body.String())
+	}
+	if stored := f.storedGenerationRequest(); stored.RequestID != second || stored.Status != generationFailed || stored.Error == nil || stored.Error.Code != generationTimedOutCode {
+		t.Fatalf("a failure reported after the timeout: %+v", stored)
+	}
+	if f.auditCount(f.tenant, "build_keystore_generation_failed") != 2 {
+		t.Fatal("the timed-out failure report was not audited")
+	}
+
+	// 还没有密钥的租户：超时就是就绪问题 KEYSTORE_GENERATION_FAILED，带上超时的原因
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key IN (?,?,?)`, f.tenant, buildKeystoreConfigKey, releaseAndroidIdentityConfigKey, buildKeystoreCheckConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.generate(map[string]any{"packageName": f.packageName, "expectedVersion": 0, "releaseIdentityExpectedVersion": 0, "reason": "first key", "confirm": true}); r.Code != http.StatusAccepted {
+		t.Fatalf("first generate: %d %s", r.Code, r.Body.String())
+	}
+	if codes := readinessCodes(t, f); !containsString(codes, readinessGenerationPending) {
+		t.Fatalf("readiness of a fresh first generation: %v", codes)
+	}
+	now = now.Add(generationTimeout + time.Second)
+	readiness, err := f.s.signerReadinessFor(t.Context(), f.tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range readiness.Problems {
+		if p.Code == readinessGenerationPending {
+			t.Fatalf("a timed-out first generation is still pending: %v", readiness.Problems)
+		}
+		found = found || (p.Code == readinessGenerationFailed && strings.Contains(p.Detail, generationTimedOutCode))
+	}
+	if !found {
+		t.Fatalf("a timed-out first generation: %v", readiness.Problems)
+	}
+}
+
 // 导出：当前密钥的密文文件原样下载、写审计；没有可用密钥 404。导入可以带恢复收件人，但不强制。
 func TestDBKeystoreExportAndImportWithRecoveryRecipients(t *testing.T) {
 	f := newGateFixture(t, 133)
@@ -1323,19 +1432,44 @@ func TestDefaultGenerationAliasIsAValidAlias(t *testing.T) {
 	}
 }
 
-// 生成请求记录的状态推导：发起之后两个版本任何一个变了，挂着的请求算失败（过期）；完成、失败的不变。
+// 生成请求记录的状态推导：发起之后两个版本任何一个变了，挂着的请求算失败（过期）；挂了超过 30 分钟算失败
+// （超时，版本变了优先报过期）；完成、失败的不变。
 func TestGenerationRequestEffectiveStatus(t *testing.T) {
-	pending := keystoreGenerationRequest{Status: generationPending, KeystoreVersion: 3, ReleaseIdentityVersion: 5}
-	if got := pending.effective(3, 5); got.Status != generationPending || got.Error != nil {
+	requestedAt := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	fresh := requestedAt.Add(generationTimeout - time.Millisecond)
+	pending := keystoreGenerationRequest{Status: generationPending, KeystoreVersion: 3, ReleaseIdentityVersion: 5, RequestedAt: iso(requestedAt)}
+	if got := pending.effective(3, 5, fresh); got.Status != generationPending || got.Error != nil {
 		t.Fatalf("an untouched pending request: %+v", got)
 	}
+	if got := pending.effective(3, 5, requestedAt.Add(generationTimeout)); got.Status != generationPending {
+		t.Fatalf("a request exactly at the timeout is still pending: %+v", got)
+	}
 	for _, versions := range [][2]int{{4, 5}, {3, 6}, {0, 0}} {
-		if got := pending.effective(versions[0], versions[1]); got.Status != generationFailed || got.Error == nil || got.Error.Code != generationStaleCode {
-			t.Fatalf("versions %v: %+v", versions, got)
+		for _, now := range []time.Time{fresh, requestedAt.Add(time.Hour)} {
+			if got := pending.effective(versions[0], versions[1], now); got.Status != generationFailed || got.Error == nil || got.Error.Code != generationStaleCode {
+				t.Fatalf("versions %v at %s: %+v", versions, now, got)
+			}
 		}
 	}
-	done := keystoreGenerationRequest{Status: generationDone, KeystoreVersion: 3, ReleaseIdentityVersion: 5}
-	if got := done.effective(4, 6); got.Status != generationDone {
+	timedOut := pending.effective(3, 5, requestedAt.Add(generationTimeout+time.Millisecond))
+	if timedOut.Status != generationFailed || timedOut.Error == nil || timedOut.Error.Code != generationTimedOutCode ||
+		!strings.Contains(timedOut.Error.Detail, "30 分钟") || !strings.Contains(timedOut.Error.Detail, "重新发起") {
+		t.Fatalf("a request pending for longer than the timeout: %+v", timedOut)
+	}
+	if pending.Status != generationPending || pending.Error != nil {
+		t.Fatalf("effective changed the stored request: %+v", pending)
+	}
+	done := keystoreGenerationRequest{Status: generationDone, KeystoreVersion: 3, ReleaseIdentityVersion: 5, RequestedAt: iso(requestedAt)}
+	if got := done.effective(4, 6, requestedAt.Add(time.Hour)); got.Status != generationDone {
 		t.Fatalf("a done request: %+v", got)
+	}
+	// 发起时间读不出来的记录读的时候就当坏记录（errGenerationRequestInvalid），不会走到推导
+	malformed := keystoreGenerationRequest{RequestID: "kgr_" + randomID(16), PackageName: "com.example.app", Alias: "release", RequestedAt: "yesterday", Status: generationPending}
+	if err := malformed.validate(); err == nil {
+		t.Fatal("a request with an unreadable requestedAt passed validation")
+	}
+	malformed.RequestedAt = iso(requestedAt)
+	if err := malformed.validate(); err != nil {
+		t.Fatalf("a well-formed request: %v", err)
 	}
 }
