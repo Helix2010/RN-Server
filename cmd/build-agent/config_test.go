@@ -16,7 +16,7 @@ var configKeys = []string{
 	"BUILD_AGENT_SERVER", "BUILD_AGENT_MACHINE_TOKEN", "BUILD_AGENT_REPO", "BUILD_AGENT_WORKSPACE",
 	"BUILD_AGENT_STATE_DIR", "BUILD_AGENT_PLATFORMS", "BUILD_AGENT_TIMEOUT_MINUTES", "BUILD_AGENT_RUNNER",
 	"BUILD_AGENT_RUNNER_USER", "BUILD_AGENT_TOKEN", "BUILD_KEYSTORE_PASSPHRASE", "GRADLE_RO_DEP_CACHE",
-	"JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+	"JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "BUILD_AGENT_SSH_KEY", "BUILD_AGENT_SSH_KNOWN_HOSTS",
 }
 
 func applyConfigEnv(t *testing.T, overrides map[string]string) {
@@ -54,30 +54,37 @@ func TestLoadConfigRefusesAnIncompleteOrUnsafeSetup(t *testing.T) {
 	if cfg.Runner != "/opt/rn-build-agent/build-runner" || cfg.RunnerUser != "builder" || cfg.Timeout != 45*time.Minute {
 		t.Fatalf("defaults = %q %q %s", cfg.Runner, cfg.RunnerUser, cfg.Timeout)
 	}
+	if cfg.SSHKey != "/var/lib/rn-build-agent/.ssh/id_ed25519" || cfg.KnownHosts != "/opt/rn-build-agent/github_known_hosts" {
+		t.Fatalf("ssh defaults = %q %q", cfg.SSHKey, cfg.KnownHosts)
+	}
 	if _, ok := cfg.MachineEnv["BUILD_AGENT_MACHINE_TOKEN"]; ok || cfg.MachineEnv["PATH"] == "" {
 		t.Fatalf("machine env = %v", cfg.MachineEnv)
 	}
 	for name, overrides := range map[string]map[string]string{
-		"no server":              {"BUILD_AGENT_SERVER": ""},
-		"no token":               {"BUILD_AGENT_MACHINE_TOKEN": ""},
-		"malformed token":        {"BUILD_AGENT_MACHINE_TOKEN": "not-a-machine-token"},
-		"old token key":          {"BUILD_AGENT_TOKEN": "legacy-shared-token"},
-		"old keystore key":       {"BUILD_KEYSTORE_PASSPHRASE": "leftover-passphrase"},
-		"no repo":                {"BUILD_AGENT_REPO": ""},
-		"no workspace":           {"BUILD_AGENT_WORKSPACE": ""},
-		"no state dir":           {"BUILD_AGENT_STATE_DIR": ""},
-		"relative workspace":     {"BUILD_AGENT_WORKSPACE": "workspace"},
-		"state inside jobs root": {"BUILD_AGENT_STATE_DIR": "/var/lib/rn-build-jobs/state"},
-		"jobs root inside state": {"BUILD_AGENT_WORKSPACE": "/var/lib/rn-build-agent/state/jobs"},
-		"repo inside jobs root":  {"BUILD_AGENT_REPO": "/var/lib/rn-build-jobs/rn-app.git"},
-		"plain http":             {"BUILD_AGENT_SERVER": "http://api.example.com"},
-		"ios":                    {"BUILD_AGENT_PLATFORMS": "android,ios"},
-		"absurd timeout":         {"BUILD_AGENT_TIMEOUT_MINUTES": "0"},
-		"timeout not a number":   {"BUILD_AGENT_TIMEOUT_MINUTES": "soon"},
-		"relative runner":        {"BUILD_AGENT_RUNNER": "build-runner"},
-		"runner user injection":  {"BUILD_AGENT_RUNNER_USER": "builder -s"},
-		"root dep cache missing": {"GRADLE_RO_DEP_CACHE": "/nonexistent/gradle-ro"},
-		"no PATH":                {"PATH": ""},
+		"no server":               {"BUILD_AGENT_SERVER": ""},
+		"no token":                {"BUILD_AGENT_MACHINE_TOKEN": ""},
+		"malformed token":         {"BUILD_AGENT_MACHINE_TOKEN": "not-a-machine-token"},
+		"old token key":           {"BUILD_AGENT_TOKEN": "legacy-shared-token"},
+		"old keystore key":        {"BUILD_KEYSTORE_PASSPHRASE": "leftover-passphrase"},
+		"no repo":                 {"BUILD_AGENT_REPO": ""},
+		"no workspace":            {"BUILD_AGENT_WORKSPACE": ""},
+		"no state dir":            {"BUILD_AGENT_STATE_DIR": ""},
+		"relative workspace":      {"BUILD_AGENT_WORKSPACE": "workspace"},
+		"state inside jobs root":  {"BUILD_AGENT_STATE_DIR": "/var/lib/rn-build-jobs/state"},
+		"jobs root inside state":  {"BUILD_AGENT_WORKSPACE": "/var/lib/rn-build-agent/state/jobs"},
+		"repo inside jobs root":   {"BUILD_AGENT_REPO": "/var/lib/rn-build-jobs/rn-app.git"},
+		"plain http":              {"BUILD_AGENT_SERVER": "http://api.example.com"},
+		"ios":                     {"BUILD_AGENT_PLATFORMS": "android,ios"},
+		"absurd timeout":          {"BUILD_AGENT_TIMEOUT_MINUTES": "0"},
+		"timeout not a number":    {"BUILD_AGENT_TIMEOUT_MINUTES": "soon"},
+		"relative runner":         {"BUILD_AGENT_RUNNER": "build-runner"},
+		"runner user injection":   {"BUILD_AGENT_RUNNER_USER": "builder -s"},
+		"root dep cache missing":  {"GRADLE_RO_DEP_CACHE": "/nonexistent/gradle-ro"},
+		"no PATH":                 {"PATH": ""},
+		"ssh key shell injection": {"BUILD_AGENT_SSH_KEY": "/x -o ProxyCommand=touch%20/tmp/y"},
+		"relative ssh key":        {"BUILD_AGENT_SSH_KEY": "id_ed25519"},
+		"known hosts with quotes": {"BUILD_AGENT_SSH_KNOWN_HOSTS": "/opt/x';touch /tmp/y'"},
+		"unclean known hosts":     {"BUILD_AGENT_SSH_KNOWN_HOSTS": "/opt/rn-build-agent/../github_known_hosts"},
 	} {
 		applyConfigEnv(t, overrides)
 		if _, err := loadConfig(); err == nil {
