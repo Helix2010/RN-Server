@@ -154,7 +154,8 @@ func (s *server) routes() *gin.Engine {
 	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		panic(err)
 	}
-	r.Use(gin.Recovery(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
+	// 不用 gin.Recovery()：它会把请求头原样打进日志（见 recoverPanics）
+	r.Use(recoverPanics(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
 	r.GET("/health/live", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "live"}) })
 	r.GET("/health/ready", s.ready)
 	r.GET("/openapi.json", func(c *gin.Context) { c.File("contracts/openapi.json") })
