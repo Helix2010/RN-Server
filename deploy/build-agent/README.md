@@ -2,6 +2,8 @@
 
 设计见 `docs/design/android-signing-gate-2026-09-16.md`「构建机」「部署与运维」，装机与注册见 `docs/design/android-signing-gate-automation-2026-09-16.md`「2. 新机器」。
 
+> 各服务谁自动部署、谁人工，以及上新机器 / 下旧机器的顺序：[`../DEPLOYMENT.md`](../DEPLOYMENT.md)。
+
 **构建机没有签名能力。** 它执行 pnpm、Gradle 和几千个第三方依赖的代码，按不可信处理：手上没有任何签名密钥，只交付**未签名包**、SBOM 和一份用本机出处密钥签名的出处声明；正式签名由签名闸做，签名闸只认在它本机 pin 过的构建机公钥。
 
 ## 一句话拓扑

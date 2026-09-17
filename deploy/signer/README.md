@@ -3,6 +3,8 @@
 设计：`docs/design/android-signing-gate-2026-09-16.md`（原设计）、`docs/design/android-signing-gate-automation-2026-09-16.md`
 （部署与换密钥自动化，下称“自动化设计”）。
 
+> 各服务谁自动部署、谁人工，以及上新机器 / 下旧机器的顺序：[`../DEPLOYMENT.md`](../DEPLOYMENT.md)。
+
 两种装法并存：
 
 - **新机器：一条命令 + 控制台接受**（第 A–D 节）。安装包由服务端下发，`install.sh` 按实例名渲染
