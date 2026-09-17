@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "RN Server Foundation API",
-    "version": "2026.09.26"
+    "version": "2026.09.27"
   },
   "paths": {
     "/v1/mobile/referral/me": {
@@ -5012,7 +5012,10 @@
             "description": "TENANT_NOT_FOUND"
           },
           "409": {
-            "description": "KEYSTORE_RESEAL_STALE (no usable v3 keystore, or it changed while being resealed), KEYSTORE_GENERATION_IN_PROGRESS"
+            "description": "KEYSTORE_RESEAL_STALE (no usable v3 keystore, or it changed while being resealed), KEYSTORE_GENERATION_IN_PROGRESS (a pending generation that is neither stale nor timed out; it replaces the recipients anyway)"
+          },
+          "429": {
+            "description": "KEYSTORE_RESEAL_RATE_LIMITED (this tenant's key was resealed less than 10 minutes ago; the signing gate throttles itself too, but that window is in memory and a restart clears it)"
           },
           "422": {
             "description": "KEYSTORE_RESEAL_MISMATCH (certificate, package name, key alias or tenant differs), KEYSTORE_RESEAL_SIGNATURE_INVALID, BUILD_KEYSTORE_RECIPIENT_UNKNOWN, KEYSTORE_RECOVERY_RECIPIENT_MISSING, KEYSTORE_PRIMARY_RECIPIENT_MISSING, BUILD_KEYSTORE_FORMAT_UNSUPPORTED"

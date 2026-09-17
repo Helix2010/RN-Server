@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/Helix2010/RN-Server/signing/ident"
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
@@ -25,6 +27,10 @@ import (
 // 服务端加不进任何本机没信任的公钥——它能做的只是不报或乱报机器状态，结果是不重新封装（拒绝服务）。
 //
 // 发布身份不动（证书没变）。有待处理的生成请求时拒绝：生成本来就会换掉收件人。
+//
+// resealWindow 是服务端这一侧的节流窗口，与签名闸本机的窗口同值。
+const resealWindow = 10 * time.Minute
+
 func (s *server) resealBuildKeystore(c *gin.Context) {
 	self, _ := machineFromContext(c)
 	var body struct {
@@ -68,6 +74,12 @@ func (s *server) resealBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_RESEAL_FAILED", "Unable to store the resealed key")
 		return
 	}
+	var keystoreUpdatedAt time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT updated_at FROM app_configs WHERE tenant_id=? AND config_key=?`,
+		tenant, buildKeystoreConfigKey).Scan(&keystoreUpdatedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_RESEAL_FAILED", "Unable to store the resealed key")
+		return
+	}
 	_, identityVersion, err := configRowVersion(ctx, tx, tenant, releaseAndroidIdentityConfigKey, true)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_RESEAL_FAILED", "Unable to store the resealed key")
@@ -99,14 +111,24 @@ func (s *server) resealBuildKeystore(c *gin.Context) {
 			"The signing keystore changed while it was being resealed; the signing gate reseals the new version next round")
 		return
 	}
+	// 用 effective 推导：版本变了或挂了超过 30 分钟的生成请求库里仍写着 pending（只有交回与失败上报会写回），
+	// 直接按原始状态判会让一条僵尸请求永久挡住重新封装
 	request, err := s.generationRequestFor(ctx, tx, tenant)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_RESEAL_FAILED", "Unable to read the generation request")
 		return
 	}
-	if request != nil && request.Status == generationPending {
+	if request != nil && request.effective(keystoreVersion, identityVersion, now).Status == generationPending {
 		problem(c, http.StatusConflict, "KEYSTORE_GENERATION_IN_PROGRESS",
 			"A key generation for this tenant is still waiting for the primary signer; that generation replaces the recipients anyway")
+		return
+	}
+	// 服务端这一侧的节流：签名闸本机也有 10 分钟窗口，但那是进程内存，崩溃重启就清零。
+	// 上一次落库的就是重新封装、且还不到窗口时间，就先不收（换密钥落库的不算，那是另一回事）
+	if current.SealKind == sealKindReseal && !keystoreUpdatedAt.IsZero() && now.Sub(keystoreUpdatedAt.UTC()) < resealWindow {
+		problem(c, http.StatusTooManyRequests, "KEYSTORE_RESEAL_RATE_LIMITED",
+			fmt.Sprintf("This tenant's key was resealed less than %d minutes ago; the signing gate reseals again after that window",
+				int(resealWindow/time.Minute)))
 		return
 	}
 	// 重新封装只换收件人：证书、包名、别名、租户一个字都不能变

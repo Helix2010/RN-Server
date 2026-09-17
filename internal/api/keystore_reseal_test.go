@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
@@ -257,5 +258,55 @@ func TestDBResealedKeystoreStillValidatesItsShape(t *testing.T) {
 		if err := record.validate(); (err != nil) != tc.wantError {
 			t.Fatalf("%s: %v", name, err)
 		}
+	}
+}
+
+// TestDBKeystoreResealIsRateLimitedPerTenant：服务端也按租户节流（签名闸本机那份窗口在进程内存里，
+// 崩溃重启就清零）。刚落库过一次重新封装时回 429；过了窗口再试就收下。
+func TestDBKeystoreResealIsRateLimitedPerTenant(t *testing.T) {
+	f := newGateFixture(t, 144)
+	recoveryKey := f.registerRecoveryKey("recovery-2026")
+	before, version := f.currentKeystore()
+	recipients := func() keystorebox.Upload {
+		return f.sealedUpload(f.slug, before.PackageName, before.KeyAlias, before.CertificateSHA256,
+			f.primary.X25519.PublicKey().Bytes(), f.standby.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
+	}
+	if r := f.reseal(f.primary, resealID(t), version, recipients(), f.primary.Ed25519); r.Code != http.StatusOK {
+		t.Fatalf("first reseal: %d %s", r.Code, r.Body.String())
+	}
+	_, version = f.currentKeystore()
+	r := f.reseal(f.primary, resealID(t), version, recipients(), f.primary.Ed25519)
+	if r.Code != http.StatusTooManyRequests || problemCode(t, r) != "KEYSTORE_RESEAL_RATE_LIMITED" {
+		t.Fatalf("a second reseal inside the window: %d %s", r.Code, r.Body.String())
+	}
+	// 窗口过去之后放行（服务端时钟可注入）
+	f.s.clock = func() time.Time { return time.Now().UTC().Add(resealWindow + time.Minute) }
+	t.Cleanup(func() { f.s.clock = nil })
+	if r := f.reseal(f.primary, resealID(t), version, recipients(), f.primary.Ed25519); r.Code != http.StatusOK {
+		t.Fatalf("a reseal after the window: %d %s", r.Code, r.Body.String())
+	}
+}
+
+// TestDBKeystoreResealIgnoresATimedOutGeneration：库里还写着 pending、但已经超时的生成请求不挡重新封装
+// （推导失败只在交回与失败上报时写回库，读路径只推导）。
+func TestDBKeystoreResealIgnoresATimedOutGeneration(t *testing.T) {
+	f := newGateFixture(t, 145)
+	recoveryKey := f.registerRecoveryKey("recovery-2026")
+	before, version := f.currentKeystore()
+	if r := f.generate(f.generateBody(f.packageName)); r.Code != http.StatusAccepted {
+		t.Fatalf("generate: %d %s", r.Code, r.Body.String())
+	}
+	upload := f.sealedUpload(f.slug, before.PackageName, before.KeyAlias, before.CertificateSHA256,
+		f.primary.X25519.PublicKey().Bytes(), f.standby.X25519.PublicKey().Bytes(), recoveryKey.Private.PublicKey().Bytes())
+	// 还在进行中：拒绝
+	if r := f.reseal(f.primary, resealID(t), version, upload, f.primary.Ed25519); r.Code != http.StatusConflict ||
+		problemCode(t, r) != "KEYSTORE_GENERATION_IN_PROGRESS" {
+		t.Fatalf("reseal while a generation is pending: %d %s", r.Code, r.Body.String())
+	}
+	// 30 分钟之后这条请求按超时推导为失败，不再挡着
+	f.s.clock = func() time.Time { return time.Now().UTC().Add(generationTimeout + time.Minute) }
+	t.Cleanup(func() { f.s.clock = nil })
+	if r := f.reseal(f.primary, resealID(t), version, upload, f.primary.Ed25519); r.Code != http.StatusOK {
+		t.Fatalf("reseal after the generation timed out: %d %s", r.Code, r.Body.String())
 	}
 }
