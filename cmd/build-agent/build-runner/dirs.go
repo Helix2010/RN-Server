@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
@@ -120,15 +121,72 @@ func readSpec(layout jobspec.Layout, kind jobspec.Kind) (jobspec.Spec, error) {
 // 下一个任务的开始。
 //
 // kill(-1) 发给调用者有权发信号的全部进程（本 uid 的进程），不含自己；sudo 父进程是 root 的，
-// 不受影响。同一台机器上 builder 只给执行进程用，所以这是安全的。
+// 不受影响。同一台机器上 builder 只给执行进程用，所以这是安全的。macOS 的语义相同（BSD 的
+// kill(2)：非特权用户发给同 uid 的全部进程，排除调用者本身与系统进程）。
 func reap(who identity) {
 	if !who.separated {
 		return
 	}
 	_ = syscall.Kill(-1, syscall.SIGKILL)
-	for _, dir := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
+	for _, dir := range reapDirs(runtime.GOOS, who.uid, darwinVarFolders) {
 		sweepOwned(dir, who.uid)
 	}
+}
+
+// darwinVarFolders 是 macOS 每用户临时目录的根。
+const darwinVarFolders = "/var/folders"
+
+// reapDirs 是这台机器上要清的临时目录。
+//
+// Linux 与 macOS 的差别不是"多一个少一个"，而是**macOS 上真正会积累东西的那两个目录不在
+// 这张清单的默认位置上**：Xcode、CocoaPods 与 Metro 写的是每用户的
+// `/var/folders/<xx>/<yyyy>/{T,C}`（`confstr(_CS_DARWIN_USER_TEMP_DIR)` 与 `…CACHE_DIR`），
+// 它们**不吃 `TMPDIR`**——把 TMPDIR 指到任务目录也拦不住。不扫这两个目录，一是磁盘会长期
+// 涨（DerivedData 之外还有几个 G 的中间产物），二是"执行进程里能做的事以一个任务为界"这条
+// 就不成立了：上一个任务留下的东西下一个任务还读得到。
+//
+// `/dev/shm` 反过来只有 Linux 有；macOS 上它不存在，扫它只是白跑一次 ReadDir。
+func reapDirs(goos string, uid int, varFolders string) []string {
+	dirs := []string{"/tmp", "/var/tmp"}
+	if goos == "darwin" {
+		return append(dirs, darwinPerUserTempDirs(varFolders, uid)...)
+	}
+	return append(dirs, "/dev/shm")
+}
+
+// darwinPerUserTempDirs 找出属于 uid 的每用户临时与缓存目录。
+//
+// 不调 `getconf DARWIN_USER_TEMP_DIR`，也不调 `confstr`：那两个回的是**当前进程**的目录，
+// 而每用户目录是按 uid 与 bootstrap 命名空间分的——执行进程在不同的 launchd 会话里跑过，
+// 就会留下不止一个。直接按属主扫 `/var/folders` 能把它们都找出来，而且不用起子进程。
+//
+// `/var/folders/<xx>` 是 root 的、可读；下一层 `<yyyy>` 才是用户的 0700。只按第二层的属主
+// 判断，别人的目录连名字都不动。
+func darwinPerUserTempDirs(varFolders string, uid int) []string {
+	var dirs []string
+	outer, err := os.ReadDir(varFolders)
+	if err != nil {
+		return nil
+	}
+	for _, first := range outer {
+		if !first.IsDir() {
+			continue
+		}
+		inner, err := os.ReadDir(filepath.Join(varFolders, first.Name()))
+		if err != nil {
+			continue
+		}
+		for _, second := range inner {
+			path := filepath.Join(varFolders, first.Name(), second.Name())
+			info, owner, err := statOwner(path)
+			if err != nil || owner != uid || !info.IsDir() {
+				continue
+			}
+			// T 与 C 本身留着（系统按这两个名字找它们），只清里面
+			dirs = append(dirs, filepath.Join(path, "T"), filepath.Join(path, "C"))
+		}
+	}
+	return dirs
 }
 
 // sweepOwned 删掉 dir 顶层里属于 uid 的条目（整棵删）。别人的东西不动。

@@ -32,7 +32,7 @@
 | A5 | 已完成 | `ios_inventory.go`：钥匙串身份 + 描述文件（纯 Go 读 CMS 里的 XML plist）+ 上传 Key 目录；每次认领前盘一次；领到任务后在检出之前再核一次 |
 | A7 | 已完成 | 认领带 `agentCommit`/`os`/`appleTeams`/`freeGb`/`paused`/`upgradeError`；收到 409 写 `state/halt`（`upgrade:<提交>`）以 75 退出，吊销（77）也写；启动时读 `state/upgrade-failed.json` 打日志并随认领上报 |
 | A8 | 已完成 | `version` 子命令与 `main.commit` 注入点；`result.json` 加 `toolchain`（执行进程直接问 `xcodebuild -version`），随 `/ios-release` 进 `file_metadata` |
-| A9 | 部分 | 认领前查空闲空间已做；`reap` 的 darwin 分支还没做 |
+| A9 | 已完成 | 认领前查空闲空间；`reap` 在 darwin 上改扫每用户的 `/var/folders/<xx>/<yyyy>/{T,C}`（Xcode/CocoaPods/Metro 写的是它们，而它们不吃 `TMPDIR`），`/dev/shm` 只留给 Linux。按属主扫目录而不是问 `confstr`：后者只回当前进程那一个，执行进程在不同 launchd 会话里跑过会留下不止一个；副作用是这段在 Linux 上测得了 |
 | A6 | 已完成 | 检出之后 `git verify-commit`（`gpg.format=ssh` + `allowedSignersFile`，都走命令行 `-c`）；allowed_signers 必须是 root 所有、组与其他人不可写的普通文件，所在目录同样（目录可写的话换掉文件只是一次 rename）；没配就是没开这道闸，启动时告警一次 |
 | A2 | 已完成 | `buildIPA` 先备签名：`security -i` 设搜索列表 + 解锁 + 关自动上锁（口令走标准输入，不进命令行），描述文件复制进任务 HOME 的两个目录；`pnpm ios:release` 改带 `--signing-dir`，**不再传 `--upload`** |
 | A3 | 已完成 | `deliverIPA` 用 `archive/zip` + 自带的二进制/XML plist 解析器读 `Payload/<App>.app/Info.plist`，与任务行比对之后才交给上传账户；`sudo -n -u _rnuploader ios-upload`，包走标准输入 |

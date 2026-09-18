@@ -330,6 +330,70 @@ func TestSweepOwnedRemovesOnlyTheCallersEntries(t *testing.T) {
 	}
 }
 
+// macOS 上真正会积累东西的不是 /tmp：Xcode、CocoaPods 与 Metro 写的是每用户的
+// /var/folders/<xx>/<yyyy>/{T,C}，而且它们不吃 TMPDIR。这两条用例在 Linux 上也跑得了
+// （按属主扫目录，不调 confstr、不起子进程），所以这段逻辑不用等到有一台 Mac 才验。
+func TestReapDirsCoversThePerUserTempDirsOnDarwin(t *testing.T) {
+	root := t.TempDir()
+	uid := os.Getuid()
+	// 两个 bootstrap 命名空间下各有一份：执行进程在不同的 launchd 会话里跑过就会这样，
+	// 只问 confstr 只能拿到当前这一个
+	for _, dir := range []string{"zz/abcdef", "yy/123456"} {
+		if err := os.MkdirAll(filepath.Join(root, dir, "T"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 第二层里的普通文件不是每用户目录（属主对得上也不算）
+	if err := os.MkdirAll(filepath.Join(root, "xx"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "xx", "afile"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 顶层的普通文件也不该被当成一层目录
+	if err := os.WriteFile(filepath.Join(root, "afile"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := reapDirs("darwin", uid, root)
+	want := map[string]bool{"/tmp": true, "/var/tmp": true}
+	for _, dir := range []string{"zz/abcdef", "yy/123456"} {
+		want[filepath.Join(root, dir, "T")] = true
+		want[filepath.Join(root, dir, "C")] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reapDirs on darwin = %v, want %d entries", got, len(want))
+	}
+	for _, dir := range got {
+		if !want[dir] {
+			t.Fatalf("reapDirs on darwin returned %q, which is not ours: %v", dir, got)
+		}
+	}
+	// /dev/shm 是 Linux 的，macOS 上没有；扫它只是白跑一次 ReadDir，但清单里不该有
+	for _, dir := range got {
+		if dir == "/dev/shm" {
+			t.Fatal("darwin has no /dev/shm")
+		}
+	}
+	// 别人的目录连名字都不动：只按第二层的属主判断
+	if dirs := darwinPerUserTempDirs(root, uid+1); len(dirs) != 0 {
+		t.Fatalf("another uid got our directories: %v", dirs)
+	}
+}
+
+func TestReapDirsOnLinuxKeepsDevShm(t *testing.T) {
+	got := reapDirs("linux", os.Getuid(), t.TempDir())
+	want := []string{"/tmp", "/var/tmp", "/dev/shm"}
+	if len(got) != len(want) {
+		t.Fatalf("reapDirs on linux = %v, want %v", got, want)
+	}
+	for i, dir := range want {
+		if got[i] != dir {
+			t.Fatalf("reapDirs on linux = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestCopyTreeKeepsSymlinksAndRefusesSpecialFiles(t *testing.T) {
 	src := t.TempDir()
 	if err := os.WriteFile(filepath.Join(src, "gradlew"), []byte("#!/bin/sh"), 0o755); err != nil {
