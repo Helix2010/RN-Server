@@ -231,3 +231,78 @@ func TestDBApproveAgentVersionRefusesJunk(t *testing.T) {
 		t.Fatalf("approving the same version twice: %d %s", r.Code, r.Body.String())
 	}
 }
+
+// 控制台在批准之前要看见的那些事实（设计 C4）。
+//
+// 为什么这条读接口不能让整条请求失败：两组安装包的状态是独立的——darwin 那组可能还没
+// 编出来，而这一页存在的理由正是"让人看见现在部署的是什么"。一组坏了就整页空白，等于
+// 把要看的东西藏起来。
+func TestDBBuildAgentVersionShowsWhatIsDeployedEvenWhenOneBundleIsBroken(t *testing.T) {
+	f := newGateFixture(t, 76)
+	f.installBundles()
+
+	// 还没签：两组都各自带 error，但接口照常 200——不然控制台上什么都看不到
+	body := decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))
+	if body["approvedAgentCommit"] != nil {
+		t.Fatalf("nothing is approved yet: %v", body["approvedAgentCommit"])
+	}
+	bundles, ok := body["bundles"].([]any)
+	if !ok || len(bundles) != 2 {
+		t.Fatalf("want a view of both bundles, got %v", body["bundles"])
+	}
+	for _, entry := range bundles {
+		bundle, _ := entry.(map[string]any)
+		if bundle["error"] == nil {
+			t.Fatalf("an unsigned bundle must say why it cannot be handed out: %v", bundle)
+		}
+		if bundle["commit"] != nil || bundle["sequence"] != nil {
+			t.Fatalf("an unsigned bundle must not claim a commit: %v", bundle)
+		}
+	}
+
+	public := signStagedBundles(t, f, 5)
+	body = decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))
+	bundles, _ = body["bundles"].([]any)
+	seen := map[string]map[string]any{}
+	for _, entry := range bundles {
+		bundle, _ := entry.(map[string]any)
+		name, _ := bundle["bundle"].(string)
+		seen[name] = bundle
+	}
+	darwin := seen[machineBundleBuilderDarwin]
+	if darwin == nil {
+		t.Fatalf("the darwin bundle is missing: %v", seen)
+	}
+	if darwin["error"] != nil {
+		t.Fatalf("a signed bundle must not carry an error: %v", darwin)
+	}
+	if darwin["commit"] != upgradeCommit {
+		t.Fatalf("commit = %v, want %s", darwin["commit"], upgradeCommit)
+	}
+	// 序号是防降级那道闸的全部依据，人在批准之前要能看见它
+	if sequence, _ := darwin["sequence"].(float64); sequence != 5 {
+		t.Fatalf("sequence = %v, want 5", darwin["sequence"])
+	}
+	// 发布公钥指纹是人拿来和密码管理器里记的那个比的
+	if darwin["publicKeySha256"] != bundlesig.PublicKeySHA256(public) {
+		t.Fatalf("publicKeySha256 = %v, want %s", darwin["publicKeySha256"], bundlesig.PublicKeySHA256(public))
+	}
+	if darwin["query"] != "darwin/arm64" {
+		t.Fatalf("query = %v, want darwin/arm64", darwin["query"])
+	}
+	archive, _ := darwin["archive"].(map[string]any)
+	if archive == nil || archive["sha256"] == nil || archive["name"] == nil {
+		t.Fatalf("the archive digest is what the operator checks against the CI log: %v", darwin)
+	}
+
+	// 批准之后这里要能看到它，否则人没法确认刚才那一下生效了
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/build-agent-version", map[string]any{
+		"commit": upgradeCommit, "expectedVersion": registryVersion(t, f), "reason": "approve after checking", "confirm": true,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("approve: %d %s", r.Code, r.Body.String())
+	}
+	body = decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))
+	if body["approvedAgentCommit"] != upgradeCommit {
+		t.Fatalf("approvedAgentCommit = %v, want %s", body["approvedAgentCommit"], upgradeCommit)
+	}
+}
