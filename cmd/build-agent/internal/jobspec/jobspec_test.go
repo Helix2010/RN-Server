@@ -23,7 +23,7 @@ func testEnv(t *testing.T, layout Layout) []string {
 		"ANDROID_HOME":              "/opt/android-sdk",
 		"BUILD_AGENT_MACHINE_TOKEN": "rnm_must-never-reach-the-runner",
 		"SSH_AUTH_SOCK":             "/run/user/1000/agent",
-	}, TaskEnv{TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win", GoogleServices: true})
+	}, TaskEnv{Platform: PlatformAndroid, TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win", GoogleServices: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestBuildEnvKeepsOnlyTheAllowList(t *testing.T) {
 func TestCheckEnvRefusesAnythingOffTheList(t *testing.T) {
 	layout := testLayout(t)
 	good := testEnv(t, layout)
-	if err := CheckEnv(layout, good); err != nil {
+	if err := CheckEnv(layout, good, PlatformAndroid); err != nil {
 		t.Fatalf("the built environment was refused: %v", err)
 	}
 	other, _ := NewLayout("/var/lib/rn-build-jobs", "bld_otherJOB9999")
@@ -95,7 +95,7 @@ func TestCheckEnvRefusesAnythingOffTheList(t *testing.T) {
 		"task value points into job": replace(good, "GOOGLE_SERVICES_JSON", layout.App()+"/google-services.json"),
 		"removed switch":             append(append([]string{}, good...), "GRADLE_DEPENDENCY_VERIFICATION=0"),
 	} {
-		if err := CheckEnv(layout, env); err == nil {
+		if err := CheckEnv(layout, env, PlatformAndroid); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
 	}
@@ -197,7 +197,7 @@ func TestResultIsCheckedPerKind(t *testing.T) {
 		"unknown field":           `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `","artifact":"/etc/passwd"}`,
 		"kind mismatch":           `{"v":1,"kind":"ota"}`,
 		// 上传标记只属于 iOS
-		"android reports an upload": `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `","uploadedToAppStoreConnect":true}`,
+		"android reports a toolchain": `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `","toolchain":"Xcode 16.2"}`,
 	} {
 		if _, err := DecodeResult(strings.NewReader(doc), KindAPK, PlatformAndroid); err == nil {
 			t.Errorf("%s was accepted", name)
@@ -210,9 +210,14 @@ func TestIOSResultCarriesNoNativeFingerprint(t *testing.T) {
 	if _, err := DecodeResult(strings.NewReader(`{"v":1,"kind":"apk"}`), KindAPK, PlatformIOS); err != nil {
 		t.Fatalf("a valid ios result was refused: %v", err)
 	}
-	parsed, err := DecodeResult(strings.NewReader(`{"v":1,"kind":"apk","uploadedToAppStoreConnect":true}`), KindAPK, PlatformIOS)
-	if err != nil || !parsed.UploadedToAppStoreConnect {
-		t.Fatalf("the upload flag must survive: %#v %v", parsed, err)
+	// 结果里带的是工具链，不是"传上去了没有"：上传由控制进程交给另一个用户做，
+	// 执行进程答不了那个问题
+	parsed, err := DecodeResult(strings.NewReader(`{"v":1,"kind":"apk","toolchain":"Xcode 16.2 (16C5032a)"}`), KindAPK, PlatformIOS)
+	if err != nil || parsed.Toolchain != "Xcode 16.2 (16C5032a)" {
+		t.Fatalf("the toolchain must survive: %#v %v", parsed, err)
+	}
+	if _, err := DecodeResult(strings.NewReader(`{"v":1,"kind":"apk","uploadedToAppStoreConnect":true}`), KindAPK, PlatformIOS); err == nil {
+		t.Fatal("the retired upload flag was accepted")
 	}
 	withFingerprint := `{"v":1,"kind":"apk","nativeFingerprint":"` + strings.Repeat("ab", 20) + `"}`
 	if _, err := DecodeResult(strings.NewReader(withFingerprint), KindAPK, PlatformIOS); err == nil {
@@ -226,24 +231,33 @@ func TestIOSResultCarriesNoNativeFingerprint(t *testing.T) {
 // 一台不该有签名材料的机器以为自己有。上传 Key 的两个标识（ASC_KEY_ID / ASC_ISSUER_ID）
 // 已经随手工签名从白名单里删掉：执行进程跑第三方依赖，一把能上传 build 的 Key 就是
 // 钥匙串里那些签名材料唯一缺的出口。
-func TestMachineEnvKeysAreAssembledPerOS(t *testing.T) {
-	linux := machineEnvKeysFor("linux")
-	darwin := machineEnvKeysFor("darwin")
-	for _, key := range linux {
+func TestMachineEnvKeysAreAssembledPerPlatform(t *testing.T) {
+	android := machineEnvKeysFor(PlatformAndroid)
+	ios := machineEnvKeysFor(PlatformIOS)
+	for _, key := range android {
 		if key == IOSSigningDirEnv {
-			t.Fatalf("%s is accepted on linux", IOSSigningDirEnv)
+			t.Fatalf("%s is accepted in an android job", IOSSigningDirEnv)
 		}
 	}
 	found := false
-	for _, key := range darwin {
+	for _, key := range ios {
 		if key == IOSSigningDirEnv {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("%s is not accepted on darwin", IOSSigningDirEnv)
+		t.Fatalf("%s is not accepted in an ios job", IOSSigningDirEnv)
 	}
-	for _, keys := range [][]string{linux, darwin} {
+	// Android 任务的环境里出现签名目录要当场拒收：同一台 Mac 上也不行
+	layout := testLayout(t)
+	env := append(testEnv(t, layout), IOSSigningDirEnv+"=/var/rn-build-signing")
+	if err := CheckEnv(layout, env, PlatformAndroid); err == nil {
+		t.Fatal("an android job was allowed to carry the signing directory")
+	}
+	if err := CheckEnv(layout, env, PlatformIOS); err != nil {
+		t.Fatalf("an ios job was refused the signing directory: %v", err)
+	}
+	for _, keys := range [][]string{android, ios} {
 		for _, key := range keys {
 			if key == "ASC_KEY_ID" || key == "ASC_ISSUER_ID" {
 				t.Fatalf("%s is still on the allow list; the build runner must hold no App Store Connect key", key)

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/fakebuild"
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 	"github.com/Helix2010/RN-Server/signing/machinekey"
 )
@@ -344,6 +345,7 @@ func newRig(t *testing.T) *testRig {
 
 	root := t.TempDir()
 	tools := fakebuild.Install(t, filepath.Join(root, "tools"))
+	signingDir := installFakeSigningMaterial(t, filepath.Join(root, "signing"))
 	bare, commit := fakebuild.SourceRepo(t, filepath.Join(root, "repo"), "anyfun")
 	// 与 install.sh 克隆出的镜像一样：只有控制进程用户能写（控制进程 fetch 前核对）
 	for path, mode := range map[string]os.FileMode{bare: 0o700, filepath.Join(bare, "config"): 0o600} {
@@ -363,7 +365,7 @@ func newRig(t *testing.T) *testRig {
 		PollEvery:    10 * time.Millisecond,
 		Runner:       runnerBinary,
 		RunnerUser:   directRunner,
-		MachineEnv:   map[string]string{"PATH": tools.PATH(), "LANG": "C.UTF-8"},
+		MachineEnv:   map[string]string{"PATH": tools.PATH(), "LANG": "C.UTF-8", jobspec.IOSSigningDirEnv: signingDir},
 		SSHKey:       filepath.Join(root, "ssh", "id_ed25519"),
 		KnownHosts:   filepath.Join(root, "ssh", "github_known_hosts"),
 	}
@@ -387,6 +389,28 @@ func newRig(t *testing.T) *testRig {
 	a.heartbeatEvery = 50 * time.Millisecond
 	a.reportDelay = time.Millisecond
 	return &testRig{server: server, tools: tools, agent: a, commit: commit, bare: bare}
+}
+
+// installFakeSigningMaterial 铺出 §4.2 那套固定布局：钥匙串、口令、一份描述文件。
+// 假的 `security` 不会真去开它，但执行进程会核对文件在不在、口令的字母表对不对。
+func installFakeSigningMaterial(t *testing.T, dir string) string {
+	t.Helper()
+	tenant := baseTenant()
+	team := tenant["appleTeamId"].(string)
+	profiles := filepath.Join(dir, "profiles", team)
+	if err := os.MkdirAll(profiles, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(dir, "rn-signing.keychain-db"):                               "fake keychain",
+		filepath.Join(dir, "rn-signing.password"):                                  "Passw0rd-for-tests_0123456789\n",
+		filepath.Join(profiles, tenant["iosBundleId"].(string)+".mobileprovision"): "fake profile",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
 }
 
 // fakeIOSInventory 是"这台机器手上有测试租户那个 Team 的全套材料"。真盘点要起

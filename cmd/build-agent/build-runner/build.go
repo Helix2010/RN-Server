@@ -145,14 +145,22 @@ func (j job) buildAPK(ctx context.Context) error {
 // 列表（隔离仍然成立），不行再考虑 iOS 任务不改写 HOME。
 func (j job) buildIPA(ctx context.Context) error {
 	app := j.layout.App()
+	// 先让这次任务的 HOME 能签名，再跑任何第三方代码：缺证书或缺描述文件的话，
+	// pnpm install 那十几分钟是白花的
+	signingDir, err := j.prepareIOSSigning(ctx)
+	if err != nil {
+		return err
+	}
+	toolchain := j.xcodeToolchain(ctx)
+	if toolchain != "" {
+		logf(j.out, "toolchain %s", toolchain)
+	}
 	if err := j.run(ctx, "pnpm", "install", "--frozen-lockfile"); err != nil {
 		return err
 	}
-	args := []string{"ios:release", j.spec.TenantDirectory}
-	if j.spec.IOSUpload {
-		args = append(args, "--upload")
-	}
-	if err := j.run(ctx, "pnpm", args...); err != nil {
+	// **不传 --upload**：执行进程不上传，也没有任何一把 App Store Connect Key（§4.3）。
+	// --signing-dir 让构建脚本读得到描述文件的名字（手工签名要 PROVISIONING_PROFILE_SPECIFIER）
+	if err := j.run(ctx, "pnpm", "ios:release", j.spec.TenantDirectory, "--signing-dir", signingDir); err != nil {
 		return err
 	}
 	name := jobspec.IPAArtifactName(j.spec.TenantDirectory, j.spec.AppVersion, j.spec.BuildNumber)
@@ -163,11 +171,9 @@ func (j job) buildIPA(ctx context.Context) error {
 	if err := copyFile(artifact, j.layout.OutFile(jobspec.IPAFileName), 0o640); err != nil {
 		return fmt.Errorf("cannot hand over the iOS package: %w", err)
 	}
-	// 报的是"这次有没有要求上传"，而它等于"有没有传成功"：上传失败的话上面那条
-	// pnpm 会非零退出，整个任务已经判失败，走不到这里
+	// 结果里没有"传上去了没有"：上传由控制进程交给另一个用户做，执行进程答不了这个问题
 	return j.writeResult(jobspec.Result{
-		Version: jobspec.ResultVersion, Kind: jobspec.KindAPK,
-		UploadedToAppStoreConnect: j.spec.IOSUpload,
+		Version: jobspec.ResultVersion, Kind: jobspec.KindAPK, Toolchain: toolchain,
 	})
 }
 

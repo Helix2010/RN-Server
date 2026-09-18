@@ -210,6 +210,7 @@ func (a *agent) iosInventory(ctx context.Context) iosInventory {
 	}
 	scanner := newIOSScanner(a.cfg)
 	scanner.Now = a.now
+	scanner.Probe = a.probeUploadKey
 	if a.iosProbe != nil {
 		scanner.Probe = a.iosProbe
 	}
@@ -514,18 +515,40 @@ func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared prepare
 		return err
 	}
 	buf.add(fmt.Sprintf("ipa %d bytes, sha256 %s", ipa.Size, ipa.SHA256))
-	if result.UploadedToAppStoreConnect {
-		buf.add("uploaded to App Store Connect")
+	// 自己读一遍包，确认它就是这条任务要的那个。执行进程跑第三方依赖，它交上来的
+	// 东西按不可信处理；而下一步是**撤不回来的**：包一旦进了 App Store Connect，
+	// 只能再出一个 build 号顶掉它
+	identity, err := readIPAIdentity(ipa.Path)
+	if err != nil {
+		return err
+	}
+	if err := checkIPAMatchesJob(identity, job); err != nil {
+		return err
+	}
+	buf.add("package identity checked: " + identity.BundleID + " " + identity.ShortVersion + " (" + identity.BuildNumber + ")")
+	var outcome uploadOutcome
+	if a.cfg.IOSUpload {
+		if outcome, err = a.uploadIPA(ctx, job, ipa.Path, identity, buf); err != nil {
+			return err
+		}
+		if outcome.UploadedByEarlierAttempt {
+			buf.add("App Store Connect already had this build number; an earlier attempt uploaded it")
+		} else {
+			buf.add("uploaded to App Store Connect")
+		}
 	} else {
 		buf.add("not uploaded: this machine is not configured to upload (BUILD_AGENT_IOS_UPLOAD)")
 	}
 	if err := withRetry(ctx, buf, "result report", 8, func(ctx context.Context) error {
-		return a.api.iosRelease(ctx, job, prepared.Commit, ipa.SHA256, ipa.Size, result.UploadedToAppStoreConnect, buf.snapshot())
+		return a.api.iosRelease(ctx, job, prepared.Commit, ipa.SHA256, ipa.Size, iosReleaseReport{
+			Uploaded: outcome.Uploaded, UploadedByEarlierAttempt: outcome.UploadedByEarlierAttempt,
+			Toolchain: result.Toolchain,
+		}, buf.snapshot())
 	}); err != nil {
 		return fmt.Errorf("the iOS package was built but the job could not be completed: %w", err)
 	}
 	a.log.Info("ios package delivered", "job", job.ID, "ipaSha256", ipa.SHA256,
-		"uploaded", result.UploadedToAppStoreConnect)
+		"uploaded", outcome.Uploaded, "uploadedByEarlierAttempt", outcome.UploadedByEarlierAttempt)
 	return nil
 }
 

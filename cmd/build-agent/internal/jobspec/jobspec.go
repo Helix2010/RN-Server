@@ -17,7 +17,6 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 
@@ -173,13 +172,17 @@ func (l Layout) OutFile(name string) string { return filepath.Join(l.Out(), name
 // build 的 App Store Connect Key 就是钥匙串里那些签名材料唯一缺的出口。现在上传由另一个
 // 用户（_rnuploader）做，Key 在执行进程读不到的目录下，执行进程连 Key 的**标识**都不需要。
 //
-// RN_IOS_SIGNING_DIR 只在 macOS 上认：它指向这台 Mac 的签名材料目录，描述文件从那里复制进
-// 任务 HOME。Linux 构建机上出现这个键只可能是配错了，拒绝比忽略好——忽略会让人以为配上了。
-var machineEnvKeys = machineEnvKeysFor(runtime.GOOS)
+// RN_IOS_SIGNING_DIR 只有 **iOS 任务**的环境里才认：它指向这台 Mac 的签名材料目录，描述
+// 文件从那里复制进任务 HOME。按任务平台分而不是按 runtime.GOOS 分——两者在生产里是同一件事
+// （BUILD_AGENT_PLATFORMS 写了 ios 而机器不是 macOS，启动就失败），但按平台分是更强的
+// 那一条：同一台 Mac 上的 Android 任务同样不该看见签名目录。
+var machineEnvKeys = machineEnvKeysFor("")
 
-func machineEnvKeysFor(goos string) []string {
+// machineEnvKeysFor 返回这个平台的任务允许带的机器级变量。platform 为空时返回全部
+// 平台的并集——控制进程用它决定"从自己的环境里读哪些键"。
+func machineEnvKeysFor(platform string) []string {
 	keys := []string{"PATH", "LANG", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_RO_DEP_CACHE"}
-	if goos == "darwin" {
+	if platform == "" || platform == PlatformIOS {
 		keys = append(keys, IOSSigningDirEnv)
 	}
 	return keys
@@ -213,6 +216,8 @@ func jobPathEnv(l Layout) map[string]string {
 
 // TaskEnv 是构造任务专用变量的输入。
 type TaskEnv struct {
+	// Platform 决定机器级白名单里认不认签名目录（见 machineEnvKeysFor）
+	Platform        string
 	TenantDirectory string
 	APIBaseURL      string
 	GoogleServices  bool
@@ -226,7 +231,7 @@ type TaskEnv struct {
 // 不会把令牌带过去。
 func BuildEnv(l Layout, machine map[string]string, task TaskEnv) ([]string, error) {
 	env := map[string]string{}
-	for _, key := range machineEnvKeys {
+	for _, key := range machineEnvKeysFor(task.Platform) {
 		if value := machine[key]; value != "" {
 			env[key] = value
 		}
@@ -252,7 +257,7 @@ func BuildEnv(l Layout, machine map[string]string, task TaskEnv) ([]string, erro
 		out = append(out, key+"="+value)
 	}
 	sort.Strings(out)
-	if err := CheckEnv(l, out); err != nil {
+	if err := CheckEnv(l, out, task.Platform); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -260,9 +265,9 @@ func BuildEnv(l Layout, machine map[string]string, task TaskEnv) ([]string, erro
 
 // CheckEnv 是执行进程拒收环境的规则：只允许白名单里的键；每任务目录必须恰好是本任务的；
 // PATH 必填且每一段是绝对路径；机器级路径变量是绝对路径；不许重复、不许控制字符。
-func CheckEnv(l Layout, env []string) error {
+func CheckEnv(l Layout, env []string, platform string) error {
 	allowed := map[string]string{}
-	for _, key := range machineEnvKeys {
+	for _, key := range machineEnvKeysFor(platform) {
 		allowed[key] = "machine"
 	}
 	for _, key := range taskEnvKeys {
@@ -359,12 +364,12 @@ type Spec struct {
 	AppVersion      string `json:"version"`
 	BuildNumber     int    `json:"buildNumber"`
 	CommitSHA       string `json:"commitSha"`
-	// IOSUpload：构建完把 .ipa 传进 App Store Connect。由装这台 Mac 的人在
-	// BUILD_AGENT_IOS_UPLOAD 里打开，不由"排了一条 iOS 任务"隐含决定——上传是一个
-	// 对外可见的动作，包一旦进了 ASC 就撤不回来，只能再出一个 build 顶掉它
-	IOSUpload bool     `json:"iosUpload,omitempty"`
-	OTA       *OTAArgs `json:"ota"`
-	Env       []string `json:"env"`
+	// **这里没有上传开关**（设计 ios-mac-builders-home-network-2026-09-18 §4.3）：
+	// 执行进程不上传，也没有任何一把 App Store Connect Key。上传由控制进程交给
+	// 另一个用户（_rnuploader）做——执行进程跑的是第三方依赖，而一把能上传 build 的
+	// Key 正是钥匙串里那些签名材料唯一缺的出口。
+	OTA *OTAArgs `json:"ota"`
+	Env []string `json:"env"`
 }
 
 // SpecVersion 是 Spec.Version 唯一允许的值。
@@ -382,8 +387,6 @@ func (s Spec) Validate(l Layout) error {
 	case s.Platform == PlatformIOS && s.Kind != KindAPK:
 		// 热更新包与平台无关，由 Android 那台机器构建；iOS 只做安装包
 		return errors.New("only installable-package jobs are built on ios")
-	case s.IOSUpload && s.Platform != PlatformIOS:
-		return errors.New("only an ios job uploads to App Store Connect")
 	case !ValidTenantDirectory(s.TenantDirectory):
 		return errors.New("spec tenantDirectory is malformed")
 	case !ValidVersion(s.AppVersion):
@@ -419,7 +422,7 @@ func (s Spec) Validate(l Layout) error {
 			return errors.New("spec ota.applicationId is malformed")
 		}
 	}
-	if err := CheckEnv(l, s.Env); err != nil {
+	if err := CheckEnv(l, s.Env, s.Platform); err != nil {
 		return err
 	}
 	if EnvValue(s.Env, "EXPO_PUBLIC_TENANT") != s.TenantDirectory {
@@ -454,13 +457,21 @@ type Result struct {
 	Version           int    `json:"v"`
 	Kind              Kind   `json:"kind"`
 	NativeFingerprint string `json:"nativeFingerprint,omitempty"`
-	// UploadedToAppStoreConnect 只用于 iOS：这次有没有真的把 .ipa 传上去。
-	// "包打出来了"和"TestFlight 上有这一版"是两件事，运营要能分辨
-	UploadedToAppStoreConnect bool `json:"uploadedToAppStoreConnect,omitempty"`
+	// Toolchain 只用于 iOS：这台 Mac 上 `xcodebuild -version` 的那一行。几台 Mac 装同一个
+	// Xcode 是人工维护的约定（§5.3），版本漂移只有记下来才看得见。它随发布记录进
+	// file_metadata。
+	//
+	// **这里没有"传上去了没有"**：上传不再由执行进程做，所以它答不了这个问题。
+	// 控制进程拿上传账户的真实结果去报（§4.3）
+	Toolchain string `json:"toolchain,omitempty"`
 }
 
 // ResultVersion 是 Result.Version 唯一允许的值。
 const ResultVersion = 1
+
+// MaxToolchainLength 够放下 `Xcode 16.2 (16C5032a)`。执行进程写的每个字符串都要有上限：
+// 它是不可信的写方。
+const MaxToolchainLength = 120
 
 // Validate 按任务种类与平台校验结果。
 //
@@ -477,8 +488,10 @@ func (r Result) Validate(kind Kind, platform string) error {
 		return errors.New("result nativeFingerprint must be 32-128 lowercase hex characters")
 	case !androidPackage && r.NativeFingerprint != "":
 		return errors.New("only an android installable-package result carries a native fingerprint")
-	case r.UploadedToAppStoreConnect && platform != PlatformIOS:
-		return errors.New("only an ios result reports an App Store Connect upload")
+	case r.Toolchain != "" && platform != PlatformIOS:
+		return errors.New("only an ios result carries a toolchain")
+	case len(r.Toolchain) > MaxToolchainLength:
+		return errors.New("result toolchain is too long")
 	}
 	return nil
 }

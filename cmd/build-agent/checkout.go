@@ -169,6 +169,7 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 	}
 
 	env, err := jobspec.BuildEnv(layout, a.cfg.MachineEnv, jobspec.TaskEnv{
+		Platform:        job.Platform,
 		TenantDirectory: job.TenantDirectory,
 		APIBaseURL:      job.APIBaseURL(),
 		GoogleServices:  googleServices,
@@ -182,7 +183,6 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		JobID:           job.ID,
 		Kind:            jobspec.Kind(job.Kind),
 		Platform:        job.Platform,
-		IOSUpload:       job.Platform == jobspec.PlatformIOS && a.cfg.IOSUpload,
 		TenantDirectory: job.TenantDirectory,
 		AppVersion:      job.Version,
 		BuildNumber:     job.BuildNumber,

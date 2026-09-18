@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/fakebuild"
 )
 
 // iOS 安装包任务从领取到交付。
@@ -49,6 +51,8 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 		ShortVersion              string   `json:"shortVersion"`
 		BuildNumber               int      `json:"buildNumber"`
 		UploadedToAppStoreConnect bool     `json:"uploadedToAppStoreConnect"`
+		UploadedByEarlierAttempt  bool     `json:"uploadedByEarlierAttempt"`
+		Toolchain                 string   `json:"toolchain"`
 		LogTail                   []string `json:"logTail"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(released[0].Body)))
@@ -71,8 +75,13 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	if report.UploadedToAppStoreConnect {
 		t.Fatal("this machine has BUILD_AGENT_IOS_UPLOAD off; it must not report an upload")
 	}
-	if upload := readRecorded(t, rig, "ios-upload.txt"); upload != "no" {
-		t.Fatalf("the build script must not have been told to upload, got %q", upload)
+	// 几台 Mac 装同一个 Xcode 是人工维护的约定，版本漂移只有记下来才看得见
+	if report.Toolchain != fakebuild.XcodeVersion+" (16C5032a)" {
+		t.Fatalf("the toolchain was not reported: %q", report.Toolchain)
+	}
+	// 构建脚本拿到的是签名目录，不是 --upload：执行进程一把 App Store Connect Key 都没有
+	if dir := readRecorded(t, rig, "ios-signing-dir.txt"); dir == "" {
+		t.Fatal("the build script was not told where the provisioning profiles are")
 	}
 }
 
@@ -83,6 +92,7 @@ func TestIOSJobUploadsOnlyWhenTheMachineIsConfiguredTo(t *testing.T) {
 	rig := newRig(t)
 	rig.agent.cfg.Platforms = []string{"ios"}
 	rig.agent.cfg.IOSUpload = true
+	rig.agent.cfg.IOSUploader = fakeUploader(t, rig, `{"uploaded":true,"uploadedByEarlierAttempt":false,"detail":"uploaded","probe":""}`)
 	rig.agent.iosScan = fakeIOSInventory
 	body := claimBody("bld_e2eIOS000002", "apk")
 	body["platform"] = "ios"
@@ -101,9 +111,32 @@ func TestIOSJobUploadsOnlyWhenTheMachineIsConfiguredTo(t *testing.T) {
 	if !strings.Contains(string(released[0].Body), `"uploadedToAppStoreConnect":true`) {
 		t.Fatalf("the upload must be reported: %s", released[0].Body)
 	}
-	if upload := readRecorded(t, rig, "ios-upload.txt"); upload != "yes" {
-		t.Fatalf("the build script must have been told to upload, got %q", upload)
+	// 上传由**另一个程序**做，控制进程只把核对过身份的包交给它。它收到的是包的内容
+	// （标准输入）与期望的身份，不是一条能读到状态目录的路径
+	args := readRecorded(t, rig, "ios-upload.args")
+	for _, want := range []string{"--team AB12CD34EF", "--expect-bundle-id com.anyfun.foundation",
+		"--expect-version 1.3.7", "--expect-build 33"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("the uploader was not told %q: %s", want, args)
+		}
 	}
+	sum := sha256.Sum256(rig.tools.IPA)
+	if got := readRecorded(t, rig, "ios-upload.sha256"); got != hex.EncodeToString(sum[:]) {
+		t.Fatalf("the uploader did not receive the package that was built: %s", got)
+	}
+}
+
+// fakeUploader 造一个假的上传程序：把收到的参数与包的摘要记下来，打印给定的一行 JSON。
+func fakeUploader(t *testing.T, rig *testRig, outcome string) string {
+	t.Helper()
+	path := filepath.Join(rig.tools.Bin, "ios-upload")
+	script := "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" > " + rig.tools.Record + "/ios-upload.args\n" +
+		"sha256sum - | cut -d' ' -f1 | tr -d '\\n' > " + rig.tools.Record + "/ios-upload.sha256\n" +
+		"printf '%s\\n' '" + outcome + "'\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func readRecorded(t *testing.T, rig *testRig, name string) string {

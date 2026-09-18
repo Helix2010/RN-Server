@@ -443,7 +443,19 @@ func (c *client) complete(ctx context.Context, job claimedJob, commit, digest, r
 // 这里报的摘要是自报的审计凭证，服务端记成 ipaSelfReported，不当分发凭证用。
 // 上报的身份取服务端下发的那份 tenant.json——服务端会拿它和任务行、release.ios 再对一遍，
 // 两端分属不同信任域，各按自己那份记录把一次。
-func (c *client) iosRelease(ctx context.Context, job claimedJob, commit, digest string, size int64, uploaded bool, logTail []string) error {
+// iosReleaseReport 是 /ios-release 里这次构建"发生了什么"的部分：包本身的摘要与身份
+// 由调用方另外给（它们是从包里读出来的，不是这里的判断）。
+type iosReleaseReport struct {
+	// Uploaded：App Store Connect 上现在有这个 build
+	Uploaded bool
+	// UploadedByEarlierAttempt：这次没传，因为同一个 build 号已经在那边了。**它是在说
+	// Apple 那份 .ipa 对应的可能是上一次检出的提交**，与这条记录里的 commitSha 不一定一致
+	UploadedByEarlierAttempt bool
+	// Toolchain 是这台机器的 xcodebuild 版本，用来发现几台 Mac 之间的版本漂移
+	Toolchain string
+}
+
+func (c *client) iosRelease(ctx context.Context, job claimedJob, commit, digest string, size int64, report iosReleaseReport, logTail []string) error {
 	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/ios-release"), job.Attempt, map[string]any{
 		"commitSha":                 commit,
 		"ipaSha256":                 digest,
@@ -451,7 +463,9 @@ func (c *client) iosRelease(ctx context.Context, job claimedJob, commit, digest 
 		"bundleId":                  job.BundleID(),
 		"shortVersion":              job.Version,
 		"buildNumber":               job.BuildNumber,
-		"uploadedToAppStoreConnect": uploaded,
+		"uploadedToAppStoreConnect": report.Uploaded,
+		"uploadedByEarlierAttempt":  report.UploadedByEarlierAttempt,
+		"toolchain":                 report.Toolchain,
 		"logTail":                   nonNil(logTail),
 	})
 	return err

@@ -47,7 +47,7 @@ func prepareJobDir(t *testing.T, root, jobID string, kind jobspec.Kind, tools fa
 		t.Fatal(err)
 	}
 	env, err := jobspec.BuildEnv(layout, map[string]string{"PATH": tools.PATH(), "LANG": "C.UTF-8"},
-		jobspec.TaskEnv{TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win"})
+		jobspec.TaskEnv{Platform: jobspec.PlatformAndroid, TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestOTAAndAPKChildrenSeeTheSameEnvironment(t *testing.T) {
 	otaLayout, otaSpec := prepareJobDir(t, root, "bld_otaJOB000001", jobspec.KindOTA, otaTools)
 	// 两套假工具的目录不同，PATH 会不同；用同一套 PATH 重写 OTA 的说明
 	otaSpec.Env, _ = jobspec.BuildEnv(otaLayout, map[string]string{"PATH": apkTools.PATH(), "LANG": "C.UTF-8"},
-		jobspec.TaskEnv{TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win"})
+		jobspec.TaskEnv{Platform: jobspec.PlatformAndroid, TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win"})
 	raw, _ := jobspec.EncodeSpec(otaSpec)
 	if err := os.WriteFile(otaLayout.Spec(), raw, 0o640); err != nil {
 		t.Fatal(err)

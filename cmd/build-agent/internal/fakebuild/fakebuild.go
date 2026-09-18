@@ -18,6 +18,53 @@ import (
 // NativeFingerprint 是假 `pnpm exec fingerprint .` 打印的哈希。
 const NativeFingerprint = "0123456789abcdef0123456789abcdef01234567"
 
+// 假 .ipa 里 Info.plist 写的身份。与 harness 的 claimBody 一致：控制进程会自己读一遍包，
+// 对不上就不交付，也不上传。
+const (
+	IPABundleID     = "com.anyfun.foundation"
+	IPAShortVersion = "1.3.7"
+	IPABuildNumber  = "33"
+)
+
+// XcodeVersion 是假 xcodebuild 打印的版本。
+const XcodeVersion = "Xcode 16.2"
+
+// IPAWithIdentity 造一个形状正确的 .ipa：一个 zip，里面是 Payload/<App>.app/Info.plist。
+// 控制进程用 archive/zip + 自带的 plist 解析器读它，所以这里必须是真的 zip。
+func IPAWithIdentity(t *testing.T, bundleID, shortVersion, buildNumber string) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	archive := zip.NewWriter(&out)
+	entry, err := archive.Create("Payload/AnyFun.app/Info.plist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key><string>` + bundleID + `</string>
+	<key>CFBundleShortVersionString</key><string>` + shortVersion + `</string>
+	<key>CFBundleVersion</key><string>` + buildNumber + `</string>
+</dict>
+</plist>`
+	if _, err := entry.Write([]byte(plist)); err != nil {
+		t.Fatal(err)
+	}
+	// App 里的扩展也有一份 Info.plist，而它的 bundle id 是 `<主 id>.<后缀>`：
+	// 放一份进来，守住"只认恰好三段路径"那条规则
+	extension, err := archive.Create("Payload/AnyFun.app/PlugIns/Share.appex/Info.plist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extension.Write([]byte(strings.Replace(plist, bundleID, bundleID+".share", 1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
 // CertificatePEM 是一张形状正确的假证书（正文三行以上、每行 64 字符）。
 var CertificatePEM = "-----BEGIN CERTIFICATE-----\n" +
 	"MIIBszCCAVmgAwIBAgIUQ2VydGlmaWNhdGVGb3JUZXN0aW5nT25seTAKBggqhkjO\n" +
@@ -50,8 +97,8 @@ func Install(t *testing.T, dir string) Tools {
 		Linger: filepath.Join(dir, "linger-on-install"),
 		APK:    APKWithCertificate(t, CertificatePEM),
 		OTA:    []byte("PK\x05\x06" + strings.Repeat("\x00", 18)),
-		// .ipa 对构建机是不透明的：它既不解析也不上传，只算一遍摘要交给服务端记账
-		IPA: []byte("fake-ipa-" + strings.Repeat("0", 64)),
+		// .ipa 是真的 zip：控制进程会打开它读 Info.plist，核对身份之后才交给上传账户
+		IPA: IPAWithIdentity(t, IPABundleID, IPAShortVersion, IPABuildNumber),
 	}
 	for _, d := range []string{tools.Bin, tools.Record} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -97,9 +144,15 @@ ios:release)
   record ios-release
   shift
   slug="$1"; shift
-  upload=no
-  for arg in "$@"; do if [ "$arg" = "--upload" ]; then upload=yes; fi; done
-  echo "$upload" > %[1]q/ios-upload.txt
+  # 执行进程不再传 --upload（它没有任何 App Store Connect Key）；--signing-dir 是手工签名
+  # 要用的描述文件目录
+  signing=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--signing-dir" ]; then signing="$2"; fi
+    if [ "$1" = "--upload" ]; then echo "fake pnpm: ios:release must not be given --upload" >&2; exit 4; fi
+    shift
+  done
+  echo "$signing" > %[1]q/ios-signing-dir.txt
   version=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "tenants/$slug/tenant.json")
   build=$(sed -n 's/.*"iosBuildNumber": *"\([^"]*\)".*/\1/p' "tenants/$slug/tenant.json")
   mkdir -p artifacts
@@ -137,7 +190,18 @@ sum=$(sha256sum "$apk" | cut -d' ' -f1)
 name=$(basename "$apk")
 printf '{"bomFormat":"CycloneDX","specVersion":"1.5","metadata":{"component":{"type":"application","hashes":[{"alg":"SHA-256","content":"%%s"}]},"properties":[{"name":"rn-app:artifact","value":"%%s"},{"name":"rn-app:artifact-signing","value":"unsigned"}]},"components":[]}\n' "$sum" "$name" > "$out"
 `, tools.Record)
-	for name, body := range map[string]string{"pnpm": pnpm, "node": node} {
+	// security：只把收到的命令记下来，不碰任何钥匙串。真机上这一步要真跑
+	security := fmt.Sprintf(`#!/bin/sh
+set -eu
+cat > %[1]q/security.stdin
+printf '%%s\n' "$*" > %[1]q/security.args
+`, tools.Record)
+	xcodebuild := fmt.Sprintf(`#!/bin/sh
+set -eu
+echo "%s"
+echo "Build version 16C5032a"
+`, XcodeVersion)
+	for name, body := range map[string]string{"pnpm": pnpm, "node": node, "security": security, "xcodebuild": xcodebuild} {
 		if err := os.WriteFile(filepath.Join(tools.Bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
