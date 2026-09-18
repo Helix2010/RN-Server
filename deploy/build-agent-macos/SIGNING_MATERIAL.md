@@ -213,10 +213,24 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 
 ### 3.1 生成（全平台一次）
 
-在**离线机器**上（`signing/` 是独立的 Go module，要在那个目录里构建）：
+#### 先把 `bundle-sign` 弄到那台机器上
+
+这一节和 §3.2 的每一条命令都要在**离线机器**上跑，而那台机器上未必有仓库，也未必装了 Go。
+三条路，按那台机器的实际情况挑：
+
+| 情况 | 做法 |
+| --- | --- |
+| 有仓库、有 Go | `cd signing && go build -o /tmp/bundle-sign ./cmd/bundle-sign`（`signing/` 是独立的 Go module，**必须在那个目录里**构建，仓库根目录构建会失败） |
+| 没仓库但能联网取一次 | 克隆仓库再按上一条构建 |
+| 真气隙（不联网、无 Go） | 在一台联网机器上交叉编译，用 U 盘拷过去：`cd signing && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o bundle-sign ./cmd/bundle-sign`（Intel Mac 用 `GOARCH=amd64`），**同时把它的 sha256 一起带过去，在离线机器上核一遍**再用 |
+
+> **手里那份旧的 `bundle-sign` 不能继续用来签。** 2026-09-18 之后签名换成了 OpenSSH 的
+> `SSHSIG` 封装（见 §3.2），旧二进制产出的是旧格式，服务端会以"不是一个 SSH 签名块"拒掉。
+> 旧的也没有 `key public` 这个子命令。每次要签之前，确认手里这份是当前提交构建出来的。
+
+#### 生成
 
 ```bash
-cd signing && go build -o /tmp/bundle-sign ./cmd/bundle-sign
 /tmp/bundle-sign key create --out ~/rn-release-key
 ```
 
@@ -256,8 +270,16 @@ public key sha256: <64 位十六进制>
 
 CI 产出 `manifest.json` 与三个归档、部署到服务器之后，在离线机器上：
 
+`bundle-sign sign` 只读 `manifest.json`——三个归档不用拷过去。清单里已经是每个归档与每个
+文件的 sha256，签了清单就等于签了它们。
+
+> 想要更强的保证（"我签的不只是 CI 说的那串数字"），在离线机器上用**同一个提交**跑一遍
+> `deploy/setup/build-bundles.sh`，再 `diff` 两份 `manifest.json`：一致说明 CI 没有夹带。
+> 前提是 Go 版本与 CI 完全相同（`build-bundles.sh` 的可复现性建立在这上面），版本不同会
+> 得到不同的二进制、对不上，别误判成被篡改。
+
 ```bash
-# 把安装包目录（manifest.json + 三个 .tar.gz）拷到离线机器，或直接在那里重新构建
+# 只需要 manifest.json；签完把 manifest.sig 放回服务器同一个目录
 /tmp/bundle-sign sign --key ~/rn-release-key/release-key.ed25519 \
                       --dir  ./machine-bundles/<提交> \
                       --sequence <比上一次大>
