@@ -29,7 +29,10 @@ const (
 )
 
 // seedIOSIdentity 给租户登记 iOS 发布身份。排队与认领都按它和机器的自报盘点比对。
-func seedIOSIdentity(t *testing.T, f *gateFixture, teamID, bundleID string) {
+// seedGateIOSIdentity 写这个租户的 release.ios 身份。名字带 Gate 是为了和
+// push_credentials_apns_test.go 里那个同名辅助分开：那一个按 *server 与租户写，
+// 这一个走 gateFixture 并且 Team 可以指定（打包机路由要按 Team 分流）。
+func seedGateIOSIdentity(t *testing.T, f *gateFixture, teamID, bundleID string) {
 	t.Helper()
 	raw, err := json.Marshal(iosReleaseIdentity{AppleTeamID: teamID, BundleID: bundleID})
 	if err != nil {
@@ -86,7 +89,7 @@ func newIOSPool(t *testing.T, seed, machines int) (*gateFixture, []gateMachine) 
 		macs = append(macs, mac)
 	}
 	f.writeMachines(records...)
-	seedIOSIdentity(t, f, poolTeamA, poolBundle)
+	seedGateIOSIdentity(t, f, poolTeamA, poolBundle)
 	return f, macs
 }
 
@@ -288,7 +291,7 @@ func TestDBIOSStalledQueueNamesAChangedTeam(t *testing.T) {
 	id := decodeBody(t, recorder)["id"].(string)
 	f.setJob(id, "created_at=?", time.Now().UTC().Add(-7*time.Hour))
 	// 排队之后运营把 Team 换成了另一个，而没有任何一台 Mac 装着它的材料
-	seedIOSIdentity(t, f, poolTeamB, poolBundle)
+	seedGateIOSIdentity(t, f, poolTeamB, poolBundle)
 
 	if result := f.s.reapBuildJobs(t.Context(), time.Now().UTC()); len(result.QueueStalled) != 1 {
 		t.Fatalf("no alert for a job whose team was changed: %+v", result)
