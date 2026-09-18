@@ -7,6 +7,7 @@
 - 签名闸本机操作（确认、信任、提升、恢复）：[`signer/README.md`](signer/README.md)
 - 构建机细节（目录、权限、镜像、deploy key）：[`build-agent/README.md`](build-agent/README.md)
 - amos 这台机器本身（nginx、TLS 证书、env、租户域名、CI 授权）：[`amos/README.md`](amos/README.md)
+- 服务端搬到 Rancher 时 Mac 打包机要的那几条：[`rancher/README.md`](rancher/README.md)
 - 配置项含义：[`../docs/CONFIGURATION.md`](../docs/CONFIGURATION.md)
 
 控制台里的位置按菜单写，例如「平台维护 → 打包机与签名闸」。`<API>` 指该租户的 API 地址（amos 上是 `https://api.anyfun.win`）。
