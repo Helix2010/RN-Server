@@ -243,6 +243,15 @@ func (s *server) machineInstallScript(c *gin.Context) {
 	c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", machinesetup.InstallScript)
 }
 
+// machineInstallMacOSScript GET /v1/machine-setup/install-macos.sh：Mac 打包机那一份。
+//
+// 单独一条路由而不是按 User-Agent 分：装机的人要能先把脚本下下来、与 CI 日志里的 sha256
+// 核对过再执行（§4.5 第一步）。一条会按请求方变内容的地址核对不了。
+func (s *server) machineInstallMacOSScript(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Data(http.StatusOK, "text/x-shellscript; charset=utf-8", machinesetup.InstallMacOSScript)
+}
+
 type enrollmentCodeBody struct {
 	Code string `json:"code"`
 }

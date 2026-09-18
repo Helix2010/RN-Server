@@ -38,7 +38,7 @@ func TestInstallScriptIsEmbedded(t *testing.T) {
 // 执行时，本机任何用户放在那里的 json.py 会以 root 身份运行。
 func TestScriptsRunPythonIsolated(t *testing.T) {
 	pythonCall := regexp.MustCompile(`\bpython3\b`)
-	for _, path := range []string{"install.sh", "../../deploy/setup/build-bundles.sh", "../../deploy/amos/merge-env.sh"} {
+	for _, path := range []string{"install.sh", "install-macos.sh", "../../deploy/setup/build-bundles.sh", "../../deploy/amos/merge-env.sh"} {
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -219,5 +219,101 @@ func TestInstallScriptFindsTheSignerTemplates(t *testing.T) {
 		if !bytes.Contains(InstallScript, []byte(want)) {
 			t.Errorf("install.sh no longer renders %s", want)
 		}
+	}
+}
+
+// ---- Mac 打包机的装机脚本 ----
+
+func TestMacInstallScriptIsEmbedded(t *testing.T) {
+	onDisk, err := os.ReadFile("install-macos.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(onDisk, InstallMacOSScript) || !bytes.HasPrefix(InstallMacOSScript, []byte("#!/usr/bin/env bash\n")) {
+		t.Fatal("the embedded script is not install-macos.sh")
+	}
+	if !bytes.Contains(InstallMacOSScript, []byte("\nset -euo pipefail\n")) {
+		t.Fatal("install-macos.sh must run with set -euo pipefail")
+	}
+	// curl … | bash：最后一行之前全是定义，main 放在最后才执行
+	if !bytes.HasSuffix(InstallMacOSScript, []byte("\nmain \"$@\"\nexit\n")) {
+		t.Fatal("install-macos.sh must end with main \"$@\" followed by exit")
+	}
+	head, _, ok := bytes.Cut(InstallMacOSScript, []byte("\nreadonly "))
+	if !ok {
+		t.Fatal("install-macos.sh has no readonly constants")
+	}
+	for _, want := range []string{"\ncd /\n", "\numask 077\n", "\nPATH=/usr/bin:/bin:/usr/sbin:/sbin\n", "compgen -e", "unset -f"} {
+		if !bytes.Contains(head, []byte(want)) {
+			t.Errorf("install-macos.sh does not start with %q", strings.TrimSpace(want))
+		}
+	}
+}
+
+// 首次装机是一次对服务端的信任：脚本、安装包与两把公钥都来自服务端。三个带外核对值
+// 因此是必填的，而且必须真的被用来比对——不比对的话它们只是三个被抄进命令行的字符串。
+func TestMacInstallScriptRequiresTheOutOfBandDigests(t *testing.T) {
+	script := string(InstallMacOSScript)
+	for _, flag := range []string{"--expect-sha256", "--release-key-sha256", "--allowed-signers-sha256"} {
+		if !strings.Contains(script, flag) {
+			t.Errorf("install-macos.sh does not take %s", flag)
+		}
+	}
+	// 三个值都要过同一条形状校验，缺一个就退出
+	if !strings.Contains(script, `for value in "$EXPECT_SHA256" "$RELEASE_KEY_SHA256" "$ALLOWED_SIGNERS_SHA256"`) {
+		t.Error("install-macos.sh does not validate all three digests together")
+	}
+	// 真的拿来比：安装包里的两把公钥各比一次，归档比一次
+	for _, comparison := range []string{
+		`[ "$key_sha" = "$RELEASE_KEY_SHA256" ]`,
+		`[ "$signers_sha" = "$ALLOWED_SIGNERS_SHA256" ]`,
+		`[ "$EXPECT_SHA256" = "$BUNDLE_SHA256" ]`,
+	} {
+		if !strings.Contains(script, comparison) {
+			t.Errorf("install-macos.sh never compares %s", comparison)
+		}
+	}
+}
+
+// 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
+func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
+	script := string(InstallMacOSScript)
+	if !strings.Contains(script, `printf 'header = "x-enrollment-code: %s"\n' "$CODE" |`) {
+		t.Error("install-macos.sh must pass the enrollment code to curl through a config on stdin")
+	}
+	if strings.Contains(script, `-H "x-enrollment-code: $CODE"`) || strings.Contains(script, "--code \"$CODE\" ") {
+		t.Error("install-macos.sh puts the enrollment code in a command line")
+	}
+	if !strings.Contains(script, `RN_ENROLLMENT_CODE="$CODE" "$INSTALL_DIR/build-agent" enroll`) {
+		t.Error("install-macos.sh must hand the enrollment code to enroll through the environment")
+	}
+	for _, line := range strings.Split(script, "\n") {
+		code := strings.TrimSpace(line)
+		if strings.HasPrefix(code, "#") {
+			continue
+		}
+		if strings.Contains(code, "echo") && strings.Contains(code, "password") {
+			t.Errorf("install-macos.sh echoes a password: %s", code)
+		}
+	}
+}
+
+// FileVault 没开就不装：这台机器上会放全部租户的 Distribution 私钥、上传 Key、
+// 机器令牌与 deploy key。
+func TestMacInstallScriptRefusesWithoutFileVault(t *testing.T) {
+	script := string(InstallMacOSScript)
+	if !strings.Contains(script, "fdesetup status") || !strings.Contains(script, "FileVault is On") {
+		t.Error("install-macos.sh does not check FileVault")
+	}
+	index := strings.Index(script, "check_filevault() {")
+	if index < 0 {
+		t.Fatal("no check_filevault")
+	}
+	body := script[index:]
+	if end := strings.Index(body, "\n# ---- 4."); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "die ") {
+		t.Error("install-macos.sh only warns about FileVault; it must refuse to install")
 	}
 }

@@ -259,6 +259,7 @@ func (s *server) routes() *gin.Engine {
 	// 安装包下载是流式的，按路由精确豁免数据库超时（exemptRouteFromDatabaseTimeout）
 	setup := r.Group("/v1/machine-setup")
 	setup.GET("/install.sh", s.machineInstallScript)
+	setup.GET("/install-macos.sh", s.machineInstallMacOSScript)
 	setup.POST("/describe", throttleMachineSetup("describe", &s.machineSetup.describe), s.describeEnrollment)
 	setup.GET("/bundle/:archive", throttleMachineSetup("bundle", &s.machineSetup.bundle), s.downloadMachineBundle)
 	setup.POST("/enroll", throttleMachineSetup("enroll", &s.machineSetup.enroll), s.enrollMachine)

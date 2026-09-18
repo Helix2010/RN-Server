@@ -9,7 +9,9 @@
 #   builder-darwin-arm64.tar.gz
 #                    darwin/arm64（Mac 打包机）：bin/build-agent、bin/build-runner、bin/ios-upload、
 #                    bin/rn-build-agent-upgrade、run-agent、两份 launchd plist、sudoers、
-#                    rn-build-agent-macos.env.example
+#                    rn-build-agent-macos.env.example，以及两把公钥（release-key.pub、
+#                    allowed_signers；由 RN_RELEASE_KEY_PUB / RN_ALLOWED_SIGNERS 指定，
+#                    缺了只警告，但 install-macos.sh 会拒绝安装）
 #   manifest.json    {"format":"rn-machine-bundles/v1","commit",
 #                     "bundles":{"signer":{"archive","archiveSha256","archiveSize","files":[{"name","size","sha256"}]},
 #                                "builder":{…},"builder-darwin-arm64":{…}}}
@@ -70,6 +72,21 @@ cp "$ROOT/deploy/signer/README.md" "$STAGE/signer/README.md"
 cp "$ROOT/internal/machinesetup/install.sh" "$STAGE/signer/install.sh"
 cp "$ROOT/deploy/build-agent/rn-build-agent.service" "$ROOT/deploy/build-agent/rn-build-agent.sudoers" \
   "$ROOT/deploy/build-agent/rn-build-agent.env.example" "$ROOT/deploy/build-agent/README.md" "$STAGE/builder/"
+# Mac 那一组还要带上两把**公钥**：发布公钥（自升级的信任根）与 allowed_signers（提交签名
+# 的信任根）。它们不是机密，但也不在仓库里——一个由离线机器上的 bundle-sign 生成，一个由
+# 平台维护。装机脚本从安装包里取出来之后，会与运维从密码管理器里带来的 sha256 比对；
+# 缺了它们的安装包装不了 Mac（install-macos.sh 会当场停下），所以这里只警告不失败：
+# 一次只出 Linux 包的构建不该因此断掉。
+RELEASE_KEY_PUB="${RN_RELEASE_KEY_PUB:-$ROOT/deploy/build-agent-macos/release-key.pub}"
+ALLOWED_SIGNERS="${RN_ALLOWED_SIGNERS:-$ROOT/deploy/build-agent-macos/allowed_signers}"
+for f in "$RELEASE_KEY_PUB" "$ALLOWED_SIGNERS"; do
+  if [ -f "$f" ]; then
+    install -m 0644 "$f" "$STAGE/builder-darwin-arm64/$(basename "$f")"
+  else
+    echo "!! 缺 $f：builder-darwin-arm64.tar.gz 不含它，install-macos.sh 会拒绝安装。" >&2
+    echo "   用 RN_RELEASE_KEY_PUB / RN_ALLOWED_SIGNERS 指过去，或者放进 deploy/build-agent-macos/。" >&2
+  fi
+done
 cp "$ROOT/deploy/build-agent-macos/rn-build-agent-macos.env.example" \
   "$ROOT/deploy/build-agent-macos/rn-build-agent.sudoers" \
   "$ROOT/deploy/build-agent-macos/run-agent" \

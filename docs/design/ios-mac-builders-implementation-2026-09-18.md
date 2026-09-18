@@ -16,7 +16,7 @@
 | S2 | 已完成 | 本分支 | 迁移 55 `build_machine_liveness`；`claim` 在锁与事务外、204 之前写；`heartbeat` 只动 `last_seen_at`；`hasLiveBuilderFor` 未改 |
 | S3 | 已完成 | 本分支 | `claim` 体加 `agentCommit`/`os`/`appleTeams`/`freeGb`；`/ios-release` 体加 `toolchain`、`uploadedByEarlierAttempt`，两者进 `file_metadata`；`ios-release` 补进 OpenAPI（之前整条路由没写） |
 | S4 | 已完成 | 本分支 | `build-bundles.sh` 多出 `builder-darwin-arm64.tar.gz`（build-agent/build-runner/ios-upload + macOS env 示例），`builder.tar.gz` 仍指 linux/amd64；登记里加 `os`，`describe`/下载按它选那一组；`-X main.commit` 注入两处一致 |
-| S5 | 未开始 | | `install-macos.sh`（`go:embed` 下发） |
+| S5 | 已完成 | 本分支 | `install-macos.sh`（674 行，`go:embed`，`GET /v1/machine-setup/install-macos.sh`）：三个带外核对值必填且真的用来比对，FileVault 没开就拒装，三个角色账户 + 目录、安装包逐文件核对、冒烟、钥匙串与随机口令、enroll、deploy key、两份 plist |
 | S6 | 已完成 | 本分支 | `GET /v1/build-agent/bundle`（清单 base64 + 离线签名 + 归档地址）与 `/bundle/archive`（流式，豁免库超时）；平台级 `approvedAgentCommit` 与 `POST /v1/admin/platform/build-agent-version`；claim 在选任务**之前**比对，不等则 409 `AGENT_UPGRADE_REQUIRED`；没签名或 `-dirty` 一律 503 |
 | S7 | 已完成 | 本分支 | `ascapi` 加 `Uploader`（**只有它能写 Apple 侧状态**，服务端只构造只读的 `Client`，有用例守着）、Build Uploads 三个端点、按 build 号查询、只读探测 |
 | S8 | 未开始 | | Rancher 部署清单 |
@@ -38,7 +38,7 @@
 | A4 | 已完成 | `cmd/build-agent/ios-upload`：`--probe`（只读探端点权限，永远以 0 退出）与上传两条路；先查同号再传，分块 PUT 可重试，"同号已存在"当成功；一行 JSON 到 stdout |
 | A10 | 已完成 | `deploy/build-agent-macos/`：两份 launchd plist（`UserName`、`KeepAlive.PathState`、`ExitTimeOut=7500`；升级那份走 `WatchPaths`）、`run-agent`（加载 env 后 `exec`）、sudoers 两条（`NOSETENV`）、env 示例；新程序 `cmd/build-agent/upgrade`（验签→核序号→核提交→逐文件核 sha256→冒烟→原子替换→删标记），全部进 darwin 归档 |
 
-下一步：S5（`install-macos.sh`）→ R1/R2（RN-App）→ C1–C4（管理端）→ S8（Rancher 部署清单）。
+下一步：R1/R2（RN-App）→ C1–C4（管理端）→ S8（Rancher 部署清单）。
 
 ## RN-App
 

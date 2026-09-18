@@ -4643,6 +4643,17 @@
         }
       }
     },
+    "/v1/machine-setup/install-macos.sh": {
+      "get": {
+        "summary": "The macOS build machine installer script",
+        "description": "Served verbatim (go:embed). A separate route rather than content negotiation on install.sh: whoever installs the machine must be able to download the script and compare its sha256 with the CI log before running it, and an address whose content depends on the caller cannot be checked that way. The script refuses to run without --expect-sha256, --release-key-sha256 and --allowed-signers-sha256: a first install is an act of trust in the server (script, bundle and both pinned public keys all come from it), so those three out-of-band digests are the only judgement this machine has that does not depend on the server.",
+        "responses": {
+          "200": {
+            "description": "text/x-shellscript"
+          }
+        }
+      }
+    },
     "/v1/machine-setup/describe": {
       "post": {
         "summary": "Describe the machine an enrollment code belongs to",
