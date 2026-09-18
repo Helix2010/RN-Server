@@ -461,10 +461,40 @@ func (s *server) createBuildJob(c *gin.Context) {
 		return
 	}
 	// iOS 的签名身份不在签名闸上，在那台 Mac 的钥匙串里，所以它有自己的一套必填项
+	warnings := []string{}
 	if platform == buildPlatformIOS {
 		if detail := s.iosBuildIdentityProblem(c.Request.Context(), tenantID(c)); detail != "" {
 			problem(c, http.StatusConflict, "IOS_IDENTITY_INCOMPLETE", detail)
 			return
+		}
+		// 登记说"有一台能打 iOS"还不够：池子模型下每台 Mac 都该能打任何租户，但
+		// 材料是人一台台导进钥匙串的，漏一台就漏一个 Team。判据是机器自己报上来的
+		// 盘点（§5.2），不是登记——登记里没有、也不该有"这台能打哪些 Team"这一列。
+		identity, err := s.iosReleaseIdentityRecord(c.Request.Context(), tenantID(c))
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to read the iOS release identity")
+			return
+		}
+		if identity != nil {
+			coverage, err := s.iosSigningCoverage(c.Request.Context(), registry,
+				identity.Value.AppleTeamID, identity.Value.BundleID, s.now())
+			if err != nil {
+				problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to read build machine liveness")
+				return
+			}
+			switch {
+			case !coverage.Reported:
+				problem(c, http.StatusConflict, "NO_BUILDER_FOR_TEAM",
+					"没有任何一台 iOS 打包机报告过它手上有 Team "+identity.Value.AppleTeamID+"、bundle id "+
+						identity.Value.BundleID+" 的签名材料，排进去的任务不会有人认领。"+
+						"把这个 Team 的证书与描述文件导进至少一台 Mac 并重启打包机程序，"+
+						"到「平台维护 → 构建机」确认它报上来之后再排。")
+				return
+			case !coverage.Online:
+				// 掉线不拦：家里的 Mac 合上盖子就没了，任务照常排队等它回来。
+				// 只把这件事说出来，让排队的人知道这不会马上开始
+				warnings = append(warnings, "no_ios_builder_online")
+			}
 		}
 	}
 	// 主签名闸没有就绪，这个包出得来也签不了——别让它占构建机，停在「待签名」里。
@@ -510,11 +540,15 @@ func (s *server) createBuildJob(c *gin.Context) {
 	// 2026-09-13 加 OTA 类型之后，这个响应一直带着 "kind": ""，而管理端按 apk|ota 校验
 	// 响应——于是每一次**成功的** APK 排队都显示成"排队失败"，重试一次就真的多排一个包。
 	// 库里那一行没问题（列默认 'apk'），坏的只是这份响应。
-	c.JSON(http.StatusCreated, buildJobView(buildJob{
+	view := buildJobView(buildJob{
 		ID: id, TenantID: tenantID(c), Platform: platform, Kind: "apk", GitRef: gitRef, Version: version,
 		BuildNumber: body.BuildNumber, Status: "queued", Reason: reason, ReleaseNotes: encodedNotes,
 		CreatedBy: actor(c), CreatedAt: now, UpdatedAt: now,
-	}))
+	})
+	// warnings 恒为数组，不是 null：管理端按 z.array 解析，而 zod 的 .default([])
+	// 只对 undefined 生效、对 null 不生效（viewPlatforms 那条教训）
+	view["warnings"] = warnings
+	c.JSON(http.StatusCreated, view)
 }
 
 func (s *server) listBuildJobs(c *gin.Context) {

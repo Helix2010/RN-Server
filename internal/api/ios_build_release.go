@@ -32,6 +32,9 @@ import (
 // 时候发的"。我们手里那份 .ipa 的摘要记进 file_metadata，只作为"构建机交付了什么"的
 // 自报凭证，不是分发凭证。
 
+// iosToolchainMaxRunes 够放下 `Xcode 16.2` + `Build version 16C5032a` 两段。
+const iosToolchainMaxRunes = 120
+
 // iosReleaseReport 是 Mac 构建完之后的上报。
 type iosReleaseReport struct {
 	CommitSHA string `json:"commitSha"`
@@ -44,8 +47,17 @@ type iosReleaseReport struct {
 	BuildNumber  int    `json:"buildNumber"`
 	// UploadedToAppStoreConnect：这次有没有真的传上去（pnpm ios:release 要显式 --upload）。
 	// 记下来是因为"包打出来了"和"TestFlight 上有这一版"是两件事，运营要能分辨
-	UploadedToAppStoreConnect bool     `json:"uploadedToAppStoreConnect"`
-	LogTail                   []string `json:"logTail"`
+	UploadedToAppStoreConnect bool `json:"uploadedToAppStoreConnect"`
+	// UploadedByEarlierAttempt：这次没传，因为 ASC 上已经有同一个 build 号了
+	// （设计 ios-mac-builders-home-network-2026-09-18 §6.3）。任务被回收重排后 build 号
+	// 不变，上一次尝试可能已经把 .ipa 传上去了、只是没报上来。这时 Apple 那份 .ipa 对应的
+	// 是**上一次检出的提交**，与这条记录里自报的 commitSha / ipaSha256 可能不是一回事——
+	// 这个标记就是在说这件事，别把它当成"没上传"
+	UploadedByEarlierAttempt bool `json:"uploadedByEarlierAttempt"`
+	// Toolchain 是这台 Mac 上 xcodebuild -version 的那一行。几台 Mac 装同一个 Xcode 是
+	// 人工维护的约定（§5.3），版本漂移只有记下来才看得见
+	Toolchain string   `json:"toolchain"`
+	LogTail   []string `json:"logTail"`
 }
 
 // completeIOSBuildJob 收 iOS 安装包任务的结果：落一条无产物的发布记录，任务转 succeeded。
@@ -112,6 +124,11 @@ func (s *server) completeIOSBuildJob(c *gin.Context) {
 		"buildJobId":                job.ID,
 		"builderId":                 machine.ID,
 		"uploadedToAppStoreConnect": body.UploadedToAppStoreConnect,
+		"uploadedByEarlierAttempt":  body.UploadedByEarlierAttempt,
+	}
+	// 没报就不写这个键：旧版代理不带它，写一个空串等于说"这台机器的 Xcode 是空的"
+	if toolchain := sanitizeSignerText(body.Toolchain, iosToolchainMaxRunes); toolchain != "" {
+		metadata["toolchain"] = toolchain
 	}
 	now := time.Now().UTC()
 	insert := releaseInsert{
@@ -121,7 +138,8 @@ func (s *server) completeIOSBuildJob(c *gin.Context) {
 		Metadata:       metadata, Notes: buildJobReleaseNotes(job),
 		Actor: builderSystemActor, RequestID: requestID(c), AuditReason: "an iOS builder delivered a TestFlight build",
 		AuditSummary: map[string]any{"buildJobId": job.ID, "builderId": machine.ID, "attempt": job.Attempt,
-			"uploadedToAppStoreConnect": body.UploadedToAppStoreConnect},
+			"uploadedToAppStoreConnect": body.UploadedToAppStoreConnect,
+			"uploadedByEarlierAttempt":  body.UploadedByEarlierAttempt},
 	}
 	releaseID := ""
 	rejection, err := s.withReleaseSequence(c.Request.Context(), job.TenantID, job.Platform, func(tx *sql.Tx) (*releaseRejection, error) {

@@ -15,6 +15,9 @@
 | `sbom` | 签名闸完成：`{"fileName","objectKey","size","sha256","format":"cyclonedx-json"}`；手工上传带 `sbomToken` 时：`{"fileName","objectKey","size","format"}` | 这个包的依赖清单在对象存储里的位置 | 键不存在 = 没有 SBOM |
 | `commitSha`、`commitSelfReported` | 签名闸完成 | 构建机检出的提交；`commitSelfReported` 恒为 `true`——提交由构建机自报，服务端没有 GitHub 凭据去核对 | 手工上传的记录没有 |
 | `buildJobId`、`builderId`、`signerMachineId` | 签名闸完成 | 打包任务 id、交付未签名包的构建机 id、签名的签名闸 id（`build.machines`） | 手工上传的记录没有 |
+| `hosted`、`bundleId`、`appleTeamId`、`installUrl`、`ipaSha256`、`ipaSize`、`ipaSelfReported`、`uploadedToAppStoreConnect` | iOS 构建机交付（`POST /v1/build-agent/jobs/:id/ios-release`） | `hosted="testflight"` 表示产物不在我们手里（Apple 重新签名、瘦身，用户装的不是我们这一份），下载与产物校验据它跳过；`ipaSha256` 只是"构建机交付了什么"的自报凭证，不是分发凭证 | 只有 iOS 记录有 |
+| `uploadedByEarlierAttempt` | 同上（设计 `ios-mac-builders-home-network-2026-09-18.md` §6.3） | 这次没传，因为 App Store Connect 上已经有同一个 build 号了。任务被回收重排后 build 号不变，上一次尝试可能已经把 `.ipa` 传上去、只是没报上来——**这时 Apple 那份对应的是上一次检出的提交**，与本条记录里自报的 `commitSha` / `ipaSha256` 可能不是一回事 | 旧代理不报，键不存在按 false 读 |
+| `toolchain` | 同上 | 这台 Mac 的 `xcodebuild -version` 那一行。几台 Mac 装同一个 Xcode 是人工维护的约定，版本漂移只有记下来才看得见 | 没报就不写这个键：写空串等于说"这台机器的 Xcode 是空的" |
 
 ## ota_releases.object_metadata（JSON，迁移 37）
 
@@ -109,3 +112,31 @@ ota：queued → claimed → running → succeeded
 - `log_tail` 最多 200 行、每行最多 2000 字节。机器上报的自由文本（`log_tail`、构建机的 `failure_reason`、签名闸的 `sign_outcome.detail` 与检查 `error`）入库前去掉 C0/C1 控制字符（保留 \t）与 Unicode 双向覆盖/隔离字符（U+202A–U+202E、U+2066–U+2069、U+200E/U+200F）。
 - 认领是**跨租户**的，取最早那条。解析不出租户、`git_ref` 不是固定分支的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。
 - 回收是服务端独立的定时器（每分钟），条件更新，多实例并发安全。
+- iOS 认领还有两条（迁移 55、设计 `docs/design/ios-mac-builders-home-network-2026-09-18.md` §5.2、§5.3）：**同租户同时只有一条 iOS 安装包任务在途**（两条并行跑完，低号那条的 `/ios-release` 会被拒，而它的 `.ipa` 已经进了 App Store Connect，撤不回来）；任务租户 `release.ios` 的 `appleTeamId` + `bundleId` 必须在这台机器**本次认领自报**的盘点里（`build_machine_liveness.apple_teams`）。两条都写成子查询并用 `FOR UPDATE OF j SKIP LOCKED` 限定锁的范围——不限定的话每次认领都会锁住各租户 `app_configs` 的 `release.ios` 那几行。Android 不加第一条：那会把两台构建机同时打同一个租户的两条任务也串起来。
+
+## build_machine_liveness（迁移 55）
+
+构建机最近一次露面与它自报的签名材料盘点。认领与心跳时写，60 秒节流，不进审计。设计见 `docs/design/ios-mac-builders-home-network-2026-09-18.md` §5.2、§5.4。
+
+**为什么不合并进 `app_configs` 的 `build.machines`**：那是一份带版本号的 JSON 文档，写入走乐观锁（`writeMachineRegistry`）。N 台机器每 10 秒认领一次、每 30 秒心跳一次，把"最近在线"写回那份文档，机器之间会互相把版本号顶掉，写失败还会污染认领这条主路径。按"先复用再建表"的判据，这是一个新实体（高频、单写方、按机器一行的运行状态），不是配置。
+
+**这张表不做任何授权判断。** `apple_teams` 是机器自己说的：持有机器令牌的人可以谎报手里有全部 Team 的材料，领走任一租户的任务再让它失败。这不是新增攻击面（持令牌本来就能认领并失败任意任务），但因此它只用来决定"派不派这条任务给这台机器"和控制台显示什么——**是运维仪表，不是安全边界**。
+
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `machine_id` | VARCHAR(40) PK | 构建机 id（`build.machines`，`mch_` 前缀），由机器令牌鉴权得出。没有外键：登记在 JSON 文档里，指不过去；机器删掉后留下的孤儿行比一条会在认领路径上失败的外键便宜 |
+| `last_seen_at` | DATETIME(3) NOT NULL | 最近一次认领或心跳 UTC。写入按 60 秒节流：`ON DUPLICATE KEY UPDATE` 没有 WHERE，用 `IF(last_seen_at < VALUES(last_seen_at) - INTERVAL 60 SECOND, …)` 让窗口内的新值等于旧值，整条语句变成空转 |
+| `agent_commit` | VARCHAR(64) NULL | 这台机器上跑的 `build-agent` 提交（`-ldflags` 注入）。与平台级 `approvedAgentCommit` 不一致时控制台标出。NULL=旧版代理没报 |
+| `os` | VARCHAR(16) NULL | `runtime.GOOS`：`darwin`=Mac 打包机，`linux`=机房构建机。装机脚本与自升级归档按它分 |
+| `platforms` | JSON NULL | 本次认领自报的平台，如 `["ios"]`。记的是**自报的**、不是被登记收窄之后的：收窄掉的恰恰是"它想干但干不了"，而那正是要在控制台上看见的 |
+| `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z"}]`。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
+| `signing_expires_at` | DATETIME(3) NULL | 本机最早到期的证书或描述文件，30 天内控制台标黄 |
+| `free_gb` | INT UNSIGNED NULL | 构建盘剩余空间 GiB。低于阈值的机器自己就不认领，这一列只为让人看见 |
+| `updated_at` | DATETIME(3) NOT NULL | 本行最近一次被写入 UTC |
+
+### 不变量
+
+- 写入点只有两个：`claim`（在 `GET_LOCK` 与事务**之外**、在"队列空回 204"**之前**——认领路径上绝大多数请求都是空转，而在线状态只有那些空转能证明）与 `heartbeat`（只动 `last_seen_at`：心跳的请求体里没有盘点，用认领那条写入会把 `apple_teams` 抹成 NULL，控制台上机器会在构建期间突然"什么材料都没有"）。
+- 写失败只记日志，不影响认领与心跳：在线状态是仪表，认领是主路径。
+- **`hasLiveBuilderFor` 不看这张表**：任务能不能排进队列仍然只看登记里有没有 active 的构建机。家里的 Mac 掉线时 iOS 任务照常排队等它回来（已定的决策）；"一台都不在线"只进排队响应的 `warnings`（`no_ios_builder_online`）与控制台提示。挡住排队的只有"**从来没有**任何一台报过这个 Team"（409 `NO_BUILDER_FOR_TEAM`），那种情况排进去永远没人领。
+- 掉线判据 5 分钟（代理每 10 秒认领、每 30 秒心跳，写入 60 秒节流），控制台卡片超过 30 分钟标黄。

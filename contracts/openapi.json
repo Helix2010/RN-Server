@@ -3067,7 +3067,7 @@
         },
         "responses": {
           "201": {
-            "description": "Queued build job"
+            "description": "Queued build job. The body is the build job view plus warnings: an always-present array of non-blocking notices, currently no_ios_builder_online (every Mac holding this tenant's signing material is offline; the job stays queued until one comes back)."
           },
           "400": {
             "description": "INVALID_BUILD_JOB: platform, git ref, semver version, positive build number, reason and confirm=true are required"
@@ -3076,7 +3076,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE. APP_IDENTITY_DRIFT: this build would change the Android package name or signing certificate of the active release, so installed devices cannot upgrade in place; the detail is written for people - after the operator confirms, resend the same request with acknowledgeIdentityChange=true. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs."
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE. APP_IDENTITY_DRIFT: this build would change the Android package name or signing certificate of the active release, so installed devices cannot upgrade in place; the detail is written for people - after the operator confirms, resend the same request with acknowledgeIdentityChange=true. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs. NO_BUILDER_FOR_TEAM: no iOS builder has ever reported holding this tenant's Apple Team and bundle id, so the job would never be claimed - import the certificate and profiles on at least one Mac first."
           },
           "422": {
             "description": "OTA_BASE_RELEASE_INVALID: this release cannot be used as an OTA base - it is not verified/active, it has no runtimeVersion, or it has no recorded native fingerprint (built before the fingerprint was recorded, so there is no way to tell whether the update is JS-only). INVALID_OTA_APPLY_STRATEGY: applyStrategy must be next_launch or immediate."
@@ -3331,7 +3331,7 @@
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
-        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view (its claimedMachineId is this builder's id, the builderId of the provenance statement) plus attempt, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims.",
+        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view (its claimedMachineId is this builder's id, the builderId of the provenance statement) plus attempt, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims. The body also carries the machine's self-report (agentCommit, os, appleTeams, freeGb): it is recorded as the machine's last-seen row before the empty-queue 204, so an idle pool still shows up as online in the console. iOS jobs are additionally filtered by that self-report - a Mac only gets a tenant's iOS job when it reports holding that tenant's Apple Team and bundle id - and only one iOS apk job per tenant is in flight at a time, because a second, lower build number would be rejected at /ios-release after its .ipa had already reached App Store Connect.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -3730,6 +3730,56 @@
           }
         },
         "deprecated": true
+      }
+    },
+    "/v1/build-agent/jobs/{id}/ios-release": {
+      "post": {
+        "summary": "Record an iOS TestFlight build and finish the job",
+        "description": "iOS installable-package jobs go claimed/running -> succeeded in one step: xcodebuild signs at export time, so there is no unsigned artifact for the signer to take. Creates a release record with no artifact (hosted=testflight in file_metadata: the package users install lives at Apple and is not the one we built) and flips the job to succeeded in the release-sequence transaction. The reported identity must match both the job row and the tenant's release.ios. Idempotent: the same claim reporting the same digest returns the same releaseId; a different digest is 409 IOS_RESULT_CONFLICT.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IOSBuildResult"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Release recorded; body is {releaseId}"
+          },
+          "400": {
+            "description": "INVALID_BUILD_RESULT"
+          },
+          "409": {
+            "description": "BUILD_KIND_MISMATCH (not an iOS apk job), IOS_IDENTITY_INCOMPLETE (release.ios was removed while the build ran), IOS_RESULT_CONFLICT, BUILD_ATTEMPT_STALE"
+          },
+          "422": {
+            "description": "IOS_ARTIFACT_MISMATCH: the reported bundleId, shortVersion or buildNumber does not match this job"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
       }
     },
     "/v1/build-agent/public-key": {
@@ -7537,6 +7587,32 @@
                 "ota"
               ]
             }
+          },
+          "agentCommit": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$",
+            "description": "Commit of the build-agent binary (injected with -ldflags at build time). Recorded for the console; once a platform admin approves a version, a claim carrying a different commit is answered with 409 AGENT_UPGRADE_REQUIRED instead of a job. Omitted by agents older than the self-upgrade rollout."
+          },
+          "os": {
+            "type": "string",
+            "enum": [
+              "darwin",
+              "linux"
+            ],
+            "description": "runtime.GOOS of the machine: darwin = a Mac iOS builder, linux = a data-centre builder."
+          },
+          "appleTeams": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/AppleTeamReport"
+            },
+            "description": "Signing material this machine holds right now. iOS jobs are only handed to a machine whose report covers the tenant's release.ios appleTeamId and bundleId."
+          },
+          "freeGb": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Free space on the build volume in GiB, for the console."
           }
         }
       },
@@ -9720,6 +9796,92 @@
           },
           "confirm": {
             "type": "boolean"
+          }
+        }
+      },
+      "AppleTeamReport": {
+        "type": "object",
+        "description": "One Apple Developer Team a Mac builder reports it can sign for: the Distribution certificate is in its keychain, provisioning profiles for these bundle ids are on disk and the upload key for that team is present. Self-reported and only narrowing: it is an operations dashboard, not a security boundary - whoever holds the machine token can claim to hold any team.",
+        "required": [
+          "teamId",
+          "bundleIds"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "teamId": {
+            "type": "string",
+            "pattern": "^[A-Z0-9]{10}$",
+            "description": "Apple Developer Team ID"
+          },
+          "bundleIds": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string"
+            },
+            "description": "Bundle ids this machine has a usable provisioning profile for"
+          },
+          "expiresAt": {
+            "type": "string",
+            "description": "RFC3339 expiry of the earliest certificate or profile of this team; omitted when unknown"
+          }
+        }
+      },
+      "IOSBuildResult": {
+        "type": "object",
+        "required": [
+          "commitSha",
+          "ipaSha256",
+          "ipaSize",
+          "bundleId",
+          "shortVersion",
+          "buildNumber"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "commitSha": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$",
+            "description": "Commit the Mac checked out. Self-reported: the server has no GitHub credentials to verify it."
+          },
+          "ipaSha256": {
+            "type": "string",
+            "description": "sha256 of the .ipa the builder holds. Self-reported evidence of what was built, not a distribution credential - the package users install is the one Apple re-signed."
+          },
+          "ipaSize": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "bundleId": {
+            "type": "string",
+            "description": "Read out of the exported package on the Mac; must equal the tenant's release.ios bundleId."
+          },
+          "shortVersion": {
+            "type": "string",
+            "description": "CFBundleShortVersionString; must equal the job's version."
+          },
+          "buildNumber": {
+            "type": "integer",
+            "description": "CFBundleVersion; must equal the job's build number."
+          },
+          "uploadedToAppStoreConnect": {
+            "type": "boolean",
+            "description": "Whether this attempt actually uploaded the build."
+          },
+          "uploadedByEarlierAttempt": {
+            "type": "boolean",
+            "description": "The upload was skipped because App Store Connect already has this build number - a requeued job keeps its build number, so an earlier attempt may have uploaded a package built from a different commit. Recorded in file_metadata so nobody reads commitSha/ipaSha256 as describing what is on Apple's side."
+          },
+          "toolchain": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "The xcodebuild -version line of this Mac, for spotting version drift across the pool."
+          },
+          "logTail": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       }

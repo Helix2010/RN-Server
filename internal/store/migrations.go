@@ -72,6 +72,9 @@ var migrations = []migration{
 	{version: 53, name: "platform_backups", apply: platformBackupsMigration},
 	// Android 签名闸（设计 android-signing-gate-2026-09-16、ADR 0019）：构建与签名拆成两段
 	{version: 54, name: "build_jobs_signing_gate", apply: buildJobsSigningGateMigration},
+	// iOS 打包机在家用网络里（设计 ios-mac-builders-home-network-2026-09-18 §5.4）：
+	// 「最近在线」与自报的签名材料盘点单独一张表，不写回 build.machines 那份 JSON 文档
+	{version: 55, name: "build_machine_liveness", apply: buildMachineLivenessMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -1982,6 +1985,38 @@ func buildJobsSigningGateMigration(ctx context.Context, db *sql.DB) error {
 			COMMENT '每台构建机同时只派一条：认领前查本机有没有 claimed/running 的任务'`); err != nil {
 			return fmt.Errorf("build jobs signing gate migration create machine index: %w", err)
 		}
+	}
+	return nil
+}
+
+// buildMachineLivenessMigration 建一张构建机「最近在线」表（设计
+// ios-mac-builders-home-network-2026-09-18 §5.4）。
+//
+// 为什么不写回 app_configs 的 build.machines：那是一份带版本号的 JSON 文档，写入走
+// 乐观锁。N 台机器每 10 秒认领一次、每 30 秒心跳一次，把「最近在线」写回那份文档，
+// 机器之间会互相把对方的版本号顶掉，写失败还会污染认领这条主路径。
+//
+// 这张表**只记事实、不做判据**：任务能不能排进队列仍然看登记里机器是不是 active
+// （hasLiveBuilderFor 不变），家里的 Mac 掉线时 iOS 任务照常排队等它回来。这里的值
+// 用来在控制台上显示「最近在线」「这台缺哪个 Team 的签名材料」，以及排队时给一句
+// 「当前没有 iOS 打包机在线」的提示。
+//
+// 没有外键：登记在 app_configs 的 JSON 文档里，指不过去。机器被删掉之后这里留一行
+// 孤儿，比一条会在认领路径上失败的外键便宜。
+func buildMachineLivenessMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS build_machine_liveness (
+		machine_id VARCHAR(40) NOT NULL COMMENT '构建机 id（app_configs 平台级 build.machines，mch_ 前缀），由机器令牌鉴权得出',
+		last_seen_at DATETIME(3) NOT NULL COMMENT '最近一次认领或心跳的时刻 UTC。写入按 60 秒节流：认领每 10 秒一次，不值得每次都写一行',
+		agent_commit VARCHAR(64) NULL COMMENT '这台机器上跑的构建机程序提交（build-agent version，-ldflags 注入）。与平台级 approvedAgentCommit 不一致时控制台标出；认领时不一致直接 409 AGENT_UPGRADE_REQUIRED。NULL=旧版代理没报',
+		os VARCHAR(16) NULL COMMENT 'runtime.GOOS：darwin=Mac 打包机，linux=机房构建机。装机脚本与自升级归档按它分。NULL=旧版代理没报',
+		platforms JSON NULL COMMENT '这次认领自报的平台列表，例如 ["ios"]。自报只能收窄登记里的能力，不能扩张。NULL=旧版代理没报',
+		apple_teams JSON NULL COMMENT '自报的签名材料盘点：[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z"}]。由 Mac 自己盘钥匙串与描述文件得出，服务端据它路由 iOS 任务，控制台据它与全部租户的 release.ios 求差集标出缺口。**这是运维仪表不是安全边界**：持有机器令牌的人可以谎报。NULL=不是 iOS 打包机或旧版代理没报',
+		signing_expires_at DATETIME(3) NULL COMMENT '本机最早到期的证书或描述文件的到期时刻 UTC，30 天内控制台标黄。NULL=没有签名材料或没报',
+		free_gb INT UNSIGNED NULL COMMENT '构建盘剩余空间 GiB，认领时自报；低于阈值的机器自己不认领，这一列只为让人看见。NULL=没报',
+		updated_at DATETIME(3) NOT NULL COMMENT '本行最近一次被写入的时刻 UTC',
+		PRIMARY KEY (machine_id)
+	) ENGINE=InnoDB COMMENT='构建机最近在线与自报盘点：认领与心跳时写，60 秒节流，不进审计。只用于控制台展示与 iOS 任务路由，鉴权与「能不能排队」都不看这里'`); err != nil {
+		return fmt.Errorf("build machine liveness migration: %w", err)
 	}
 	return nil
 }

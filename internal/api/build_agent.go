@@ -86,29 +86,87 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	var body struct {
 		Platforms []string `json:"platforms"`
 		Kinds     []string `json:"kinds"`
+		// 以下四项是机器的自报（设计 ios-mac-builders-home-network-2026-09-18 §5.2、§5.4）。
+		// 旧版代理不带，零值即"没报"——请求体是 DisallowUnknownFields 严格解析，所以
+		// **服务端要先于新代理上线**，反过来新代理先上会被 400 顶回去。
+		AgentCommit string            `json:"agentCommit"`
+		OS          string            `json:"os"`
+		AppleTeams  []appleTeamReport `json:"appleTeams"`
+		FreeGb      int64             `json:"freeGb"`
 	}
 	if decode(c, &body) != nil || len(body.Platforms) == 0 || len(body.Kinds) == 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
 		return
 	}
+	for _, p := range body.Platforms {
+		if p != buildPlatformAndroid && p != buildPlatformIOS {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms must be android or ios")
+			return
+		}
+	}
+	for _, k := range body.Kinds {
+		if k != jobKindAPK && k != jobKindOTA {
+			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "kinds must be apk or ota")
+			return
+		}
+	}
+	if body.AgentCommit != "" && !commitSHAPattern.MatchString(body.AgentCommit) {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "agentCommit must be a full commit sha")
+		return
+	}
+	if body.OS != "" && body.OS != machineOSDarwin && body.OS != machineOSLinux {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "os must be darwin or linux")
+		return
+	}
+	if body.FreeGb < 0 {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "freeGb must not be negative")
+		return
+	}
+	teams, ok := normalizeAppleTeamReports(body.AppleTeams)
+	if !ok {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM",
+			"appleTeams must carry 10-character Apple Team IDs with bundle ids and an optional RFC3339 expiresAt")
+		return
+	}
+	ctx := c.Request.Context()
+	// 在 GET_LOCK 与事务**之外**、在"队列空回 204"提前返回**之前**记一次在线与自报盘点。
+	// 认领这条路径上绝大多数请求都是空转（队列是空的），而"这台机器还活着、手上有这些
+	// 材料"恰恰是那些空转唯一的产出；控制台据它显示"最近在线"与"这台缺哪个 Team"。
+	freeGB := sql.NullInt64{Valid: body.FreeGb > 0, Int64: body.FreeGb}
+	s.recordMachineLiveness(ctx, machineLiveness{
+		MachineID: machine.ID, LastSeenAt: s.now(), AgentCommit: body.AgentCommit, OS: body.OS,
+		// 记自报的平台，不是下面收窄之后的：收窄掉的恰恰是"它想干但干不了"，
+		// 而那正是要在控制台上看见的东西
+		Platforms: body.Platforms, AppleTeams: teams,
+		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB,
+	})
+
 	// 自报的平台只能**收窄**登记里的能力，不能扩张它：一台没装 Xcode 的 Linux 机器
 	// 报了 ios，领走的 iOS 任务只会失败、退回排队、再被它领走——一个自愈不了的循环，
 	// 而队列是跨租户的。登记是平台管理员维护的，自报只是"我这次想干什么"。
 	capable := machine.buildPlatforms()
 	args := []any{}
 	claimed := []string{}
+	pairs := signingPairs(teams)
 	for _, p := range body.Platforms {
-		if p != buildPlatformAndroid && p != buildPlatformIOS {
-			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms must be android or ios")
-			return
-		}
 		if !containsString(capable, p) {
+			continue
+		}
+		// iOS 还要再收窄一次：一台手上一个 Team 的签名材料都没有的 Mac 领走任何
+		// iOS 任务都只会失败三次、烧掉一个 build 号。它不算"没登记"（登记没错，
+		// 是材料没装），所以不报 409，安静地当作队列里没有它能干的活——控制台上
+		// 它的 apple_teams 是空的，缺口一眼就看得见
+		if p == buildPlatformIOS && len(pairs) == 0 {
 			continue
 		}
 		claimed = append(claimed, p)
 		args = append(args, p)
 	}
 	if len(claimed) == 0 {
+		if containsString(body.Platforms, buildPlatformIOS) && containsString(capable, buildPlatformIOS) {
+			c.Status(http.StatusNoContent)
+			return
+		}
 		problemWith(c, http.StatusConflict, "MACHINE_PLATFORM_NOT_REGISTERED",
 			"This machine is not registered to build any of the platforms it asked for; a platform admin changes that in the console",
 			gin.H{"requested": body.Platforms, "registered": capable})
@@ -116,14 +174,19 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	}
 	platformPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(claimed)), ",")
 	for _, k := range body.Kinds {
-		if k != jobKindAPK && k != jobKindOTA {
-			problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "kinds must be apk or ota")
-			return
-		}
 		args = append(args, k)
 	}
 	kindPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(body.Kinds)), ",")
-	ctx := c.Request.Context()
+	// 自报盘点摊平成 "TEAMID.bundleid"，进认领 SQL 的 IN 列表。没有 iOS 能力的机器
+	// 这里是空的，SQL 里那一支被 platform<>'ios' 短路掉，但 IN () 是语法错误，
+	// 所以放一个永远不会等于任何 "TEAM.bundle" 的占位值
+	if len(pairs) == 0 {
+		pairs = []string{""}
+	}
+	pairPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(pairs)), ",")
+	for _, pair := range pairs {
+		args = append(args, pair)
+	}
 
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -160,10 +223,34 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		return
 	}
 
+	// 选一条能派给这台机器的任务。平台与类型之外，iOS 还有两条自己的条件
+	// （设计 ios-mac-builders-home-network-2026-09-18 §5.2、§5.3）：
+	//
+	//  1. **同租户没有别的 iOS 安装包任务在途**：iOS 的发布记录入库要过
+	//     RELEASE_VERSION_NOT_INCREASING（版本与 build 号都要大于上一条）。同租户排两条
+	//     被两台 Mac 并行领走，高号先落库、低号的 /ios-release 被拒——而它的 .ipa 已经传进
+	//     App Store Connect，撤不回来。Android 那侧有签名闸按 versionCode 的记录兜着这件事，
+	//     所以这条只对 iOS 加：给 Android 加上会把"两台构建机同时打同一个租户的两条任务"
+	//     也串起来，而那是今天就成立、也有用例盯着的行为。
+	//  2. 这台机器手上确实有这个租户那个 Team、那个 bundle id 的签名材料（自报盘点）。
+	//
+	// 第 2 条用子查询而不是 JOIN，并且把锁**限定在 build_jobs 上**（FOR UPDATE OF j）：
+	// MySQL 的锁定读会把子查询里读到的行一起锁上，不限定的话每次认领都会锁住 app_configs
+	// 里各租户的 release.ios 那几行，而认领是每台机器每 10 秒一次的高频路径——控制台保存
+	// iOS 发布身份会被它挡住。同理第 1 条里的 build_jobs 别名 o 也不该被锁。
 	var id string
 	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM build_jobs WHERE status='queued' AND platform IN (`+platformPlaceholders+`) AND kind IN (`+kindPlaceholders+`)
-		  ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`, args...).Scan(&id)
+		`SELECT j.id FROM build_jobs j
+		  WHERE j.status='queued' AND j.platform IN (`+platformPlaceholders+`) AND j.kind IN (`+kindPlaceholders+`)
+		    AND (j.platform<>'`+buildPlatformIOS+`' OR (
+		          NOT EXISTS (SELECT 1 FROM build_jobs o
+		                       WHERE o.tenant_id=j.tenant_id AND o.platform=j.platform AND o.kind='`+jobKindAPK+`'
+		                         AND o.status IN (`+sqlBuilderActive+`))
+		          AND EXISTS (SELECT 1 FROM app_configs c
+		                       WHERE c.tenant_id=j.tenant_id AND c.config_key='`+releaseIOSIdentityConfigKey+`'
+		                         AND CONCAT(UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',
+		                                    JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId'))) IN (`+pairPlaceholders+`))))
+		  ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, args...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.Status(http.StatusNoContent)
 		return
@@ -393,6 +480,10 @@ func (s *server) buildJobHeartbeat(c *gin.Context) {
 		return
 	}
 	now := s.now()
+	// 心跳也算"最近在线"：构建跑满两小时的那台 Mac 期间一次认领都不会发（一机一活），
+	// 只有这里能证明它还活着。只动 last_seen_at——请求体里没有材料盘点，用认领那条写入
+	// 会把 apple_teams 抹成 NULL，控制台上这台机器会在构建期间突然"什么材料都没有"
+	s.touchMachineLiveness(c.Request.Context(), machine.ID, now)
 	guard := `id=? AND status IN (` + sqlBuilderActive + `) AND attempt=? AND claimed_machine_id=?`
 	guardArgs := []any{c.Param("id"), attempt, machine.ID}
 	result, err := s.db.ExecContext(c.Request.Context(),
