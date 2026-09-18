@@ -222,8 +222,8 @@ security set-keychain-settings "$K"                          # 不自动上锁
 
 命令行全局覆盖 `PROVISIONING_PROFILE_SPECIFIER` 会作用到 **Pods 的每个 target**，Xcode 14 起资源 bundle 不再默认关签名，于是报「`ExpoLocalization does not support provisioning profiles, but provisioning profile … has been manually specified`」（expo/expo#29526，SDK 51 起可复现）。**不要走命令行全局覆盖**。正确做法是 EAS 自己用的那一套，三步：
 
-1. **只给 App target 写手工签名**：prebuild 之后调用 `@expo/config-plugins` 的 `IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj(projectRoot, { targetName, profileName, appleTeamId, buildConfiguration: "Release", codeSignIdentity: "Apple Distribution" })`——它只改指定 target 的 Release 配置，写 `CODE_SIGN_STYLE=Manual`、`PROVISIONING_PROFILE_SPECIFIER`、`DEVELOPMENT_TEAM`、`CODE_SIGN_IDENTITY`。RN-App 已在 Expo SDK 57 上，这个包随 `expo` 带着。`codeSignIdentity` 默认值是旧的 `iPhone Distribution`，要显式传 `Apple Distribution`。
-2. **Pods 关签名**：Podfile `post_install` 里对 `installer.pods_project.targets` 设 `CODE_SIGNING_ALLOWED=NO`、`CODE_SIGNING_REQUIRED=NO`、`EXPANDED_CODE_SIGN_IDENTITY=""`。用仓库已有的本地 config plugin 形式（`plugins/with-*.js`，`withDangerousMod` 改 Podfile）加进 `app.config.ts`。SDK 57 的模板是否已经带这一段**需在阶段 A 看一眼**，带了就不加。
+1. **只给 App target 写手工签名**：prebuild 之后调用 `IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj(projectRoot, { targetName, profileName, appleTeamId, buildConfiguration: "Release", codeSignIdentity: "Apple Distribution" })`——它只改指定 target 的 Release 配置，写 `CODE_SIGN_STYLE=Manual`、`PROVISIONING_PROFILE_SPECIFIER`、`DEVELOPMENT_TEAM`、`CODE_SIGN_IDENTITY`。**从 `expo/config-plugins` 引入**（已在 RN-App 的 node_modules 里验证可解析，`@expo/config-plugins` 57.0.9），不要直接依赖 `@expo/config-plugins`——pnpm 严格模式下它不是直接依赖、解析不到。`codeSignIdentity` 默认值是旧的 `iPhone Distribution`，要显式传 `Apple Distribution`。
+2. **Pods 关签名**：Podfile `post_install` 里对 `installer.pods_project.targets` 设 `CODE_SIGNING_ALLOWED=NO`、`CODE_SIGNING_REQUIRED=NO`、`EXPANDED_CODE_SIGN_IDENTITY=""`。**必须加**（已核实，2026-09-18）：`expo-template-bare-minimum@sdk-57` 的 Podfile 只调 `react_native_post_install`，而它的 `turn_off_resource_bundle_react_core` 只对 **React-Core 一个 pod** 的资源 bundle 关签名（`react-native/scripts/cocoapods/utils.rb`），`ExpoLocalization` 这类 Expo 模块的资源 bundle 不在内，正是 expo#29526 报的那个错。用仓库已有的本地 config plugin 形式（`plugins/with-ios-pods-unsigned.js`，`withDangerousMod` 追加 Podfile 的 `post_install`）加进 `app.config.ts`，只在 `EXPO_OS=ios` 的 release 构建生效。
 3. **export 用 manual**：`ExportOptions.plist` 的 `signingStyle=manual`，`provisioningProfiles` 字典 bundle id → 描述文件名（`ios-release-identity.js` 的 `exportOptionsPlist` 改）。Xcode 在 export 时只有 manual 才认这个字典。
 
 命令行只剩 `OTHER_CODE_SIGN_FLAGS=--keychain <路径>`（对 Pods 无害，它们不签名）和 `DEVELOPMENT_TEAM`；**去掉 `-allowProvisioningUpdates`**。描述文件按 §4.2 复制进任务 HOME 的两个目录。
@@ -232,7 +232,11 @@ security set-keychain-settings "$K"                          # 不自动上锁
 
 1. 控制进程用 Go 的 `archive/zip` 从 `.ipa` 里只取 `Payload/*.app/Info.plist`，用纯 Go 的 plist 解析读 bundle id / 版本 / build 号，与任务行比对。**不对不可信文件调 `unzip`、`plutil`。**
 2. 通过：`sudo -n -u _rnuploader /opt/rn-build-agent/ios-upload --team <TEAMID> --ipa <路径> --expect-bundle-id … --expect-build …`。`ios-upload` 是同仓的小程序：查 `/var/rn-build-upload/<TEAMID>/key.json`，先按 §6.3 查 ASC 上有没有同号 build，再调上传，把结果以一行 JSON 写到 stdout。
-3. 上传实现（已核实，2026-09-18）：**首选 App Store Connect API 的 Build Uploads**（WWDC25 新增：`POST /v1/buildUploads` 建上传 → `buildUploadFiles` 报文件 → 按返回的 URL 与头分块 PUT → 标记完成 → 处理完成有 webhook），纯 HTTPS，用 `internal/ascapi` 已有的 JWT 与 HTTP 骨架在 Go 里实现，**不依赖 Xcode 的 altool**，分块上传也解决了家用上行「不可续传、失败整个重传」的问题。备选 Transporter 的 `iTMSTransporter -m upload -assetFile <ipa> -apiKey <KEYID> -apiIssuer <ISSUER>`（`.p8` 放 `~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8`，Transporter 要从 Mac App Store 装）。**不用 altool**：Apple 的 TN3147 只弃用了它的公证功能，上传仍在 Apple 支持列表里，但 Xcode 26 的 altool `--upload-app` 路径有已知回归（打不开包、失败不返回非零），fastlane 靠 `--use-old-altool` 绕。Build Uploads API 能否用 Developer 角色的 Team Key 调用，Apple 文档没写清楚，阶段 B 用真 Key 验；不行就退到 iTMSTransporter（Developer 角色上传是文档明确允许的）。
+3. 上传实现（已核实，2026-09-18）：**首选 App Store Connect API 的 Build Uploads**（WWDC25 新增：`POST /v1/buildUploads` 建上传 → `buildUploadFiles` 报文件 → 按返回的 URL 与头分块 PUT → 标记完成 → 处理完成有 webhook），纯 HTTPS，用 `internal/ascapi` 已有的 JWT 与 HTTP 骨架在 Go 里实现，**不依赖 Xcode 的 altool**，分块上传也解决了家用上行「不可续传、失败整个重传」的问题。备选 Transporter 的 `iTMSTransporter -m upload -assetFile <ipa> -apiKey <KEYID> -apiIssuer <ISSUER>`（`.p8` 放 `~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8`，Transporter 要从 Mac App Store 装）。**不用 altool**：Apple 的 TN3147 只弃用了它的公证功能，上传仍在 Apple 支持列表里，但 Xcode 26 的 altool `--upload-app` 路径有已知回归（打不开包、失败不返回非零），fastlane 靠 `--use-old-altool` 绕。Build Uploads API 的端点文档没有写权限要求（`POST /v1/buildUploads` 的 JSON 文档只列了 401/403 等错误码）。**处置方式定为：只实现这一条自动化路径，用只读探测提前发现权限不够，不做第二套自动上传。**
+
+   - `ios-upload --probe --team <TEAMID>`：用该 Team 的上传 Key 调 `GET /v1/apps/{appId}/buildUploads?limit=1`（只读）。200 → Key 能用这套端点；403 → 把这台 Mac 这个 Team 的 Key **换成 App Manager 角色的 Team Key**（仍按机器分），§7 上传账户那一行的后果按 App Manager 重写。探测结果进 §5.2 的材料盘点（`uploadProbe: ok | forbidden | error`），控制台在机器卡片上标出来，**在第一次构建之前**就知道。
+   - iTMSTransporter 不进自动化路径：Transporter 要从 Mac App Store 装，App Store 需要一个登录的 Apple ID，与无人值守的 role account 机器不搭。它只作为「包已经在 Mac 上、由人手工传」的备用手段写进手册。
+   - 为什么不并存两套：两个上传实现就是两倍的错误处理、两套「同号已存在」判定和两处要跟 Apple 变化的地方；Developer 与 App Manager 的差别（能否管外部组、提审）已经由 Apple 的处理与审核兜住，用角色升一级换一条代码路径，划得来。
 4. `uploadedToAppStoreConnect` 以上传程序的真实结果为准。
 
 配套：`build-ios-release.mjs` 的 `--upload` 只留给开发者手工路径；`jobspec.machineEnvKeys` 里的 `ASC_KEY_ID` / `ASC_ISSUER_ID` 删掉；`BUILD_AGENT_IOS_UPLOAD` 语义不变（开着才调上传账户）；控制进程新增配置 `BUILD_AGENT_IOS_UPLOAD_KEYS=/var/rn-build-upload`（只给控制进程看、不进执行进程白名单）。
@@ -334,7 +338,7 @@ git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/opt/rn-build-agent/allowed_
 
 | 位置 | 规则 |
 | --- | --- |
-| 代理启动与每次认领前 | 盘点：钥匙串里有哪些 Team 的 Apple Distribution 证书（`security find-identity -v -p codesigning`）、`profiles/<TEAMID>/` 下每份描述文件的 bundle id 与到期日、`/var/rn-build-upload/<TEAMID>/` 是否齐。得到本机「材料齐全的 (Team, bundleId) 列表」与最早到期日 |
+| 代理启动与每次认领前 | 盘点：钥匙串里有哪些 Team 的 Apple Distribution 证书（`security find-identity -v -p codesigning`）、`profiles/<TEAMID>/` 下每份描述文件的 bundle id 与到期日、`/var/rn-build-upload/<TEAMID>/` 是否齐；启动时另跑一次 `ios-upload --probe`（只读，§4.3 第 3 条）。得到本机「材料齐全的 (Team, bundleId) 列表」、最早到期日与上传探测结果 |
 | 认领 `POST /claim` | 请求体新增 `appleTeams: [{teamId, bundleIds, expiresAt}]`（自报，**只能收窄**）。服务端 iOS 任务多一个条件：任务租户的 `release.ios.appleTeamId` 与 `bundleId` 在列表里。`release.ios` 在 `app_configs`，用子查询而不是 JOIN——`FOR UPDATE SKIP LOCKED` 不能把 `app_configs` 的行一起锁上 |
 | 排队 `createBuildJob` | 看心跳表里每台 active 构建机**最近一次自报**（不看它现在在不在线）：没有任何一台报过该租户的 Team → 409 `NO_BUILDER_FOR_TEAM`（材料没装，排进去永远没人领）；有报过但都不在线 → **照常排队**，响应带 `warnings:["no_ios_builder_online"]`，控制台提示「当前没有 iOS 打包机在线，任务会等待」 |
 | 心跳表（§5.4） | `apple_teams JSON`、`signing_expires_at` 两列，认领时随 `agentCommit`/`os` 一起写 |
@@ -500,7 +504,7 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 | A1 | 机器级白名单键加 `RN_IOS_SIGNING_DIR`：`machineEnvKeys` 是静态切片、两端共用一份 `CheckEnv`，要按 `runtime.GOOS` 组装（或 build tag），Linux 上不接受；删 `ASC_KEY_ID` / `ASC_ISSUER_ID`。控制进程新配置 `BUILD_AGENT_IOS_UPLOAD{ER,_USER,_KEYS}`、`BUILD_AGENT_ALLOWED_SIGNERS`、`BUILD_AGENT_MIN_FREE_GB` | `jobspec.go`、`config.go` |
 | A2 | `buildIPA`：设钥匙串搜索列表并解锁、复制描述文件进任务 HOME（§4.2）；把手工签名的 build setting 交给脚本；不再传 `--upload` | `build-runner/build.go` |
 | A3 | `deliverIPA`：Go `archive/zip` + 纯 Go plist 读 `Info.plist` 核身份；`sudo -u _rnuploader ios-upload …`；解析其一行 JSON 结果 | `agent.go`、新 `ios_deliver.go` |
-| A4 | 新程序 `ios-upload`：读 `key.json`，ASC 预查，上传（首选 Build Uploads API，分块 PUT 可重试；备选 `iTMSTransporter`；不用 altool），「同号已存在」当成功，输出 JSON | 新 `cmd/build-agent/ios-upload/`，复用 `internal/ascapi` |
+| A4 | 新程序 `ios-upload`：`--probe`（只读探测端点权限）与上传两个子命令；读 `key.json`，ASC 预查，Build Uploads API 分块 PUT 可重试；「同号已存在」当成功；输出一行 JSON。**只有这一条自动化上传路径**，不实现 altool / iTMSTransporter | 新 `cmd/build-agent/ios-upload/`，复用 `internal/ascapi` |
 | A5 | 材料盘点（证书、描述文件到期、上传 Key 目录）得出 `appleTeams`，启动与认领前各一次；`prepareWorktree` 再核一次 | 新 `ios_inventory.go`、`checkout.go` |
 | A6 | 提交签名校验：检出后 `git verify-commit`，`gpg.format=ssh` + `allowedSignersFile`；配了 `BUILD_AGENT_ALLOWED_SIGNERS` 才启用，iOS 平台不配则启动失败 | `checkout.go` |
 | A7 | `claim` 带 `agentCommit` / `os` / `appleTeams` / `freeGb`；收到 409 `AGENT_UPGRADE_REQUIRED` 写 `state/halt` 以 75 退出；77 也写 halt；启动时读 `upgrade-failed.json` 打日志 | `client.go`、`agent.go`、`main.go` |
@@ -513,7 +517,7 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 | # | 改什么 |
 | --- | --- |
 | R1 | `build-ios-release.mjs`：prebuild 后调 `IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj`（只改 App target 的 Release，`codeSignIdentity: "Apple Distribution"`）；命令行只留 `DEVELOPMENT_TEAM` 与 `OTHER_CODE_SIGN_FLAGS=--keychain`，去掉 `-allowProvisioningUpdates`；`--signing-dir <目录>` 读描述文件名；打印 `xcodebuild -version` 一行供 runner 解析；`--upload` 只留手工路径 |
-| R2 | `ios-release-identity.js` 的 `exportOptionsPlist`：`signingStyle=manual` + `provisioningProfiles`；新增本地 config plugin `plugins/with-ios-pods-unsigned.js`（Podfile `post_install` 关 Pods 签名，SDK 57 模板没带才加） |
+| R2 | `ios-release-identity.js` 的 `exportOptionsPlist`：`signingStyle=manual` + `provisioningProfiles`；新增本地 config plugin `plugins/with-ios-pods-unsigned.js`（Podfile `post_install` 关全部 Pods target 的签名；SDK 57 模板没带，已核实必加） |
 | R3 | 仓库 `main` 开「要求签名提交」分支保护；合并方式限 rebase / fast-forward；开发者用 SSH 密钥签提交 |
 
 ### 8.4 RN-Admin
@@ -532,7 +536,7 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 验证：控制台排一条 iOS 任务 → Mac 领到 → 出 `.ipa` → `/ios-release` 落记录、任务 succeeded → 包用手工 `altool` 传上去 → 内部测试组装机 → 冷启动、bootstrap、深链、Face ID、OTA。
 
 **阶段 B：上传账户与手工签名（A1–A4、R1、R2）**
-验证：`BUILD_AGENT_IOS_UPLOAD=true` 下整条链不需要人碰；`_rnbuilder` 下 `find / -name '*.p8'` 一个都读不到；拔网线 15 分钟再插回，任务被回收重排，第二次不重复上传且 `uploadedByEarlierAttempt` 为真；用 Developer 角色的 Team Key 验证 **Build Uploads API 能否调用**（不行就退 iTMSTransporter）；确认 SDK 57 的 Podfile 模板是否已关 Pods 签名（§4.3b 第 2 步要不要加）。
+验证：`BUILD_AGENT_IOS_UPLOAD=true` 下整条链不需要人碰；`_rnbuilder` 下 `find / -name '*.p8'` 一个都读不到；拔网线 15 分钟再插回，任务被回收重排，第二次不重复上传且 `uploadedByEarlierAttempt` 为真；`ios-upload --probe` 用 Developer 角色的 Team Key 探 Build Uploads 端点：200 就定 Developer，403 就把上传 Key 换成 App Manager 并改 §7；随后完整传一次。
 
 **阶段 C：第二台 Mac、第二个 Team、提交验签（§4.4、S1、A5、A6、R3、C1）**
 在一台专用 Mac 上申请每个 Team 的证书与描述文件、导出归档，两台都导入。
@@ -613,6 +617,9 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 | prebuild 工程能否命令行覆盖成手工签名 | 全局覆盖会打到 Pods target 报错（expo/expo#29526，Xcode 14+ 行为）；正确做法是 `setProvisioningProfileForPbxproj` 只改 App target + Podfile 关 Pods 签名 + export manual | §4.3b、R1、R2 |
 | Distribution 证书上限 | Apple 原文「one type of each … per team」，社区 1–3 张不一；按一 Team 一张做。证书只能由 Account Holder / Admin 建 → 改成 CSR 流程，私钥不离开平台 | §4.4 |
 | altool 上传是否弃用 | TN3147 只弃用公证；上传仍在 Apple 支持列表，但 Xcode 26 的 altool 有已知回归；Apple 2025 新增 Build Uploads API | §4.3 第 3 条、A4、S7 |
+| Build Uploads API 对 Developer 角色是否开放 | Apple 端点文档不写权限。改成只读探测 `GET /v1/apps/{id}/buildUploads` 提前判定，403 就升 App Manager；只保留一条自动化上传路径 | §4.3 第 3 条、§5.2、§9 阶段 B |
+| SDK 57 Podfile 是否已关 Pods 签名 | 没有：`react_native_post_install` 只关 React-Core 的资源 bundle（`utils.rb` `turn_off_resource_bundle_react_core`）；Expo 模块的资源 bundle 仍会撞 expo#29526。plugin 必加 | §4.3b 第 2 步、R2 |
+| `setProvisioningProfileForPbxproj` 在 RN-App 里能否用 | 能，经 `expo/config-plugins` 再导出解析到 `@expo/config-plugins@57.0.9`；直接 require `@expo/config-plugins` 在 pnpm 下解析不到 | §4.3b 第 1 步、R1 |
 
 ### 评审中核实成立的关键论证
 
