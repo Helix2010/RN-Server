@@ -1,6 +1,6 @@
 # 设计：家用网络里的 Mac 打包机与机房里的管理端怎么配合出 iOS 包
 
-状态：设计（2026-09-18）。在 `ios-testflight-distribution-2026-09-17.md` 已实现的阶段 0–1 之上，回答它 §4.8 末尾与 §6 第 13 条留下的问题：**服务端跑在机房（虚拟机或 Rancher），Mac 打包机是家里的电脑、没有公网地址、可能有好几台**，两边怎么配合把 iOS 包打出来、发出去。
+状态：设计（2026-09-18，同日按两条决定修订：Mac 是一个池子、自升级要做）。在 `ios-testflight-distribution-2026-09-17.md` 已实现的阶段 0–1 之上，回答它 §4.8 末尾与 §6 第 13 条留下的问题：**服务端跑在机房（虚拟机或 Rancher），Mac 打包机是家里的电脑、没有公网地址、可能有好几台**，两边怎么配合把 iOS 包打出来、发出去。
 
 不改动已定的安全论证（`build-service-2026-09-11.md`：服务端不下发命令、签名材料不经服务端、任务只带参数）。本文引用的代码以 `origin/main` 2026-09-18 为准。
 
@@ -12,9 +12,9 @@
 
 | # | 缺什么 | 为什么现在不够 | 见 |
 | --- | --- | --- | --- |
-| 1 | **按 Apple Team 路由任务** | 认领只按平台求交集（`build_agent.go` `claimBuildJob`）。签名身份在 Mac 的钥匙串里、按租户的 Apple 团队分，一台没有租户 X 证书的 Mac 会领走 X 的任务、失败、退回、再领走——正是 §4.8 说的那个自愈不了的循环，只是换成了租户维度 | §5.2 |
+| 1 | **Mac 池：每台都持有全部租户的签名材料，缺了要看得见** | 已定每台 Mac 能打任意租户的包。认领只按平台求交集（`build_agent.go` `claimBuildJob`），一台还没装齐某个 Team 材料的 Mac 会领走那个租户的任务、失败、退回、再领走——正是 §4.8 说的那个自愈不了的循环，只是换成了租户维度。同时 Apple 每个 Team 只给 3 张 Distribution 证书，Mac 多于 3 台就不能各自申请 | §4.4、§5.2 |
 | 2 | **Mac 的账户、钥匙串与 ASC 密钥布局** | 执行进程的 `HOME` 被换成任务目录（`jobspec.jobPathEnv`），而 codesign 找钥匙串、xcodebuild 找 Xcode 账号、altool 找 `.p8` 全靠 `HOME`。原文 §10.3 已预判会撞；这里把修法定下来，并把「上传」从第三方代码里挪出来 | §4 |
-| 3 | **macOS 的安装与常驻** | `install.sh` 只认 x86_64 + systemd，安装包只编 linux/amd64（`build-bundles.sh`），unit、sudoers、用户都是 Linux 的 | §4.4、§8 |
+| 3 | **macOS 的安装与常驻** | `install.sh` 只认 x86_64 + systemd，安装包只编 linux/amd64（`build-bundles.sh`），unit、sudoers、用户都是 Linux 的 | §4.5、§8 |
 | 4 | **机器在线状态** | 登记里没有「最近一次心跳」。排队闸 `hasLiveBuilderFor` 只看 `active`，注释自己写着「一台 active 但已经关机的机器同样领不到，那件事这里看不出来」。家里的电脑会休眠、断电、断网，这个盲区在机房里可以忍，在家里不行 | §5.4 |
 | 5 | **家用网络的失效路径** | 心跳断 10 分钟任务被回收重排（`build_reaper.go`），重排后用**同一个 build 号**再传一次 App Store Connect 会被 Apple 拒；45 分钟默认超时对「archive + 家用上行传几百 MB」偏紧 | §6 |
 
@@ -29,7 +29,7 @@
 | 持有 | 数据库、对象存储、租户配置、机器登记 | 源码检出、Xcode、**签名身份**、ASC 密钥、本机令牌 |
 | 不能持有 | 任何签名材料（既定原则） | 服务端配置、其它 Mac 的身份 |
 
-租户可能不止一个，每个租户一个 Apple Team、一个 bundle id（原文 §4.3「多租户隔离」）。**不是每台 Mac 都必然持有每个 Team 的签名身份**——这是 §5.2 的出发点。
+租户可能不止一个，每个租户一个 Apple Team、一个 bundle id（原文 §4.3「多租户隔离」）。**已定：Mac 是一个池子，任何一台都能打任何租户的包。** 含义是每台 Mac 都要持有全部 Team 的签名材料，新加一个租户就要把它的材料装到每一台上（§4.4）；换来的是调度上完全对称——任务落到哪台都一样，坏一台不影响任何租户。代价写在 §7：每一台 Mac 的主人都能签全部租户的包。
 
 ## 2. 拓扑与网络
 
@@ -197,9 +197,27 @@ security set-keychain-settings /var/rn-build-signing/rn-signing.keychain-db     
 - `build-agent deliverIPA`：核对 `.ipa` 里 `Info.plist` 的 bundle id / 版本 / build 号（`unzip -p … | plutil -convert json`，控制进程自己做，不信执行进程的 `result.json`）→ `BUILD_AGENT_IOS_UPLOAD` 开着且本机有该 Team 的上传密钥 → `xcrun altool --upload-app --apiKey --apiIssuer`，`API_PRIVATE_KEYS_DIR` 指到控制进程自己的目录 → 传成功再报 `uploadedToAppStoreConnect: true`。
 - `jobspec.machineEnvKeys` 里的 `ASC_KEY_ID` / `ASC_ISSUER_ID` 删掉。
 
-密钥泄露的后果对照：执行进程那把（Developer）泄露，对方能给该 App 申请证书、注册设备、传 build；控制进程那把泄露，对方能传 build。两者都在 ASC 后台一点即废（原文 §4.6.1 的论证）。**每台 Mac 每个 Team 各自一把**，吊销一台 Mac 的密钥不影响别的 Mac——这也是 §5.5 下线一台 Mac 时要做的事。
+密钥泄露的后果对照：执行进程那把（Developer）泄露，对方能给该 App 申请证书、注册设备、传 build；控制进程那把泄露，对方能传 build。两者都在 ASC 后台一点即废（原文 §4.6.1 的论证）。**每台 Mac 每个 Team 各自一把**，吊销一台 Mac 的密钥不影响别的 Mac——这也是 §5.5 下线一台 Mac 时要做的事。N 台 Mac × T 个 Team × 2 把，数量随池子线性涨；ASC 每个 Team 的 API Key 上限是 50 把，够用，但要在 ASC 上按「机器名-用途」命名，否则吊销时分不清哪把是哪台的。
 
-### 4.4 装机清单（`install-macos.sh`，服务端下发）
+### 4.4 签名材料怎么到每台 Mac
+
+Mac 是池子，意味着每台都要有每个 Team 的三样东西。它们的来源和分发方式不一样：
+
+| 材料 | 每 Team 几份 | 从哪来 | 怎么到 Mac |
+| --- | --- | --- | --- |
+| Apple Distribution 证书 + 私钥 | **1 份，全部 Mac 共用** | 在**一台**离线或专用 Mac 上申请一次，导出 `.p12` | 加密归档 + 口令进密码管理器，由运维放到每台 Mac 的钥匙串（§4.2）。**不经服务端** |
+| 申请描述文件用的 ASC Key（Developer） | 每台 Mac 一把 | ASC 后台生成，`.p8` 只能下载一次 | 直接放到那台 Mac 的 `/var/rn-build-signing/provisioning/<TEAMID>/` |
+| 上传用的 ASC Key | 每台 Mac 一把 | 同上 | 放到 `/var/rn-build-agent/asc/<TEAMID>/` |
+
+**为什么证书不能每台 Mac 自己申请**：Apple 每个 Team 最多 3 张 Apple Distribution 证书。`-allowProvisioningUpdates` 在钥匙串里找不到可用证书时会**自动新建一张**，第 4 台 Mac 就申请不出来了；更糟的是前 3 台各自建了一张，之后任何一台的证书吊销都不影响别台，看起来方便，实际是把 3 个名额用光、再也加不了机器。所以一个 Team 一张证书，私钥分发。原文 §4.3 说「不手工搬 `.p12`」是在只有一台 Mac 时说的，池子模型下这条要收回，代价如实写进 §7。
+
+**代理的自检因此更重要**：领到任务后先查钥匙串里有没有该 Team 的 Distribution 证书（§5.2），没有就拒收。不拒收的话 Xcode 会替这台机器新建证书，悄悄消耗一个名额。
+
+**加一个租户**：申请证书、导出 → 每台 Mac 导入 + 放两把 Key → 每台重启代理（钥匙串盘点在启动时做，§5.2）→ 控制台看到每台都报了这个 Team 才排任务。少一台没装，那一台就领不到这个租户的任务，控制台上标出来。
+
+**证书到期（一年）**：同一流程再走一遍；旧证书过期前新旧并存一段时间，钥匙串里两张都在，Xcode 会选没过期的。
+
+### 4.5 装机清单（`install-macos.sh`，服务端下发）
 
 复用 `install.sh` 的骨架与协议（describe → 下载核对安装包 → 安装 → enroll → 启动），但按角色只做构建机、按平台只做 macOS：
 
@@ -237,25 +255,20 @@ LANG=en_US.UTF-8
 
 出处密钥对 iOS 没有消费者（原文 §10.1 第 2 条），但注册与认领流程仍然要它：`enroll` 用它换令牌，`ensureKeyAccepted` 在控制台接受之前不领任务。所以控制台「接受」这一步对 Mac 照做，只是**不需要**在签名闸上 `trust-builder`——签名闸只签 Android，不认识 iOS 构建机。`DEPLOYMENT.md` §3.2 第 5 步对 iOS 机器跳过。
 
-### 5.2 路由：平台之外再加 Apple Team
+### 5.2 路由：池子模型下靠自报盘点，不靠登记
 
-登记（`build.machines`）给构建机再加一个字段：
-
-```jsonc
-{ "id": "mch_…", "role": "builder", "platforms": ["ios"],
-  "appleTeamIds": ["J4JDF12345", "ABCDE67890"] }   // 空 = 不限（沿用旧行为）
-```
-
-三处一起改，原则与 `platforms` 相同——**登记说了算，自报只能收窄**：
+既然每台 Mac 都应该能打任何租户，登记里就不需要「这台能打哪些 Team」这一列——登记一列的正确值永远是「全部」，维护它只会引入一个能与实际不一致的地方。真正要回答的问题变成：**哪台 Mac 现在缺哪个 Team 的材料**。这个事实只有 Mac 自己知道，所以由它自报：
 
 | 位置 | 规则 |
 | --- | --- |
-| 排队 `createBuildJob` | iOS 任务：没有一台 active、`platforms` 含 ios、且 `appleTeamIds` 为空或含该租户 `release.ios.appleTeamId` 的机器 → 409 `NO_BUILDER_FOR_TEAM`，提示去登记或去那台 Mac 上装这个 Team 的身份 |
-| 认领 `claimBuildJob` | iOS 任务的 SQL 多一个条件：`platform<>'ios' OR tenant_id IN (<该机器 appleTeamIds 对应的租户>)`。租户 → Team 的映射从 `app_configs` 的 `release.ios` 读，认领时算一次 |
-| 改登记 `POST /machines/:id/apple-teams` | `expectedVersion` + `reason` + `confirm`，进审计；照 `setMachinePlatforms` 抄 |
-| 代理自己 | 领到任务后、动磁盘之前，`prepareWorktree` 加一条：`security find-identity -v -p codesigning <钥匙串>` 里有没有该 Team 的 Apple Distribution 证书。没有就 `refused`（走现有的 `Refused` 上报路径判失败），并在日志里说清是登记错了 |
+| 代理启动与每次认领前 | `security find-identity -v -p codesigning <钥匙串>` 盘点有哪些 Team 的 Apple Distribution 证书，交叉 `/var/rn-build-signing/provisioning/<TEAMID>/` 与 `/var/rn-build-agent/asc/<TEAMID>/` 是否齐，得到本机「材料齐全的 Team 列表」 |
+| 认领 `POST /claim` | 请求体新增 `appleTeams: [...]`（自报，**只能收窄**：报了没有的 Team 只会让它领到一条必然失败的任务，后果落在自己身上）。服务端 iOS 任务的 SQL 多一个条件：任务租户的 `release.ios.appleTeamId` 在这个列表里 |
+| 排队 `createBuildJob` | 5 分钟内有心跳、且自报列表含该租户 Team 的 Mac 一台都没有 → 409 `NO_BUILDER_FOR_TEAM`，文案区分「没有一台 Mac 在线」与「在线的 Mac 都没装这个租户的签名材料」 |
+| 心跳表（§5.4） | `apple_teams JSON` 一列，认领时随 `agentCommit`/`os` 一起写 |
+| 控制台 | 机器卡片列出自报的 Team；拿全部租户的 `release.ios.appleTeamId` 求差集，缺的标黄「缺 <租户> 的签名材料」。这是「池子」这个不变量的监视器 |
+| 代理领到任务后 | `prepareWorktree` 再核一次该 Team 在不在列表里（盘点与认领之间可能有人动了钥匙串），不在就 `refused` |
 
-为什么不用租户 slug 而用 Team ID 登记：Mac 上持有的是 Team 的证书，一个 Team 下可能有几个租户的 App（原文 §7.1 实测那把 Key 能看到 5 个 App）；按 Team 登记与机器上实际有的东西一一对应。
+为什么按 Team 而不按租户自报：Mac 上持有的是 Team 的证书，一个 Team 下可能有几个租户的 App（原文 §7.1 实测那把 Key 能看到 5 个 App）；按 Team 报与机器上实际有的东西一一对应，租户 → Team 的映射服务端从 `release.ios` 读。
 
 ### 5.3 并发与公平
 
@@ -286,11 +299,33 @@ CREATE TABLE build_machine_liveness (
 
 ### 5.5 上一台、下一台
 
-**上**：控制台新建构建机（勾 ios、填 Team ID）→ 把一次性安装命令（60 分钟有效、一次性）通过安全渠道发给那台 Mac 的主人 → 对方按 §4.4 执行 → 加 deploy key、重跑 → 控制台接受出处公钥 → 主人把证书导进钥匙串、放两把 `.p8` → 排一条测试任务。机器主人**不需要**控制台账号。
+**上**：控制台新建构建机（勾 ios）→ 把一次性安装命令（60 分钟有效、一次性）通过安全渠道发给那台 Mac 的主人 → 对方按 §4.5 执行 → 加 deploy key、重跑 → 控制台接受出处公钥 → 运维把**全部 Team** 的证书归档（§4.4）交给主人导入钥匙串，并为这台 Mac 在每个 Team 的 ASC 后台生成两把 Key 放好 → 重启代理 → 控制台机器卡片上每个租户的 Team 都不标黄 → 排一条测试任务。机器主人**不需要**控制台账号，也不需要 ASC 账号（Key 由运维生成后交给他）。
 
-**下**（顺序）：等它手上的任务结束 → 控制台吊销（令牌立即失效，代理以 77 退出）→ **ASC 后台吊销这台 Mac 的两把 Key** → Mac 上 `launchctl bootout`，销毁 `/var/rn-build-agent`（令牌、出处私钥、上传 Key、镜像）、`/var/rn-build-signing`（钥匙串、描述文件 Key）、`/etc/rn-build-agent.env` → GitHub 删它的 deploy key。Distribution 证书的私钥这台机器持有过，**要不要吊销证书**看它是不是因为被攻陷才下线：证书吊销会让别的 Mac 上同一张证书失效，得重新申请（自动签名会自己申请，代价是一次构建失败后重试）。
+**下**（顺序）：等它手上的任务结束 → 控制台吊销（令牌立即失效，代理以 77 退出）→ **ASC 后台吊销这台 Mac 的两把 Key** → Mac 上 `launchctl bootout`，销毁 `/var/rn-build-agent`（令牌、出处私钥、上传 Key、镜像）、`/var/rn-build-signing`（钥匙串、描述文件 Key）、`/etc/rn-build-agent.env` → GitHub 删它的 deploy key。Distribution 证书的私钥这台机器持有过，而且是**全部 Team 共用的那一张**（§4.4）。正常下线（换机器、主人退出）不吊销证书；**因被攻陷或失窃下线的**，每个 Team 的证书都要吊销并重新申请分发，这一次要把全部 Mac 都换上新证书。这是池子模型的真实代价，下线前要明确分类。
 
-**换程序**：拉模型意味着服务端推不了升级。安装包接口要注册码，已注册的机器拿不到。加一条 `GET /v1/build-agent/bundle`（机器令牌鉴权，回本机 os/arch 的安装包与 sha256），Mac 上一条 `rn-build-agent-upgrade` 脚本下载、核对、替换两个二进制、重启——两个二进制协议版本要一致（`checkRunner --protocol`），所以一起换。在此之前按 README「换二进制」手工 scp。
+**换程序**：见 §5.6。
+
+### 5.6 自升级（已定要做）
+
+拉模型意味着服务端推不了升级，而每台 Mac 手工 scp 两个二进制在几台以后一定会有人忘。但**这是整个方案里唯一一条「服务端能往 Mac 上放可执行代码」的路**，而 Mac 上放着全部租户的签名材料——服务端被攻破时，这条路能把每台 Mac 的钥匙串都掏空。所以它不能只是「下载、校验 sha256、替换」：sha256 是服务端给的，服务端被攻破它就没有意义。
+
+三道闸，缺一不可：
+
+| 闸 | 挡什么 | 怎么做 |
+| --- | --- | --- |
+| **离线签名** | 服务端被攻破后下发恶意程序 | CI 产出 `manifest.json` 后，由**人**在离线机器上用发布密钥（Ed25519，私钥只在离线机器与密码管理器）签 `manifest.json`，签名文件与清单一起放进安装包目录。Mac 上 `/opt/rn-build-agent/release-key.pub`（root 0644，装机时人工放、装机脚本核对指纹）；升级程序先验清单签名，再按清单核对归档与每个文件的 sha256。**服务端手里没有这把私钥，攻破它换不出一个能过验的清单。** 这与签名闸「不采信服务端」的原则同源 |
+| **控制台审批** | 有问题的版本不该滚到所有 Mac | 机器登记新增平台级字段 `approvedAgentCommit`（`expectedVersion` + `reason` + `confirm`，进审计）。Mac 只升到这个提交；CI 部署了新版本不等于 Mac 会升。可以先审批、只重启一台 Mac 观察，再让其余的升 |
+| **排空再换** | 换二进制打断构建 | 升级只在代理空闲时发生：控制进程认领时收到服务端回的 `approvedAgentCommit` 与自己不一致 → 不再认领、写标记文件、以退出码 75（新定义，`EX_TEMPFAIL`）退出；root 的升级程序接手 |
+
+角色与流程：
+
+- 控制进程（`_rnbuildagent`）**不写 `/opt`**，它只负责「发现要升、排空、退出」。写 `/opt/rn-build-agent/` 的是 root，与 Linux 上「二进制 root 所有、控制进程改不了」的要求一致（`checkRunner` 会拒绝非 root 所有的执行进程二进制）。
+- `rn-build-agent-upgrade`（随安装包分发的脚本，root 0700，由 launchd 的 `KeepAlive={PathState: <标记文件>}` 或代理退出后触发）：读 env 文件里的令牌 → `GET /v1/build-agent/bundle`（机器令牌鉴权；回本机 os/arch 的清单、签名、归档地址）→ 验签 → 下载归档到临时目录、核对 → 解包核对每个文件 → 冒烟（空环境跑新 `build-agent` 必须以 2 退出；新 `build-runner` 自检 `--protocol` 与新 `build-agent` 一致）→ 原子替换两个二进制（先写 `.new`，`mv`）→ 删标记文件 → `launchctl kickstart` 代理。任何一步失败：保留旧二进制，写日志，代理照常重启（旧版继续工作），控制台上 `agentCommit` 落后的机器标出来。
+- `build-agent` 加 `version` 子命令与 `-ldflags -X main.commit=…`（CI 编译时注入），`claim` 请求体的 `agentCommit` 就是它。清单里的 `commit` 与之比对，`-dirty` 的清单拒绝升级。
+- 服务端：`GET /v1/build-agent/bundle` 复用 `machineBundles()` 读同一个目录，按查询参数 `os`/`arch` 选归档；限速按机器；审计不记（每台机器每次启动都可能来一次）。签名文件不在就回 503，**不回一个没签名的清单**——没签名就不升，是 fail-closed。
+- 回滚：`approvedAgentCommit` 改回旧提交，旧归档还在安装包目录里（`rn-foundation-apply bundles <提交>` 按提交建目录，`current` 只是软链）。要求服务端保留最近 N 个提交的归档目录，而不是只留 `current`。
+
+Linux 上的构建机（amos）**不走这条**：它由 CI 经 `rn-foundation-apply` 部署，`DEPLOYMENT.md` 已经写明那条路的取舍。自升级只给拉模型的机器，两条路不要并存在同一台上。
 
 ## 6. 家用网络的失效路径
 
@@ -300,7 +335,7 @@ CREATE TABLE build_machine_liveness (
 | --- | --- | --- | --- |
 | 构建中断网 < 10 分钟 | 心跳失败只记日志，构建继续；网络回来心跳恢复 | 没影响 | — |
 | 断网 ≥ 10 分钟 | 服务端回收：任务退回 `queued`、`attempt+1`（`reapStaleBuilds`）；Mac 下一次心跳 409 `BUILD_ATTEMPT_STALE`，当场中止、清目录、不上报 | 任务被另一台（或同一台）重领重建 | 见 §6.3 的重复上传问题 |
-| 构建中休眠 / 断电 | 同上被回收；Mac 醒来后认领撞 409 `BUILDER_HAS_ACTIVE_JOB`（若还没被回收）→ 上报失败 | 一条失败记录，任务要重排 | §4.4 第 8 步禁休眠；断电靠 `restartpowerfailure` |
+| 构建中休眠 / 断电 | 同上被回收；Mac 醒来后认领撞 409 `BUILDER_HAS_ACTIVE_JOB`（若还没被回收）→ 上报失败 | 一条失败记录，任务要重排 | §4.5 第 8 步禁休眠；断电靠 `restartpowerfailure` |
 | 服务端不可达（机房维护） | 认领失败只记日志，10 秒后再试；结果上报按退避重试到分钟级（`report`） | 自愈 | — |
 | Mac 换了网络（IP 变） | 无感：没有任何按 IP 的绑定 | — | — |
 | 出口被运营商拦 22 | 检出失败 | 任务失败 | §2.2 的 ssh 443 |
@@ -334,10 +369,10 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 | --- | --- | --- | --- |
 | **Mac 执行进程**（第三方依赖投毒） | 拿到本机钥匙串里的 Distribution 私钥与 Developer 角色 Key；能签**该 Team** 的任意包 | 只能签，**不能传**：上传 Key 在控制进程；传上去也要过 TestFlight 处理与 Beta 审核；证书与 Key 可在 Apple 后台吊销；用户装的是 Apple 重签的那份 | 它交付给控制进程的 `.ipa` 里的代码——控制进程核对身份，核不了内容（Android 侧同样承认这一点） |
 | **Mac 控制进程**（令牌、上传 Key 泄露） | 以这台机器的名义交 `/ios-release`（无产物，服务端只核身份字段）；传任意 `.ipa` 进该 Team 的 ASC | 服务端要求 bundleId / 版本 / build 号与任务行和 `release.ios` 一致；控制台吊销机器令牌；ASC 吊销 Key | 已经落库的那条发布记录会成为 `latestVersion` 与 OTA 基线的依据——所以 `latestVersion.ios` 阶段一仍是**运营手填**（原文 §4.5.2），不跟随发布记录，是有意的 |
-| **服务端 / 数据库** | 排任务、改 `release.ios`（Team ID、bundle id、installUrl）、改机器登记 | Mac 检出固定 `main`（`buildBranch`），身份文件里的 bundle id 要与 `tenants/<slug>/tenant.json` 一致（`tenantfile.go` 那道闸），Team 要在本机钥匙串里有证书（§5.2 代理自检）；改 `installUrl` 只能指向 `testflight.apple.com` / `apps.apple.com` | 改 `installUrl` 把用户导去另一个 TestFlight 链接——这是原文 §4.5.1 已知的面，靠审计与只允许两个 host 缩小 |
-| **一台 Mac 的主人** | 上面两条的合集，对它持有的那几个 Team | `appleTeamIds` 登记让它领不到别的租户的任务；每台 Mac 各自的 Key，吊一台不牵连别的 | 它持有的 Team 的证书私钥——这就是「让谁家的 Mac 持有哪个租户的身份」是**业务决定**而不是技术决定的原因 |
+| **服务端 / 数据库** | 排任务、改 `release.ios`（Team ID、bundle id、installUrl）、改机器登记、改 `approvedAgentCommit`、换安装包目录里的归档 | Mac 检出固定 `main`（`buildBranch`），身份文件里的 bundle id 要与 `tenants/<slug>/tenant.json` 一致（`tenantfile.go` 那道闸），Team 要在本机钥匙串里有证书（§5.2 代理自检）；改 `installUrl` 只能指向 `testflight.apple.com` / `apps.apple.com`；**升级清单要过离线发布密钥的签名**（§5.6），服务端换不出能过验的程序 | 改 `installUrl` 把用户导去另一个 TestFlight 链接——这是原文 §4.5.1 已知的面，靠审计与只允许两个 host 缩小；把 `approvedAgentCommit` 改回一个有已知漏洞的旧版（缓解：清单里带最低允许提交，或发布密钥签名时带过期时间） |
+| **一台 Mac 的主人**（或偷走这台 Mac 的人） | 上面「执行进程 + 控制进程」的合集，**对全部 Team**：签任意租户的包、传进任意租户的 ASC | 每台 Mac 各自的 ASC Key，吊一台不牵连别的；全盘加密（FileVault）+ 开机口令让失窃的机器拿不到钥匙串；`.ipa` 要过 TestFlight 处理与 Beta 审核才到用户手里 | 全部 Team 共用的那张 Distribution 证书私钥——这是「池子」直接换来的代价：**Mac 的台数与主人应按「愿意让几个人持有全部租户的签名能力」定，不按吞吐定**（与 `build-concurrency-2026-09-15.md` §8 对 Android 打包机的说法一致） |
 
-与 Android 最大的不同：Android 侧「执行第三方代码的机器没有签名能力」在 iOS 上不成立。本稿做的是把这个必然的暴露面切细（按 Team、按机器、按用途分密钥）并让每一片都可撤销，不是消除它。
+与 Android 最大的不同：Android 侧「执行第三方代码的机器没有签名能力」在 iOS 上不成立。本稿做的是把能切细的部分切细（ASC Key 按机器、按用途分）并让每一片都可撤销；池子模型下**证书私钥这一片是切不细的**，它靠 Apple 侧的可吊销与审核兜底，靠限制台数与主人兜前。
 
 ## 8. 改动清单
 
@@ -345,12 +380,13 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 
 | # | 改什么 | 位置 | 量级 |
 | --- | --- | --- | --- |
-| S1 | 机器登记加 `appleTeamIds`；排队与认领按它过滤；`POST /machines/:id/apple-teams` | `machines.go`、`build_jobs.go` `createBuildJob`、`build_agent.go` `claimBuildJob`、契约 | 中 |
-| S2 | `build_machine_liveness` 表与迁移；`claim`/`heartbeat` 节流写入；`hasLiveBuilderFor` 加在线判据；机器视图带 `lastSeenAt` | `build_agent.go`、`build_reaper.go` 旁、`machines.go`、迁移 | 中 |
+| S1 | `claim` 接受自报 `appleTeams`，iOS 认领按它过滤；排队闸按心跳表里的自报列表判 `NO_BUILDER_FOR_TEAM`；机器视图带自报 Team 与缺口 | `build_agent.go` `claimBuildJob`、`build_jobs.go` `createBuildJob`、`machines.go`、契约 | 中 |
+| S2 | `build_machine_liveness` 表（含 `apple_teams`）与迁移；`claim`/`heartbeat` 节流写入；`hasLiveBuilderFor` 加在线判据；机器视图带 `lastSeenAt` | `build_agent.go`、`build_reaper.go` 旁、`machines.go`、迁移 | 中 |
 | S3 | `claim` 请求体接受可选 `agentCommit` / `os`；`/ios-release` 接受可选 `toolchain` 记进 `file_metadata` | `build_agent.go`、`ios_build_release.go`、`client.go` | 小 |
 | S4 | 安装包多一组 darwin/arm64（可再加 amd64）；`manifest.json` 按 `role/os/arch`；`describe` 与 `bundle` 按脚本自报 os/arch 选 | `deploy/setup/build-bundles.sh`、`machine_setup.go`、CI `deploy-amos.yml` | 中 |
 | S5 | `install-macos.sh`（服务端 `go:embed` 下发，`GET /v1/machine-setup/install-macos.sh`） | `internal/machinesetup/` | 大（脚本） |
-| S6 | `GET /v1/build-agent/bundle`（机器令牌鉴权，给已注册机器自升级用） | `machine_setup.go` | 小 |
+| S6 | 自升级（§5.6）：`GET /v1/build-agent/bundle`（机器令牌鉴权，按 os/arch 回清单、签名、归档）；清单无签名时 503；登记加平台级 `approvedAgentCommit` 与 `POST /machines/approved-agent-commit`；`claim` 响应带 `approvedAgentCommit`；`rn-foundation-apply bundles` 保留最近 N 个提交的目录 | `machine_setup.go`、`machines.go`、`build_agent.go`、`deploy/amos/rn-foundation-apply` | 中 |
+| S9 | 发布密钥签清单的离线工具（`build-keystore` 加 `sign-bundle-manifest` 子命令，或独立 `bundle-sign`）；CI 输出的清单不带签名，签名由人补进安装包目录 | `signing/cmd/…`、`deploy/setup/` | 小 |
 | S7 | `ascapi` 补按 build 号查询 | `internal/ascapi` | 小 |
 | S8 | Rancher 部署：机器安装包目录挂卷；`TRUSTED_PROXIES`；出站到 ASC 的 NetworkPolicy；Ingress 不重定向打包机路径 | 部署清单，不是代码 | — |
 
@@ -361,10 +397,11 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 | A1 | 机器级白名单键加 `RN_IOS_SIGNING_DIR`（仅 darwin 接受）；删 `ASC_KEY_ID` / `ASC_ISSUER_ID` | `jobspec.go`、`config.go` |
 | A2 | `buildIPA`：设钥匙串搜索列表并解锁（§4.2）；把 Team 的 provisioning Key 参数交给脚本；不再传 `--upload` | `build-runner/build.go` |
 | A3 | `deliverIPA`：控制进程读 `.ipa` 的 `Info.plist` 核身份；查 ASC 有没有同号 build；上传；`uploadedToAppStoreConnect` 以真实结果为准 | `agent.go`、新 `ios_upload.go` |
-| A4 | `prepareWorktree`：iOS 任务先查本机钥匙串有没有该 Team 的证书，没有就 refused | `checkout.go` |
+| A4 | 钥匙串与密钥目录盘点得出「材料齐全的 Team 列表」，启动时与认领前各做一次；`claim` 带 `appleTeams`；`prepareWorktree` 再核一次，不在就 refused | `agent.go`、`client.go`、新 `ios_inventory.go` |
 | A5 | `claim` 带 `agentCommit` / `os` | `client.go` |
 | A6 | `reap` 与临时目录清理的 macOS 分支；`/dev/shm` 不存在时静默 | `build-runner/dirs.go` |
-| A7 | 退出码 77 时的 launchd 处理放在包装脚本里，程序不改 | `deploy/build-agent-macos/` |
+| A7 | 退出码 77（吊销）与 75（等待升级）的 launchd 处理放在包装脚本里 | `deploy/build-agent-macos/` |
+| A8 | 自升级（§5.6）：`version` 子命令与 `-ldflags -X` 注入提交；认领响应里 `approvedAgentCommit` 与本机不一致时排空、写标记、以 75 退出；`rn-build-agent-upgrade` 脚本（验签、核对、冒烟、原子替换、kickstart） | `main.go`、`agent.go`、`deploy/build-agent-macos/rn-build-agent-upgrade` |
 
 ### 8.3 RN-App
 
@@ -377,7 +414,8 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 
 | # | 改什么 |
 | --- | --- |
-| C1 | 机器卡片：`appleTeamIds` 的显示与修改（照 `platforms` 抄）；「最近在线」；离线标黄 |
+| C1 | 机器卡片：自报的 Team 列表与「缺 <租户> 的签名材料」标黄；「最近在线」；离线标黄；`agentCommit` 与 `approvedAgentCommit` 不一致时标出 |
+| C4 | 「平台维护 → 打包机与签名闸」加「批准打包机程序版本」：显示 CI 当前安装包的提交与清单签名状态，审批走 `reason` + `confirm` |
 | C2 | 新建构建机时可选「macOS」，安装命令换成 `install-macos.sh` 那条 |
 | C3 | 打包任务列表：有 iOS 任务排队而无在线 iOS 机器时的提示 |
 
@@ -390,8 +428,9 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 **阶段 B：上传挪到控制进程，密钥分层（A1–A3、R1）**
 验证：`BUILD_AGENT_IOS_UPLOAD=true` 下整条链不需要人碰；拔网线 15 分钟再插回，任务被回收重排，第二次不重复上传（§6.3）。
 
-**阶段 C：第二台 Mac、第二个 Team（S1、A4、C1）**
-验证：两个租户各排一条，分别落到持有其 Team 的 Mac 上；把一台的 `appleTeamIds` 清空，它领到不该领的任务时当场 refused 而不是构建到一半失败。
+**阶段 C：第二台 Mac、第二个 Team（§4.4、S1、A4、C1）**
+先在一台专用 Mac 上申请每个 Team 的证书、导出 `.p12`，两台 Mac 都导入。
+验证：两个租户各排两条，四条任务在两台 Mac 上并行、任意分布；从一台钥匙串里删掉某个 Team 的证书并重启代理，控制台那台标黄「缺 X 的签名材料」，X 的任务只落到另一台；用 ASC 后台核对 Distribution 证书数量**没有增加**（自检没漏、Xcode 没有偷偷新建）。
 
 **阶段 D：在线状态与装机脚本（S2–S6、C2、C3）**
 验证：合上 MacBook 盖子，5 分钟后控制台标离线、排队被 409；打开后自愈。新 Mac 从控制台一条命令装到能领任务，中途不出现令牌、口令、`.p8` 内容。
@@ -399,9 +438,13 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 **阶段 E：Rancher 上线（S8）**
 验证：`describe` 从卷里读到安装包；`externalOrigin` 拼出的安装命令是 https 的外部域名；两个 API 副本同时在，两台 Mac 同时认领只各拿到一条。
 
+**阶段 F：自升级（S6、S9、A8、C4）**
+验证：CI 出新提交、清单未签名 → Mac 不升、控制台显示「待签名」；离线签名后放进目录、控制台审批到该提交 → 正在构建的 Mac 做完手上那条才退出、升级、回来认领，`agentCommit` 变成新提交；改坏归档里一个字节 → 验签或核对失败，旧版继续跑，控制台标出落后；把 `approvedAgentCommit` 改回上一个提交 → Mac 降回去。
+
 ## 10. 未决
 
-1. **Mac 的主人是谁**决定了「哪些 Team 的证书放在哪台机器上」。一台 Mac 服务多个租户，等于那台机器的主人能签那几个租户的包（§7 最后一行）。这是运营决定，本稿只提供按 Team 隔离的工具。
+1. ~~Mac 的主人是谁决定了哪些 Team 的证书放在哪台机器上~~ **已决（2026-09-18）**：Mac 是池子，每台持有全部 Team 的材料（§1、§4.4）。随之而来、仍要定的是**池子允许多大、谁能当主人**（§7 最后一行）。
 2. iOS 的 OTA 构建（`expo export --platform ios`）不需要 Xcode，理论上可以在 Linux 构建机上做；现在执行进程写死 `--platform android`（`buildOTA`）。要不要让 amos 顺带出 iOS 的热更新包，与本稿无关，但会影响「Mac 要不要领 OTA 任务」的答案（现在是不领：`validateClaimedJob` 拒绝 iOS 的 OTA 任务）。
-3. 已注册机器的自升级（S6）做不做。不做就是每台 Mac 手工 scp 两个二进制，台数多了以后会有人忘。
+3. ~~已注册机器的自升级做不做~~ **已决（2026-09-18）**：做，形状见 §5.6。仍要定的是发布密钥由谁持有、签名要不要双人。
 4. 钥匙串口令文件对 `_rnbuilder` 可读等于对第三方代码可读（§4.2）。替代是每次任务由人解锁——那与「无人值守」冲突。接受，记进风险台账。
+5. 签名材料归档（§4.4）的制作、分发、轮换与销毁流程要另写一份运维手册（照 `deploy/amos/SIGNING_GATE_ROLLOUT.md` 的形状），本稿只定了形状。
