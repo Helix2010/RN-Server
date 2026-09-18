@@ -41,6 +41,17 @@
 
 下一步：§9 阶段 A–F 真机验证（剩下的都要一台真 Mac）。两把信任根已落地（见下表）；R3 的开发者侧已就绪，GitHub 侧的分支保护受 Free 版限制暂缺。
 
+**装第一台 Mac 之前还差四步，前三步与 Mac 无关**（2026-09-18 查线上确认：`GET /v1/machine-setup/install-macos.sh` 与
+`GET /v1/admin/platform/build-agent-version` 都是 404，已登记机器只有 `amos-builder`、`amos-signer-a`、`amos-signer-b`
+——本方案一行都还没上线）：
+
+1. 三个仓库推送，CI 构建；
+2. CI 的 `build-bundles.sh` 产出传到 amos，`rn-foundation-apply bundles <提交>` 切 current；
+3. 离线机器上 `bundle-sign sign --sequence 1`，`manifest.sig` 放回服务器同一目录——**没有它 `describe` 一律 503，装不了**；
+4. 控制台新建 macOS 机器拿注册码，Mac 上跑那四行。
+
+离线机器上那份旧格式的 `release-key.pub`（一行裸 base64）要先用 `bundle-sign key public` 重出一份，见 SIGNING_MATERIAL §3.0。
+
 ## RN-App
 
 | # | 状态 | 提交 | 备注 |
@@ -93,6 +104,7 @@
 | §4.4「`security cms -D -i` 读 `ExpirationDate`」 | 起子进程解描述文件 | 纯 Go 从 CMS 块里取出 XML plist 自己解析 | 与 §4.3 第 1 步对 `.ipa` 定的规矩一致（不对文件调 `unzip`/`plutil`），少一处子进程；副作用是盘点在 Linux 上也测得了，不需要一台 Mac |
 | §4.5 装机要三个带外核对值 | `--expect-sha256`（CI 日志里的归档摘要）、`--release-key-sha256`、`--allowed-signers-sha256` | 只要 `--release-key-sha256` 一个。`describe` 对 darwin 额外下发清单原始字节、它的离线签名与发布公钥；脚本用人给的指纹认出公钥 → 验清单 → 从**已验签的清单**里取归档与每个文件的摘要 | 三个值里有两个是冗余的（归档摘要对了，包里的文件就都对了），而剩下那个"归档摘要"每次发版都变、要去翻 CI 日志找对应版本——它恰恰是最麻烦也最弱的一环：CI 日志能被改，离线签名不能。人工抄写从 3 处减到 1 处，抄错的机会少三分之二，而判据反而更强 |
 | §5.6 清单签名的编码 | 只说"Ed25519 签 `manifest.json`" | 签名放进 `manifest.sig` 时用 **OpenSSH 的 `SSHSIG` 封装**（namespace `rn-machine-bundles`），被签的字节不变 | 算法没变，变的是外层封装。装机脚本要在**下载安装包之前**验这份签名，那时机器上除了脚本自己没有任何可信的东西——换成这个格式，验签就是 macOS 自带的 `ssh-keygen -Y verify` 一条命令，脚本里一行密码学都不用写。先前那一版为此内嵌了约 160 行纯 Python 的 ed25519 验签；它跑得通（RFC 8032 向量、与 Go 交叉验证、非 canonical 的 S 都验过），但运维在执行前要把这个脚本从头读一遍再比对 shasum，而一段椭圆曲线运算没人读得动——"比对摘要"就只剩比对、没有"我知道我在跑什么"。顺带把两个信任根的文件格式统一了：`release-key.pub` 与 `allowed_signers` 现在都是 OpenSSH 的一行公钥。**密钥与指纹口径都没动**，密码管理器里那个 `395937be…` 继续用 |
+| §9 阶段 A「手工装」 | 第一台 Mac 手工建三个账户、目录、sudoers、launchd，不走装机脚本（"先用现有代码"） | 直接跑 `install-macos.sh` | 设计这么写是因为当时脚本还不存在。它给的理由是"预期第一个错就是钥匙串（§4.2），脚本挡在中间分不清是脚本的锅还是 macOS 的锅"——这个顾虑成立，但现在脚本已经写完并且每一步都有 `step`/`note` 输出，卡住时看得见停在哪一步，钥匙串那一步尤其是单独一段。反过来，手工再做一遍等于把脚本里的账户、目录权限、sudoers 与两份 plist 用人再实现一次，出错面比脚本大。阶段 A 真正要验的东西（真机出一次包、钥匙串、§4.3b 的手工签名）一条不减 |
 | §4.3 上传 Key 探测 | `uploadProbe` 只说"进材料盘点" | 在认领体的 `appleTeams[]` 里加 `uploadProbe` 字段，落进 `build_machine_liveness.apple_teams` | 服务端请求体是严格解析，不先加字段代理就报不上来 |
 | A1「`machineEnvKeys` 按 `runtime.GOOS` 组装」 | Linux 上不接受 `RN_IOS_SIGNING_DIR` | 按**任务平台**组装：只有 iOS 任务的环境里才有它 | 是更强的那一条——同一台 Mac 上的 Android 任务同样不该看见签名目录；Linux 侧的保护不变（`BUILD_AGENT_PLATFORMS=ios` 在非 darwin 上启动就失败）。副作用是 iOS 那条链路在 Linux 上测得了，`go test` 覆盖到钥匙串准备、描述文件复制、身份核对与上传交接 |
 | §4.2「`security unlock-keychain -p "$(cat …)"`」 | 口令作为命令行参数 | 三条命令走 `security -i` 的标准输入 | 命令行参数 `ps` 看得到（AGENTS.md「机密的操作纪律」）。口令的字母表在读入时校验，拼不出第二条命令 |
