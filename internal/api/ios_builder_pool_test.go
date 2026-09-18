@@ -2,12 +2,15 @@ package api
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Helix2010/RN-Server/signing/bundlesig"
 )
 
 // iOS 打包机是一个池子：每台 Mac 都应该能打任何租户的包，所以"这台能打哪些 Team"
@@ -355,7 +358,25 @@ func TestDBMacBuilderInstallsTheDarwinBundle(t *testing.T) {
 	}
 	code := created["enrollment"].(map[string]any)["code"].(string)
 
+	// 还没签：一个字节都不给。这台机器将要持有全部租户的签名材料，不该在"清单还没签"的
+	// 窗口里装上一份没人背书的程序
+	if r := f.describe(code); r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("an unsigned bundle was offered to a new Mac: %d %s", r.Code, r.Body.String())
+	}
+	public := signStagedBundles(t, f, 4)
+
 	described := decodeBody(t, f.describe(code))
+	// 装机只让人带一个带外核对值，其余摘要都从这份验过签的清单里取
+	if described["releaseKeyPub"] != base64.StdEncoding.EncodeToString(public) {
+		t.Fatalf("describe must hand over the release key: %v", described["releaseKeyPub"])
+	}
+	signature, _ := described["manifestSignature"].(map[string]any)
+	if signature == nil || signature["publicKeySha256"] != bundlesig.PublicKeySHA256(public) {
+		t.Fatalf("describe must hand over the manifest signature: %v", described["manifestSignature"])
+	}
+	if raw, _ := described["manifestBase64"].(string); raw == "" {
+		t.Fatal("describe must hand over the manifest bytes the signature covers")
+	}
 	bundle, _ := described["bundle"].(map[string]any)
 	if described["os"] != machineOSDarwin || bundle["archive"] != machineBundleBuilderDarwin+".tar.gz" {
 		t.Fatalf("a macOS builder was told to install %v", bundle)

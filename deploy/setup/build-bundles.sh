@@ -82,6 +82,11 @@ ALLOWED_SIGNERS="${RN_ALLOWED_SIGNERS:-$ROOT/deploy/build-agent-macos/allowed_si
 for f in "$RELEASE_KEY_PUB" "$ALLOWED_SIGNERS"; do
   if [ -f "$f" ]; then
     install -m 0644 "$f" "$STAGE/builder-darwin-arm64/$(basename "$f")"
+    # 发布公钥**另外**在目录根放一份（与 manifest.json 并排）：装机脚本要在下载归档之前
+    # 就拿到它来验清单签名，而归档里那一份得先解包才看得到——那时清单还没验过，等于
+    # 用不可信的东西去建立信任。两份内容相同；归档里那一份是装到机器上的，这一份只给
+    # 装机脚本读。它的完整性不靠清单（清单正是靠它验的），靠运维带来的那个指纹。
+    [ "$f" = "$RELEASE_KEY_PUB" ] && install -m 0644 "$f" "$OUT/release-key.pub"
   else
     echo "!! 缺 $f：builder-darwin-arm64.tar.gz 不含它，install-macos.sh 会拒绝安装。" >&2
     echo "   用 RN_RELEASE_KEY_PUB / RN_ALLOWED_SIGNERS 指过去，或者放进 deploy/build-agent-macos/。" >&2

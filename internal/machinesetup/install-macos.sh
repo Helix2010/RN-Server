@@ -4,14 +4,15 @@
 #   curl -fsSLo install-macos.sh <API>/v1/machine-setup/install-macos.sh
 #   shasum -a 256 install-macos.sh            # 与 CI 日志「Build machine bundles」那一步的值比
 #   sudo bash install-macos.sh --server <API> --code rne_… \
-#        --expect-sha256 <CI 日志里 builder-darwin-arm64.tar.gz 的 sha256> \
-#        --release-key-sha256 <密码管理器里发布公钥的 sha256> \
-#        --allowed-signers-sha256 <密码管理器里 allowed_signers 的 sha256>
+#        --release-key-sha256 <密码管理器里发布公钥的 sha256>
 #
 # **首次装机是一次对服务端的信任**：脚本本身、安装包、两把要钉死的公钥都来自服务端。
-# 所以那三样东西必须从带外渠道核对，缺参数就拒绝——不给"先装上以后再说"的选项：
-# 装上之后再补，中间那一段时间这台机器已经在按服务端说的做事了，而它手上有全部租户的
-# 签名材料。
+# 所以要有一个从别处来的判据，缺了就拒绝——不给"先装上以后再说"的选项：装上之后再补，
+# 中间那一段时间这台机器已经在按服务端说的做事了，而它手上有全部租户的签名材料。
+#
+# 那个判据只有一个：发布公钥的指纹。其余的摘要都从一份**离线签名背书的清单**里推出来，
+# 而签那份清单的私钥服务端和 CI 都没有。让人抄三个值不比抄一个更安全——多两次抄写只是
+# 多两次抄错的机会，而其中"归档摘要"那一个还得每次发版去翻 CI 日志找对应的版本。
 #
 # 步骤（设计 docs/design/ios-mac-builders-home-network-2026-09-18.md §4.5）：
 #   1. 前提：Apple Silicon、Xcode（xip 装的，不是 App Store）、git/node/pnpm/pod、磁盘、时钟
@@ -66,9 +67,7 @@ readonly BUNDLE_NAME=builder-darwin-arm64
 
 SERVER=""
 CODE=""
-EXPECT_SHA256=""
 RELEASE_KEY_SHA256=""
-ALLOWED_SIGNERS_SHA256=""
 CURL_PROTO="=https"
 WORK=""
 CACHE=""
@@ -77,6 +76,7 @@ BUNDLE_ARCHIVE=""
 BUNDLE_SHA256=""
 BUNDLE_SIZE=""
 BUNDLE_COMMIT=""
+BUNDLE_SEQUENCE=""
 MACHINE_NAME=""
 MISSING=()
 
@@ -92,17 +92,20 @@ usage() {
   cat >&2 <<'USAGE'
 用法（以 root 执行）：
   sudo bash install-macos.sh --server <API> --code rne_… \
-       --expect-sha256 <归档 sha256> \
-       --release-key-sha256 <发布公钥 sha256> \
-       --allowed-signers-sha256 <allowed_signers sha256>
+       --release-key-sha256 <发布公钥 sha256>
 
-四个核对值都是必填的，都要从带外渠道拿：
-  --expect-sha256           CI 日志「Build machine bundles」那一步打印的 builder-darwin-arm64.tar.gz
-  --release-key-sha256      密码管理器里记的发布公钥指纹（自升级的信任根）
-  --allowed-signers-sha256  密码管理器里记的 allowed_signers 指纹（提交签名的信任根）
+只有一个带外核对值：
+  --release-key-sha256   密码管理器里记的发布公钥指纹（公钥**字节**的 sha256，
+                         不是 release-key.pub 这个文件的）
 
-首次装机是一次对服务端的信任：脚本、安装包与这两把公钥都来自服务端，只有这几个值是
-从别处来的。它们是这台机器唯一不依赖服务端的判据。
+首次装机是一次对服务端的信任：脚本、安装包与两把公钥都来自服务端，只有这个值是从别处
+来的。它是这台机器唯一不依赖服务端的判据，其余全部由它推出来：
+
+  人给的指纹 → 认出发布公钥 → 验清单的离线签名 → 可信清单里的摘要
+              → 核对归档 → 核对包内每个文件（含 allowed_signers）
+
+归档摘要因此不再需要人从 CI 日志里抄：它来自一份离线签名背书的清单，而那把私钥服务端
+和 CI 都没有。脚本本身的 shasum 仍然要与 CI 日志比对——那是这条链子的第一环。
 USAGE
   exit 2
 }
@@ -112,9 +115,7 @@ parse_args() {
     case "$1" in
       --server) SERVER="${2:-}"; shift 2 ;;
       --code) CODE="${2:-}"; shift 2 ;;
-      --expect-sha256) EXPECT_SHA256="${2:-}"; shift 2 ;;
       --release-key-sha256) RELEASE_KEY_SHA256="${2:-}"; shift 2 ;;
-      --allowed-signers-sha256) ALLOWED_SIGNERS_SHA256="${2:-}"; shift 2 ;;
       --insecure-http) CURL_PROTO="=https,http"; shift ;;
       -h | --help) usage ;;
       *) printf 'install-macos.sh: 不认识的参数 %s\n' "$1" >&2; usage ;;
@@ -128,11 +129,8 @@ parse_args() {
     *) die "--server 必须是 https 地址（本机测试可以用 http://127.0.0.1…）" ;;
   esac
   case "$CODE" in rne_*) ;; *) die "--code 看起来不是控制台发的注册码（rne_ 开头）" ;; esac
-  local value
-  for value in "$EXPECT_SHA256" "$RELEASE_KEY_SHA256" "$ALLOWED_SIGNERS_SHA256"; do
-    printf '%s' "$value" | grep -Eq '^[0-9a-f]{64}$' ||
-      die "--expect-sha256、--release-key-sha256、--allowed-signers-sha256 三个都必须给，且是 64 位小写十六进制。这三个值是这台机器唯一不依赖服务端的判据，见 --help"
-  done
+  printf '%s' "$RELEASE_KEY_SHA256" | grep -Eq '^[0-9a-f]{64}$' ||
+    die "--release-key-sha256 必须给，且是 64 位小写十六进制。它是这台机器唯一不依赖服务端的判据，见 --help"
 }
 
 curl_api() {
@@ -331,31 +329,169 @@ describe() {
 
 parse_description() {
   local parsed
-  parsed="$(python3 -I - "$1" "$WORK/files.sha256" "$BUNDLE_NAME" <<'PY'
-import json, sys
-path, files_out, want_bundle = sys.argv[1:4]
+  parsed="$(python3 -I - "$1" "$WORK/files.sha256" "$BUNDLE_NAME" "$RELEASE_KEY_SHA256" <<'PY'
+# 这一段是整条链子的核心：人只带来一个指纹，其余全部由它推出来。
+#
+#   人给的指纹 -> 认出发布公钥 -> 验清单的离线签名 -> 可信清单里的摘要
+#               -> 核对归档 -> 核对包内每个文件（含 allowed_signers）
+#
+# 所以**下面一切摘要都必须来自验过签的那份清单**，不能来自 describe 响应里 bundle 那个
+# 对象——那是服务端说的，正是要被验证的东西。
+import base64, hashlib, json, sys
+
+path, files_out, want_bundle, want_key_sha = sys.argv[1:5]
 with open(path) as f:
     doc = json.load(f)
-bundle = doc.get("bundle") or {}
+
 role = doc.get("role")
 machine_os = doc.get("os")
 if role != "builder":
     sys.exit("这个注册码是给 %s 的，不是 Mac 打包机" % role)
 if machine_os != "darwin":
     sys.exit("这台机器在控制台里登记的是 %s，不是 macOS：新建机器时要选 macOS" % machine_os)
-if bundle.get("role") != want_bundle:
-    sys.exit("服务端要给的安装包是 %s，不是 %s" % (bundle.get("role"), want_bundle))
+
+# ---- 1) 人给的指纹认出发布公钥 ----
+key_text = (doc.get("releaseKeyPub") or "").strip()
+if not key_text:
+    sys.exit("服务端没给发布公钥：安装包目录里缺 release-key.pub，先把签过的安装包部署上去")
+try:
+    public = base64.b64decode(key_text, validate=True)
+except Exception:
+    sys.exit("服务端给的发布公钥不是 base64")
+if len(public) != 32:
+    sys.exit("服务端给的发布公钥不是 32 字节的 ed25519 公钥")
+got_key_sha = hashlib.sha256(public).hexdigest()
+if got_key_sha != want_key_sha:
+    sys.exit("服务端给的发布公钥指纹是 %s，与 --release-key-sha256 %s 不符。\n"
+             "   这个值是公钥**字节**的摘要（bundle-sign key create 打印的那一行、控制台上显示的那一个），\n"
+             "   不是 release-key.pub 这个文件的摘要。确认手里的值取自密码管理器；仍然不符就不要继续装。"
+             % (got_key_sha, want_key_sha))
+
+# ---- 2) 用它验清单的离线签名 ----
+manifest_b64 = doc.get("manifestBase64") or ""
+signature = doc.get("manifestSignature") or {}
+if not manifest_b64 or not signature:
+    sys.exit("服务端没给清单签名：安装包还没签，不能装。签名在离线机器上用 bundle-sign 生成")
+manifest_raw = base64.b64decode(manifest_b64)
+if signature.get("format") != "rn-machine-bundles-signature/v1":
+    sys.exit("清单签名的 format 不认识：%r" % signature.get("format"))
+if hashlib.sha256(manifest_raw).hexdigest() != signature.get("manifestSha256"):
+    sys.exit("清单的摘要与签名里记的不符")
+
+# 签的是每字段一行的规范化字节，**不是 JSON**：JSON 的字段顺序、空白与转义有多种写法，
+# 签它等于把"同一份内容的不同写法"也算进签名里。与 signing/bundlesig 逐字节一致
+signed = ("\n".join(["rn-machine-bundles-signature/v1",
+                     "commit=" + signature["commit"],
+                     "sequence=" + str(signature["sequence"]),
+                     "manifestSha256=" + signature["manifestSha256"]]) + "\n").encode()
+
+# Ed25519 验签（RFC 8032）。只做 verify，不做 sign。这段代码的可信度来自这个脚本本身的
+# shasum——运维在下载它之后、执行之前与 CI 日志比对过，那是这条链子的第一环
+P = 2**255 - 19
+L = 2**252 + 27742317777372353535851937790883648493
+D = -121665 * pow(121666, P - 2, P) % P
+I = pow(2, (P - 1) // 4, P)
+
+def xrecover(y):
+    xx = (y * y - 1) * pow(D * y * y + 1, P - 2, P)
+    x = pow(xx, (P + 3) // 8, P)
+    if (x * x - xx) % P != 0:
+        x = x * I % P
+    return P - x if x % 2 else x
+
+By = 4 * pow(5, P - 2, P) % P
+B = (xrecover(By), By, 1, xrecover(By) * By % P)
+
+def add(pt, q):
+    x1, y1, z1, t1 = pt
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % P
+    b = (y1 + x1) * (y2 + x2) % P
+    c = t1 * 2 * D * t2 % P
+    dd = z1 * 2 * z2 % P
+    e, f, g, h = b - a, dd - c, dd + c, b + a
+    return (e * f % P, g * h % P, f * g % P, e * h % P)
+
+def mul(pt, e):
+    q = (0, 1, 1, 0)
+    while e > 0:
+        if e & 1:
+            q = add(q, pt)
+        pt = add(pt, pt)
+        e >>= 1
+    return q
+
+def encode(pt):
+    x, y, z, _ = pt
+    zi = pow(z, P - 2, P)
+    x, y = x * zi % P, y * zi % P
+    return ((y & ((1 << 255) - 1)) | ((x & 1) << 255)).to_bytes(32, "little")
+
+def on_curve(pt):
+    x, y, z, t = pt
+    return (z % P != 0 and x * y % P == z * t % P
+            and (y * y - x * x - z * z - D * t * t) % P == 0)
+
+def decode(raw):
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= P:
+        raise ValueError("non-canonical y")
+    x = xrecover(y)
+    if x & 1 != raw[31] >> 7:
+        x = P - x
+    pt = (x, y, 1, x * y % P)
+    if not on_curve(pt):
+        raise ValueError("not on curve")
+    return pt
+
+def ed25519_verify(sig, msg, pub):
+    if len(sig) != 64 or len(pub) != 32:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= L:            # 非 canonical 的 S 一律拒（签名可延展性）
+        return False
+    try:
+        r, a = decode(sig[:32]), decode(pub)
+    except ValueError:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % L
+    return encode(mul(B, s)) == encode(add(r, mul(a, h)))
+
+try:
+    raw_sig = base64.b64decode(signature.get("signature") or "", validate=True)
+except Exception:
+    sys.exit("清单签名不是 base64")
+if not ed25519_verify(raw_sig, signed, public):
+    sys.exit("清单的离线签名验不过：服务端上的安装包不是那把发布密钥签出来的，拒绝安装")
+
+# ---- 3) 从**已验签**的清单里取摘要 ----
+manifest = json.loads(manifest_raw)
+if manifest.get("format") != "rn-machine-bundles/v1":
+    sys.exit("清单 format 不认识：%r" % manifest.get("format"))
+if manifest.get("commit") != signature.get("commit"):
+    sys.exit("清单里的提交与签名覆盖的提交不同")
+bundle = (manifest.get("bundles") or {}).get(want_bundle)
+if not bundle:
+    sys.exit("已验签的清单里没有 %s 这一组安装包" % want_bundle)
 files = bundle.get("files") or []
 if not files:
-    sys.exit("安装包清单里没有文件")
+    sys.exit("已验签的清单里 %s 没有文件" % want_bundle)
 with open(files_out, "w") as out:
     for item in files:
         name, digest = item["name"], item["sha256"]
         if not name or ".." in name or name.startswith("/"):
-            sys.exit("安装包清单里有不该出现的文件名 %r" % name)
+            sys.exit("清单里有不该出现的文件名 %r" % name)
         out.write("%s  %s\n" % (digest, name))
+
+# 服务端在 describe 响应里自报的那一份只用来对照：不一致说明这台服务器上的清单与它回的
+# 话不是一回事，值得当场停下——真正采信的始终是上面那份验过签的
+said = doc.get("bundle") or {}
+if said.get("archiveSha256") and said["archiveSha256"] != bundle.get("archiveSha256"):
+    sys.exit("服务端自报的归档摘要与已验签清单里的不一致，拒绝安装")
+
 print("\n".join([doc.get("name") or "", bundle.get("archive") or "", bundle.get("archiveSha256") or "",
-                 str(bundle.get("archiveSize") or 0), doc.get("commit") or bundle.get("commit") or ""]))
+                 str(bundle.get("archiveSize") or 0), manifest.get("commit") or "",
+                 str(signature.get("sequence") or 0)]))
 PY
 )" || die "describe 的结果不能用：$parsed"
   MACHINE_NAME="$(printf '%s' "$parsed" | sed -n 1p)"
@@ -363,13 +499,14 @@ PY
   BUNDLE_SHA256="$(printf '%s' "$parsed" | sed -n 3p)"
   BUNDLE_SIZE="$(printf '%s' "$parsed" | sed -n 4p)"
   BUNDLE_COMMIT="$(printf '%s' "$parsed" | sed -n 5p)"
+  BUNDLE_SEQUENCE="$(printf '%s' "$parsed" | sed -n 6p)"
+  note "发布公钥指纹与带外给的值一致，清单的离线签名验过（序号 $BUNDLE_SEQUENCE）"
   note "机器 $MACHINE_NAME，安装包 $BUNDLE_ARCHIVE（提交 ${BUNDLE_COMMIT:-未知}）"
 }
 
 fetch_bundle() {
   step "下载并核对安装包"
-  [ "$EXPECT_SHA256" = "$BUNDLE_SHA256" ] ||
-    die "服务端清单里的归档 sha256 是 $BUNDLE_SHA256，与 --expect-sha256 $EXPECT_SHA256 不符，拒绝安装"
+  # 归档摘要来自已验签的清单（parse_description 里验的），不再需要人从 CI 日志抄一份
   local archive="$CACHE/$BUNDLE_ARCHIVE"
   if [ -f "$archive" ] && [ "$(sha256_of "$archive")" = "$BUNDLE_SHA256" ]; then
     note "用上次下载的 $archive"
@@ -448,23 +585,22 @@ install_programs() {
     put_file "$BUNDLE/bin/$name" "$INSTALL_DIR/$name" root wheel 0755
   done
   put_file "$BUNDLE/run-agent" "$INSTALL_DIR/run-agent" root wheel 0755
-  # 两把信任根：**与命令行给的 sha256 比对**，不符即停。它们是这台机器唯一不依赖服务端
-  # 的判据——发布公钥决定它肯装哪一版程序，allowed_signers 决定它肯构建谁签的提交
-  local key_sha signers_sha
+  # 两把信任根。它们的完整性已经由**已验签的清单**保证（fetch_bundle 逐文件核过），
+  # 所以这里不再要第二、第三个命令行参数——多两次抄写只是多两次抄错的机会。
+  #
+  # 归档里这一份 release-key.pub 还要再与 describe 用过的那把比一次：链子是"人给的指纹
+  # 认那一把公钥"，装到机器上的必须就是它，否则这台机器以后按另一把公钥验自升级
+  local key_sha
   [ -f "$BUNDLE/release-key.pub" ] || die "安装包里没有 release-key.pub；先在控制台部署一份签过的安装包"
   [ -f "$BUNDLE/allowed_signers" ] || die "安装包里没有 allowed_signers"
   key_sha="$(release_key_sha256 "$BUNDLE/release-key.pub")"
-  signers_sha="$(sha256_of "$BUNDLE/allowed_signers")"
   [ "$key_sha" = "$RELEASE_KEY_SHA256" ] ||
-    die "安装包里发布公钥的 sha256 是 $key_sha，与 --release-key-sha256 不符。
-   这个值是**公钥字节**的摘要（bundle-sign key create 打印的那一行、控制台上显示的那一个），
-   不是 release-key.pub 这个文件的摘要——先确认手里的值取自密码管理器里记的那一条。
-   确认无误还不符，那么要么服务端上的安装包被换过，要么这不是同一把密钥,两种都不该继续装。"
-  [ "$signers_sha" = "$ALLOWED_SIGNERS_SHA256" ] ||
-    die "安装包里的 allowed_signers sha256 是 $signers_sha，与 --allowed-signers-sha256 不符，拒绝安装"
+    die "归档里发布公钥的指纹是 $key_sha，与 --release-key-sha256 不符。
+   清单验过签、包内文件也与清单一致，却出现这个，说明签出这份清单的密钥不是运维手里的
+   那一把——不该继续装。"
   put_file "$BUNDLE/release-key.pub" "$INSTALL_DIR/release-key.pub" root wheel 0644
   put_file "$BUNDLE/allowed_signers" "$INSTALL_DIR/allowed_signers" root wheel 0644
-  note "两把公钥的指纹与带外给的值一致"
+  note "两把信任根就位（发布公钥指纹 $key_sha）"
   if [ -f "$BUNDLE/github_known_hosts" ]; then
     put_file "$BUNDLE/github_known_hosts" "$INSTALL_DIR/github_known_hosts" root wheel 0644
   elif [ ! -f "$INSTALL_DIR/github_known_hosts" ]; then

@@ -63,10 +63,10 @@
 
 ## 两把信任根（2026-09-18 落地）
 
-| 东西 | 值 | 装机参数 |
+| 东西 | 值 | 装机时要人抄吗 |
 | --- | --- | --- |
-| 发布公钥（自升级） | 公钥字节 sha256 `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a` | `--release-key-sha256` |
-| `allowed_signers`（提交验签） | 文件 sha256 `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` | `--allowed-signers-sha256` |
+| 发布公钥（自升级、清单验签） | 公钥字节 sha256 `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a` | **要**，`--release-key-sha256`，唯一的一个 |
+| `allowed_signers`（提交验签） | 文件 sha256 `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` | 不要，由脚本从验过签的清单里核对 |
 
 两者口径不同（一个算公钥字节、一个算文件），落地当天撞出一个必然导致装机失败的 bug，见提交 `b01a11d`。
 `build-bundles.sh` 结尾现在会按正确口径各打印一行；零警告的完整构建已跑通。
@@ -86,6 +86,7 @@
 | §5.2 认领 SQL | "用子查询而不是 JOIN"（避免锁住 `app_configs`） | 子查询 + `FOR UPDATE OF j SKIP LOCKED` | 只写子查询不够：MySQL 的锁定读会把子查询里读到的行一起锁上，要 `OF j` 才真的把锁限定在 `build_jobs` 上 |
 | §6.2「低于 `BUILD_AGENT_MIN_FREE_GB` 不认领并告警（进 claim 的自报）」 | 两句话合不拢：不认领就没有 claim，也就没有自报，控制台只会看到"离线" | 认领**照发**，但带 `paused` + `pausedReason`，服务端记一行在线与原因后回 204 不派活；请求体与心跳表各加一个字段 | 磁盘满和关机要做的处理完全不同，控制台得分得清。代价是契约多两个字段 |
 | §4.4「`security cms -D -i` 读 `ExpirationDate`」 | 起子进程解描述文件 | 纯 Go 从 CMS 块里取出 XML plist 自己解析 | 与 §4.3 第 1 步对 `.ipa` 定的规矩一致（不对文件调 `unzip`/`plutil`），少一处子进程；副作用是盘点在 Linux 上也测得了，不需要一台 Mac |
+| §4.5 装机要三个带外核对值 | `--expect-sha256`（CI 日志里的归档摘要）、`--release-key-sha256`、`--allowed-signers-sha256` | 只要 `--release-key-sha256` 一个。`describe` 对 darwin 额外下发清单原始字节、它的离线签名与发布公钥；脚本用人给的指纹认出公钥 → 验清单 → 从**已验签的清单**里取归档与每个文件的摘要 | 三个值里有两个是冗余的（归档摘要对了，包里的文件就都对了），而剩下那个"归档摘要"每次发版都变、要去翻 CI 日志找对应版本——它恰恰是最麻烦也最弱的一环：CI 日志能被改，离线签名不能。人工抄写从 3 处减到 1 处，抄错的机会少三分之二，而判据反而更强。代价是脚本里多了一段纯 Python 的 ed25519 验签（只做 verify，RFC 8032 向量与 Go 交叉验证都跑过），它的可信度来自脚本自身的 shasum——那是这条链子的第一环，本来就要核对 |
 | §4.3 上传 Key 探测 | `uploadProbe` 只说"进材料盘点" | 在认领体的 `appleTeams[]` 里加 `uploadProbe` 字段，落进 `build_machine_liveness.apple_teams` | 服务端请求体是严格解析，不先加字段代理就报不上来 |
 | A1「`machineEnvKeys` 按 `runtime.GOOS` 组装」 | Linux 上不接受 `RN_IOS_SIGNING_DIR` | 按**任务平台**组装：只有 iOS 任务的环境里才有它 | 是更强的那一条——同一台 Mac 上的 Android 任务同样不该看见签名目录；Linux 侧的保护不变（`BUILD_AGENT_PLATFORMS=ios` 在非 darwin 上启动就失败）。副作用是 iOS 那条链路在 Linux 上测得了，`go test` 覆盖到钥匙串准备、描述文件复制、身份核对与上传交接 |
 | §4.2「`security unlock-keychain -p "$(cat …)"`」 | 口令作为命令行参数 | 三条命令走 `security -i` 的标准输入 | 命令行参数 `ps` 看得到（AGENTS.md「机密的操作纪律」）。口令的字母表在读入时校验，拼不出第二条命令 |

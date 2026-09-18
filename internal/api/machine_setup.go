@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Helix2010/RN-Server/signing/bundlesig"
 
 	"github.com/Helix2010/RN-Server/internal/machinesetup"
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
@@ -51,7 +54,12 @@ const (
 	// 不是配置项：它和服务端二进制一起由同一个部署脚本放下，路径是部署约定
 	defaultMachineBundleDir = "/opt/rn-foundation/machine-bundles/current"
 	machineBundleManifest   = "manifest.json"
-	maxMachineBundleFiles   = 256
+	// machineReleaseKeyFile 是发布公钥在安装包目录里单独放的那一份（build-bundles.sh 放）。
+	// 归档里也有同样一份，但那是装到机器上的；装机脚本要在**下载归档之前**拿到它验清单签名
+	machineReleaseKeyFile = "release-key.pub"
+	// machineReleaseKeyMaxSize：一行 base64 的 32 字节公钥，45 字节
+	machineReleaseKeyMaxSize = 1 << 10
+	maxMachineBundleFiles    = 256
 )
 
 var (
@@ -128,17 +136,18 @@ func (s *server) enrollmentView(c *gin.Context, m buildMachine, code string) gin
 // macOSInstallCommand 是 Mac 打包机的装机命令（设计 §4.5）。
 //
 // 它**不是**一条 `curl … | sudo bash`：首次装机是一次对服务端的信任，而这台机器将要
-// 持有全部租户的签名材料。脚本先落地、由人按带外渠道核对它的摘要，再执行；三个 sha256
-// 参数（安装包归档、发布公钥、allowed_signers）都是尖括号占位——它们的正确值在 CI 日志
-// 和密码管理器里，控制台替人填等于让这台 Mac 把服务端说的话当成信任根。
+// 持有全部租户的签名材料。脚本先落地、由人按带外渠道核对它的摘要，再执行。
+//
+// 只有一个尖括号占位：发布公钥的指纹。它的正确值在密码管理器里，控制台替人填等于让这台
+// Mac 把服务端说的话当成信任根。归档与包内每个文件的摘要都由脚本从一份**离线签名背书的
+// 清单**里取，不再要人从 CI 日志抄——让人抄三个值不比抄一个更安全，多两次抄写只是多两次
+// 抄错的机会，而其中归档摘要那一个还得每次发版去翻日志找对应的版本。
 func macOSInstallCommand(origin, code string) string {
 	return strings.Join([]string{
 		"curl -fsSLo install-macos.sh " + origin + "/v1/machine-setup/install-macos.sh",
 		"shasum -a 256 install-macos.sh   # 与 CI「Build machine bundles」那一步打印的值比对",
 		"sudo bash install-macos.sh --server " + origin + " --code " + code + " \\",
-		"     --expect-sha256 <从 CI 日志粘贴 builder-darwin-arm64.tar.gz 的 sha256> \\",
-		"     --release-key-sha256 <从密码管理器粘贴发布公钥指纹> \\",
-		"     --allowed-signers-sha256 <从密码管理器粘贴 allowed_signers 指纹>",
+		"     --release-key-sha256 <从密码管理器粘贴发布公钥指纹>",
 	}, "\n")
 }
 
@@ -317,6 +326,24 @@ func (s *server) describeEnrollment(c *gin.Context) {
 			"archiveSize": bundle.ArchiveSize, "files": bundle.Files,
 		},
 		"recoveryKeys": []gin.H{}, "primarySigner": nil,
+		// 这三项只对 Mac 打包机有值，见 signedManifestForSetup
+		"manifestBase64": nil, "manifestSignature": nil, "releaseKeyPub": nil,
+	}
+	// Mac 装机只让人带一个带外核对值（发布公钥的指纹），归档摘要与包内每个文件的摘要都从
+	// **验过签的清单**里取。所以这里要把清单原始字节、它的离线签名和发布公钥一起给出去——
+	// 装机脚本先用人给的指纹认这把公钥，再用它验清单，然后才谈下载。
+	//
+	// 没签名就什么都不给：一台将要持有全部租户签名材料的机器，不该在"清单还没签"的窗口里
+	// 装上一份没人背书的程序。Linux 那条路不受影响（install.sh 走的是 CI 日志里的摘要）。
+	if m.osOf() == machineOSDarwin {
+		manifestRaw, signature, releaseKey, err := s.signedManifestForSetup()
+		if err != nil {
+			bundleUnavailable(c, bundleName, err)
+			return
+		}
+		response["manifestBase64"] = base64.StdEncoding.EncodeToString(manifestRaw)
+		response["manifestSignature"] = json.RawMessage(mustJSON(signature))
+		response["releaseKeyPub"] = releaseKey
 	}
 	if m.Role == machineRoleSigner {
 		recovery, err := readRecoveryKeys(ctx, s.db, false)
@@ -521,4 +548,38 @@ func (s *server) enrollMachine(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"machineId": enrolled.ID, "token": token, "status": enrolled.Status})
+}
+
+// signedManifestForSetup 读安装包目录里的清单、它的离线签名，以及与 manifest.json 并排
+// 放着的那一份发布公钥。
+//
+// 三样都齐才返回。装机脚本拿它们建立信任链：人给的指纹认公钥 → 公钥验清单 → 可信清单里
+// 的摘要核对归档与包内每个文件。服务端自己不验签（它没有那把私钥，也不该有），但清单与
+// 签名对不上是这台服务器上的事故，signedBundleFor 已经挡在前面了。
+func (s *server) signedManifestForSetup() ([]byte, bundlesig.Signature, string, error) {
+	signed, err := s.signedBundleFor(machineBundleBuilderDarwin)
+	if err != nil {
+		return nil, bundlesig.Signature{}, "", err
+	}
+	path := filepath.Join(signed.Dir, machineReleaseKeyFile)
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, bundlesig.Signature{}, "", errors.New("the deployed bundles have no " + machineReleaseKeyFile +
+			" next to " + machineBundleManifest + "; a new Mac cannot verify the manifest without it")
+	}
+	if !info.Mode().IsRegular() || info.Size() > machineReleaseKeyMaxSize {
+		return nil, bundlesig.Signature{}, "", errors.New(machineReleaseKeyFile + " is not a small regular file")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, bundlesig.Signature{}, "", err
+	}
+	key := strings.TrimSpace(string(raw))
+	// 形状检查：一行 base64 的 32 字节。装机脚本还会按指纹核对它，这里只是不把明显坏掉的
+	// 东西递出去——否则错误会在那台 Mac 上以"验签失败"的样子出现，指向错误的方向
+	decoded, err := base64.StdEncoding.DecodeString(key)
+	if err != nil || len(decoded) != ed25519.PublicKeySize {
+		return nil, bundlesig.Signature{}, "", errors.New(machineReleaseKeyFile + " is not a base64 ed25519 public key")
+	}
+	return signed.Manifest, signed.Signature, key, nil
 }

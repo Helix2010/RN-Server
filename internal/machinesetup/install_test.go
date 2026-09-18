@@ -250,28 +250,49 @@ func TestMacInstallScriptIsEmbedded(t *testing.T) {
 	}
 }
 
-// 首次装机是一次对服务端的信任：脚本、安装包与两把公钥都来自服务端。三个带外核对值
-// 因此是必填的，而且必须真的被用来比对——不比对的话它们只是三个被抄进命令行的字符串。
-func TestMacInstallScriptRequiresTheOutOfBandDigests(t *testing.T) {
+// 首次装机是一次对服务端的信任：脚本、安装包与两把公钥都来自服务端。判据只有一个——
+// 发布公钥的指纹——而它必须真的被用来比对，其余摘要必须来自**验过签的清单**。
+//
+// 这一条盯的是那条链子不能被抄近路：任何一处改回"直接采信 describe 响应里 bundle 那个
+// 对象"，这台机器的信任根就变成了服务端说的话，而它手上有全部租户的签名材料。
+func TestMacInstallScriptDerivesEverythingFromOneOutOfBandDigest(t *testing.T) {
 	script := string(InstallMacOSScript)
-	for _, flag := range []string{"--expect-sha256", "--release-key-sha256", "--allowed-signers-sha256"} {
-		if !strings.Contains(script, flag) {
-			t.Errorf("install-macos.sh does not take %s", flag)
+	if !strings.Contains(script, "--release-key-sha256") {
+		t.Error("install-macos.sh does not take --release-key-sha256")
+	}
+	// 另外两个不该再要人抄：多两次抄写只是多两次抄错的机会
+	for _, gone := range []string{"--expect-sha256", "--allowed-signers-sha256"} {
+		if strings.Contains(script, gone) {
+			t.Errorf("install-macos.sh still asks the operator for %s", gone)
 		}
 	}
-	// 三个值都要过同一条形状校验，缺一个就退出
-	if !strings.Contains(script, `for value in "$EXPECT_SHA256" "$RELEASE_KEY_SHA256" "$ALLOWED_SIGNERS_SHA256"`) {
-		t.Error("install-macos.sh does not validate all three digests together")
+	if !strings.Contains(script, `printf '%s' "$RELEASE_KEY_SHA256" | grep -Eq '^[0-9a-f]{64}$'`) {
+		t.Error("install-macos.sh does not validate the shape of --release-key-sha256")
 	}
-	// 真的拿来比：安装包里的两把公钥各比一次，归档比一次
-	for _, comparison := range []string{
-		`[ "$key_sha" = "$RELEASE_KEY_SHA256" ]`,
-		`[ "$signers_sha" = "$ALLOWED_SIGNERS_SHA256" ]`,
-		`[ "$EXPECT_SHA256" = "$BUNDLE_SHA256" ]`,
+	// 链子的四环，少一环都不成立
+	for _, step := range []string{
+		// 1) 人给的指纹认出发布公钥
+		`got_key_sha != want_key_sha`,
+		// 2) 用它验清单的离线签名（签的是规范化字节，不是 JSON）
+		`"rn-machine-bundles-signature/v1",`,
+		`if not ed25519_verify(raw_sig, signed, public):`,
+		// 3) 摘要从已验签的清单里取，不从 describe 响应里那个 bundle 对象取
+		`manifest = json.loads(manifest_raw)`,
+		`bundle = (manifest.get("bundles") or {}).get(want_bundle)`,
+		// 4) 服务端自报的与已验签的不一致就停
+		`sys.exit("服务端自报的归档摘要与已验签清单里的不一致，拒绝安装")`,
 	} {
-		if !strings.Contains(script, comparison) {
-			t.Errorf("install-macos.sh never compares %s", comparison)
+		if !strings.Contains(script, step) {
+			t.Errorf("install-macos.sh is missing a link of the trust chain: %s", step)
 		}
+	}
+	// 归档里那把公钥仍要与 describe 用过的那把一致：装到机器上的必须就是它
+	if !strings.Contains(script, `[ "$key_sha" = "$RELEASE_KEY_SHA256" ]`) {
+		t.Error("install-macos.sh does not re-check the release key it installs")
+	}
+	// 非 canonical 的 S 要拒（签名可延展性）
+	if !strings.Contains(script, "if s >= L:") {
+		t.Error("the embedded ed25519 verifier does not reject a non-canonical S")
 	}
 }
 

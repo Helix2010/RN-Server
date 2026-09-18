@@ -224,7 +224,10 @@ public key sha256: <64 位十六进制>
   > 清单签名的 `publicKeySha256` 字段和控制台「批准打包机程序版本」那张卡片上，三处一致，
   > 你在控制台看到的就是密码管理器里记的那个。
   >
-  > 隔壁的 `allowed_signers` 反过来用**文件**摘要（它是多行文本，没有"原始字节"可言）。
+  > **装机只要这一个值。** 归档摘要与包内每个文件的摘要（含 `allowed_signers`）都由
+  > `install-macos.sh` 从一份离线签名背书的清单里取：人给的指纹认出公钥 → 公钥验清单 →
+  > 可信清单里的摘要核对归档与每个文件。让人抄三个值不比抄一个更安全，多两次抄写只是多
+  > 两次抄错的机会，而其中归档摘要那一个还得每次发版去翻 CI 日志找对应的版本。
 - **公钥文件**：放进仓库的 `deploy/build-agent-macos/release-key.pub`，`build-bundles.sh` 会把它
   打进 darwin 那组安装包（没有它只是警告，但 `install-macos.sh` 会拒绝安装）。
 
@@ -333,8 +336,10 @@ ls -ld /opt/rn-build-agent /opt/rn-build-agent/allowed_signers    # 都应该是
 
 `allowed_signers` **不从服务端取、不随任务下发**。轮换等于重新分发文件，与证书归档同一条运维
 路径：改仓库里的 `deploy/build-agent-macos/allowed_signers` → 下一版安装包带上新的 → 每台 Mac
-装机或手工 `install` 覆盖 → 记新的 sha256 进密码管理器（`install-macos.sh --allowed-signers-sha256`
-要它）。
+装机或手工 `install` 覆盖。
+
+**它的摘要不用单独记**：装机时由 `install-macos.sh` 从验过签的清单里核对（§3 那条链子），
+运维只带发布公钥的指纹。
 
 **减人要当天做**：一个已经离开的人的公钥还在这个文件里，等于他推一个签过名的提交就能在所有 Mac 上
 跑代码。

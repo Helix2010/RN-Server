@@ -4675,7 +4675,7 @@
     "/v1/machine-setup/describe": {
       "post": {
         "summary": "Describe the machine an enrollment code belongs to",
-        "description": "Does not consume the code. Returns the machine identity, the bundle manifest entry for its role, the recovery keys (signers) and the primary signer's keys (standby signers). Rate limited per client IP. The response carries os and the bundle the machine should install, chosen from the registry entry's os.",
+        "description": "Does not consume the code. Returns the machine identity, the bundle manifest entry for its role, the recovery keys (signers) and the primary signer's keys (standby signers). Rate limited per client IP. The response carries os and the bundle the machine should install, chosen from the registry entry's os. A darwin machine additionally gets manifestBase64, manifestSignature and releaseKeyPub: its installer is given one out-of-band value only (the release key fingerprint) and derives everything else from them - it recognises the key by that fingerprint, verifies the offline manifest signature with it, and takes the archive digest and every file digest from the verified manifest rather than from the bundle object in this response. When the deployed bundles are unsigned, have no release-key.pub beside manifest.json, or were built from a dirty tree, a darwin describe is answered 503 MACHINE_BUNDLE_UNAVAILABLE and nothing is handed out. These three are null for linux machines, which still install via install.sh and the digest printed in the CI log.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4707,7 +4707,7 @@
             "description": "MACHINE_SETUP_RATE_LIMITED: more than 20 requests a minute from this address on this route"
           },
           "503": {
-            "description": "MACHINE_BUNDLE_UNAVAILABLE (bundle directory, manifest or this role's bundle missing or malformed), MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+            "description": "MACHINE_BUNDLE_UNAVAILABLE (darwin: also when the bundles are not signed)"
           }
         }
       }
@@ -9216,7 +9216,7 @@
           },
           "installCommand": {
             "type": "string",
-            "description": "The command to run as root on the new machine, composed by the server from the request's external origin. Linux is one line: curl -fsSL <origin>/v1/machine-setup/install.sh | sudo bash -s -- --server <origin> --code <code>; signers additionally end with ' --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>'. A darwin machine gets six newline-separated lines instead: the installer is downloaded to disk, its digest checked out of band, and then run with --expect-sha256, --release-key-sha256 and --allowed-signers-sha256 - never piped into a shell, because a Mac holds every tenant's signing material and first install is where its trust roots are pinned. Every angle-bracket placeholder is kept verbatim for the operator to replace from the CI log or the password manager. Show and copy it as is."
+            "description": "The command to run as root on the new machine, composed by the server from the request's external origin. Linux is one line: curl -fsSL <origin>/v1/machine-setup/install.sh | sudo bash -s -- --server <origin> --code <code>; signers additionally end with ' --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>'. A darwin machine gets four newline-separated lines instead: the installer is downloaded to disk, its digest checked against the CI log, and then run with a single --release-key-sha256 - never piped into a shell, because a Mac holds every tenant's signing material and first install is where its trust roots are pinned. The archive and per-file digests are derived by the installer from the offline-signed manifest, so the operator copies one value, not three. Every angle-bracket placeholder is kept verbatim for the operator to replace from the CI log or the password manager. Show and copy it as is."
           }
         }
       },
