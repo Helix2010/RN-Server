@@ -39,7 +39,7 @@
 | A4 | 已完成 | `cmd/build-agent/ios-upload`：`--probe`（只读探端点权限，永远以 0 退出）与上传两条路；先查同号再传，分块 PUT 可重试，"同号已存在"当成功；一行 JSON 到 stdout |
 | A10 | 已完成 | `deploy/build-agent-macos/`：两份 launchd plist（`UserName`、`KeepAlive.PathState`、`ExitTimeOut=7500`；升级那份走 `WatchPaths`）、`run-agent`（加载 env 后 `exec`）、sudoers 两条（`NOSETENV`）、env 示例；新程序 `cmd/build-agent/upgrade`（验签→核序号→核提交→逐文件核 sha256→冒烟→原子替换→删标记），全部进 darwin 归档 |
 
-下一步：§9 阶段 A–F 真机验证（剩下的都要一台真 Mac）；R3 是 GitHub 上的设置，随时可做。
+下一步：§9 阶段 A–F 真机验证（剩下的都要一台真 Mac）。两把信任根已落地（见下表）；R3 的开发者侧已就绪，GitHub 侧的分支保护受 Free 版限制暂缺。
 
 ## RN-App
 
@@ -47,7 +47,7 @@
 | --- | --- | --- | --- |
 | R1 | 已完成 | `23978e5` | `build-ios-release.mjs` 加 `--signing-dir`：按 `application-identifier` 在签名目录里找描述文件（过期的单独报出来），用 `IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj` 写进工程而不是全局覆盖命令行，`OTHER_CODE_SIGN_FLAGS=--keychain …`；两处 `-allowProvisioningUpdates` 都删了（无人值守的机器上它会去找 Xcode 账户） |
 | R2 | 已完成 | `23978e5` | `exportOptionsPlist` 给了 `profileName` 就切 `manual` 并写 `provisioningProfiles`（留着 `automatic` 会让导出去找账户）；新增 `plugins/with-ios-pods-unsigned.js`（Podfile `post_install` 关掉全部 Pods target 的签名），`app.config.ts` 注册 |
-| R3 | 未开始 | | 仓库 `main` 开「要求签名提交」分支保护、合并限 rebase/fast-forward。这是 GitHub 上的操作，不是代码改动；A6 那道验签闸已经在代理侧生效，缺这一条时它验的是"开发者有没有自己签"，不是"仓库强制签" |
+| R3 | 部分 | `f705f23` | **开发者侧已就绪**（2026-09-18）：第一个 principal `rn-app-signing-a@gmail.com` 的 SSH 签名密钥已配好并实测签得出、验得过；`deploy/build-agent-macos/allowed_signers` 已落地。**GitHub 侧的分支保护暂缺**——Free 版私有仓库没有 Rulesets，那一栏不显示。缺它时 A6 那道闸仍然 fail-closed（未签名的提交到了 Mac 上验签失败、任务失败），代价是失败发现得晚、少一层独立记录。**真正要守的纪律与分支保护无关**：不要用 GitHub 网页的三个合并按钮——那三种合并都由 GitHub 生成或重写提交，签名要么是 web-flow 的、要么被改写失效，到了 Mac 上一律验不过；合并在本地做、fast-forward 推 |
 
 ## RN-Admin
 
@@ -60,6 +60,16 @@
 
 管理端门禁（`format:check` / `lint` / `typecheck` / `test` / `build`）全绿，580 个用例。
 服务端侧 `gofmt` / `go vet` / `go test -race -p 1 ./...`（带本机 MySQL）全绿。
+
+## 两把信任根（2026-09-18 落地）
+
+| 东西 | 值 | 装机参数 |
+| --- | --- | --- |
+| 发布公钥（自升级） | 公钥字节 sha256 `b60f0ccf66e3d9e5603f4e568a6364940dbc9de2e3688d905bade00697292c45` | `--release-key-sha256` |
+| `allowed_signers`（提交验签） | 文件 sha256 `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` | `--allowed-signers-sha256` |
+
+两者口径不同（一个算公钥字节、一个算文件），落地当天撞出一个必然导致装机失败的 bug，见提交 `b01a11d`。
+`build-bundles.sh` 结尾现在会按正确口径各打印一行；零警告的完整构建已跑通。
 
 ## 运维手册（设计 §10 第 5 条）
 
