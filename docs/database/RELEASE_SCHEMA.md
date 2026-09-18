@@ -129,9 +129,10 @@ ota：queued → claimed → running → succeeded
 | `agent_commit` | VARCHAR(64) NULL | 这台机器上跑的 `build-agent` 提交（`-ldflags` 注入）。与平台级 `approvedAgentCommit` 不一致时控制台标出。NULL=旧版代理没报 |
 | `os` | VARCHAR(16) NULL | `runtime.GOOS`：`darwin`=Mac 打包机，`linux`=机房构建机。装机脚本与自升级归档按它分 |
 | `platforms` | JSON NULL | 本次认领自报的平台，如 `["ios"]`。记的是**自报的**、不是被登记收窄之后的：收窄掉的恰恰是"它想干但干不了"，而那正是要在控制台上看见的 |
-| `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z"}]`。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
+| `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z","uploadProbe":"ok"}]`（`uploadProbe`：`ok`/`forbidden`/`error`，启动时对上传 Key 做的只读探测，让"角色不够传不上去"在**第一次构建之前**就看得见）。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
 | `signing_expires_at` | DATETIME(3) NULL | 本机最早到期的证书或描述文件，30 天内控制台标黄 |
-| `free_gb` | INT UNSIGNED NULL | 构建盘剩余空间 GiB。低于阈值的机器自己就不认领，这一列只为让人看见 |
+| `free_gb` | INT UNSIGNED NULL | 构建盘剩余空间 GiB，认领时自报 |
+| `paused_reason` | VARCHAR(200) NULL | 这台机器自己暂停认领的原因（空闲空间低于 `BUILD_AGENT_MIN_FREE_GB` 等）。它仍然每 10 秒来问一次（仍然算在线），只是请求里带着 `paused`，服务端记下这一行就回 204 不派活。**为什么不让它干脆别来问**：那样控制台只能看到"离线"，而磁盘满和关机需要的处理完全不同 |
 | `updated_at` | DATETIME(3) NOT NULL | 本行最近一次被写入 UTC |
 
 ### 不变量

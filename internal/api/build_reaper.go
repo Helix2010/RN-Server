@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -33,6 +34,17 @@ const (
 	maxSignFailures     = 2
 	buildReaperInterval = time.Minute
 	reaperActor         = "system-build"
+	// buildQueueStallWarning：排队超过它的 iOS 任务发一条告警（设计
+	// ios-mac-builders-home-network-2026-09-18 §5.4）。回收器只管 claimed/running，
+	// 一条**没人认领**的任务不会被回收也不会失败——它会一直排着，占着这个租户这个平台的
+	// build 号。最常见的两个成因：唯一那台 Mac 关机了几天；排队之后有人改了
+	// release.ios 的 Team ID 或 bundle id，于是再没有任何一台机器的自报盘点能匹配上。
+	// 六小时是"家里的 Mac 睡了一夜也该醒了"的量级：更短会在正常的夜间等待里响，
+	// 更长就失去了"人还记得自己排过这条"的窗口
+	buildQueueStallWarning = 6 * time.Hour
+	// buildQueueStalledAction 同时是审计动作名与去重依据：每条任务只告警一次，
+	// 而回收是每分钟一轮的循环
+	buildQueueStalledAction = "build_job_queue_stalled"
 )
 
 // RunBuildJobReaper 是 cmd/server 启动的回收循环：先跑一轮，之后每分钟一轮，ctx 结束就返回。
@@ -69,13 +81,104 @@ type reapResult struct {
 	Failed     []string
 	SignBack   []string
 	SignFailed []string
+	// QueueStalled 是这一轮新告警的"排太久没人领"的任务。它们的状态没有被改动——
+	// 排队不是故障，只是需要有人看一眼
+	QueueStalled []string
 }
 
 func (s *server) reapBuildJobs(ctx context.Context, now time.Time) reapResult {
 	var result reapResult
 	s.reapStaleBuilds(ctx, now, &result)
 	s.reapStaleSignings(ctx, now, &result)
+	s.warnStalledIOSQueue(ctx, now, &result)
 	return result
+}
+
+// warnStalledIOSQueue 对排队超过六小时的 iOS 安装包任务发一条告警。
+//
+// **不改状态**：Mac 掉线时队列不停是已定的决策，任务要能等它回来。这里做的只是让
+// "等得不正常久"这件事有人知道——回收器管不着排队中的任务，没有这条告警的话，一条
+// 因为 release.ios 被改过而永远没人能领的任务，会安静地占着 build 号直到有人想起它。
+//
+// 每条任务只告警一次，靠审计里有没有这条记录去重（回收是每分钟一轮）。多个服务端
+// 实例同时跑时可能各写一条：去重查询和写入之间没有锁。重复一条告警比漏一条便宜，
+// 也比为它引一把锁便宜。
+func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result *reapResult) {
+	cutoff := now.Add(-buildQueueStallWarning)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id,tenant_id,version,build_number,created_at FROM build_jobs
+		  WHERE status='`+jobQueued+`' AND kind='`+jobKindAPK+`' AND platform='`+buildPlatformIOS+`' AND created_at < ?
+		  ORDER BY created_at LIMIT 50`, cutoff)
+	if err != nil {
+		slog.Error("cannot look for iOS builds stuck in the queue", "error", err)
+		return
+	}
+	type stalled struct {
+		id, tenant, version string
+		buildNumber         int
+		createdAt           time.Time
+	}
+	var found []stalled
+	for rows.Next() {
+		var item stalled
+		if err := rows.Scan(&item.id, &item.tenant, &item.version, &item.buildNumber, &item.createdAt); err != nil {
+			slog.Error("cannot read an iOS build stuck in the queue", "error", err)
+			continue
+		}
+		found = append(found, item)
+	}
+	rows.Close()
+	if len(found) == 0 {
+		return
+	}
+	registry, err := s.machineRegistry(ctx)
+	if err != nil {
+		slog.Error("cannot read the machine registry while warning about stuck iOS builds", "error", err)
+		return
+	}
+	for _, item := range found {
+		if s.alreadyWarnedAboutQueue(ctx, item.tenant, item.id, item.createdAt) {
+			continue
+		}
+		// 说清楚是"没人在线"还是"没人有材料"：两者的处理完全不同——前者去把 Mac 叫醒，
+		// 后者去看是不是有人动过这个租户的 Apple Team 或 bundle id
+		detail := "当前没有能打这个租户 iOS 包的打包机在线。"
+		identity, err := s.iosReleaseIdentityRecord(ctx, item.tenant)
+		switch {
+		case err != nil || identity == nil:
+			detail = "这个租户的 iOS 发布身份读不出来或已被删除，这条任务不会有人认领。"
+		default:
+			coverage, err := s.iosSigningCoverage(ctx, registry, identity.Value.AppleTeamID, identity.Value.BundleID, now)
+			if err == nil && !coverage.Reported {
+				detail = "没有任何一台打包机报告过它手上有 Team " + identity.Value.AppleTeamID + "、bundle id " +
+					identity.Value.BundleID + " 的签名材料——排队之后这个租户的 iOS 身份被改过，或者材料从那台 Mac 上没了。" +
+					"这条任务不会有人认领，改回去或者取消它。"
+			}
+		}
+		reason := fmt.Sprintf("这条 iOS 打包任务（%s / build %d）已经排了 %s 还没有被认领。%s",
+			item.version, item.buildNumber, now.Sub(item.createdAt).Truncate(time.Minute), detail)
+		result.QueueStalled = append(result.QueueStalled, item.id)
+		slog.Warn("an iOS build job has been queued for too long",
+			"job", item.id, "tenant", item.tenant, "queuedFor", now.Sub(item.createdAt).Truncate(time.Minute).String())
+		s.auditNow(newAudit(item.tenant, reaperActor, buildQueueStalledAction, "build-job", item.id, clipRunes(reason, 500), "",
+			map[string]any{"jobId": item.id, "version": item.version, "buildNumber": item.buildNumber,
+				"queuedSeconds": int(now.Sub(item.createdAt).Seconds())}))
+	}
+}
+
+// alreadyWarnedAboutQueue 查这条任务有没有告警过。按 (tenant_id, created_at) 那个索引
+// 走，下界取任务的排队时刻——审计表是只增的，不限下界等于全表扫。
+func (s *server) alreadyWarnedAboutQueue(ctx context.Context, tenant, jobID string, since time.Time) bool {
+	var exists int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM audit_events WHERE tenant_id=? AND created_at>=? AND action=? AND target_type='build-job' AND target_id=? LIMIT 1`,
+		tenant, since, buildQueueStalledAction, jobID).Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// 查不出来就当告警过：宁可漏一条，也不要每分钟重复写一条审计
+		slog.Error("cannot tell whether a stuck iOS build was already reported", "job", jobID, "error", err)
+		return true
+	}
+	return err == nil
 }
 
 // reapStaleBuilds：claimed/running 10 分钟没有心跳。

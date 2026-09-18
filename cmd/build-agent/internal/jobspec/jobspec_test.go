@@ -219,3 +219,35 @@ func TestIOSResultCarriesNoNativeFingerprint(t *testing.T) {
 		t.Fatal("an ios result carrying a native fingerprint was accepted")
 	}
 }
+
+// 机器级白名单按 GOOS 组装：RN_IOS_SIGNING_DIR 只在 macOS 上认。
+//
+// Linux 构建机上出现这个键只可能是配错了，而它是一条指向签名材料的路径——放行等于让
+// 一台不该有签名材料的机器以为自己有。上传 Key 的两个标识（ASC_KEY_ID / ASC_ISSUER_ID）
+// 已经随手工签名从白名单里删掉：执行进程跑第三方依赖，一把能上传 build 的 Key 就是
+// 钥匙串里那些签名材料唯一缺的出口。
+func TestMachineEnvKeysAreAssembledPerOS(t *testing.T) {
+	linux := machineEnvKeysFor("linux")
+	darwin := machineEnvKeysFor("darwin")
+	for _, key := range linux {
+		if key == IOSSigningDirEnv {
+			t.Fatalf("%s is accepted on linux", IOSSigningDirEnv)
+		}
+	}
+	found := false
+	for _, key := range darwin {
+		if key == IOSSigningDirEnv {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%s is not accepted on darwin", IOSSigningDirEnv)
+	}
+	for _, keys := range [][]string{linux, darwin} {
+		for _, key := range keys {
+			if key == "ASC_KEY_ID" || key == "ASC_ISSUER_ID" {
+				t.Fatalf("%s is still on the allow list; the build runner must hold no App Store Connect key", key)
+			}
+		}
+	}
+}

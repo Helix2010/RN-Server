@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -32,6 +33,22 @@ type config struct {
 	Platforms []string
 	// IOSUpload：构建完之后把 .ipa 传进 App Store Connect。默认关。
 	IOSUpload bool
+	// 上传走**另一个用户**（设计 ios-mac-builders-home-network-2026-09-18 §4.3）：
+	// 执行进程一把 App Store Connect Key 都没有，控制进程也不读 Key——它把核对过身份的
+	// .ipa 交给 `sudo -n -u <IOSUploadUser> <IOSUploader>`，Key 只有那个用户读得到。
+	// 这样钥匙串里那些签名材料在这台机器上没有出口：签得出包，传不上去。
+	IOSUploader   string
+	IOSUploadUser string
+	// IOSUploadKeys 是上传 Key 的目录（每个 Team 一个子目录）。控制进程只把路径传过去，
+	// 自己不读；它存在与否进认领时的自报盘点，好让控制台看得见"这台机器缺谁的上传 Key"。
+	IOSUploadKeys string
+	// AllowedSigners 是 `git verify-commit` 用的允许签名者文件（root 所有，控制进程改不了）。
+	// 配了才启用提交签名校验；iOS 机器不配直接启动失败（§4.6）——服务端被攻破时，
+	// "让 Mac 检出一个带后门的提交"是通向全部租户签名材料最短的一条路。
+	AllowedSigners string
+	// MinFreeGB 是认领前要求的空闲空间（GiB），0=不检查。磁盘满时每条任务都会在
+	// pnpm install 或 archive 阶段失败，各烧掉一个 build 号（§6.2）。
+	MinFreeGB int64
 	Timeout   time.Duration
 	PollEvery time.Duration
 	// Runner 是执行进程二进制的绝对路径；RunnerUser 是经 sudo 切换到的用户。
@@ -51,8 +68,11 @@ type config struct {
 }
 
 const (
-	defaultSSHKey     = "/var/lib/rn-build-agent/.ssh/id_ed25519"
-	defaultKnownHosts = "/opt/rn-build-agent/github_known_hosts"
+	defaultSSHKey        = "/var/lib/rn-build-agent/.ssh/id_ed25519"
+	defaultKnownHosts    = "/opt/rn-build-agent/github_known_hosts"
+	defaultIOSUploader   = "/opt/rn-build-agent/ios-upload"
+	defaultIOSUploadUser = "_rnuploader"
+	defaultIOSUploadKeys = "/var/rn-build-upload"
 )
 
 // directRunner 是 BUILD_AGENT_RUNNER_USER 的特殊值：不经 sudo。
@@ -107,6 +127,10 @@ func loadConfig() (config, error) {
 		SSHKey:         envOr("BUILD_AGENT_SSH_KEY", defaultSSHKey),
 		KnownHosts:     envOr("BUILD_AGENT_SSH_KNOWN_HOSTS", defaultKnownHosts),
 		MirrorProtocol: envOr("BUILD_AGENT_MIRROR_PROTOCOL", "ssh"),
+		IOSUploader:    envOr("BUILD_AGENT_IOS_UPLOADER", defaultIOSUploader),
+		IOSUploadUser:  envOr("BUILD_AGENT_IOS_UPLOAD_USER", defaultIOSUploadUser),
+		IOSUploadKeys:  envOr("BUILD_AGENT_IOS_UPLOAD_KEYS", defaultIOSUploadKeys),
+		AllowedSigners: envOr("BUILD_AGENT_ALLOWED_SIGNERS", ""),
 	}
 	// 作废的机密先挡：它们留在 env 文件里就是一份没人管的秘密
 	if os.Getenv("BUILD_KEYSTORE_PASSPHRASE") != "" {
@@ -187,9 +211,64 @@ func loadConfig() (config, error) {
 	if containsPlatform(cfg.Platforms, jobspec.PlatformIOS) && runtime.GOOS != "darwin" {
 		return cfg, fmt.Errorf("BUILD_AGENT_PLATFORMS names ios but this machine runs %s; iOS packages need macOS with Xcode", runtime.GOOS)
 	}
+	// 机器级工具变量：只取白名单里的，逐个校验。执行进程还会再校验一次。
+	// 白名单按 GOOS 组装（jobspec.machineEnvKeysFor）：RN_IOS_SIGNING_DIR 只在 macOS 上认。
+	for _, key := range jobspec.MachineEnvKeys() {
+		if value := os.Getenv(key); value != "" {
+			cfg.MachineEnv[key] = value
+		}
+	}
+
 	// 上传 TestFlight 是一个对外可见的动作，所以由装这台机器的人显式打开，
 	// 不由"排了一条 iOS 任务"隐含决定。关着时照样出包，只是停在这台机器上。
 	cfg.IOSUpload = iosUploadEnabled(envOr("BUILD_AGENT_IOS_UPLOAD", ""))
+	for key, value := range map[string]string{
+		"BUILD_AGENT_IOS_UPLOADER":    cfg.IOSUploader,
+		"BUILD_AGENT_IOS_UPLOAD_KEYS": cfg.IOSUploadKeys,
+	} {
+		if !filepath.IsAbs(value) || filepath.Clean(value) != value {
+			return cfg, fmt.Errorf("%s must be a clean absolute path (got %q)", key, value)
+		}
+	}
+	if !unixUserPattern.MatchString(cfg.IOSUploadUser) {
+		return cfg, fmt.Errorf("BUILD_AGENT_IOS_UPLOAD_USER must be a user name (got %q)", cfg.IOSUploadUser)
+	}
+	// 上传账户必须与执行进程、控制进程都不是同一个用户：三个身份合并任何两个，
+	// "签名材料没有出口"这条就不成立了
+	if cfg.IOSUpload {
+		if cfg.IOSUploadUser == cfg.RunnerUser {
+			return cfg, fmt.Errorf("BUILD_AGENT_IOS_UPLOAD_USER must not be the build runner user (%q): the process that runs third-party code would then hold an App Store Connect key", cfg.RunnerUser)
+		}
+		if me, err := user.Current(); err == nil && me.Username == cfg.IOSUploadUser {
+			return cfg, fmt.Errorf("BUILD_AGENT_IOS_UPLOAD_USER must not be the user this agent runs as (%q)", cfg.IOSUploadUser)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("BUILD_AGENT_MIN_FREE_GB")); raw != "" {
+		gb, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || gb < 0 || gb > 4096 {
+			return cfg, fmt.Errorf("BUILD_AGENT_MIN_FREE_GB must be between 0 (no check) and 4096 (got %q)", raw)
+		}
+		cfg.MinFreeGB = gb
+	}
+	if cfg.AllowedSigners != "" {
+		if filepath.Clean(cfg.AllowedSigners) != cfg.AllowedSigners || !shellSafePathPattern.MatchString(cfg.AllowedSigners) {
+			return cfg, fmt.Errorf("BUILD_AGENT_ALLOWED_SIGNERS must be a clean absolute path of letters, digits and ._-/ (got %q)", cfg.AllowedSigners)
+		}
+	}
+	if containsPlatform(cfg.Platforms, jobspec.PlatformIOS) {
+		// 没有这份文件就没有提交签名校验，而这台 Mac 上放着全部租户的签名材料：
+		// 能推 main 的人（或攻破服务端的人）等于能在这台机器上执行任意代码
+		if cfg.AllowedSigners == "" {
+			return cfg, errors.New("BUILD_AGENT_ALLOWED_SIGNERS is required on an iOS build machine: without it the agent would build any commit the server points it at, and this machine holds every tenant's signing material")
+		}
+		dir := cfg.MachineEnv[jobspec.IOSSigningDirEnv]
+		if dir == "" {
+			return cfg, fmt.Errorf("%s is required on an iOS build machine: it is where the certificates and provisioning profiles live", jobspec.IOSSigningDirEnv)
+		}
+		if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+			return cfg, fmt.Errorf("%s must be a clean absolute path (got %q)", jobspec.IOSSigningDirEnv, dir)
+		}
+	}
 	raw := envOr("BUILD_AGENT_TIMEOUT_MINUTES", "45")
 	minutes, err := strconv.Atoi(raw)
 	if err != nil || minutes < 1 || minutes > 480 {
@@ -197,12 +276,6 @@ func loadConfig() (config, error) {
 	}
 	cfg.Timeout = time.Duration(minutes) * time.Minute
 
-	// 机器级工具变量：只取白名单里的，逐个校验。执行进程还会再校验一次。
-	for _, key := range jobspec.MachineEnvKeys() {
-		if value := os.Getenv(key); value != "" {
-			cfg.MachineEnv[key] = value
-		}
-	}
 	if cfg.MachineEnv["PATH"] == "" {
 		return cfg, errors.New("PATH is required: it is handed to the build runner so it can find node, pnpm and java")
 	}

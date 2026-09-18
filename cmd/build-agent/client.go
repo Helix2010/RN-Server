@@ -316,12 +316,39 @@ func (c *client) registerKey(ctx context.Context, publicKeyBase64 string, rotati
 	return out, nil
 }
 
+// claimRequest 是一次认领里这台机器自报的东西（设计
+// ios-mac-builders-home-network-2026-09-18 §5.2、§5.4）。
+//
+// 服务端用它做三件事：记一行"最近在线"（认领每 10 秒一次，是空闲机器唯一的生命迹象）；
+// 决定 iOS 任务派不派给这台机器（它手上有没有那个 Team 的签名材料）；以及在控制台上
+// 显示这台机器缺什么。**自报只能收窄**：报了做不到的事，只会领到一条必然失败的任务。
+type claimRequest struct {
+	Platforms   []string              `json:"platforms"`
+	Kinds       []string              `json:"kinds"`
+	AgentCommit string                `json:"agentCommit,omitempty"`
+	OS          string                `json:"os,omitempty"`
+	AppleTeams  []appleTeamSelfReport `json:"appleTeams,omitempty"`
+	FreeGb      int64                 `json:"freeGb,omitempty"`
+	// Paused：这台机器现在不领活（磁盘不够等），但仍然来报到。服务端记下在线与原因，
+	// 直接回 204
+	Paused       bool   `json:"paused,omitempty"`
+	PausedReason string `json:"pausedReason,omitempty"`
+}
+
+// appleTeamSelfReport 是自报盘点里的一个 Team。字段名与服务端的严格解析一一对应：
+// 服务端的请求体是 DisallowUnknownFields，多一个字段整条认领就 400。
+type appleTeamSelfReport struct {
+	TeamID      string   `json:"teamId"`
+	BundleIDs   []string `json:"bundleIds"`
+	ExpiresAt   string   `json:"expiresAt,omitempty"`
+	UploadProbe string   `json:"uploadProbe,omitempty"`
+}
+
 // claim 领一条任务。队列空时服务端给 204。
-func (c *client) claim(ctx context.Context, platforms []string) (claimResult, error) {
+func (c *client) claim(ctx context.Context, request claimRequest) (claimResult, error) {
 	const path = "/v1/build-agent/claim"
-	status, payload, err := c.send(ctx, http.MethodPost, path, 0, map[string]any{
-		"platforms": platforms, "kinds": []string{"apk", "ota"},
-	})
+	request.Kinds = []string{"apk", "ota"}
+	status, payload, err := c.send(ctx, http.MethodPost, path, 0, request)
 	if errorCode(err) == codeBuilderHasActiveJob {
 		var active activeJobRef
 		if json.Unmarshal(payload, &active) != nil || active.JobID == "" || active.Attempt < 1 {

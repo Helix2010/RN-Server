@@ -79,7 +79,10 @@ func TestRedirectsAreNeverFollowed(t *testing.T) {
 			}
 
 			calls := map[string]func() error{
-				"claim": func() error { _, err := c.claim(context.Background(), []string{"android"}); return err },
+				"claim": func() error {
+					_, err := c.claim(context.Background(), claimRequest{Platforms: []string{"android"}})
+					return err
+				},
 				"heartbeat": func() error {
 					return c.heartbeat(context.Background(), job, []string{"line"})
 				},

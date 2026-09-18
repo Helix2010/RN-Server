@@ -7613,6 +7613,15 @@
             "type": "integer",
             "minimum": 0,
             "description": "Free space on the build volume in GiB, for the console."
+          },
+          "paused": {
+            "type": "boolean",
+            "description": "This machine is up but is not taking work right now (for example free disk space fell below BUILD_AGENT_MIN_FREE_GB). The server records the liveness row, including pausedReason, and answers 204 without dispatching. The machine keeps polling, so it still counts as online - letting it go quiet instead would show up in the console as 'offline', and a full disk needs a different response than a powered-off Mac."
+          },
+          "pausedReason": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "One line explaining the pause, shown in the console. Only read when paused is true."
           }
         }
       },
@@ -9824,6 +9833,15 @@
           "expiresAt": {
             "type": "string",
             "description": "RFC3339 expiry of the earliest certificate or profile of this team; omitted when unknown"
+          },
+          "uploadProbe": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "forbidden",
+              "error"
+            ],
+            "description": "Result of the read-only probe the machine ran at startup against this team's upload key (GET /v1/apps/{id}/buildUploads?limit=1). ok = the key can use the Build Uploads endpoints; forbidden = the role is not enough, swap this machine's key for an App Manager team key; error = the probe could not run. Omitted when the machine does not upload. Known before the first build, rather than after a build number has been burned."
           }
         }
       },

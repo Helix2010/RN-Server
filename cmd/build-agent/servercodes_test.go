@@ -127,9 +127,22 @@ func TestClaimInProgressIsRetriedLater(t *testing.T) {
 	for _, call := range rig.server.callsTo("/claim") {
 		decoder := json.NewDecoder(strings.NewReader(string(call.Body)))
 		decoder.DisallowUnknownFields()
+		// 服务端的请求体是 DisallowUnknownFields：这里逐字段列出来，多报一个字段
+		// 就会让每一次认领 400，而那是一台安静地什么都不干的构建机
 		var strict struct {
-			Platforms []string `json:"platforms"`
-			Kinds     []string `json:"kinds"`
+			Platforms   []string `json:"platforms"`
+			Kinds       []string `json:"kinds"`
+			AgentCommit string   `json:"agentCommit"`
+			OS          string   `json:"os"`
+			AppleTeams  []struct {
+				TeamID      string   `json:"teamId"`
+				BundleIDs   []string `json:"bundleIds"`
+				ExpiresAt   string   `json:"expiresAt"`
+				UploadProbe string   `json:"uploadProbe"`
+			} `json:"appleTeams"`
+			FreeGb       int64  `json:"freeGb"`
+			Paused       bool   `json:"paused"`
+			PausedReason string `json:"pausedReason"`
 		}
 		if err := decoder.Decode(&strict); err != nil || len(strict.Platforms) == 0 || len(strict.Kinds) == 0 {
 			t.Fatalf("claim body %s does not carry non-empty platforms and kinds (%v)", call.Body, err)

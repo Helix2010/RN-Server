@@ -33,9 +33,19 @@ const (
 	machineLivenessThrottle = "60"
 	// 自报盘点的规模上限：它会被展开成认领 SQL 的 IN 列表。租户数是几十的量级，
 	// 一台 Mac 上的 Team 数不会超过它
-	maxAppleTeamReports   = 64
-	maxBundleIDsPerTeam   = 64
-	appleSigningNeverEnds = ""
+	// machinePausedReasonMaxRunes：一句话，够说清"磁盘只剩 12 GiB，低于 40"
+	machinePausedReasonMaxRunes = 200
+	maxAppleTeamReports         = 64
+	maxBundleIDsPerTeam         = 64
+	appleSigningNeverEnds       = ""
+)
+
+// 上传 Key 的只读探测结果。取值由代理报，服务端只校验是不是这几个之一。
+const (
+	uploadProbeUnknown   = ""
+	uploadProbeOK        = "ok"
+	uploadProbeForbidden = "forbidden"
+	uploadProbeError     = "error"
 )
 
 // 机器自报的操作系统。装机脚本、自升级归档（builder-darwin-arm64.tar.gz）与控制台
@@ -54,6 +64,13 @@ type appleTeamReport struct {
 	BundleIDs []string `json:"bundleIds"`
 	// ExpiresAt 是这个 Team 里最早到期的证书或描述文件（RFC3339）。空=没报
 	ExpiresAt string `json:"expiresAt"`
+	// UploadProbe 是启动时那次只读探测的结果（设计 §4.3 第 3 条）：ok=这把上传 Key 能用
+	// Build Uploads 那套端点；forbidden=角色不够（Developer 不行就换 App Manager 的 Team Key）；
+	// error=探不通（网络、Key 坏了）。空=没探（这台机器没开上传）。
+	//
+	// 记它的意义在于**第一次构建之前**就知道传不上去：上传发生在一次构建的最后一步，
+	// 等到那时才发现权限不够，已经烧掉了一个 build 号和半小时。
+	UploadProbe string `json:"uploadProbe"`
 }
 
 // machineLiveness 是表里的一行。
@@ -66,6 +83,10 @@ type machineLiveness struct {
 	AppleTeams       []appleTeamReport
 	SigningExpiresAt sql.NullTime
 	FreeGB           sql.NullInt64
+	// PausedReason 是机器自己报的"我现在不领活"的原因（磁盘不够等）。空=没暂停。
+	// 暂停的机器**仍然算在线**：它每 10 秒还来问一次，只是带着 paused。把它显示成离线
+	// 会把"磁盘满了"和"关机了"混成一件事，而这两件事要做的处理完全不同
+	PausedReason string
 }
 
 func (l machineLiveness) online(now time.Time) bool {
@@ -118,7 +139,12 @@ func normalizeAppleTeamReports(reports []appleTeamReport) ([]appleTeamReport, bo
 			}
 			expires = at.UTC().Format(time.RFC3339)
 		}
-		out = append(out, appleTeamReport{TeamID: team, BundleIDs: bundles, ExpiresAt: expires})
+		switch report.UploadProbe {
+		case uploadProbeUnknown, uploadProbeOK, uploadProbeForbidden, uploadProbeError:
+		default:
+			return nil, false
+		}
+		out = append(out, appleTeamReport{TeamID: team, BundleIDs: bundles, ExpiresAt: expires, UploadProbe: report.UploadProbe})
 	}
 	return out, true
 }
@@ -160,15 +186,16 @@ func (s *server) recordMachineLiveness(ctx context.Context, live machineLiveness
 	}
 	now := live.LastSeenAt
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?)
+		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,paused_reason,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?)
 		 ON DUPLICATE KEY UPDATE
 		   last_seen_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(last_seen_at), last_seen_at),
 		   agent_commit=VALUES(agent_commit),os=VALUES(os),platforms=VALUES(platforms),
 		   apple_teams=VALUES(apple_teams),signing_expires_at=VALUES(signing_expires_at),free_gb=VALUES(free_gb),
+		   paused_reason=VALUES(paused_reason),
 		   updated_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(updated_at), updated_at)`,
 		live.MachineID, now, nullableString(live.AgentCommit), nullableString(live.OS), string(platforms),
-		teams, live.SigningExpiresAt, live.FreeGB, now); err != nil {
+		teams, live.SigningExpiresAt, live.FreeGB, nullableString(live.PausedReason), now); err != nil {
 		slog.Warn("unable to record build machine liveness", "machineId", live.MachineID, "error", err)
 	}
 }
@@ -194,7 +221,7 @@ func (s *server) touchMachineLiveness(ctx context.Context, machineID string, now
 // machineLivenessByID 读全表。行数等于登记过的机器数（上限 64），一次全取比按 id 查几十次便宜。
 func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiveness, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb FROM build_machine_liveness`)
+		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,paused_reason FROM build_machine_liveness`)
 	if err != nil {
 		return nil, err
 	}
@@ -202,12 +229,13 @@ func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiv
 	out := map[string]machineLiveness{}
 	for rows.Next() {
 		var live machineLiveness
-		var agentCommit, os sql.NullString
+		var agentCommit, os, paused sql.NullString
 		var platforms, teams []byte
 		if err := rows.Scan(&live.MachineID, &live.LastSeenAt, &agentCommit, &os, &platforms, &teams,
-			&live.SigningExpiresAt, &live.FreeGB); err != nil {
+			&live.SigningExpiresAt, &live.FreeGB, &paused); err != nil {
 			return nil, err
 		}
+		live.PausedReason = paused.String
 		live.LastSeenAt = live.LastSeenAt.UTC()
 		live.AgentCommit = agentCommit.String
 		live.OS = os.String

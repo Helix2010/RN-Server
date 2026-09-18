@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -386,6 +387,19 @@ func newRig(t *testing.T) *testRig {
 	a.heartbeatEvery = 50 * time.Millisecond
 	a.reportDelay = time.Millisecond
 	return &testRig{server: server, tools: tools, agent: a, commit: commit, bare: bare}
+}
+
+// fakeIOSInventory 是"这台机器手上有测试租户那个 Team 的全套材料"。真盘点要起
+// `security` 子进程读钥匙串，没有一台 Mac 就跑不了，而"领到任务前再核一次材料"这条
+// 规则要有用例守着（真盘点本身由 ios_inventory_test.go 直接测）。
+func fakeIOSInventory(context.Context) iosInventory {
+	tenant := baseTenant()
+	return iosInventory{Teams: []appleTeamMaterial{{
+		TeamID:      tenant["appleTeamId"].(string),
+		BundleIDs:   []string{tenant["iosBundleId"].(string)},
+		ExpiresAt:   time.Now().Add(180 * 24 * time.Hour).UTC(),
+		UploadProbe: "ok",
+	}}}
 }
 
 func claimBody(id, kind string) map[string]any {

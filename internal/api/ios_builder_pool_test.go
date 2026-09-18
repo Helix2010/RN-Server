@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -229,4 +230,104 @@ func readLiveness(t *testing.T, f *gateFixture, machineID string) machineLivenes
 		t.Fatalf("no liveness row for %s", machineID)
 	}
 	return live
+}
+
+// 排队太久的 iOS 任务发一条告警，只发一条，而且**不动它的状态**：Mac 掉线时队列不停
+// 是已定的决策，任务要能等它回来（设计 §5.4）。
+func TestDBIOSStalledQueueRaisesExactlyOneAlert(t *testing.T) {
+	f, macs := newIOSPool(t, 65, 1)
+	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
+		t.Fatalf("claim: %d %s", recorder.Code, recorder.Body.String())
+	}
+	recorder := queueIOS(f, "1.3.0", 1300)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("queue: %d %s", recorder.Code, recorder.Body.String())
+	}
+	id := decodeBody(t, recorder)["id"].(string)
+	queuedAt := time.Now().UTC().Add(-7 * time.Hour)
+	f.setJob(id, "created_at=?", queuedAt)
+
+	now := time.Now().UTC()
+	if result := f.s.reapBuildJobs(t.Context(), now); len(result.QueueStalled) != 1 || result.QueueStalled[0] != id {
+		t.Fatalf("a job queued for 7 hours raised no alert: %+v", result)
+	}
+	// 告警不是回收：任务还在队列里等那台 Mac 回来
+	if job := f.jobStatus(id); job.Status != jobQueued {
+		t.Fatalf("the alert changed the job status to %s", job.Status)
+	}
+	// 每分钟一轮的回收循环不能每轮都写一条审计
+	if result := f.s.reapBuildJobs(t.Context(), now.Add(time.Minute)); len(result.QueueStalled) != 0 {
+		t.Fatalf("the same job was reported twice: %+v", result)
+	}
+	var reason string
+	if err := f.db.QueryRow(
+		`SELECT reason FROM audit_events WHERE target_type='build-job' AND target_id=? AND action=? LIMIT 1`,
+		id, buildQueueStalledAction).Scan(&reason); err != nil {
+		t.Fatalf("no audit event for the stuck job: %v", err)
+	}
+	// 在线的 Mac 手上有材料，所以原因该说"没人在线"，不该说"没人有材料"
+	if !strings.Contains(reason, "没有能打这个租户 iOS 包的打包机在线") {
+		t.Fatalf("the alert does not say why nobody claimed it: %s", reason)
+	}
+}
+
+// 排队之后有人改了租户的 Apple Team：这条任务再没有任何一台机器能领，而回收器只管
+// claimed/running，它会一直排着。告警要把这件事指出来，而不是笼统说"没人在线"。
+func TestDBIOSStalledQueueNamesAChangedTeam(t *testing.T) {
+	f, macs := newIOSPool(t, 66, 1)
+	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
+		t.Fatalf("claim: %d %s", recorder.Code, recorder.Body.String())
+	}
+	recorder := queueIOS(f, "1.4.0", 1400)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("queue: %d %s", recorder.Code, recorder.Body.String())
+	}
+	id := decodeBody(t, recorder)["id"].(string)
+	f.setJob(id, "created_at=?", time.Now().UTC().Add(-7*time.Hour))
+	// 排队之后运营把 Team 换成了另一个，而没有任何一台 Mac 装着它的材料
+	seedIOSIdentity(t, f, poolTeamB, poolBundle)
+
+	if result := f.s.reapBuildJobs(t.Context(), time.Now().UTC()); len(result.QueueStalled) != 1 {
+		t.Fatalf("no alert for a job whose team was changed: %+v", result)
+	}
+	var reason string
+	if err := f.db.QueryRow(
+		`SELECT reason FROM audit_events WHERE target_type='build-job' AND target_id=? AND action=? LIMIT 1`,
+		id, buildQueueStalledAction).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reason, poolTeamB) || !strings.Contains(reason, "没有任何一台打包机报告过") {
+		t.Fatalf("the alert must name the team nobody holds: %s", reason)
+	}
+}
+
+// 报了 paused 的机器仍然算在线，但不派活。让它干脆别来问的话，控制台只能看到"离线"，
+// 而磁盘满和关机需要的处理完全不同（设计 §6.2）。
+func TestDBPausedMachineStaysOnlineButGetsNoJob(t *testing.T) {
+	f, macs := newIOSPool(t, 67, 1)
+	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
+		t.Fatalf("claim: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := queueIOS(f, "1.5.0", 1500); recorder.Code != http.StatusCreated {
+		t.Fatalf("queue: %d %s", recorder.Code, recorder.Body.String())
+	}
+	paused := f.do(http.MethodPost, "/v1/build-agent/claim", macs[0].Token, nil, map[string]any{
+		"platforms": []string{buildPlatformIOS}, "kinds": []string{jobKindAPK},
+		"appleTeams": teamReport(poolTeamA, poolBundle), "freeGb": 3,
+		"paused": true, "pausedReason": "only 3 GiB free, below BUILD_AGENT_MIN_FREE_GB=40",
+	})
+	if paused.Code != http.StatusNoContent {
+		t.Fatalf("a paused machine was handed a job: %d %s", paused.Code, paused.Body.String())
+	}
+	live := readLiveness(t, f, macs[0].ID)
+	if !live.online(time.Now().UTC()) {
+		t.Fatal("a paused machine must still count as online")
+	}
+	if !strings.Contains(live.PausedReason, "BUILD_AGENT_MIN_FREE_GB") || live.FreeGB.Int64 != 3 {
+		t.Fatalf("the pause reason and free space were not recorded: %+v", live)
+	}
+	// 任务还在队列里等着，没有被派掉
+	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusOK {
+		t.Fatalf("the job was not still queued for a machine that resumed: %d %s", recorder.Code, recorder.Body.String())
+	}
 }

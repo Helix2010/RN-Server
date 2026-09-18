@@ -131,7 +131,11 @@ func TestExamplesDoNotOfferKeysNobodyReads(t *testing.T) {
 func TestEnvExamplesAreSafeToSource(t *testing.T) {
 	// 未加引号时会被 shell 解释的字符。空格和制表符也算：它们让赋值在中间断开。
 	unsafe := "()&$`|;<>*?#'\" \t"
-	for _, path := range []string{productionExample, developmentExample} {
+	// 构建机的两份也算：它们同样被 launchd / systemd 的 EnvironmentFile 读，
+	// 解析失败时的报错会把整行连值一起打出来，而其中一行是本机令牌
+	for _, path := range []string{productionExample, developmentExample,
+		"../../deploy/build-agent/rn-build-agent.env.example",
+		"../../deploy/build-agent-macos/rn-build-agent-macos.env.example"} {
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)

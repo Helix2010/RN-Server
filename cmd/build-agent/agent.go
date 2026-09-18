@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
@@ -30,6 +33,15 @@ type agent struct {
 	heartbeatEvery time.Duration
 	reportDelay    time.Duration
 	now            func() time.Time
+
+	// iosProbe 覆盖上传 Key 的只读探测（测试用）；nil = 按配置决定探不探
+	iosProbe func(ctx context.Context, teamID string) string
+	// iosScan 覆盖整次签名材料盘点（测试用）；nil = 真去问钥匙串与磁盘。
+	// 盘点要起 `security` 子进程、读这台机器的钥匙串，没有一台 Mac 就测不了，
+	// 而"领到任务前再核一次材料"这条规则本身是要有用例守着的
+	iosScan func(ctx context.Context) iosInventory
+	// lastSaid 是 sayOnce 的去重表：盘点每 10 秒一次，说的话几天不变
+	lastSaid map[string]string
 
 	keyActive      bool
 	keyCheckedAt   time.Time
@@ -153,6 +165,82 @@ func (a *agent) say(message string, args ...any) {
 }
 
 // pollOnce 领一个任务并把它做完，返回是否真的做了事。
+// claimRequest 组装这一次认领要自报的东西（设计 §5.2、§5.4、§6.2）。
+//
+// 每次认领都重新盘点一遍签名材料，而不是启动时盘一次记住：材料是运维用手导进钥匙串、
+// 拷进目录的，中途加一个租户、删一张过期证书都不会通知这个进程。每 10 秒起一次
+// `security` 子进程的代价，换的是"控制台上看到的就是这台机器现在真实有的东西"。
+func (a *agent) claimRequest(ctx context.Context) claimRequest {
+	request := claimRequest{Platforms: a.cfg.Platforms, AgentCommit: agentCommit(), OS: runtime.GOOS}
+	// 空闲空间：磁盘满时每条任务都会在 pnpm install 或 archive 那一步失败，各烧掉一个
+	// build 号。报上去让控制台看得见，低于阈值就暂停认领——但仍然来报到，
+	// 否则控制台只能显示"离线"，而磁盘满和关机要做的处理完全不同
+	if free, err := freeGiB(a.cfg.Workspace); err != nil {
+		a.log.Warn("cannot read the free space of the jobs root", "path", a.cfg.Workspace, "error", err)
+	} else {
+		request.FreeGb = free
+		if a.cfg.MinFreeGB > 0 && free < a.cfg.MinFreeGB {
+			request.Paused = true
+			request.PausedReason = fmt.Sprintf("%s has %d GiB free, below BUILD_AGENT_MIN_FREE_GB=%d; not claiming until there is room",
+				a.cfg.Workspace, free, a.cfg.MinFreeGB)
+			a.sayOnce("lowDisk", request.PausedReason)
+		}
+	}
+	if !containsPlatform(a.cfg.Platforms, jobspec.PlatformIOS) {
+		return request
+	}
+	inventory := a.iosInventory(ctx)
+	for _, team := range inventory.Teams {
+		report := appleTeamSelfReport{TeamID: team.TeamID, BundleIDs: team.BundleIDs, UploadProbe: team.UploadProbe}
+		if !team.ExpiresAt.IsZero() {
+			report.ExpiresAt = team.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		request.AppleTeams = append(request.AppleTeams, report)
+	}
+	return request
+}
+
+// iosInventory 盘点一次签名材料，并把"看见了但用不了"的东西打进日志——每轮都打会把
+// 日志刷满（认领每 10 秒一次），所以只在内容变了的时候打。
+func (a *agent) iosInventory(ctx context.Context) iosInventory {
+	if a.iosScan != nil {
+		return a.iosScan(ctx)
+	}
+	scanner := newIOSScanner(a.cfg)
+	scanner.Now = a.now
+	if a.iosProbe != nil {
+		scanner.Probe = a.iosProbe
+	}
+	inventory := scanner.scan(ctx)
+	a.sayOnce("iosTeams", "signing material for "+strings.Join(inventory.teamIDs(), ", "))
+	if len(inventory.Problems) > 0 {
+		a.sayOnce("iosProblems", strings.Join(inventory.Problems, "; "))
+	}
+	return inventory
+}
+
+// sayOnce 只在这条消息与上一次不同时打一行。盘点与磁盘检查每 10 秒做一次，
+// 而它们要说的话几天都不会变。
+func (a *agent) sayOnce(topic, message string) {
+	if a.lastSaid == nil {
+		a.lastSaid = map[string]string{}
+	}
+	if a.lastSaid[topic] == message {
+		return
+	}
+	a.lastSaid[topic] = message
+	a.log.Info(message, "topic", topic)
+}
+
+// freeGiB 是这个路径所在卷的可用空间（GiB，向下取整）。
+func freeGiB(path string) (int64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	return int64(uint64(stat.Bavail) * uint64(stat.Bsize) / (1 << 30)), nil
+}
+
 func (a *agent) pollOnce(ctx context.Context) bool {
 	if a.api.isRevoked() {
 		return false
@@ -166,7 +254,8 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 	}
 	// 领取请求不随停机信号取消：服务端已经派出的任务，响应丢在半路就只能等下次启动时判失败。
 	// 领到了就照常做完（停机只是不再发起新的领取）。
-	result, err := a.api.claim(context.WithoutCancel(ctx), a.cfg.Platforms)
+	request := a.claimRequest(ctx)
+	result, err := a.api.claim(context.WithoutCancel(ctx), request)
 	if err != nil {
 		switch errorCode(err) {
 		case codeKeyNotAccepted:
@@ -204,6 +293,16 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 		return true
 	case result.Job == nil:
 		return false
+	case request.Paused:
+		// 认领时说了"我现在不领活"，服务端还是派了一条过来。一台正常的服务端不会这么做
+		// （它看到 paused 就回 204），所以这里不是"要不要将就一下"，而是收到了不该收到的
+		// 东西：照做会在磁盘满的机器上跑一次注定失败的构建。判失败并说清原因，让人看得见
+		a.log.Error("the server dispatched a job to a machine that reported itself paused",
+			"job", result.Job.ID, "reason", request.PausedReason)
+		a.report(reportCtx, result.Job.ID, "failure", func(ctx context.Context) error {
+			return a.api.fail(ctx, result.Job.ID, result.Job.Attempt, request.PausedReason, "", nil)
+		})
+		return true
 	}
 	a.runJob(ctx, *result.Job)
 	return true
@@ -292,6 +391,16 @@ func (a *agent) runJob(ctx context.Context, job claimedJob) {
 
 // buildAndDeliver 返回检出的提交与第一个错误。安装包任务以 /built 结束，热更新任务以 /complete 结束。
 func (a *agent) buildAndDeliver(ctx context.Context, job claimedJob, buf *logBuffer) (string, error) {
+	// 盘点与认领之间可能有人动过钥匙串或删掉了描述文件（设计 §5.2 最后一行）。
+	// 在检出仓库、装依赖、跑 archive 之前先核一次：缺材料的话那几十分钟一定白花，
+	// 而且失败会出现在 xcodebuild 的输出里，看起来像构建问题而不是材料问题
+	if job.Kind == string(jobspec.KindAPK) && job.Platform == string(jobspec.PlatformIOS) {
+		if team, bundle := job.AppleTeamID(), job.BundleID(); !a.iosInventory(ctx).covers(team, bundle) {
+			return "", fmt.Errorf("this machine has no usable signing material for Apple Team %s / bundle id %s: "+
+				"import the distribution certificate into the keychain and put the provisioning profile under %s, then restart the agent",
+				team, bundle, a.cfg.MachineEnv[jobspec.IOSSigningDirEnv])
+		}
+	}
 	prepared, err := a.prepareWorktree(ctx, job, buf)
 	if err != nil {
 		return prepared.Commit, err

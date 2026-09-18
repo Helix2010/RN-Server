@@ -13,6 +13,7 @@
 //	build-agent show-key        只读打印出处公钥 base64 与完整 sha256
 //	build-agent rotate-key      生成下一把出处密钥，常驻进程用当前密钥签换钥证明登记它
 //	build-agent enroll          新机器用一次性注册码换机器令牌，令牌直接写进 env 文件（install.sh 以 root 调用）
+//	build-agent version         打印编译进来的提交（升级脚本据它确认换上了新的那一个）
 //
 // 设计见 docs/design/android-signing-gate-2026-09-16.md「构建机」。
 package main
@@ -44,8 +45,10 @@ func main() {
 			os.Exit(rotateKey(os.Args[2:], os.Stdout, os.Stderr))
 		case "enroll":
 			os.Exit(enroll(os.Args[2:], os.Stdout, os.Stderr))
+		case "version":
+			os.Exit(version(os.Args[2:], os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintln(os.Stderr, "usage: build-agent [show-key|rotate-key|enroll] (configuration comes from the environment)")
+			fmt.Fprintln(os.Stderr, "usage: build-agent [show-key|rotate-key|enroll|version] (configuration comes from the environment)")
 			os.Exit(2)
 		}
 	}
@@ -109,7 +112,7 @@ func runAgent() int {
 		slog.Warn("BUILD_AGENT_MIRROR_PROTOCOL is not ssh: the repository mirror is fetched over another transport. Only for local testing",
 			"protocol", cfg.MirrorProtocol)
 	}
-	slog.Info("build agent started", "server", cfg.Server, "platforms", cfg.Platforms,
+	slog.Info("build agent started", "server", cfg.Server, "platforms", cfg.Platforms, "agentCommit", agentCommit(),
 		"jobsRoot", cfg.Workspace, "runner", cfg.Runner, "runnerUser", cfg.RunnerUser,
 		"runnerSeparated", cfg.runnerSeparated(), "provenancePublicKeySha256", keys.current.sha256)
 

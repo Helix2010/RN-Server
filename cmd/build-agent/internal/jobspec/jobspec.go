@@ -17,6 +17,7 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -164,12 +165,28 @@ func (l Layout) OutFile(name string) string { return filepath.Join(l.Out(), name
 
 // ---- 子进程环境白名单 ----
 
-// 机器级变量：值来自控制进程自己的环境（systemd unit / env 文件），是这台机器的拓扑，不是机密。
-// ASC_KEY_ID / ASC_ISSUER_ID 是上传 TestFlight 用的标识，不是机密——真正的机密是 .p8，
-// 它留在这台 Mac 的 ~/.appstoreconnect/private_keys/ 下，由 altool 自己去找，既不经过
-// 服务端也不进这个环境。
-var machineEnvKeys = []string{"PATH", "LANG", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_RO_DEP_CACHE",
-	"ASC_KEY_ID", "ASC_ISSUER_ID"}
+// 机器级变量：值来自控制进程自己的环境（systemd unit / launchd plist / env 文件），是这台
+// 机器的拓扑，不是机密。
+//
+// **这里曾经有 ASC_KEY_ID / ASC_ISSUER_ID**，随手工签名一起删掉了（设计
+// ios-mac-builders-home-network-2026-09-18 §4.3）：执行进程跑的是第三方依赖，而一把能上传
+// build 的 App Store Connect Key 就是钥匙串里那些签名材料唯一缺的出口。现在上传由另一个
+// 用户（_rnuploader）做，Key 在执行进程读不到的目录下，执行进程连 Key 的**标识**都不需要。
+//
+// RN_IOS_SIGNING_DIR 只在 macOS 上认：它指向这台 Mac 的签名材料目录，描述文件从那里复制进
+// 任务 HOME。Linux 构建机上出现这个键只可能是配错了，拒绝比忽略好——忽略会让人以为配上了。
+var machineEnvKeys = machineEnvKeysFor(runtime.GOOS)
+
+func machineEnvKeysFor(goos string) []string {
+	keys := []string{"PATH", "LANG", "JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "GRADLE_RO_DEP_CACHE"}
+	if goos == "darwin" {
+		keys = append(keys, IOSSigningDirEnv)
+	}
+	return keys
+}
+
+// IOSSigningDirEnv 是签名材料目录（证书归档、profiles/<TEAMID>/、钥匙串）的机器级变量名。
+const IOSSigningDirEnv = "RN_IOS_SIGNING_DIR"
 
 // MachineEnvKeys 返回机器级变量名的副本。
 func MachineEnvKeys() []string { return append([]string(nil), machineEnvKeys...) }

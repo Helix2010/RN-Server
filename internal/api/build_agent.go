@@ -93,6 +93,11 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		OS          string            `json:"os"`
 		AppleTeams  []appleTeamReport `json:"appleTeams"`
 		FreeGb      int64             `json:"freeGb"`
+		// Paused：这台机器现在不领活（磁盘不够等），但仍然来报到。它照样记一行在线，
+		// 只是不派任务——让它干脆别来问的话，控制台只能看到"离线"，而"磁盘满了"和
+		// "关机了"要做的处理完全不同
+		Paused       bool   `json:"paused"`
+		PausedReason string `json:"pausedReason"`
 	}
 	if decode(c, &body) != nil || len(body.Platforms) == 0 || len(body.Kinds) == 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
@@ -133,13 +138,25 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	// 认领这条路径上绝大多数请求都是空转（队列是空的），而"这台机器还活着、手上有这些
 	// 材料"恰恰是那些空转唯一的产出；控制台据它显示"最近在线"与"这台缺哪个 Team"。
 	freeGB := sql.NullInt64{Valid: body.FreeGb > 0, Int64: body.FreeGb}
+	pausedReason := ""
+	if body.Paused {
+		pausedReason = sanitizeSignerText(body.PausedReason, machinePausedReasonMaxRunes)
+		if pausedReason == "" {
+			pausedReason = "paused by the machine"
+		}
+	}
 	s.recordMachineLiveness(ctx, machineLiveness{
 		MachineID: machine.ID, LastSeenAt: s.now(), AgentCommit: body.AgentCommit, OS: body.OS,
 		// 记自报的平台，不是下面收窄之后的：收窄掉的恰恰是"它想干但干不了"，
 		// 而那正是要在控制台上看见的东西
 		Platforms: body.Platforms, AppleTeams: teams,
-		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB,
+		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB, PausedReason: pausedReason,
 	})
+	// 暂停的机器在这里就回去了：登记了在线、登记了原因，但不派活
+	if body.Paused {
+		c.Status(http.StatusNoContent)
+		return
+	}
 
 	// 自报的平台只能**收窄**登记里的能力，不能扩张它：一台没装 Xcode 的 Linux 机器
 	// 报了 ios，领走的 iOS 任务只会失败、退回排队、再被它领走——一个自愈不了的循环，

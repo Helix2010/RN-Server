@@ -20,6 +20,7 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
 	rig := newRig(t)
 	rig.agent.cfg.Platforms = []string{"android", "ios"}
+	rig.agent.iosScan = fakeIOSInventory
 	body := claimBody("bld_e2eIOS000001", "apk")
 	body["platform"] = "ios"
 	rig.server.queueClaim(body)
@@ -82,6 +83,7 @@ func TestIOSJobUploadsOnlyWhenTheMachineIsConfiguredTo(t *testing.T) {
 	rig := newRig(t)
 	rig.agent.cfg.Platforms = []string{"ios"}
 	rig.agent.cfg.IOSUpload = true
+	rig.agent.iosScan = fakeIOSInventory
 	body := claimBody("bld_e2eIOS000002", "apk")
 	body["platform"] = "ios"
 	rig.server.queueClaim(body)
