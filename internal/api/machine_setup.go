@@ -114,12 +114,32 @@ func enrollmentCodeInvalid(c *gin.Context) {
 // enrollmentView 是新建与重发响应里的 enrollment：注册码原文、有效期、服务端拼好的安装命令。
 func (s *server) enrollmentView(c *gin.Context, m buildMachine, code string) gin.H {
 	origin := s.externalOrigin(c)
+	if m.osOf() == machineOSDarwin {
+		return gin.H{"code": code, "expiresAt": m.Enrollment.ExpiresAt, "installCommand": macOSInstallCommand(origin, code)}
+	}
 	command := "curl -fsSL " + origin + "/v1/machine-setup/install.sh | sudo bash -s -- --server " + origin + " --code " + code
 	if m.Role == machineRoleSigner {
 		// 恢复公钥指纹由运维从密码管理器粘贴，不取控制台的值：签名闸要 pin 的正是"服务端说了不算"的那把
 		command += " --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>"
 	}
 	return gin.H{"code": code, "expiresAt": m.Enrollment.ExpiresAt, "installCommand": command}
+}
+
+// macOSInstallCommand 是 Mac 打包机的装机命令（设计 §4.5）。
+//
+// 它**不是**一条 `curl … | sudo bash`：首次装机是一次对服务端的信任，而这台机器将要
+// 持有全部租户的签名材料。脚本先落地、由人按带外渠道核对它的摘要，再执行；三个 sha256
+// 参数（安装包归档、发布公钥、allowed_signers）都是尖括号占位——它们的正确值在 CI 日志
+// 和密码管理器里，控制台替人填等于让这台 Mac 把服务端说的话当成信任根。
+func macOSInstallCommand(origin, code string) string {
+	return strings.Join([]string{
+		"curl -fsSLo install-macos.sh " + origin + "/v1/machine-setup/install-macos.sh",
+		"shasum -a 256 install-macos.sh   # 与 CI「Build machine bundles」那一步打印的值比对",
+		"sudo bash install-macos.sh --server " + origin + " --code " + code + " \\",
+		"     --expect-sha256 <从 CI 日志粘贴 builder-darwin-arm64.tar.gz 的 sha256> \\",
+		"     --release-key-sha256 <从密码管理器粘贴发布公钥指纹> \\",
+		"     --allowed-signers-sha256 <从密码管理器粘贴 allowed_signers 指纹>",
+	}, "\n")
 }
 
 // externalOrigin 是这次请求的外部源（scheme://host）。https 的判据：TLS 直连；或直连对端是

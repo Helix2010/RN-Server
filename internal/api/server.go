@@ -231,6 +231,7 @@ func (s *server) routes() *gin.Engine {
 	platform.POST("/machines/:id/enrollment", s.reissueEnrollment)
 	// 批准构建机程序版本（自升级）。批准之后版本不一致的机器认领时收到 409，
 	// 在空闲的时候自己升；正在跑的构建不受影响
+	platform.GET("/build-agent-version", s.buildAgentVersion)
 	platform.POST("/build-agent-version", s.approveAgentVersion)
 	// 平台离线恢复公钥（build.recovery.recipients）：签名闸生成的密钥都要加密给它，签名闸本机另外 pin
 	platform.GET("/recovery-keys", s.listRecoveryKeys)

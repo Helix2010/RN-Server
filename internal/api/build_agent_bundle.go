@@ -165,3 +165,48 @@ func mustJSON(value any) []byte {
 	}
 	return raw
 }
+
+// deployedBundleView 是控制台「批准打包机程序版本」要看的一组安装包：它现在是哪一版、
+// 清单被谁签的、序号多少。
+//
+// 每组各自带 error 而不是整条请求 503：两组安装包的状态是独立的（darwin 那组可能还没
+// 编出来），而这一页存在的理由正是"让人看见现在部署的是什么"——一组坏了就整页看不见，
+// 等于把要看的东西藏起来。
+func (s *server) deployedBundleView(query, name string) gin.H {
+	view := gin.H{"bundle": name, "query": query, "commit": nil, "sequence": nil,
+		"signedAt": nil, "publicKeySha256": nil, "archive": nil, "error": nil}
+	signed, err := s.signedBundleFor(name)
+	if err != nil {
+		view["error"] = err.Error()
+		return view
+	}
+	view["commit"] = signed.Commit
+	view["sequence"] = signed.Signature.Sequence
+	view["signedAt"] = signed.Signature.SignedAt
+	view["publicKeySha256"] = signed.Signature.PublicKeySHA256
+	view["archive"] = gin.H{"name": signed.Bundle.Archive, "sha256": signed.Bundle.ArchiveSHA256, "size": signed.Bundle.ArchiveSize}
+	return view
+}
+
+// buildAgentVersion GET /v1/admin/platform/build-agent-version：现在部署着哪一版构建机
+// 程序、平台批准的是哪一版。
+//
+// 批准一个提交之前要能看见这个提交是什么、清单签名的序号是多少——否则「批准」就是往
+// 输入框里粘一个 40 位十六进制，粘错一位的后果是**所有**机器停止领任务（自报版本与批准
+// 的不一致就领不到），而症状是队列安静地不动。
+func (s *server) buildAgentVersion(c *gin.Context) {
+	snapshot, err := readMachineRegistry(c.Request.Context(), s.db, false)
+	if err != nil {
+		slog.Error("cannot read the machine registry", "error", err)
+		problem(c, http.StatusInternalServerError, "MACHINE_REGISTRY_INVALID", "Stored build.machines configuration cannot be read")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"version":             snapshot.Version,
+		"approvedAgentCommit": nullableString(string(snapshot.Doc.ApprovedAgentCommit)),
+		"bundles": []gin.H{
+			s.deployedBundleView("linux/amd64", machineRoleBuilder),
+			s.deployedBundleView("darwin/arm64", machineBundleBuilderDarwin),
+		},
+	})
+}

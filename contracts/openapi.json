@@ -4406,6 +4406,24 @@
       }
     },
     "/v1/admin/platform/build-agent-version": {
+      "get": {
+        "summary": "Read the deployed and approved build-agent version",
+        "description": "Platform admin. Returns what is deployed on this server right now (per bundle: commit, the offline signature sequence, when it was signed and which release key signed it, plus the archive digest) together with the approved commit. Each bundle carries its own error string instead of failing the whole call, so an unsigned or missing darwin bundle stays visible. Reading this before approving is the point: approving a wrong sha stops every machine from claiming, and the symptom is a queue that quietly stops moving.",
+        "responses": {
+          "200": {
+            "description": "version, approvedAgentCommit and the deployed bundles"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Platform admin only"
+          },
+          "500": {
+            "description": "MACHINE_REGISTRY_INVALID"
+          }
+        }
+      },
       "post": {
         "summary": "Approve a build-agent version",
         "description": "Platform admin. Machines whose self-reported agentCommit differs are answered 409 AGENT_UPGRADE_REQUIRED at claim time instead of being given a job, so they upgrade while idle and a build in flight finishes untouched. Send an empty commit to stop pinning a version. This is not a security boundary - what stops a compromised server from shipping a malicious binary is the offline-signed manifest and its monotonic sequence; this only decides when machines move.",
@@ -9198,7 +9216,7 @@
           },
           "installCommand": {
             "type": "string",
-            "description": "The one-line command to run as root on the new machine, composed by the server from the request's external origin: curl -fsSL <origin>/v1/machine-setup/install.sh | sudo bash -s -- --server <origin> --code <code>; signers additionally end with ' --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>' where the angle-bracket placeholder is kept verbatim for the operator to replace from the password manager. Show and copy it as is."
+            "description": "The command to run as root on the new machine, composed by the server from the request's external origin. Linux is one line: curl -fsSL <origin>/v1/machine-setup/install.sh | sudo bash -s -- --server <origin> --code <code>; signers additionally end with ' --recovery-sha256 <从密码管理器粘贴恢复公钥指纹>'. A darwin machine gets six newline-separated lines instead: the installer is downloaded to disk, its digest checked out of band, and then run with --expect-sha256, --release-key-sha256 and --allowed-signers-sha256 - never piped into a shell, because a Mac holds every tenant's signing material and first install is where its trust roots are pinned. Every angle-bracket placeholder is kept verbatim for the operator to replace from the CI log or the password manager. Show and copy it as is."
           }
         }
       },
