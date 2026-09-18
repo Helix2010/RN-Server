@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 构建机的「最近在线」与自报盘点（设计 ios-mac-builders-home-network-2026-09-18 §5.2、§5.4）。
@@ -291,4 +293,106 @@ func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesD
 		}
 	}
 	return coverage, nil
+}
+
+// iosSigningTarget 是一个租户要的签名材料：哪个 Team、哪个 bundle id。
+type iosSigningTarget struct {
+	TenantID string
+	Slug     string
+	TeamID   string
+	BundleID string
+}
+
+// iosSigningTargets 列出所有登记了 iOS 发布身份的租户。
+//
+// 控制台拿它与每台机器的自报盘点求差集，得出"这台缺 <租户> 的签名材料"。这是**池子**
+// 这个不变量唯一的监视器：设计里每台 Mac 都应该能打任何租户的包，而材料是人一台台导进
+// 钥匙串的——漏一台就漏一个租户，不看差集的话要等到那个租户排任务时才发现。
+func (s *server) iosSigningTargets(ctx context.Context) ([]iosSigningTarget, error) {
+	// 只算还在的租户：删掉的租户留下的 release.ios 会在每台机器上变成一条永远补不上的
+	// 缺口，而那个租户再也不会排任务
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT c.tenant_id,t.slug,c.config_value FROM app_configs c
+		  JOIN tenants t ON t.id=c.tenant_id AND t.deleted=0
+		  WHERE c.config_key=? AND c.tenant_id<>0`, releaseIOSIdentityConfigKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []iosSigningTarget{}
+	for rows.Next() {
+		var target iosSigningTarget
+		var raw []byte
+		if err := rows.Scan(&target.TenantID, &target.Slug, &raw); err != nil {
+			return nil, err
+		}
+		// 一条读不出来的配置不该让整页打不开：它在别处（排队、认领）会自己报出来
+		identity, err := parseIOSReleaseIdentity(raw)
+		if err != nil || identity.AppleTeamID == "" || identity.BundleID == "" {
+			continue
+		}
+		target.TeamID, target.BundleID = identity.AppleTeamID, identity.BundleID
+		out = append(out, target)
+	}
+	return out, rows.Err()
+}
+
+// machineLivenessView 是控制台机器卡片要的那一块。
+//
+// 恒有值（机器从没报到过时各项为 null / 空数组）：一个新字段不该有能力让整页打不开，
+// 而"从来没上线过"本身就是要显示出来的状态。
+func machineLivenessView(live machineLiveness, machine gin.H, wanted []iosSigningTarget, now time.Time) gin.H {
+	role, _ := machine["role"].(string)
+	platforms, _ := machine["platforms"].([]string)
+	view := gin.H{
+		"lastSeenAt":  nil,
+		"online":      false,
+		"agentCommit": nil,
+		"freeGb":      nil,
+		"appleTeams":  []gin.H{},
+		// missingTenants 是这台机器缺材料的租户（只对能打 iOS 的构建机算）
+		"missingTenants":   []gin.H{},
+		"signingExpiresAt": nil,
+		"pausedReason":     nil,
+		"upgradeError":     nil,
+	}
+	if live.MachineID != "" {
+		view["lastSeenAt"] = live.LastSeenAt.UTC().Format(time.RFC3339)
+		view["online"] = live.online(now)
+		view["agentCommit"] = nullableString(live.AgentCommit)
+		view["pausedReason"] = nullableString(live.PausedReason)
+		view["upgradeError"] = nullableString(live.UpgradeError)
+		if live.FreeGB.Valid {
+			view["freeGb"] = live.FreeGB.Int64
+		}
+		if live.SigningExpiresAt.Valid {
+			view["signingExpiresAt"] = live.SigningExpiresAt.Time.UTC().Format(time.RFC3339)
+		}
+		teams := make([]gin.H, 0, len(live.AppleTeams))
+		for _, team := range live.AppleTeams {
+			teams = append(teams, gin.H{
+				"teamId": team.TeamID, "bundleIds": team.BundleIDs,
+				"expiresAt": nullableString(team.ExpiresAt), "uploadProbe": nullableString(team.UploadProbe),
+			})
+		}
+		view["appleTeams"] = teams
+	}
+	// 差集只对"能打 iOS 的构建机"算：签名闸与只打 Android 的机器没有这个概念，
+	// 给它们算一份缺口只会让控制台上出现一片与它们无关的黄色
+	if role != machineRoleBuilder || !containsString(platforms, buildPlatformIOS) {
+		return view
+	}
+	held := signingPairs(live.AppleTeams)
+	missing := []gin.H{}
+	for _, target := range wanted {
+		if containsString(held, strings.ToUpper(target.TeamID)+"."+target.BundleID) {
+			continue
+		}
+		missing = append(missing, gin.H{
+			"tenantId": target.TenantID, "slug": target.Slug,
+			"teamId": target.TeamID, "bundleId": target.BundleID,
+		})
+	}
+	view["missingTenants"] = missing
+	return view
 }

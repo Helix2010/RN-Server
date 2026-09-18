@@ -4075,7 +4075,7 @@
     "/v1/admin/platform/machines": {
       "get": {
         "summary": "List builders and signers",
-        "description": "The build.machines registry. Console acceptance only affects routing: signers and the offline tool trust their local records and the offline pin file.",
+        "description": "The build.machines registry. Console acceptance only affects routing: signers and the offline tool trust their local records and the offline pin file. The response also carries approvedAgentCommit (the build-agent version machines must run) and, per machine, a liveness block.",
         "responses": {
           "200": {
             "description": "Registry",
@@ -8482,6 +8482,9 @@
               "darwin"
             ],
             "description": "Operating system of this machine; always present, defaults to linux for machines registered before this field existed. Decides which bundle it installs."
+          },
+          "liveness": {
+            "$ref": "#/components/schemas/MachineLiveness"
           }
         }
       },
@@ -10146,6 +10149,109 @@
           "signature": {
             "type": "string",
             "description": "base64 ed25519 signature over a canonical line-per-field payload, not over the JSON."
+          }
+        }
+      },
+      "MachineLiveness": {
+        "type": "object",
+        "description": "What this machine looks like right now, as opposed to what the registry says it is. The two live apart (the registry is a versioned config document written by admins; this comes from the liveness table a machine writes on every claim and heartbeat) but must be read together: missingTenants is the only monitor of the pool invariant - every Mac should be able to build every tenant, yet the material is imported machine by machine, by hand. Always present; a machine that never reported shows nulls and empty arrays rather than making the page fail.",
+        "required": [
+          "lastSeenAt",
+          "online",
+          "agentCommit",
+          "freeGb",
+          "appleTeams",
+          "missingTenants",
+          "signingExpiresAt",
+          "pausedReason",
+          "upgradeError"
+        ],
+        "properties": {
+          "lastSeenAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Last claim or heartbeat, UTC. null = never reported."
+          },
+          "online": {
+            "type": "boolean",
+            "description": "Seen within the last 5 minutes. A machine being offline does not block queueing - jobs wait for it to come back."
+          },
+          "agentCommit": {
+            "type": "string",
+            "nullable": true,
+            "description": "Commit of the build-agent binary on that machine. Compare with approvedAgentCommit on the list."
+          },
+          "freeGb": {
+            "type": "integer",
+            "nullable": true
+          },
+          "appleTeams": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "teamId": {
+                  "type": "string"
+                },
+                "bundleIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "expiresAt": {
+                  "type": "string",
+                  "nullable": true
+                },
+                "uploadProbe": {
+                  "type": "string",
+                  "nullable": true,
+                  "enum": [
+                    "ok",
+                    "forbidden",
+                    "error",
+                    null
+                  ]
+                }
+              }
+            },
+            "description": "Signing material this machine reported holding. Self-reported: an operations dashboard, not a security boundary."
+          },
+          "missingTenants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tenantId": {
+                  "type": "string"
+                },
+                "slug": {
+                  "type": "string"
+                },
+                "teamId": {
+                  "type": "string"
+                },
+                "bundleId": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Tenants with an iOS release identity whose (team, bundle id) this machine did not report. Only computed for builders that can build ios; empty for everything else."
+          },
+          "signingExpiresAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Earliest certificate or profile expiry reported by this machine."
+          },
+          "pausedReason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why the machine is up but not taking work (low disk, for example)."
+          },
+          "upgradeError": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why the last self-upgrade failed."
           }
         }
       }

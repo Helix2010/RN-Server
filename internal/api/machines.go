@@ -661,13 +661,40 @@ func machineViews(doc buildMachinesDoc) []gin.H {
 // ---- 管理端（平台管理员） ----
 
 func (s *server) listMachines(c *gin.Context) {
-	snapshot, err := readMachineRegistry(c.Request.Context(), s.db, false)
+	ctx := c.Request.Context()
+	snapshot, err := readMachineRegistry(ctx, s.db, false)
 	if err != nil {
 		slog.Error("cannot read the machine registry", "error", err)
 		problem(c, http.StatusInternalServerError, "MACHINE_REGISTRY_INVALID", "Stored build.machines configuration cannot be read")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"version": snapshot.Version, "items": machineViews(snapshot.Doc)})
+	items := machineViews(snapshot.Doc)
+	// 登记只说这台机器是谁；它现在活着没有、手上有哪些 Team 的签名材料、跑的是哪一版
+	// 程序，都在心跳表里（设计 ios-mac-builders-home-network-2026-09-18 §5.4）。
+	// 这两件事分开存，但在控制台上必须一起看——"这台机器缺谁的材料"是池子这个不变量
+	// 唯一的监视器
+	liveness, err := s.machineLivenessByID(ctx)
+	if err != nil {
+		slog.Error("cannot read build machine liveness", "error", err)
+		problem(c, http.StatusInternalServerError, "MACHINE_LIVENESS_UNAVAILABLE", "Build machine liveness cannot be read")
+		return
+	}
+	wanted, err := s.iosSigningTargets(ctx)
+	if err != nil {
+		slog.Error("cannot read the iOS release identities", "error", err)
+		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.ios configuration is invalid")
+		return
+	}
+	now := s.now()
+	for _, item := range items {
+		id, _ := item["id"].(string)
+		item["liveness"] = machineLivenessView(liveness[id], item, wanted, now)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"version":             snapshot.Version,
+		"approvedAgentCommit": nullableString(string(snapshot.Doc.ApprovedAgentCommit)),
+		"items":               items,
+	})
 }
 
 type machineWriteCommon struct {

@@ -392,3 +392,89 @@ func TestDBMacBuilderMustBeAbleToBuildIOS(t *testing.T) {
 		}
 	}
 }
+
+// 机器列表要把"登记"与"现在的样子"一起给出来：控制台上那张卡片要回答的是
+// "这台机器活着没有、手上有哪些 Team 的材料、缺谁的"，而这三件事分在两处存
+// （设计 §5.2、§5.4）。
+func TestDBMachineListCarriesLivenessAndTheSigningGap(t *testing.T) {
+	f, macs := newIOSPool(t, 75, 1)
+	// 另一个租户也登记了 iOS 身份，但这台 Mac 没有它的材料：差集要把它列出来
+	other := testTenant(76)
+	if _, err := f.db.Exec(`INSERT INTO tenants(id,slug,status,start_date,expiry_date,deleted,created_at,updated_at)
+		VALUES(?,?,1,CURDATE(),DATE_ADD(CURDATE(), INTERVAL 1 YEAR),0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		other, "bld-"+other); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(iosReleaseIdentity{AppleTeamID: poolTeamB, BundleID: "com.other.app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+		VALUES(?,?,?,1,'test',UTC_TIMESTAMP(3))`, other, releaseIOSIdentityConfigKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
+		t.Fatalf("claim: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	listed := f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil)
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list machines: %d %s", listed.Code, listed.Body.String())
+	}
+	body := decodeBody(t, listed)
+	if _, present := body["approvedAgentCommit"]; !present {
+		t.Fatal("the machine list must say which agent version is approved")
+	}
+	items, _ := body["items"].([]any)
+	var mac map[string]any
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["id"] == macs[0].ID {
+			mac = entry
+		}
+	}
+	if mac == nil {
+		t.Fatalf("the Mac is not in the list: %v", items)
+	}
+	live, _ := mac["liveness"].(map[string]any)
+	if live == nil || live["online"] != true || live["lastSeenAt"] == nil {
+		t.Fatalf("liveness: %v", live)
+	}
+	teams, _ := live["appleTeams"].([]any)
+	if len(teams) != 1 {
+		t.Fatalf("self-reported teams: %v", live["appleTeams"])
+	}
+	// 差集是跨租户算的（测试库里还有别的用例留下的租户），只断言该在的在、不该在的不在
+	missing, _ := live["missingTenants"].([]any)
+	var gapForOther map[string]any
+	for _, item := range missing {
+		gap, _ := item.(map[string]any)
+		if gap["tenantId"] == other {
+			gapForOther = gap
+		}
+		if gap["tenantId"] == f.tenant {
+			t.Fatalf("a tenant this machine can build was listed as a gap: %v", gap)
+		}
+	}
+	if gapForOther == nil || gapForOther["teamId"] != poolTeamB || gapForOther["bundleId"] != "com.other.app" {
+		t.Fatalf("the signing gap must name the tenant this machine cannot build: %v", missing)
+	}
+	if gapForOther["slug"] == "" {
+		t.Fatalf("a gap must name the tenant, not just its id: %v", gapForOther)
+	}
+	// 签名闸与只打 Android 的机器没有"缺哪个 Team"这个概念：给它们算差集只会在控制台上
+	// 铺一片与它们无关的黄色
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["id"] == macs[0].ID {
+			continue
+		}
+		entryLive, _ := entry["liveness"].(map[string]any)
+		if entryLive == nil {
+			t.Fatalf("every machine must carry a liveness block: %v", entry)
+		}
+		if gaps, _ := entryLive["missingTenants"].([]any); len(gaps) != 0 {
+			t.Fatalf("a non-iOS machine was given a signing gap: %v", entry)
+		}
+	}
+}
