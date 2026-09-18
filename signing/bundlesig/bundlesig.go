@@ -103,7 +103,7 @@ func Sign(private ed25519.PrivateKey, manifest []byte, commit string, sequence i
 		PublicKeySHA256: PublicKeySHA256(public),
 		SignedAt:        at.UTC().Format(time.RFC3339),
 	}
-	signature.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(private, signature.signedBytes()))
+	signature.Signature = signSSHSig(private, Namespace, signature.signedBytes())
 	return signature, nil
 }
 
@@ -129,6 +129,8 @@ func Parse(raw []byte) (Signature, error) {
 		return signature, errors.New("the signature has no usable manifest digest")
 	case !digestPattern.MatchString(signature.PublicKeySHA256):
 		return signature, errors.New("the signature has no usable public key digest")
+	case !strings.HasPrefix(strings.TrimSpace(signature.Signature), armorBegin):
+		return signature, errors.New("the signature is not an armoured SSH signature")
 	}
 	return signature, nil
 }
@@ -149,26 +151,21 @@ func Verify(public ed25519.PublicKey, manifest []byte, signature Signature) erro
 	if got := ManifestSHA256(manifest); got != signature.ManifestSHA256 {
 		return fmt.Errorf("the manifest does not match its signature (%s, signed %s)", got, signature.ManifestSHA256)
 	}
-	raw, err := base64.StdEncoding.DecodeString(signature.Signature)
-	if err != nil || len(raw) != ed25519.SignatureSize {
-		return errors.New("the signature is not an ed25519 signature")
-	}
-	if !ed25519.Verify(public, signature.signedBytes(), raw) {
-		return errors.New("the manifest signature does not verify against the pinned release key")
-	}
-	return nil
+	return verifySSHSig(public, Namespace, signature.signedBytes(), signature.Signature)
 }
 
-// ParsePublicKey 读一份公钥文件（base64，允许尾部换行）。
+// ParsePublicKey 读一份公钥文件。格式是 OpenSSH 的一行公钥（`ssh-ed25519 AAAA… 注释`），
+// 与 allowed_signers 里的写法一致：这台机器上两个信任根因此是同一种格式。
 func ParsePublicKey(raw []byte) (ed25519.PublicKey, error) {
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+	fields := strings.Fields(strings.TrimSpace(string(raw)))
+	if len(fields) < 2 || fields[0] != keyAlgo {
+		return nil, fmt.Errorf("the release public key is not an %s public key line", keyAlgo)
+	}
+	blob, err := base64.StdEncoding.DecodeString(fields[1])
 	if err != nil {
 		return nil, fmt.Errorf("the release public key is not base64: %w", err)
 	}
-	if len(decoded) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("the release public key is %d bytes, expected %d", len(decoded), ed25519.PublicKeySize)
-	}
-	return ed25519.PublicKey(decoded), nil
+	return parseSSHPublicKeyBlob(blob)
 }
 
 // ParsePrivateKey 读一份私钥文件（base64）。它只在离线机器上被读。

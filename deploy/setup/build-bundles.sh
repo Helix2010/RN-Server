@@ -157,13 +157,16 @@ echo "安装包：$OUT（提交 $COMMIT）"
 # ——这两行只是省掉一次"去哪儿算这个值"，**不是**核对的来源。
 #
 # 两者口径不同，不能都用 sha256sum：
-#   release-key.pub  算的是**公钥字节**的摘要（与 bundle-sign key create 打印的、清单签名
+#   release-key.pub  算的是**公钥字节**的摘要（与 bundle-sign key create / key public 打印的、清单签名
 #                    里 publicKeySha256、控制台显示的一致）。文件里是 base64 加一个换行，
 #                    按文件算会得到另一个数，装机时永远对不上。
 #   allowed_signers  是一份多行文本，没有"原始字节"可言，文件摘要就是它唯一的判据。
 if [ -f "$STAGE/builder-darwin-arm64/release-key.pub" ]; then
+  # 公钥文件是 OpenSSH 的一行（ssh-ed25519 <base64> <注释>）。base64 解出来是 51 字节的
+  # SSH blob，末 32 字节才是公钥本身——指纹算的是那 32 字节，与装机脚本里的算法一致
   printf '%s  release-key.pub (公钥字节)\n' \
-    "$(openssl base64 -d -A <"$STAGE/builder-darwin-arm64/release-key.pub" | sha256sum | cut -d' ' -f1)"
+    "$(awk '{print $2}' "$STAGE/builder-darwin-arm64/release-key.pub" |
+      openssl base64 -d -A | tail -c 32 | sha256sum | cut -d' ' -f1)"
 fi
 [ -f "$STAGE/builder-darwin-arm64/allowed_signers" ] &&
   (cd "$STAGE/builder-darwin-arm64" && sha256sum allowed_signers)

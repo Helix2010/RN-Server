@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -367,7 +366,8 @@ func TestDBMacBuilderInstallsTheDarwinBundle(t *testing.T) {
 
 	described := decodeBody(t, f.describe(code))
 	// 装机只让人带一个带外核对值，其余摘要都从这份验过签的清单里取
-	if described["releaseKeyPub"] != base64.StdEncoding.EncodeToString(public) {
+	// 公钥按 OpenSSH 的一行给出去：装机脚本拿它当场生成 allowed_signers 喂给 ssh-keygen -Y verify
+	if described["releaseKeyPub"] != bundlesig.SSHPublicKeyLine(public, "rn-release-key") {
 		t.Fatalf("describe must hand over the release key: %v", described["releaseKeyPub"])
 	}
 	signature, _ := described["manifestSignature"].(map[string]any)

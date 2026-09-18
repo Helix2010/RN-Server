@@ -1,6 +1,7 @@
 // bundle-sign 是安装包清单的离线签名工具，只在不联网的离线机器上运行。
 //
 //	bundle-sign key create --out <目录>            生成发布密钥（全平台只做一次）
+//	bundle-sign key public --key <私钥>            从私钥重新打印公钥与它的指纹
 //	bundle-sign sign --key <私钥> --dir <安装包目录> --sequence <n>
 //	bundle-sign verify --pub <公钥> --dir <安装包目录> [--min-sequence <n>] [--expect-commit <sha>]
 //
@@ -31,6 +32,9 @@ import (
 // manifestName 与 build-bundles.sh 产出的文件名一致。
 const manifestName = "manifest.json"
 
+// releaseKeyComment 是公钥行末尾的注释，只为了人看着知道这是哪一把。
+const releaseKeyComment = "rn-release-key"
+
 // maxManifestSize：清单是几十 KB 的 JSON（每个文件一条）。
 const maxManifestSize = 4 << 20
 
@@ -48,6 +52,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		if len(args) >= 2 && args[1] == "create" {
 			return createKey(args[2:], stdout, stderr)
 		}
+		if len(args) >= 2 && args[1] == "public" {
+			return publicKey(args[2:], stdout, stderr)
+		}
 	case "sign":
 		return sign(args[1:], stdout, stderr)
 	case "verify":
@@ -60,6 +67,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func usage(stderr io.Writer) {
 	fmt.Fprintln(stderr, "usage:")
 	fmt.Fprintln(stderr, "  bundle-sign key create --out <dir>")
+	fmt.Fprintln(stderr, "  bundle-sign key public --key <private key file>")
 	fmt.Fprintln(stderr, "  bundle-sign sign --key <private key file> --dir <bundle dir> --sequence <n>")
 	fmt.Fprintln(stderr, "  bundle-sign verify --pub <public key file> --dir <bundle dir> [--min-sequence <n>] [--expect-commit <sha>]")
 }
@@ -100,7 +108,7 @@ func createKey(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if err := os.WriteFile(publicPath, []byte(base64.StdEncoding.EncodeToString(public)+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(publicPath, []byte(bundlesig.SSHPublicKeyLine(public, releaseKeyComment)+"\n"), 0o644); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
@@ -108,6 +116,39 @@ func createKey(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "public key:  %s\n", publicPath)
 	fmt.Fprintf(stdout, "public key sha256: %s\n", bundlesig.PublicKeySHA256(public))
 	fmt.Fprintln(stdout, "write that sha256 into the password manager: every machine installation checks it out of band.")
+	return 0
+}
+
+// publicKey 从私钥重新导出公钥：
+//
+//	bundle-sign key public --key release-key.ed25519 > release-key.pub
+//
+// 有了它，换公钥文件格式这种事不需要动私钥，也不需要把私钥从密码管理器里搬到别处去——
+// 在那台离线机器上跑一条命令就行。
+func publicKey(args []string, stdout, stderr io.Writer) int {
+	set := flag.NewFlagSet("key public", flag.ContinueOnError)
+	set.SetOutput(stderr)
+	keyPath := set.String("key", "", "release private key file")
+	if err := set.Parse(args); err != nil || set.NArg() != 0 || *keyPath == "" {
+		fmt.Fprintln(stderr, "usage: bundle-sign key public --key <private key file>")
+		return 2
+	}
+	keyRaw, err := os.ReadFile(*keyPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "cannot read the release private key:", err)
+		return 1
+	}
+	private, err := bundlesig.ParsePrivateKey(keyRaw)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	public, _ := private.Public().(ed25519.PublicKey)
+	// 公钥行走 stdout，说明走 stderr：`bundle-sign key public --key … > release-key.pub`
+	// 就是完整的用法，不用再 head -1
+	fmt.Fprintln(stdout, bundlesig.SSHPublicKeyLine(public, releaseKeyComment))
+	fmt.Fprintf(stderr, "public key sha256: %s\n", bundlesig.PublicKeySHA256(public))
+	fmt.Fprintln(stderr, "redirect stdout into release-key.pub; the sha256 is what every installation checks out of band.")
 	return 0
 }
 

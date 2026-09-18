@@ -130,3 +130,32 @@ func TestUsageIsRefusedNotGuessed(t *testing.T) {
 		}
 	}
 }
+
+// key public 要能直接重定向成 release-key.pub：公钥行走 stdout，说明走 stderr。
+// 这条是给"已经有一把私钥、需要换公钥文件格式"的场景用的——不用碰私钥。
+func TestKeyPublicWritesOnlyTheKeyLineToStdout(t *testing.T) {
+	keys := newReleaseKey(t)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"key", "public", "--key", filepath.Join(keys, "release-key.ed25519")}, &stdout, &stderr); code != 0 {
+		t.Fatalf("key public: %d %s", code, stderr.String())
+	}
+	line := strings.TrimRight(stdout.String(), "\n")
+	if strings.Contains(line, "\n") {
+		t.Fatalf("stdout must hold nothing but the public key line: %q", stdout.String())
+	}
+	public, err := bundlesig.ParsePublicKey([]byte(line))
+	if err != nil {
+		t.Fatalf("key public did not print a usable public key: %v", err)
+	}
+	// 与 key create 当初写下的那一份逐字节相同：重新导出不能得到另一把
+	onDisk, err := os.ReadFile(filepath.Join(keys, "release-key.pub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimRight(string(onDisk), "\n") != line {
+		t.Fatalf("key public disagrees with key create:\n%q\n%q", onDisk, line)
+	}
+	if !strings.Contains(stderr.String(), bundlesig.PublicKeySHA256(public)) {
+		t.Fatalf("key public must report the out-of-band digest: %s", stderr.String())
+	}
+}

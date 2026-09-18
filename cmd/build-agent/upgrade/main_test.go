@@ -133,7 +133,7 @@ func newMachine(t *testing.T, public ed25519.PublicKey, server string) machine {
 		}
 	}
 	if err := os.WriteFile(filepath.Join(m.installDir, releaseKeyName),
-		[]byte(base64.StdEncoding.EncodeToString(public)+"\n"), 0o644); err != nil {
+		[]byte(bundlesig.SSHPublicKeyLine(public, "rn-release-key")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range upgradeBinaries {

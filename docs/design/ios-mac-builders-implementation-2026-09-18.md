@@ -16,11 +16,11 @@
 | S2 | 已完成 | 本分支 | 迁移 55 `build_machine_liveness`；`claim` 在锁与事务外、204 之前写；`heartbeat` 只动 `last_seen_at`；`hasLiveBuilderFor` 未改 |
 | S3 | 已完成 | 本分支 | `claim` 体加 `agentCommit`/`os`/`appleTeams`/`freeGb`；`/ios-release` 体加 `toolchain`、`uploadedByEarlierAttempt`，两者进 `file_metadata`；`ios-release` 补进 OpenAPI（之前整条路由没写） |
 | S4 | 已完成 | 本分支 | `build-bundles.sh` 多出 `builder-darwin-arm64.tar.gz`（build-agent/build-runner/ios-upload + macOS env 示例），`builder.tar.gz` 仍指 linux/amd64；登记里加 `os`，`describe`/下载按它选那一组；`-X main.commit` 注入两处一致 |
-| S5 | 已完成 | 本分支 | `install-macos.sh`（674 行，`go:embed`，`GET /v1/machine-setup/install-macos.sh`）：三个带外核对值必填且真的用来比对，FileVault 没开就拒装，三个角色账户 + 目录、安装包逐文件核对、冒烟、钥匙串与随机口令、enroll、deploy key、两份 plist |
+| S5 | 已完成 | 本分支 | `install-macos.sh`（816 行，`go:embed`，`GET /v1/machine-setup/install-macos.sh`）：唯一那个带外核对值必填且真的用来比对（人给的指纹 → 认公钥 → `ssh-keygen -Y verify` 验清单 → 可信清单里的摘要），FileVault 没开就拒装，三个角色账户 + 目录、安装包逐文件核对、冒烟、钥匙串与随机口令、enroll、deploy key、两份 plist |
 | S6 | 已完成 | 本分支 | `GET /v1/build-agent/bundle`（清单 base64 + 离线签名 + 归档地址）与 `/bundle/archive`（流式，豁免库超时）；平台级 `approvedAgentCommit` 与 `POST /v1/admin/platform/build-agent-version`；claim 在选任务**之前**比对，不等则 409 `AGENT_UPGRADE_REQUIRED`；没签名或 `-dirty` 一律 503 |
 | S7 | 已完成 | 本分支 | `ascapi` 加 `Uploader`（**只有它能写 Apple 侧状态**，服务端只构造只读的 `Client`，有用例守着）、Build Uploads 三个端点、按 build 号查询、只读探测 |
 | S8 | 已完成 | 本分支 | `deploy/rancher/README.md`：安装包目录挂卷（含 `manifest.sig` 必须一起放）、`TRUSTED_PROXIES`、Ingress 不重定向与不剥请求头、出站到 ASC、**限速按副本各算**（N 副本就是 N×20，写下来免得有人按 20 算容量）、多副本直接开的依据、阶段 E 的验证清单 |
-| S11 | 已完成 | 本分支 | `GET /v1/admin/platform/build-agent-version`（C4 要的读接口）与 darwin 的六行装机命令。设计里没有编号，归在 S6/S5 名下 |
+| S11 | 已完成 | 本分支 | `GET /v1/admin/platform/build-agent-version`（C4 要的读接口）与 darwin 的四行装机命令。设计里没有编号，归在 S6/S5 名下 |
 | S9 | 已完成 | 本分支 | `signing/bundlesig` + 离线 `bundle-sign`（key create / sign / verify）；签的是提交 + 单调序号 + 清单摘要的规范化字节，不签 JSON |
 | S10 | 已完成 | 本分支 | 排队超 6 小时的 iOS 任务发一条告警（每条只发一次，靠审计去重），**不改状态**；告警分得清"没人在线"与"没人有这个 Team 的材料" |
 
@@ -54,7 +54,7 @@
 | # | 状态 | 提交 | 备注 |
 | --- | --- | --- | --- |
 | C1 | 已完成 | `fba909c` | 机器卡片加「运行状态」：最近在线 / 离线 / 从未上报、空闲空间、程序版本（与 `approvedAgentCommit` 不一致时标黄并说明它会自己升级）、自报的 Team 与上传 Key 探测结论、「缺 X 租户的签名材料」、证书 30 天内到期与已过期、机器自停领任务与上一次升级失败。整块写明"自报是运维仪表不是安全边界" |
-| C2 | 已完成 | `fba909c` + `2f62b9b` | 新建构建机可选 macOS（自动勾上 iOS 且不能取消，与服务端 400 一致）；服务端给 darwin 拼六行装机命令，控制台把**每个**尖括号占位都标黄（原来只标第一个）并写明它为什么不是 `curl \| bash` |
+| C2 | 已完成 | `fba909c` + `2f62b9b` | 新建构建机可选 macOS（自动勾上 iOS 且不能取消，与服务端 400 一致）；服务端给 darwin 拼四行装机命令，控制台把**每个**尖括号占位都标黄（原来只标第一个）并写明它为什么不是 `curl \| bash` |
 | C3 | 已完成 | `fba909c` | 打包任务表加「排队」列（还在排队的那格自己走并标黄）；`buildJobSchema` 加 `warnings`，`no_ios_builder_online` 翻成一条留在页面上的提示；409 `NO_BUILDER_FOR_TEAM` 翻成"去哪儿导材料" |
 | C4 | 已完成 | `fba909c` + `2f62b9b` | 新增 `GET /v1/admin/platform/build-agent-version` 与「批准打包机程序版本」卡片：先显示两组安装包各自的提交、签名序号、签名时间、发布公钥指纹、归档摘要，再谈批准；批准与取消钉版本都走 `reason` + `confirm`；列出"现在因为版本不一致领不到任务"的机器 |
 
@@ -69,7 +69,12 @@
 | `allowed_signers`（提交验签） | 文件 sha256 `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` | 不要，由脚本从验过签的清单里核对 |
 
 两者口径不同（一个算公钥字节、一个算文件），落地当天撞出一个必然导致装机失败的 bug，见提交 `b01a11d`。
-`build-bundles.sh` 结尾现在会按正确口径各打印一行；零警告的完整构建已跑通。
+`build-bundles.sh` 结尾现在会按正确口径各打印一行；零警告的完整构建已跑通。口径的一致性现在有
+端到端测试兜着（`internal/machinesetup/install_macos_chain_test.go`：真密钥、真签名，把脚本里的
+`parse_description` 拉出来跑正反面）——把指纹改回按文件算，那组测试当场转红，正是当初漏掉的那个 bug。
+
+**两份文件现在是同一种格式**：`release-key.pub` 与 `allowed_signers` 都是 OpenSSH 的一行公钥。
+密钥没换、上表两个值都没变，改的只是 `release-key.pub` 的编码（原来是一行裸 base64）。
 
 ## 运维手册（设计 §10 第 5 条）
 
@@ -86,12 +91,13 @@
 | §5.2 认领 SQL | "用子查询而不是 JOIN"（避免锁住 `app_configs`） | 子查询 + `FOR UPDATE OF j SKIP LOCKED` | 只写子查询不够：MySQL 的锁定读会把子查询里读到的行一起锁上，要 `OF j` 才真的把锁限定在 `build_jobs` 上 |
 | §6.2「低于 `BUILD_AGENT_MIN_FREE_GB` 不认领并告警（进 claim 的自报）」 | 两句话合不拢：不认领就没有 claim，也就没有自报，控制台只会看到"离线" | 认领**照发**，但带 `paused` + `pausedReason`，服务端记一行在线与原因后回 204 不派活；请求体与心跳表各加一个字段 | 磁盘满和关机要做的处理完全不同，控制台得分得清。代价是契约多两个字段 |
 | §4.4「`security cms -D -i` 读 `ExpirationDate`」 | 起子进程解描述文件 | 纯 Go 从 CMS 块里取出 XML plist 自己解析 | 与 §4.3 第 1 步对 `.ipa` 定的规矩一致（不对文件调 `unzip`/`plutil`），少一处子进程；副作用是盘点在 Linux 上也测得了，不需要一台 Mac |
-| §4.5 装机要三个带外核对值 | `--expect-sha256`（CI 日志里的归档摘要）、`--release-key-sha256`、`--allowed-signers-sha256` | 只要 `--release-key-sha256` 一个。`describe` 对 darwin 额外下发清单原始字节、它的离线签名与发布公钥；脚本用人给的指纹认出公钥 → 验清单 → 从**已验签的清单**里取归档与每个文件的摘要 | 三个值里有两个是冗余的（归档摘要对了，包里的文件就都对了），而剩下那个"归档摘要"每次发版都变、要去翻 CI 日志找对应版本——它恰恰是最麻烦也最弱的一环：CI 日志能被改，离线签名不能。人工抄写从 3 处减到 1 处，抄错的机会少三分之二，而判据反而更强。代价是脚本里多了一段纯 Python 的 ed25519 验签（只做 verify，RFC 8032 向量与 Go 交叉验证都跑过），它的可信度来自脚本自身的 shasum——那是这条链子的第一环，本来就要核对 |
+| §4.5 装机要三个带外核对值 | `--expect-sha256`（CI 日志里的归档摘要）、`--release-key-sha256`、`--allowed-signers-sha256` | 只要 `--release-key-sha256` 一个。`describe` 对 darwin 额外下发清单原始字节、它的离线签名与发布公钥；脚本用人给的指纹认出公钥 → 验清单 → 从**已验签的清单**里取归档与每个文件的摘要 | 三个值里有两个是冗余的（归档摘要对了，包里的文件就都对了），而剩下那个"归档摘要"每次发版都变、要去翻 CI 日志找对应版本——它恰恰是最麻烦也最弱的一环：CI 日志能被改，离线签名不能。人工抄写从 3 处减到 1 处，抄错的机会少三分之二，而判据反而更强 |
+| §5.6 清单签名的编码 | 只说"Ed25519 签 `manifest.json`" | 签名放进 `manifest.sig` 时用 **OpenSSH 的 `SSHSIG` 封装**（namespace `rn-machine-bundles`），被签的字节不变 | 算法没变，变的是外层封装。装机脚本要在**下载安装包之前**验这份签名，那时机器上除了脚本自己没有任何可信的东西——换成这个格式，验签就是 macOS 自带的 `ssh-keygen -Y verify` 一条命令，脚本里一行密码学都不用写。先前那一版为此内嵌了约 160 行纯 Python 的 ed25519 验签；它跑得通（RFC 8032 向量、与 Go 交叉验证、非 canonical 的 S 都验过），但运维在执行前要把这个脚本从头读一遍再比对 shasum，而一段椭圆曲线运算没人读得动——"比对摘要"就只剩比对、没有"我知道我在跑什么"。顺带把两个信任根的文件格式统一了：`release-key.pub` 与 `allowed_signers` 现在都是 OpenSSH 的一行公钥。**密钥与指纹口径都没动**，密码管理器里那个 `395937be…` 继续用 |
 | §4.3 上传 Key 探测 | `uploadProbe` 只说"进材料盘点" | 在认领体的 `appleTeams[]` 里加 `uploadProbe` 字段，落进 `build_machine_liveness.apple_teams` | 服务端请求体是严格解析，不先加字段代理就报不上来 |
 | A1「`machineEnvKeys` 按 `runtime.GOOS` 组装」 | Linux 上不接受 `RN_IOS_SIGNING_DIR` | 按**任务平台**组装：只有 iOS 任务的环境里才有它 | 是更强的那一条——同一台 Mac 上的 Android 任务同样不该看见签名目录；Linux 侧的保护不变（`BUILD_AGENT_PLATFORMS=ios` 在非 darwin 上启动就失败）。副作用是 iOS 那条链路在 Linux 上测得了，`go test` 覆盖到钥匙串准备、描述文件复制、身份核对与上传交接 |
 | §4.2「`security unlock-keychain -p "$(cat …)"`」 | 口令作为命令行参数 | 三条命令走 `security -i` 的标准输入 | 命令行参数 `ps` 看得到（AGENTS.md「机密的操作纪律」）。口令的字母表在读入时校验，拼不出第二条命令 |
 | §5.6「Mac 在状态目录记本机见过的最高序号」 | 水位线放在代理的状态目录 | 放在 root 拥有的 `/opt/rn-build-agent/upgrade-sequence` | 状态目录属于代理那个账户。把"防降级"的水位线放在被防的一方能写的地方，这道闸就不成立了 |
 | §4.3 第 2 步「`--ipa <路径>`」 | 把包的路径交给上传账户 | 包走**标准输入**，上传程序自己落到它的临时文件 | 产物副本在控制进程的 spool 里，而 spool 在状态目录下（0700，同一棵树里放着出处私钥）。为了传一个不是机密的包，去放宽一个装着机密的目录，不划算 |
-| C2 装机命令 | 设计 §4.5 只给了在 Mac 上敲的那几行 | 由服务端拼好整段（六行，含 `shasum` 那一行）随注册码一起下发，控制台原样显示并标出占位 | 与 Linux 那条一致：命令里有服务端才知道的外部源与注册码。三个 sha256 仍然是占位——控制台替人填等于让这台 Mac 把服务端说的话当成信任根 |
+| C2 装机命令 | 设计 §4.5 只给了在 Mac 上敲的那几行 | 由服务端拼好整段（四行，含 `shasum` 那一行）随注册码一起下发，控制台原样显示并标出占位 | 与 Linux 那条一致：命令里有服务端才知道的外部源与注册码。`--release-key-sha256` 仍然是占位——控制台替人填等于让这台 Mac 把服务端说的话当成信任根 |
 | C4 「显示当前安装包提交、清单签名与序号」 | 没说从哪儿读 | 新增一条平台级只读接口，两组安装包各自带 `error` 而不是整条 503 | darwin 那组可能还没编出来；这一页存在的理由就是让人看见现在部署的是什么，一组坏了就整页空白等于把要看的东西藏起来 |
 | §5.3「`build-ios-release.mjs` 打印 `xcodebuild -version` 供 runner 解析」 | 从构建脚本的日志里捞一行 | 执行进程直接问 `xcodebuild -version` | 否则这个值的正确性取决于另一个仓库里某行日志的格式 |

@@ -197,6 +197,20 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 任何清单，所以是直接替换而不是 §3.4 的轮换——没有序号水位线要考虑，也不用去任何机器上换公钥。
 **这个便利只在第一台 Mac 装机之前成立**；一旦有机器装了，换密钥就必须走 §3.4。
 
+> **公钥文件换过一次格式（2026-09-18）。** `release-key.pub` 现在是 OpenSSH 的一行公钥
+> （`ssh-ed25519 AAAA… rn-release-key`），与 `allowed_signers` 里的写法一致——这台机器上两个
+> 信任根因此是同一种格式。**密钥本身没动，指纹也没动**（仍是公钥那 32 字节的 sha256，就是上
+> 表里的值），密码管理器不用改。
+>
+> 离线机器上那份旧格式的 `release-key.pub`（一行裸 base64）要重新导出一次，否则 §3.2 的
+> `bundle-sign verify --pub` 会说"不是一行 ssh-ed25519 公钥"：
+>
+> ```bash
+> /tmp/bundle-sign key public --key ~/rn-release-key/release-key.ed25519 > ~/rn-release-key/release-key.pub
+> ```
+>
+> 它同时把指纹打在 stderr 上，顺手和密码管理器里的值对一眼。
+
 ### 3.1 生成（全平台一次）
 
 在**离线机器**上（`signing/` 是独立的 Go module，要在那个目录里构建）：
@@ -228,8 +242,13 @@ public key sha256: <64 位十六进制>
   > `install-macos.sh` 从一份离线签名背书的清单里取：人给的指纹认出公钥 → 公钥验清单 →
   > 可信清单里的摘要核对归档与每个文件。让人抄三个值不比抄一个更安全，多两次抄写只是多
   > 两次抄错的机会，而其中归档摘要那一个还得每次发版去翻 CI 日志找对应的版本。
-- **公钥文件**：放进仓库的 `deploy/build-agent-macos/release-key.pub`，`build-bundles.sh` 会把它
-  打进 darwin 那组安装包（没有它只是警告，但 `install-macos.sh` 会拒绝安装）。
+- **公钥文件**：OpenSSH 的一行（`ssh-ed25519 AAAA… rn-release-key`）。放进仓库的
+  `deploy/build-agent-macos/release-key.pub`，`build-bundles.sh` 会把它打进 darwin 那组安装包
+  （没有它只是警告，但 `install-macos.sh` 会拒绝安装）。丢了可以从私钥重新导出，不用碰密钥：
+
+  ```bash
+  /tmp/bundle-sign key public --key ~/rn-release-key/release-key.ed25519 > release-key.pub
+  ```
 
 **已定不做双人签名**（设计 §10 第 3 条）：由平台管理员一人持有。
 
@@ -257,6 +276,21 @@ CI 产出 `manifest.json` 与三个归档、部署到服务器之后，在离线
 
 没有 `manifest.sig` 时，`GET /v1/build-agent/bundle` 一律回 503，什么都不给——免得一台机器在
 「清单还没签」的窗口里下到一份没人背书的程序。
+
+**签名放在 `manifest.sig` 的 `signature` 字段里，是一个 OpenSSH 签名块**（`SSHSIG`，就是
+`ssh-keygen -Y sign` 那个格式，namespace 固定 `rn-machine-bundles`）。被签的字节没变，仍是
+每字段一行的规范化内容，不是 JSON。
+
+换成这个格式是为了**装机脚本里不必自带密码学**：新 Mac 要在下载安装包之前验这份签名，那时
+机器上除了脚本自己没有任何可信的东西。用这个格式，验签就是系统自带的一条命令：
+
+```bash
+ssh-keygen -Y verify -f <当场生成的 allowed_signers> -I release-key \
+           -n rn-machine-bundles -s manifest.sig < <被签的字节>
+```
+
+运维在执行前要把那个脚本从头读一遍、再与 CI 日志比对 shasum——那是整条链子的第一环，靠的是
+"能读完"。一段椭圆曲线运算没人读得动，比对摘要就只剩比对、没有"我知道我在跑什么"。
 
 ### 3.3 放开升级
 

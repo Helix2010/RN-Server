@@ -150,10 +150,13 @@ sha256_of() {
 # publicKeySha256 那个字段、控制台「批准打包机程序版本」显示的，全都是公钥 32 字节
 # 的摘要。运维记进密码管理器的就是那个值，装机时 --release-key-sha256 给的也是它。
 # 按文件算会得到另一个数——两边永远对不上，而报错会说"安装包被换过"，让人以为遭到
-# 了攻击。文件里是 base64 加一个换行，先解回原始字节再算。
+# 了攻击。
+#
+# 文件里是 OpenSSH 的一行：`ssh-ed25519 <base64> <注释>`。第二栏解出来是 51 字节的 SSH
+# blob（长度域 + "ssh-ed25519" + 长度域 + 32 字节公钥），**末 32 字节**才是公钥本身。
 release_key_sha256() {
   local sum
-  sum="$(/usr/bin/openssl base64 -d -A <"$1" | /usr/bin/shasum -a 256)"
+  sum="$(awk '{print $2}' "$1" | /usr/bin/openssl base64 -d -A | tail -c 32 | /usr/bin/shasum -a 256)"
   printf '%s' "${sum%% *}"
 }
 
@@ -178,7 +181,7 @@ preflight() {
   [ "$(uname -s)" = Darwin ] || die "这个脚本只装 Mac 打包机；Linux 构建机用 install.sh"
   MISSING=()
   [ "$(uname -m)" = arm64 ] || MISSING+=("Apple Silicon（安装包只编 darwin/arm64；Intel Mac 也跑不了当前的 Xcode）")
-  need_commands curl python3 shasum tar git node pnpm pod xcodebuild xcrun security sysadminctl dseditgroup launchctl
+  need_commands curl python3 shasum openssl ssh-keygen tar git node pnpm pod xcodebuild xcrun security sysadminctl dseditgroup launchctl
 
   if command -v xcodebuild >/dev/null 2>&1; then
     xcodebuild -version >/dev/null 2>&1 ||
@@ -327,148 +330,137 @@ describe() {
   parse_description "$body"
 }
 
-parse_description() {
-  local parsed
-  parsed="$(python3 -I - "$1" "$WORK/files.sha256" "$BUNDLE_NAME" "$RELEASE_KEY_SHA256" <<'PY'
-# 这一段是整条链子的核心：人只带来一个指纹，其余全部由它推出来。
+# parse_description 是整条链子闭合的地方。三步，每一步只信上一步验过的东西：
 #
 #   人给的指纹 -> 认出发布公钥 -> 验清单的离线签名 -> 可信清单里的摘要
 #               -> 核对归档 -> 核对包内每个文件（含 allowed_signers）
 #
-# 所以**下面一切摘要都必须来自验过签的那份清单**，不能来自 describe 响应里 bundle 那个
-# 对象——那是服务端说的，正是要被验证的东西。
-import base64, hashlib, json, sys
+# 这里**一行密码学都没有**：验签交给 macOS 自带的 ssh-keygen -Y verify。自带一个 ed25519
+# 实现当然也能验，但运维在执行前要把这个脚本从头读一遍——那是这条链子的第一环，而一段
+# 曲线运算没人读得动。能读完的脚本才配得上"比对 shasum"这个动作。
+parse_description() {
+  local body="$1"
 
-path, files_out, want_bundle, want_key_sha = sys.argv[1:5]
+  # ---- 1) 拆包。这一步拿到的东西全是服务端说的，一律按不可信处理：只取值、只查形状 ----
+  # 失败原因（python 写在 stderr 上的那一行）要跟着 die 一起出来，否则运维只看到
+  # "describe 的结果不能用"，得自己往上翻
+  local why
+  why="$(python3 -I - "$body" "$WORK" 2>&1 <<'PY'
+import base64, json, struct, sys
+
+path, work = sys.argv[1:3]
 with open(path) as f:
     doc = json.load(f)
 
-role = doc.get("role")
-machine_os = doc.get("os")
+role, machine_os = doc.get("role"), doc.get("os")
 if role != "builder":
     sys.exit("这个注册码是给 %s 的，不是 Mac 打包机" % role)
 if machine_os != "darwin":
     sys.exit("这台机器在控制台里登记的是 %s，不是 macOS：新建机器时要选 macOS" % machine_os)
 
-# ---- 1) 人给的指纹认出发布公钥 ----
+# 发布公钥：OpenSSH 的一行公钥，与 allowed_signers 里的写法一致。这里把它拆开验形状再
+# **重新拼一遍**写出去——写出去的那一行因此必然是 51 字节的规范编码，末 32 字节就是公钥
+# 本身。下一步在 shell 里算指纹靠的正是这个保证
 key_text = (doc.get("releaseKeyPub") or "").strip()
 if not key_text:
     sys.exit("服务端没给发布公钥：安装包目录里缺 release-key.pub，先把签过的安装包部署上去")
+fields = key_text.split()
+if len(fields) < 2 or fields[0] != "ssh-ed25519":
+    sys.exit("服务端给的发布公钥不是一行 ssh-ed25519 公钥")
 try:
-    public = base64.b64decode(key_text, validate=True)
+    blob = base64.b64decode(fields[1], validate=True)
 except Exception:
     sys.exit("服务端给的发布公钥不是 base64")
-if len(public) != 32:
-    sys.exit("服务端给的发布公钥不是 32 字节的 ed25519 公钥")
-got_key_sha = hashlib.sha256(public).hexdigest()
-if got_key_sha != want_key_sha:
-    sys.exit("服务端给的发布公钥指纹是 %s，与 --release-key-sha256 %s 不符。\n"
-             "   这个值是公钥**字节**的摘要（bundle-sign key create 打印的那一行、控制台上显示的那一个），\n"
-             "   不是 release-key.pub 这个文件的摘要。确认手里的值取自密码管理器；仍然不符就不要继续装。"
-             % (got_key_sha, want_key_sha))
 
-# ---- 2) 用它验清单的离线签名 ----
+def read(buf):
+    if len(buf) < 4:
+        sys.exit("服务端给的发布公钥格式不对")
+    n = struct.unpack(">I", buf[:4])[0]
+    if n > len(buf) - 4:
+        sys.exit("服务端给的发布公钥格式不对")
+    return buf[4:4 + n], buf[4 + n:]
+
+algo, rest = read(blob)
+public, rest = read(rest)
+if algo != b"ssh-ed25519" or len(public) != 32 or rest:
+    sys.exit("服务端给的发布公钥不是一把干净的 32 字节 ed25519 公钥")
+canonical = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + public
+with open(work + "/release-key.pub", "w") as out:
+    out.write("ssh-ed25519 " + base64.b64encode(canonical).decode() + " rn-release-key\n")
+
+# 清单与它的签名
 manifest_b64 = doc.get("manifestBase64") or ""
 signature = doc.get("manifestSignature") or {}
 if not manifest_b64 or not signature:
     sys.exit("服务端没给清单签名：安装包还没签，不能装。签名在离线机器上用 bundle-sign 生成")
-manifest_raw = base64.b64decode(manifest_b64)
 if signature.get("format") != "rn-machine-bundles-signature/v1":
     sys.exit("清单签名的 format 不认识：%r" % signature.get("format"))
-if hashlib.sha256(manifest_raw).hexdigest() != signature.get("manifestSha256"):
-    sys.exit("清单的摘要与签名里记的不符")
+armoured = signature.get("signature") or ""
+if not armoured.lstrip().startswith("-----BEGIN SSH SIGNATURE-----"):
+    sys.exit("清单签名不是一个 SSH 签名块")
+with open(work + "/manifest.sig", "w") as out:
+    out.write(armoured if armoured.endswith("\n") else armoured + "\n")
+with open(work + "/manifest.json", "wb") as out:
+    out.write(base64.b64decode(manifest_b64))
 
-# 签的是每字段一行的规范化字节，**不是 JSON**：JSON 的字段顺序、空白与转义有多种写法，
-# 签它等于把"同一份内容的不同写法"也算进签名里。与 signing/bundlesig 逐字节一致
-signed = ("\n".join(["rn-machine-bundles-signature/v1",
-                     "commit=" + signature["commit"],
-                     "sequence=" + str(signature["sequence"]),
-                     "manifestSha256=" + signature["manifestSha256"]]) + "\n").encode()
+# 被签的是每字段一行的规范化字节，**不是 JSON**：JSON 的字段顺序、空白与转义有多种写法，
+# 签它等于把"同一份内容的不同写法"也算进签名里。与 signing/bundlesig 逐字节一致。
+# 这几个值现在还不可信——它们是拼出来喂给验签的**候选**，验过了才算数
+for key in ("commit", "sequence", "manifestSha256"):
+    if signature.get(key) in (None, ""):
+        sys.exit("清单签名里缺 %s" % key)
+with open(work + "/signed-bytes", "w") as out:
+    out.write("\n".join(["rn-machine-bundles-signature/v1",
+                         "commit=" + str(signature["commit"]),
+                         "sequence=" + str(signature["sequence"]),
+                         "manifestSha256=" + str(signature["manifestSha256"])]) + "\n")
+PY
+)" || die "describe 的结果不能用：$why"
 
-# Ed25519 验签（RFC 8032）。只做 verify，不做 sign。这段代码的可信度来自这个脚本本身的
-# shasum——运维在下载它之后、执行之前与 CI 日志比对过，那是这条链子的第一环
-P = 2**255 - 19
-L = 2**252 + 27742317777372353535851937790883648493
-D = -121665 * pow(121666, P - 2, P) % P
-I = pow(2, (P - 1) // 4, P)
+  # ---- 2) 人给的指纹认出发布公钥。这是整条链子上唯一的外部输入 ----
+  local got_key_sha
+  got_key_sha="$(release_key_sha256 "$WORK/release-key.pub")"
+  if [ "$got_key_sha" != "$RELEASE_KEY_SHA256" ]; then
+    die "服务端给的发布公钥指纹是 $got_key_sha，与 --release-key-sha256 $RELEASE_KEY_SHA256 不符。
+   这个值是公钥**字节**的摘要（bundle-sign key create / key public 打印的那一行、控制台上显示的那一个），
+   不是 release-key.pub 这个文件的摘要。确认手里的值取自密码管理器；仍然不符就不要继续装。"
+  fi
 
-def xrecover(y):
-    xx = (y * y - 1) * pow(D * y * y + 1, P - 2, P)
-    x = pow(xx, (P + 3) // 8, P)
-    if (x * x - xx) % P != 0:
-        x = x * I % P
-    return P - x if x % 2 else x
+  # ---- 3) 用它验清单的离线签名。allowed_signers 是拿刚认过指纹的那把公钥当场生成的，
+  # 只有一个签名人；namespace 写死，免得同一把密钥在别处签的东西被拿来当清单签名用 ----
+  printf 'release-key %s\n' "$(cat "$WORK/release-key.pub")" > "$WORK/allowed_signers"
+  if ! ssh-keygen -Y verify -f "$WORK/allowed_signers" -I release-key \
+    -n rn-machine-bundles -s "$WORK/manifest.sig" \
+    <"$WORK/signed-bytes" >/dev/null 2>"$WORK/verify.err"; then
+    die "清单的离线签名验不过：服务端上的安装包不是那把发布密钥签出来的，拒绝安装
+   ssh-keygen 说：$(tr '\n' ' ' <"$WORK/verify.err")"
+  fi
 
-By = 4 * pow(5, P - 2, P) % P
-B = (xrecover(By), By, 1, xrecover(By) * By % P)
+  # 验过之后，signed-bytes 里的三个值才可信。清单要与其中记的摘要对上，它才是被签的那一份
+  local want_manifest got_manifest
+  want_manifest="$(sed -n 's/^manifestSha256=//p' "$WORK/signed-bytes")"
+  got_manifest="$(sha256_of "$WORK/manifest.json")"
+  if [ "$want_manifest" != "$got_manifest" ]; then
+    die "服务端给的清单摘要是 $got_manifest，签名覆盖的是 $want_manifest：这不是被签的那一份清单"
+  fi
+  BUNDLE_COMMIT="$(sed -n 's/^commit=//p' "$WORK/signed-bytes")"
+  BUNDLE_SEQUENCE="$(sed -n 's/^sequence=//p' "$WORK/signed-bytes")"
 
-def add(pt, q):
-    x1, y1, z1, t1 = pt
-    x2, y2, z2, t2 = q
-    a = (y1 - x1) * (y2 - x2) % P
-    b = (y1 + x1) * (y2 + x2) % P
-    c = t1 * 2 * D * t2 % P
-    dd = z1 * 2 * z2 % P
-    e, f, g, h = b - a, dd - c, dd + c, b + a
-    return (e * f % P, g * h % P, f * g % P, e * h % P)
+  # ---- 4) 到这里清单可信了，剩下的摘要全从它里面取 ----
+  local parsed
+  parsed="$(python3 -I - "$body" "$WORK/manifest.json" "$WORK/files.sha256" "$BUNDLE_NAME" "$BUNDLE_COMMIT" 2>&1 <<'PY'
+# 这一段读的是**已经验过签**的清单。describe 响应里 bundle 那个对象只用来对照，不采信
+import json, sys
 
-def mul(pt, e):
-    q = (0, 1, 1, 0)
-    while e > 0:
-        if e & 1:
-            q = add(q, pt)
-        pt = add(pt, pt)
-        e >>= 1
-    return q
+body_path, manifest_path, files_out, want_bundle, want_commit = sys.argv[1:6]
+with open(manifest_path) as f:
+    manifest = json.load(f)
+with open(body_path) as f:
+    doc = json.load(f)
 
-def encode(pt):
-    x, y, z, _ = pt
-    zi = pow(z, P - 2, P)
-    x, y = x * zi % P, y * zi % P
-    return ((y & ((1 << 255) - 1)) | ((x & 1) << 255)).to_bytes(32, "little")
-
-def on_curve(pt):
-    x, y, z, t = pt
-    return (z % P != 0 and x * y % P == z * t % P
-            and (y * y - x * x - z * z - D * t * t) % P == 0)
-
-def decode(raw):
-    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
-    if y >= P:
-        raise ValueError("non-canonical y")
-    x = xrecover(y)
-    if x & 1 != raw[31] >> 7:
-        x = P - x
-    pt = (x, y, 1, x * y % P)
-    if not on_curve(pt):
-        raise ValueError("not on curve")
-    return pt
-
-def ed25519_verify(sig, msg, pub):
-    if len(sig) != 64 or len(pub) != 32:
-        return False
-    s = int.from_bytes(sig[32:], "little")
-    if s >= L:            # 非 canonical 的 S 一律拒（签名可延展性）
-        return False
-    try:
-        r, a = decode(sig[:32]), decode(pub)
-    except ValueError:
-        return False
-    h = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % L
-    return encode(mul(B, s)) == encode(add(r, mul(a, h)))
-
-try:
-    raw_sig = base64.b64decode(signature.get("signature") or "", validate=True)
-except Exception:
-    sys.exit("清单签名不是 base64")
-if not ed25519_verify(raw_sig, signed, public):
-    sys.exit("清单的离线签名验不过：服务端上的安装包不是那把发布密钥签出来的，拒绝安装")
-
-# ---- 3) 从**已验签**的清单里取摘要 ----
-manifest = json.loads(manifest_raw)
 if manifest.get("format") != "rn-machine-bundles/v1":
     sys.exit("清单 format 不认识：%r" % manifest.get("format"))
-if manifest.get("commit") != signature.get("commit"):
+if manifest.get("commit") != want_commit:
     sys.exit("清单里的提交与签名覆盖的提交不同")
 bundle = (manifest.get("bundles") or {}).get(want_bundle)
 if not bundle:
@@ -483,23 +475,19 @@ with open(files_out, "w") as out:
             sys.exit("清单里有不该出现的文件名 %r" % name)
         out.write("%s  %s\n" % (digest, name))
 
-# 服务端在 describe 响应里自报的那一份只用来对照：不一致说明这台服务器上的清单与它回的
-# 话不是一回事，值得当场停下——真正采信的始终是上面那份验过签的
+# 服务端自报的那一份不一致，说明这台服务器上的清单与它回的话不是一回事，值得当场停下
 said = doc.get("bundle") or {}
 if said.get("archiveSha256") and said["archiveSha256"] != bundle.get("archiveSha256"):
     sys.exit("服务端自报的归档摘要与已验签清单里的不一致，拒绝安装")
 
-print("\n".join([doc.get("name") or "", bundle.get("archive") or "", bundle.get("archiveSha256") or "",
-                 str(bundle.get("archiveSize") or 0), manifest.get("commit") or "",
-                 str(signature.get("sequence") or 0)]))
+print("\n".join([doc.get("name") or "", bundle.get("archive") or "",
+                 bundle.get("archiveSha256") or "", str(bundle.get("archiveSize") or 0)]))
 PY
-)" || die "describe 的结果不能用：$parsed"
+)" || die "已验签的清单不能用：$parsed"
   MACHINE_NAME="$(printf '%s' "$parsed" | sed -n 1p)"
   BUNDLE_ARCHIVE="$(printf '%s' "$parsed" | sed -n 2p)"
   BUNDLE_SHA256="$(printf '%s' "$parsed" | sed -n 3p)"
   BUNDLE_SIZE="$(printf '%s' "$parsed" | sed -n 4p)"
-  BUNDLE_COMMIT="$(printf '%s' "$parsed" | sed -n 5p)"
-  BUNDLE_SEQUENCE="$(printf '%s' "$parsed" | sed -n 6p)"
   note "发布公钥指纹与带外给的值一致，清单的离线签名验过（序号 $BUNDLE_SEQUENCE）"
   note "机器 $MACHINE_NAME，安装包 $BUNDLE_ARCHIVE（提交 ${BUNDLE_COMMIT:-未知}）"
 }

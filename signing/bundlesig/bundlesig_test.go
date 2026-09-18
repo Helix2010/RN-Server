@@ -136,13 +136,19 @@ func TestParseRefusesMalformedSignatureFiles(t *testing.T) {
 
 func TestParsePublicKeyRefusesJunk(t *testing.T) {
 	public, _ := testKey(t)
-	if _, err := ParsePublicKey([]byte(base64.StdEncoding.EncodeToString(public) + "\n")); err != nil {
+	if _, err := ParsePublicKey([]byte(SSHPublicKeyLine(public, "rn-release-key") + "\n")); err != nil {
 		t.Fatalf("a valid public key was refused: %v", err)
 	}
+	if _, err := ParsePublicKey([]byte(SSHPublicKeyLine(public, "") + "\n")); err != nil {
+		t.Fatalf("a public key without a comment was refused: %v", err)
+	}
 	for name, raw := range map[string]string{
-		"not base64": "!!!!",
-		"wrong size": base64.StdEncoding.EncodeToString([]byte("short")),
-		"empty":      "",
+		"not base64":        "ssh-ed25519 !!!!",
+		"wrong size":        "ssh-ed25519 " + base64.StdEncoding.EncodeToString(append(sshString([]byte("ssh-ed25519")), sshString([]byte("short"))...)),
+		"empty":             "",
+		"another algorithm": "ssh-rsa " + base64.StdEncoding.EncodeToString(sshPublicKeyBlob(public)),
+		"trailing bytes":    "ssh-ed25519 " + base64.StdEncoding.EncodeToString(append(sshPublicKeyBlob(public), 'x')),
+		"bare base64 (旧格式)": base64.StdEncoding.EncodeToString(public),
 	} {
 		if _, err := ParsePublicKey([]byte(raw)); err == nil {
 			t.Errorf("%s was accepted as a public key", name)

@@ -66,7 +66,7 @@ func signStagedBundles(t *testing.T, f *gateFixture, sequence int64) ed25519.Pub
 	// 发布公钥与 manifest.json 并排放一份，与 build-bundles.sh 的产出一致：新 Mac 的
 	// describe 要在下载归档之前拿到它验清单签名
 	if err := os.WriteFile(filepath.Join(dir, machineReleaseKeyFile),
-		[]byte(base64.StdEncoding.EncodeToString(public)+"\n"), 0o644); err != nil {
+		[]byte(bundlesig.SSHPublicKeyLine(public, "rn-release-key")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return public

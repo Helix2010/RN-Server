@@ -272,12 +272,17 @@ func TestMacInstallScriptDerivesEverythingFromOneOutOfBandDigest(t *testing.T) {
 	// 链子的四环，少一环都不成立
 	for _, step := range []string{
 		// 1) 人给的指纹认出发布公钥
-		`got_key_sha != want_key_sha`,
-		// 2) 用它验清单的离线签名（签的是规范化字节，不是 JSON）
+		`if [ "$got_key_sha" != "$RELEASE_KEY_SHA256" ]; then`,
+		// 2) 用它验清单的离线签名。allowed_signers 当场生成，namespace 写死在命令行上：
+		// 能从签名文件里读 namespace 的验签方等于没有 namespace
+		`printf 'release-key %s\n' "$(cat "$WORK/release-key.pub")" > "$WORK/allowed_signers"`,
+		`ssh-keygen -Y verify -f "$WORK/allowed_signers" -I release-key`,
+		`-n rn-machine-bundles -s "$WORK/manifest.sig"`,
+		// 签的是规范化字节，不是 JSON
 		`"rn-machine-bundles-signature/v1",`,
-		`if not ed25519_verify(raw_sig, signed, public):`,
-		// 3) 摘要从已验签的清单里取，不从 describe 响应里那个 bundle 对象取
-		`manifest = json.loads(manifest_raw)`,
+		// 3) 清单要与**验过签的**那串字节里记的摘要对上，摘要才从清单里取
+		`want_manifest="$(sed -n 's/^manifestSha256=//p' "$WORK/signed-bytes")"`,
+		`if [ "$want_manifest" != "$got_manifest" ]; then`,
 		`bundle = (manifest.get("bundles") or {}).get(want_bundle)`,
 		// 4) 服务端自报的与已验签的不一致就停
 		`sys.exit("服务端自报的归档摘要与已验签清单里的不一致，拒绝安装")`,
@@ -290,9 +295,30 @@ func TestMacInstallScriptDerivesEverythingFromOneOutOfBandDigest(t *testing.T) {
 	if !strings.Contains(script, `[ "$key_sha" = "$RELEASE_KEY_SHA256" ]`) {
 		t.Error("install-macos.sh does not re-check the release key it installs")
 	}
-	// 非 canonical 的 S 要拒（签名可延展性）
-	if !strings.Contains(script, "if s >= L:") {
-		t.Error("the embedded ed25519 verifier does not reject a non-canonical S")
+}
+
+// 这个脚本里不许再出现自己实现的密码学。
+//
+// 运维在执行前要把它从头读一遍、再与 CI 日志比对 shasum——那是整条链子的第一环，靠的是
+// "能读完"。一段椭圆曲线运算没人读得动，比对摘要就只剩比对、没有"我知道我在跑什么"。
+// 验签交给 macOS 自带的 ssh-keygen -Y verify，它比我们写的任何一版都更经得起看。
+func TestMacInstallScriptRollsNoCryptoOfItsOwn(t *testing.T) {
+	script := string(InstallMacOSScript)
+	for _, smell := range []string{
+		"def ed25519_verify", "ed25519_verify(", // 曾经内嵌过的那一版
+		"xrecover", "on_curve", "def mul(", "2**255 - 19", // 曲线运算的痕迹
+		"if s >= L:", // 连"拒非 canonical 的 S"也不该由我们来管
+	} {
+		if strings.Contains(script, smell) {
+			t.Errorf("install-macos.sh rolls its own crypto again (%q); verification belongs to ssh-keygen -Y verify", smell)
+		}
+	}
+	if !strings.Contains(script, "ssh-keygen -Y verify") {
+		t.Error("install-macos.sh does not verify the manifest with ssh-keygen -Y verify")
+	}
+	// 它要在 preflight 里被要求，否则缺了会在验签那一步以"签名验不过"的样子出现
+	if !strings.Contains(script, "need_commands curl python3 shasum openssl ssh-keygen") {
+		t.Error("install-macos.sh does not require ssh-keygen and openssl up front")
 	}
 }
 

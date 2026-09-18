@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -575,11 +574,11 @@ func (s *server) signedManifestForSetup() ([]byte, bundlesig.Signature, string, 
 		return nil, bundlesig.Signature{}, "", err
 	}
 	key := strings.TrimSpace(string(raw))
-	// 形状检查：一行 base64 的 32 字节。装机脚本还会按指纹核对它，这里只是不把明显坏掉的
-	// 东西递出去——否则错误会在那台 Mac 上以"验签失败"的样子出现，指向错误的方向
-	decoded, err := base64.StdEncoding.DecodeString(key)
-	if err != nil || len(decoded) != ed25519.PublicKeySize {
-		return nil, bundlesig.Signature{}, "", errors.New(machineReleaseKeyFile + " is not a base64 ed25519 public key")
+	// 形状检查：一行 OpenSSH 格式的 ed25519 公钥。装机脚本还会按指纹核对它，这里只是不把
+	// 明显坏掉的东西递出去——否则错误会在那台 Mac 上以"验签失败"的样子出现，指向错误的方向
+	if _, err := bundlesig.ParsePublicKey(raw); err != nil {
+		return nil, bundlesig.Signature{}, "", errors.New(machineReleaseKeyFile +
+			" is not an ssh-ed25519 public key line: " + err.Error())
 	}
 	return signed.Manifest, signed.Signature, key, nil
 }
