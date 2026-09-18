@@ -65,7 +65,7 @@
 
 | 东西 | 值 | 装机参数 |
 | --- | --- | --- |
-| 发布公钥（自升级） | 公钥字节 sha256 `b60f0ccf66e3d9e5603f4e568a6364940dbc9de2e3688d905bade00697292c45` | `--release-key-sha256` |
+| 发布公钥（自升级） | 公钥字节 sha256 `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a` | `--release-key-sha256` |
 | `allowed_signers`（提交验签） | 文件 sha256 `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` | `--allowed-signers-sha256` |
 
 两者口径不同（一个算公钥字节、一个算文件），落地当天撞出一个必然导致装机失败的 bug，见提交 `b01a11d`。
