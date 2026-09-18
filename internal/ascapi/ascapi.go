@@ -4,10 +4,15 @@
 // 最新的 build 是哪一个、什么时候过期、外部测试组开没开公开链接（设计
 // docs/design/ios-testflight-distribution-2026-09-17.md §4.6）。
 //
-// **这个包不写 Apple 侧的任何状态，也不该写。** 提交 Beta App Review、开关公开链接、
+// **Client 不写 Apple 侧的任何状态，也不该写。** 提交 Beta App Review、开关公开链接、
 // 增删测试员这三件事永远由人在管理端点、且二次确认：它们直接改变对外可见状态，而且
 // 失败后果不对称——多开一个公开链接是把内测包发给全世界，少开一个只是没人能装
-// （§4.6.6）。所以这里连 POST 的能力都没有。
+// （§4.6.6）。所以 Client 连 POST 的能力都没有。
+//
+// 2026-09-18 起这个包多了一个 Uploader（buildupload.go）：它能把 .ipa 传进 App Store
+// Connect。**它只给打包机上的 ios-upload 用**，服务端从不构造它——写的能力挂在另一个
+// 类型上，"谁能传包"因此写在类型系统里而不是注释里，TestServerSideNeverConstructsAnUploader
+// 守着这条。上面那段关于 Client 的话没有松动。
 //
 // 凭证的保管与 pushcreds 同构：issuerId / keyId 是 ASC 页面上公开显示的标识，明文存；
 // .p8 私钥用 STORAGE_MASTER_KEY 封存，AAD 绑租户。见 internal/api/ios_asc.go。

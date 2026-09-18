@@ -210,13 +210,16 @@ func (a *agent) uploadIPA(ctx context.Context, job claimedJob, ipaPath string, i
 // probeUploadKey 问上传程序"这把 Key 能不能用这套端点"（只读，不传任何东西）。
 // 启动时每个 Team 各跑一次，结果随认领自报上去——好让"角色不够传不上去"在**第一次构建
 // 之前**就看得见，而不是在一次构建的最后一步。
-func (a *agent) probeUploadKey(ctx context.Context, teamID string) string {
-	if !a.cfg.IOSUpload {
+func (a *agent) probeUploadKey(ctx context.Context, teamID string, bundleIDs []string) string {
+	if !a.cfg.IOSUpload || len(bundleIDs) == 0 {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	cmd := a.uploaderCommand(ctx, "--probe", "--team", teamID, "--keys", a.cfg.IOSUploadKeys)
+	// 探一个 App 就够了：这把 Key 的角色对这个 Team 下的每个 App 都一样（团队密钥没有
+	// App 范围，§4.3a）
+	cmd := a.uploaderCommand(ctx, "--probe", "--team", teamID, "--keys", a.cfg.IOSUploadKeys,
+		"--expect-bundle-id", bundleIDs[0])
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {

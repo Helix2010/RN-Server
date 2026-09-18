@@ -109,8 +109,10 @@ type iosScanner struct {
 	Identities func(ctx context.Context, keychain string) (map[string]bool, error)
 	// Certificates 返回每个 Team 最早到期的分发证书
 	Certificates func(ctx context.Context, keychain string) (map[string]time.Time, error)
-	// Probe 是上传 Key 的只读探测，返回 ok / forbidden / error；nil = 不探
-	Probe func(ctx context.Context, teamID string) string
+	// Probe 是上传 Key 的只读探测，返回 ok / forbidden / error；nil = 不探。
+	// 带上 bundle id 是因为这套端点挂在具体的 App 下（GET /v1/apps/{id}/buildUploads），
+	// 而"这个 Team 有哪些 App"只有盘点知道
+	Probe func(ctx context.Context, teamID string, bundleIDs []string) string
 }
 
 func newIOSScanner(cfg config) iosScanner {
@@ -186,7 +188,7 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 		material.BundleIDs = append(material.BundleIDs, bundles.ids...)
 		sort.Strings(material.BundleIDs)
 		if s.Probe != nil {
-			material.UploadProbe = s.Probe(ctx, team)
+			material.UploadProbe = s.Probe(ctx, team, material.BundleIDs)
 		}
 		inv.Teams = append(inv.Teams, material)
 	}

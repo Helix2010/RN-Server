@@ -18,7 +18,7 @@
 | S4 | 未开始 | | `builder-darwin-arm64.tar.gz`；`builder.tar.gz` 仍指 linux/amd64 |
 | S5 | 未开始 | | `install-macos.sh`（`go:embed` 下发） |
 | S6 | 未开始 | | 自升级接口、`approvedAgentCommit`、claim 前 409 `AGENT_UPGRADE_REQUIRED` |
-| S7 | 未开始 | | `ascapi` 补 Build Uploads 三个端点与按 build 号查询 |
+| S7 | 已完成 | 本分支 | `ascapi` 加 `Uploader`（**只有它能写 Apple 侧状态**，服务端只构造只读的 `Client`，有用例守着）、Build Uploads 三个端点、按 build 号查询、只读探测 |
 | S8 | 未开始 | | Rancher 部署清单 |
 | S9 | 未开始 | | 离线 `bundle-sign`（Ed25519 + `sequence`） |
 | S10 | 已完成 | 本分支 | 排队超 6 小时的 iOS 任务发一条告警（每条只发一次，靠审计去重），**不改状态**；告警分得清"没人在线"与"没人有这个 Team 的材料" |
@@ -35,7 +35,8 @@
 | A6 | 已完成 | 检出之后 `git verify-commit`（`gpg.format=ssh` + `allowedSignersFile`，都走命令行 `-c`）；allowed_signers 必须是 root 所有、组与其他人不可写的普通文件，所在目录同样（目录可写的话换掉文件只是一次 rename）；没配就是没开这道闸，启动时告警一次 |
 | A2 | 已完成 | `buildIPA` 先备签名：`security -i` 设搜索列表 + 解锁 + 关自动上锁（口令走标准输入，不进命令行），描述文件复制进任务 HOME 的两个目录；`pnpm ios:release` 改带 `--signing-dir`，**不再传 `--upload`** |
 | A3 | 已完成 | `deliverIPA` 用 `archive/zip` + 自带的二进制/XML plist 解析器读 `Payload/<App>.app/Info.plist`，与任务行比对之后才交给上传账户；`sudo -n -u _rnuploader ios-upload`，包走标准输入 |
-| A4、A10 | 未开始 | 下一步：A4（`ios-upload` + S7 的 Build Uploads 客户端）→ A10（macOS 部署件） |
+| A4 | 已完成 | `cmd/build-agent/ios-upload`：`--probe`（只读探端点权限，永远以 0 退出）与上传两条路；先查同号再传，分块 PUT 可重试，"同号已存在"当成功；一行 JSON 到 stdout |
+| A10 | 未开始 | 下一步：S4（darwin 归档）→ S5/S6/S9（装机与自升级）→ A10（macOS 部署件）→ R1/R2（RN-App）→ C1–C4（管理端） |
 
 ## RN-App
 

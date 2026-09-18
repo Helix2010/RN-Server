@@ -35,7 +35,7 @@ type agent struct {
 	now            func() time.Time
 
 	// iosProbe 覆盖上传 Key 的只读探测（测试用）；nil = 按配置决定探不探
-	iosProbe func(ctx context.Context, teamID string) string
+	iosProbe func(ctx context.Context, teamID string, bundleIDs []string) string
 	// iosScan 覆盖整次签名材料盘点（测试用）；nil = 真去问钥匙串与磁盘。
 	// 盘点要起 `security` 子进程、读这台机器的钥匙串，没有一台 Mac 就测不了，
 	// 而"领到任务前再核一次材料"这条规则本身是要有用例守着的
