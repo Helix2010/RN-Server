@@ -4483,7 +4483,7 @@
     "/v1/machine-setup/describe": {
       "post": {
         "summary": "Describe the machine an enrollment code belongs to",
-        "description": "Does not consume the code. Returns the machine identity, the bundle manifest entry for its role, the recovery keys (signers) and the primary signer's keys (standby signers). Rate limited per client IP.",
+        "description": "Does not consume the code. Returns the machine identity, the bundle manifest entry for its role, the recovery keys (signers) and the primary signer's keys (standby signers). Rate limited per client IP. The response carries os and the bundle the machine should install, chosen from the registry entry's os.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4523,7 +4523,7 @@
     "/v1/machine-setup/bundle/{archive}": {
       "get": {
         "summary": "Download the installation bundle",
-        "description": "Streams signer.tar.gz or builder.tar.gz from the deployed bundle directory (/opt/rn-foundation/machine-bundles/current). Only the bundle of the code's machine role. Exempt from the database timeout (exact route match). The client verifies archiveSha256 from describe (also sent as x-content-sha256, not to be trusted on its own). Rate limited per client IP.",
+        "description": "Streams signer.tar.gz or builder.tar.gz from the deployed bundle directory (/opt/rn-foundation/machine-bundles/current). Only the bundle of the code's machine role. Exempt from the database timeout (exact route match). The client verifies archiveSha256 from describe (also sent as x-content-sha256, not to be trusted on its own). Rate limited per client IP. Bundles are signer.tar.gz, builder.tar.gz (linux/amd64) and builder-darwin-arm64.tar.gz (Mac build machines). The enrollment code must belong to a machine that installs exactly that bundle: handing a macOS machine the linux archive only fails at first start with 'not a valid executable for this architecture', which reads nothing like 'you downloaded the wrong bundle'.",
         "parameters": [
           {
             "name": "archive",
@@ -8295,6 +8295,14 @@
             "format": "date-time",
             "nullable": true,
             "description": "When reportedTrust last changed; null while reportedTrust is null"
+          },
+          "os": {
+            "type": "string",
+            "enum": [
+              "linux",
+              "darwin"
+            ],
+            "description": "Operating system of this machine; always present, defaults to linux for machines registered before this field existed. Decides which bundle it installs."
           }
         }
       },
@@ -8341,6 +8349,14 @@
           },
           "confirm": {
             "type": "boolean"
+          },
+          "os": {
+            "type": "string",
+            "enum": [
+              "linux",
+              "darwin"
+            ],
+            "description": "Operating system of this machine; omitted = linux. It decides which bundle it installs (linux/amd64 or darwin/arm64) and which installer script the console shows. A darwin machine must be a builder that can build ios; the signing gate is Linux only."
           }
         }
       },
@@ -9223,6 +9239,14 @@
             ],
             "nullable": true,
             "description": "Standby signers only: the active routed primary's accepted keys, trusted on first use by signer enroll to verify the primary's generation signatures. null otherwise."
+          },
+          "os": {
+            "type": "string",
+            "enum": [
+              "linux",
+              "darwin"
+            ],
+            "description": "Operating system of this machine, from the registry entry."
           }
         }
       },

@@ -156,6 +156,14 @@ func (s *server) fromTrustedProxy(c *gin.Context) bool {
 
 // ---- 安装包 ----
 
+// machineBundleBuilderDarwin 是 Mac 打包机那一组安装包的名字。归档名与它一致
+// （builder-darwin-arm64.tar.gz）。
+//
+// Apple Silicon 是唯一被支持的 Mac 架构：Intel Mac 跑不了新版 Xcode，而这条链路的前提
+// 就是一台能装当前 Xcode 的机器。真要支持 x86_64 时再加一个并列的名字，不要把架构
+// 从名字里抹掉——运维核对 sha256 时要能一眼看出自己下的是哪一个。
+const machineBundleBuilderDarwin = "builder-darwin-arm64"
+
 type machineBundleFile struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
@@ -265,15 +273,18 @@ func (s *server) describeEnrollment(c *gin.Context) {
 		bundleUnavailable(c, m.Role, err)
 		return
 	}
-	bundle, err := manifest.bundleFor(m.Role)
+	// 装哪一组包由登记里的 os 决定：Mac 打包机要的是 darwin/arm64 那一组
+	bundleName := m.bundleName()
+	bundle, err := manifest.bundleFor(bundleName)
 	if err != nil {
-		bundleUnavailable(c, m.Role, err)
+		bundleUnavailable(c, bundleName, err)
 		return
 	}
 	response := gin.H{
-		"machineId": m.ID, "name": m.Name, "role": m.Role, "signerRole": nullableString(string(m.SignerRole)),
+		"machineId": m.ID, "name": m.Name, "role": m.Role, "os": m.osOf(),
+		"signerRole": nullableString(string(m.SignerRole)),
 		"bundle": gin.H{
-			"role": m.Role, "commit": manifest.Commit, "archive": bundle.Archive, "archiveSha256": bundle.ArchiveSHA256,
+			"role": bundleName, "commit": manifest.Commit, "archive": bundle.Archive, "archiveSha256": bundle.ArchiveSHA256,
 			"archiveSize": bundle.ArchiveSize, "files": bundle.Files,
 		},
 		"recoveryKeys": []gin.H{}, "primarySigner": nil,
@@ -314,9 +325,10 @@ func signerPeerKeys(m buildMachine) gin.H {
 // 机器还能用的注册码，只给这台机器角色的安装包。流式返回，按路由精确豁免数据库超时。
 func (s *server) downloadMachineBundle(c *gin.Context) {
 	archive := c.Param("archive")
-	role := strings.TrimSuffix(archive, ".tar.gz")
-	if role == archive || (role != machineRoleBuilder && role != machineRoleSigner) {
-		problem(c, http.StatusNotFound, "MACHINE_BUNDLE_NOT_FOUND", "Bundles are signer.tar.gz and builder.tar.gz")
+	name := strings.TrimSuffix(archive, ".tar.gz")
+	if name == archive || (name != machineRoleBuilder && name != machineRoleSigner && name != machineBundleBuilderDarwin) {
+		problem(c, http.StatusNotFound, "MACHINE_BUNDLE_NOT_FOUND",
+			"Bundles are signer.tar.gz, builder.tar.gz and "+machineBundleBuilderDarwin+".tar.gz")
 		return
 	}
 	// 这条路由整体豁免了数据库超时（流式下载），查登记这一步自己带上超时
@@ -333,29 +345,33 @@ func (s *server) downloadMachineBundle(c *gin.Context) {
 		enrollmentCodeInvalid(c)
 		return
 	}
-	if registry.Machines[index].Role != role {
-		problem(c, http.StatusForbidden, "MACHINE_ROLE_FORBIDDEN", "This enrollment code belongs to a machine of another role")
+	// 按注册码那台机器**该装的那一组**核对，不只核对角色：一台登记成 macOS 的机器
+	// 下 linux 那一组，只会在第一次启动时以"这不是本机架构的可执行文件"失败，
+	// 而那条错误读起来完全不像"下错了包"
+	if registry.Machines[index].bundleName() != name {
+		problem(c, http.StatusForbidden, "MACHINE_ROLE_FORBIDDEN",
+			"This enrollment code belongs to a machine that installs another bundle")
 		return
 	}
 	dir, manifest, err := s.machineBundles()
 	if err != nil {
-		bundleUnavailable(c, role, err)
+		bundleUnavailable(c, name, err)
 		return
 	}
-	bundle, err := manifest.bundleFor(role)
+	bundle, err := manifest.bundleFor(name)
 	if err != nil {
-		bundleUnavailable(c, role, err)
+		bundleUnavailable(c, name, err)
 		return
 	}
 	file, err := os.Open(filepath.Join(dir, bundle.Archive))
 	if err != nil {
-		bundleUnavailable(c, role, err)
+		bundleUnavailable(c, name, err)
 		return
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != bundle.ArchiveSize {
-		bundleUnavailable(c, role, errors.New("the archive is missing, not a regular file, or its size differs from the manifest"))
+		bundleUnavailable(c, name, errors.New("the archive is missing, not a regular file, or its size differs from the manifest"))
 		return
 	}
 	// sha256 在清单里（describe 已经给了），安装脚本下载后自己算、对不上拒绝安装
@@ -366,7 +382,7 @@ func (s *server) downloadMachineBundle(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Status(http.StatusOK)
 	if _, err := io.Copy(c.Writer, file); err != nil {
-		slog.Error("machine bundle download stream failed", "role", role, "error", err)
+		slog.Error("machine bundle download stream failed", "bundle", name, "error", err)
 	}
 }
 

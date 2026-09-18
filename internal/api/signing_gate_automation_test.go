@@ -32,7 +32,7 @@ import (
 
 // ---- 夹具补充 ----
 
-// installBundles 在临时目录里摆一份部署好的安装包（current 软链指向一个提交目录），返回两个归档的原始字节。
+// installBundles 在临时目录里摆一份部署好的安装包（current 软链指向一个提交目录），返回每个归档的原始字节。
 func (f *gateFixture) installBundles() map[string][]byte {
 	f.t.Helper()
 	root := f.t.TempDir()
@@ -42,7 +42,7 @@ func (f *gateFixture) installBundles() map[string][]byte {
 	}
 	archives := map[string][]byte{}
 	bundles := map[string]any{}
-	for _, role := range []string{machineRoleSigner, machineRoleBuilder} {
+	for _, role := range []string{machineRoleSigner, machineRoleBuilder, machineBundleBuilderDarwin} {
 		archive := []byte("archive of the " + role + " bundle " + randomID(12))
 		binary := []byte("binary " + role)
 		archives[role] = archive

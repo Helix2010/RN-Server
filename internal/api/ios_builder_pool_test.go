@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -329,5 +330,65 @@ func TestDBPausedMachineStaysOnlineButGetsNoJob(t *testing.T) {
 	// 任务还在队列里等着，没有被派掉
 	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusOK {
 		t.Fatalf("the job was not still queued for a machine that resumed: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// macOS 打包机装的是另一组安装包（设计 §5.5、§8 的 S4）。
+//
+// 一台登记成 macOS 的机器下 linux 那一组，只会在第一次启动时以"这不是本机架构的
+// 可执行文件"失败，而那条错误读起来完全不像"下错了包"。所以按登记里的 os 决定给哪一组，
+// 并且拿另一组的注册码去下要当场拒。
+func TestDBMacBuilderInstallsTheDarwinBundle(t *testing.T) {
+	f := newGateFixture(t, 68)
+	archives := f.installBundles()
+	mac := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", map[string]any{
+		"role": machineRoleBuilder, "name": "mac-" + uniqueSuffix(), "signerRole": nil,
+		"platforms": []string{buildPlatformIOS}, "os": machineOSDarwin,
+		"expectedVersion": registryVersion(t, f), "reason": "add a mac builder", "confirm": true,
+	})
+	if mac.Code != http.StatusCreated {
+		t.Fatalf("create a macOS builder: %d %s", mac.Code, mac.Body.String())
+	}
+	created := decodeBody(t, mac)
+	if created["machine"].(map[string]any)["os"] != machineOSDarwin {
+		t.Fatalf("the machine view must say which OS it runs: %v", created["machine"])
+	}
+	code := created["enrollment"].(map[string]any)["code"].(string)
+
+	described := decodeBody(t, f.describe(code))
+	bundle, _ := described["bundle"].(map[string]any)
+	if described["os"] != machineOSDarwin || bundle["archive"] != machineBundleBuilderDarwin+".tar.gz" {
+		t.Fatalf("a macOS builder was told to install %v", bundle)
+	}
+	download := func(archive string) *httptest.ResponseRecorder {
+		return f.do(http.MethodGet, "/v1/machine-setup/bundle/"+archive, "",
+			map[string]string{enrollmentCodeHeader: code}, nil)
+	}
+	if r := download(machineBundleBuilderDarwin + ".tar.gz"); r.Code != http.StatusOK ||
+		!bytes.Equal(r.Body.Bytes(), archives[machineBundleBuilderDarwin]) {
+		t.Fatalf("download the darwin bundle: %d", r.Code)
+	}
+	if r := download("builder.tar.gz"); r.Code != http.StatusForbidden {
+		t.Fatalf("a macOS builder downloaded the linux bundle: %d %s", r.Code, r.Body.String())
+	}
+}
+
+// 一台 Mac 建出来却只勾 android，是一台永远领不到活的机器；签名闸没有 macOS 版。
+func TestDBMacBuilderMustBeAbleToBuildIOS(t *testing.T) {
+	f := newGateFixture(t, 69)
+	for name, body := range map[string]map[string]any{
+		"android only": {"role": machineRoleBuilder, "name": "mac-" + uniqueSuffix(), "signerRole": nil,
+			"platforms": []string{buildPlatformAndroid}, "os": machineOSDarwin},
+		"a signer on macOS": {"role": machineRoleSigner, "name": "sgn-" + uniqueSuffix(), "signerRole": signerRoleStandby,
+			"os": machineOSDarwin},
+		"unknown os": {"role": machineRoleBuilder, "name": "mac-" + uniqueSuffix(), "signerRole": nil,
+			"platforms": []string{buildPlatformIOS}, "os": "windows"},
+	} {
+		body["expectedVersion"] = registryVersion(t, f)
+		body["reason"] = "should be refused"
+		body["confirm"] = true
+		if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", body); r.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", name, r.Code, r.Body.String())
+		}
 	}
 }

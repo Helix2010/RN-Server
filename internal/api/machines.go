@@ -127,7 +127,11 @@ type buildMachine struct {
 	// 跨租户的——一台配错的机器领走 iOS 任务、失败、退回排队、再领走，会把这个租户的
 	// 发布卡在一个自愈不了的循环里。空 = ["android"]：签名闸上线之前登记的构建机全是
 	// Linux，不能因为加了这个字段就把它们变成"什么都不能构建"。
-	Platforms              []string           `json:"platforms,omitempty"`
+	Platforms []string `json:"platforms,omitempty"`
+	// OS 是这台机器的操作系统：linux（机房构建机、签名闸）或 darwin（Mac 打包机）。
+	// 它决定装哪一组安装包（linux/amd64 还是 darwin/arm64）与哪一份装机脚本。
+	// 空 = linux：这个字段之前登记的机器全是 Linux，不能因为加了它就都变成"装不了"
+	OS                     optString          `json:"os"`
 	Name                   string             `json:"name"`
 	Status                 string             `json:"status"`
 	TokenSHA256            string             `json:"tokenSha256"`
@@ -171,6 +175,25 @@ func (m buildMachine) buildPlatforms() []string {
 
 func (m buildMachine) canBuild(platform string) bool {
 	return containsString(m.buildPlatforms(), platform)
+}
+
+// osOf 是这台机器的操作系统，空值按 linux 读（见 buildMachine.OS）。
+func (m buildMachine) osOf() string {
+	if os := strings.TrimSpace(string(m.OS)); os != "" {
+		return os
+	}
+	return machineOSLinux
+}
+
+// bundleName 是这台机器该装的那一组安装包的名字。
+//
+// **linux 那组仍然叫 builder**：Linux 的 install.sh 与已经部署的清单都按这个名字取，
+// 换名字等于让所有在跑的构建机在下一次装机时断掉。macOS 另起一个并列的名字。
+func (m buildMachine) bundleName() string {
+	if m.Role == machineRoleBuilder && m.osOf() == machineOSDarwin {
+		return machineBundleBuilderDarwin
+	}
+	return m.Role
 }
 
 // viewPlatforms 是 machineView 里的那一份，**恒为数组，永远不是 null**。
@@ -576,6 +599,7 @@ func machineView(m buildMachine) gin.H {
 		"role":                          m.Role,
 		"signerRole":                    nullableString(string(m.SignerRole)),
 		"platforms":                     viewPlatforms(m),
+		"os":                            m.osOf(),
 		"name":                          m.Name,
 		"status":                        m.Status,
 		"publicKeySha256":               nullableString(string(m.PublicKeySHA256)),
@@ -700,6 +724,7 @@ func (s *server) createMachine(c *gin.Context) {
 		Name       string   `json:"name"`
 		SignerRole *string  `json:"signerRole"`
 		Platforms  []string `json:"platforms"`
+		OS         string   `json:"os"`
 		machineWriteCommon
 	}
 	if decode(c, &body) != nil || !body.valid() {
@@ -726,6 +751,25 @@ func (s *server) createMachine(c *gin.Context) {
 	}
 	if role == machineRoleSigner && len(body.Platforms) > 0 {
 		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "a signer builds nothing; omit platforms")
+		return
+	}
+	// 操作系统决定装哪一组安装包。不传按 linux（这个字段之前登记的机器全是 Linux）
+	machineOS := strings.TrimSpace(strings.ToLower(body.OS))
+	switch {
+	case machineOS == "":
+		machineOS = machineOSLinux
+	case machineOS != machineOSLinux && machineOS != machineOSDarwin:
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "os must be linux or darwin")
+		return
+	}
+	if machineOS == machineOSDarwin && role != machineRoleBuilder {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "only a builder runs on macOS; the signing gate is Linux only")
+		return
+	}
+	// 一台 Mac 建出来却只勾了 android，是一台永远领不到活的机器：iOS 打包机的意义就是
+	// 那台装了 Xcode 的机器，而 Android 构建今天全在机房那台 Linux 上
+	if machineOS == machineOSDarwin && !containsString(platforms, buildPlatformIOS) {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "a macOS build machine must be able to build ios")
 		return
 	}
 	switch {
@@ -791,12 +835,13 @@ func (s *server) createMachine(c *gin.Context) {
 		}
 		if role == machineRoleBuilder {
 			created.Platforms = platforms
+			created.OS = optString(machineOS)
 		}
 		doc.Machines = append(doc.Machines, created)
 		// 审计记机器身份与注册码有效期，不记注册码也不记它的 sha256
 		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_machine_create", machineAuditTargetType, created.ID, reason, requestID(c),
 			map[string]any{"machineId": created.ID, "role": role, "name": name, "signerRole": nullableString(signerRole),
-				"platforms": created.buildPlatforms(), "enrollmentExpiresAt": created.Enrollment.ExpiresAt})}
+				"platforms": created.buildPlatforms(), "os": machineOS, "enrollmentExpiresAt": created.Enrollment.ExpiresAt})}
 	})
 	if !ok {
 		return
