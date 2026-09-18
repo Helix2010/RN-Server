@@ -59,6 +59,7 @@
 | C4 | 已完成 | `fba909c` + `2f62b9b` | 新增 `GET /v1/admin/platform/build-agent-version` 与「批准打包机程序版本」卡片：先显示两组安装包各自的提交、签名序号、签名时间、发布公钥指纹、归档摘要，再谈批准；批准与取消钉版本都走 `reason` + `confirm`；列出"现在因为版本不一致领不到任务"的机器 |
 
 管理端门禁（`format:check` / `lint` / `typecheck` / `test` / `build`）全绿，580 个用例。
+服务端侧 `gofmt` / `go vet` / `go test -race -p 1 ./...`（带本机 MySQL）全绿。
 
 ## 运维手册（设计 §10 第 5 条）
 
