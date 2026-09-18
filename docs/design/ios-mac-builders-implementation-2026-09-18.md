@@ -20,6 +20,7 @@
 | S6 | 已完成 | 本分支 | `GET /v1/build-agent/bundle`（清单 base64 + 离线签名 + 归档地址）与 `/bundle/archive`（流式，豁免库超时）；平台级 `approvedAgentCommit` 与 `POST /v1/admin/platform/build-agent-version`；claim 在选任务**之前**比对，不等则 409 `AGENT_UPGRADE_REQUIRED`；没签名或 `-dirty` 一律 503 |
 | S7 | 已完成 | 本分支 | `ascapi` 加 `Uploader`（**只有它能写 Apple 侧状态**，服务端只构造只读的 `Client`，有用例守着）、Build Uploads 三个端点、按 build 号查询、只读探测 |
 | S8 | 未开始 | | Rancher 部署清单 |
+| S11 | 已完成 | 本分支 | `GET /v1/admin/platform/build-agent-version`（C4 要的读接口）与 darwin 的六行装机命令。设计里没有编号，归在 S6/S5 名下 |
 | S9 | 已完成 | 本分支 | `signing/bundlesig` + 离线 `bundle-sign`（key create / sign / verify）；签的是提交 + 单调序号 + 清单摘要的规范化字节，不签 JSON |
 | S10 | 已完成 | 本分支 | 排队超 6 小时的 iOS 任务发一条告警（每条只发一次，靠审计去重），**不改状态**；告警分得清"没人在线"与"没人有这个 Team 的材料" |
 
@@ -38,15 +39,26 @@
 | A4 | 已完成 | `cmd/build-agent/ios-upload`：`--probe`（只读探端点权限，永远以 0 退出）与上传两条路；先查同号再传，分块 PUT 可重试，"同号已存在"当成功；一行 JSON 到 stdout |
 | A10 | 已完成 | `deploy/build-agent-macos/`：两份 launchd plist（`UserName`、`KeepAlive.PathState`、`ExitTimeOut=7500`；升级那份走 `WatchPaths`）、`run-agent`（加载 env 后 `exec`）、sudoers 两条（`NOSETENV`）、env 示例；新程序 `cmd/build-agent/upgrade`（验签→核序号→核提交→逐文件核 sha256→冒烟→原子替换→删标记），全部进 darwin 归档 |
 
-下一步：R1/R2（RN-App）→ C1–C4（管理端）→ S8（Rancher 部署清单）。
+下一步：S8（Rancher 部署清单）→ §10 第 5 条（签名材料归档运维手册）→ §9 阶段 A–F 真机验证。
 
 ## RN-App
 
-R1、R2、R3 未开始。
+| # | 状态 | 提交 | 备注 |
+| --- | --- | --- | --- |
+| R1 | 已完成 | `23978e5` | `build-ios-release.mjs` 加 `--signing-dir`：按 `application-identifier` 在签名目录里找描述文件（过期的单独报出来），用 `IOSConfig.ProvisioningProfile.setProvisioningProfileForPbxproj` 写进工程而不是全局覆盖命令行，`OTHER_CODE_SIGN_FLAGS=--keychain …`；两处 `-allowProvisioningUpdates` 都删了（无人值守的机器上它会去找 Xcode 账户） |
+| R2 | 已完成 | `23978e5` | `exportOptionsPlist` 给了 `profileName` 就切 `manual` 并写 `provisioningProfiles`（留着 `automatic` 会让导出去找账户）；新增 `plugins/with-ios-pods-unsigned.js`（Podfile `post_install` 关掉全部 Pods target 的签名），`app.config.ts` 注册 |
+| R3 | 未开始 | | 仓库 `main` 开「要求签名提交」分支保护、合并限 rebase/fast-forward。这是 GitHub 上的操作，不是代码改动；A6 那道验签闸已经在代理侧生效，缺这一条时它验的是"开发者有没有自己签"，不是"仓库强制签" |
 
 ## RN-Admin
 
-C1–C4 未开始。
+| # | 状态 | 提交 | 备注 |
+| --- | --- | --- | --- |
+| C1 | 已完成 | `fba909c` | 机器卡片加「运行状态」：最近在线 / 离线 / 从未上报、空闲空间、程序版本（与 `approvedAgentCommit` 不一致时标黄并说明它会自己升级）、自报的 Team 与上传 Key 探测结论、「缺 X 租户的签名材料」、证书 30 天内到期与已过期、机器自停领任务与上一次升级失败。整块写明"自报是运维仪表不是安全边界" |
+| C2 | 已完成 | `fba909c` + `2f62b9b` | 新建构建机可选 macOS（自动勾上 iOS 且不能取消，与服务端 400 一致）；服务端给 darwin 拼六行装机命令，控制台把**每个**尖括号占位都标黄（原来只标第一个）并写明它为什么不是 `curl \| bash` |
+| C3 | 已完成 | `fba909c` | 打包任务表加「排队」列（还在排队的那格自己走并标黄）；`buildJobSchema` 加 `warnings`，`no_ios_builder_online` 翻成一条留在页面上的提示；409 `NO_BUILDER_FOR_TEAM` 翻成"去哪儿导材料" |
+| C4 | 已完成 | `fba909c` + `2f62b9b` | 新增 `GET /v1/admin/platform/build-agent-version` 与「批准打包机程序版本」卡片：先显示两组安装包各自的提交、签名序号、签名时间、发布公钥指纹、归档摘要，再谈批准；批准与取消钉版本都走 `reason` + `confirm`；列出"现在因为版本不一致领不到任务"的机器 |
+
+管理端门禁（`format:check` / `lint` / `typecheck` / `test` / `build`）全绿，580 个用例。
 
 ## 与设计的偏离
 
@@ -62,4 +74,6 @@ C1–C4 未开始。
 | §4.2「`security unlock-keychain -p "$(cat …)"`」 | 口令作为命令行参数 | 三条命令走 `security -i` 的标准输入 | 命令行参数 `ps` 看得到（AGENTS.md「机密的操作纪律」）。口令的字母表在读入时校验，拼不出第二条命令 |
 | §5.6「Mac 在状态目录记本机见过的最高序号」 | 水位线放在代理的状态目录 | 放在 root 拥有的 `/opt/rn-build-agent/upgrade-sequence` | 状态目录属于代理那个账户。把"防降级"的水位线放在被防的一方能写的地方，这道闸就不成立了 |
 | §4.3 第 2 步「`--ipa <路径>`」 | 把包的路径交给上传账户 | 包走**标准输入**，上传程序自己落到它的临时文件 | 产物副本在控制进程的 spool 里，而 spool 在状态目录下（0700，同一棵树里放着出处私钥）。为了传一个不是机密的包，去放宽一个装着机密的目录，不划算 |
+| C2 装机命令 | 设计 §4.5 只给了在 Mac 上敲的那几行 | 由服务端拼好整段（六行，含 `shasum` 那一行）随注册码一起下发，控制台原样显示并标出占位 | 与 Linux 那条一致：命令里有服务端才知道的外部源与注册码。三个 sha256 仍然是占位——控制台替人填等于让这台 Mac 把服务端说的话当成信任根 |
+| C4 「显示当前安装包提交、清单签名与序号」 | 没说从哪儿读 | 新增一条平台级只读接口，两组安装包各自带 `error` 而不是整条 503 | darwin 那组可能还没编出来；这一页存在的理由就是让人看见现在部署的是什么，一组坏了就整页空白等于把要看的东西藏起来 |
 | §5.3「`build-ios-release.mjs` 打印 `xcodebuild -version` 供 runner 解析」 | 从构建脚本的日志里捞一行 | 执行进程直接问 `xcodebuild -version` | 否则这个值的正确性取决于另一个仓库里某行日志的格式 |
