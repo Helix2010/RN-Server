@@ -197,9 +197,17 @@ env 里的 bundle id 与某租户的 `release.ios` 不一致，打一条 warn �
 
 两张卡，**按记录边界切**（标准 §15.1：一张卡 = 一次保存 = 一条记录）：
 
-- **卡 1「共通参数」** — `build.config`.identity 那一条，一次保存。
-  `appName` / `scheme` / `apiBaseUrl` / `iconBackgroundColor`。
+- **卡 1「共通参数」** — `appName` / `scheme` / `apiBaseUrl` / `iconBackgroundColor`。
   卡头说清楚："这四项两个平台共用，改了 Android 和 iOS 下一次构建都会变。"
+
+  **注意这四项和 Android 的仓库目录、`google-services.json` 是同一条
+  `build.config` 记录、同一个乐观锁**（2026-09-18 实现时才核出来，原稿
+  把它们当成两条）。`PUT /build-config` 是整条替换，所以两个 Tab 都要发完整
+  的一份。可行是因为它们共用同一个 `["build-config"]` 查询：任一边保存后
+  失效重取，另一边拿到的就是新版本号。并发编辑仍由乐观锁挡，和今天一样。
+
+  真要拆成两条记录（`app.identity` 与 `build.android`）是服务端迁移，
+  收益是两个 Tab 各自独立的锁，这一版不做。
 - **卡 2「各平台包标识」** — **只读汇总**，用 `identity-details`。
   Android 包名 + 证书指纹（来自 `release.android`）、iOS Team ID + bundle id
   （来自 `release.ios`），每项带一个"去改"的链接跳到对应 Tab。
