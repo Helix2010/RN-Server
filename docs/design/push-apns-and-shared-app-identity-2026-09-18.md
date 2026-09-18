@@ -35,13 +35,13 @@
 > 只有这几个字段由租户在控制台维护：`appName` / `scheme` / `androidPackage` /
 > `iosBundleId` / `apiBaseUrl` / `iconBackgroundColor`。
 
-组装时的来源（`tenant_manifest.go:164-176`）：
+组装时的来源（`tenant_manifest.go:182-195`，行号按 origin/main）：
 
 | 字段 | 来源 | 平台 |
 | --- | --- | --- |
 | `appName` `scheme` `apiBaseUrl` `iconBackgroundColor` | `build.config`.identity | **跨平台** |
 | `androidPackage` | `release.android`.packageName | Android |
-| `iosBundleId` | `release.ios`.bundleId | iOS |
+| `iosBundleId`、`appleTeamId` | `release.ios` | iOS |
 
 所以**用户的理解是对的，而且服务端的模型本来就长这样**：一份租户身份，
 外加两个按平台的包标识。`tenantManifest` 同时带 `androidPackage` 和
@@ -49,7 +49,7 @@
 同一份清单。
 
 错的只有控制台的归属。错得有多深，看服务端自己的报缺失文案就知道
-（`tenant_manifest.go:98`）：
+（`tenant_manifest.go:108-114`）：
 
 ```go
 add("appName", "Android 打包与签名 → App 参数")
@@ -92,8 +92,12 @@ iOS 构建同样要这三项，但指路只会把人送去 Android 那一页。
 
 ### 2.2 topic（bundle id）不存在这条记录里
 
-`sendAPNs` 的 topic 取该租户 `release.ios` 的 `bundleId`，不在 `push.apns` 里存
-第二份。
+`sendAPNs` 的 topic **主取设备自报的 `app_installations.package_id`**（发送时已经
+是这样了），兜底取该租户 `release.ios` 的 `bundleId`——替换掉今天那个全局的
+`cfg.APNsBundleID`。不在 `push.apns` 里存第二份。
+
+设备自报的那一份最准：它就是这台设备上装的那个 App 的 bundle id。配置只在
+旧版本没上报 `package_id` 时兜底。
 
 理由：存两份必然漂移，而漂移的表现是**推送静默失效**——APNs 回 400
 `DeviceTokenNotForTopic`，和 FCM 的 `SENDER_ID_MISMATCH` 是同一类"构建成功、
@@ -163,7 +167,8 @@ env 里的 bundle id 与某租户的 `release.ios` 不一致，打一条 warn �
 - `apns *apns2.Client` → 按租户缓存的 `map[string]*apns2.Client`，键是**生效行的
   租户**（可能是 "0"），不是请求方租户——和 FCM 的 `SourceTenant` 语义一致。
 - 配置改动要让缓存失效（沿用 FCM 现有的失效路径）。
-- `sendAPNs` 的 `topic` 从 `cfg.APNsBundleID` 改成该租户 `release.ios.bundleId`。
+- `sendAPNs` 的 topic 兜底从 `cfg.APNsBundleID` 改成该租户 `release.ios.bundleId`；
+  主路径（设备自报的 `package_id`）不变。
 - 403 不再当普通非 2xx 重试——和 ADR-0017 修 FCM 403 的理由相同：重试五次
   只会把一个配置错误拖成四十分钟后的一行 `APNs status 403`。
 

@@ -310,10 +310,10 @@ func (s *server) pushCredentialsView(ctx context.Context, tenant string) (gin.H,
 		fcm["projectMatches"] = nil
 	}
 
-	// APNs / HMS 本次不进库：没有租户在用。位置先占住，形状和 FCM 一致，
-	// 免得将来加进来时控制台要改两套。
+	// HMS 仍不进库：没有租户在用，而它的字段形状和前两家都不同，现在设计等于凭空猜。
+	// 位置先占住，界面上画出来标"未接入"。
 	return gin.H{"fcm": fcm,
-		"apns": gin.H{"configured": false, "inherited": false, "version": 0},
+		"apns": s.apnsCredentialView(ctx, tenant),
 		"hms":  gin.H{"configured": false, "inherited": false, "version": 0}}, nil
 }
 

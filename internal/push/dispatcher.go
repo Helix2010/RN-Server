@@ -33,13 +33,21 @@ type Dispatcher struct {
 	// 不需要重启进程，多实例也不需要互相广播。
 	sendersMu sync.Mutex
 	senders   map[string]*tenantSender
-	// apns 与 hms 仍是全局的一份：没有租户在用。谁把它们改成按租户，必须同时把
-	// 这两处改成 map[tenant]，否则两个租户会互相拿到对方的令牌；sendAPNs 里
-	// 那个 cfg.APNsBundleID 兜底也要换成该租户 release.ios 的 bundleId。
-	apns      *apns2.Client
+	// apnsClients 与 senders 同构：键是**生效行**的租户，version 跟着
+	// app_configs.version 走，换了密钥下一条事件自然重建。
+	// 2026-09-18 从全局一份改成按租户（设计 push-apns-and-shared-app-identity-2026-09-18 §2.6）。
+	apnsMu      sync.Mutex
+	apnsClients map[string]*apnsSender
+	// hms 仍是全局的一份：没有租户在用。谁把它改成按租户，照 apns 这一套来。
 	hmsMu     sync.Mutex
 	hmsToken  string
 	hmsExpiry time.Time
+}
+
+// apnsSender 是一个租户生效的 APNs 凭据在进程里的样子。
+type apnsSender struct {
+	version int
+	client  *apns2.Client
 }
 
 // tenantSender 是一个租户生效的 FCM 凭据在进程里的样子。
@@ -89,7 +97,8 @@ func (e invalidTokenError) Unwrap() error { return e.cause }
 
 func New(ctx context.Context, db *sql.DB, cfg config.Config, secrets *secretbox.Box) (*Dispatcher, error) {
 	d := &Dispatcher{db: db, cfg: cfg, secrets: secrets,
-		plainClient: &http.Client{Timeout: 15 * time.Second}, senders: map[string]*tenantSender{}}
+		plainClient: &http.Client{Timeout: 15 * time.Second}, senders: map[string]*tenantSender{},
+		apnsClients: map[string]*apnsSender{}}
 	// 过渡期：库里一行凭据都没有时还认 env 里那两个键，但每次启动都说一次。
 	// 下一版删掉 env 读取，所以这个状态不会永久化。
 	if cfg.FCMServiceAccountJSON != "" {
@@ -97,18 +106,15 @@ func New(ctx context.Context, db *sql.DB, cfg config.Config, secrets *secretbox.
 			slog.Warn("FCM credentials are still in the env file; run `rn-server push-credentials import-env` to move them into the database, then delete FCM_PROJECT_ID and FCM_SERVICE_ACCOUNT_JSON")
 		}
 	}
+	// APNs 的 env 那份和 FCM 一样只当过渡期兜底，懒建（legacyAPNsSender）。
+	// 这里只在启动时验一次形状：坏掉的 .p8 早说比第一条推送时才说好。
 	if cfg.APNsPrivateKey != "" {
-		authKey, err := token.AuthKeyFromBytes(decodeSecret(cfg.APNsPrivateKey))
-		if err != nil {
+		if _, err := token.AuthKeyFromBytes(decodeSecret(cfg.APNsPrivateKey)); err != nil {
 			return nil, fmt.Errorf("load APNs key: %w", err)
 		}
-		client := apns2.NewTokenClient(&token.Token{AuthKey: authKey, KeyID: cfg.APNsKeyID, TeamID: cfg.APNsTeamID})
-		if cfg.APNsEnvironment == "sandbox" {
-			client = client.Development()
-		} else {
-			client = client.Production()
+		if configured, err := pushcreds.AnyAPNsConfigured(ctx, db); err == nil && !configured {
+			slog.Warn("APNs credentials are still in the env file; run `rn-server push-credentials import-env` to move them into the database, then delete APNS_TEAM_ID, APNS_KEY_ID, APNS_PRIVATE_KEY and APNS_BUNDLE_ID")
 		}
-		d.apns = client
 	}
 	return d, nil
 }
@@ -306,7 +312,7 @@ func (d *Dispatcher) sendWithMessage(ctx context.Context, item event, fcm *tenan
 		return d.sendFCM(ctx, fcm, recipient.Token, data, title, body, visible)
 	}
 	if recipient.Provider == "apns" {
-		return d.sendAPNs(ctx, recipient.Token, recipient.PackageID, data, title, body, visible)
+		return d.sendAPNs(ctx, item.TenantID, recipient.Token, recipient.PackageID, data, title, body, visible)
 	}
 	if recipient.Provider == "hms" {
 		return d.sendHMS(ctx, recipient.Token, data, title, body, visible)
@@ -421,13 +427,21 @@ func (d *Dispatcher) sendFCM(ctx context.Context, sender *tenantSender, targetTo
 	return result.Name, nil
 }
 
-func (d *Dispatcher) sendAPNs(ctx context.Context, targetToken, packageID string, data map[string]string, title, messageBody string, visible bool) (string, error) {
+func (d *Dispatcher) sendAPNs(ctx context.Context, tenant, targetToken, packageID string, data map[string]string, title, messageBody string, visible bool) (string, error) {
+	// topic 主取设备自报的 bundle id——它就是这台设备上装的那个 App。旧版本没
+	// 上报时才回落到该租户 release.ios 的 bundleId（2026-09-18 之前这里是 env
+	// 里全局的一份，多租户下必然发错 topic）。
 	topic := packageID
 	if topic == "" {
-		topic = d.cfg.APNsBundleID
+		topic = d.tenantBundleID(ctx, tenant)
 	}
-	if d.apns == nil || topic == "" {
-		return "", errors.New("APNs is not configured")
+	if topic == "" {
+		return "", credentialError{"IOS_BUNDLE_ID_REQUIRED",
+			"这台设备没上报 bundle id，租户 " + tenant + " 的 release.ios 里也没有"}
+	}
+	client, err := d.apnsSender(ctx, tenant)
+	if err != nil {
+		return "", err
 	}
 	aps := map[string]any{"content-available": 1}
 	if visible {
@@ -439,7 +453,7 @@ func (d *Dispatcher) sendAPNs(ctx context.Context, targetToken, packageID string
 		payload[key] = value
 	}
 	raw, _ := json.Marshal(payload)
-	response, err := d.apns.PushWithContext(ctx, &apns2.Notification{DeviceToken: targetToken, Topic: topic, Payload: raw})
+	response, err := client.PushWithContext(ctx, &apns2.Notification{DeviceToken: targetToken, Topic: topic, Payload: raw})
 	if err != nil {
 		return "", err
 	}

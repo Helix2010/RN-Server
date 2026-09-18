@@ -46,6 +46,8 @@ type server struct {
 	// verifyFCM 真去 Google 换一次访问令牌。做成字段是因为保存推送凭据这条路
 	// **必须**联网验证（见 pushcreds.Verify 的注释），而测试不该联网。
 	verifyFCM func(context.Context, pushcreds.ServiceAccount) error
+	// verifyAPNs 真向 APNs 发一条探活推送。同样做成字段，测试里不出网。
+	verifyAPNs func(context.Context, pushcreds.APNs, []byte, string) error
 	// ascBaseURL 覆盖 App Store Connect 的地址；空 = Apple 的正式地址。只有测试会设——
 	// 这条链路必须真调一次 Apple 才算验证通过（见 ascapi.Client.Verify），而测试不该联网
 	ascBaseURL string
@@ -143,7 +145,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	if err != nil {
 		panic(err)
 	}
-	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify}
+	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify, verifyAPNs: pushcreds.VerifyAPNs}
 	return s.routes()
 }
 
@@ -235,6 +237,8 @@ func (s *server) routes() *gin.Engine {
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
 	platform.DELETE("/push/credentials/fcm", s.deletePlatformPushCredentialsFCM)
+	platform.PUT("/push/credentials/apns", s.updatePlatformPushCredentialsAPNs)
+	platform.DELETE("/push/credentials/apns", s.deletePlatformPushCredentialsAPNs)
 	platform.GET("/scan/chains", s.scanChains)
 	platform.PUT("/scan/chains/:chain", s.saveScanChain)
 	platform.POST("/scan/chains/:chain/probe", s.probeScanChain)
@@ -415,6 +419,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/push/credentials/fcm", s.updatePushCredentialsFCM)
 	group.DELETE("/push/credentials/fcm", s.deletePushCredentialsFCM)
 	group.POST("/push/credentials/fcm/test", s.testPushCredentialsFCM)
+	// APNs 的 topic 取自 release.ios 的 bundleId，所以这三条隐含依赖 iOS 发布身份
+	group.PUT("/push/credentials/apns", s.updatePushCredentialsAPNs)
+	group.DELETE("/push/credentials/apns", s.deletePushCredentialsAPNs)
+	group.POST("/push/credentials/apns/test", s.testPushCredentialsAPNs)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	// 导入已有密钥（离线工具产出的 v3 文件，高级）
 	group.PUT("/build-keystore", s.saveBuildKeystore)
