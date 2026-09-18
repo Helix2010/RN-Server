@@ -7785,6 +7785,11 @@
             "type": "string",
             "maxLength": 200,
             "description": "One line explaining the pause, shown in the console. Only read when paused is true."
+          },
+          "upgradeError": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Why the last self-upgrade failed, read from the state directory at startup. The upgrade helper runs as root and the agent is still on the old version when it fails, so without this the console only shows a machine whose version never catches up with the approved one."
           }
         }
       },

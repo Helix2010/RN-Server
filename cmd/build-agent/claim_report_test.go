@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 认领时自报什么（设计 ios-mac-builders-home-network-2026-09-18 §5.2、§5.4、§6.2）。
@@ -82,5 +86,58 @@ func TestClaimPausesItselfWhenTheDiskIsTooFull(t *testing.T) {
 	fails := rig.server.callsTo("/fail")
 	if len(fails) != 1 || !strings.Contains(string(fails[0].Body), "BUILD_AGENT_MIN_FREE_GB") {
 		t.Fatalf("a job dispatched to a paused machine must fail with the reason: %v", fails)
+	}
+}
+
+// 服务端说"先升级"（409 AGENT_UPGRADE_REQUIRED）：写停机标记、以 75 退出。
+//
+// 标记是给 launchd 看的：它不认退出码（systemd 有 RestartPreventExitStatus），不写标记的话
+// 一台要求升级的机器会变成每秒重启一次。root 的升级程序换完二进制删掉标记，launchd 随即
+// 把新版拉起来。
+func TestUpgradeRequiredWritesTheHaltMarkerAndExits75(t *testing.T) {
+	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
+	rig := newRig(t)
+	const approved = "3333333333333333333333333333333333333333"
+	rig.server.queueProblem(http.StatusConflict, "AGENT_UPGRADE_REQUIRED", map[string]any{"agentCommit": approved})
+	// 队列里还有一条任务：要求升级的时候服务端不派活，代理也不该去做它
+	rig.server.queueClaim(claimBody("bld_notWhileUpgrading", "apk"))
+
+	if code := rig.agent.serve(context.Background()); code != exitUpgradeRequired {
+		t.Fatalf("exit %d, want %d", code, exitUpgradeRequired)
+	}
+	raw, err := os.ReadFile(haltPath(rig.agent.cfg.StateDir))
+	if err != nil {
+		t.Fatalf("no halt marker: %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != upgradeHaltReason(approved) {
+		t.Fatalf("halt marker says %q", strings.TrimSpace(string(raw)))
+	}
+	if calls := rig.server.callsTo("/built"); len(calls) != 0 {
+		t.Fatal("the agent took a job after it was told to upgrade")
+	}
+}
+
+// 上一次升级失败过：启动时读出来，随认领报给服务端——控制台不然只能看到
+// "这台机器的版本一直追不上审批值"。
+func TestClaimReportsALastFailedUpgrade(t *testing.T) {
+	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
+	rig := newRig(t)
+	if err := writeUpgradeFailure(rig.agent.cfg.StateDir, "4444444444444444444444444444444444444444",
+		errors.New("the archive does not match the digest in the signed manifest"), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	failure, failed := readUpgradeFailure(rig.agent.cfg.StateDir)
+	if !failed {
+		t.Fatal("the failure was not read back")
+	}
+	rig.agent.upgradeError = failure.summary()
+	if rig.agent.pollOnce(context.Background()) {
+		t.Fatal("the agent claimed a job that was not queued")
+	}
+	body := lastClaimBody(t, rig)
+	reported, _ := body["upgradeError"].(string)
+	if !strings.Contains(reported, "4444444444444444444444444444444444444444") ||
+		!strings.Contains(reported, "does not match the digest") {
+		t.Fatalf("the claim did not carry why the upgrade failed: %q", reported)
 	}
 }

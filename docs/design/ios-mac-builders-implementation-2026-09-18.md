@@ -29,14 +29,16 @@
 | --- | --- | --- |
 | A1 | 已完成 | `machineEnvKeys` 按 `runtime.GOOS` 组装（`RN_IOS_SIGNING_DIR` 只在 darwin 认），删 `ASC_KEY_ID`/`ASC_ISSUER_ID`；新配置 `BUILD_AGENT_IOS_UPLOAD{ER,_USER,_KEYS}`、`BUILD_AGENT_ALLOWED_SIGNERS`、`BUILD_AGENT_MIN_FREE_GB`；iOS 机器不配 `ALLOWED_SIGNERS` 或 `RN_IOS_SIGNING_DIR` 直接启动失败 |
 | A5 | 已完成 | `ios_inventory.go`：钥匙串身份 + 描述文件（纯 Go 读 CMS 里的 XML plist）+ 上传 Key 目录；每次认领前盘一次；领到任务后在检出之前再核一次 |
-| A7 | 部分 | 认领带 `agentCommit`/`os`/`appleTeams`/`freeGb`/`paused`；**409 `AGENT_UPGRADE_REQUIRED` 的处理与 halt 标记还没做**（等 S6） |
+| A7 | 已完成 | 认领带 `agentCommit`/`os`/`appleTeams`/`freeGb`/`paused`/`upgradeError`；收到 409 写 `state/halt`（`upgrade:<提交>`）以 75 退出，吊销（77）也写；启动时读 `state/upgrade-failed.json` 打日志并随认领上报 |
 | A8 | 已完成 | `version` 子命令与 `main.commit` 注入点；`result.json` 加 `toolchain`（执行进程直接问 `xcodebuild -version`），随 `/ios-release` 进 `file_metadata` |
 | A9 | 部分 | 认领前查空闲空间已做；`reap` 的 darwin 分支还没做 |
 | A6 | 已完成 | 检出之后 `git verify-commit`（`gpg.format=ssh` + `allowedSignersFile`，都走命令行 `-c`）；allowed_signers 必须是 root 所有、组与其他人不可写的普通文件，所在目录同样（目录可写的话换掉文件只是一次 rename）；没配就是没开这道闸，启动时告警一次 |
 | A2 | 已完成 | `buildIPA` 先备签名：`security -i` 设搜索列表 + 解锁 + 关自动上锁（口令走标准输入，不进命令行），描述文件复制进任务 HOME 的两个目录；`pnpm ios:release` 改带 `--signing-dir`，**不再传 `--upload`** |
 | A3 | 已完成 | `deliverIPA` 用 `archive/zip` + 自带的二进制/XML plist 解析器读 `Payload/<App>.app/Info.plist`，与任务行比对之后才交给上传账户；`sudo -n -u _rnuploader ios-upload`，包走标准输入 |
 | A4 | 已完成 | `cmd/build-agent/ios-upload`：`--probe`（只读探端点权限，永远以 0 退出）与上传两条路；先查同号再传，分块 PUT 可重试，"同号已存在"当成功；一行 JSON 到 stdout |
-| A10 | 未开始 | 下一步：S4（darwin 归档）→ S5/S6/S9（装机与自升级）→ A10（macOS 部署件）→ R1/R2（RN-App）→ C1–C4（管理端） |
+| A10 | 已完成 | `deploy/build-agent-macos/`：两份 launchd plist（`UserName`、`KeepAlive.PathState`、`ExitTimeOut=7500`；升级那份走 `WatchPaths`）、`run-agent`（加载 env 后 `exec`）、sudoers 两条（`NOSETENV`）、env 示例；新程序 `cmd/build-agent/upgrade`（验签→核序号→核提交→逐文件核 sha256→冒烟→原子替换→删标记），全部进 darwin 归档 |
+
+下一步：S5（`install-macos.sh`）→ R1/R2（RN-App）→ C1–C4（管理端）→ S8（Rancher 部署清单）。
 
 ## RN-App
 
@@ -58,5 +60,6 @@ C1–C4 未开始。
 | §4.3 上传 Key 探测 | `uploadProbe` 只说"进材料盘点" | 在认领体的 `appleTeams[]` 里加 `uploadProbe` 字段，落进 `build_machine_liveness.apple_teams` | 服务端请求体是严格解析，不先加字段代理就报不上来 |
 | A1「`machineEnvKeys` 按 `runtime.GOOS` 组装」 | Linux 上不接受 `RN_IOS_SIGNING_DIR` | 按**任务平台**组装：只有 iOS 任务的环境里才有它 | 是更强的那一条——同一台 Mac 上的 Android 任务同样不该看见签名目录；Linux 侧的保护不变（`BUILD_AGENT_PLATFORMS=ios` 在非 darwin 上启动就失败）。副作用是 iOS 那条链路在 Linux 上测得了，`go test` 覆盖到钥匙串准备、描述文件复制、身份核对与上传交接 |
 | §4.2「`security unlock-keychain -p "$(cat …)"`」 | 口令作为命令行参数 | 三条命令走 `security -i` 的标准输入 | 命令行参数 `ps` 看得到（AGENTS.md「机密的操作纪律」）。口令的字母表在读入时校验，拼不出第二条命令 |
+| §5.6「Mac 在状态目录记本机见过的最高序号」 | 水位线放在代理的状态目录 | 放在 root 拥有的 `/opt/rn-build-agent/upgrade-sequence` | 状态目录属于代理那个账户。把"防降级"的水位线放在被防的一方能写的地方，这道闸就不成立了 |
 | §4.3 第 2 步「`--ipa <路径>`」 | 把包的路径交给上传账户 | 包走**标准输入**，上传程序自己落到它的临时文件 | 产物副本在控制进程的 spool 里，而 spool 在状态目录下（0700，同一棵树里放着出处私钥）。为了传一个不是机密的包，去放宽一个装着机密的目录，不划算 |
 | §5.3「`build-ios-release.mjs` 打印 `xcodebuild -version` 供 runner 解析」 | 从构建脚本的日志里捞一行 | 执行进程直接问 `xcodebuild -version` | 否则这个值的正确性取决于另一个仓库里某行日志的格式 |

@@ -1,0 +1,14 @@
+# /etc/sudoers.d/rn-build-agent —— root:wheel 0440，用 `visudo -c -f` 检查过再放上去。
+#
+# 两条规则，都收窄到"哪个账户、以哪个身份、跑哪一个绝对路径"：
+#
+#   - 执行进程：第三方依赖在它里面跑，所以它与控制进程分账户（设计 §4.1）；
+#   - 上传程序：它持有能往 App Store Connect 传 build 的 Key，而那是钥匙串里那些签名材料
+#     唯一缺的出口。它既不该是执行进程，也不该是控制进程（§4.3）。
+#
+# NOSETENV 是关键：没有它，调用方可以经 sudo 传环境变量进去——那等于把"执行进程的环境
+# 由白名单构造"这条绕开。两个目标程序都是 root:wheel 0755，组与其他人不可写。
+Defaults!/opt/rn-build-agent/build-runner !requiretty
+Defaults!/opt/rn-build-agent/ios-upload   !requiretty
+_rnbuildagent ALL=(_rnbuilder)  NOPASSWD:NOSETENV: /opt/rn-build-agent/build-runner
+_rnbuildagent ALL=(_rnuploader) NOPASSWD:NOSETENV: /opt/rn-build-agent/ios-upload

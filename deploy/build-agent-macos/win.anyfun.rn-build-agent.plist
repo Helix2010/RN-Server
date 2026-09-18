@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  /Library/LaunchDaemons/win.anyfun.rn-build-agent.plist —— root:wheel 0644。
+  装好之后 `launchctl bootstrap system <这个文件>`。
+
+  三处与 systemd 不一样的地方（设计 ios-mac-builders-home-network-2026-09-18 §4.1）：
+
+  1. UserName：launchd 在 exec **之前**就切用户，没有"PID 1 以 root 读 env 再降权"这一步。
+     所以 env 文件属于这个账户（0600），由 run-agent 自己加载。
+  2. KeepAlive.PathState：launchd 不认退出码（systemd 有 RestartPreventExitStatus）。
+     代理在以 75（等升级）或 77（被吊销）退出之前先写这个标记文件，标记在 launchd 就不再
+     拉起它；升级程序换完二进制删掉标记，launchd 随即把新版拉起来。没有这一条，一台要求
+     升级的机器会变成每秒重启一次。
+  3. ExitTimeOut：launchd 默认 20 秒就 SIGKILL，而一次 iOS 构建可以跑两小时。这里给
+     BUILD_AGENT_TIMEOUT_MINUTES（120）再加 5 分钟，"停机时手上这条做完"才成立。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>win.anyfun.rn-build-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/rn-build-agent/run-agent</string>
+  </array>
+  <key>UserName</key>
+  <string>_rnbuildagent</string>
+  <key>GroupName</key>
+  <string>_rnbuildjobs</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict>
+      <key>/var/rn-build-agent/state/halt</key>
+      <false/>
+    </dict>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>7500</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/var/log/rn-build-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/rn-build-agent.log</string>
+  <key>WorkingDirectory</key>
+  <string>/var/rn-build-agent</string>
+</dict>
+</plist>

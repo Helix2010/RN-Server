@@ -42,6 +42,10 @@ type agent struct {
 	iosScan func(ctx context.Context) iosInventory
 	// lastSaid 是 sayOnce 的去重表：盘点每 10 秒一次，说的话几天不变
 	lastSaid map[string]string
+	// upgradeError 是上一次自升级失败的摘要（启动时从状态目录读出来），随认领报上去
+	upgradeError string
+	// haltReason 非空表示这一轮之后要停机让位给升级程序（先写标记，再以 75 退出）
+	haltReason string
 
 	keyActive      bool
 	keyCheckedAt   time.Time
@@ -173,7 +177,8 @@ func (a *agent) say(message string, args ...any) {
 // 拷进目录的，中途加一个租户、删一张过期证书都不会通知这个进程。每 10 秒起一次
 // `security` 子进程的代价，换的是"控制台上看到的就是这台机器现在真实有的东西"。
 func (a *agent) claimRequest(ctx context.Context) claimRequest {
-	request := claimRequest{Platforms: a.cfg.Platforms, AgentCommit: agentCommit(), OS: runtime.GOOS}
+	request := claimRequest{Platforms: a.cfg.Platforms, AgentCommit: agentCommit(), OS: runtime.GOOS,
+		UpgradeError: a.upgradeError}
 	// 空闲空间：磁盘满时每条任务都会在 pnpm install 或 archive 那一步失败，各烧掉一个
 	// build 号。报上去让控制台看得见，低于阈值就暂停认领——但仍然来报到，
 	// 否则控制台只能显示"离线"，而磁盘满和关机要做的处理完全不同
@@ -294,6 +299,13 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 			})
 		}
 		return true
+	case result.Upgrade != nil:
+		// 服务端在**没有派任务**的时候说"先升级"，所以这一刻手上一定是空的。写停机标记
+		// 再退出：launchd 看到标记就不再拉起我们，root 的升级程序换完二进制删掉它
+		a.log.Info("the server approved another build-agent version; stopping so the upgrade helper can install it",
+			"approved", result.Upgrade.AgentCommit, "running", agentCommit())
+		a.haltReason = upgradeHaltReason(result.Upgrade.AgentCommit)
+		return false
 	case result.Job == nil:
 		return false
 	case request.Paused:
@@ -580,10 +592,17 @@ func (a *agent) serve(ctx context.Context) int {
 	for {
 		worked := a.pollOnce(ctx)
 		if a.api.isRevoked() {
+			// 吊销也写停机标记：在 launchd 下不写的话，一台被吊销的机器会每秒重启一次，
+			// 每次都去问一遍服务端
+			a.halt("revoked")
 			a.log.Error("this build machine was revoked in the console (or its token is no longer recognised); stopping. "+
 				"Create a new machine in the console and put its token in the env file to build again",
 				"exitStatus", exitMachineRevoked)
 			return exitMachineRevoked
+		}
+		if a.haltReason != "" {
+			a.halt(a.haltReason)
+			return exitUpgradeRequired
 		}
 		if ctx.Err() != nil {
 			a.log.Info("build agent stopped")
@@ -600,6 +619,17 @@ func (a *agent) serve(ctx context.Context) int {
 		case <-time.After(a.cfg.PollEvery):
 		}
 	}
+}
+
+// halt 写停机标记。写不成只记日志：写不成的后果是 launchd 把旧版拉回来接着跑，
+// 那比"退不出去"好。
+func (a *agent) halt(reason string) {
+	if err := writeHalt(a.cfg.StateDir, reason); err != nil {
+		a.log.Error("cannot write the halt marker; launchd will start this agent again in a moment",
+			"path", haltPath(a.cfg.StateDir), "error", err)
+		return
+	}
+	a.log.Info("halt marker written", "path", haltPath(a.cfg.StateDir), "reason", reason)
 }
 
 // report 反复重试最后那一次上报（失败原因）。这一步失败的代价是任务停在 claimed、

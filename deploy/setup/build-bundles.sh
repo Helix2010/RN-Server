@@ -8,6 +8,7 @@
 #                    rn-build-agent.sudoers、rn-build-agent.env.example、README.md
 #   builder-darwin-arm64.tar.gz
 #                    darwin/arm64（Mac 打包机）：bin/build-agent、bin/build-runner、bin/ios-upload、
+#                    bin/rn-build-agent-upgrade、run-agent、两份 launchd plist、sudoers、
 #                    rn-build-agent-macos.env.example
 #   manifest.json    {"format":"rn-machine-bundles/v1","commit",
 #                     "bundles":{"signer":{"archive","archiveSha256","archiveSize","files":[{"name","size","sha256"}]},
@@ -59,6 +60,8 @@ export GOTOOLCHAIN=local CGO_ENABLED=0
 (cd "$ROOT" && GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o "$STAGE/builder-darwin-arm64/bin/build-agent" ./cmd/build-agent)
 (cd "$ROOT" && GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$STAGE/builder-darwin-arm64/bin/build-runner" ./cmd/build-agent/build-runner)
 (cd "$ROOT" && GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$STAGE/builder-darwin-arm64/bin/ios-upload" ./cmd/build-agent/ios-upload)
+# 升级程序以 root 跑，由停机标记触发；它验清单签名、核单调序号与目标提交之后才换二进制
+(cd "$ROOT" && GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$STAGE/builder-darwin-arm64/bin/rn-build-agent-upgrade" ./cmd/build-agent/upgrade)
 # 与 deploy/signer/README.md「构建」同一组参数
 (cd "$ROOT/signing" && GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o "$STAGE/signer/bin/" ./cmd/signer ./cmd/signer-check)
 
@@ -67,7 +70,12 @@ cp "$ROOT/deploy/signer/README.md" "$STAGE/signer/README.md"
 cp "$ROOT/internal/machinesetup/install.sh" "$STAGE/signer/install.sh"
 cp "$ROOT/deploy/build-agent/rn-build-agent.service" "$ROOT/deploy/build-agent/rn-build-agent.sudoers" \
   "$ROOT/deploy/build-agent/rn-build-agent.env.example" "$ROOT/deploy/build-agent/README.md" "$STAGE/builder/"
-cp "$ROOT/deploy/build-agent-macos/rn-build-agent-macos.env.example" "$STAGE/builder-darwin-arm64/"
+cp "$ROOT/deploy/build-agent-macos/rn-build-agent-macos.env.example" \
+  "$ROOT/deploy/build-agent-macos/rn-build-agent.sudoers" \
+  "$ROOT/deploy/build-agent-macos/run-agent" \
+  "$ROOT/deploy/build-agent-macos/win.anyfun.rn-build-agent.plist" \
+  "$ROOT/deploy/build-agent-macos/win.anyfun.rn-build-agent-upgrade.plist" \
+  "$STAGE/builder-darwin-arm64/"
 
 for role in signer builder builder-darwin-arm64; do
   tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$EPOCH" --mode='u+rwX,go+rX,go-w' \
@@ -121,4 +129,4 @@ echo "安装包：$OUT（提交 $COMMIT）"
 # darwin 的二进制在 Linux 上跑不了，冒烟只能在 Mac 上做（升级脚本会做，见 §5.6）。
 # 交叉编译出来的 darwin 二进制带 Go 链接器默认的 ad-hoc 签名，在 Mac 上用
 # `codesign -dv bin/build-agent` 核一次
-(cd "$STAGE/builder-darwin-arm64" && sha256sum bin/build-agent bin/build-runner bin/ios-upload)
+(cd "$STAGE/builder-darwin-arm64" && sha256sum bin/build-agent bin/build-runner bin/ios-upload bin/rn-build-agent-upgrade)

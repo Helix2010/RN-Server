@@ -35,6 +35,9 @@ const (
 	// 一台 Mac 上的 Team 数不会超过它
 	// machinePausedReasonMaxRunes：一句话，够说清"磁盘只剩 12 GiB，低于 40"
 	machinePausedReasonMaxRunes = 200
+	// machineUpgradeErrorMaxRunes：升级程序写的一句话，比暂停原因宽一点（它可能带上
+	// 下载或校验失败的细节）
+	machineUpgradeErrorMaxRunes = 300
 	maxAppleTeamReports         = 64
 	maxBundleIDsPerTeam         = 64
 	appleSigningNeverEnds       = ""
@@ -87,6 +90,9 @@ type machineLiveness struct {
 	// 暂停的机器**仍然算在线**：它每 10 秒还来问一次，只是带着 paused。把它显示成离线
 	// 会把"磁盘满了"和"关机了"混成一件事，而这两件事要做的处理完全不同
 	PausedReason string
+	// UpgradeError 是上一次自升级失败的原因。空=没失败过。升级是 root 那个程序做的，
+	// 它失败时代理还在跑旧版——不报上来的话，控制台看到的只是"版本一直追不上审批值"
+	UpgradeError string
 }
 
 func (l machineLiveness) online(now time.Time) bool {
@@ -186,16 +192,16 @@ func (s *server) recordMachineLiveness(ctx context.Context, live machineLiveness
 	}
 	now := live.LastSeenAt
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,paused_reason,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)
+		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		 ON DUPLICATE KEY UPDATE
 		   last_seen_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(last_seen_at), last_seen_at),
 		   agent_commit=VALUES(agent_commit),os=VALUES(os),platforms=VALUES(platforms),
 		   apple_teams=VALUES(apple_teams),signing_expires_at=VALUES(signing_expires_at),free_gb=VALUES(free_gb),
-		   paused_reason=VALUES(paused_reason),
+		   upgrade_error=VALUES(upgrade_error),paused_reason=VALUES(paused_reason),
 		   updated_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(updated_at), updated_at)`,
 		live.MachineID, now, nullableString(live.AgentCommit), nullableString(live.OS), string(platforms),
-		teams, live.SigningExpiresAt, live.FreeGB, nullableString(live.PausedReason), now); err != nil {
+		teams, live.SigningExpiresAt, live.FreeGB, nullableString(live.UpgradeError), nullableString(live.PausedReason), now); err != nil {
 		slog.Warn("unable to record build machine liveness", "machineId", live.MachineID, "error", err)
 	}
 }
@@ -221,7 +227,7 @@ func (s *server) touchMachineLiveness(ctx context.Context, machineID string, now
 // machineLivenessByID 读全表。行数等于登记过的机器数（上限 64），一次全取比按 id 查几十次便宜。
 func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiveness, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,paused_reason FROM build_machine_liveness`)
+		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason FROM build_machine_liveness`)
 	if err != nil {
 		return nil, err
 	}
@@ -229,12 +235,13 @@ func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiv
 	out := map[string]machineLiveness{}
 	for rows.Next() {
 		var live machineLiveness
-		var agentCommit, os, paused sql.NullString
+		var agentCommit, os, upgradeError, paused sql.NullString
 		var platforms, teams []byte
 		if err := rows.Scan(&live.MachineID, &live.LastSeenAt, &agentCommit, &os, &platforms, &teams,
-			&live.SigningExpiresAt, &live.FreeGB, &paused); err != nil {
+			&live.SigningExpiresAt, &live.FreeGB, &upgradeError, &paused); err != nil {
 			return nil, err
 		}
+		live.UpgradeError = upgradeError.String
 		live.PausedReason = paused.String
 		live.LastSeenAt = live.LastSeenAt.UTC()
 		live.AgentCommit = agentCommit.String

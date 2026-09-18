@@ -98,6 +98,9 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		// "关机了"要做的处理完全不同
 		Paused       bool   `json:"paused"`
 		PausedReason string `json:"pausedReason"`
+		// UpgradeError：上一次自升级失败的原因。升级是 root 的那个程序做的，它失败时
+		// 代理还在跑旧版，控制台只会看到"版本追不上审批值"——不报上来就只能上机器看日志
+		UpgradeError string `json:"upgradeError"`
 	}
 	if decode(c, &body) != nil || len(body.Platforms) == 0 || len(body.Kinds) == 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
@@ -151,6 +154,7 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		// 而那正是要在控制台上看见的东西
 		Platforms: body.Platforms, AppleTeams: teams,
 		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB, PausedReason: pausedReason,
+		UpgradeError: sanitizeSignerText(body.UpgradeError, machineUpgradeErrorMaxRunes),
 	})
 	// 版本闸在**选任务之前**（设计 ios-mac-builders-home-network-2026-09-18 §5.6）。
 	//

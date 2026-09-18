@@ -1,0 +1,20 @@
+#!/bin/sh
+# /opt/rn-build-agent/run-agent —— root:wheel 0755（可读不可写）。
+#
+# launchd 在 exec 之前就切到 UserName，没有"PID 1 以 root 读 env 文件再降权"这一步，
+# 所以 env 文件由跑控制进程的那个账户自己读。这个包装脚本只做一件事：加载它，然后 exec。
+#
+# **exec 不能少**：exec 之后 SIGTERM 直达控制进程，停机时"不再领新活、手上这条做完"的
+# 语义与 Linux 上一致；不 exec 的话信号停在这个 sh 上，launchd 到 ExitTimeOut 直接 SIGKILL，
+# 正在跑的构建被拦腰砍断。
+set -eu
+ENV_FILE="${RN_BUILD_AGENT_ENV:-/var/rn-build-agent/env}"
+if [ ! -r "$ENV_FILE" ]; then
+  echo "run-agent: cannot read $ENV_FILE (it must be owned by the agent account, mode 0600)" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+exec /opt/rn-build-agent/build-agent

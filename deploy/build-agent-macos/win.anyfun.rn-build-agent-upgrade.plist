@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  /Library/LaunchDaemons/win.anyfun.rn-build-agent-upgrade.plist —— root:wheel 0644。
+
+  升级程序**以 root 跑**，由停机标记出现触发（WatchPaths）。它换的是 /opt/rn-build-agent
+  下 root:wheel 0755 的几个二进制，所以只能是 root——但也正因为它是 root，它对服务端
+  给的每一样东西都要自己验：清单的离线签名、单调序号、目标提交、每个文件的 sha256
+  （设计 §5.6）。服务端手里没有那把发布私钥。
+
+  WatchPaths 在文件出现、消失、被改写时都会触发，所以这个程序必须对"标记不在"和
+  "标记不是升级请求"都安静地什么都不做——尤其**不删**不属于它的标记：被吊销的机器
+  就该停在那里。
+
+  RunAtLoad 是 false：开机时没有标记，不需要跑；有标记的话 WatchPaths 会在加载时触发。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>win.anyfun.rn-build-agent-upgrade</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/rn-build-agent/rn-build-agent-upgrade</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+    <string>/var/rn-build-agent/state/halt</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/rn-build-agent-upgrade.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/rn-build-agent-upgrade.log</string>
+</dict>
+</plist>

@@ -76,6 +76,12 @@ func runAgent() int {
 	defer stop()
 
 	a := newAgent(cfg, keys)
+	// 上一次升级失败过：打进日志，并随认领报给服务端。不报的话控制台上只能看到
+	// "这台机器的版本一直追不上审批值"，看不出是为什么
+	if failure, failed := readUpgradeFailure(cfg.StateDir); failed {
+		a.upgradeError = failure.summary()
+		slog.Error("the last self-upgrade did not finish", "detail", a.upgradeError)
+	}
 	if !cfg.runnerSeparated() {
 		slog.Warn("!!! BUILD_AGENT_RUNNER_USER is '-': the build runner runs as the SAME user as the build agent, " +
 			"so third-party build code can read the machine token and the provenance key. LOCAL TESTING ONLY, NEVER IN PRODUCTION !!!")

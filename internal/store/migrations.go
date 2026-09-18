@@ -2013,6 +2013,7 @@ func buildMachineLivenessMigration(ctx context.Context, db *sql.DB) error {
 		apple_teams JSON NULL COMMENT '自报的签名材料盘点：[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z"}]。由 Mac 自己盘钥匙串与描述文件得出，服务端据它路由 iOS 任务，控制台据它与全部租户的 release.ios 求差集标出缺口。**这是运维仪表不是安全边界**：持有机器令牌的人可以谎报。NULL=不是 iOS 打包机或旧版代理没报',
 		signing_expires_at DATETIME(3) NULL COMMENT '本机最早到期的证书或描述文件的到期时刻 UTC，30 天内控制台标黄。NULL=没有签名材料或没报',
 		free_gb INT UNSIGNED NULL COMMENT '构建盘剩余空间 GiB，认领时自报。NULL=没报',
+		upgrade_error VARCHAR(300) NULL COMMENT '这台机器上一次自升级失败的原因（升级程序写 state/upgrade-failed.json，代理启动后读出来随认领报上来）。NULL=上一次升级没失败过。为什么要报上来：升级是 root 的那个程序做的，它失败时代理还在跑旧版，控制台上看到的只是"这台机器版本一直追不上审批值"，不说原因就只能上机器看日志',
 		paused_reason VARCHAR(200) NULL COMMENT '这台机器自己暂停认领的原因，例如空闲空间低于 BUILD_AGENT_MIN_FREE_GB。它仍然每 10 秒来问一次（所以仍然算在线），但请求里带着 paused，服务端记下这一行就回 204 不派活。NULL=没有暂停。为什么不让它干脆别来问：那样控制台只能看到"离线"，而磁盘满和关机需要的处理完全不同',
 		updated_at DATETIME(3) NOT NULL COMMENT '本行最近一次被写入的时刻 UTC',
 		PRIMARY KEY (machine_id)
@@ -2020,6 +2021,11 @@ func buildMachineLivenessMigration(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("build machine liveness migration: %w", err)
 	}
 	// CREATE TABLE IF NOT EXISTS 对已经建好的表什么都不做，所以后加的列要单独补一次
+	if err := addColumnIfMissing(ctx, db, "build_machine_liveness", "upgrade_error",
+		`ALTER TABLE build_machine_liveness ADD COLUMN upgrade_error VARCHAR(300) NULL
+			COMMENT '这台机器上一次自升级失败的原因（升级程序写 state/upgrade-failed.json，代理启动后读出来随认领报上来）。NULL=上一次升级没失败过' AFTER free_gb`); err != nil {
+		return fmt.Errorf("build machine liveness migration upgrade_error: %w", err)
+	}
 	if err := addColumnIfMissing(ctx, db, "build_machine_liveness", "paused_reason",
 		`ALTER TABLE build_machine_liveness ADD COLUMN paused_reason VARCHAR(200) NULL
 			COMMENT '这台机器自己暂停认领的原因，例如空闲空间低于 BUILD_AGENT_MIN_FREE_GB。它仍然每 10 秒来问一次（所以仍然算在线），但请求里带着 paused，服务端记下这一行就回 204 不派活。NULL=没有暂停' AFTER free_gb`); err != nil {

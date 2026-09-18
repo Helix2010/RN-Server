@@ -28,6 +28,7 @@ const (
 	codeKeyNotAccepted      = "MACHINE_KEY_NOT_ACCEPTED"
 	codeKeyRotationUnproven = "MACHINE_KEY_ROTATION_UNPROVEN"
 	codeClaimInProgress     = "BUILDER_CLAIM_IN_PROGRESS"
+	codeUpgradeRequired     = "AGENT_UPGRADE_REQUIRED"
 	codeMachineRevoked      = "MACHINE_REVOKED"
 	codeMachineAuthRequired = "MACHINE_AUTH_REQUIRED"
 
@@ -166,6 +167,8 @@ type claimResult struct {
 	Refused *refusedClaim
 	// Active 是服务端说本机还有一条 claimed/running 的任务（409 BUILDER_HAS_ACTIVE_JOB）
 	Active *activeJobRef
+	// Upgrade 是服务端要求先升级（409 AGENT_UPGRADE_REQUIRED）
+	Upgrade *upgradeRequest
 }
 
 type refusedClaim struct {
@@ -177,6 +180,13 @@ type refusedClaim struct {
 type activeJobRef struct {
 	JobID   string `json:"jobId"`
 	Attempt int    `json:"attempt"`
+}
+
+// upgradeRequest 是服务端说"你这一版不是被批准的那一版，先升级再来"（409
+// AGENT_UPGRADE_REQUIRED，设计 §5.6）。它只在**没有派任务**的时候出现，所以收到它的
+// 那一刻这台机器手上一定是空的——升级因此总是发生在空闲时。
+type upgradeRequest struct {
+	AgentCommit string `json:"agentCommit"`
 }
 
 type client struct {
@@ -333,6 +343,9 @@ type claimRequest struct {
 	// 直接回 204
 	Paused       bool   `json:"paused,omitempty"`
 	PausedReason string `json:"pausedReason,omitempty"`
+	// UpgradeError 是上一次自升级失败的摘要。升级是 root 那个程序做的，它失败时这个
+	// 进程还在跑旧版——不报上来，控制台只会看到"版本一直追不上审批值"
+	UpgradeError string `json:"upgradeError,omitempty"`
 }
 
 // appleTeamSelfReport 是自报盘点里的一个 Team。字段名与服务端的严格解析一一对应：
@@ -349,6 +362,14 @@ func (c *client) claim(ctx context.Context, request claimRequest) (claimResult, 
 	const path = "/v1/build-agent/claim"
 	request.Kinds = []string{"apk", "ota"}
 	status, payload, err := c.send(ctx, http.MethodPost, path, 0, request)
+	if errorCode(err) == codeUpgradeRequired {
+		var upgrade upgradeRequest
+		if json.Unmarshal(payload, &upgrade) != nil || !commitPattern.MatchString(upgrade.AgentCommit) {
+			// 说了要升级却没说升到哪一版：这条响应没法执行，当普通错误处理
+			return claimResult{}, fmt.Errorf("%s asked for an upgrade but named no commit", path)
+		}
+		return claimResult{Upgrade: &upgrade}, nil
+	}
 	if errorCode(err) == codeBuilderHasActiveJob {
 		var active activeJobRef
 		if json.Unmarshal(payload, &active) != nil || active.JobID == "" || active.Attempt < 1 {

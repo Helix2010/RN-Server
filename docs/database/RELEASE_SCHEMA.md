@@ -132,6 +132,7 @@ ota：queued → claimed → running → succeeded
 | `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z","uploadProbe":"ok"}]`（`uploadProbe`：`ok`/`forbidden`/`error`，启动时对上传 Key 做的只读探测，让"角色不够传不上去"在**第一次构建之前**就看得见）。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
 | `signing_expires_at` | DATETIME(3) NULL | 本机最早到期的证书或描述文件，30 天内控制台标黄 |
 | `free_gb` | INT UNSIGNED NULL | 构建盘剩余空间 GiB，认领时自报 |
+| `upgrade_error` | VARCHAR(300) NULL | 上一次自升级失败的原因（升级程序写 `state/upgrade-failed.json`，代理启动后读出来随认领报上来）。**为什么要报上来**：升级是 root 的那个程序做的，它失败时代理还在跑旧版，控制台上看到的只是"版本一直追不上审批值"，不说原因就只能上机器看日志 |
 | `paused_reason` | VARCHAR(200) NULL | 这台机器自己暂停认领的原因（空闲空间低于 `BUILD_AGENT_MIN_FREE_GB` 等）。它仍然每 10 秒来问一次（仍然算在线），只是请求里带着 `paused`，服务端记下这一行就回 204 不派活。**为什么不让它干脆别来问**：那样控制台只能看到"离线"，而磁盘满和关机需要的处理完全不同 |
 | `updated_at` | DATETIME(3) NOT NULL | 本行最近一次被写入 UTC |
 
