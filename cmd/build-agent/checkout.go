@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -281,6 +282,9 @@ func (a *agent) checkoutMain(ctx context.Context, dst string, buf *logBuffer) (s
 	if head != sha {
 		return "", fmt.Errorf("the checkout is at %s, not %s", head, sha)
 	}
+	if err := a.verifyCommitSignature(gitCtx, dst, sha, buf); err != nil {
+		return "", err
+	}
 	buf.add("commit " + sha + " (" + buildBranchRef + ")")
 	return sha, nil
 }
@@ -394,26 +398,77 @@ func (a *agent) checkMirror(ctx context.Context) error {
 // rootUID 是固定 known_hosts 文件必须的属主：root。控制进程自己改不了它。
 const rootUID = 0
 
-// checkKnownHosts 核对 fetch 用的 known_hosts：root（测试里是 a.knownHostsOwner）所有的普通文件，
+// checkKnownHosts 核对 fetch 用的 known_hosts：root（测试里是 a.pinnedFilesOwner）所有的普通文件，
 // 它和所在目录组与其他人都不可写。
 func (a *agent) checkKnownHosts() error {
-	path := a.cfg.KnownHosts
+	return a.checkPinnedFile(a.cfg.KnownHosts, "the pinned GitHub known_hosts",
+		"so the build agent cannot change which host key GitHub must have")
+}
+
+// checkPinnedFile 核对一份"控制进程自己改不了"的文件：root（测试里是 a.pinnedFilesOwner）
+// 所有的普通文件，在同样属于它的真实目录里，组和其他人不可写。
+//
+// 目录也要查：目录可写的话，换掉整个文件只是一次 rename。
+func (a *agent) checkPinnedFile(path, what, why string) error {
 	for _, p := range []string{path, filepath.Dir(path)} {
 		info, err := os.Lstat(p)
 		if err != nil {
-			return fmt.Errorf("the pinned GitHub known_hosts %s is not usable (%w): install it as described in deploy/amos/SIGNING_GATE_ROLLOUT.md", path, err)
+			return fmt.Errorf("%s %s is not usable (%w): install it as described in the machine setup guide", what, path, err)
 		}
 		st, ok := info.Sys().(*syscall.Stat_t)
 		wantDir := p != path
 		switch {
 		case info.Mode()&fs.ModeSymlink != 0 || info.IsDir() != wantDir || (!wantDir && !info.Mode().IsRegular()):
-			return fmt.Errorf("%s must be a regular file in a real directory, not a symlink: install the pinned GitHub known_hosts as described in deploy/amos/SIGNING_GATE_ROLLOUT.md", p)
-		case !ok || int(st.Uid) != a.knownHostsOwner:
-			return fmt.Errorf("%s must belong to root so the build agent cannot change which host key GitHub must have", p)
+			return fmt.Errorf("%s must be a regular file in a real directory, not a symlink: install %s as described in the machine setup guide", p, what)
+		case !ok || int(st.Uid) != a.pinnedFilesOwner:
+			return fmt.Errorf("%s must belong to root %s", p, why)
 		case info.Mode().Perm()&0o022 != 0:
 			return fmt.Errorf("%s must not be writable by group or others", p)
 		}
 	}
+	return nil
+}
+
+// checkAllowedSigners 核对提交签名校验用的允许签名者文件（设计
+// ios-mac-builders-home-network-2026-09-18 §4.6）。没配就是没开这道闸——iOS 机器上
+// 不配会在 loadConfig 里直接启动失败。
+func (a *agent) checkAllowedSigners() error {
+	if a.cfg.AllowedSigners == "" {
+		return nil
+	}
+	return a.checkPinnedFile(a.cfg.AllowedSigners, "the pinned allowed_signers file",
+		"so the build agent cannot add a signer to the list it checks commits against")
+}
+
+// verifyCommitSignature 要求这个提交由 allowed_signers 里的某把 SSH 密钥签过。
+//
+// **为什么这道闸在 iOS 机器上是必需的**：这台 Mac 上放着全部租户的签名材料，而它构建的
+// 是服务端指过来的那个提交。没有这道闸，任何一条通向"能改 main"或"能改服务端数据库"的
+// 路，都直接变成"在这台机器上执行任意代码"——而那等于拿到全部租户的 Distribution 私钥。
+// 有了它，推得上去也过不了这一关：签名者的私钥不在 GitHub、也不在服务端。
+//
+// gpg.format=ssh 与 allowedSignersFile 走命令行的 -c，不写进仓库配置：检出目录是每次任务
+// 新建的，而 git 的配置优先级里命令行最高。allowed_signers 属于 root，控制进程改不了它。
+func (a *agent) verifyCommitSignature(ctx context.Context, dir, sha string, buf *logBuffer) error {
+	if a.cfg.AllowedSigners == "" {
+		return nil
+	}
+	if err := a.checkAllowedSigners(); err != nil {
+		return err
+	}
+	cmd := a.gitCommand(ctx, dir, "-c", "gpg.format=ssh",
+		"-c", "gpg.ssh.allowedSignersFile="+a.cfg.AllowedSigners,
+		"verify-commit", "--", sha)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		// git 把"谁签的、签没签"都打在 stderr 上。原样带出去（经日志缓冲的脱敏），
+		// 它是这条任务失败原因里唯一有用的部分
+		return fmt.Errorf("commit %s is not signed by an allowed signer (%s): %w. "+
+			"Every commit on the build branch must carry an SSH signature from a key listed in %s",
+			sha, firstRunes(strings.TrimSpace(stderr.String()), 300), err, a.cfg.AllowedSigners)
+	}
+	buf.add("commit signature verified against " + a.cfg.AllowedSigners)
 	return nil
 }
 

@@ -383,7 +383,7 @@ func newRig(t *testing.T) *testRig {
 	a := newAgent(cfg, keys)
 	// 测试的镜像从本地路径取；固定 known_hosts 属于当前用户
 	a.mirrorProtocol = "file"
-	a.knownHostsOwner = os.Geteuid()
+	a.pinnedFilesOwner = os.Geteuid()
 	a.heartbeatEvery = 50 * time.Millisecond
 	a.reportDelay = time.Millisecond
 	return &testRig{server: server, tools: tools, agent: a, commit: commit, bare: bare}

@@ -102,6 +102,15 @@ func runAgent() int {
 	if err := a.checkKnownHosts(); err != nil {
 		slog.Error("builds will fail until this is fixed", "error", err)
 	}
+	// 提交签名校验的允许签名者文件同理：不合规的话每一条任务都会在检出之后失败，
+	// 而那时看起来像"仓库有问题"。iOS 机器上这个键是必填的（loadConfig 里挡着）
+	if err := a.checkAllowedSigners(); err != nil {
+		slog.Error("builds will fail until this is fixed", "error", err)
+	}
+	if cfg.AllowedSigners == "" {
+		slog.Warn("BUILD_AGENT_ALLOWED_SIGNERS is not set: this machine builds whatever commit the server points it at, " +
+			"without checking who signed it. Required on iOS machines, strongly recommended everywhere else")
+	}
 	if _, err := os.Lstat(cfg.Repo); err == nil {
 		if err := a.checkMirror(ctx); err != nil {
 			slog.Error("builds will fail until this is fixed", "error", err)

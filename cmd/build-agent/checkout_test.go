@@ -614,7 +614,7 @@ func TestCheckoutRefusesAnUnsafeKnownHostsFile(t *testing.T) {
 			mustSymlink(t, a.cfg.KnownHosts, link)
 			a.cfg.KnownHosts = link
 		},
-		"another owner": func(t *testing.T, a *agent) { a.knownHostsOwner = os.Geteuid() + 1 },
+		"another owner": func(t *testing.T, a *agent) { a.pinnedFilesOwner = os.Geteuid() + 1 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			rig := newRig(t)

@@ -32,7 +32,8 @@
 | A7 | 部分 | 认领带 `agentCommit`/`os`/`appleTeams`/`freeGb`/`paused`；**409 `AGENT_UPGRADE_REQUIRED` 的处理与 halt 标记还没做**（等 S6） |
 | A8 | 部分 | `version` 子命令与 `main.commit` 注入点已有；`result.json` 的 `toolchain` 还没做 |
 | A9 | 部分 | 认领前查空闲空间已做；`reap` 的 darwin 分支还没做 |
-| A2、A3、A4、A6、A10 | 未开始 | 顺序：A6（提交验签）→ A2/A3（构建与交付）→ A4（`ios-upload`）→ A10（macOS 部署件） |
+| A6 | 已完成 | 检出之后 `git verify-commit`（`gpg.format=ssh` + `allowedSignersFile`，都走命令行 `-c`）；allowed_signers 必须是 root 所有、组与其他人不可写的普通文件，所在目录同样（目录可写的话换掉文件只是一次 rename）；没配就是没开这道闸，启动时告警一次 |
+| A2、A3、A4、A10 | 未开始 | 顺序：A2/A3（构建与交付）→ A4（`ios-upload`）→ A10（macOS 部署件） |
 
 ## RN-App
 
