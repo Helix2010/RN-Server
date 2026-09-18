@@ -19,7 +19,7 @@
 | S5 | 已完成 | 本分支 | `install-macos.sh`（674 行，`go:embed`，`GET /v1/machine-setup/install-macos.sh`）：三个带外核对值必填且真的用来比对，FileVault 没开就拒装，三个角色账户 + 目录、安装包逐文件核对、冒烟、钥匙串与随机口令、enroll、deploy key、两份 plist |
 | S6 | 已完成 | 本分支 | `GET /v1/build-agent/bundle`（清单 base64 + 离线签名 + 归档地址）与 `/bundle/archive`（流式，豁免库超时）；平台级 `approvedAgentCommit` 与 `POST /v1/admin/platform/build-agent-version`；claim 在选任务**之前**比对，不等则 409 `AGENT_UPGRADE_REQUIRED`；没签名或 `-dirty` 一律 503 |
 | S7 | 已完成 | 本分支 | `ascapi` 加 `Uploader`（**只有它能写 Apple 侧状态**，服务端只构造只读的 `Client`，有用例守着）、Build Uploads 三个端点、按 build 号查询、只读探测 |
-| S8 | 未开始 | | Rancher 部署清单 |
+| S8 | 已完成 | 本分支 | `deploy/rancher/README.md`：安装包目录挂卷（含 `manifest.sig` 必须一起放）、`TRUSTED_PROXIES`、Ingress 不重定向与不剥请求头、出站到 ASC、**限速按副本各算**（N 副本就是 N×20，写下来免得有人按 20 算容量）、多副本直接开的依据、阶段 E 的验证清单 |
 | S11 | 已完成 | 本分支 | `GET /v1/admin/platform/build-agent-version`（C4 要的读接口）与 darwin 的六行装机命令。设计里没有编号，归在 S6/S5 名下 |
 | S9 | 已完成 | 本分支 | `signing/bundlesig` + 离线 `bundle-sign`（key create / sign / verify）；签的是提交 + 单调序号 + 清单摘要的规范化字节，不签 JSON |
 | S10 | 已完成 | 本分支 | 排队超 6 小时的 iOS 任务发一条告警（每条只发一次，靠审计去重），**不改状态**；告警分得清"没人在线"与"没人有这个 Team 的材料" |
@@ -39,7 +39,7 @@
 | A4 | 已完成 | `cmd/build-agent/ios-upload`：`--probe`（只读探端点权限，永远以 0 退出）与上传两条路；先查同号再传，分块 PUT 可重试，"同号已存在"当成功；一行 JSON 到 stdout |
 | A10 | 已完成 | `deploy/build-agent-macos/`：两份 launchd plist（`UserName`、`KeepAlive.PathState`、`ExitTimeOut=7500`；升级那份走 `WatchPaths`）、`run-agent`（加载 env 后 `exec`）、sudoers 两条（`NOSETENV`）、env 示例；新程序 `cmd/build-agent/upgrade`（验签→核序号→核提交→逐文件核 sha256→冒烟→原子替换→删标记），全部进 darwin 归档 |
 
-下一步：S8（Rancher 部署清单）→ §10 第 5 条（签名材料归档运维手册）→ §9 阶段 A–F 真机验证。
+下一步：§9 阶段 A–F 真机验证（剩下的都要一台真 Mac）；R3 是 GitHub 上的设置，随时可做。
 
 ## RN-App
 
@@ -59,6 +59,12 @@
 | C4 | 已完成 | `fba909c` + `2f62b9b` | 新增 `GET /v1/admin/platform/build-agent-version` 与「批准打包机程序版本」卡片：先显示两组安装包各自的提交、签名序号、签名时间、发布公钥指纹、归档摘要，再谈批准；批准与取消钉版本都走 `reason` + `confirm`；列出"现在因为版本不一致领不到任务"的机器 |
 
 管理端门禁（`format:check` / `lint` / `typecheck` / `test` / `build`）全绿，580 个用例。
+
+## 运维手册（设计 §10 第 5 条）
+
+| 状态 | 提交 | 备注 |
+| --- | --- | --- |
+| 已完成 | 本分支 | `deploy/build-agent-macos/SIGNING_MATERIAL.md`：签名材料归档（CSR 流程、合成 `.p12`、分发到每台 Mac、年度续期的先换后 revoke、销毁）、上传 Key（每机一把、探测结果怎么读、吊销）、发布密钥（生成、每次发版签一份、序号只增、轮换时先换遍所有 Mac 的公钥再签）、`allowed_signers`（文件格式、权限与它的失败症状、加减人、配套的 GitHub 分支保护、它挡不住什么）、一台 Mac 退役的清单 |
 
 ## 与设计的偏离
 
