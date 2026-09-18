@@ -275,6 +275,16 @@ git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/opt/rn-build-agent/allowed_
     verify-commit <sha>
 ```
 
+### 4.0 当前名单
+
+| principal（= 那个人的 `git config user.email`） | 加入 | 备注 |
+| --- | --- | --- |
+| `rn-app-signing-a@gmail.com` | 2026-09-18 | 平台运维；密钥 `~/.ssh/rn-app-signing-A`，仅用于签提交 |
+
+**现在只有一把。** 这把密钥所在的机器丢了、或者要换密钥时，在所有 Mac 的
+`allowed_signers` 都换完之前**打不出 iOS 包**——队列会停在「排队中」，而不是报错。
+第二个人(或同一个人在另一台机器上的第二把)什么时候加进来，决定这个单点什么时候消失。
+
 ### 4.1 文件长什么样
 
 一行一个允许给 `main` 出包的人，格式是 OpenSSH 的 allowed_signers：

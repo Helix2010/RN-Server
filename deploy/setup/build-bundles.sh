@@ -147,3 +147,9 @@ echo "安装包：$OUT（提交 $COMMIT）"
 # 交叉编译出来的 darwin 二进制带 Go 链接器默认的 ad-hoc 签名，在 Mac 上用
 # `codesign -dv bin/build-agent` 核一次
 (cd "$STAGE/builder-darwin-arm64" && sha256sum bin/build-agent bin/build-runner bin/ios-upload bin/rn-build-agent-upgrade)
+# 两把公钥的 sha256 单独打出来：装机时 install-macos.sh 的 --release-key-sha256 与
+# --allowed-signers-sha256 要的就是它们。运维核对的是密码管理器里记的值，不是这里打印的
+# ——这两行只是省掉一次"去哪儿算这个值"，**不是**核对的来源
+for f in release-key.pub allowed_signers; do
+  [ -f "$STAGE/builder-darwin-arm64/$f" ] && (cd "$STAGE/builder-darwin-arm64" && sha256sum "$f")
+done

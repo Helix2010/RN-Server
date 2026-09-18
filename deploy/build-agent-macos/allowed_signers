@@ -1,0 +1,16 @@
+# 允许给 RN-App 的 main 出包的人。控制进程在检出之后、交给执行进程之前跑
+#   git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=<本文件> verify-commit <sha>
+# 验不过的提交，任务直接失败（设计 ios-mac-builders-home-network-2026-09-18 §4.6）。
+#
+# 为什么这份名单不从服务端下发：它挡的正是"能改服务端、能改 main 的人"。iOS 的 .ipa
+# 在 Mac 上签完直接进 App Store Connect，中间没有签名闸那种独立复核，而每台 Mac 上
+# 放着全部租户的 Distribution 私钥。判据一旦由服务端说了算，这道闸就是装饰品。
+#
+# 第一列是 principal，必须与那个人 `git config user.email` 的值**完全一致**，否则
+# verify-commit 报 "No principal matched"。第二、三列是 SSH 签名公钥，不带注释字段。
+#
+# 加减人：改这里 → 随下一版安装包分发（装机时按 --allowed-signers-sha256 带外核对），
+# 或直接 scp 到每台 Mac 覆盖 /opt/rn-build-agent/allowed_signers（root:wheel 0644）。
+# 代理每条任务都重读它，换完立刻生效，不用重启。**减人要当天做**。
+# 详见 SIGNING_MATERIAL.md §4。
+rn-app-signing-a@gmail.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILydSiAXDLA4GJaZBXb+m96CBYY246eW/wxq8hm4p8vk
