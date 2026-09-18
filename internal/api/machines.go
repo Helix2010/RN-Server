@@ -79,6 +79,10 @@ const (
 
 var signerMachineNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,21}$`)
 
+// agentCommitPattern 是构建机程序版本（完整提交 sha）。与代理自报时的规则同一条：
+// 两侧不一致会让一台机器永远追不上审批值。
+var agentCommitPattern = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
 // optString 是 JSON 里可以为 null 的字符串：空串序列化成 null，null 读回空串。
 // 登记里有十来个可空字段，全用 *string 写起来到处是判空。
 type optString string
@@ -271,6 +275,15 @@ func (e *machineEnrollment) usable(now time.Time) bool {
 
 type buildMachinesDoc struct {
 	Machines []buildMachine `json:"machines"`
+	// ApprovedAgentCommit 是平台管理员批准的构建机程序版本（设计
+	// ios-mac-builders-home-network-2026-09-18 §5.6）。认领时机器自报的 agentCommit 与它
+	// 不一致就不派任务，回 409 AGENT_UPGRADE_REQUIRED——于是升级总是发生在空闲的时候，
+	// 正在跑的构建自然做完。
+	//
+	// 空 = 不管版本（今天的 Linux 构建机走的是 CI"推"的那条路，不自升级）。它**不是**
+	// 安全边界：真正挡住"服务端被攻破后下发恶意程序"的是离线签名的清单与单调序号，
+	// 这里只决定"什么时候升"。
+	ApprovedAgentCommit optString `json:"approvedAgentCommit"`
 }
 
 // isActivePrimary：只有它能领签名任务。
@@ -1321,4 +1334,47 @@ func (s *server) setMachinePlatforms(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"version": snapshot.Version, "machine": machineView(updated)})
+}
+
+// ---- 构建机程序版本（自升级，设计 ios-mac-builders-home-network-2026-09-18 §5.6）----
+
+// approveAgentVersion 批准一个构建机程序版本。
+//
+// 批准之后，认领时自报 agentCommit 与它不一致的机器拿不到任务、拿到的是 409
+// AGENT_UPGRADE_REQUIRED，于是它们在**空闲的时候**升级，手上正在跑的构建自然做完。
+//
+// **这不是安全边界**：真正挡住"服务端被攻破后往每台 Mac 上放恶意程序"的是离线签名的
+// 清单与单调序号（bundlesig）——那把私钥服务端手里没有。这里决定的只是"什么时候升"，
+// 所以可以先批、看一台 Mac 升上去没问题，再放开。
+func (s *server) approveAgentVersion(c *gin.Context) {
+	var body struct {
+		Commit string `json:"commit"`
+		machineWriteCommon
+	}
+	if decode(c, &body) != nil || !body.valid() {
+		problem(c, http.StatusBadRequest, "INVALID_AGENT_VERSION",
+			"commit, expectedVersion, reason (at least 3 characters) and confirm=true are required")
+		return
+	}
+	commit := strings.ToLower(strings.TrimSpace(body.Commit))
+	// 空串是"不管版本"：Linux 构建机走的是 CI 推的那条路，不该被这个闸挡住
+	if commit != "" && !agentCommitPattern.MatchString(commit) {
+		problem(c, http.StatusBadRequest, "INVALID_AGENT_VERSION", "commit must be a full commit sha, or empty to stop pinning a version")
+		return
+	}
+	reason := strings.TrimSpace(body.Reason)
+	snapshot, ok := s.mutateMachines(c, *body.ExpectedVersion, func(doc *buildMachinesDoc, _ time.Time) (int, string, string, []auditEvent) {
+		previous := string(doc.ApprovedAgentCommit)
+		if previous == commit {
+			return http.StatusConflict, "AGENT_VERSION_UNCHANGED", "This version is already the approved one", nil
+		}
+		doc.ApprovedAgentCommit = optString(commit)
+		return 0, "", "", []auditEvent{newAudit(platformTenantID, actor(c), "build_agent_version_approve", machineAuditTargetType,
+			"build-agent", reason, requestID(c),
+			map[string]any{"commit": nullableString(commit), "previous": nullableString(previous)})}
+	})
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"version": snapshot.Version, "approvedAgentCommit": nullableString(commit)})
 }

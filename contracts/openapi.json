@@ -3365,7 +3365,7 @@
             "description": "INVALID_BUILD_CLAIM"
           },
           "409": {
-            "description": "BUILDER_HAS_ACTIVE_JOB (body adds jobId and attempt), BUILDER_CLAIM_IN_PROGRESS, APP_IDENTITY_INCOMPLETE, OTA_BASE_RELEASE_INVALID"
+            "description": "BUILDER_HAS_ACTIVE_JOB (body adds jobId and attempt), BUILDER_CLAIM_IN_PROGRESS, APP_IDENTITY_INCOMPLETE, OTA_BASE_RELEASE_INVALID AGENT_UPGRADE_REQUIRED: a platform admin approved another build-agent version; the body carries agentCommit (the approved one) and reported. No job is dispatched, so the upgrade happens while the machine is idle."
           },
           "401": {
             "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
@@ -3375,6 +3375,110 @@
           },
           "426": {
             "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/bundle": {
+      "get": {
+        "summary": "Manifest, offline signature and archive location for this machine's bundle",
+        "description": "Self-upgrade for a machine that is already enrolled (machine token). Answers with the raw manifest bytes (base64 - the signature covers those bytes, re-encoding them would break it), the offline signature and where to fetch the archive. The server only hands the files over: verification happens on the machine, against a release public key the server does not have. Nothing is handed out while the manifest is unsigned or was built from a dirty working tree.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "name": "os",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "linux",
+                "darwin"
+              ]
+            }
+          },
+          {
+            "name": "arch",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "amd64",
+                "arm64"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "bundle, commit, manifestBase64, signature and archive {name, sha256, size, url}"
+          },
+          "404": {
+            "description": "MACHINE_BUNDLE_NOT_FOUND: bundles exist for linux/amd64 and darwin/arm64"
+          },
+          "503": {
+            "description": "MACHINE_BUNDLE_UNAVAILABLE: no bundles deployed, no manifest.sig yet, a dirty build, or the signature does not match the manifest"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED / MACHINE_REVOKED"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN or MACHINE_KEY_NOT_ACCEPTED"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/bundle/archive": {
+      "get": {
+        "summary": "Download this machine's bundle archive",
+        "description": "Streams the archive named by GET /v1/build-agent/bundle. Its sha256 is in the signed manifest, so the machine checks what it downloaded against something the server cannot forge. Exempt from the database timeout: tens of megabytes over a home line.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "name": "os",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "linux",
+                "darwin"
+              ]
+            }
+          },
+          {
+            "name": "arch",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "amd64",
+                "arm64"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The archive; x-content-sha256 repeats the digest from the manifest"
+          },
+          "404": {
+            "description": "MACHINE_BUNDLE_NOT_FOUND"
+          },
+          "503": {
+            "description": "MACHINE_BUNDLE_UNAVAILABLE"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED / MACHINE_REVOKED"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN or MACHINE_KEY_NOT_ACCEPTED"
           }
         }
       }
@@ -4297,6 +4401,65 @@
           },
           "500": {
             "description": "MACHINE_SAVE_FAILED, MACHINE_REGISTRY_INVALID, RECOVERY_KEYS_INVALID (a signer and build.recovery.recipients cannot be read)"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/build-agent-version": {
+      "post": {
+        "summary": "Approve a build-agent version",
+        "description": "Platform admin. Machines whose self-reported agentCommit differs are answered 409 AGENT_UPGRADE_REQUIRED at claim time instead of being given a job, so they upgrade while idle and a build in flight finishes untouched. Send an empty commit to stop pinning a version. This is not a security boundary - what stops a compromised server from shipping a malicious binary is the offline-signed manifest and its monotonic sequence; this only decides when machines move.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "commit",
+                  "expectedVersion",
+                  "reason",
+                  "confirm"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "commit": {
+                    "type": "string",
+                    "description": "Full commit sha, or empty to stop pinning. Uppercase is normalised to lowercase."
+                  },
+                  "expectedVersion": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "version and approvedAgentCommit"
+          },
+          "400": {
+            "description": "INVALID_AGENT_VERSION"
+          },
+          "409": {
+            "description": "AGENT_VERSION_UNCHANGED (this version is already approved) or MACHINES_VERSION_CONFLICT"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Platform admin only"
           }
         }
       }
@@ -9924,6 +10087,49 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "BundleSignature": {
+        "type": "object",
+        "description": "The offline signature over a bundle manifest. A platform admin signs it on an offline machine with the release key; the server never holds that private key. The machine checks the signature, that the sequence is not lower than one it already accepted, and that the commit equals the approved one, before it replaces any binary.",
+        "required": [
+          "format",
+          "commit",
+          "sequence",
+          "manifestSha256",
+          "publicKeySha256",
+          "signedAt",
+          "signature"
+        ],
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "rn-machine-bundles-signature/v1"
+            ]
+          },
+          "commit": {
+            "type": "string",
+            "description": "The commit these bundles were built from. A -dirty build cannot be signed."
+          },
+          "sequence": {
+            "type": "integer",
+            "description": "Raised by one per signature. A machine refuses anything below the highest it has seen, so whoever breaks into the server cannot roll a machine back to an older version that was once legitimately signed. Rolling back on purpose means signing a higher sequence that points at the older commit - an explicit, signed act."
+          },
+          "manifestSha256": {
+            "type": "string"
+          },
+          "publicKeySha256": {
+            "type": "string",
+            "description": "Which release key signed it; every machine pins one out of band at installation time."
+          },
+          "signedAt": {
+            "type": "string"
+          },
+          "signature": {
+            "type": "string",
+            "description": "base64 ed25519 signature over a canonical line-per-field payload, not over the JSON."
           }
         }
       }

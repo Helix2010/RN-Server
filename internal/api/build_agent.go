@@ -152,6 +152,21 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		Platforms: body.Platforms, AppleTeams: teams,
 		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB, PausedReason: pausedReason,
 	})
+	// 版本闸在**选任务之前**（设计 ios-mac-builders-home-network-2026-09-18 §5.6）。
+	//
+	// 初稿是"认领响应里带上 approvedAgentCommit"，走不通：队列空时响应是 204 无正文，
+	// 空闲的机器永远收不到；而收到的时候它已经领到任务了。改成这里直接 409、不派任务，
+	// 升级于是总是发生在空闲的时候，手上正在跑的构建自然做完。
+	//
+	// 这不是安全边界——挡住"服务端被攻破后下发恶意程序"的是离线签名的清单与单调序号。
+	if registry, err := s.machineRegistry(ctx); err == nil {
+		if target := strings.TrimSpace(string(registry.ApprovedAgentCommit)); target != "" && body.AgentCommit != target {
+			problemWith(c, http.StatusConflict, "AGENT_UPGRADE_REQUIRED",
+				"这台机器上的构建机程序不是平台批准的那一版，先升级再来领任务",
+				gin.H{"agentCommit": target, "reported": nullableString(body.AgentCommit)})
+			return
+		}
+	}
 	// 暂停的机器在这里就回去了：登记了在线、登记了原因，但不派活
 	if body.Paused {
 		c.Status(http.StatusNoContent)

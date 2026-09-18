@@ -229,6 +229,9 @@ func (s *server) routes() *gin.Engine {
 	platform.POST("/machines/:id/platforms", s.setMachinePlatforms)
 	// 重发注册码（旧码作废），只对还没注册的机器
 	platform.POST("/machines/:id/enrollment", s.reissueEnrollment)
+	// 批准构建机程序版本（自升级）。批准之后版本不一致的机器认领时收到 409，
+	// 在空闲的时候自己升；正在跑的构建不受影响
+	platform.POST("/build-agent-version", s.approveAgentVersion)
 	// 平台离线恢复公钥（build.recovery.recipients）：签名闸生成的密钥都要加密给它，签名闸本机另外 pin
 	platform.GET("/recovery-keys", s.listRecoveryKeys)
 	platform.POST("/recovery-keys", s.createRecoveryKey)
@@ -268,6 +271,10 @@ func (s *server) routes() *gin.Engine {
 	builder := agent.Group("")
 	builder.Use(s.machineAuth(machineRoleBuilder, false))
 	builder.POST("/claim", s.claimBuildJob)
+	// 自升级：已登记的机器拿本机令牌取清单、清单的离线签名与归档。服务端只递文件，
+	// 验签、核序号、核提交都在机器那一侧做（§5.6）
+	builder.GET("/bundle", s.describeAgentBundle)
+	builder.GET("/bundle/archive", s.downloadAgentBundle)
 	// 图标一张一张取，不塞进领取响应——那条响应在构建机那边有 1 MiB 上限
 	builder.GET("/jobs/:id/icons/:name", s.builderJobScope(s.buildJobIcon))
 	builder.POST("/jobs/:id/heartbeat", s.buildJobHeartbeat)
@@ -489,14 +496,16 @@ func (s *server) databaseTimeout() gin.HandlerFunc {
 //   - POST /v1/signer/jobs/:id/complete：服务端要从对象存储整份取回已签名包、解析与验签之后
 //     才开事务落发布记录，大包在 10 秒内做不完；
 //   - GET /v1/machine-setup/bundle/:archive：新机器下载安装包（几十 MB 的二进制），慢链路上 10 秒
-//     写不完。处理函数查登记那一步自己带超时。
+//     写不完。处理函数查登记那一步自己带超时；
+//   - GET /v1/build-agent/bundle/archive：已登记的机器自升级时下载同样的东西，家用下行更慢。
 //
 // 用 c.FullPath()（路由模板）而不是 URL 后缀：只有这几条路由本身被豁免，路径参数里塞什么都不影响。
 func exemptRouteFromDatabaseTimeout(c *gin.Context) bool {
 	route := c.FullPath()
 	return (c.Request.Method == http.MethodPut && route == "/v1/build-agent/jobs/:id/ota-artifact") ||
 		(c.Request.Method == http.MethodPost && route == "/v1/signer/jobs/:id/complete") ||
-		(c.Request.Method == http.MethodGet && route == "/v1/machine-setup/bundle/:archive")
+		(c.Request.Method == http.MethodGet && route == "/v1/machine-setup/bundle/:archive") ||
+		(c.Request.Method == http.MethodGet && route == "/v1/build-agent/bundle/archive")
 }
 
 // readsTokenChain 识别要去链上读元数据的三个代币接口。它们跟 /release-storage/test
