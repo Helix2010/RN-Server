@@ -187,12 +187,18 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 租户的签名材料。只校验 sha256 没有意义——那个 sha256 也是服务端给的。所以清单要由一把
 **服务端手里没有**的私钥签过。
 
+### 3.0 当前这一把
+
+| 公钥字节 sha256 | 生成 | 备注 |
+| --- | --- | --- |
+| `b60f0ccf66e3d9e5603f4e568a6364940dbc9de2e3688d905bade00697292c45` | 2026-09-18 | 平台管理员一人持有；公钥在 `deploy/build-agent-macos/release-key.pub` |
+
 ### 3.1 生成（全平台一次）
 
-在**离线机器**上：
+在**离线机器**上（`signing/` 是独立的 Go module，要在那个目录里构建）：
 
 ```bash
-go build -o /tmp/bundle-sign ./signing/cmd/bundle-sign     # 或从别处拷一个编好的过来
+cd signing && go build -o /tmp/bundle-sign ./cmd/bundle-sign
 /tmp/bundle-sign key create --out ~/rn-release-key
 ```
 
@@ -208,6 +214,13 @@ public key sha256: <64 位十六进制>
   离线机器坏了而密码管理器里没有备份，就再也签不出更高序号的清单——所有 Mac 停在当前版本。
 - **`public key sha256`**：**记进密码管理器**。装机时 `install-macos.sh --release-key-sha256`
   要的就是它，每台 Mac 的每次装机都拿它做一次带外核对。
+
+  > 这个值是**公钥字节**（base64 解码后那 32 字节）的摘要，**不是 `release-key.pub` 这个
+  > 文件的摘要**——两者不同，别用 `shasum -a 256 release-key.pub` 去算。同一个值还出现在
+  > 清单签名的 `publicKeySha256` 字段和控制台「批准打包机程序版本」那张卡片上，三处一致，
+  > 你在控制台看到的就是密码管理器里记的那个。
+  >
+  > 隔壁的 `allowed_signers` 反过来用**文件**摘要（它是多行文本，没有"原始字节"可言）。
 - **公钥文件**：放进仓库的 `deploy/build-agent-macos/release-key.pub`，`build-bundles.sh` 会把它
   打进 darwin 那组安装包（没有它只是警告，但 `install-macos.sh` 会拒绝安装）。
 

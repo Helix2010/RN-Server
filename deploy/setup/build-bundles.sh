@@ -149,7 +149,16 @@ echo "安装包：$OUT（提交 $COMMIT）"
 (cd "$STAGE/builder-darwin-arm64" && sha256sum bin/build-agent bin/build-runner bin/ios-upload bin/rn-build-agent-upgrade)
 # 两把公钥的 sha256 单独打出来：装机时 install-macos.sh 的 --release-key-sha256 与
 # --allowed-signers-sha256 要的就是它们。运维核对的是密码管理器里记的值，不是这里打印的
-# ——这两行只是省掉一次"去哪儿算这个值"，**不是**核对的来源
-for f in release-key.pub allowed_signers; do
-  [ -f "$STAGE/builder-darwin-arm64/$f" ] && (cd "$STAGE/builder-darwin-arm64" && sha256sum "$f")
-done
+# ——这两行只是省掉一次"去哪儿算这个值"，**不是**核对的来源。
+#
+# 两者口径不同，不能都用 sha256sum：
+#   release-key.pub  算的是**公钥字节**的摘要（与 bundle-sign key create 打印的、清单签名
+#                    里 publicKeySha256、控制台显示的一致）。文件里是 base64 加一个换行，
+#                    按文件算会得到另一个数，装机时永远对不上。
+#   allowed_signers  是一份多行文本，没有"原始字节"可言，文件摘要就是它唯一的判据。
+if [ -f "$STAGE/builder-darwin-arm64/release-key.pub" ]; then
+  printf '%s  release-key.pub (公钥字节)\n' \
+    "$(openssl base64 -d -A <"$STAGE/builder-darwin-arm64/release-key.pub" | sha256sum | cut -d' ' -f1)"
+fi
+[ -f "$STAGE/builder-darwin-arm64/allowed_signers" ] &&
+  (cd "$STAGE/builder-darwin-arm64" && sha256sum allowed_signers)

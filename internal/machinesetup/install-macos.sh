@@ -146,6 +146,19 @@ sha256_of() {
   printf '%s' "${sum%% *}"
 }
 
+# release_key_sha256 算的是**公钥字节**的 sha256，不是 release-key.pub 这个文件的。
+#
+# 这一条必须和 bundle-sign 一致：`bundle-sign key create` 打印的、清单签名里
+# publicKeySha256 那个字段、控制台「批准打包机程序版本」显示的，全都是公钥 32 字节
+# 的摘要。运维记进密码管理器的就是那个值，装机时 --release-key-sha256 给的也是它。
+# 按文件算会得到另一个数——两边永远对不上，而报错会说"安装包被换过"，让人以为遭到
+# 了攻击。文件里是 base64 加一个换行，先解回原始字节再算。
+release_key_sha256() {
+  local sum
+  sum="$(/usr/bin/openssl base64 -d -A <"$1" | /usr/bin/shasum -a 256)"
+  printf '%s' "${sum%% *}"
+}
+
 file_size_of() { /usr/bin/stat -f %z "$1"; }
 
 need_commands() {
@@ -440,11 +453,13 @@ install_programs() {
   local key_sha signers_sha
   [ -f "$BUNDLE/release-key.pub" ] || die "安装包里没有 release-key.pub；先在控制台部署一份签过的安装包"
   [ -f "$BUNDLE/allowed_signers" ] || die "安装包里没有 allowed_signers"
-  key_sha="$(sha256_of "$BUNDLE/release-key.pub")"
+  key_sha="$(release_key_sha256 "$BUNDLE/release-key.pub")"
   signers_sha="$(sha256_of "$BUNDLE/allowed_signers")"
   [ "$key_sha" = "$RELEASE_KEY_SHA256" ] ||
-    die "安装包里的 release-key.pub sha256 是 $key_sha，与 --release-key-sha256 不符。
-   要么服务端上的安装包被换过，要么你手里的值不是这一把密钥的——两种都不该继续装。"
+    die "安装包里发布公钥的 sha256 是 $key_sha，与 --release-key-sha256 不符。
+   这个值是**公钥字节**的摘要（bundle-sign key create 打印的那一行、控制台上显示的那一个），
+   不是 release-key.pub 这个文件的摘要——先确认手里的值取自密码管理器里记的那一条。
+   确认无误还不符，那么要么服务端上的安装包被换过，要么这不是同一把密钥,两种都不该继续装。"
   [ "$signers_sha" = "$ALLOWED_SIGNERS_SHA256" ] ||
     die "安装包里的 allowed_signers sha256 是 $signers_sha，与 --allowed-signers-sha256 不符，拒绝安装"
   put_file "$BUNDLE/release-key.pub" "$INSTALL_DIR/release-key.pub" root wheel 0644
