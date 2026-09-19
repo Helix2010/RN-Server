@@ -409,6 +409,41 @@ func TestMacInstallScriptCreatesAGroupForEveryRoleAccount(t *testing.T) {
 	}
 }
 
+// 角色账户用 dscl 一条条写属性建，不用 sysadminctl。
+//
+// sysadminctl -addUser -roleAccount 在 macOS 15 上留下一条**空记录**——UniqueID、
+// PrimaryGroupID、NFSHomeDirectory、UserShell 一个都没有——而且**返回 0**。脚本因此打着
+// "已建角色账户"一路往下，三步之后在建目录时以 `install: unknown user _rnbuildagent` 失败，
+// 指向完全错误的方向。装第一台机器时就是这么死的。
+//
+// 判据也必须是 getpwnam（`id`）能不能解析，不是 `dscl . -read` 有没有记录：那条空记录
+// dscl 读得到、getpwnam 解析不了，两者会给出相反的答案。
+func TestMacInstallScriptBuildsRoleAccountsWithDscl(t *testing.T) {
+	script := string(InstallMacOSScript)
+	// 禁的是**调用**，不是这个词：上面那段注释正要讲清楚为什么不用它
+	if strings.Contains(script, "sysadminctl -addUser") {
+		t.Error("install-macos.sh is back on sysadminctl -addUser; it returns 0 while leaving an empty " +
+			"user record, which only surfaces three steps later as \"install: unknown user\"")
+	}
+	if !strings.Contains(script, `if id "$1" >/dev/null 2>&1; then`) {
+		t.Error("ensure_role_account must decide with id (getpwnam), not with dscl -read")
+	}
+	// 没有这四个属性的记录就是一条 getpwnam 看不见的空壳
+	for _, key := range []string{"UniqueID", "PrimaryGroupID", "NFSHomeDirectory", "UserShell"} {
+		if !strings.Contains(script, `dscl . -create "/Users/$1" `+key) {
+			t.Errorf("ensure_role_account does not set %s; without it getpwnam cannot resolve the account", key)
+		}
+	}
+	// 建完必须验一次：dscl 的每一条都可能悄悄失败
+	if !strings.Contains(script, `id "$1" >/dev/null 2>&1 || die "角色账户 $1 建完仍然解析不了`) {
+		t.Error("ensure_role_account does not verify the account resolves after creating it")
+	}
+	// 组要先于账户建好，账户拿同名组的 gid 当主组（而不是 staff——每个本地用户都在那里面）
+	if strings.Index(script, `ensure_role_group "$AGENT_USER"`) > strings.Index(script, `ensure_role_account "$AGENT_USER"`) {
+		t.Error("groups must be created before the accounts that take their gid as a primary group")
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)

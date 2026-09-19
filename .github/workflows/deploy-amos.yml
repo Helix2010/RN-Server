@@ -17,10 +17,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: amos-production-server
-  cancel-in-progress: false
-
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -134,6 +130,18 @@ jobs:
   deploy:
     needs: validate
     if: vars.AMOS_DEPLOY_ENABLED == 'true' && needs.validate.outputs.deploy-needed == 'true'
+    # 串行的只有**真正动线上那台机器**的这一段：rn-foundation-apply 会停服务、换二进制、
+    # 跑迁移，两次叠在一起就是在一台机器上同时做两次这件事。
+    #
+    # 原来这段写在工作流级别，于是 validate 也跟着排队——一天里连推十次，第十次要等前九次
+    # 整个跑完（每次十几分钟）才开始编译，CI 看起来就"非常慢"，而其实是在排队。
+    #
+    # **不加 cancel-in-progress**：它和"只改文档就跳过部署"凑在一起会吃掉部署。先推一个代码
+    # 提交、紧接着推一个改错别字的提交，后者会取消前者，而它自己又因为是纯文档而不部署——
+    # 那个代码改动就永远上不了线，且没有任何地方报错。
+    concurrency:
+      group: amos-production-server
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: production
     env:

@@ -188,7 +188,7 @@ preflight() {
   [ "$(uname -s)" = Darwin ] || die "这个脚本只装 Mac 打包机；Linux 构建机用 install.sh"
   MISSING=()
   [ "$(uname -m)" = arm64 ] || MISSING+=("Apple Silicon（安装包只编 darwin/arm64；Intel Mac 也跑不了当前的 Xcode）")
-  need_commands curl python3 shasum openssl ssh-keygen tar git node pnpm pod xcodebuild xcrun security sysadminctl dseditgroup launchctl
+  need_commands curl python3 shasum openssl ssh-keygen tar git node pnpm pod xcodebuild xcrun security dscl dseditgroup launchctl
 
   if command -v xcodebuild >/dev/null 2>&1; then
     xcodebuild -version >/dev/null 2>&1 ||
@@ -280,16 +280,60 @@ check_filevault() {
 
 # ---- 4. 账户与目录 ---------------------------------------------------------------------------
 
+# group_gid 读一个组的 gid。
+group_gid() { # $1 组名
+  dscl . -read "/Groups/$1" PrimaryGroupID 2>/dev/null | awk '{print $2}'
+}
+
+# next_role_uid 挑一个空闲的 uid。角色账户按 macOS 的惯例落在 200–400：小于 500 的账户
+# 不出现在登录窗口里，而 200 以下是系统自己的。
+next_role_uid() {
+  local uid=200 taken
+  taken="$(dscl . -list /Users UniqueID | awk '{print $2}')"
+  while printf '%s\n' "$taken" | grep -qx "$uid"; do
+    uid=$((uid + 1))
+    [ "$uid" -lt 400 ] || die "200–400 之间没有空闲的 uid 了"
+  done
+  printf '%s' "$uid"
+}
+
+# ensure_role_account 建一个不能登录的角色账户。要求同名组已经建好（取它的 gid 当主组）。
+#
+# **用 dscl 一条条写属性，不用 sysadminctl。** sysadminctl 在 macOS 15 上建角色账户会留下
+# 一条**空记录**——UniqueID、PrimaryGroupID、NFSHomeDirectory、UserShell 一个都没有——而且
+# **返回 0**。于是脚本打着"已建角色账户"一路往下，三步之后在建目录时以
+# `install: unknown user _rnbuildagent` 失败，指向完全错误的方向。装第一台机器时就是这样。
+#
+# 判据也换成 `id`（getpwnam）能不能解析，不是 `dscl . -read` 有没有记录：那条空记录 dscl
+# 读得到，getpwnam 解析不了，两者会给出相反的答案。
+#
+# 主组用同名私有组而不是 staff：这个账户以后建出来的文件就不会落进一个每个本地用户都在的组。
 ensure_role_account() { # $1 用户名
-  if dscl . -read "/Users/$1" >/dev/null 2>&1; then
+  if id "$1" >/dev/null 2>&1; then
     note "账户 $1 已存在"
     return 0
   fi
-  sysadminctl -addUser "$1" -fullName "$1" -home /var/empty -shell /usr/bin/false -roleAccount >/dev/null 2>&1 ||
-    die "建不出角色账户 $1"
-  # 角色账户不该能登录：口令随机且不可用，隐藏出登录窗口
-  dscl . -create "/Users/$1" IsHidden 1 >/dev/null 2>&1 || true
-  note "已建角色账户 $1"
+  # 有记录但解析不了 = 上一次留下的空壳。它什么都拥有不了，删掉重建是安全的
+  if dscl . -read "/Users/$1" >/dev/null 2>&1; then
+    dscl . -delete "/Users/$1" >/dev/null 2>&1 ||
+      die "账户 $1 有一条残缺的记录，删不掉：手工 sudo dscl . -delete /Users/$1 之后重来"
+    warn "清掉了 $1 的残缺记录（有记录但没有 uid），重新建"
+  fi
+  local uid gid
+  uid="$(next_role_uid)"
+  gid="$(group_gid "$1")"
+  [ -n "$gid" ] || die "同名组 $1 不存在，建不了账户"
+  dscl . -create "/Users/$1" >/dev/null 2>&1 || die "建不出角色账户 $1"
+  dscl . -create "/Users/$1" RealName "$1" >/dev/null 2>&1
+  dscl . -create "/Users/$1" UniqueID "$uid" >/dev/null 2>&1
+  dscl . -create "/Users/$1" PrimaryGroupID "$gid" >/dev/null 2>&1
+  dscl . -create "/Users/$1" NFSHomeDirectory /var/empty >/dev/null 2>&1
+  dscl . -create "/Users/$1" UserShell /usr/bin/false >/dev/null 2>&1
+  # 不能登录：口令写成 *（没有可用的认证方式），并隐藏出登录窗口
+  dscl . -create "/Users/$1" Password '*' >/dev/null 2>&1
+  dscl . -create "/Users/$1" IsHidden 1 >/dev/null 2>&1
+  id "$1" >/dev/null 2>&1 || die "角色账户 $1 建完仍然解析不了（uid $uid、gid $gid）"
+  note "已建角色账户 $1（uid $uid）"
 }
 
 # ensure_role_group 建一个组。
@@ -310,13 +354,14 @@ ensure_role_group() { # $1 组名
 
 ensure_accounts() {
   step "账户与目录"
-  ensure_role_account "$AGENT_USER"
-  ensure_role_account "$RUNNER_USER"
-  ensure_role_account "$UPLOAD_USER"
+  # 组先于账户：账户要拿同名组的 gid 当主组
   ensure_role_group "$AGENT_USER"
   ensure_role_group "$RUNNER_USER"
   ensure_role_group "$UPLOAD_USER"
   ensure_role_group "$JOBS_GROUP"
+  ensure_role_account "$AGENT_USER"
+  ensure_role_account "$RUNNER_USER"
+  ensure_role_account "$UPLOAD_USER"
   local user
   for user in "$AGENT_USER" "$RUNNER_USER" "$UPLOAD_USER"; do
     dseditgroup -o edit -a "$user" -t user "$JOBS_GROUP" >/dev/null 2>&1 || true
