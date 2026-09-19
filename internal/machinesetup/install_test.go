@@ -243,10 +243,20 @@ func TestMacInstallScriptIsEmbedded(t *testing.T) {
 	if !ok {
 		t.Fatal("install-macos.sh has no readonly constants")
 	}
-	for _, want := range []string{"\ncd /\n", "\numask 077\n", "\nPATH=/usr/bin:/bin:/usr/sbin:/sbin\n", "compgen -e", "unset -f"} {
+	for _, want := range []string{"\ncd /\n", "\numask 077\n", "compgen -e", "unset -f"} {
 		if !bytes.Contains(head, []byte(want)) {
 			t.Errorf("install-macos.sh does not start with %q", strings.TrimSpace(want))
 		}
+	}
+	// PATH 收紧是对的，但收得太紧就把自己锁死了：node、pnpm、pod 只可能在 Homebrew 的两个
+	// 目录里（macOS 不自带），而 preflight 的 need_commands 用 command -v 找它们。少了那两个
+	// 目录，**任何一台 Mac 都过不了 preflight**，而报错说的是"缺少前提：命令 node"，人会一遍
+	// 遍去装已经装好的东西。2026-09-19 装第一台机器时正是这个状态。
+	//
+	// 顺序也有讲究：系统目录在前，curl/git/tar 一律解析到系统那一份，Homebrew 被投毒也换不掉。
+	if !bytes.Contains(head, []byte("\nPATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin\n")) {
+		t.Error("install-macos.sh must put the system directories first and still include the Homebrew ones; " +
+			"without them command -v can never find node/pnpm/pod and no Mac can pass preflight")
 	}
 }
 

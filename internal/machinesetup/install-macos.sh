@@ -33,7 +33,14 @@
 set -euo pipefail
 cd /
 umask 077
-PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# 系统目录在前，Homebrew 的两个在后：
+#
+#   - 在前：curl、git、tar、shasum 这些一律解析到系统那一份。Homebrew 的目录是管理员
+#     可写的，被投毒也换不掉这些；
+#   - 但必须带上：node、pnpm、pod 只可能装在那两个目录里（macOS 不自带），不放进来的话
+#     preflight 的 need_commands 用 command -v 永远找不到它们——这台机器装什么都过不了，
+#     而报错说的是"缺少前提：命令 node"，人会一遍遍去装已经装好的东西。
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
 HOME=/var/root
 export PATH HOME
 for _name in $(compgen -e); do
