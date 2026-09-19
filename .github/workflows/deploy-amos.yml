@@ -84,7 +84,7 @@ jobs:
           echo "这一推动了："; printf '%s\n' "$changed" | sed 's/^/  /'
           # 白名单：确定只给人看的文档。deploy/signer/README.md 与
           # deploy/build-agent/README.md **会被打进安装包**，不在这里
-          rest="$(printf '%s\n' "$changed" | grep -Ev '^(docs/|[^/]+\.md$|deploy/build-agent-macos/(MAC_SETUP_RUNBOOK|SIGNING_MATERIAL)\.md$)' || true)"
+          rest="$(printf '%s\n' "$changed" | grep -Ev '^(docs/|[^/]+\.md$|deploy/DEPLOYMENT\.md$|deploy/build-agent-macos/(MAC_SETUP_RUNBOOK|SIGNING_MATERIAL)\.md$)' || true)"
           if [ -z "$rest" ]; then
             echo "deploy-needed=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=只改了文档::跳过部署，安装包与已有的清单签名保持不变。要强制部署就用 workflow_dispatch。"
