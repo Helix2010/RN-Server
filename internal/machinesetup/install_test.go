@@ -504,6 +504,27 @@ func TestMacInstallScriptExplainsWhyDescribeFailed(t *testing.T) {
 	}
 }
 
+// 冒烟必须走生产那条路：由控制进程的账户发起 sudo，而不是以 root 直接切过去。
+//
+// build-runner 的 self-check 会核对任务根目录属于"调用 sudo 的那个人"（SUDO_UID），生产
+// 路径里那个人正是 _rnbuildagent——目录也正属于它。以 root 跑的话 SUDO_UID 是 0，和目录
+// 属主永远对不上，冒烟必失败，而它验的根本不是生产路径。装第一台机器时就死在这儿。
+//
+// 套两层还有个好处：这一下真的走了一遍 sudoers 里那条规则（root 切谁都不需要规则），失败
+// 时说"检查 sudoers"才名副其实。
+func TestMacInstallScriptSmokeTestsThroughTheControllerAccount(t *testing.T) {
+	script := string(InstallMacOSScript)
+	if !strings.Contains(script, `sudo -n -u "$AGENT_USER" sudo -n -u "$RUNNER_USER" "$INSTALL_DIR/build-runner" self-check`) {
+		t.Error("the smoke test must reach build-runner the way production does — " +
+			"controller account first, then sudo to the build user; running it straight from root " +
+			"makes SUDO_UID 0 and self-check can never match the jobs root owner")
+	}
+	// build-runner 说了什么要带出来，别再自己猜原因
+	if !strings.Contains(script, `自检失败。它说：`) {
+		t.Error("the smoke test throws away what build-runner said and guesses the cause instead")
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)

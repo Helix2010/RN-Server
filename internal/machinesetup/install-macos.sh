@@ -711,10 +711,17 @@ smoke_test() {
   local code=0
   env -i "$INSTALL_DIR/build-agent" >/dev/null 2>&1 || code=$?
   [ "$code" = 2 ] || die "空环境下 build-agent 的退出码是 ${code}，应该是 2（配置不全）"
-  sudo -n -u "$RUNNER_USER" "$INSTALL_DIR/build-runner" self-check \
-    --jobs-root "$JOBS_ROOT" --protocol 1 --expect-separated >/dev/null ||
-    die "build-runner 以 $RUNNER_USER 自检失败：检查 sudoers 与 $JOBS_ROOT 的权限"
-  note "两个程序都能跑"
+  # 必须**从控制进程那个账户**发起，不能以 root 直接切过去。self-check 会核对任务根目录属于
+  # "调用 sudo 的那个人"（SUDO_UID），而生产路径里那个人正是 ${AGENT_USER}——目录也正属于它。
+  # 以 root 跑的话 SUDO_UID 是 0，和目录属主永远对不上，冒烟必失败，而它验的根本不是生产路径。
+  #
+  # 套两层还有个好处：这一下真的走了一遍 sudoers 里那条规则，而不是绕过它（root 切谁都不需要
+  # 规则）。失败时说"检查 sudoers"这才名副其实。
+  local out
+  out="$(sudo -n -u "$AGENT_USER" sudo -n -u "$RUNNER_USER" "$INSTALL_DIR/build-runner" self-check \
+    --jobs-root "$JOBS_ROOT" --protocol 1 --expect-separated 2>&1)" ||
+    die "build-runner 以 ${RUNNER_USER} 自检失败。它说：$(printf '%s' "${out}" | tr '\n' ' ')"
+  note "两个程序都能跑（${out}）"
 }
 
 # ---- 6. 签名区与上传区 -----------------------------------------------------------------------

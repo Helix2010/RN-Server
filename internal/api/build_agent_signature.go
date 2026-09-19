@@ -141,14 +141,25 @@ func (s *server) uploadBundleSignature(c *gin.Context) {
 		problem(c, http.StatusConflict, "BUNDLE_SIGNATURE_KEY_MISMATCH", err.Error())
 		return
 	}
-	previous, err := storedBundleSignature(c.Request.Context(), s.db, signature.Commit)
-	switch {
-	case err == nil && previous.Sequence >= signature.Sequence:
-		problem(c, http.StatusConflict, "BUNDLE_SIGNATURE_SEQUENCE_NOT_HIGHER",
-			"a signature with sequence "+itoa64(previous.Sequence)+" is already stored for this commit; "+
-				"re-signing it needs a higher sequence (machines refuse anything below the highest they have seen)")
+	// 和**历史最高**比，不是和这个提交上一次比。序号的水位线记在每台机器上，与提交无关：
+	// 机器只认"比我见过的最高值更高"，不管那份清单指向哪一个提交。按提交比的话，给一个新
+	// 提交签一个已经用过的序号会被这里放行，然后在装过机的机器上被当成降级拒掉——而那条
+	// 报错说的是序号太低，不会提示"你重置了序号"。
+	var highest sql.NullInt64
+	if err := s.db.QueryRowContext(c.Request.Context(),
+		`SELECT MAX(sequence_no) FROM machine_bundle_signatures`).Scan(&highest); err != nil {
+		problem(c, http.StatusInternalServerError, "BUNDLE_SIGNATURE_UNREADABLE", "cannot read the stored signatures")
 		return
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
+	}
+	if highest.Valid && signature.Sequence <= highest.Int64 {
+		problem(c, http.StatusConflict, "BUNDLE_SIGNATURE_SEQUENCE_NOT_HIGHER",
+			"sequence "+itoa64(signature.Sequence)+" is not above the highest one already accepted ("+
+				itoa64(highest.Int64)+"); machines refuse anything below the highest they have seen, "+
+				"whichever commit it pointed at")
+		return
+	}
+	previous, err := storedBundleSignature(c.Request.Context(), s.db, signature.Commit)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		problem(c, http.StatusInternalServerError, "BUNDLE_SIGNATURE_UNREADABLE", "cannot read the stored signature")
 		return
 	}

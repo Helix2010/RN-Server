@@ -27,14 +27,16 @@ import (
 	"github.com/Helix2010/RN-Server/signing/bundlesig"
 )
 
-// clearStoredSignature 抹掉这个提交在库里的签名。
+// clearStoredSignatures 清空签名表。
 //
-// machine_bundle_signatures 是**平台级**的表，不按租户也不按夹具隔离，而本地跑测试用的是
-// 一个长期存在的库：上一次 go test 留下的行会让这一次以「序号没往上走」失败，而那条报错
-// 指向的是用例本身，不是残留。每个用例自己先清干净。
-func clearStoredSignature(t *testing.T, f *gateFixture, commit string) {
+// **整表清，不是只清一个提交**：序号的判据是历史最高值（跨提交），留下任何一行都会让这一次
+// 的用例以「序号没往上走」失败。machine_bundle_signatures 是平台级的表，不按租户也不按夹具
+// 隔离，而本地跑测试用的是一个长期存在的库——上一次 go test 留下的行同样会踩到。
+//
+// 放在每个用例的开头，不放进 stageUnsignedBundles：有的用例要在同一次里签两个提交。
+func clearStoredSignatures(t *testing.T, f *gateFixture) {
 	t.Helper()
-	if _, err := f.s.db.Exec(`DELETE FROM machine_bundle_signatures WHERE commit_sha = ?`, commit); err != nil {
+	if _, err := f.s.db.Exec(`DELETE FROM machine_bundle_signatures`); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -42,7 +44,6 @@ func clearStoredSignature(t *testing.T, f *gateFixture, commit string) {
 // stageUnsignedBundles 摆好安装包但**不签**，并放好发布公钥。返回私钥与清单原始字节。
 func stageUnsignedBundles(t *testing.T, f *gateFixture, commit string) (ed25519.PrivateKey, []byte) {
 	t.Helper()
-	clearStoredSignature(t, f, commit)
 	dir := f.s.machineBundleDir
 	manifestPath := filepath.Join(dir, machineBundleManifest)
 	raw, err := os.ReadFile(manifestPath)
@@ -84,6 +85,7 @@ func uploadSignature(t *testing.T, f *gateFixture, signature bundlesig.Signature
 func TestDBDeployedManifestIsAvailableBeforeItIsSigned(t *testing.T) {
 	f := newGateFixture(t, 71)
 	f.installBundles()
+	clearStoredSignatures(t, f)
 	commit := strings.Repeat("a", 40)
 	_, raw := stageUnsignedBundles(t, f, commit)
 
@@ -125,6 +127,7 @@ func TestDBDeployedManifestIsAvailableBeforeItIsSigned(t *testing.T) {
 func TestDBUploadedSignatureIsServedToMachines(t *testing.T) {
 	f := newGateFixture(t, 71)
 	f.installBundles()
+	clearStoredSignatures(t, f)
 	commit := strings.Repeat("b", 40)
 	private, raw := stageUnsignedBundles(t, f, commit)
 	token := f.builder.Token
@@ -173,6 +176,7 @@ func TestDBUploadedSignatureIsServedToMachines(t *testing.T) {
 func TestDBUploadedSignatureMustMatchWhatIsDeployed(t *testing.T) {
 	f := newGateFixture(t, 71)
 	f.installBundles()
+	clearStoredSignatures(t, f)
 	commit := strings.Repeat("c", 40)
 	private, raw := stageUnsignedBundles(t, f, commit)
 
@@ -208,11 +212,13 @@ func TestDBUploadedSignatureMustMatchWhatIsDeployed(t *testing.T) {
 	}
 }
 
-// 序号只增不减。同一个提交重签必须用更高的序号，否则机器（记着自己见过的最高值）会拒，
-// 而运维在控制台上看不出为什么。
+// 序号只增不减，而且是**跨提交**的：水位线记在每台机器上，机器只认"比我见过的最高值更高"，
+// 不管那份清单指向哪一个提交。按提交比的话，给一个新提交签一个用过的序号会被放行，然后在
+// 装过机的机器上被当成降级拒掉——而那条报错说的是序号太低，不会提示"你重置了序号"。
 func TestDBUploadedSignatureSequenceMustGoUp(t *testing.T) {
 	f := newGateFixture(t, 71)
 	f.installBundles()
+	clearStoredSignatures(t, f)
 	commit := strings.Repeat("d", 40)
 	private, raw := stageUnsignedBundles(t, f, commit)
 
@@ -240,6 +246,17 @@ func TestDBUploadedSignatureSequenceMustGoUp(t *testing.T) {
 	if code, body := uploadSignature(t, f, higher); code != http.StatusOK {
 		t.Fatalf("re-signing with a higher sequence was refused: %d %v", code, body)
 	}
+
+	// 换个提交也不能重用序号：机器只比数字，不管那份清单指向哪一个提交
+	otherCommit := strings.Repeat("f", 40)
+	otherPrivate, otherRaw := stageUnsignedBundles(t, f, otherCommit)
+	reused, err := bundlesig.Sign(otherPrivate, otherRaw, otherCommit, 6, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := uploadSignature(t, f, reused); code != http.StatusConflict {
+		t.Fatalf("a used sequence was accepted for another commit: %d", code)
+	}
 }
 
 // 文件那条老路要继续管用：SIGNING_MATERIAL.md 一直这么写，能碰服务器文件系统的场景下
@@ -247,7 +264,7 @@ func TestDBUploadedSignatureSequenceMustGoUp(t *testing.T) {
 func TestDBSignatureOnDiskStillWorks(t *testing.T) {
 	f := newGateFixture(t, 71)
 	f.installBundles()
-	clearStoredSignature(t, f, upgradeCommit)
+	clearStoredSignatures(t, f)
 	signStagedBundles(t, f, 3)
 
 	r := f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil)
@@ -268,6 +285,7 @@ func TestDBSignatureOnDiskStillWorks(t *testing.T) {
 func TestDBBundleIsUnavailableWhenItsArchiveIsMissing(t *testing.T) {
 	f := newGateFixture(t, 71)
 	f.installBundles()
+	clearStoredSignatures(t, f)
 	commit := strings.Repeat("e", 40)
 	private, raw := stageUnsignedBundles(t, f, commit)
 	signature, err := bundlesig.Sign(private, raw, commit, 3, time.Now())
