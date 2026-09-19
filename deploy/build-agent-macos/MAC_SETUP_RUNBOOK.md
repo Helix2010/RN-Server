@@ -573,6 +573,8 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 | `清单的离线签名验不过` | 签清单用的不是那把密钥，或者清单被改过。也可能是**用旧版 bundle-sign 签的**（旧格式） |
 | `the signature is not an armoured SSH signature` | 确定是旧版 `bundle-sign` 签的。重新构建工具再签 |
 | `commit X is not signed by an allowed signer` | 目标提交没签名，或提交者邮箱不在 `allowed_signers` 里。见第 5 节 |
+| 装完了，控制台上这台机器一直离线；`/var/log/rn-build-agent.log` **不存在** | 看 `sudo launchctl print system/win.anyfun.rn-build-agent`。`last exit code = 78`（EX_CONFIG）是 **launchd 自己**没能把 job 摆起来，程序一行都没跑：它在 exec **之前**就切到 `UserName`，建 `StandardOutPath` 用的也是那个身份，而 `/var/log` 是 `root:wheel 0755`。装机脚本会先把日志文件按 job 的账户建好；文件被人删掉或属主被改过就会复发。补救：`sudo install -o _rnbuildagent -g _rnbuildjobs -m 0640 /dev/null /var/log/rn-build-agent.log` 再 `sudo launchctl kickstart -k system/win.anyfun.rn-build-agent` |
+| `launchctl print` 里 `last exit code = 2` | 这回是程序自己退的：配置不全 / 读不到出处密钥 / 建不了任务根目录。日志里写着是哪一项 |
 | `No signature`（`git log --show-signature`） | **不一定是没签**。本地没配 `gpg.ssh.allowedSignersFile` 时 git 根本没法验，就用这个很误导的说法。判断签没签看 `git log -1 --format='%G?'`：`N` 才是没签 |
 
 ---

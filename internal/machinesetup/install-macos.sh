@@ -198,7 +198,7 @@ preflight() {
   [ "$(uname -s)" = Darwin ] || die "这个脚本只装 Mac 打包机；Linux 构建机用 install.sh"
   MISSING=()
   [ "$(uname -m)" = arm64 ] || MISSING+=("Apple Silicon（安装包只编 darwin/arm64；Intel Mac 也跑不了当前的 Xcode）")
-  need_commands curl python3 shasum openssl ssh-keygen tar git node pnpm pod xcodebuild xcrun security dscl dseditgroup launchctl
+  need_commands curl python3 shasum openssl ssh-keygen tar git node pnpm pod xcodebuild xcrun security dscl dseditgroup launchctl plutil
 
   if command -v xcodebuild >/dev/null 2>&1; then
     xcodebuild -version >/dev/null 2>&1 ||
@@ -898,10 +898,53 @@ clone_mirror() {
 
 # ---- 9. 常驻 ---------------------------------------------------------------------------------
 
+# plist_value 读 plist 里的一个键；没有这个键回空串。
+plist_value() {
+  /usr/bin/plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
+}
+
+# ensure_daemon_logs 把 plist 写明的日志文件先建出来，属主是这个 job 将要用的账户。
+#
+# 非建不可：launchd 在 exec **之前**就切到 UserName，**建 StandardOutPath 用的也是那个
+# 身份**。/var/log 是 root:wheel 0755，_rnbuildagent 在里面建不出文件，于是 launchd 判定
+# 这个 job 不可用、以 EX_CONFIG(78) 收场——程序一行都没跑过，日志文件也不存在，屏幕上、
+# 日志里、状态目录里都没有任何线索，只有 `launchctl print` 里一个 78 和不断长大的 runs。
+#
+# 路径与账户都从 plist 里读，不写死：plist 来自**安装包**，而这个脚本是服务端单独下发的，
+# 两者可以不同版本（describe 走缓存时装的就是旧安装包）。写死等于赌它们一致。
+ensure_daemon_logs() {
+  local plist="$1" user group key path dir
+  user="$(plist_value "$plist" UserName)"
+  group="$(plist_value "$plist" GroupName)"
+  [ -n "$user" ] || user=root
+  [ -n "$group" ] || group=wheel
+  for key in StandardOutPath StandardErrorPath; do
+    path="$(plist_value "$plist" "$key")"
+    if [ -z "$path" ]; then
+      die "读不出 ${plist} 的 ${key}。没有它就没法把日志文件按 job 的身份先建好，而 launchd
+   会以 EX_CONFIG(78) 失败且不留任何线索。确认 /usr/bin/plutil 能读这个文件。"
+    fi
+    if [ -e "$path" ]; then
+      # 已经在了：内容一个字不动（重复执行不该清掉正在被人读的日志），但属主要摆正——
+      # 属主不对的话 launchd 打不开它，照样是 78
+      chown "$user:$group" "$path" || die "改不了 ${path} 的属主"
+      chmod 0640 "$path"
+      continue
+    fi
+    dir="$(dirname "$path")"
+    [ -d "$dir" ] || install -d -o root -g wheel -m 0755 "$dir"
+    install -o "$user" -g "$group" -m 0640 /dev/null "$path" ||
+      die "建不出日志文件 $path"
+    note "已建日志文件 ${path}（${user}:${group}）"
+  done
+}
+
 install_daemons() {
   step "常驻"
   put_file "$BUNDLE/$AGENT_LABEL.plist" "/Library/LaunchDaemons/$AGENT_LABEL.plist" root wheel 0644
   put_file "$BUNDLE/$UPGRADE_LABEL.plist" "/Library/LaunchDaemons/$UPGRADE_LABEL.plist" root wheel 0644
+  ensure_daemon_logs "/Library/LaunchDaemons/$AGENT_LABEL.plist"
+  ensure_daemon_logs "/Library/LaunchDaemons/$UPGRADE_LABEL.plist"
   # 停机标记在的话代理不会被拉起来：装机时它不该存在（升级或吊销之后由对应的流程删）
   if [ -f "$AGENT_HOME/state/halt" ]; then
     warn "$AGENT_HOME/state/halt 还在：代理不会启动。确认这台机器不是被吊销的，再删掉它"
@@ -921,7 +964,12 @@ install_daemons() {
     sleep 2
   done
   if [ ! -f "$AGENT_HOME/state/runner-mode.json" ]; then
-    warn "代理还没写出 state/runner-mode.json，看 /var/log/rn-build-agent.log"
+    warn "代理还没写出 state/runner-mode.json。
+   先看日志：sudo tail -n 40 $(plist_value "/Library/LaunchDaemons/$AGENT_LABEL.plist" StandardOutPath)
+   日志是空的或者不存在，就看 launchd 那边：sudo launchctl print system/$AGENT_LABEL
+     last exit code = 78 (EX_CONFIG)：launchd 自己没能把 job 摆起来（程序一行没跑），
+       多半是日志文件或程序路径的属主/权限不对；
+     last exit code = 2：程序跑了但配置不全，日志里有具体是哪一项。"
   fi
 }
 

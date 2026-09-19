@@ -235,3 +235,10 @@ func TestMacInstallClonesIntoAScratchPathFirst(t *testing.T) {
 		}
 	}
 }
+
+// runBash 跑一段 harness，回它的全部输出。
+func runBash(t *testing.T, script string) (string, error) {
+	t.Helper()
+	out, err := exec.Command("bash", "-c", script).CombinedOutput()
+	return string(out), err
+}
