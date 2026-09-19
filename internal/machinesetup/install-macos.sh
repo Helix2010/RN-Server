@@ -732,9 +732,20 @@ prepare_signing() {
   local password_file="$SIGNING_DIR/rn-signing.password"
   if [ ! -f "$password_file" ]; then
     # 口令的字母表与执行进程那侧的校验一致（只有字母数字与 _-）：带空格或引号的口令
-    # 会让交给 security 的那一行被切成别的命令
-    LC_ALL=C tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 48 >"$WORK/keychain-password"
-    printf '\n' >>"$WORK/keychain-password"
+    # 会让交给 security 的那一行被切成别的命令。
+    #
+    # **不能写成 `tr </dev/urandom | head -c 48`。** /dev/urandom 是无限的生产者，head 取够
+    # 就退出，tr 于是吃到 SIGPIPE（141）；脚本开着 pipefail，管道的退出码变成 141，set -e
+    # 当场把脚本**静默**杀掉——没有报错、没有 die，只是回到提示符。装第一台机器时就是这样
+    # 停在"签名区与上传区"下面一片空白，最难查的那种。
+    #
+    # 脚本里别处那些 `printf … | grep -q` 不受影响：生产者只写几十字节，一次就写进管道
+    # 缓冲区并退出，轮不到 SIGPIPE。区别在于生产者有没有边界。
+    local password
+    password="$(LC_ALL=C tr -dc 'A-Za-z0-9_-' < <(dd if=/dev/urandom bs=1024 count=8 2>/dev/null))"
+    password="${password:0:48}"
+    [ "${#password}" = 48 ] || die "生成不出钥匙串口令"
+    printf '%s\n' "${password}" >"$WORK/keychain-password"
     install -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0600 "$WORK/keychain-password" "$password_file"
     note "已生成钥匙串口令 $password_file"
   fi

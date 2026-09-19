@@ -525,6 +525,29 @@ func TestMacInstallScriptSmokeTestsThroughTheControllerAccount(t *testing.T) {
 	}
 }
 
+// 无边界的生产者不能接 head：脚本开着 pipefail。
+//
+// `tr </dev/urandom | head -c 48` 里 head 取够就退出，tr 吃到 SIGPIPE（141），pipefail 把
+// 管道的退出码变成 141，set -e 当场**静默**杀掉脚本——没有报错、没有 die，只是回到提示符。
+// 装第一台机器时就是这样停在"签名区与上传区"下面一片空白。
+//
+// 别处那些 `printf … | grep -q` 不受影响：生产者只写几十字节，一次写进管道缓冲区就退出，
+// 轮不到 SIGPIPE。区别在于生产者有没有边界，所以这里只盯 /dev/urandom。
+func TestMacInstallScriptDoesNotPipeUrandomIntoHead(t *testing.T) {
+	script := string(InstallMacOSScript)
+	for _, line := range strings.Split(script, "\n") {
+		// 跳注释：上面那段注释正要讲清楚为什么不能这么写
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if strings.Contains(line, "/dev/urandom") && strings.Contains(line, "| head") {
+			t.Errorf("install-macos.sh pipes /dev/urandom into head (%q); "+
+				"head exits first, tr takes SIGPIPE, and pipefail plus set -e kill the script "+
+				"with no message at all", strings.TrimSpace(line))
+		}
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)
