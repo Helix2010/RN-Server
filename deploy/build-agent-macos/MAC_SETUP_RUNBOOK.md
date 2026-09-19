@@ -112,11 +112,26 @@ ssh-keygen -l -f ~/rn-release-ios-key/release-key.pub
 所有 Mac 停在当前版本）。打印的 `public key sha256` 也记进密码管理器——装机时要人手抄的就是它，
 **整条链子上唯一的外部输入**。
 
-新密钥还要把公钥行放进仓库——**这是公钥进入发布流水线的唯一入口**：
+新密钥还要把公钥行放进仓库——**这是公钥进入发布流水线的唯一入口**。
+
+**这一步在 A 机上做完，也从 A 机提交推送。** 公钥的权威来源是 A 机：私钥在那，只有它能确定公钥
+是什么。别把公钥行念给别人、让别人从另一台机器去改这个文件——转述错一位，所有装机全部失败，
+而报错说的是"确认手里的值取自密码管理器"，人会往抄错了的方向找，不会想到仓库里那行是错的。
 
 ```bash
-cat ~/rn-release-ios-key/release-key.pub > <仓库>/deploy/build-agent-macos/release-key.pub
+cd <仓库>
+git checkout main && git pull --ff-only
+cat ~/rn-release-ios-key/release-key.pub > deploy/build-agent-macos/release-key.pub
+git add deploy/build-agent-macos/release-key.pub
+git commit -m "feat(build-agent-macos): 换发布密钥"
+git push origin main
 ```
+
+RN-Server 不要求提交签名（要求签名的是 RN-App，因为打包机要验它的提交），所以 A 机推没有额外
+负担。真把 A 机做成气隙机的话，公钥就得抄出来在别处提交——那时要有第二个人复核那一行，不能
+单人转述。
+
+推完 CI 会重新构建安装包。**必须等带新公钥的那一版部署完再签**，见第 3.2 步。
 
 `build-bundles.sh` 会把它放到两个地方，两份内容相同但缺一不可：
 
