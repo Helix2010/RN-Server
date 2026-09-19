@@ -69,6 +69,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	set.SetOutput(stderr)
 	probe := set.Bool("probe", false, "only check whether this key may use the build upload endpoints")
 	install := set.Bool("install-key", false, "install an upload key handed over as ciphertext on stdin")
+	fingerprint := set.Bool("material-key-fingerprint", false, "print the sha256 of this account's material public key")
 	team := set.String("team", "", "Apple Developer Team ID")
 	keys := set.String("keys", "/var/rn-build-upload", "directory that holds <TEAMID>/key.json and the .p8")
 	bundleID := set.String("expect-bundle-id", "", "bundle id of the app this package belongs to")
@@ -80,6 +81,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	// 装 Key 那条路不需要 --team / --expect-*：要装什么全写在密文里，而那一份是
 	// 平台在离线机器或浏览器里封的，比命令行上的值可信
+	if *fingerprint {
+		if err := materialKeyFingerprint(stdout, *keys); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if *install {
 		if err := installKey(stdin, stdout, *keys); err != nil {
 			fmt.Fprintln(stderr, err)

@@ -441,6 +441,23 @@ sudo bash install-macos.sh --server <API> --code rne_… \
 `--release-key-sha256` 的值从**密码管理器**取，不要从控制台上复制——控制台替人填这个值，等于让
 这台机器把服务端说的话当成信任根。
 
+### 4.2.1 顺手把两把材料私钥也放上（可选，但装了省事）
+
+装机命令后面加两个参数，签名材料就不用逐台人工放了——平台在控制台上传一次密文，这台机器
+自己取、自己解、自己装：
+
+```bash
+     --material-key-builder  /path/to/builder.x25519 \
+     --material-key-uploader /path/to/uploader.x25519
+```
+
+两把私钥从**密码管理器**取（`ios-material keygen` 在 A 机上生成的那两个），不从服务端来。
+脚本会把它们各装到对应账户名下（0600），并打印两个公钥指纹——与控制台「平台维护 → iOS
+签名材料」上登记的那两把核对，**对不上就是放错了**。
+
+已经装好的机器（mac-01 就是）不必重装：两把私钥各 `install` 一个文件就行，见
+[`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §6.3「已经装好的机器怎么补」。整节细节见 §6。
+
 ### 4.3 脚本会做什么
 
 按顺序：前提检查 → 系统设置 → FileVault → 建三个角色账户与目录 → `describe` 与验签 → 下载核对

@@ -15,7 +15,8 @@
 //	build-runner cleanup    --jobs-root <abs> --job <id>
 //	build-runner self-check    --jobs-root <abs> --protocol <n> [--expect-separated]
 //	build-runner ios-inventory        --signing-dir <abs>
-//	build-runner install-ios-material --signing-dir <abs>   （密文走标准输入）
+//	build-runner install-ios-material     --signing-dir <abs>   （密文走标准输入）
+//	build-runner material-key-fingerprint --signing-dir <abs>
 //
 // 退出码：0 成功；1 构建失败；2 参数、身份或任务目录不合规。失败原因最后一行以
 // "build-runner: error: " 开头写到标准输出，控制进程取它做失败原因。
@@ -97,6 +98,18 @@ func dispatch(ctx context.Context, args []string, in io.Reader, out io.Writer, g
 			return usageError{err}
 		}
 		return cleanup(out, who, layout)
+	case "material-key-fingerprint":
+		set := flag.NewFlagSet("material-key-fingerprint", flag.ContinueOnError)
+		set.SetOutput(io.Discard)
+		var dir onceValue
+		set.Var(&dir, "signing-dir", "")
+		if err := set.Parse(args[1:]); err != nil {
+			return usagef("bad arguments: %v", err)
+		}
+		if set.NArg() != 0 {
+			return usagef("unexpected positional arguments")
+		}
+		return materialKeyFingerprint(out, who, dir.value)
 	case "install-ios-material":
 		set := flag.NewFlagSet("install-ios-material", flag.ContinueOnError)
 		set.SetOutput(io.Discard)

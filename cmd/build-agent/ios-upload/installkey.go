@@ -10,7 +10,10 @@ package main
 // **控制进程与执行进程都没有它**：上传 Key 是那些签名材料唯一缺的出口，它只属于这个账户。
 
 import (
+	"crypto/ecdh"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -82,6 +85,22 @@ func installKey(stdin io.Reader, stdout io.Writer, keysDir string) error {
 	return json.NewEncoder(stdout).Encode(map[string]any{
 		"installed": true, "kind": material.Kind, "teamId": material.TeamID, "keyId": material.KeyID,
 	})
+}
+
+// materialKeyFingerprint 打印本机这把材料私钥对应的**公钥**指纹，装机时与控制台核对。
+func materialKeyFingerprint(stdout io.Writer, keysDir string) error {
+	private, err := readMaterialKey(filepath.Join(keysDir, materialKeyFileName))
+	if err != nil {
+		return err
+	}
+	defer wipeBytes(private)
+	key, err := ecdh.X25519().NewPrivateKey(private)
+	if err != nil {
+		return fmt.Errorf("%s is not a usable X25519 private key: %w", materialKeyFileName, err)
+	}
+	digest := sha256.Sum256(key.PublicKey().Bytes())
+	fmt.Fprintln(stdout, hex.EncodeToString(digest[:]))
+	return nil
 }
 
 // writePrivate 以 0600 原子写一个文件。

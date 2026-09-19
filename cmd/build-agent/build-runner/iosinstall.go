@@ -16,7 +16,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -79,6 +82,31 @@ func installIOSMaterial(ctx context.Context, out io.Writer, in io.Reader, who id
 		"installed": true, "kind": material.Kind, "teamId": material.TeamID,
 		"bundleId": material.BundleID,
 	})
+}
+
+// materialKeyFingerprint 打印本机这把材料私钥对应的**公钥**指纹。
+//
+// 装机时用它与控制台上登记的那一把核对。放错密钥的表现否则是"材料下来了但解不开"，
+// 而那条错要等第一次下发才出现，还容易被当成服务端的问题。
+//
+// 算这个值要做一次标量乘法，交给 Go：装机脚本里那条链子的第一环是"人能把脚本从头读一遍"，
+// 一段曲线运算没人读得动（install-macos.sh 开头那段注释说的就是这件事）。
+func materialKeyFingerprint(out io.Writer, who identity, dir string) error {
+	if err := checkSigningDir(who, dir); err != nil {
+		return usageError{err}
+	}
+	private, err := readMaterialKey(filepath.Join(dir, materialKeyFileName))
+	if err != nil {
+		return err
+	}
+	defer wipe(private)
+	key, err := ecdh.X25519().NewPrivateKey(private)
+	if err != nil {
+		return fmt.Errorf("%s is not a usable X25519 private key: %w", materialKeyFileName, err)
+	}
+	digest := sha256.Sum256(key.PublicKey().Bytes())
+	fmt.Fprintln(out, hex.EncodeToString(digest[:]))
+	return nil
 }
 
 // importCertificate 把 .p12 导进签名钥匙串，并做 set-key-partition-list。

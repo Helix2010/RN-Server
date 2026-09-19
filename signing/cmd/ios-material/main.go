@@ -106,7 +106,7 @@ func keygen(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprint(stdout, `
 下一步：
-  1. 两个 .pub 的内容登记到控制台（平台维护 → 打包机与签名闸 → iOS 签名材料）；
+  1. 两个 .pub 的内容登记到控制台（平台维护 → iOS 签名材料 → 平台密钥）；
   2. 两个私钥进密码管理器，装机时用 --material-key-builder / --material-key-uploader 放到 Mac 上；
   3. 这台机器上的私钥文件在确认密码管理器里有了之后再删。
      **私钥一个字节都不要经过服务端。**

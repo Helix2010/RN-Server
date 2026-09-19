@@ -75,6 +75,10 @@ readonly BUNDLE_NAME=builder-darwin-arm64
 SERVER=""
 CODE=""
 RELEASE_KEY_SHA256=""
+# 两把材料私钥的**本机路径**（内容由人从密码管理器取，不从网上来）。不给就不装，
+# 这台机器仍然能用——只是签名材料要按运维手册第 1.3 节人工放
+MATERIAL_KEY_BUILDER=""
+MATERIAL_KEY_UPLOADER=""
 CURL_PROTO="=https"
 WORK=""
 CACHE=""
@@ -99,11 +103,20 @@ usage() {
   cat >&2 <<'USAGE'
 用法（以 root 执行）：
   sudo bash install-macos.sh --server <API> --code rne_… \
-       --release-key-sha256 <发布公钥 sha256>
+       --release-key-sha256 <发布公钥 sha256> \
+       [--material-key-builder <文件>] [--material-key-uploader <文件>]
 
 只有一个带外核对值：
   --release-key-sha256   密码管理器里记的发布公钥指纹（公钥**字节**的 sha256，
                          不是 release-key.pub 这个文件的）
+
+可选，两把**材料私钥**（内容从密码管理器取，放在这台机器上的文件里）：
+  --material-key-builder   构建账户那把，解证书与描述文件
+  --material-key-uploader  上传账户那把，解 App Store Connect 上传 Key
+
+  给了它们，签名材料就由平台在控制台上传一次、这台机器自己取自己装；不给也能装完，
+  只是那三样要按运维手册第 1.3 节人工放。**这两把私钥不从服务端来**——服务端只转发
+  它读不懂的密文，这是整套设计的前提。
 
 首次装机是一次对服务端的信任：脚本、安装包与两把公钥都来自服务端，只有这个值是从别处
 来的。它是这台机器唯一不依赖服务端的判据，其余全部由它推出来：
@@ -123,6 +136,8 @@ parse_args() {
       --server) SERVER="${2:-}"; shift 2 ;;
       --code) CODE="${2:-}"; shift 2 ;;
       --release-key-sha256) RELEASE_KEY_SHA256="${2:-}"; shift 2 ;;
+      --material-key-builder) MATERIAL_KEY_BUILDER="${2:-}"; shift 2 ;;
+      --material-key-uploader) MATERIAL_KEY_UPLOADER="${2:-}"; shift 2 ;;
       --insecure-http) CURL_PROTO="=https,http"; shift ;;
       -h | --help) usage ;;
       *) printf 'install-macos.sh: 不认识的参数 %s\n' "$1" >&2; usage ;;
@@ -148,6 +163,17 @@ parse_args() {
    到控制台「平台维护 → 打包机与签名闸 → 构建机 → 新建」拿一个，类型选 macOS。"
   printf '%s' "$RELEASE_KEY_SHA256" | grep -Eq '^[0-9a-f]{64}$' ||
     die "--release-key-sha256 必须给，且是 64 位小写十六进制。它是这台机器唯一不依赖服务端的判据，见 --help"
+  local role path
+  for role in BUILDER UPLOADER; do
+    eval "path=\$MATERIAL_KEY_$role"
+    [ -n "$path" ] || continue
+    [ -f "$path" ] || die "--material-key-$(printf '%s' "$role" | tr 'A-Z' 'a-z') 指向的文件不在：${path}"
+    # 形状在这里就查：一行 base64、解出来 32 字节。装错了的表现否则是"材料下来了但解不开"
+    LC_ALL=C tr -d '[:space:]' <"$path" | openssl base64 -d -A 2>/dev/null | wc -c |
+      grep -q '^ *32$' ||
+      die "${path} 不是一把 X25519 私钥：它应该是一行 base64，解出来正好 32 字节
+   （ios-material keygen 写出来的 builder.x25519 / uploader.x25519 就是这个样子）"
+  done
 }
 
 curl_api() {
@@ -777,6 +803,57 @@ EOF
           $UPLOAD_DIR/<TEAMID>/AuthKey_<KEYID>.p8                      （$UPLOAD_USER 0600）
    放好之后重启代理，控制台上这台机器就会报出它能打哪些 Team 的包。
 EOF
+  install_material_keys
+}
+
+# install_material_keys 装那两把**材料私钥**，并打印各自的公钥指纹让人与控制台核对。
+#
+# 有了它们，上面那三样就不用人逐台放了：平台在控制台上传一次密文，这台机器自己取、自己解、
+# 自己装（设计 ios-signing-material-distribution-2026-09-19）。私钥从密码管理器来，
+# **不从服务端来**——服务端只转发它读不懂的密文，这是整套设计的前提。
+install_material_keys() {
+  if [ -z "$MATERIAL_KEY_BUILDER" ] && [ -z "$MATERIAL_KEY_UPLOADER" ]; then
+    note "没给材料私钥（--material-key-builder / --material-key-uploader）：
+   这台机器不会自动收证书与上传 Key，上面那三样按运维手册第 1.3 节人工放。"
+    return 0
+  fi
+  put_material_key "$MATERIAL_KEY_BUILDER" "$RUNNER_USER" "$SIGNING_DIR/material-key.x25519" "构建账户"
+  put_material_key "$MATERIAL_KEY_UPLOADER" "$UPLOAD_USER" "$UPLOAD_DIR/material-key.x25519" "上传账户"
+  # 指纹要与控制台上登记的那两把**对得上**。对不上的表现否则是"材料下来了但解不开"，
+  # 而那条错要等第一次下发才出现，还容易被当成服务端的问题
+  # 算不出来的时候要让人看见**为什么**：这两条的 stderr 不吞。吞掉它换来的是一句
+  # "（算不出来）"，而装机现场唯一能判断的线索正好在那条错误里——show-key 就这样查过一轮
+  local builder_fp uploader_fp
+  if [ -n "$MATERIAL_KEY_BUILDER" ]; then
+    builder_fp="$(sudo -n -u "$RUNNER_USER" "$INSTALL_DIR/build-runner" material-key-fingerprint \
+      --signing-dir "$SIGNING_DIR")" || builder_fp=""
+  fi
+  if [ -n "$MATERIAL_KEY_UPLOADER" ]; then
+    uploader_fp="$(sudo -n -u "$UPLOAD_USER" "$INSTALL_DIR/ios-upload" --material-key-fingerprint \
+      --keys "$UPLOAD_DIR")" || uploader_fp=""
+  fi
+  cat <<EOF
+
+   这两个指纹要与控制台「平台维护 → iOS 签名材料」上登记的那两把**一致**，
+   不一致就是私钥放错了——那台机器会取到材料但解不开：
+     构建账户 ${builder_fp:-（算不出来，看上面有没有报错）}
+     上传账户 ${uploader_fp:-（算不出来，看上面有没有报错）}
+EOF
+}
+
+# put_material_key 把一把材料私钥装到对应账户名下，并把它的**公钥指纹**打出来。
+#
+# 指纹由对应的程序算（它们读得到自己那把私钥），不在这个脚本里算：算它要做一次标量乘法，
+# 而这个脚本的第一环是"人能把它从头读一遍"——一段曲线运算没人读得动（见文件开头那段）。
+put_material_key() {
+  local source="$1" account="$2" target="$3" label="$4"
+  [ -n "$source" ] || return 0
+  install -o "$account" -g "$account" -m 0600 "$source" "$target" ||
+    die "装不上 ${label} 的材料私钥"
+  # 装完不动源文件：它是人放上来的，删别人的文件不是这个脚本该做的事。但要提醒——
+  # 一把明文私钥留在 /tmp 或某个用户的家目录里，比放在这台机器上那份还容易被顺走
+  note "已装 ${label} 的材料私钥 ${target}（${account} 0600）
+   源文件 ${source} 还在，装完请自行删掉。"
 }
 
 # ---- 7. env 与注册 ---------------------------------------------------------------------------

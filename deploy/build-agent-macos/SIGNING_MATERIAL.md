@@ -422,14 +422,22 @@ ls -ld /opt/rn-build-agent /opt/rn-build-agent/allowed_signers    # 都应该是
 
 ---
 
-## 6. 材料分发密钥（密文分发，建设中）
+## 6. 材料分发密钥（密文分发）
 
 设计见 [`ios-signing-material-distribution-2026-09-19.md`](../../docs/design/ios-signing-material-distribution-2026-09-19.md)。
-目标是把第 1、2 节那些"由人逐台放"的材料改成**控制台传一次、每台 Mac 自己取**，而服务端
-全程只见密文。
+它把第 1、2 节那些"由人逐台放"的材料改成**控制台传一次、每台 Mac 自己取**，而服务端全程
+只见密文。
 
-**现在可以做的只有一步：生成平台密钥。**上传与自动下发（B、C 期）还没上线，材料仍旧按第
-1.3 节人工放。
+**2026-09-19 全部上线**（A–D 期）。上手顺序是三步，缺一步后面那步没法做：
+
+| 步 | 做什么 | 在哪 |
+| --- | --- | --- |
+| 1 | `ios-material keygen` 生成两把平台密钥，私钥进密码管理器 | A 机（§6.1） |
+| 2 | 两个**公钥**登记到控制台「平台维护 → iOS 签名材料」 | 控制台（§6.2） |
+| 3 | 两把**私钥**放到每台 Mac 上，核对指纹 | 每台 Mac（§6.3） |
+
+三步走完，证书、描述文件、上传 Key 就在控制台上传一次、机器自己取；第 1.3 节那套人工放
+材料的路留着兜底，没走完这三步时仍然按它做。
 
 ### 6.1 生成（全平台一次，在 A 机上）
 
@@ -477,14 +485,59 @@ uploader
 ### 6.2 立刻要做的三件事
 
 1. 两把**私钥进密码管理器**，连同 `keygen` 打出来的指纹；
-2. 两个 `.pub` 的内容记下来，B 期上线后登记到控制台；
+2. 两个公钥（`keygen` 打出来的那两行 base64）登记到控制台「平台维护 → iOS 签名材料 →
+   平台密钥」，指纹与 `keygen` 打的对一遍；
 3. 确认密码管理器里有了之后，删掉 A 机上的私钥文件（或者让它留在这台不联网的机器上——
    但**绝不能**进任何联网的机器、更不能进服务端）。
 
 > **私钥一个字节都不要经过服务端。**服务端只转发它读不懂的密文，这是整套设计的前提：
 > 它被攻破也变不出能用的签名材料。私钥要是从服务端下发，这条前提当场作废。
 
-### 6.3 先试一把（可选）
+### 6.3 装机时把私钥放到 Mac 上
+
+```bash
+sudo bash install-macos.sh --server <API> --code rne_… \
+     --release-key-sha256 <发布公钥指纹> \
+     --material-key-builder  /path/to/builder.x25519 \
+     --material-key-uploader /path/to/uploader.x25519
+```
+
+两个参数是**这台机器上的文件路径**，内容从密码管理器取（scp 过去、或者现场 `cat >` 一份，
+装完删掉）。脚本会：
+
+1. 查形状（一行 base64、解出来 32 字节）；
+2. 各装各的账户：`builder` 那把归 `_rnbuilder`，`uploader` 那把归 `_rnuploader`，都是 0600；
+3. **把两个公钥指纹打出来**，与控制台「平台维护 → iOS 签名材料」上登记的那两把核对。
+
+> 对不上就是私钥放错了。不核对的话，表现是"材料下来了但解不开"——而那条错要等第一次下发
+> 才出现，还容易被当成服务端的问题。
+
+不给这两个参数照样装得完，只是这台机器不会自动收材料，证书与描述文件仍按第 1.3 节人工放。
+
+#### 已经装好的机器怎么补
+
+装机时没给这两个参数（mac-01 就是这样装的），不必重装——两把私钥各放一个文件、各归一个
+账户就行。以 root 在那台 Mac 上：
+
+```bash
+sudo install -o _rnbuilder  -g _rnbuilder  -m 0600 builder.x25519  /var/rn-build-signing/material-key.x25519
+sudo install -o _rnuploader -g _rnuploader -m 0600 uploader.x25519 /var/rn-build-upload/material-key.x25519
+```
+
+再照装机脚本那样核对指纹（这两条各自以对应账户跑，因为私钥只有它读得到）：
+
+```bash
+sudo -u _rnbuilder  /opt/rn-build-agent/build-runner material-key-fingerprint --signing-dir /var/rn-build-signing
+sudo -u _rnuploader /opt/rn-build-agent/ios-upload --material-key-fingerprint --keys /var/rn-build-upload
+```
+
+两个值与控制台上登记的那两把对得上就成了：控制进程下一轮认领（最多两分钟）就会去取材料。
+**放完把源文件删掉**——一把明文私钥留在 `/tmp` 或家目录里，比装到这台机器上那份还容易被顺走。
+
+> 这两个子命令是 2026-09-19 随 D 期一起进的。机器上那版程序更早的话，先按运维手册 §5 把
+> 版本换上去，否则会报"不认识的子命令"。
+
+### 6.4 先试一把（可选）
 
 工具现在就能用，可以拿一份假材料走一遍，确认你手上的密钥是对的：
 

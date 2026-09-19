@@ -9,8 +9,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"os"
@@ -153,5 +155,19 @@ func TestInstallKeyRefusesAnUnusableP8(t *testing.T) {
 	// 而且不该在盘上留下半份材料
 	if _, err := os.Stat(filepath.Join(dir, "J4JDFC8LCC", "AuthKey_8WQNTAY7MP.p8")); err == nil {
 		t.Error("the unusable key was written anyway")
+	}
+}
+
+// 与 build-runner 那一条同一件事：上传账户这把的指纹也要与控制台登记的值一字不差。
+// 两个账户各有一把，装机时正是靠这两个值分辨"哪把放错了位置"。
+func TestMaterialKeyFingerprintIsTheValueTheConsoleRegisters(t *testing.T) {
+	dir, pub := uploadFixture(t)
+	var out, errBuf bytes.Buffer
+	if code := run([]string{"--material-key-fingerprint", "--keys", dir}, strings.NewReader(""), &out, &errBuf); code != 0 {
+		t.Fatalf("exit %d: %s%s", code, out.String(), errBuf.String())
+	}
+	want := sha256.Sum256(pub)
+	if strings.TrimSpace(out.String()) != hex.EncodeToString(want[:]) {
+		t.Fatalf("fingerprint %q, the console registers %s", strings.TrimSpace(out.String()), hex.EncodeToString(want[:]))
 	}
 }

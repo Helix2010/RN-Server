@@ -9,7 +9,9 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -194,5 +196,31 @@ func TestInstallRefusesMaterialForAnotherKey(t *testing.T) {
 	}
 	if strings.Contains(out, "secret-profile-bytes") {
 		t.Errorf("the error leaked the payload: %s", out)
+	}
+}
+
+// 指纹是装机现场唯一的核对判据：它必须与控制台登记那把公钥时算的值（sha256(公钥字节)）
+// 一字不差。算错一端——对 base64 文本取摘要、或者拿私钥去算——运维比的就是两个永远不会
+// 相等的字符串，而那要等第一次下发材料才看得出来，还容易被当成服务端的问题。
+func TestMaterialKeyFingerprintIsTheValueTheConsoleRegisters(t *testing.T) {
+	dir, pub := materialFixture(t)
+	code, out := runRunner(t, func(string) string { return "" }, "material-key-fingerprint", "--signing-dir", dir)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	want := sha256.Sum256(pub)
+	if strings.TrimSpace(out) != hex.EncodeToString(want[:]) {
+		t.Fatalf("fingerprint %q, the console registers %s", strings.TrimSpace(out), hex.EncodeToString(want[:]))
+	}
+}
+
+// 私钥不在就说不在：装机脚本靠这条退出码决定要不要把"算不出来"印出来
+func TestMaterialKeyFingerprintSaysSoWhenThereIsNoKey(t *testing.T) {
+	code, out := runRunner(t, func(string) string { return "" }, "material-key-fingerprint", "--signing-dir", signingDir(t))
+	if code == 0 {
+		t.Fatalf("a missing material key was reported as success: %s", out)
+	}
+	if !strings.Contains(out, materialKeyFileName) {
+		t.Errorf("the error does not name the file that is missing: %s", out)
 	}
 }

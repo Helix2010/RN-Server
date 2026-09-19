@@ -647,3 +647,52 @@ func TestMacInstallClearsAStaleUpgradeFailure(t *testing.T) {
 			"and nothing ever clears it — only a successful self-upgrade does")
 	}
 }
+
+// 两把材料私钥是**带外**的：内容从密码管理器取，装机时由人放到这台机器上的文件里。
+// 脚本绝不能从服务端取它们——服务端只转发它读不懂的密文，那是整套设计的前提
+// （ios-signing-material-distribution-2026-09-19 第 2 节）。
+func TestMacInstallTakesMaterialKeysOnlyFromLocalFiles(t *testing.T) {
+	body := string(InstallMacOSScript)
+	start := strings.Index(body, "\ninstall_material_keys() {\n")
+	if start < 0 {
+		t.Fatal("no install_material_keys() in install-macos.sh")
+	}
+	fn := body[start:]
+	if end := strings.Index(fn, "\n}\n"); end >= 0 {
+		fn = fn[:end]
+	}
+	for _, forbidden := range []string{"curl", "$SERVER", "describe", "machine-setup"} {
+		if strings.Contains(fn, forbidden) {
+			t.Errorf("install_material_keys mentions %q. A material private key must never come "+
+				"from the server: the whole point is that a compromised server still cannot produce "+
+				"usable signing material", forbidden)
+		}
+	}
+	// 各归各的账户：构建那把给 _rnbuilder，上传那把给 _rnuploader。一把给两个账户等于
+	// 拿到构建账户就同时拿到了上传能力
+	if !strings.Contains(fn, `put_material_key "$MATERIAL_KEY_BUILDER" "$RUNNER_USER"`) ||
+		!strings.Contains(fn, `put_material_key "$MATERIAL_KEY_UPLOADER" "$UPLOAD_USER"`) {
+		t.Error("the two material keys are not installed under their own accounts")
+	}
+	// 指纹要打出来让人与控制台核对
+	if !strings.Contains(fn, "material-key-fingerprint") {
+		t.Error("install_material_keys does not print the fingerprints; a key placed on the wrong " +
+			"machine would only show up as 'the material arrived but cannot be opened'")
+	}
+}
+
+// 私钥文件必须是 0600、归对应账户。别人读得到就不是它独有的了。
+func TestMacInstallPlacesMaterialKeysPrivately(t *testing.T) {
+	body := string(InstallMacOSScript)
+	start := strings.Index(body, "\nput_material_key() {\n")
+	if start < 0 {
+		t.Fatal("no put_material_key() in install-macos.sh")
+	}
+	fn := body[start:]
+	if end := strings.Index(fn, "\n}\n"); end >= 0 {
+		fn = fn[:end]
+	}
+	if !strings.Contains(fn, `install -o "$account" -g "$account" -m 0600`) {
+		t.Error("a material key is not installed 0600 under its own account")
+	}
+}
