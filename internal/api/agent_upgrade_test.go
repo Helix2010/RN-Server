@@ -153,6 +153,11 @@ func TestDBAgentBundleRefusesAManifestThatDoesNotMatchItsSignature(t *testing.T)
 // 发生在空闲的时候，正在跑的构建自然做完。
 func TestDBApprovedAgentVersionStopsOutdatedMachinesFromClaiming(t *testing.T) {
 	f, macs := newIOSPool(t, 73, 1)
+	// 只有服务器上现在摆着的那一版才批得了（见 TestDBApproveAgentVersionOnlyTakesWhatIsDeployed），
+	// 所以先把安装包摆成这个提交
+	f.installBundles()
+	clearStoredSignatures(t, f)
+	stageUnsignedBundles(t, f, upgradeCommit)
 	claim := func(commit string) *httptest.ResponseRecorder {
 		body := map[string]any{
 			"platforms": []string{buildPlatformIOS}, "kinds": []string{jobKindAPK},
@@ -199,6 +204,9 @@ func TestDBApprovedAgentVersionStopsOutdatedMachinesFromClaiming(t *testing.T) {
 
 func TestDBApproveAgentVersionRefusesJunk(t *testing.T) {
 	f := newGateFixture(t, 74)
+	f.installBundles()
+	clearStoredSignatures(t, f)
+	stageUnsignedBundles(t, f, upgradeCommit)
 	for name, commit := range map[string]any{
 		"short":    "abc",
 		"a branch": "main",
@@ -310,5 +318,66 @@ func TestDBBuildAgentVersionShowsWhatIsDeployedEvenWhenOneBundleIsBroken(t *test
 	body = decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))
 	if body["approvedAgentCommit"] != upgradeCommit {
 		t.Fatalf("approvedAgentCommit = %v, want %s", body["approvedAgentCommit"], upgradeCommit)
+	}
+}
+
+// 批准一个**不是服务器上现在摆着的那一版**，等于造一个谁都到不了的目标：被挡住的机器
+// 去取安装包，而那个接口只下发当前这一版 → 503；就算取到了，升级程序也会以"签名里的
+// 提交不是我被告知要装的那个"拒绝。
+//
+// 2026-09-19 真机停摆就是这么来的：批准了 A，CI 随后部署了 B，一台机器超前、一台落后，
+// 两台都不等于 A，全都领不到活——而控制台上它们还都显示"在线"，因为版本闸在记完心跳之后
+// 才拦。
+func TestDBApproveAgentVersionOnlyTakesWhatIsDeployed(t *testing.T) {
+	f := newGateFixture(t, 75)
+	f.installBundles()
+	clearStoredSignatures(t, f)
+	deployed := strings.Repeat("c", 40)
+	stageUnsignedBundles(t, f, deployed)
+
+	stale := strings.Repeat("d", 40)
+	r := f.adminDo(http.MethodPost, "/v1/admin/platform/build-agent-version", map[string]any{
+		"commit": stale, "expectedVersion": registryVersion(t, f), "reason": "pin a commit that is no longer deployed", "confirm": true,
+	})
+	if r.Code != http.StatusConflict || problemCode(t, r) != "AGENT_VERSION_NOT_DEPLOYED" {
+		t.Fatalf("a commit the server cannot hand out was approved: %d %s", r.Code, r.Body.String())
+	}
+	if detail, _ := decodeBody(t, r)["detail"].(string); !strings.Contains(detail, deployed) {
+		t.Errorf("the refusal does not name the commit that can be approved: %q", detail)
+	}
+
+	// 当前部署的那一版照收
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/build-agent-version", map[string]any{
+		"commit": deployed, "expectedVersion": registryVersion(t, f), "reason": "approve what is deployed", "confirm": true,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("the deployed commit was refused: %d %s", r.Code, r.Body.String())
+	}
+	// "不管版本"任何时候都能撤：它是出了事之后恢复服务的那一下，不该被任何检查挡住
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/build-agent-version", map[string]any{
+		"commit": "", "expectedVersion": registryVersion(t, f), "reason": "unpin to recover", "confirm": true,
+	}); r.Code != http.StatusOK {
+		t.Fatalf("unpinning was refused: %d %s", r.Code, r.Body.String())
+	}
+}
+
+// 安装包没签时那句 503 要说"还没签"，不能说成"去部署安装包"。机器把这句话原样打在装机
+// 屏幕上、升级程序把它写进失败记录再报给控制台——说错方向的代价是运维去重新部署一遍毫无
+// 问题的包，而真正要做的事（离线签一份清单交上来）没人提。
+func TestDBUnsignedBundleSaysItIsUnsignedNotUndeployed(t *testing.T) {
+	f := newGateFixture(t, 76)
+	f.installBundles()
+	clearStoredSignatures(t, f)
+	stageUnsignedBundles(t, f, strings.Repeat("e", 40))
+
+	r := f.do(http.MethodGet, "/v1/build-agent/bundle?os=darwin&arch=arm64", f.builder.Token, nil, nil)
+	if r.Code != http.StatusServiceUnavailable {
+		t.Fatalf("an unsigned bundle was handed out: %d %s", r.Code, r.Body.String())
+	}
+	detail, _ := decodeBody(t, r)["detail"].(string)
+	if !strings.Contains(detail, "signature") {
+		t.Errorf("the 503 does not say the bundles are unsigned: %q", detail)
+	}
+	if strings.Contains(detail, "deploy the machine bundles") {
+		t.Errorf("the 503 still blames deployment for a signing problem: %q", detail)
 	}
 }

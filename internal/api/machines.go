@@ -1389,6 +1389,28 @@ func (s *server) approveAgentVersion(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_AGENT_VERSION", "commit must be a full commit sha, or empty to stop pinning a version")
 		return
 	}
+	// 只许批准**服务器上现在部署着的那一版**。批准别的等于造一个谁都到不了的目标：机器被
+	// 挡下来之后去取安装包，而那个接口只下发当前这一版，于是它拿到 503；就算拿到了，升级
+	// 程序也会以"签名里的提交不是我被告知要装的那个"拒绝——那一条是对的，不能放松。
+	//
+	// 真机上就这么停摆过一次（2026-09-19）：批准了 A，CI 随后部署了 B，于是一台机器超前、
+	// 一台落后，两台都不等于 A，全都领不到活；而控制台上它们还都显示"在线"，因为版本闸在
+	// 记完心跳之后才拦。
+	if commit != "" {
+		_, deployed, deployedErr := s.machineBundles()
+		switch {
+		case deployedErr != nil:
+			problem(c, http.StatusServiceUnavailable, "MACHINE_BUNDLE_UNAVAILABLE",
+				"Cannot read the deployed machine bundles, so this version cannot be checked against what the server would hand out: "+deployedErr.Error())
+			return
+		case deployed.Commit != commit:
+			problem(c, http.StatusConflict, "AGENT_VERSION_NOT_DEPLOYED",
+				"Only the commit deployed on the server right now ("+deployed.Commit+") can be approved. "+
+					"A machine held back by the version gate downloads its bundle from this server, which only ever hands out the deployed one; "+
+					"approving anything else leaves every machine blocked with nowhere to upgrade to.")
+			return
+		}
+	}
 	reason := strings.TrimSpace(body.Reason)
 	snapshot, ok := s.mutateMachines(c, *body.ExpectedVersion, func(doc *buildMachinesDoc, _ time.Time) (int, string, string, []auditEvent) {
 		previous := string(doc.ApprovedAgentCommit)

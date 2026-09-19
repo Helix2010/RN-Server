@@ -704,6 +704,10 @@ install_programs() {
   put_file "$BUNDLE/rn-build-agent.sudoers" /etc/sudoers.d/rn-build-agent root wheel 0440
   visudo -c -f /etc/sudoers.d/rn-build-agent >/dev/null || die "sudoers 片段不合法"
   smoke_test
+  # 换过程序了，上一次升级失败的记录就不再成立——它只会在控制台上一直挂着一条吓人的
+  # 错。只有"升级成功"才会删它（upgrade/main.go），而这个脚本换二进制是不走升级的，
+  # 真机上就这么留了一条指向已经装上的版本的失败记录。
+  rm -f "$AGENT_HOME/state/upgrade-failed.json"
 }
 
 smoke_test() {

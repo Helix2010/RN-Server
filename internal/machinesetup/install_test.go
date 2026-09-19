@@ -627,3 +627,23 @@ func TestMacInstallShowsTheFingerprintAsTheAgentAccount(t *testing.T) {
 		t.Errorf("finish() calls show-key %d times; expected exactly one call to pin", calls)
 	}
 }
+
+// 换过程序之后，上一次升级失败的记录就不再成立。只有"升级成功"才会删它
+// （cmd/build-agent/upgrade），而装机脚本换二进制不走升级——真机上因此留下一条指向
+// 已经装上的那一版的失败记录，控制台上一直挂着，看着像机器有毛病。
+func TestMacInstallClearsAStaleUpgradeFailure(t *testing.T) {
+	body := string(InstallMacOSScript)
+	start := strings.Index(body, "\ninstall_programs() {\n")
+	if start < 0 {
+		t.Fatal("no install_programs() in install-macos.sh")
+	}
+	fn := body[start:]
+	if end := strings.Index(fn, "\n}\n"); end >= 0 {
+		fn = fn[:end]
+	}
+	if !strings.Contains(fn, `rm -f "$AGENT_HOME/state/upgrade-failed.json"`) {
+		t.Error("install_programs replaces the binaries but leaves state/upgrade-failed.json behind. " +
+			"The console then reports a failed upgrade to a version this machine is already running, " +
+			"and nothing ever clears it — only a successful self-upgrade does")
+	}
+}

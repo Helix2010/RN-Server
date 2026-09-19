@@ -257,10 +257,15 @@ func (doc machineBundleManifestDoc) bundleFor(role string) (machineBundle, error
 	return bundle, nil
 }
 
+// bundleUnavailable 把**真实原因**带回去。原来一律答"部署安装包再试"，而最常见的那种
+// 根本不是这个意思：包部署好了、只是还没签（要平台管理员离线签一份清单交上来）。机器把
+// 这句话原样打在装机屏幕上、升级程序把它写进失败记录再报给控制台——说错方向的代价是运维
+// 去重新部署一遍毫无问题的安装包，而真正要做的事没人提。
+//
+// 这里的 err 都是运维面向的文字（缺签名、归档不在、清单形状不对），不含机密。
 func bundleUnavailable(c *gin.Context, role string, err error) {
 	slog.Error("machine bundle is unavailable", "role", role, "error", err)
-	problem(c, http.StatusServiceUnavailable, "MACHINE_BUNDLE_UNAVAILABLE",
-		"The installation bundle for this machine role is not available on the server; deploy the machine bundles and retry")
+	problem(c, http.StatusServiceUnavailable, "MACHINE_BUNDLE_UNAVAILABLE", err.Error())
 }
 
 // ---- 接口 ----
