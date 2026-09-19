@@ -136,6 +136,9 @@ sudo rm -rf "$d"
 4. **控制台**点「接受」，核对指纹与安装输出一致。接受只影响服务端路由，**不代表任何一台签名闸信任它**。
 5. **在签名闸本机建立信任**（服务端不能代劳）：
    - 新构建机：每台签名闸上 `signer trust-builder --builder <构建机名>`，粘贴构建机安装输出里的出处公钥指纹。
+     **macOS / iOS 打包机跳过这一条**：签名闸只签 Android 的 APK，iOS 的包在 Mac 本机用钥匙串里的
+     Distribution 证书签完，不经过签名闸——装机流程见
+     [`build-agent-macos/MAC_SETUP_RUNBOOK.md`](build-agent-macos/MAC_SETUP_RUNBOOK.md)。
    - 新签名闸（备）：主签名闸上 `signer trust-peer --peer <新机器名>`；新机器上 `signer trust-peer --peer <主机器名>`，
      指纹取**对方本机** `signer show-key` 或它的安装输出，不取控制台。
    - 平台第一台主签名闸：`sudo systemctl stop rn-signer-<实例>` → `signer promote --first` → 再启动。
