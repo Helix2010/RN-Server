@@ -590,3 +590,40 @@ func TestMacInstallScriptRefusesWithoutFileVault(t *testing.T) {
 		t.Error("install-macos.sh only warns about FileVault; it must refuse to install")
 	}
 }
+
+// 装机最后那行 show-key 必须切到控制进程那个账户。build-agent 认的是"跑它的人得是状态
+// 目录的属主"（cmd/build-agent/key.go 的 checkPrivate 用 geteuid），而装机脚本是 root：
+// 以 root 跑 show-key 会以 "state must belong to the user running build-agent (uid 0)"
+// 失败。真机上就这么发生过——失败信息还被 2>/dev/null 吃掉，屏幕上只剩下紧跟着的那句
+// "核对上面这个出处公钥 sha256"，而上面什么都没有。
+func TestMacInstallShowsTheFingerprintAsTheAgentAccount(t *testing.T) {
+	body := string(InstallMacOSScript)
+	start := strings.Index(body, "\nfinish() {\n")
+	if start < 0 {
+		t.Fatal("no finish() in install-macos.sh")
+	}
+	fn := body[start:]
+	if end := strings.Index(fn, "\n}\n"); end >= 0 {
+		fn = fn[:end]
+	}
+	// 只看真正调用那个二进制的行（带引号的完整路径）；提示文字里给人抄的示例命令不算。
+	calls := 0
+	for _, line := range strings.Split(fn, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") || !strings.Contains(line, `build-agent" show-key`) {
+			continue
+		}
+		calls++
+		if !strings.Contains(line, `sudo -n -u "$AGENT_USER"`) {
+			t.Errorf("finish() runs show-key as root:\n  %s\nThe provenance key belongs to $AGENT_USER and "+
+				"build-agent refuses to read a state directory it does not own, so this prints nothing — "+
+				"while the very next line tells the operator to compare the fingerprint above", strings.TrimSpace(line))
+		}
+		if strings.Contains(line, "2>/dev/null") {
+			t.Errorf("finish() throws away show-key's stderr:\n  %s\nWhen it fails there is nothing left "+
+				"on screen to explain why the fingerprint is missing", strings.TrimSpace(line))
+		}
+	}
+	if calls != 1 {
+		t.Errorf("finish() calls show-key %d times; expected exactly one call to pin", calls)
+	}
+}

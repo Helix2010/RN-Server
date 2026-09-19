@@ -927,7 +927,16 @@ install_daemons() {
 
 finish() {
   step "装好了"
-  "$INSTALL_DIR/build-agent" show-key --state-dir "$AGENT_HOME/state" 2>/dev/null || true
+  # 必须切到控制进程那个账户：出处密钥与状态目录归它，而 build-agent 认的是"跑它的人就得是
+  # 属主"（checkPrivate 用 geteuid）。以 root 跑 show-key 会以"state 必须属于 uid 0"失败，
+  # 而下面那句写着"核对**上面**这个 sha256"——上面什么都没有。
+  #
+  # 也不许把 stderr 丢掉：这一行印不出来，人就没得核对，得当场看见是为什么。
+  if ! sudo -n -u "$AGENT_USER" "$INSTALL_DIR/build-agent" show-key --state-dir "$AGENT_HOME/state"; then
+    warn "show-key 没能打印出处公钥指纹（上面是它的原话）。
+   指纹在注册那一步也打过一次（provenance public key sha256），往上翻；
+   或者装完之后自己跑：sudo -u $AGENT_USER $INSTALL_DIR/build-agent show-key --state-dir $AGENT_HOME/state"
+  fi
   cat <<EOF
 
    接下来（都在控制台 平台维护 → 构建机）：
