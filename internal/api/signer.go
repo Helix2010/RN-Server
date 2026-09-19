@@ -69,10 +69,29 @@ func sanitizeSignerText(text string, max int) string {
 func (s *server) signerKeystoreChecks(c *gin.Context) {
 	machine, _ := machineFromContext(c)
 	ctx := c.Request.Context()
+	// cutShort 是这条接口唯一不能含糊的地方：请求被超时或取消截断时，**不许**回一份残缺的清单。
+	// 在签名闸那边，残缺的清单与"这个平台没事要你做"长得一模一样——密钥不换、检查结论不报、
+	// 生成请求领不走，而两边日志里一条错都没有。这条接口本来就是轮询的，回 503 让它下一轮重试。
+	//
+	// 这条接口没有上限：平台上每多一个配了密钥的租户就多几条查询，而请求本身最多只能跑
+	// MYSQL_QUERY_TIMEOUT_SECONDS 秒（databaseTimeout）。租户多到一定程度它就跑不完。
+	cutShort := func() bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		problem(c, http.StatusServiceUnavailable, "BUILD_KEYSTORE_CHECK_INCOMPLETE",
+			"Listing the keystores did not finish within the time this request may take; ask again")
+		return true
+	}
+	fail := func() {
+		if !cutShort() {
+			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_QUERY_FAILED", "Unable to list keystores")
+		}
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT k.tenant_id FROM app_configs k JOIN tenants t ON t.id=k.tenant_id WHERE k.config_key IN (?,?) ORDER BY k.tenant_id`,
 		buildKeystoreConfigKey, buildKeystoreRequestConfigKey)
 	if err != nil {
-		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_QUERY_FAILED", "Unable to list keystores")
+		fail()
 		return
 	}
 	tenants := []string{}
@@ -80,16 +99,25 @@ func (s *server) signerKeystoreChecks(c *gin.Context) {
 		var tenant string
 		if err := rows.Scan(&tenant); err != nil {
 			rows.Close()
-			problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CHECK_QUERY_FAILED", "Unable to list keystores")
+			fail()
 			return
 		}
 		tenants = append(tenants, tenant)
 	}
 	rows.Close()
+	// 迭代中途断了要当场说出来：截断的租户列表和"这台签名闸没事可做"长得一模一样，
+	// 而那正是主签名闸拿不到生成请求、也拿不到密文的样子——静默的空列表查不出来
+	if err := rows.Err(); err != nil {
+		fail()
+		return
+	}
 	items := []gin.H{}
 	for _, tenant := range tenants {
 		item, err := s.signerCheckItem(ctx, machine, tenant)
 		if err != nil {
+			if cutShort() {
+				return
+			}
 			// 一个租户的记录坏了不能挡住其它租户的检查；这个租户在控制台上会直接报错
 			slog.Error("skipping a tenant in the signer keystore checks", "tenant", tenant, "machineId", machine.ID, "error", err)
 			continue
@@ -97,6 +125,10 @@ func (s *server) signerKeystoreChecks(c *gin.Context) {
 		if item != nil {
 			items = append(items, item)
 		}
+	}
+	// 出门前最后一道：走到这里但请求已经被截断，说明这份清单没跑完
+	if cutShort() {
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"machineId": machine.ID, "signerRole": nullableString(string(machine.SignerRole)), "items": items})
 }
@@ -520,6 +552,11 @@ func (s *server) claimSigningJob(c *gin.Context) {
 		candidates = append(candidates, id)
 	}
 	rows.Close()
+	// 同上：候选列表截断了就是"没有待签名的包"，签名闸会安静地空转
+	if err := rows.Err(); err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to look for builds to sign")
+		return
+	}
 	for _, id := range candidates {
 		job, err := scanBuildJob(s.db.QueryRowContext(ctx, `SELECT `+buildJobColumns+` FROM build_jobs WHERE id=?`, id))
 		if err != nil {

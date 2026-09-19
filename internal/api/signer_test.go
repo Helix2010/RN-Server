@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -538,5 +539,28 @@ func TestDBForceFailStopsTheSigner(t *testing.T) {
 	_ = f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=? AND action='build_job_force_fail' AND target_id=?`, f.tenant, jobID).Scan(&audited)
 	if audited != 1 {
 		t.Fatalf("force-fail audit: %d", audited)
+	}
+}
+
+// 检查清单被截断时不许回 200。
+//
+// 这条接口按"平台上所有配了密钥的租户"线性展开，而每个请求最多只能跑
+// MYSQL_QUERY_TIMEOUT_SECONDS 秒（databaseTimeout）。租户够多的时候它跑不完，
+// 而跑不完时回一份**残缺**的清单，在签名闸那边与"没事可做"完全一样：密钥不换、
+// 检查结论不报、生成请求领不走，两边日志都干净。宁可 503 让它下一轮重试。
+func TestDBSignerKeystoreChecksRefuseToAnswerWithAPartialList(t *testing.T) {
+	f := newGateFixture(t, 146)
+	c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/signer/keystore-checks", nil)
+	c.Set(machineContextKey, f.primary.record(signerRolePrimary))
+	cut, cancel := context.WithCancel(c.Request.Context())
+	cancel()
+	c.Request = c.Request.WithContext(cut)
+
+	f.s.signerKeystoreChecks(c)
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("a request that was cut short still answered with a list: %s", recorder.Body.String())
+	}
+	if recorder.Code != http.StatusServiceUnavailable || problemCode(t, recorder) != "BUILD_KEYSTORE_CHECK_INCOMPLETE" {
+		t.Fatalf("cut short: %d %s", recorder.Code, recorder.Body.String())
 	}
 }

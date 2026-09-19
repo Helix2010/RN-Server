@@ -339,6 +339,7 @@ amos 上已经按手工流程装好 `amos-signer-a`、`amos-signer-b`、`amos-bu
 - **导出只含恢复收件人的密文**：第 1 节「恢复」只说"控制台提供导出密文文件"。导出文件只保留发给未吊销恢复公钥的 box（没有 → 409 `BUILD_KEYSTORE_EXPORT_NO_RECOVERY_RECIPIENT`），发给签名闸的不带：租户管理员都能导出，带上的话一台被吊销但没擦盘的签名闸私钥加上任何一次导出就能解开密钥。`build-keystore recover` 只解发给恢复公钥的那份、核对明文与外层字段，不校验生成签名，不受影响。导出与审计同一个事务，审计写不进去就不导出。恢复路径仍是 导出 → `recover` → `seal` → 导入。
 - **吊销恢复公钥后的视图**：`GET /v1/admin/build-keystore` 的 `recoveryRecipients` 仍含已吊销的恢复公钥，另加 `revokedRecoveryRecipients`（其中已吊销的子集）；全部吊销时控制台提示这把密钥已没有可用的离线恢复。
 - **`trust` 可以缺**：第 4 节的 `reportedTrust` 由签名闸每轮上报。迁移时 CI 先把服务端推上线、签名闸二进制人工升级，中间几个小时里旧签名闸不带 `trust`：上报照常收下（本机角色与检查结论照常更新），`reportedTrust` 记成 null，控制台显示为未上报。
+- **检查清单跑不完时宁可 503**（2026-09-19 补）：`GET /v1/signer/keystore-checks` 按"平台上每个配了密钥或有生成请求的租户"线性展开，每个租户几条查询，没有上限；而每个请求最多只能跑 `MYSQL_QUERY_TIMEOUT_SECONDS`（默认 10 秒，`databaseTimeout` 中间件）。跑不完时原先回的是一份**残缺**的清单——在签名闸那边它与"这个平台没事要你做"完全一样：密钥不换、检查结论不报、生成请求领不走，两边日志都干净。现在只要请求被截断就回 503 `BUILD_KEYSTORE_CHECK_INCOMPLETE`（这条接口本来就是轮询的，下一轮重试）。**真正该补的**是别再全表展开：按"收件人里有这台机器"或"有在途生成请求"在 SQL 里先筛。今天 anyfun 只有几个租户、一次调用十几毫秒，这一条是提前堵住而不是已经发生的故障。
 - **panic 日志**：服务端不再用 `gin.Recovery()`（debug 模式下会把 `x-enrollment-code`、`x-machine-token` 等请求头原样打进日志），panic 只记 panic 值、路由模板、request id 与堆栈。
 
 ### 签名闸与安装（已知偏离）
