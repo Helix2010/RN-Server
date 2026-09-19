@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -31,14 +32,15 @@ import (
 
 const (
 	// keychainFileName 与 profilesDirName 是装机脚本铺出来的固定布局（§4.2）。
-	// 写死而不是配置：换一个名字只会让"材料在哪"多一处要对齐的地方
-	keychainFileName = "rn-signing.keychain-db"
-	profilesDirName  = "profiles"
+	// 写死而不是配置：换一个名字只会让"材料在哪"多一处要对齐的地方。
+	// 定义在 jobspec 里，因为取材料的是 build-runner（见那边的说明）
+	keychainFileName = jobspec.IOSKeychainFileName
+	profilesDirName  = jobspec.IOSProfilesDirName
 	// uploadKeyFileName 是上传 Key 的元数据（issuerId / keyId），.p8 在它旁边。
 	// 控制进程**不读**这两个文件，只看目录在不在：Key 是上传账户的东西
 	uploadKeyFileName = "key.json"
 	// profileSuffix 是描述文件的扩展名
-	profileSuffix = ".mobileprovision"
+	profileSuffix = jobspec.IOSProfileSuffix
 	// appleTeamIDLength：Apple Team ID 固定 10 位大写字母数字
 	appleTeamIDLength = 10
 )
@@ -109,6 +111,12 @@ type iosScanner struct {
 	Identities func(ctx context.Context, keychain string) (map[string]bool, error)
 	// Certificates 返回每个 Team 最早到期的分发证书
 	Certificates func(ctx context.Context, keychain string) (map[string]time.Time, error)
+	// Material 一次子进程把签名区里的原文取回来（build-runner 以 _rnbuilder 的身份跑）。
+	// 生产里非有它不可：签名区是 0700 _rnbuilder，控制进程连目录都 stat 不了。
+	// nil = 直接读本地，用于测试与 BUILD_AGENT_RUNNER_USER=- 的本地形态
+	Material func(ctx context.Context) (jobspec.IOSMaterial, error)
+	// Profiles 返回 "<TEAMID>/<文件名>" -> 描述文件原文；nil = 自己走文件系统
+	Profiles func() (map[string][]byte, []string)
 	// Probe 是上传 Key 的只读探测，返回 ok / forbidden / error；nil = 不探。
 	// 带上 bundle id 是因为这套端点挂在具体的 App 下（GET /v1/apps/{id}/buildUploads），
 	// 而"这个 Team 有哪些 App"只有盘点知道
@@ -126,6 +134,48 @@ func newIOSScanner(cfg config) iosScanner {
 	}
 }
 
+// iosMaterial 经 build-runner 取一次签名区原文。控制进程自己读不到那个目录（0700
+// _rnbuilder），而 build-runner 是 sudoers 里唯一允许它以那个账户启动的程序——所以这件事
+// 挂在它身上，既不用为盘点再开一条 sudo 规则，也不用放宽签名区的权限。
+func (a *agent) iosMaterial(ctx context.Context) (jobspec.IOSMaterial, error) {
+	dir := a.cfg.MachineEnv[jobspec.IOSSigningDirEnv]
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := a.runnerReadCommand(ctx, "ios-inventory", "--signing-dir", dir)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		return jobspec.IOSMaterial{}, fmt.Errorf("%s ios-inventory: %w: %s", a.cfg.Runner, err, truncate(detail, 300))
+	}
+	var material jobspec.IOSMaterial
+	if err := json.Unmarshal(stdout.Bytes(), &material); err != nil {
+		// 执行进程把失败原因写在标准输出上（build-runner: error: …），所以这一条不是
+		// "格式坏了"，多半就是它拒绝了参数——把它的原话带出来
+		return jobspec.IOSMaterial{}, fmt.Errorf("the build runner did not answer with JSON: %s", truncate(strings.TrimSpace(stdout.String()), 300))
+	}
+	return material, nil
+}
+
+// runnerReadCommand 构造一条只读的执行进程调用：经 sudo 切到执行账户，环境只给 PATH
+// 与 LANG。与 uploaderCommand 同一条路子。
+func (a *agent) runnerReadCommand(ctx context.Context, args ...string) *exec.Cmd {
+	env := []string{"PATH=" + a.cfg.MachineEnv["PATH"], "LANG=C"}
+	if a.cfg.RunnerUser == directRunner {
+		// 本地测试：不经 sudo。生产里 BUILD_AGENT_RUNNER_USER=- 已经在启动时大声告警过
+		cmd := exec.CommandContext(ctx, a.cfg.Runner, args...)
+		cmd.Env = env
+		return cmd
+	}
+	sudo := append([]string{"-n", "-u", a.cfg.RunnerUser, a.cfg.Runner}, args...)
+	cmd := exec.CommandContext(ctx, "/usr/bin/sudo", sudo...)
+	cmd.Env = env
+	return cmd
+}
+
 func (s iosScanner) keychain() string { return filepath.Join(s.SigningDir, keychainFileName) }
 
 // scan 盘点一次。子进程出错不是致命错误：盘点失败等于"这台机器这次什么都报不出来"，
@@ -134,6 +184,16 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 	var inv iosInventory
 	if s.SigningDir == "" {
 		return inv
+	}
+	if s.Material != nil {
+		material, err := s.Material(ctx)
+		if err != nil {
+			// 取不到材料等于这一轮什么都不报：机器安静地领不到 iOS 任务，控制台上
+			// 它的材料列表是空的——这正是要让人看见的状态
+			inv.Problems = append(inv.Problems, "cannot read the signing material through the build runner: "+err.Error())
+			return inv
+		}
+		s = s.withMaterial(material)
 	}
 	identities, err := s.Identities(ctx, s.keychain())
 	if err != nil {
@@ -208,6 +268,45 @@ type teamProfiles struct {
 // Team ID，按文件里的那个归类。放错目录的文件因此只会被归对，不会让一个 Team 凭空出现。
 func (s iosScanner) scanProfiles() (map[string]teamProfiles, []string) {
 	out := map[string]teamProfiles{}
+	root := filepath.Join(s.SigningDir, profilesDirName)
+	files, problems := s.profileFiles()
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	now := s.Now().UTC()
+	for _, name := range names {
+		path := filepath.Join(root, name)
+		team, bundleID, expires, err := parseProvisioningProfile(files[name])
+		if err != nil {
+			problems = append(problems, "cannot read "+path+": "+err.Error())
+			continue
+		}
+		// 过期的描述文件签出来的包 Apple 直接拒。报上去只会让服务端把任务派过来再失败
+		if !expires.After(now) {
+			problems = append(problems, path+" expired on "+expires.Format(time.RFC3339))
+			continue
+		}
+		current := out[team]
+		if !containsPlatform(current.ids, bundleID) {
+			current.ids = append(current.ids, bundleID)
+		}
+		current.expiresAt = earliest(current.expiresAt, expires)
+		out[team] = current
+	}
+	return out, problems
+}
+
+// profileFiles 取 profiles/<TEAMID>/*.mobileprovision 的原文，键是 "<TEAMID>/<文件名>"。
+//
+// 生产里由 build-runner 以 _rnbuilder 的身份取（Profiles 字段）：签名区是 0700 _rnbuilder，
+// 控制进程读不到。这里这一份是本地实现，测试与 BUILD_AGENT_RUNNER_USER=- 的本地形态用。
+func (s iosScanner) profileFiles() (map[string][]byte, []string) {
+	if s.Profiles != nil {
+		return s.Profiles()
+	}
+	out := map[string][]byte{}
 	var problems []string
 	root := filepath.Join(s.SigningDir, profilesDirName)
 	entries, err := os.ReadDir(root)
@@ -217,7 +316,6 @@ func (s iosScanner) scanProfiles() (map[string]teamProfiles, []string) {
 		}
 		return out, problems
 	}
-	now := s.Now().UTC()
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -232,38 +330,23 @@ func (s iosScanner) scanProfiles() (map[string]teamProfiles, []string) {
 			if file.IsDir() || !strings.HasSuffix(file.Name(), profileSuffix) {
 				continue
 			}
-			path := filepath.Join(dir, file.Name())
-			team, bundleID, expires, err := readProvisioningProfile(path)
+			raw, err := os.ReadFile(filepath.Join(dir, file.Name()))
 			if err != nil {
-				problems = append(problems, "cannot read "+path+": "+err.Error())
+				problems = append(problems, "cannot read "+filepath.Join(dir, file.Name())+": "+err.Error())
 				continue
 			}
-			// 过期的描述文件签出来的包 Apple 直接拒。报上去只会让服务端把任务派过来再失败
-			if !expires.After(now) {
-				problems = append(problems, path+" expired on "+expires.Format(time.RFC3339))
-				continue
-			}
-			current := out[team]
-			if !containsPlatform(current.ids, bundleID) {
-				current.ids = append(current.ids, bundleID)
-			}
-			current.expiresAt = earliest(current.expiresAt, expires)
-			out[team] = current
+			out[entry.Name()+"/"+file.Name()] = raw
 		}
 	}
 	return out, problems
 }
 
-// readProvisioningProfile 从一份 .mobileprovision 里读出 Team ID、bundle id 与到期日。
+// parseProvisioningProfile 从一份 .mobileprovision 的原文里读出 Team ID、bundle id 与到期日。
 //
 // 文件是 CMS 签名块，里面包着一份 XML plist。**不验签**：这份材料是运维放上去的，
 // 而真正的把关在别处——签不出 Apple 认的包，或者签出来 Apple 拒收。这里只需要读出
 // "这台机器能签哪个 App"。
-func readProvisioningProfile(path string) (teamID, bundleID string, expires time.Time, err error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", time.Time{}, err
-	}
+func parseProvisioningProfile(raw []byte) (teamID, bundleID string, expires time.Time, err error) {
 	start := bytes.Index(raw, []byte("<?xml"))
 	end := bytes.LastIndex(raw, []byte("</plist>"))
 	if start < 0 || end < start {
@@ -297,11 +380,35 @@ func keychainIdentities(ctx context.Context, keychain string) (map[string]bool, 
 	if err != nil {
 		return nil, err
 	}
+	return parseIdentities(out), nil
+}
+
+// parseIdentities 从 find-identity 的输出里挑出 Team ID。
+func parseIdentities(out string) map[string]bool {
 	teams := map[string]bool{}
 	for _, match := range signingIdentityPattern.FindAllStringSubmatch(out, -1) {
 		teams[match[1]] = true
 	}
-	return teams, nil
+	return teams
+}
+
+// withMaterial 把三个取材料的口子换成"读这一份已经取回来的原文"。解析与判断一个字都没挪：
+// 判断留在控制进程这一侧，见 jobspec.IOSMaterial 的说明。
+func (s iosScanner) withMaterial(m jobspec.IOSMaterial) iosScanner {
+	s.Identities = func(context.Context, string) (map[string]bool, error) {
+		if m.IdentitiesError != "" {
+			return nil, errors.New(m.IdentitiesError)
+		}
+		return parseIdentities(m.Identities), nil
+	}
+	s.Certificates = func(context.Context, string) (map[string]time.Time, error) {
+		if m.CertificatesError != "" {
+			return nil, errors.New(m.CertificatesError)
+		}
+		return parseCertificates(m.Certificates), nil
+	}
+	s.Profiles = func() (map[string][]byte, []string) { return m.Profiles, m.Problems }
+	return s
 }
 
 // keychainCertificates 读每个 Team 最早到期的分发证书。
@@ -312,6 +419,11 @@ func keychainCertificates(ctx context.Context, keychain string) (map[string]time
 	if err != nil {
 		return nil, err
 	}
+	return parseCertificates(out), nil
+}
+
+// parseCertificates 从一串 PEM 里读出每个 Team 最早到期的分发证书。
+func parseCertificates(out string) map[string]time.Time {
 	expiry := map[string]time.Time{}
 	rest := []byte(out)
 	for {
@@ -335,7 +447,7 @@ func keychainCertificates(ctx context.Context, keychain string) (map[string]time
 			expiry[unit] = earliest(expiry[unit], certificate.NotAfter.UTC())
 		}
 	}
-	return expiry, nil
+	return expiry
 }
 
 // securityOutput 跑一条 `security` 子命令并收标准输出。

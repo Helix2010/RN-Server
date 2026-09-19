@@ -13,7 +13,8 @@
 //
 //	build-runner build      --jobs-root <abs> --job <id> --kind apk|ota
 //	build-runner cleanup    --jobs-root <abs> --job <id>
-//	build-runner self-check --jobs-root <abs> --protocol <n> [--expect-separated]
+//	build-runner self-check    --jobs-root <abs> --protocol <n> [--expect-separated]
+//	build-runner ios-inventory --signing-dir <abs>
 //
 // 退出码：0 成功；1 构建失败；2 参数、身份或任务目录不合规。失败原因最后一行以
 // "build-runner: error: " 开头写到标准输出，控制进程取它做失败原因。
@@ -72,7 +73,7 @@ func run(ctx context.Context, args []string, out io.Writer, getenv func(string) 
 
 func dispatch(ctx context.Context, args []string, out io.Writer, getenv func(string) string) error {
 	if len(args) == 0 {
-		return usagef("usage: build-runner build|cleanup|self-check --jobs-root <abs> ...")
+		return usagef("usage: build-runner build|cleanup|self-check|ios-inventory ...")
 	}
 	who, err := detectIdentity(getenv)
 	if err != nil {
@@ -95,6 +96,18 @@ func dispatch(ctx context.Context, args []string, out io.Writer, getenv func(str
 			return usageError{err}
 		}
 		return cleanup(out, who, layout)
+	case "ios-inventory":
+		set := flag.NewFlagSet("ios-inventory", flag.ContinueOnError)
+		set.SetOutput(io.Discard)
+		var dir onceValue
+		set.Var(&dir, "signing-dir", "")
+		if err := set.Parse(args[1:]); err != nil {
+			return usagef("bad arguments: %v", err)
+		}
+		if set.NArg() != 0 {
+			return usagef("unexpected positional arguments")
+		}
+		return iosInventory(ctx, out, who, dir.value)
 	case "self-check":
 		flags, err := parseFlags(args[1:], false, false, true)
 		if err != nil {

@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
 )
 
 // 签名材料盘点：这台 Mac 现在能签哪些 (Team, bundle id)。
@@ -41,6 +45,18 @@ func writeProfile(t *testing.T, dir, name, teamID, bundleID string, expires time
 	if err := os.WriteFile(filepath.Join(dir, name), body, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// profileBytes 造一份描述文件的原文，不落盘：经 build-runner 取回来的就是这样一串字节。
+func profileBytes(t *testing.T, teamID, bundleID string, expires time.Time) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	writeProfile(t, dir, "x"+profileSuffix, teamID, bundleID, expires)
+	raw, err := os.ReadFile(filepath.Join(dir, "x"+profileSuffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func testScanner(t *testing.T, teams map[string]bool) iosScanner {
@@ -161,5 +177,104 @@ func TestIOSInventoryReportsNothingWhenTheKeychainCannotBeRead(t *testing.T) {
 	inventory := scanner.scan(context.Background())
 	if len(inventory.Teams) != 0 || len(inventory.Problems) != 1 {
 		t.Fatalf("inventory: %+v", inventory)
+	}
+}
+
+// 生产形态：签名区是 0700 _rnbuilder，控制进程连目录都 stat 不了，材料经 build-runner
+// 取回来。真机上没有这一步时它只打一行 "permission denied"，然后一个 Team 都不报——
+// 机器看着在线、控制台上永远缺材料、iOS 任务永远派不过来。
+func TestIOSInventoryTakesTheMaterialFromTheBuildRunner(t *testing.T) {
+	dir := t.TempDir()
+	runner := filepath.Join(dir, "build-runner")
+	answer := `{"identities":"  1) AA \"Apple Distribution: Anyfun (RUNNERTEAM)\"\n","profiles":{"RUNNERTEAM/a.mobileprovision":"` +
+		base64.StdEncoding.EncodeToString(profileBytes(t, "RUNNERTEAM", "com.anyfun.fromrunner", time.Now().Add(100*24*time.Hour))) + `"}}`
+	script := "#!/bin/sh\nprintf '%s' '" + answer + "'\n"
+	if err := os.WriteFile(runner, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &agent{cfg: config{
+		Runner:     runner,
+		RunnerUser: directRunner,
+		MachineEnv: map[string]string{jobspec.IOSSigningDirEnv: dir, "PATH": "/usr/bin:/bin"},
+	}}
+	material, err := a.iosMaterial(context.Background())
+	if err != nil {
+		t.Fatalf("iosMaterial: %v", err)
+	}
+
+	// 控制进程自己那份签名区里放的是**另一个** Team：报出来的必须是执行账户交回来的那份，
+	// 否则说明它还在读本地文件系统——而生产里那条路是读不通的
+	scanner := testScanner(t, nil)
+	writeProfile(t, filepath.Join(scanner.SigningDir, profilesDirName, "LOCALTEAM1"),
+		"local"+profileSuffix, "LOCALTEAM1", "com.anyfun.local", time.Now().Add(100*24*time.Hour))
+	scanner.Material = func(context.Context) (jobspec.IOSMaterial, error) { return material, nil }
+
+	inventory := scanner.scan(context.Background())
+	if len(inventory.Teams) != 1 || inventory.Teams[0].TeamID != "RUNNERTEAM" {
+		t.Fatalf("inventory reported %+v; it must come from the build runner, not from the control process's own view "+
+			"of the signing area (which is unreadable in production)", inventory.Teams)
+	}
+	if strings.Join(inventory.Teams[0].BundleIDs, ",") != "com.anyfun.fromrunner" {
+		t.Errorf("bundle ids: %v", inventory.Teams[0].BundleIDs)
+	}
+}
+
+// 取不到材料：这一轮什么都不报，并把原因说出来。装作"钥匙串是空的"会让人去查证书，
+// 而实际上是 sudo 或执行进程的问题。
+func TestIOSInventoryReportsNothingWhenTheRunnerFails(t *testing.T) {
+	scanner := testScanner(t, map[string]bool{"AB12CD34EF": true})
+	writeProfile(t, filepath.Join(scanner.SigningDir, profilesDirName, "AB12CD34EF"),
+		"x"+profileSuffix, "AB12CD34EF", "com.anyfun.app", time.Now().Add(100*24*time.Hour))
+	scanner.Material = func(context.Context) (jobspec.IOSMaterial, error) {
+		return jobspec.IOSMaterial{}, errors.New("sudo: a password is required")
+	}
+	inventory := scanner.scan(context.Background())
+	if len(inventory.Teams) != 0 {
+		t.Fatalf("a machine whose signing material could not be read reported %+v", inventory.Teams)
+	}
+	if len(inventory.Problems) != 1 || !strings.Contains(inventory.Problems[0], "sudo: a password is required") {
+		t.Errorf("the reason is not on screen: %v", inventory.Problems)
+	}
+}
+
+// 钥匙串读不出来与钥匙串是空的，不是一回事。
+func TestIOSInventorySeparatesAnUnreadableKeychainFromAnEmptyOne(t *testing.T) {
+	scanner := testScanner(t, nil)
+	scanner.Material = func(context.Context) (jobspec.IOSMaterial, error) {
+		return jobspec.IOSMaterial{IdentitiesError: "security find-identity: exit status 1"}, nil
+	}
+	inventory := scanner.scan(context.Background())
+	if len(inventory.Teams) != 0 {
+		t.Fatalf("teams: %+v", inventory.Teams)
+	}
+	if len(inventory.Problems) == 0 || !strings.Contains(strings.Join(inventory.Problems, " "), "find-identity") {
+		t.Errorf("an unreadable keychain was reported as an empty one: %v", inventory.Problems)
+	}
+}
+
+// 接线：控制进程每次盘点都必须走 build-runner。少了这一行，机器在生产里会安静地
+// 一个 Team 都不报——而所有单元测试照样绿，因为它们自己喂材料。
+func TestAgentInventoryGoesThroughTheRunner(t *testing.T) {
+	rig := newRig(t)
+	a := rig.agent
+	runner := filepath.Join(t.TempDir(), "build-runner")
+	answer := `{"identities":"  1) AA \"Apple Distribution: Anyfun (WIREDTEAM1)\"\n","profiles":{"WIREDTEAM1/a.mobileprovision":"` +
+		base64.StdEncoding.EncodeToString(profileBytes(t, "WIREDTEAM1", "com.anyfun.wired", time.Now().Add(100*24*time.Hour))) + `"}}`
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '%s' '"+answer+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.cfg.Runner, a.cfg.RunnerUser = runner, directRunner
+	a.cfg.IOSUpload = false
+	if a.cfg.MachineEnv == nil {
+		a.cfg.MachineEnv = map[string]string{}
+	}
+	a.cfg.MachineEnv[jobspec.IOSSigningDirEnv] = t.TempDir()
+	a.cfg.MachineEnv["PATH"] = "/usr/bin:/bin"
+
+	inventory := a.iosInventory(context.Background())
+	if len(inventory.Teams) != 1 || inventory.Teams[0].TeamID != "WIREDTEAM1" {
+		t.Fatalf("the agent reported %+v; the signing area is 0700 _rnbuilder in production, so the only way "+
+			"to see any material is through build-runner", inventory.Teams)
 	}
 }

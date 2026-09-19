@@ -215,6 +215,8 @@ func (a *agent) iosInventory(ctx context.Context) iosInventory {
 	}
 	scanner := newIOSScanner(a.cfg)
 	scanner.Now = a.now
+	// 签名区归执行账户，控制进程读不到：材料由 build-runner 以那个身份取回来（§4.2）
+	scanner.Material = a.iosMaterial
 	scanner.Probe = a.probeUploadKey
 	if a.iosProbe != nil {
 		scanner.Probe = a.iosProbe
