@@ -433,10 +433,37 @@ ls -ld /opt/rn-build-agent /opt/rn-build-agent/allowed_signers    # 都应该是
 
 ### 6.1 生成（全平台一次，在 A 机上）
 
+#### 先把 `ios-material` 弄到那台机器上
+
+和 `bundle-sign` 同一件事（§3.1），三条路挑一条。**注意它是 2026-09-19 才有的**，手里那份
+旧检出里没有这个子命令，要先把仓库更到当前 main。
+
+| 情况 | 做法 |
+| --- | --- |
+| 有仓库、有 Go | `cd <仓库>/signing && go build -o /tmp/ios-material ./cmd/ios-material`（`signing/` 是独立的 Go module，**必须在那个目录里**构建） |
+| 没仓库但能联网取一次 | 克隆仓库再按上一条构建 |
+| 真气隙 | 在联网机器上交叉编译，用 U 盘拷过去：`cd signing && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ios-material ./cmd/ios-material`（Intel Mac 用 `GOARCH=amd64`），**把 sha256 一起带过去核一遍**再用 |
+
+#### 生成
+
 ```bash
-cd <RN-Server 仓库>/signing && go build -o /tmp/ios-material ./cmd/ios-material
 /tmp/ios-material keygen --out ~/rn-ios-material-keys
 ```
+
+它会打印两块，每块三行（私钥路径、公钥、指纹）：
+
+```
+builder
+  私钥   ~/rn-ios-material-keys/builder.x25519（0600，立刻进密码管理器）
+  公钥   <base64>
+  指纹   <64 位十六进制>
+uploader
+  …
+```
+
+**私钥不会被打印**，只写进那两个 0600 的文件——要存进密码管理器得自己 `cat` 它们。
+再跑一次 `keygen` 不会覆盖已有私钥（覆盖等于把已经发出去的材料全部作废），要换密钥得先
+自己把旧文件挪走，并且清楚代价：已存材料全部要重新加密上传，每台 Mac 都要重放新私钥。
 
 产出两把，**按角色分开**：
 
