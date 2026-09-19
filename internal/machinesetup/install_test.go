@@ -322,6 +322,22 @@ func TestMacInstallScriptRollsNoCryptoOfItsOwn(t *testing.T) {
 	}
 }
 
+// 装机命令第二行让人把脚本的 sha256 与 CI 打印的值比对——那是整条信任链的第一环，也是
+// "脚本里不自带密码学、所以你能把它从头读完"这个论证的落点：你得先确认跑的就是你读的。
+//
+// CI 不打印这个值的话，那一行就是一句**做不到的话**，而运维只会以为自己没找到。2026-09-19
+// 之前正是这个状态：build-bundles.sh 只打印 install.sh（Linux 那个）的摘要。
+func TestBundlesScriptPrintsTheMacInstallDigest(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/setup/build-bundles.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "sha256sum install-macos.sh") {
+		t.Error("build-bundles.sh does not print the sha256 of install-macos.sh; " +
+			"the second line of the install command tells the operator to compare against it")
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)

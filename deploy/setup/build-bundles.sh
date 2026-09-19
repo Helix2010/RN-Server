@@ -147,14 +147,21 @@ fi
 echo "安装包：$OUT（提交 $COMMIT）"
 (cd "$OUT" && sha256sum signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz)
 (cd "$STAGE/signer" && sha256sum install.sh bin/signer bin/signer-check)
+# 装机脚本的 sha256。**这是整条信任链的第一环**：运维 curl 下脚本之后、以 root 执行之前，
+# 要把它和这里打印的值比一眼。不打印的话那一步就没有可比的东西，而"脚本里不自带密码学、
+# 所以你能把它从头读完"这个论证正是建立在"你确认过跑的就是你读的"上面。
+#
+# 打的是仓库里的那一份：服务端下发的是 go:embed 进二进制的同一个文件，
+# TestMacInstallScriptIsEmbedded 盯着两者逐字节相同。
+(cd "$ROOT/internal/machinesetup" && sha256sum install-macos.sh)
 (cd "$STAGE/builder" && sha256sum bin/build-agent bin/build-runner)
 # darwin 的二进制在 Linux 上跑不了，冒烟只能在 Mac 上做（升级脚本会做，见 §5.6）。
 # 交叉编译出来的 darwin 二进制带 Go 链接器默认的 ad-hoc 签名，在 Mac 上用
 # `codesign -dv bin/build-agent` 核一次
 (cd "$STAGE/builder-darwin-arm64" && sha256sum bin/build-agent bin/build-runner bin/ios-upload bin/rn-build-agent-upgrade)
-# 两把公钥的 sha256 单独打出来：装机时 install-macos.sh 的 --release-key-sha256 与
-# --allowed-signers-sha256 要的就是它们。运维核对的是密码管理器里记的值，不是这里打印的
-# ——这两行只是省掉一次"去哪儿算这个值"，**不是**核对的来源。
+# 两把公钥的 sha256 单独打出来。装机只要 --release-key-sha256 一个，而**它的核对来源是
+# 密码管理器，不是这里**——这两行只是省掉一次"去哪儿算这个值"。allowed_signers 那个值
+# 装机时根本不用人抄（脚本从验过签的清单里核），打出来是为了换名单时有个地方对一眼。
 #
 # 两者口径不同，不能都用 sha256sum：
 #   release-key.pub  算的是**公钥字节**的摘要（与 bundle-sign key create / key public 打印的、清单签名
