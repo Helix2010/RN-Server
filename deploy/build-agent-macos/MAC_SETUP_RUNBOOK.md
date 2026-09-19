@@ -97,11 +97,27 @@ ssh-keygen -l -f ~/rn-release-ios-key/release-key.pub
 所有 Mac 停在当前版本）。打印的 `public key sha256` 也记进密码管理器——装机时要人手抄的就是它，
 **整条链子上唯一的外部输入**。
 
-新密钥还要把公钥行放进仓库：
+新密钥还要把公钥行放进仓库——**这是公钥进入发布流水线的唯一入口**：
 
 ```bash
 cat ~/rn-release-ios-key/release-key.pub > <仓库>/deploy/build-agent-macos/release-key.pub
 ```
+
+`build-bundles.sh` 会把它放到两个地方，两份内容相同但缺一不可：
+
+- **安装包目录根**（与 `manifest.json` 并排）：`describe` 把它作为 `releaseKeyPub` 回给新 Mac。
+  那时候机器上什么都还没有——归档里那份得先解包才看得见，而那时清单还没验过，等于用不可信
+  的东西去建立信任。
+- **打进 `builder-darwin-arm64.tar.gz`**：装到 `/opt/rn-build-agent/release-key.pub`，成为这台
+  机器此后每次自升级的常驻信任根。装机脚本会把它再按 `--release-key-sha256` 核一次，确保装上
+  去的就是人手里那把。
+
+> **已经有 Mac 装过机之后换密钥，不是改个文件就完事。** 改这个文件要连锁做完：提交推 main →
+> CI 重新构建（新提交、新目录）→ 用**新私钥**重签清单（序号 +1）→ **挨个去每台已装机的 Mac 上
+> 换 `/opt/rn-build-agent/release-key.pub`**。最后一条是关键：已装机的 Mac 验签用的是本机那份，
+> 不会自动接受新公钥；顺序反了它们会集体拒绝升级。完整顺序见
+> [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §3.4。第一台 Mac 装机之前换密钥则没有这些负担，
+> 直接替换即可。
 
 ### 1.4 确认 B 机上没有私钥副本
 
