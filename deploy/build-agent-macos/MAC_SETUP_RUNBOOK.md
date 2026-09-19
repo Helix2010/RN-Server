@@ -214,6 +214,15 @@ curl -s -o /dev/null -w '%{http_code}\n' <API>/v1/machine-setup/install-macos.sh
 
 CI 每次部署都会在服务器上产出一份新的安装包目录，**没签过的一律 503，装不了**。
 
+> **刚换过发布密钥的话，必须等带新公钥的安装包部署完再签。** 安装包里打着 `release-key.pub`，
+> 旧包里是旧公钥。拿新私钥去签旧包，装机会在**第一步**就死：脚本拿 `describe` 给的公钥算指纹，
+> 和人给的 `--release-key-sha256` 对不上，报的是"确认手里的值取自密码管理器"——指向完全错误的
+> 方向。确认办法就是下面 `echo "$COMMIT"` 打出来的那个值，它必须是你推公钥那次的提交。
+>
+> ```bash
+> until ssh <服务器> "readlink /opt/rn-foundation/machine-bundles/current" | grep -q <提交短号>; do sleep 30; done
+> ```
+
 **路径一律走 `current`，不要手抄提交号。** 服务器上每部署一次就多一个以提交号命名的目录，
 `current` 这个软链指向当前那一份。手抄提交号每次都是一次抄错的机会，而且抄错的症状是
 "签了一份没人要的清单"——服务端那边毫无变化，你会以为是别的地方出了问题。
