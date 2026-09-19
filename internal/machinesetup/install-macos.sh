@@ -292,17 +292,35 @@ ensure_role_account() { # $1 用户名
   note "已建角色账户 $1"
 }
 
+# ensure_role_group 建一个组。
+#
+# **macOS 与 Linux 在这里不一样，照搬会装不上**：Linux 的 useradd 顺带建一个同名私有组，
+# 所以 `install -g "$用户名"` 直接可用；macOS 的 sysadminctl 只建用户、把主组设成 staff，
+# **不建同名组**。下面那几个 0700 目录用的正是 -g "$用户名"，没有同名组就会以
+# `install: unknown group _rnbuildagent` 失败——而那条报错不说这是平台差异，人只会以为
+# 账户没建成。
+#
+# 不去改账户的主组：那要读 gid、要改账户记录，失败面比收益大。这些目录是 0700 的，属主
+# 之外谁都进不去；同名组在这里的作用只是"别用 staff"——staff 是每个本地用户都在的组。
+ensure_role_group() { # $1 组名
+  dseditgroup -o read "$1" >/dev/null 2>&1 && return 0
+  dseditgroup -o create "$1" >/dev/null 2>&1 || die "建不出组 $1"
+  note "已建组 $1"
+}
+
 ensure_accounts() {
   step "账户与目录"
   ensure_role_account "$AGENT_USER"
   ensure_role_account "$RUNNER_USER"
   ensure_role_account "$UPLOAD_USER"
-  if ! dseditgroup -o read "$JOBS_GROUP" >/dev/null 2>&1; then
-    dseditgroup -o create "$JOBS_GROUP" >/dev/null 2>&1 || die "建不出组 $JOBS_GROUP"
-  fi
+  ensure_role_group "$AGENT_USER"
+  ensure_role_group "$RUNNER_USER"
+  ensure_role_group "$UPLOAD_USER"
+  ensure_role_group "$JOBS_GROUP"
   local user
   for user in "$AGENT_USER" "$RUNNER_USER" "$UPLOAD_USER"; do
     dseditgroup -o edit -a "$user" -t user "$JOBS_GROUP" >/dev/null 2>&1 || true
+    dseditgroup -o edit -a "$user" -t user "$user" >/dev/null 2>&1 || true
   done
   install -d -o root -g wheel -m 0755 "$INSTALL_DIR"
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$AGENT_HOME" "$AGENT_HOME/state" "$AGENT_HOME/repos" "$AGENT_HOME/.ssh"

@@ -390,6 +390,25 @@ func TestBundledMarkdownIsAccountedForInTheDeploySkipList(t *testing.T) {
 	}
 }
 
+// macOS 的 sysadminctl 建用户**不建同名组**（主组是 staff），Linux 的 useradd 建。脚本里
+// 有好几处 `install -g "$用户名"` 与 `chown "$用户:$用户"`，照搬 Linux 的习惯就会以
+// `install: unknown group _rnbuildagent` 失败——装第一台机器时正是死在这里。那条报错不说
+// 这是平台差异，人只会以为账户没建成，然后去查 sysadminctl。
+func TestMacInstallScriptCreatesAGroupForEveryRoleAccount(t *testing.T) {
+	script := string(InstallMacOSScript)
+	for _, user := range []string{"AGENT_USER", "RUNNER_USER", "UPLOAD_USER"} {
+		asGroup := strings.Contains(script, `-g "$`+user+`"`) ||
+			strings.Contains(script, `"$`+user+`:$`+user+`"`)
+		if !asGroup {
+			continue
+		}
+		if !strings.Contains(script, `ensure_role_group "$`+user+`"`) {
+			t.Errorf("install-macos.sh uses $%s as a group name but never creates that group; "+
+				"macOS does not create one group per user the way Linux useradd does", user)
+		}
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)
