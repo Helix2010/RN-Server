@@ -186,10 +186,6 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 **证书**（它在那台机器的钥匙串里）并重签重发、ASC 吊销上传 Key 并重新上传一把。
 证书那一步本来就要全平台做，所以上传 Key 跟着一起换不额外多停一次机。
 
-**可选的更严一档**：租户在意「同 Team 其它 App 也看得到」时，让它在自己的 ASC 里为**每台 Mac**
-建一个专用用户（Developer 角色、Selected Apps 只勾这一个 App），用那个用户的 **Individual Key**。
-代价是 N 台 Mac 要 N 个邮箱与 N 次邀请。不作默认。
-
 ---
 
 ## 3. 发布密钥（自升级的信任根）
