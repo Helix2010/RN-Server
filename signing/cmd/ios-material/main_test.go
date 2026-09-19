@@ -90,7 +90,7 @@ func TestUploaderMaterialNeedsTheUploaderKey(t *testing.T) {
 	if code, out, errOut := runTool(t, "", "encrypt",
 		"--pub", filepath.Join(dir, "uploader.x25519.pub"), "--team", "J4JDFC8LCC",
 		"--kind", "upload-key", "--p8", p8, "--issuer", "3223da1d-14c5-46fc-80a1-41ecfb6e3c67",
-		"--key-id", "8WQNTAY7MP", "--machine", "mch_YSX7-u_TPeImo0mQ2uUoYA", "--out", box); code != 0 {
+		"--key-id", "8WQNTAY7MP", "--out", box); code != 0 {
 		t.Fatalf("encrypt: %d %s %s", code, out, errOut)
 	}
 	if code, _, _ := runTool(t, "", "verify", "--key", filepath.Join(dir, "builder.x25519"), "--in", box); code == 0 {

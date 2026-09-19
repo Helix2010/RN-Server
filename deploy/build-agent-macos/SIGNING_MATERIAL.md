@@ -5,7 +5,7 @@
 | 东西 | 是什么 | 放在哪台 Mac 的哪 | 谁能签发 | 有效期 |
 | --- | --- | --- | --- | --- |
 | **签名材料归档** | 每个 Team 一张 Apple Distribution 证书（含私钥）+ 每个 App 一份 App Store 描述文件 | `/var/rn-build-signing/`（`_rnbuilder` 0700） | 租户的 Account Holder / Admin | 1 年 |
-| **上传 Key** | 每台 Mac 每个 Team 一把 ASC Team Key（`.p8`） | `/var/rn-build-upload/<TEAMID>/`（`_rnuploader` 0700） | 租户的 Account Holder / Admin | 不过期，可吊销 |
+| **上传 Key** | 每个 Team 一把 ASC Team Key（`.p8`），所有 Mac 共用 | `/var/rn-build-upload/<TEAMID>/`（`_rnuploader` 0700） | 租户的 Account Holder / Admin | 不过期，可吊销 |
 | **发布密钥** | 签安装包清单的 Ed25519 密钥，自升级的信任根 | 公钥在每台 Mac 的 `/opt/rn-build-agent/release-key.pub`（root 0644）；私钥只在离线机器与密码管理器 | 平台管理员 | 不过期 |
 | **`allowed_signers`** | 允许给 RN-App 的 `main` 出包的人的 SSH 签名公钥，提交验签的信任根 | 每台 Mac 的 `/opt/rn-build-agent/allowed_signers`（root 0644） | 平台管理员 | 随人员变动 |
 
@@ -144,16 +144,21 @@ sudo -u _rnbuilder security delete-certificate -Z <旧证书的 SHA-1> "$K"
 
 ## 2. 上传 Key
 
-**每台 Mac 每个 Team 一把**，角色 **Developer**（能上传 build 与管内部测试组的最低角色）。
-按机器分是为了出事时能只吊销一台，不影响别的机器。
+**每个 Team 一把**，所有 Mac 共用，角色 **Developer**（能上传 build 与管内部测试组的最低角色）。
+
+> 2026-09-19 从「每台 Mac 一把」改成「每 Team 一把」。按机器分是想让丢一台只吊销一把，
+> 但**证书私钥本来就是全机共用的**：丢一台 Mac 就得在 Apple 后台吊销证书、重签、全机重发，
+> 那一刻所有 Mac 都停了，上传 Key 分不分机器省不下这次停机。而按机器分的代价是天天付的
+> ——ASC Key 只能在租户自己的 Apple 账号里建，按机器分就要求租户知道平台有几台打包机。
+> 理由记在设计 `ios-signing-material-distribution-2026-09-19.md` §5。
 
 租户的 Account Holder / Admin 在 App Store Connect → Users and Access → Integrations →
 App Store Connect API → Team Keys → `+`，角色选 Developer，**`.p8` 只能下载一次**。
 
 > **2026-09-19 起有更省事的一条**：走完第 6 节那三步之后，这把 Key 可以在控制台上传——
-> 租户的「iOS 打包与分发」页 → iOS 签名材料 → 每台机器的上传 Key，选那台 Mac、填 issuer id
-> 与 key id、选 `.p8`，浏览器加密后上传，机器下一轮认领时自己装。下面这段手工放的做法留着
-> 兜底（没登记平台密钥、或者那台机器还没换到含 D 期的版本时用它）。
+> 租户的「iOS 打包与分发」页 → iOS 签名材料 → 上传 Key，填 issuer id 与 key id、选 `.p8`，
+> 浏览器加密后上传，**所有 Mac** 下一轮认领时自己装。下面这段手工放的做法留着兜底
+> （没登记平台密钥、或者机器还没换到含 D 期的版本时用它）。
 
 放到那台 Mac：
 
@@ -170,15 +175,16 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 
 - **上传 Key 可用**：这把 Key 能用 Build Uploads 那套端点，第一次构建就能传。
 - **上传 Key 权限不够**：Developer 角色在这套端点上不够用，把这个 Team 的 Key
-  **换成 App Manager 角色的 Team Key**（仍按机器分）。换完重启代理再看。
+  **换成 App Manager 角色的 Team Key**。换完重启代理再看。
 - **上传 Key 探测失败**：网络不通，或者 `key.json` / `.p8` 写错了。
 
 探测存在的意义是**在第一次构建之前**知道传不上去：上传是一次构建的最后一步，等到那时才发现
 权限不够，已经烧掉一个 build 号和半小时。
 
-**吊销**：ASC 后台 Revoke 那把 Key，然后删掉那台 Mac 上的 `/var/rn-build-upload/<TEAMID>/`。
-一台 Mac 报废、被偷、或者要退役，第一件事就是吊销它的每一把上传 Key——机器令牌在控制台吊销，
-上传 Key 在 ASC 吊销，两边都要做。
+**吊销**：ASC 后台 Revoke 那把 Key，然后删掉每台 Mac 上的 `/var/rn-build-upload/<TEAMID>/`。
+一台 Mac 报废、被偷、或者要退役，要做的是一整套：控制台吊销机器令牌、Apple 后台吊销
+**证书**（它在那台机器的钥匙串里）并重签重发、ASC 吊销上传 Key 并重新上传一把。
+证书那一步本来就要全平台做，所以上传 Key 跟着一起换不额外多停一次机。
 
 **可选的更严一档**：租户在意「同 Team 其它 App 也看得到」时，让它在自己的 ASC 里为**每台 Mac**
 建一个专用用户（Developer 角色、Selected Apps 只勾这一个 App），用那个用户的 **Individual Key**。

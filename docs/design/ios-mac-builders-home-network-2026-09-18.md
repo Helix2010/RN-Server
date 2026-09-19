@@ -202,7 +202,7 @@ security set-keychain-settings "$K"                          # 不自动上锁
 | 用途 | 谁持有 | 材料 | 为什么 |
 | --- | --- | --- | --- |
 | 签名 | `_rnbuilder`（执行进程） | 每 Team 一张 Apple Distribution 证书 + 每 App 一份 App Store 描述文件（§4.4 分发） | 没有 Key 就申请不了新描述文件、注册不了设备、传不了 build。能做的只剩「签一个装不到任何设备上的 App Store 包」 |
-| 上传 `.ipa` | `_rnuploader`（上传账户） | 每 Team 每 Mac 一把 **Team Key，角色 Developer**；`key.json{issuerId,keyId}` + `.p8` | 上传是对外可见、撤不回的动作，由不执行第三方代码、也不持令牌的账户做。Developer 是能上传 build 的最低角色（§4.3a） |
+| 上传 `.ipa` | `_rnuploader`（上传账户） | 每 Team 一把 **Team Key，角色 Developer**（2026-09-19 改，原为每 Mac 一把）；`key.json{issuerId,keyId}` + `.p8` | 上传是对外可见、撤不回的动作，由不执行第三方代码、也不持令牌的账户做。Developer 是能上传 build 的最低角色（§4.3a） |
 | 只读同步（模式 A） | 服务端（`ios.asc`） | App Manager | 已实现，不变 |
 
 #### 4.3a 角色与 Key 类型（已按 Apple 文档核实，2026-09-18）
@@ -216,7 +216,7 @@ security set-keychain-settings "$K"                          # 不自动上锁
 
 所以原文 §4.6.1「ASC 支持把 Key 的访问范围限制到指定 App」只对 Individual Key 成立，服务端那把 App Manager 团队密钥限制不了 App，那一句要改。
 
-**上传 Key 的选型**：每台 Mac 每个 Team 一把 **Team Key，角色 Developer**。它能做的事只有上传 build 与管内部测试组；租户一个 Team 就是一个租户，「看得到同 Team 其它 App」只在租户把多个产品放在同一个 Team 时才有意义（anyfun 的 Team 有 5 个 App）。租户在意的话有一条更严的路：在它的 ASC 里为每台 Mac 建一个专用用户（Developer 角色、Selected Apps 只勾这一个 App），用该用户的 Individual Key。代价是 N 台 Mac 就要 N 个邮箱与 N 次邀请，写进手册作为可选项，不作默认。
+**上传 Key 的选型**：每个 Team 一把 **Team Key，角色 Developer**（本文初稿写的是每台 Mac 一把，2026-09-19 实现时改成每 Team 一把、所有 Mac 共用；理由见 `ios-signing-material-distribution-2026-09-19.md` §5——证书本来就全机共用，按机器分省不下丢机时的全平台停机，却要求租户知道平台有几台打包机）。它能做的事只有上传 build 与管内部测试组；租户一个 Team 就是一个租户，「看得到同 Team 其它 App」只在租户把多个产品放在同一个 Team 时才有意义（anyfun 的 Team 有 5 个 App）。租户在意的话有一条更严的路：在它的 ASC 里为每台 Mac 建一个专用用户（Developer 角色、Selected Apps 只勾这一个 App），用该用户的 Individual Key。代价是 N 台 Mac 就要 N 个邮箱与 N 次邀请，写进手册作为可选项，不作默认。
 
 #### 4.3b 手工签名怎么落到 Expo prebuild 的工程（已核实）
 
@@ -234,7 +234,7 @@ security set-keychain-settings "$K"                          # 不自动上锁
 2. 通过：`sudo -n -u _rnuploader /opt/rn-build-agent/ios-upload --team <TEAMID> --ipa <路径> --expect-bundle-id … --expect-build …`。`ios-upload` 是同仓的小程序：查 `/var/rn-build-upload/<TEAMID>/key.json`，先按 §6.3 查 ASC 上有没有同号 build，再调上传，把结果以一行 JSON 写到 stdout。
 3. 上传实现（已核实，2026-09-18）：**首选 App Store Connect API 的 Build Uploads**（WWDC25 新增：`POST /v1/buildUploads` 建上传 → `buildUploadFiles` 报文件 → 按返回的 URL 与头分块 PUT → 标记完成 → 处理完成有 webhook），纯 HTTPS，用 `internal/ascapi` 已有的 JWT 与 HTTP 骨架在 Go 里实现，**不依赖 Xcode 的 altool**，分块上传也解决了家用上行「不可续传、失败整个重传」的问题。备选 Transporter 的 `iTMSTransporter -m upload -assetFile <ipa> -apiKey <KEYID> -apiIssuer <ISSUER>`（`.p8` 放 `~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8`，Transporter 要从 Mac App Store 装）。**不用 altool**：Apple 的 TN3147 只弃用了它的公证功能，上传仍在 Apple 支持列表里，但 Xcode 26 的 altool `--upload-app` 路径有已知回归（打不开包、失败不返回非零），fastlane 靠 `--use-old-altool` 绕。Build Uploads API 的端点文档没有写权限要求（`POST /v1/buildUploads` 的 JSON 文档只列了 401/403 等错误码）。**处置方式定为：只实现这一条自动化路径，用只读探测提前发现权限不够，不做第二套自动上传。**
 
-   - `ios-upload --probe --team <TEAMID>`：用该 Team 的上传 Key 调 `GET /v1/apps/{appId}/buildUploads?limit=1`（只读）。200 → Key 能用这套端点；403 → 把这台 Mac 这个 Team 的 Key **换成 App Manager 角色的 Team Key**（仍按机器分），§7 上传账户那一行的后果按 App Manager 重写。探测结果进 §5.2 的材料盘点（`uploadProbe: ok | forbidden | error`），控制台在机器卡片上标出来，**在第一次构建之前**就知道。
+   - `ios-upload --probe --team <TEAMID>`：用该 Team 的上传 Key 调 `GET /v1/apps/{appId}/buildUploads?limit=1`（只读）。200 → Key 能用这套端点；403 → 把这个 Team 的 Key **换成 App Manager 角色的 Team Key**，§7 上传账户那一行的后果按 App Manager 重写。探测结果进 §5.2 的材料盘点（`uploadProbe: ok | forbidden | error`），控制台在机器卡片上标出来，**在第一次构建之前**就知道。
    - iTMSTransporter 不进自动化路径：Transporter 要从 Mac App Store 装，App Store 需要一个登录的 Apple ID，与无人值守的 role account 机器不搭。它只作为「包已经在 Mac 上、由人手工传」的备用手段写进手册。
    - 为什么不并存两套：两个上传实现就是两倍的错误处理、两套「同号已存在」判定和两处要跟 Apple 变化的地方；Developer 与 App Manager 的差别（能否管外部组、提审）已经由 Apple 的处理与审核兜住，用角色升一级换一条代码路径，划得来。
 4. `uploadedToAppStoreConnect` 以上传程序的真实结果为准。
@@ -249,7 +249,7 @@ Mac 是池子，每台都要有每个 Team 的材料。手工签名之后材料�
 | --- | --- | --- | --- | --- |
 | Apple Distribution 证书 + 私钥（`.p12`） | **1 份，全部 Mac 共用** | **CSR 流程**：平台在离线 Mac 上生成私钥与 CSR，交给租户的 Account Holder / Admin 在 developer.apple.com 签发（Distribution 证书只有这两个角色能建，App Manager 要额外勾「Access to Certificates, Identifiers & Profiles」），拿回 `.cer` 合成 `.p12`。**私钥从不离开平台** | 1 年 | 加密归档 + 口令进密码管理器，运维导入每台 Mac 的钥匙串（§4.2） |
 | App Store 描述文件（每 App 一份） | 1 份，全部 Mac 共用 | 租户 Admin / App Manager 在 developer.apple.com 选这张证书 + App ID 生成、下载后交给平台 | 1 年 | 随归档一起放到 `/var/rn-build-signing/profiles/<TEAMID>/`；不是机密，但和证书一起换 |
-| 上传 Key（`.p8`） | **每 Mac 一把** | ASC 后台生成，只能下载一次 | 不过期，可吊销 | 直接放到那台 Mac 的 `/var/rn-build-upload/<TEAMID>/` |
+| 上传 Key（`.p8`） | **每 Team 一把**（2026-09-19 改，原为每 Mac 一把） | ASC 后台生成，只能下载一次 | 不过期，可吊销 | 控制台上传密文、每台 Mac 自己装；兜底仍可直接放到 `/var/rn-build-upload/<TEAMID>/` |
 
 **为什么证书不能每台 Mac 自己申请**：Apple 帮助原文是「Distribution certificates belong to the team and only one type of each distribution certificate … is allowed per team」，社区资料对 Apple Distribution 类型的上限说法在 1 到 3 张之间（旧的 iOS Distribution 是 3）。**别在代码里写死**，按最紧的理解做：一个 Team 一张。多台各申请一张会把名额用光、再也加不了机器；而且建证书本来就要租户的 Admin 到场，不是自动化能做的事。所以一个 Team 一张证书，私钥分发。原文 §4.3「不手工搬 `.p12`」是在只有一台 Mac 时说的，池子模型下这条收回。手工签名还有一个副产品：执行进程没有 Key，Xcode **不可能**偷偷新建证书，初稿担心的名额消耗不再存在。
 
@@ -471,7 +471,7 @@ ASC 的 JWT `exp` ≤ 20 分钟，家用 Mac 时钟漂移几分钟就会 401。m
 | --- | --- | --- | --- |
 | **Mac 执行进程**（第三方依赖投毒，在 `_rnbuilder` 下跑） | 解开钥匙串，拿到**全部 Team** 的 Distribution 私钥与描述文件；能签任意 App Store 包 | **没有出口**：它一把 ASC Key 都没有（§4.3），传不了 build、建不了 Ad Hoc 描述文件、注册不了设备；App Store 描述文件签出的包装不到任何设备上；交回控制进程的 `.ipa` 要过身份核对，传上去还要过 TestFlight 处理与 Beta 审核；证书与描述文件可吊销 | 私钥本身带走——离线签一个包，等将来拿到别的出口（例如同一 Team 别处泄露的 Key）。以及 `.ipa` 里的**代码**：控制进程核身份，核不了内容（Android 侧同样承认） |
 | **Mac 控制进程**（令牌、出处私钥、deploy key） | 以这台机器的名义交 `/ios-release`（无产物，服务端只核身份字段）；调用上传账户传任意 `.ipa`（它能指定文件） | 服务端要求 bundleId / 版本 / build 号与任务行和 `release.ios` 一致；控制台吊销机器令牌；上传账户只传控制进程递过来的、且身份核对通过的文件——但核对是控制进程自己做的，被攻破就不算 | 已经落库的那条发布记录会成为 `latestVersion` 与 OTA 基线的依据。**硬约束：`latestVersion.ios` 不自动跟随发布记录，运营手填**（原文 §4.5.2）。持令牌者还能自报全部 Team 领任务再失败（§5.2 末段） |
-| **上传账户** `_rnuploader` | 用这台 Mac 的上传 Key（Developer 角色 Team Key）往每个 Team 的 ASC 传 build、动内部测试组 | 传的东西要过 TestFlight 处理，外部分发还要过 Beta 审核（Developer 管不了外部组、不能提审）；Key 按机器分，ASC 后台吊销 | 同 Team 下其它 App 也能被传 build（Team Key 限不了 App，§4.3a）；租户在意就走 Individual Key 那条可选路 |
+| **上传账户** `_rnuploader` | 用这台 Mac 的上传 Key（Developer 角色 Team Key）往每个 Team 的 ASC 传 build、动内部测试组 | 传的东西要过 TestFlight 处理，外部分发还要过 Beta 审核（Developer 管不了外部组、不能提审）；Key 按 Team 分（2026-09-19 改），ASC 后台吊销 | 同 Team 下其它 App 也能被传 build（Team Key 限不了 App，§4.3a）；租户在意就走 Individual Key 那条可选路 |
 | **服务端 / 数据库** | 排任务、改 `release.ios`（Team ID、bundle id、installUrl）、改机器登记、改 `approvedAgentCommit`、换安装包目录里的归档 | Mac 检出固定 `main`（`buildBranch`）且**提交必须由允许的签名者签过**（§4.6）；Team 与 bundle id 要在本机钥匙串与描述文件里有材料（§5.2 自检）；改 `installUrl` 只能指向 `testflight.apple.com` / `apps.apple.com`；**升级清单要过离线发布密钥签名且序号单调**（§5.6） | 改 `installUrl` 把用户导去另一个 TestFlight 链接——原文 §4.5.1 已知的面；把一个**合法签过的旧清单**配上改过的 `approvedAgentCommit`——被 `commit == approvedAgentCommit` 与单调序号一起挡住，除非序号更高的合法清单本身有洞 |
 | **GitHub 仓库 / CI**（能推 `main`、能改 Actions） | 改 `scripts/build-ios-release.mjs` 或任何依赖，等于上面「执行进程」那一行的全集，**对全部 Mac** | `main` 上每个提交要由 `allowed_signers` 里的 SSH 密钥签名（§4.6），推得上去也过不了 Mac 的验签；安装包清单要过离线发布密钥（CI 产出的清单没有签名，Mac 不认） | 允许签名者本人被钓鱼；接受 GitHub 网页合并时 GitHub 的 web-flow 密钥就成了信任根 |
 | **拿到一台 Mac 的人**（失窃、被物理接触） | 开机运行中：等同执行进程 + 控制进程 + 上传账户三行之和 | FileVault（§4.5，已定开）+ 关自动登录：关机或冷启动状态下拿不到任何东西；每台 Mac 各自的上传 Key 与令牌，吊一台不牵连别的 | 开机运行中被接触到的机器上、全部 Team 共用的那张 Distribution 证书私钥——**池子直接换来的代价**。所以每加一台都是多一处能拿到全部签名能力的物理点，放置地点按这个标准选；失窃后按 §5.5「被攻陷下线」换全部 Team 的证书 |

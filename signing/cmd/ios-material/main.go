@@ -5,7 +5,7 @@
 //	ios-material encrypt --pub <公钥文件> --team <TEAMID> --out <密文> \
 //	                     --kind certificate --p12 <文件>            （口令走标准输入）
 //	                     --kind profile     --profile <文件> --bundle <bundle id>
-//	                     --kind upload-key  --p8 <文件> --issuer <id> --key-id <id> --machine <机器 id>
+//	                     --kind upload-key  --p8 <文件> --issuer <id> --key-id <id>
 //	ios-material verify  --key <私钥文件> --in <密文>
 //
 // 它跑在**离线机器**上。私钥在这里生成、从这里进密码管理器，**不经过服务端**——服务端只
@@ -40,7 +40,7 @@ const usage = `用法:
 种类与它要的东西:
   certificate  --p12 <文件>                             口令从标准输入读
   profile      --profile <文件> --bundle <bundle id>
-  upload-key   --p8 <文件> --issuer <id> --key-id <id> --machine <机器 id>
+  upload-key   --p8 <文件> --issuer <id> --key-id <id>
 `
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, os.Stdin)) }
@@ -126,7 +126,6 @@ func encrypt(args []string, stdout io.Writer, stdin io.Reader) error {
 	p8 := set.String("p8", "", "上传 Key .p8")
 	issuer := set.String("issuer", "", "ASC issuer id（上传 Key）")
 	keyID := set.String("key-id", "", "ASC key id（上传 Key）")
-	machine := set.String("machine", "", "机器 id（上传 Key，每台一把）")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
@@ -157,7 +156,7 @@ func encrypt(args []string, stdout io.Writer, stdin io.Reader) error {
 			return err
 		}
 	case iosmaterial.KindUploadKey:
-		material.MachineID, material.IssuerID, material.KeyID = *machine, *issuer, *keyID
+		material.IssuerID, material.KeyID = *issuer, *keyID
 		if material.P8Base64, err = readBase64(*p8); err != nil {
 			return err
 		}

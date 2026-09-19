@@ -93,9 +93,9 @@ func certificateMaterial() iosmaterial.Material {
 	}
 }
 
-func uploadMaterial(machineID string) iosmaterial.Material {
+func uploadMaterial() iosmaterial.Material {
 	return iosmaterial.Material{
-		Kind: iosmaterial.KindUploadKey, TeamID: materialTeam, MachineID: machineID,
+		Kind: iosmaterial.KindUploadKey, TeamID: materialTeam,
 		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
 		P8Base64: base64.StdEncoding.EncodeToString([]byte("p8")),
 	}
@@ -169,42 +169,38 @@ func TestDBIOSMaterialRefusesAnUnknownRecipient(t *testing.T) {
 // 角色不能混：上传 Key 必须加密给上传那把。加密给构建那把的话，Mac 上解它的是
 // _rnuploader，而那个账户没有构建账户的私钥。
 func TestDBIOSMaterialKeepsTheTwoRolesApart(t *testing.T) {
-	f, macs := newIOSPool(t, 82, 1)
+	f, _ := newIOSPool(t, 82, 1)
 	clearStoredMaterial(t, f)
 	builder, uploader := materialKeys(t, f)
 
-	wrong := uploadMaterial(macs[0].ID)
+	wrong := uploadMaterial()
 	wrong.Purpose = iosmaterial.PurposeBuilder
 	if _, err := iosmaterial.Seal(wrong, builder.pub); err == nil {
 		t.Fatal("iosmaterial sealed an upload key under the builder purpose")
 	}
 	// 正确的那一份收得下
-	if code, body := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial(macs[0].ID), uploader)); code != http.StatusOK {
+	if code, body := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial(), uploader)); code != http.StatusOK {
 		t.Fatalf("a correctly addressed upload key was refused: %d %v", code, body)
 	}
 }
 
-// 上传 Key 是发给某一台机器的：不在登记里的机器不收，别的机器也取不走。
-func TestDBIOSUploadKeyBelongsToOneMachine(t *testing.T) {
+// 上传 Key 与证书一样是**这个 Team 一份**：每台 Mac 都看得见、都取得走。
+//
+// 它起初按机器分（每台一把）。那条策略挡不住它要挡的事——证书本来就全机共用，丢一台 Mac
+// 就得吊销证书、重签、全机重发，那一刻所有 Mac 都停了——代价却是把"平台有几台打包机"
+// 漏给租户（ASC Key 只能在租户自己的 Apple 账号里建）。设计 §5 记了这次调整。
+func TestDBIOSUploadKeyGoesToEveryMac(t *testing.T) {
 	f, macs := newIOSPool(t, 83, 2)
 	clearStoredMaterial(t, f)
 	builder, uploader := materialKeys(t, f)
-	// 先放一份**全机共用**的证书：两台都该看见它。少了它，"清单按机器过滤"这件事就只剩
-	// "两台都看不见"一种可能，过滤写错了也测不出来
 	if code, _ := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder)); code != http.StatusOK {
 		t.Fatal("upload certificate failed")
 	}
-
-	if code, body := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial("mch_nobody"), uploader)); code != http.StatusConflict ||
-		body["code"] != "IOS_MATERIAL_MACHINE_UNKNOWN" {
-		t.Fatalf("an upload key for an unknown machine was accepted: %d %v", code, body)
-	}
-	if code, _ := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial(macs[0].ID), uploader)); code != http.StatusOK {
-		t.Fatal("upload for a real machine failed")
+	if code, body := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial(), uploader)); code != http.StatusOK {
+		t.Fatalf("upload key refused: %d %v", code, body)
 	}
 
-	// 第二台机器：清单里看不见，直接取也取不走
-	for name, mac := range map[string]gateMachine{"owner": macs[0], "other": macs[1]} {
+	for name, mac := range map[string]gateMachine{"first": macs[0], "second": macs[1]} {
 		list := decodeBody(t, f.do(http.MethodGet, "/v1/build-agent/ios-material", mac.Token, nil, nil))
 		items, _ := list["items"].([]any)
 		kinds := map[string]bool{}
@@ -213,35 +209,26 @@ func TestDBIOSUploadKeyBelongsToOneMachine(t *testing.T) {
 			kind, _ := entry["kind"].(string)
 			kinds[kind] = true
 		}
-		if !kinds["certificate"] {
-			t.Errorf("%s does not see the shared certificate: %v", name, items)
+		if !kinds["certificate"] || !kinds["upload-key"] {
+			t.Errorf("%s does not see both kinds: %v", name, items)
 		}
-		if got := kinds["upload-key"]; got != (name == "owner") {
-			t.Errorf("%s sees upload-key = %v; an upload key belongs to exactly one machine: %v", name, got, items)
+		if r := f.do(http.MethodGet, "/v1/build-agent/ios-material/box?kind=upload-key&teamId="+materialTeam+"&scope=",
+			mac.Token, nil, nil); r.Code != http.StatusOK {
+			t.Errorf("%s could not fetch the upload key: %d %s", name, r.Code, r.Body.String())
 		}
-	}
-	r := f.do(http.MethodGet, "/v1/build-agent/ios-material/box?kind=upload-key&teamId="+materialTeam+"&scope="+macs[0].ID,
-		macs[1].Token, nil, nil)
-	if r.Code != http.StatusForbidden {
-		t.Fatalf("another machine fetched an upload key that is not its own: %d %s", r.Code, r.Body.String())
-	}
-	// 自己的那一份取得走
-	if r := f.do(http.MethodGet, "/v1/build-agent/ios-material/box?kind=upload-key&teamId="+materialTeam+"&scope="+macs[0].ID,
-		macs[0].Token, nil, nil); r.Code != http.StatusOK {
-		t.Fatalf("a machine could not fetch its own upload key: %d %s", r.Code, r.Body.String())
 	}
 }
 
 // 换平台公钥 = 已经存着的密文全部作废（新私钥解不开旧密文）。有多少份会失效必须当场说，
 // 不能让人换完之后靠"机器怎么一直取不到材料"去发现。
 func TestDBIOSMaterialSaysHowMuchAKeyChangeOrphans(t *testing.T) {
-	f, macs := newIOSPool(t, 84, 1)
+	f, _ := newIOSPool(t, 84, 1)
 	clearStoredMaterial(t, f)
 	builder, uploader := materialKeys(t, f)
 	if code, _ := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder)); code != http.StatusOK {
 		t.Fatal("upload certificate failed")
 	}
-	if code, _ := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial(macs[0].ID), uploader)); code != http.StatusOK {
+	if code, _ := uploadMaterialBox(t, f, sealMaterial(t, uploadMaterial(), uploader)); code != http.StatusOK {
 		t.Fatal("upload key failed")
 	}
 

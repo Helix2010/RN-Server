@@ -54,7 +54,7 @@ func TestInstallKeyLandsWhereTheUploaderLooks(t *testing.T) {
 	dir, pub := uploadFixture(t)
 	p8 := testPrivateKeyPEM(t)
 	box := sealedKey(t, iosmaterial.Material{
-		Kind: iosmaterial.KindUploadKey, TeamID: "J4JDFC8LCC", MachineID: "mch_x",
+		Kind: iosmaterial.KindUploadKey, TeamID: "J4JDFC8LCC",
 		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
 		P8Base64: base64.StdEncoding.EncodeToString(p8),
 	}, pub)
@@ -108,7 +108,7 @@ func TestInstallKeyRefusesOtherKinds(t *testing.T) {
 func TestInstallKeyNeedsItsOwnPrivateKey(t *testing.T) {
 	dir, pub := uploadFixture(t)
 	box := sealedKey(t, iosmaterial.Material{
-		Kind: iosmaterial.KindUploadKey, TeamID: "J4JDFC8LCC", MachineID: "mch_x",
+		Kind: iosmaterial.KindUploadKey, TeamID: "J4JDFC8LCC",
 		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
 		P8Base64: base64.StdEncoding.EncodeToString(testPrivateKeyPEM(t)),
 	}, pub)
@@ -144,7 +144,7 @@ func testPrivateKeyPEM(t *testing.T) []byte {
 func TestInstallKeyRefusesAnUnusableP8(t *testing.T) {
 	dir, pub := uploadFixture(t)
 	box := sealedKey(t, iosmaterial.Material{
-		Kind: iosmaterial.KindUploadKey, TeamID: "J4JDFC8LCC", MachineID: "mch_x",
+		Kind: iosmaterial.KindUploadKey, TeamID: "J4JDFC8LCC",
 		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
 		P8Base64: base64.StdEncoding.EncodeToString([]byte("-----BEGIN PRIVATE KEY-----\nnope\n")),
 	}, pub)

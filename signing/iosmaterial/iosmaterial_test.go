@@ -38,7 +38,7 @@ func profile() Material {
 
 func uploadKey() Material {
 	return Material{
-		Kind: KindUploadKey, TeamID: "J4JDFC8LCC", MachineID: "mch_YSX7-u_TPeImo0mQ2uUoYA",
+		Kind: KindUploadKey, TeamID: "J4JDFC8LCC",
 		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
 		P8Base64: base64.StdEncoding.EncodeToString([]byte("-----BEGIN PRIVATE KEY-----")),
 	}
@@ -160,11 +160,14 @@ func TestSealRejectsMixedKinds(t *testing.T) {
 		"certificate with a p8":   func(m Material) Material { m.P8Base64 = "AAAA"; return m },
 		"profile with a password": func(m Material) Material { m.P12Password = "x"; return m },
 		"certificate with bundle": func(m Material) Material { m.BundleID = "com.x.y"; return m },
-		"profile with machine":    func(m Material) Material { m.MachineID = "mch_x"; return m },
+		"upload key with bundle":  func(m Material) Material { m.BundleID = "com.x.y"; return m },
 	} {
 		base := certificate()
-		if strings.HasPrefix(name, "profile") {
+		switch {
+		case strings.HasPrefix(name, "profile"):
 			base = profile()
+		case strings.HasPrefix(name, "upload"):
+			base = uploadKey()
 		}
 		if _, err := Seal(broken(base), pub); err == nil {
 			t.Errorf("%s was accepted", name)

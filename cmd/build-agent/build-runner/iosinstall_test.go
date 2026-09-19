@@ -136,7 +136,7 @@ func TestInstallCertificateAlsoSetsThePartitionList(t *testing.T) {
 func TestInstallRefusesWhatIsNotItsJob(t *testing.T) {
 	dir, pub := materialFixture(t)
 	box := sealed(t, iosmaterial.Material{
-		Kind: iosmaterial.KindUploadKey, TeamID: testTeam, MachineID: "mch_x",
+		Kind: iosmaterial.KindUploadKey, TeamID: testTeam,
 		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
 		P8Base64: base64.StdEncoding.EncodeToString([]byte("p8")),
 	}, pub)

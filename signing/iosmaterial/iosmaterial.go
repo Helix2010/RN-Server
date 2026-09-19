@@ -9,7 +9,7 @@
 // 材料之间是**域分隔**的：同一把私钥即便被同时授予两种身份，一种的密文也绝不会被当成另一
 // 种解开——不是靠调用方记得检查，是解密这一步就失败。
 //
-// Box 外层那几个字段（kind、teamId、bundleId、machineId）是给**服务端路由**用的明文提示，
+// Box 外层那几个字段（kind、teamId、bundleId）是给**服务端路由**用的明文提示，
 // 它们可以被篡改。真正作数的是密文里那一份：Mac 解开之后按自己的判据逐项核对，外层只作对照。
 package iosmaterial
 
@@ -71,11 +71,10 @@ var (
 	// ErrInvalidMaterial：解开了，但里面不是一份合法的材料。
 	ErrInvalidMaterial = errors.New("iosmaterial: decrypted content is not a valid material record")
 
-	teamIDPattern    = regexp.MustCompile(`^[A-Z0-9]{10}$`)
-	bundleIDPattern  = regexp.MustCompile(`^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$`)
-	machineIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	keyIDPattern     = regexp.MustCompile(`^[A-Z0-9]{10}$`)
-	issuerIDPattern  = regexp.MustCompile(`^[0-9a-f-]{16,64}$`)
+	teamIDPattern   = regexp.MustCompile(`^[A-Z0-9]{10}$`)
+	bundleIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$`)
+	keyIDPattern    = regexp.MustCompile(`^[A-Z0-9]{10}$`)
+	issuerIDPattern = regexp.MustCompile(`^[0-9a-f-]{16,64}$`)
 )
 
 // Material 是一份材料的明文。**它装着私钥与口令**：
@@ -88,8 +87,6 @@ type Material struct {
 	TeamID  string `json:"teamId"`
 	// BundleID 只有描述文件有
 	BundleID string `json:"bundleId,omitempty"`
-	// MachineID 只有上传 Key 有
-	MachineID string `json:"machineId,omitempty"`
 	// RecipientSHA256 是收件人公钥指纹。附加数据里已经绑了一次，明文里再写一份是为了
 	// 解开之后还能自证"这份确实是发给我的"，而不必回头信任外层
 	RecipientSHA256 string `json:"recipientSha256"`
@@ -117,7 +114,6 @@ type Box struct {
 	Kind               string `json:"kind"`
 	TeamID             string `json:"teamId"`
 	BundleID           string `json:"bundleId,omitempty"`
-	MachineID          string `json:"machineId,omitempty"`
 	RecipientSHA256    string `json:"recipientSha256"`
 	EphemeralPublicKey string `json:"epk"`
 	Nonce              string `json:"nonce"`
@@ -178,8 +174,6 @@ func (m Material) Validate() error {
 			return err
 		}
 		switch {
-		case !machineIDPattern.MatchString(m.MachineID):
-			return fmt.Errorf("machineId %q is malformed", firstRunes(m.MachineID, 64))
 		case !issuerIDPattern.MatchString(m.IssuerID):
 			return fmt.Errorf("issuerId %q is malformed", firstRunes(m.IssuerID, 64))
 		case !keyIDPattern.MatchString(m.KeyID):
@@ -214,12 +208,9 @@ func requireOnly(m Material, allowed ...string) error {
 	for name := range present {
 		return fmt.Errorf("%s does not belong in a %s record", name, m.Kind)
 	}
-	// bundleId 与 machineId 也各有归属
+	// bundleId 也各有归属
 	if m.Kind != KindProfile && m.BundleID != "" {
 		return fmt.Errorf("bundleId does not belong in a %s record", m.Kind)
-	}
-	if m.Kind != KindUploadKey && m.MachineID != "" {
-		return fmt.Errorf("machineId does not belong in a %s record", m.Kind)
 	}
 	return nil
 }
@@ -273,7 +264,7 @@ func Seal(m Material, recipientPub []byte) (Box, error) {
 	box := Box{
 		Version: Version, Algorithm: Algorithm,
 		Purpose: m.Purpose, Kind: m.Kind, TeamID: m.TeamID,
-		BundleID: m.BundleID, MachineID: m.MachineID,
+		BundleID:           m.BundleID,
 		RecipientSHA256:    sealed.RecipientSHA256,
 		EphemeralPublicKey: sealed.EphemeralPublicKey,
 		Nonce:              sealed.Nonce,
@@ -333,7 +324,6 @@ func Open(b Box, x25519Private []byte) (Material, error) {
 		{"kind", b.Kind, out.Kind},
 		{"teamId", b.TeamID, out.TeamID},
 		{"bundleId", b.BundleID, out.BundleID},
-		{"machineId", b.MachineID, out.MachineID},
 	} {
 		if pair.outer != pair.inner {
 			return Material{}, fmt.Errorf("%w: the box says %s=%q but the sealed record says %q",
@@ -411,9 +401,6 @@ func (m Material) String() string {
 	parts := []string{"kind=" + m.Kind, "team=" + m.TeamID}
 	if m.BundleID != "" {
 		parts = append(parts, "bundle="+m.BundleID)
-	}
-	if m.MachineID != "" {
-		parts = append(parts, "machine="+m.MachineID)
 	}
 	if m.KeyID != "" {
 		parts = append(parts, "keyId="+m.KeyID)

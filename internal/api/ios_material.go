@@ -135,13 +135,17 @@ type storedIOSMaterial struct {
 	UploadedAt      string `json:"uploadedAt"`
 }
 
-// scopeFor 回这一份材料在 (kind, team) 下的那一维。证书是全机共用的，所以空串。
+// scopeFor 回这一份材料在 (kind, team) 下的那一维：描述文件按 bundle id 分，证书与上传 Key
+// 都是**这个 Team 一份、所有 Mac 共用**，所以是空串。
+//
+// 上传 Key 起初按机器分（每台一把，想让丢一台只吊销一把）。那条策略挡不住它真正要挡的事：
+// 证书本来就全机共用，丢一台 Mac 就要在 Apple 后台吊销证书、重签、给所有机器重发——那一刻
+// 所有 Mac 本来就停了，上传 Key 分不分机器省不下这次停机。代价却是天天在付：ASC Key 只能
+// 在租户自己的 Apple 账号里建，按机器分就等于把"平台有几台打包机"漏给租户，租户页上还得
+// 摆一份机器列表（设计 ios-signing-material-distribution-2026-09-19 §5）。
 func scopeFor(box iosmaterial.Box) string {
-	switch box.Kind {
-	case iosmaterial.KindProfile:
+	if box.Kind == iosmaterial.KindProfile {
 		return box.BundleID
-	case iosmaterial.KindUploadKey:
-		return box.MachineID
 	}
 	return ""
 }
@@ -333,21 +337,6 @@ func (s *server) uploadIOSMaterial(c *gin.Context) {
 		return
 	}
 	scope := scopeFor(box)
-	if box.Kind == iosmaterial.KindUploadKey {
-		// 上传 Key 是发给某一台机器的：机器不在登记里，这份密文永远不会被取走
-		registry, err := readMachineRegistry(ctx, s.db, false)
-		if err != nil {
-			problem(c, http.StatusInternalServerError, "MACHINE_REGISTRY_INVALID", "Stored build.machines configuration cannot be read")
-			return
-		}
-		index, found := registry.Doc.find(scope)
-		if !found || registry.Doc.Machines[index].Role != machineRoleBuilder ||
-			registry.Doc.Machines[index].Status == machineStatusRevoked {
-			problem(c, http.StatusConflict, "IOS_MATERIAL_MACHINE_UNKNOWN",
-				"machineId "+scope+" is not a registered, active build machine; an upload key is issued per machine")
-			return
-		}
-	}
 
 	now := time.Now().UTC()
 	var version int64
@@ -439,9 +428,8 @@ func (s *server) removeIOSMaterial(c *gin.Context) {
 // listIOSMaterialForMachine GET /v1/build-agent/ios-material：这台机器该装哪些材料。
 // 只回清单，不回密文——密文一份一份取，每份都是几 KB 到几十 KB。
 func (s *server) listIOSMaterialForMachine(c *gin.Context) {
-	machine, _ := machineFromContext(c)
-	items, err := listIOSMaterial(c.Request.Context(), s.db,
-		`(kind <> ? OR scope = ?)`, iosmaterial.KindUploadKey, machine.ID)
+	// 三样材料都是这个 Team 一份、所有 Mac 共用：不再按机器筛（scopeFor 那段注释说了为什么）
+	items, err := listIOSMaterial(c.Request.Context(), s.db, "")
 	if err != nil {
 		slog.Error("cannot list the iOS signing material", "error", err)
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
@@ -452,16 +440,9 @@ func (s *server) listIOSMaterialForMachine(c *gin.Context) {
 
 // getIOSMaterialBox GET /v1/build-agent/ios-material/box：取一份密文，原样下发。
 func (s *server) getIOSMaterialBox(c *gin.Context) {
-	machine, _ := machineFromContext(c)
 	kind := strings.TrimSpace(c.Query("kind"))
 	team := strings.TrimSpace(c.Query("teamId"))
 	scope := strings.TrimSpace(c.Query("scope"))
-	// 上传 Key 是每台一把：别的机器的那一份不下发，哪怕它知道 scope
-	if kind == iosmaterial.KindUploadKey && scope != machine.ID {
-		problem(c, http.StatusForbidden, "IOS_MATERIAL_NOT_FOR_THIS_MACHINE",
-			"An upload key belongs to one machine; this one may only fetch its own")
-		return
-	}
 	var ciphertext []byte
 	err := s.db.QueryRowContext(c.Request.Context(),
 		`SELECT ciphertext FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=?`,
