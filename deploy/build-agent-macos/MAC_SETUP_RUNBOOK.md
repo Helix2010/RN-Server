@@ -5,6 +5,19 @@
 配套文档：签名材料的来龙去脉在 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md)，方案设计在
 `docs/design/ios-mac-builders-home-network-2026-09-18.md`。
 
+## 执行顺序
+
+| 节 | 在哪 | 干什么 | 做完的标志 |
+| --- | --- | --- | --- |
+| [1](#1-a-机签名机) | **A 机** | 仓库拉到最新、构建 `bundle-sign`、确认发布密钥 | 指纹与密码管理器一致 |
+| [2](#2-b-机打包机体检) | **B 机** | 体检十项 | 十项全过，且 B 机上没有发布私钥 |
+| [3](#3-服务端让安装包可用) | **A 机** + 服务器 | 签当前那一版清单，放回服务器 | 控制台「打包机程序版本」`error` 消失 |
+| [4](#4-b-机装机) | **B 机** | 控制台建机器、跑装机四行 | 脚本打印完成 |
+| [5](#5-装完验证) | 控制台 | 批准版本、排一条 iOS 任务 | 任务出包 |
+
+第 3 节和第 4 节之间**不要往 main 推任何东西**（[为什么](#34-先推完再签再装)）。换过发布密钥的话，
+第 1 节之后要等 CI 把带新公钥的安装包部署完，才能做第 3 节。
+
 ---
 
 ## 0. 两台机器
@@ -32,6 +45,7 @@
 | `<API>` | 服务端的 API 地址（amos 上是 anyfun 的） | `https://api.anyfun.win` |
 | `<服务器>` | 跑着 RN-Server 的那台机器的 ssh 目标 | `amos`（配在 `~/.ssh/config` 里的别名） |
 | `<比上次大 1>` | 清单签名的单调序号，从密码管理器里取上次的值 +1 | `2` |
+| `<指纹>` | 发布公钥指纹，**从密码管理器取**，不要从这份文档、也不要从控制台复制 | 64 位十六进制 |
 
 路径一律写**绝对路径**。装机脚本开头会 `cd /` 并重置 `PATH`（它就该这么做），相对路径在那之后
 全部失效。
@@ -90,7 +104,7 @@ cd signing && CGO_ENABLED=0 go build -o /tmp/bundle-sign ./cmd/bundle-sign && cd
 
 ### 1.3 发布密钥
 
-**已经有一把**（当前这把指纹 `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488`）：
+**已经有一把**：
 
 ```bash
 # 确认私钥还是那一把
@@ -100,7 +114,8 @@ openssl base64 -d -A < ~/rn-release-ios-key/release-key.ed25519 | tail -c 32 | s
 ssh-keygen -l -f ~/rn-release-ios-key/release-key.pub
 ```
 
-**合格线**：前两条都打出 `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488`。
+**合格线**：前两条打出的是同一个值，且等于**密码管理器里记的那个**。三处一致才往下走——
+只要两处一致就继续，等于把"我手里这把是不是对的"这个问题跳过去了。
 
 **还没有**：
 
@@ -254,7 +269,7 @@ echo "$COMMIT"
 /tmp/bundle-sign verify --pub ~/rn-release-ios-key/release-key.pub --dir . --expect-commit "$COMMIT"
 ```
 
-**合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 5aebeaf4…`，
+**合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 <指纹>`，
 其中的 commit 与上面 `echo "$COMMIT"` 打出来的一致。
 
 > `--expect-commit "$COMMIT"` 看着像自证（两个值都来自同一份清单），它挡的不是"清单被换"——那
@@ -325,7 +340,7 @@ ssh <服务器> "sudo install -o root -g root -m 0644 /tmp/manifest.sig \
 curl -fsSLo install-macos.sh <API>/v1/machine-setup/install-macos.sh
 shasum -a 256 install-macos.sh
 sudo bash install-macos.sh --server <API> --code rne_… \
-     --release-key-sha256 5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488
+     --release-key-sha256 <指纹>
 ```
 
 **第二行不能跳过。** 它的值要和 CI「Build machine bundles」那一步打印的比对——这是整条信任链的
@@ -410,12 +425,20 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 
 ---
 
-## 附：本次（2026-09-19）的实际值
+## 附：值从哪里取
 
-| | |
-| --- | --- |
-| 服务端提交 | `9d73dfd37342255d64a94bcd49063545fea4de0c` |
-| `install-macos.sh` sha256 | `ccd959b69e92d10c23e783cb048612843ee65a1e9c22dcc6bd4d2d875e967100` |
-| 发布公钥指纹 | `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488` |
-| 清单签名序号 | `1`（下次签用 2） |
-| `allowed_signers` 文件 sha256 | `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` |
+**这份文档里不写任何会过期的值。** 它们都有权威来源，照来源取：
+
+| 值 | 权威来源 | 别从哪里取 |
+| --- | --- | --- |
+| 发布公钥指纹（`--release-key-sha256`） | **密码管理器** | 别从这份文档、别从控制台复制——控制台替人填这个值，等于让这台机器把服务端说的话当成信任根 |
+| `install-macos.sh` 的 sha256 | CI「Build machine bundles」那一步的日志 | 别信服务端给的 |
+| 当前安装包的提交 | 服务器上 `machine-bundles/current` 指向的目录，或 `manifest.json` 里的 `commit` | 别手抄 |
+| 清单签名序号 | 密码管理器里上次那个 +1 | — |
+| `allowed_signers` 文件 sha256 | 不用人管，脚本从验过签的清单里核 | — |
+
+文档里写死一个会变的值，下次它就是错的，而照错值装机报出来的是"确认手里的值取自密码管理器"
+——把人往抄错了的方向引，不会让人想到文档才是错的。所以这里只写来源。
+
+历史上的密钥指纹记在 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §3.0，那里是**一张有日期的
+表**，换一次加一行，不是散落在正文里的字面量。
