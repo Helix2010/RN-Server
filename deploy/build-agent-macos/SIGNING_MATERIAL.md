@@ -191,22 +191,24 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 
 | 公钥字节 sha256 | 生成 | 备注 |
 | --- | --- | --- |
-| `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a` | 2026-09-18 | 平台管理员一人持有；公钥在 `deploy/build-agent-macos/release-key.pub` |
+| `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488` | 2026-09-19 | 平台管理员一人持有；公钥在 `deploy/build-agent-macos/release-key.pub` |
 
-当天先生成过一把（`b60f0ccf…`）随即换掉。那一把**从未部署**：没有任何 Mac 装过机，也没签过
-任何清单，所以是直接替换而不是 §3.4 的轮换——没有序号水位线要考虑，也不用去任何机器上换公钥。
-**这个便利只在第一台 Mac 装机之前成立**；一旦有机器装了，换密钥就必须走 §3.4。
+在它之前生成过两把并随即换掉（`b60f0ccf…`、`395937be…`）。**两把都从未部署**：没有任何 Mac 装过
+机，也没有一份被任何机器接受过的清单，所以每次都是直接替换而不是 §3.4 的轮换——没有序号水位线
+要考虑，也不用去任何机器上换公钥。
 
-> **公钥文件换过一次格式（2026-09-18）。** `release-key.pub` 现在是 OpenSSH 的一行公钥
+**这个便利只在第一台 Mac 装机之前成立。** 一旦有机器装了，换密钥就必须走 §3.4：先跑遍每台机器
+换掉 `/opt/rn-build-agent/release-key.pub`，再用新私钥签，顺序反了它们会集体拒绝升级。
+
+> **公钥文件的格式换过一次（2026-09-18）。** `release-key.pub` 现在是 OpenSSH 的一行公钥
 > （`ssh-ed25519 AAAA… rn-release-key`），与 `allowed_signers` 里的写法一致——这台机器上两个
-> 信任根因此是同一种格式。**密钥本身没动，指纹也没动**（仍是公钥那 32 字节的 sha256，就是上
-> 表里的值），密码管理器不用改。
+> 信任根因此是同一种格式。`bundle-sign key create` 直接产出这个格式。
 >
-> 离线机器上那份旧格式的 `release-key.pub`（一行裸 base64）要重新导出一次，否则 §3.2 的
-> `bundle-sign verify --pub` 会说"不是一行 ssh-ed25519 公钥"：
+> 手上如果有旧格式的 `.pub`（一行裸 base64），`bundle-sign verify --pub` 会说"不是一行
+> ssh-ed25519 公钥"。不用动私钥，重新导出一份即可：
 >
 > ```bash
-> /tmp/bundle-sign key public --key ~/rn-release-key/release-key.ed25519 > ~/rn-release-key/release-key.pub
+> /tmp/bundle-sign key public --key <私钥目录>/release-key.ed25519 > <私钥目录>/release-key.pub
 > ```
 >
 > 它同时把指纹打在 stderr 上，顺手和密码管理器里的值对一眼。

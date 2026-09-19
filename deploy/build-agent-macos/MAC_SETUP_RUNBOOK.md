@@ -90,7 +90,7 @@ cd signing && CGO_ENABLED=0 go build -o /tmp/bundle-sign ./cmd/bundle-sign && cd
 
 ### 1.3 发布密钥
 
-**已经有一把**（当前这把指纹 `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a`）：
+**已经有一把**（当前这把指纹 `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488`）：
 
 ```bash
 # 确认私钥还是那一把
@@ -100,7 +100,7 @@ openssl base64 -d -A < ~/rn-release-ios-key/release-key.ed25519 | tail -c 32 | s
 ssh-keygen -l -f ~/rn-release-ios-key/release-key.pub
 ```
 
-**合格线**：前两条都打出 `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a`。
+**合格线**：前两条都打出 `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488`。
 
 **还没有**：
 
@@ -230,7 +230,7 @@ echo "$COMMIT"
 /tmp/bundle-sign verify --pub ~/rn-release-ios-key/release-key.pub --dir . --expect-commit "$COMMIT"
 ```
 
-**合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 395937be…`，
+**合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 5aebeaf4…`，
 其中的 commit 与上面 `echo "$COMMIT"` 打出来的一致。
 
 > `--expect-commit "$COMMIT"` 看着像自证（两个值都来自同一份清单），它挡的不是"清单被换"——那
@@ -292,7 +292,7 @@ ssh <服务器> "sudo install -o root -g root -m 0644 /tmp/manifest.sig \
 curl -fsSLo install-macos.sh <API>/v1/machine-setup/install-macos.sh
 shasum -a 256 install-macos.sh
 sudo bash install-macos.sh --server <API> --code rne_… \
-     --release-key-sha256 395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a
+     --release-key-sha256 5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488
 ```
 
 **第二行不能跳过。** 它的值要和 CI「Build machine bundles」那一步打印的比对——这是整条信任链的
@@ -383,6 +383,6 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 | --- | --- |
 | 服务端提交 | `9d73dfd37342255d64a94bcd49063545fea4de0c` |
 | `install-macos.sh` sha256 | `ccd959b69e92d10c23e783cb048612843ee65a1e9c22dcc6bd4d2d875e967100` |
-| 发布公钥指纹 | `395937be6513e23f0e293dbabb3fd110dd864bb53ef7b48cf47d35e2849b978a` |
+| 发布公钥指纹 | `5aebeaf4f1027acd079e6bed0b3abda0db7ecf289150b6f8ce10acd544320488` |
 | 清单签名序号 | `1`（下次签用 2） |
 | `allowed_signers` 文件 sha256 | `296a3753aedc51b632db6fc8a58d58e79c177bf06a16ed27409b0c293fd2c755` |
