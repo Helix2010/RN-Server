@@ -183,14 +183,28 @@ curl -s -o /dev/null -w '%{http_code}\n' <API>/v1/machine-setup/install-macos.sh
 
 CI 每次部署都会在服务器上产出一份新的安装包目录，**没签过的一律 503，装不了**。
 
+**路径一律走 `current`，不要手抄提交号。** 服务器上每部署一次就多一个以提交号命名的目录，
+`current` 这个软链指向当前那一份。手抄提交号每次都是一次抄错的机会，而且抄错的症状是
+"签了一份没人要的清单"——服务端那边毫无变化，你会以为是别的地方出了问题。
+
 ```bash
-mkdir -p ~/sign-<提交短号> && cd ~/sign-<提交短号>
-scp <服务器>:/opt/rn-foundation/machine-bundles/<完整提交>/manifest.json .
+mkdir -p ~/sign-bundle && cd ~/sign-bundle && rm -f manifest.json manifest.sig
+scp <服务器>:/opt/rn-foundation/machine-bundles/current/manifest.json .
+
+# 提交号从清单里读出来，不手抄
+COMMIT=$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' manifest.json | head -1)
+echo "$COMMIT"
+
 /tmp/bundle-sign sign --key ~/rn-release-ios-key/release-key.ed25519 --dir . --sequence <比上次大 1>
-/tmp/bundle-sign verify --pub ~/rn-release-ios-key/release-key.pub --dir . --expect-commit <完整提交>
+/tmp/bundle-sign verify --pub ~/rn-release-ios-key/release-key.pub --dir . --expect-commit "$COMMIT"
 ```
 
-**合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 395937be…`。
+**合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 395937be…`，
+其中的 commit 与上面 `echo "$COMMIT"` 打出来的一致。
+
+> `--expect-commit "$COMMIT"` 看着像自证（两个值都来自同一份清单），它挡的不是"清单被换"——那
+> 由签名管。它挡的是**你签的和你以为的不是同一份**：`--dir` 指错目录、上一次的 `manifest.sig`
+> 没删干净、`scp` 其实失败了而你用的是旧文件。所以上面第一条命令里的 `rm -f` 不是多余的。
 
 只需要 `manifest.json`，三个 `.tar.gz` 不用拷——清单里已经是每个归档与每个文件的 sha256，
 签了清单就等于签了它们。
@@ -206,7 +220,7 @@ scp <服务器>:/opt/rn-foundation/machine-bundles/<完整提交>/manifest.json 
 ```bash
 scp manifest.sig <服务器>:/tmp/
 ssh <服务器> "sudo install -o root -g root -m 0644 /tmp/manifest.sig \
-  /opt/rn-foundation/machine-bundles/<完整提交>/ && rm /tmp/manifest.sig"
+  /opt/rn-foundation/machine-bundles/current/ && rm /tmp/manifest.sig"
 ```
 
 在控制台「平台维护 → 打包机与签名闸 → 构建机 → 打包机程序版本」核对：提交、序号、签名时间、
@@ -309,6 +323,7 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 | `tool 'xcodebuild' requires Xcode, but active developer directory is a command line tools instance` | 只装了 Command Line Tools，没装 Xcode，或没 `xcode-select -s` |
 | `fatal: unable to read tree` | 浅克隆或对象库不全。`git fetch --unshallow`，不行就重新克隆 |
 | `describe 返回 503` | 安装包还没签。回第 3.2 步 |
+| 签完了，控制台还是说 `no manifest.sig` | 多半签到了**别的目录**：往 main 推过东西之后 `current` 换了一份。用 `current` 走一遍第 3.2 步 |
 | `服务端给的发布公钥指纹是 X，与 --release-key-sha256 Y 不符` | 手抄的值不对，或服务器上的 `release-key.pub` 不是你那把。**先怀疑抄错**，去密码管理器核 |
 | `清单的离线签名验不过` | 签清单用的不是那把密钥，或者清单被改过。也可能是**用旧版 bundle-sign 签的**（旧格式） |
 | `the signature is not an armoured SSH signature` | 确定是旧版 `bundle-sign` 签的。重新构建工具再签 |
