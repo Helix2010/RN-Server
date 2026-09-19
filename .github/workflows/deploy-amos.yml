@@ -24,6 +24,8 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      deploy-needed: ${{ steps.changes.outputs.deploy-needed }}
     # 数据库测试（TestDB*、迁移测试）没有 RN_TEST_MYSQL_DSN 时一律 skip，而 skip 在 go test 里
     # 算通过：签名闸的状态机、完成事务、迁移全在这一类里，不给库等于 CI 假绿。
     # 库是一次性的容器，口令只在这个 job 里有效，不是机密
@@ -45,10 +47,55 @@ jobs:
       RN_TEST_MYSQL_DSN: root:rn-test@tcp(127.0.0.1:33061)/rn_test?parseTime=true&charset=utf8mb4
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 要和上一个 main 比，才知道这一推动了什么
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      # 只改文档的提交不该重新部署。不是为了省那几分钟：**每次部署都会产出一份新的
+      # 安装包，而安装包必须由平台管理员在离线机器上重新签一次**（提交号通过
+      # -X main.commit 编进二进制，提交变了摘要就变）。为一个改错别字的提交让人再走
+      # 一遍离线签名，人就会开始嫌它烦——而那道签名是"服务端被攻破也换不出能过验的
+      # 清单"的全部依据。
+      #
+      # 跳的只有 deploy。**validate 永远跑**：有测试是读文档的
+      # （TestReleaseKeyTableMatchesTheDeployedKey 读 SIGNING_MATERIAL.md，
+      # TestBundlesScriptPrintsTheMacInstallDigest 读 build-bundles.sh），
+      # 纯文档改动照样可能让它们红，整个工作流跳过等于让这些守护失效。
+      #
+      # 判据是白名单取反：**只有确定不进安装包、也不进二进制的文档**才算"不用部署"。
+      # 拿不准就部署——多部署一次只是多签一次，少部署一次是线上没跟上。
+      - name: Decide whether this push needs a deploy
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" != push ]; then
+            echo "deploy-needed=true" >> "$GITHUB_OUTPUT"
+            echo "手动触发：照常部署"
+            exit 0
+          fi
+          before='${{ github.event.before }}'
+          # 分支新建、force push 之后 before 可能不可用：拿不准就部署
+          if [ -z "$before" ] || [ "$before" = 0000000000000000000000000000000000000000 ] ||
+            ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+            echo "deploy-needed=true" >> "$GITHUB_OUTPUT"
+            echo "取不到上一个 main，照常部署"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$before" "${{ github.sha }}")"
+          echo "这一推动了："; printf '%s\n' "$changed" | sed 's/^/  /'
+          # 白名单：确定只给人看的文档。deploy/signer/README.md 与
+          # deploy/build-agent/README.md **会被打进安装包**，不在这里
+          rest="$(printf '%s\n' "$changed" | grep -Ev '^(docs/|[^/]+\.md$|deploy/build-agent-macos/(MAC_SETUP_RUNBOOK|SIGNING_MATERIAL)\.md$)' || true)"
+          if [ -z "$rest" ]; then
+            echo "deploy-needed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=只改了文档::跳过部署，安装包与已有的清单签名保持不变。要强制部署就用 workflow_dispatch。"
+          else
+            echo "deploy-needed=true" >> "$GITHUB_OUTPUT"
+            echo "有文档以外的改动，照常部署"
+          fi
       - run: test -z "$(gofmt -l cmd internal signing)"
       - run: go vet ./...
       # 这几个脚本以 root 跑在服务器上（install.sh 由服务端下发给新机器）：shellcheck 不过不发
@@ -86,7 +133,7 @@ jobs:
 
   deploy:
     needs: validate
-    if: vars.AMOS_DEPLOY_ENABLED == 'true'
+    if: vars.AMOS_DEPLOY_ENABLED == 'true' && needs.validate.outputs.deploy-needed == 'true'
     runs-on: ubuntu-latest
     environment: production
     env:

@@ -338,6 +338,48 @@ func TestBundlesScriptPrintsTheMacInstallDigest(t *testing.T) {
 	}
 }
 
+// CI 对「只改文档的提交」跳过部署（deploy-amos.yml 的 Decide whether this push needs a deploy）。
+// 跳的理由不是省那几分钟：**每次部署都产出一份新的安装包，而它必须由平台管理员在离线机器上
+// 重新签一次**。为一个改错别字的提交让人再走一遍离线签名，人就会开始嫌那道签名烦——而它是
+// "服务端被攻破也换不出能过验的清单"的全部依据。
+//
+// 判据是一张白名单（docs/、仓库根的 *.md、两份 Mac 手册）。**有两个 .md 是会被打进安装包的**
+// （deploy/signer/README.md、deploy/build-agent/README.md），它们改了必须部署。再往安装包里加
+// .md 的人不会想到去看那份白名单，所以这里盯着：安装包里的 .md 一变，这条测试就要人回去确认。
+func TestBundledMarkdownIsAccountedForInTheDeploySkipList(t *testing.T) {
+	raw, err := os.ReadFile("../../deploy/setup/build-bundles.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"deploy/signer/README.md":      true,
+		"deploy/build-agent/README.md": true,
+	}
+	found := map[string]bool{}
+	for _, field := range strings.Fields(string(raw)) {
+		trimmed := strings.Trim(field, `"'`)
+		if !strings.HasSuffix(trimmed, ".md") {
+			continue
+		}
+		if path, ok := strings.CutPrefix(trimmed, "$ROOT/"); ok {
+			found[path] = true
+		}
+	}
+	for path := range found {
+		if !want[path] {
+			t.Errorf("build-bundles.sh now packs %s into a bundle. "+
+				"Check the docs whitelist in .github/workflows/deploy-amos.yml (Decide whether this push "+
+				"needs a deploy): a file that ships inside a bundle must trigger a deploy, "+
+				"otherwise the deployed bundle silently stops matching main", path)
+		}
+	}
+	for path := range want {
+		if !found[path] {
+			t.Errorf("build-bundles.sh no longer packs %s; drop it from this test and re-check the CI whitelist", path)
+		}
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)
