@@ -39,6 +39,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Helix2010/RN-Server/signing/bundlesig"
@@ -75,6 +76,10 @@ var (
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	// 这个程序摆出来的东西要给**别的账户**用：换上去的 build-runner 由执行账户跑，换之前
+	// 的自检也是。launchd 交给我们的 umask 不定，继承一个严一点的（027、077）会让解出来的
+	// 二进制别人连执行都不行，而失败信息是一句没头没尾的 "Permission denied"。定死它。
+	syscall.Umask(0o022)
 	set := flag.NewFlagSet("rn-build-agent-upgrade", flag.ContinueOnError)
 	set.SetOutput(stderr)
 	envFile := set.String("env", defaultEnvFile, "the build agent env file (root owned)")
@@ -174,6 +179,13 @@ func upgrade(ctx context.Context, in upgradeInput) error {
 	}
 	defer os.RemoveAll(staging)
 	if err := download(ctx, in, described, staging); err != nil {
+		return err
+	}
+	// 自检要以**执行账户**的身份跑 staging 里的 build-runner，而 MkdirTemp 建出来的目录
+	// 是 0700 root：别的账户连进都进不去，sudo 只会回一句 "unable to execute …:
+	// Permission denied"，看着像二进制坏了。等文件全部按签过的清单核对完再放开——放开的
+	// 只是"能进来读"，目录仍归 root、别人写不了，而里面的字节与公开的安装包逐个对过。
+	if err := os.Chmod(staging, 0o755); err != nil {
 		return err
 	}
 	if err := smoke(ctx, in, staging); err != nil {

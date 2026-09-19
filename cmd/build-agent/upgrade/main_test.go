@@ -320,3 +320,47 @@ func readFile(t *testing.T, path string) string {
 	}
 	return string(raw)
 }
+
+// 换之前的自检以**执行账户**的身份跑 staging 里的 build-runner，可 MkdirTemp 建出来的
+// 目录是 0700 root——别的账户进不去，sudo 只回一句 "unable to execute …: Permission
+// denied"。真机上每次升级都在这里失败：代理被版本闸挡住、写停机标记、退出，升级程序装不
+// 上、删掉标记，代理又起来……一轮一轮地转，控制台上只有一条 upgradeError。
+//
+// 这里让假的 build-agent 在自检那一刻把 staging 的权限记下来，回头检查"别人进得去"。
+func TestUpgradeLetsTheBuildUserIntoTheStagingDirectory(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := filepath.Join(t.TempDir(), "staging-mode")
+	// 第一行是 staging 目录，第二行是刚解出来的那个二进制本身：目录进得去、文件跑得动，
+	// 两条都得成立，而它们分别由 chmod 与 umask 决定
+	agent := "#!/bin/sh\n{ ls -ld \"$(dirname \"$0\")/..\"; ls -l \"$0\"; } > " + probe + "\nexit 2\n"
+	fake := newBundle(t, private, newCommit, 5, agent)
+	m := newMachine(t, public, fake.server.URL)
+	m.requestUpgrade(t, newCommit)
+
+	if code, output := m.run(t); code != 0 {
+		t.Fatalf("upgrade: %d %s", code, output)
+	}
+	raw, err := os.ReadFile(probe)
+	if err != nil {
+		t.Fatalf("the self-check never ran: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("cannot read the staging modes from %q", raw)
+	}
+	dir, binary := strings.Fields(lines[0])[0], strings.Fields(lines[1])[0]
+	if len(dir) < 10 || dir[0] != 'd' || len(binary) < 10 {
+		t.Fatalf("cannot read the staging modes from %q", raw)
+	}
+	if dir[9] != 'x' {
+		t.Errorf("the staging directory is %s while the self-check runs; the build user cannot even "+
+			"traverse into it, so sudo fails with Permission denied and every upgrade dies there", dir)
+	}
+	if binary[9] != 'x' {
+		t.Errorf("the staged binary is %s; the build user cannot execute it. The mode comes from the "+
+			"umask this program inherited from launchd — pin it instead of hoping", binary)
+	}
+}
