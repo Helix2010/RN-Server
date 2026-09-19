@@ -482,6 +482,28 @@ func TestMacInstallScriptRejectsUnsubstitutedPlaceholders(t *testing.T) {
 	}
 }
 
+// describe 失败时要按状态码分开说，并把服务端写在 problem+json 里的原因带出来。
+//
+// 原来所有非 200 都套同一句"注册码过期或已用过就到控制台重发一个"。装第一台机器时撞上
+// 503（安装包还没签），照着那句话去重发注册码，换来一模一样的 503——而真正要做的是去签
+// 清单。这一步本来就不消耗注册码，那句话从一开始就不可能对。
+func TestMacInstallScriptExplainsWhyDescribeFailed(t *testing.T) {
+	script := string(InstallMacOSScript)
+	for _, want := range []string{
+		"503) die \"服务端上的安装包还没签",      // 去签，不是去重发码
+		"404 | 410) die \"注册码过期或已经用过", // 这一种才是重发
+		"000) die \"连不上",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("describe does not tell the operator what %q actually means", strings.TrimSuffix(want, ") die \""))
+		}
+	}
+	if !strings.Contains(script, `服务端说：${detail}`) {
+		t.Error("describe throws away the detail the server put in problem+json; " +
+			"without it the operator only sees a status code")
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)

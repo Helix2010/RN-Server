@@ -397,11 +397,35 @@ describe() {
     curl_api --max-time 60 -o "$body" -w '%{http_code}' -H 'content-type: application/json' \
       --data-binary @- "$SERVER/v1/machine-setup/describe")" || status="000"
   if [ "$status" != 200 ]; then
+    # 服务端在 problem+json 里写了具体原因，带出来——不带的话运维只看得到一个状态码
+    local detail
+    detail="$(python3 -I - "$body" 2>/dev/null <<'PY' || true
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+print(str(doc.get("detail") or doc.get("title") or "").strip())
+PY
+)"
     if [ -f "$CACHE/describe.json" ]; then
       warn "describe 返回 ${status}，用第一次执行时留下的结果继续（注册码可能已经用过）"
       cp "$CACHE/describe.json" "$body"
     else
-      die "describe 返回 ${status}：注册码过期或已用过就到控制台重发一个"
+      # 逐个状态码分开说。原来所有非 200 都套"注册码过期或已用过"，而 503 跟注册码毫无
+      # 关系（这一步本来就不消耗它）——人照着去重发一个码，换来一模一样的 503。
+      case "${status}" in
+        503) die "服务端上的安装包还没签，所以什么都不下发。
+   平台管理员要在离线机器上签一份清单，再用控制台「平台维护 → 打包机与签名闸 → 构建机
+   → 打包机程序版本」的「选择 manifest.sig」交上去。
+   **注册码没有被消耗**，签完重跑同一条命令即可。${detail:+
+   服务端说：${detail}}" ;;
+        404 | 410) die "注册码过期或已经用过（60 分钟有效、一次性）。
+   到控制台「平台维护 → 打包机与签名闸 → 构建机 → 新建」重发一个，类型选 macOS。${detail:+
+   服务端说：${detail}}" ;;
+        000) die "连不上 ${SERVER}。检查网络，以及这台机器能不能解析到那个域名。" ;;
+        *) die "describe 返回 ${status}。${detail:+服务端说：${detail}}" ;;
+      esac
     fi
   else
     install -d -o root -g wheel -m 0700 "$SETUP_ROOT" "$CACHE"
