@@ -135,7 +135,17 @@ parse_args() {
     http://127.0.0.1* | http://localhost*) CURL_PROTO="=https,http" ;;
     *) die "--server 必须是 https 地址（本机测试可以用 http://127.0.0.1…）" ;;
   esac
-  case "$CODE" in rne_*) ;; *) die "--code 看起来不是控制台发的注册码（rne_ 开头）" ;; esac
+  # 没替换的占位符要在这里就认出来。不查的话它会一路走到第七步才以 describe 404 失败，
+  # 而那条报错说的是"注册码过期或已用过"——完全错误的方向，人会跑去控制台重发一个。
+  case "$CODE$SERVER$RELEASE_KEY_SHA256" in
+    *…* | *'<'* | *'>'*)
+      die "命令里还有没替换的占位符。控制台「新建机器」会给出完整的四行，把
+   <从密码管理器粘贴发布公钥指纹> 换成密码管理器里那个 64 位十六进制，其余原样粘贴。" ;;
+  esac
+  # rne_ + 43 个 base64url 字符（服务端 signing/machinekey.ValidEnrollmentCode 的口径）
+  printf '%s' "$CODE" | grep -Eq '^rne_[A-Za-z0-9_-]{43}$' ||
+    die "--code 不是控制台发的注册码：应该是 rne_ 加 43 个字符，你给的是 ${#CODE} 个字符的 \"$CODE\"。
+   到控制台「平台维护 → 打包机与签名闸 → 构建机 → 新建」拿一个，类型选 macOS。"
   printf '%s' "$RELEASE_KEY_SHA256" | grep -Eq '^[0-9a-f]{64}$' ||
     die "--release-key-sha256 必须给，且是 64 位小写十六进制。它是这台机器唯一不依赖服务端的判据，见 --help"
 }

@@ -464,6 +464,24 @@ func TestMacInstallScriptBracesVariablesBeforeNonASCII(t *testing.T) {
 	}
 }
 
+// 没替换的占位符要在解析参数时就拦住。
+//
+// 装第一台机器时把文档里的 `--code rne_…` 原样粘了上去：它以 rne_ 开头，于是过了当时那个
+// 只看前缀的检查，一路走到第七步才以 `describe 返回 404` 失败——而那条报错说的是"注册码过期
+// 或已用过就到控制台重发一个"，指向完全错误的方向，人会跑去重发一个同样用不了的码。
+func TestMacInstallScriptRejectsUnsubstitutedPlaceholders(t *testing.T) {
+	script := string(InstallMacOSScript)
+	// 三个参数里任何一个还带着 …、< 或 > 都算没填
+	if !strings.Contains(script, `case "$CODE$SERVER$RELEASE_KEY_SHA256" in`) {
+		t.Error("parse_args does not look for unsubstituted placeholders in the three arguments")
+	}
+	// 注册码的形状要按服务端的口径查，光看 rne_ 前缀挡不住 rne_…
+	if !strings.Contains(script, `'^rne_[A-Za-z0-9_-]{43}$'`) {
+		t.Error("parse_args does not check the shape of --code; " +
+			"a prefix-only check lets the documentation placeholder rne_… straight through")
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)
