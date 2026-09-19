@@ -137,7 +137,14 @@ ssh-keygen -l -f ~/rn-release-ios-key/release-key.pub
 cd <仓库>
 git checkout main && git pull --ff-only
 cat ~/rn-release-ios-key/release-key.pub > deploy/build-agent-macos/release-key.pub
-git add deploy/build-agent-macos/release-key.pub
+
+# 同一个提交里把 SIGNING_MATERIAL.md §3.0「当前这一把」那张表也改掉：
+#   - 表里那一行换成新指纹和今天的日期
+#   - 下面那句"在它之前生成过 N 把"把刚换掉的那一把加进去
+# 不改这张表，文档和仓库就对不上，而这张表正是以后别人查"当前是哪把"的地方。
+$EDITOR deploy/build-agent-macos/SIGNING_MATERIAL.md
+
+git add deploy/build-agent-macos/release-key.pub deploy/build-agent-macos/SIGNING_MATERIAL.md
 git commit -m "feat(build-agent-macos): 换发布密钥"
 git push origin main
 ```
