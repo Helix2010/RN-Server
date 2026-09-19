@@ -98,6 +98,27 @@ func TestDBDeployedManifestIsAvailableBeforeItIsSigned(t *testing.T) {
 	if got := r.Header().Get("X-Bundle-Commit"); got != commit {
 		t.Fatalf("the response must name the deployed commit: %q", got)
 	}
+
+	// 卡片在**还没签**的时候也要答得出部署着哪一版：那正是要拿去签的那一版。答不出的话
+	// 运维只能去服务器上 readlink current，而这两条接口本来就是为了不必登服务器才开的。
+	//
+	// 但它走的是 deployedCommit 而不是 commit：commit 是批准按钮的输入，给未签名的包填上
+	// 它，就等于让人能批准一个下载不到的版本——机器因版本不符停止认领，又拿不到那一版的
+	// 安装包，队列安静地死掉。
+	card := decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))
+	bundles, _ := card["bundles"].([]any)
+	if len(bundles) == 0 {
+		t.Fatalf("want a view of the bundles: %v", card)
+	}
+	for _, entry := range bundles {
+		view, _ := entry.(map[string]any)
+		if view["deployedCommit"] != commit {
+			t.Fatalf("an unsigned bundle must still report what is deployed: %v", view)
+		}
+		if view["commit"] != nil {
+			t.Fatalf("an unsigned bundle must not offer a commit to approve: %v", view)
+		}
+	}
 }
 
 // 正路：交一份签名，机器那条下发口立刻可用，而且下发的签名与交上来的逐字节相同。

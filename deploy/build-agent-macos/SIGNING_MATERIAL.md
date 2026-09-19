@@ -191,9 +191,12 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 
 | 公钥字节 sha256 | 生成 | 备注 |
 | --- | --- | --- |
-| `bac1ec56b4e11d8f33ce1b4dbbba34e8ae7fc43d43001f408ab95f3c4b5bb4f6` | 2026-09-19 | 平台管理员一人持有；公钥在 `deploy/build-agent-macos/release-key.pub` |
+| `5037b2f8337739f54335482ff64a31934fee2c7873e793beacc13081095d533d` | 2026-09-19 | 平台管理员一人持有；公钥在 `deploy/build-agent-macos/release-key.pub` |
 
-在它之前生成过三把并随即换掉（`b60f0ccf…`、`395937be…`、`5aebeaf4…`）。**三把都从未部署**：没有任何 Mac 装过
+> 这张表由 `TestReleaseKeyTableMatchesTheDeployedKey` 守着：表里那一行与仓库里
+> `release-key.pub` 算出来的指纹对不上就编译不过。换密钥时两个文件要在**同一个提交**里改。
+
+在它之前生成过四把并随即换掉（`b60f0ccf…`、`395937be…`、`5aebeaf4…`、`bac1ec56…`）。**四把都从未部署**：没有任何 Mac 装过
 机，也没有一份被任何机器接受过的清单，所以每次都是直接替换而不是 §3.4 的轮换——没有序号水位线
 要考虑，也不用去任何机器上换公钥。
 

@@ -171,8 +171,20 @@ func mustJSON(value any) []byte {
 // 编出来），而这一页存在的理由正是"让人看见现在部署的是什么"——一组坏了就整页看不见，
 // 等于把要看的东西藏起来。
 func (s *server) deployedBundleView(ctx context.Context, query, name string) gin.H {
-	view := gin.H{"bundle": name, "query": query, "commit": nil, "sequence": nil,
-		"signedAt": nil, "publicKeySha256": nil, "archive": nil, "error": nil}
+	// commit 与 deployedCommit 是两件事，分开是有意的：
+	//
+	//   - deployedCommit：服务器上现在摆着哪一版。**没签也有值**——那正是要拿去签的那一版。
+	//     不答的话运维只能去服务器上 readlink current，而交签名那条路本来就是为了不必登
+	//     服务器才开的。
+	//   - commit：**可以批准的那一版**，也就是批准按钮的输入。没签就是 null。
+	//
+	// 合成一个字段会让控制台把"批准"按在一个下载不到的版本上：机器一旦因为版本不符停止
+	// 认领，又拿不到那一版的安装包（没签一律 503），队列就安静地死在那里。
+	view := gin.H{"bundle": name, "query": query, "commit": nil, "deployedCommit": nil,
+		"sequence": nil, "signedAt": nil, "publicKeySha256": nil, "archive": nil, "error": nil}
+	if _, doc, deployedErr := s.machineBundles(); deployedErr == nil {
+		view["deployedCommit"] = doc.Commit
+	}
 	signed, err := s.signedBundleFor(ctx, name)
 	if err != nil {
 		view["error"] = err.Error()
