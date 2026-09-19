@@ -46,6 +46,9 @@ type agent struct {
 	upgradeError string
 	// haltReason 非空表示这一轮之后要停机让位给升级程序（先写标记，再以 75 退出）
 	haltReason string
+	// lastMaterialSync 是上一次去问"该装哪些签名材料"的时刻。认领每 10 秒一次，而材料
+	// 几个月才动一次，不必每一轮都问
+	lastMaterialSync time.Time
 
 	keyActive      bool
 	keyCheckedAt   time.Time
@@ -213,6 +216,9 @@ func (a *agent) iosInventory(ctx context.Context) iosInventory {
 	if a.iosScan != nil {
 		return a.iosScan(ctx)
 	}
+	// 先把控制台传下来的材料装上，再盘点——同一轮里装完就能报出来，否则要等下一轮，
+	// 而人盯着控制台等那个 Team 出现
+	a.syncIOSMaterial(ctx)
 	scanner := newIOSScanner(a.cfg)
 	scanner.Now = a.now
 	// 签名区归执行账户，控制进程读不到：材料由 build-runner 以那个身份取回来（§4.2）

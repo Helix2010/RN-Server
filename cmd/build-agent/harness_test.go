@@ -79,6 +79,10 @@ type fakeServer struct {
 	redirects map[string]string
 	// authCode 非空时每个请求都回 401 这个码（MACHINE_REVOKED / MACHINE_AUTH_REQUIRED）
 	authCode string
+	// material 是 /v1/build-agent/ios-material 回的清单；materialBoxes 按
+	// "kind/team/scope" 存密文原文
+	material      []map[string]any
+	materialBoxes map[string][]byte
 }
 
 func (f *fakeServer) setHeartbeatCode(code string) {
@@ -139,6 +143,7 @@ func (f *fakeServer) failOnce(suffix string, status int, code string) {
 
 func newFakeServer(t *testing.T) *fakeServer {
 	f := &fakeServer{t: t, keyStatus: "active", uploads: map[string][]byte{}, failNext: map[string][]injectedProblem{}, redirects: map[string]string{}}
+	f.materialBoxes = map[string][]byte{}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -209,6 +214,16 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/v1/build-agent/public-key":
 		f.publicKey(w, body)
+	case path == "/v1/build-agent/ios-material":
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": f.material})
+	case path == "/v1/build-agent/ios-material/box":
+		box, ok := f.materialBoxes[r.URL.Query().Get("kind")+"/"+
+			r.URL.Query().Get("teamId")+"/"+r.URL.Query().Get("scope")]
+		if !ok {
+			f.problem(w, http.StatusNotFound, "IOS_MATERIAL_NOT_FOUND")
+			return
+		}
+		_, _ = w.Write(box)
 	case path == "/v1/build-agent/claim":
 		if len(f.claims) == 0 {
 			w.WriteHeader(http.StatusNoContent)

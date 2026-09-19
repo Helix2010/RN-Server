@@ -6,6 +6,7 @@
 //	    --team <TEAMID> --keys /var/rn-build-upload \
 //	    --expect-bundle-id com.x.y --expect-version 1.3.7 --expect-build 33   # 包走标准输入
 //	sudo -n -u _rnuploader /opt/rn-build-agent/ios-upload --probe --team <TEAMID> --keys … --expect-bundle-id …
+//	sudo -n -u _rnuploader /opt/rn-build-agent/ios-upload --install-key --keys /var/rn-build-upload   # 密文走标准输入
 //
 // 为什么是单独一个程序、单独一个账户（设计 ios-mac-builders-home-network-2026-09-18 §4.3）：
 // 这台 Mac 的钥匙串里有全部租户的 Distribution 私钥，而执行进程跑的是几千个第三方依赖。
@@ -67,6 +68,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	set := flag.NewFlagSet("ios-upload", flag.ContinueOnError)
 	set.SetOutput(stderr)
 	probe := set.Bool("probe", false, "only check whether this key may use the build upload endpoints")
+	install := set.Bool("install-key", false, "install an upload key handed over as ciphertext on stdin")
 	team := set.String("team", "", "Apple Developer Team ID")
 	keys := set.String("keys", "/var/rn-build-upload", "directory that holds <TEAMID>/key.json and the .p8")
 	bundleID := set.String("expect-bundle-id", "", "bundle id of the app this package belongs to")
@@ -75,6 +77,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	baseURL := set.String("base-url", "", "App Store Connect base URL; empty = Apple's own (tests only)")
 	if err := set.Parse(args); err != nil || set.NArg() != 0 {
 		return 2
+	}
+	// 装 Key 那条路不需要 --team / --expect-*：要装什么全写在密文里，而那一份是
+	// 平台在离线机器或浏览器里封的，比命令行上的值可信
+	if *install {
+		if err := installKey(stdin, stdout, *keys); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
 	}
 	switch {
 	case !appleTeamIDPattern.MatchString(*team):

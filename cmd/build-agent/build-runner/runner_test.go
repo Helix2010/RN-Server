@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -69,8 +70,14 @@ func prepareJobDir(t *testing.T, root, jobID string, kind jobspec.Kind, tools fa
 
 func runRunner(t *testing.T, getenv func(string) string, args ...string) (int, string) {
 	t.Helper()
+	return runRunnerWithInput(t, getenv, strings.NewReader(""), args...)
+}
+
+// runRunnerWithInput 给收标准输入的子命令用（install-ios-material 的密文走那里）。
+func runRunnerWithInput(t *testing.T, getenv func(string) string, in io.Reader, args ...string) (int, string) {
+	t.Helper()
 	var out bytes.Buffer
-	code := run(context.Background(), args, &out, getenv)
+	code := run(context.Background(), args, in, &out, getenv)
 	return code, out.String()
 }
 

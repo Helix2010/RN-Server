@@ -14,7 +14,8 @@
 //	build-runner build      --jobs-root <abs> --job <id> --kind apk|ota
 //	build-runner cleanup    --jobs-root <abs> --job <id>
 //	build-runner self-check    --jobs-root <abs> --protocol <n> [--expect-separated]
-//	build-runner ios-inventory --signing-dir <abs>
+//	build-runner ios-inventory        --signing-dir <abs>
+//	build-runner install-ios-material --signing-dir <abs>   （密文走标准输入）
 //
 // 退出码：0 成功；1 构建失败；2 参数、身份或任务目录不合规。失败原因最后一行以
 // "build-runner: error: " 开头写到标准输出，控制进程取它做失败原因。
@@ -48,7 +49,7 @@ func main() {
 	syscall.Umask(0o027)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Getenv))
+	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Getenv))
 }
 
 // usageError 表示参数、身份或目录不合规（退出码 2）。
@@ -58,8 +59,8 @@ func (e usageError) Error() string { return e.err.Error() }
 
 func usagef(format string, args ...any) error { return usageError{fmt.Errorf(format, args...)} }
 
-func run(ctx context.Context, args []string, out io.Writer, getenv func(string) string) int {
-	err := dispatch(ctx, args, out, getenv)
+func run(ctx context.Context, args []string, in io.Reader, out io.Writer, getenv func(string) string) int {
+	err := dispatch(ctx, args, in, out, getenv)
 	if err == nil {
 		return 0
 	}
@@ -71,7 +72,7 @@ func run(ctx context.Context, args []string, out io.Writer, getenv func(string) 
 	return exitFailed
 }
 
-func dispatch(ctx context.Context, args []string, out io.Writer, getenv func(string) string) error {
+func dispatch(ctx context.Context, args []string, in io.Reader, out io.Writer, getenv func(string) string) error {
 	if len(args) == 0 {
 		return usagef("usage: build-runner build|cleanup|self-check|ios-inventory ...")
 	}
@@ -96,6 +97,18 @@ func dispatch(ctx context.Context, args []string, out io.Writer, getenv func(str
 			return usageError{err}
 		}
 		return cleanup(out, who, layout)
+	case "install-ios-material":
+		set := flag.NewFlagSet("install-ios-material", flag.ContinueOnError)
+		set.SetOutput(io.Discard)
+		var dir onceValue
+		set.Var(&dir, "signing-dir", "")
+		if err := set.Parse(args[1:]); err != nil {
+			return usagef("bad arguments: %v", err)
+		}
+		if set.NArg() != 0 {
+			return usagef("unexpected positional arguments")
+		}
+		return installIOSMaterial(ctx, out, in, who, dir.value)
 	case "ios-inventory":
 		set := flag.NewFlagSet("ios-inventory", flag.ContinueOnError)
 		set.SetOutput(io.Discard)
