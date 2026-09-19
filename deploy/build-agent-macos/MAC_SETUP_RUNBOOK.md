@@ -471,6 +471,17 @@ sudo bash install-macos.sh --server <API> --code rne_… \
 第一次执行时 `describe` 的响应连同它那份离线签名一起存在 `/var/rn-machine-setup/<注册码的 sha256>/`
 （root 0600），重跑读的是那一份，而且**签名照验一遍**——走缓存没有让信任链松一格。
 
+加完 key 那一趟才会真的去克隆（`git clone --mirror`，RN-App 第一次拉完要几分钟）。克隆没成的话
+屏幕上会有 git 自己那句话，三种原因各不相同：
+
+| git 说 | 实际是 |
+| --- | --- |
+| `Permission denied (publickey)` | deploy key 没加、加错仓库，或者粘贴时断了行 |
+| 连不上 `github.com` | 网络 |
+| `Host key verification failed` | 安装包里的 `github_known_hosts` 与 GitHub 现在的主机密钥对不上——**别用 `-o StrictHostKeyChecking=no` 绕**，查为什么变了 |
+
+失败留下的半个目录脚本会自己删掉，直接重跑同一条命令。
+
 所以重跑必须用**同一个注册码**：缓存按码的 sha256 归档，换一个没用过的码会真的去问服务端，拿回来的
 是**另一台机器**的描述。
 

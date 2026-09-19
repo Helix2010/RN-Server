@@ -832,16 +832,26 @@ enroll_machine() {
 
 # ---- 8. 仓库镜像 -----------------------------------------------------------------------------
 
+# 装机要在这里停一次：deploy key 是这台机器现场生成的，GitHub 上还没有它，而脚本没有
+# 任何办法替人去加。停下来印出公钥，人加完再执行同一条命令——那一次就该真的克隆。
+#
+# 返回 0 = 镜像就位，继续往下装；返回 1 = 印过公钥了，等人加完再来。
 ensure_mirror() {
   step "仓库镜像"
-  local key="$AGENT_HOME/.ssh/id_ed25519"
+  local key="$AGENT_HOME/.ssh/id_ed25519" fresh=0
   if [ ! -f "$key" ]; then
     sudo -n -u "$AGENT_USER" ssh-keygen -q -t ed25519 -N '' -C "rn-build-agent@$MACHINE_NAME" -f "$key" ||
       die "生成 deploy key 失败"
     note "已生成这台机器的 deploy key"
+    fresh=1
   fi
   if [ -d "$AGENT_HOME/repos/rn-app.git" ]; then
     note "仓库镜像已存在"
+    return 0
+  fi
+  # 这一轮刚生成的 key 不可能已经在 GitHub 上，别拿一次必然失败的克隆去浪费人的时间；
+  # key 是上一轮留下的，就说明人这一趟是加完回来的，该克隆了
+  if [ "$fresh" = 0 ] && clone_mirror; then
     return 0
   fi
   cat <<EOF
@@ -856,13 +866,34 @@ EOF
   return 1
 }
 
+# 防护与 Linux 那台构建机一模一样（install.sh 里的同一段）：
+#
+#   - 先克隆到 .part 再改名。半个目录只可能叫 .part，rn-app.git 要么完整要么不存在——
+#     不然下一次执行会把残缺的仓库当成"镜像已存在"跳过去，错要到跑任务时才冒出来，而且
+#     看着跟装机毫无关系；
+#   - env -i：本机其他用户设的 GIT_* 一个都别带进来；
+#   - 不读系统与全局 git 配置、不跑 hook、不用模板目录（模板里的 hook 会以 _rnbuildagent
+#     的身份执行）、除 ssh 之外什么协议都不许、终端不许弹提示（这台机器没人盯着）。
 clone_mirror() {
   step "克隆仓库镜像"
-  sudo -n -u "$AGENT_USER" env \
-    GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i $AGENT_HOME/.ssh/id_ed25519 -o UserKnownHostsFile=$INSTALL_DIR/github_known_hosts -o StrictHostKeyChecking=yes" \
-    git clone --mirror git@github.com:Helix2010/RN-App.git "$AGENT_HOME/repos/rn-app.git" ||
-    die "克隆失败：确认 deploy key 已经加到 RN-App 仓库"
-  note "镜像已克隆"
+  local part="$AGENT_HOME/repos/rn-app.git.part"
+  sudo -n -u "$AGENT_USER" rm -rf "$part"
+  if sudo -n -u "$AGENT_USER" env -i \
+    PATH="$PATH" HOME="$AGENT_HOME" LANG=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_SSH_COMMAND="ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -i $AGENT_HOME/.ssh/id_ed25519 -o UserKnownHostsFile=$INSTALL_DIR/github_known_hosts -o StrictHostKeyChecking=yes" \
+    git -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.ssh.allow=always \
+    clone --mirror --template= git@github.com:Helix2010/RN-App.git "$part" &&
+    sudo -n -u "$AGENT_USER" chmod 0700 "$part" &&
+    sudo -n -u "$AGENT_USER" chmod -R go-w "$part" &&
+    sudo -n -u "$AGENT_USER" mv "$part" "$AGENT_HOME/repos/rn-app.git"; then
+    note "镜像已克隆"
+    return 0
+  fi
+  sudo -n -u "$AGENT_USER" rm -rf "$part"
+  warn "克隆没成（上面是 git 的原话）。Permission denied (publickey) 就是 deploy key 还没加上或者加错了仓库；
+   连不上 github.com 是网络；Host key verification failed 是安装包里的 github_known_hosts 与 GitHub 现在的主机密钥对不上"
+  return 1
 }
 
 # ---- 9. 常驻 ---------------------------------------------------------------------------------
@@ -924,9 +955,7 @@ main() {
   prepare_signing
   write_env
   enroll_machine
-  if ensure_mirror; then
-    clone_mirror
-  else
+  if ! ensure_mirror; then
     note "加完 deploy key 之后重新执行同一条命令"
     exit 0
   fi
