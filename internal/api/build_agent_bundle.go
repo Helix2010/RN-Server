@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -51,8 +52,10 @@ type signedBundle struct {
 	Commit    string
 }
 
-// signedBundleFor 读安装包目录，要求清单、签名与归档三者齐备且互相对得上。
-func (s *server) signedBundleFor(name string) (signedBundle, error) {
+// signedBundleFor 取一组安装包连同它的离线签名，要求清单、签名与归档三者齐备且互相对得上。
+//
+// 签名来自库（控制台交上来的）或安装包目录里的 manifest.sig，见 bundleSignatureFor。
+func (s *server) signedBundleFor(ctx context.Context, name string) (signedBundle, error) {
 	dir, manifest, err := s.machineBundles()
 	if err != nil {
 		return signedBundle{}, err
@@ -70,22 +73,17 @@ func (s *server) signedBundleFor(name string) (signedBundle, error) {
 	if err != nil {
 		return signedBundle{}, err
 	}
-	sigRaw, err := os.ReadFile(filepath.Join(dir, bundlesig.FileName))
-	if err != nil {
-		return signedBundle{}, errors.New("the deployed bundles have no " + bundlesig.FileName +
-			": a platform admin signs the manifest offline before machines may install it")
-	}
-	signature, err := bundlesig.Parse(sigRaw)
+	signature, err := s.bundleSignatureFor(ctx, dir, raw, manifest.Commit)
 	if err != nil {
 		return signedBundle{}, err
 	}
 	// 服务端自己不验签（它没有那把公钥，也不该有），但清单与签名对不上是这台服务器上的
 	// 事故，不该让每台 Mac 各下一遍几十 MB 才发现
 	if signature.ManifestSHA256 != bundlesig.ManifestSHA256(raw) {
-		return signedBundle{}, errors.New(bundlesig.FileName + " does not match " + machineBundleManifest)
+		return signedBundle{}, errors.New("the stored signature does not match " + machineBundleManifest)
 	}
 	if signature.Commit != manifest.Commit {
-		return signedBundle{}, errors.New(bundlesig.FileName + " was signed for another commit")
+		return signedBundle{}, errors.New("the stored signature was made for another commit")
 	}
 	return signedBundle{Name: name, Dir: dir, Manifest: raw, Signature: signature, Bundle: bundle, Commit: manifest.Commit}, nil
 }
@@ -100,7 +98,7 @@ func (s *server) describeAgentBundle(c *gin.Context) {
 		problem(c, http.StatusNotFound, "MACHINE_BUNDLE_NOT_FOUND", "Bundles exist for linux/amd64 and darwin/arm64")
 		return
 	}
-	signed, err := s.signedBundleFor(name)
+	signed, err := s.signedBundleFor(c.Request.Context(), name)
 	if err != nil {
 		bundleUnavailable(c, name, err)
 		return
@@ -130,7 +128,7 @@ func (s *server) downloadAgentBundle(c *gin.Context) {
 		problem(c, http.StatusNotFound, "MACHINE_BUNDLE_NOT_FOUND", "Bundles exist for linux/amd64 and darwin/arm64")
 		return
 	}
-	signed, err := s.signedBundleFor(name)
+	signed, err := s.signedBundleFor(c.Request.Context(), name)
 	if err != nil {
 		bundleUnavailable(c, name, err)
 		return
@@ -172,10 +170,10 @@ func mustJSON(value any) []byte {
 // 每组各自带 error 而不是整条请求 503：两组安装包的状态是独立的（darwin 那组可能还没
 // 编出来），而这一页存在的理由正是"让人看见现在部署的是什么"——一组坏了就整页看不见，
 // 等于把要看的东西藏起来。
-func (s *server) deployedBundleView(query, name string) gin.H {
+func (s *server) deployedBundleView(ctx context.Context, query, name string) gin.H {
 	view := gin.H{"bundle": name, "query": query, "commit": nil, "sequence": nil,
 		"signedAt": nil, "publicKeySha256": nil, "archive": nil, "error": nil}
-	signed, err := s.signedBundleFor(name)
+	signed, err := s.signedBundleFor(ctx, name)
 	if err != nil {
 		view["error"] = err.Error()
 		return view
@@ -205,8 +203,8 @@ func (s *server) buildAgentVersion(c *gin.Context) {
 		"version":             snapshot.Version,
 		"approvedAgentCommit": nullableString(string(snapshot.Doc.ApprovedAgentCommit)),
 		"bundles": []gin.H{
-			s.deployedBundleView("linux/amd64", machineRoleBuilder),
-			s.deployedBundleView("darwin/arm64", machineBundleBuilderDarwin),
+			s.deployedBundleView(c.Request.Context(), "linux/amd64", machineRoleBuilder),
+			s.deployedBundleView(c.Request.Context(), "darwin/arm64", machineBundleBuilderDarwin),
 		},
 	})
 }

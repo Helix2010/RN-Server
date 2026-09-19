@@ -233,6 +233,10 @@ func (s *server) routes() *gin.Engine {
 	// 在空闲的时候自己升；正在跑的构建不受影响
 	platform.GET("/build-agent-version", s.buildAgentVersion)
 	platform.POST("/build-agent-version", s.approveAgentVersion)
+	// 清单的离线签名走接口交，不必 ssh 进服务器放文件——那等于要求持有发布私钥的人
+	// 同时握着服务器 shell，而这两个角色正是这套设计要分开的
+	platform.GET("/build-agent-version/manifest", s.deployedManifest)
+	platform.POST("/build-agent-version/signature", s.uploadBundleSignature)
 	// 平台离线恢复公钥（build.recovery.recipients）：签名闸生成的密钥都要加密给它，签名闸本机另外 pin
 	platform.GET("/recovery-keys", s.listRecoveryKeys)
 	platform.POST("/recovery-keys", s.createRecoveryKey)

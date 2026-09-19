@@ -249,15 +249,17 @@ curl -s -o /dev/null -w '%{http_code}\n' <API>/v1/machine-setup/install-macos.sh
 
 ### 3.2 A 机签清单
 
-> **这一节现在要服务器 shell，那是开发期的变通，不是最终形态。**
->
-> 服务端目前只**读** `manifest.sig`，没有任何接口能下发未签名的清单、也没有接口能接收签名。
-> 所以取清单和放回签名只能走 `scp`/`ssh`。生产环境运维通常没有服务器 shell，而且更要紧的是：
-> 这让**持有发布私钥的人必须同时握着服务器 shell**——而这两个角色正是整套设计要分开的。攻破
-> 这个人，两样一起拿到。
->
-> 该补的是两个管理端接口（下发清单 / 上传签名）加控制台上对应的两个动作，让运维全程只用浏览器
-> 和离线机器。记在实现文档的「已知缺口」里。
+**走控制台，不要 ssh 进服务器。** 控制台「平台维护 → 打包机与签名闸 → 构建机 → 打包机程序
+版本」那张卡片底下有两个动作：**下载 manifest.json** 和**选择 manifest.sig**。
+
+这不只是方便。只认服务器目录里那个文件的话，签名就必须由有服务器 shell 的人来放——而签名是
+在离线机器上做的，**持有发布私钥的人因此得同时握着服务器 shell**。整套设计的前提是"服务端被
+攻破也换不出能过验的清单"，它要求私钥既不在服务端、也不在能碰服务端的人手上。这两个动作把
+角色分开：离线机器只碰两个文件，浏览器只搬运。
+
+> 那两个动作**不是安全边界**：服务端拿到一份签名也伪造不出有效的，真正的判据是每台 Mac 按你
+> 手抄的指纹 pin 住的那把公钥。服务端上传时做的检查（提交对不对、清单摘要对不对、序号有没有
+> 退）全是**帮你当场发现拿错了文件**，传错了立刻说清楚，好过等一台 Mac 下完几十 MB 才失败。
 
 CI 每次部署都会在服务器上产出一份新的安装包目录，**没签过的一律 503，装不了**。
 
@@ -274,9 +276,12 @@ CI 每次部署都会在服务器上产出一份新的安装包目录，**没签
 `current` 这个软链指向当前那一份。手抄提交号每次都是一次抄错的机会，而且抄错的症状是
 "签了一份没人要的清单"——服务端那边毫无变化，你会以为是别的地方出了问题。
 
+1. 控制台上点**下载 manifest.json**，存到离线机器上一个空目录里。
+2. 在离线机器上签：
+
 ```bash
-mkdir -p ~/sign-bundle && cd ~/sign-bundle && rm -f manifest.json manifest.sig
-scp <服务器>:/opt/rn-foundation/machine-bundles/current/manifest.json .
+cd ~/sign-bundle                      # 放刚下载的 manifest.json，别留上一次的 manifest.sig
+rm -f manifest.sig
 
 # 提交号从清单里读出来，不手抄
 COMMIT=$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]*\)".*/\1/p' manifest.json | head -1)
@@ -285,6 +290,8 @@ echo "$COMMIT"
 /tmp/bundle-sign sign --key ~/rn-release-ios-key/release-key.ed25519 --dir . --sequence <比上次大 1>
 /tmp/bundle-sign verify --pub ~/rn-release-ios-key/release-key.pub --dir . --expect-commit "$COMMIT"
 ```
+
+3. 控制台上点**选择 manifest.sig**，把刚产出的那个文件交上去。
 
 **合格线**：`verify` 打出 `signature is valid: commit …, sequence N, release key sha256 <指纹>`，
 其中的 commit 与上面 `echo "$COMMIT"` 打出来的一致。
@@ -309,15 +316,15 @@ echo "$COMMIT"
 >   数字，不管是谁签的。从 1 开始签出来的清单会被它们当成降级拒掉，而报错说的是序号太低，不会
 >   提示你"是因为你重置了序号"。
 
-### 3.3 放回服务器
+### 3.3 确认服务端收下了
 
-`/opt/rn-foundation/machine-bundles/` 是 root 的，`rn-foundation-apply` 没有放签名的子命令：
+交完之后卡片上会立刻显示提交、序号、签名时间与发布公钥指纹。传错文件会当场报错，报错里写
+清楚是哪一种不符（提交不是当前这一版 / 清单摘要对不上 / 序号没往上走 / 不是这把密钥签的），
+照着改就行。
 
-```bash
-scp manifest.sig <服务器>:/tmp/
-ssh <服务器> "sudo install -o root -g root -m 0644 /tmp/manifest.sig \
-  /opt/rn-foundation/machine-bundles/current/ && rm /tmp/manifest.sig"
-```
+> 还能碰服务器文件系统的话，老办法仍然有效：把 `manifest.sig` 放进
+> `/opt/rn-foundation/machine-bundles/current/`（root:root 0644）。服务端两条路都认，优先用
+> 控制台交上来的那份。但常规流程走控制台——理由见上面那段。
 
 在控制台「平台维护 → 打包机与签名闸 → 构建机 → 打包机程序版本」核对：提交、序号、签名时间、
 发布公钥指纹都对，`error` 消失。**那个指纹就是你密码管理器里记的那个**——密码管理器、签名文件、

@@ -335,7 +335,7 @@ func (s *server) describeEnrollment(c *gin.Context) {
 	// 没签名就什么都不给：一台将要持有全部租户签名材料的机器，不该在"清单还没签"的窗口里
 	// 装上一份没人背书的程序。Linux 那条路不受影响（install.sh 走的是 CI 日志里的摘要）。
 	if m.osOf() == machineOSDarwin {
-		manifestRaw, signature, releaseKey, err := s.signedManifestForSetup()
+		manifestRaw, signature, releaseKey, err := s.signedManifestForSetup(c.Request.Context())
 		if err != nil {
 			bundleUnavailable(c, bundleName, err)
 			return
@@ -555,8 +555,8 @@ func (s *server) enrollMachine(c *gin.Context) {
 // 三样都齐才返回。装机脚本拿它们建立信任链：人给的指纹认公钥 → 公钥验清单 → 可信清单里
 // 的摘要核对归档与包内每个文件。服务端自己不验签（它没有那把私钥，也不该有），但清单与
 // 签名对不上是这台服务器上的事故，signedBundleFor 已经挡在前面了。
-func (s *server) signedManifestForSetup() ([]byte, bundlesig.Signature, string, error) {
-	signed, err := s.signedBundleFor(machineBundleBuilderDarwin)
+func (s *server) signedManifestForSetup(ctx context.Context) ([]byte, bundlesig.Signature, string, error) {
+	signed, err := s.signedBundleFor(ctx, machineBundleBuilderDarwin)
 	if err != nil {
 		return nil, bundlesig.Signature{}, "", err
 	}

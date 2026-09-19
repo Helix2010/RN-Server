@@ -75,6 +75,8 @@ var migrations = []migration{
 	// iOS 打包机在家用网络里（设计 ios-mac-builders-home-network-2026-09-18 §5.4）：
 	// 「最近在线」与自报的签名材料盘点单独一张表，不写回 build.machines 那份 JSON 文档
 	{version: 55, name: "build_machine_liveness", apply: buildMachineLivenessMigration},
+	// 安装包清单的离线签名收在库里，让平台管理员用控制台交签名而不是 ssh 进服务器
+	{version: 56, name: "machine_bundle_signatures", apply: machineBundleSignaturesMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2030,6 +2032,37 @@ func buildMachineLivenessMigration(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE build_machine_liveness ADD COLUMN paused_reason VARCHAR(200) NULL
 			COMMENT '这台机器自己暂停认领的原因，例如空闲空间低于 BUILD_AGENT_MIN_FREE_GB。它仍然每 10 秒来问一次（所以仍然算在线），但请求里带着 paused，服务端记下这一行就回 204 不派活。NULL=没有暂停' AFTER free_gb`); err != nil {
 		return fmt.Errorf("build machine liveness migration paused_reason: %w", err)
+	}
+	return nil
+}
+
+// machineBundleSignaturesMigration 建一张存安装包清单离线签名的表（设计
+// ios-mac-builders-home-network-2026-09-18 §5.6）。
+//
+// 为什么要进库，而不是继续只认 machine-bundles/<提交>/manifest.sig 那个文件：
+// 签名是在**离线机器**上做的，而那台机器按设计不该有服务器的 shell。原来只能
+// scp 进去放文件，等于要求"持有发布私钥的人"同时握着服务器 shell——而这两个角色
+// 正是整套设计要分开的（服务端被攻破也换不出能过验的清单，前提是私钥不在服务端，
+// 也不在能碰服务端的人手上）。收进库之后，交签名是一次管理端接口调用。
+//
+// **这不削弱那道闸。** 签名的权威性来自离线私钥，不来自它怎么送达：服务端拿到一份
+// 签名也伪造不出有效的，Mac 上按人给的指纹 pin 的那把公钥才是判据。服务端本来就能
+// 对这条链路做拒绝服务（归档是它服务的），多一个写入点不增加任何伪造能力。
+//
+// 文件那条路保留：signedBundleFor 先查库、查不到回退读文件，所以离线放文件的老办法
+// 仍然有效。
+func machineBundleSignaturesMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS machine_bundle_signatures (
+		commit_sha VARCHAR(40) NOT NULL COMMENT '这份签名覆盖的构建提交（manifest.json 里的 commit）。一个提交一行；重签同一个提交要用更高的序号',
+		sequence_no BIGINT NOT NULL COMMENT '单调序号。每台 Mac 记住自己见过的最高值，低于它的清单一律拒——这是防「攻破服务端后把机器降回一个有已知漏洞、但当初确实被签过的旧版本」那道闸。回滚要用更高的序号再签一份指向旧提交的清单',
+		manifest_sha256 CHAR(64) NOT NULL COMMENT '被签清单的字节摘要。收下之前与当前部署的 manifest.json 比对过，对不上不收',
+		public_key_sha256 CHAR(64) NOT NULL COMMENT '签它的发布公钥指纹（公钥 32 字节的 sha256）。只用于控制台展示与人工核对，不是服务端的判据——服务端没有 pin 任何公钥，也不该有',
+		signature JSON NOT NULL COMMENT 'manifest.sig 的完整内容（bundlesig.Signature）。原样存，下发时逐字节回给机器',
+		uploaded_by VARCHAR(100) NOT NULL COMMENT '交这份签名的平台管理员',
+		uploaded_at DATETIME(3) NOT NULL COMMENT '收下的时刻 UTC',
+		PRIMARY KEY (commit_sha)
+	) ENGINE=InnoDB COMMENT='安装包清单的离线签名。平台管理员在离线机器上签完，用控制台交上来，免去 ssh 进服务器放文件——那等于要求持有发布私钥的人同时握着服务器 shell'`); err != nil {
+		return fmt.Errorf("machine bundle signatures migration: %w", err)
 	}
 	return nil
 }
