@@ -523,6 +523,23 @@ func TestCheckoutAcceptsACleanMirror(t *testing.T) {
 	}
 }
 
+// macOS 上 git clone 自己写的那两个键不算"不可信"。真机上就栽在这里：Mac 打包机装好、
+// 代理连上了服务端，每一轮都打一条"镜像配置不可信…有不允许的键 core.ignorecase"，一条
+// 任务也不领——而那个键是 git 在 APFS 上 clone 时必写的，人什么都没做错。
+func TestCheckoutAcceptsAMirrorClonedOnMacOS(t *testing.T) {
+	for _, key := range []string{"core.ignorecase", "core.precomposeunicode"} {
+		t.Run(key, func(t *testing.T) {
+			rig := newRig(t)
+			fakebuild.Git(t, rig.bare, "config", key, "true")
+			if err := rig.agent.checkMirror(context.Background()); err != nil {
+				t.Fatalf("a mirror carrying %s was refused: %v\n"+
+					"git writes this itself when cloning on a case-insensitive filesystem; "+
+					"refusing it means no Mac builder ever runs a job", key, err)
+			}
+		})
+	}
+}
+
 // 仓库镜像的 fetch 只放行生产里的 ssh：本地路径与 ext:: 这类传输一律不许，镜像配置里的 url 改不了这一点
 func TestMirrorFetchOnlyAllowsSSH(t *testing.T) {
 	rig := newRig(t)

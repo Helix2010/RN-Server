@@ -63,8 +63,17 @@ exec "$@"
 `, 0o755)
 	// 失败开关走文件，不走环境变量：脚本开头会把所有导出变量 unset 掉（PATH、HOME 等
 	// 几个除外），环境变量传不进桩里。
+	// git 的桩要分清两种调用：config 读/删（normalize_mirror_config）与 clone。
+	// config 的"当前有哪些键"放在 keys 文件里，测试自己摆。
 	write(t, filepath.Join(dir, "bin/git"), `#!/bin/bash
 printf '%s\n' "$*" >>"`+rig.gitLog+`"
+keys="`+filepath.Join(dir, "config-keys")+`"
+case "$*" in
+  *" config --local --get "*)
+    grep -qx "${!#}" "$keys" 2>/dev/null; exit $? ;;
+  *" config --local --unset-all "*)
+    grep -vx "${!#}" "$keys" >"$keys.new" 2>/dev/null; mv "$keys.new" "$keys"; exit 0 ;;
+esac
 dest="${@: -1}"
 # 真的 git clone 是先把目标目录建出来再去连 GitHub 的，失败时地上可能留着半个目录。
 # 桩要照这个顺序来，不然"失败后清不清理"根本测不到。
@@ -106,6 +115,21 @@ if ensure_mirror; then echo "RESULT mirror-ready"; else echo "RESULT needs-deplo
 	}
 	t.Fatalf("ensure_mirror printed no result:\n%s", text)
 	return "", false
+}
+
+// configKeys 摆一份"镜像 config 里现在有哪些键"。
+func (r mirrorRig) configKeys(t *testing.T, keys ...string) {
+	t.Helper()
+	write(t, filepath.Join(r.dir, "config-keys"), strings.Join(keys, "\n")+"\n", 0o600)
+}
+
+func (r mirrorRig) remainingKeys(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(r.dir, "config-keys"))
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 func (r mirrorRig) gitRan(t *testing.T) bool {
@@ -241,4 +265,37 @@ func runBash(t *testing.T, script string) (string, error) {
 	t.Helper()
 	out, err := exec.Command("bash", "-c", script).CombinedOutput()
 	return string(out), err
+}
+
+// macOS 的 git 在 clone 时会往镜像 config 里写 core.ignorecase / core.precomposeunicode。
+// 代理只认一张白名单，多一个键就判"镜像配置不可信"，一条任务都不领——真机上就是这样：
+// 代理起来了、连上了服务端，每次循环打一条 ERROR，队列里的活一条也不碰。
+//
+// 装机脚本必须把它们摘掉，而且**每次执行都摘**：镜像是上一趟克隆的，这一趟不会再克隆。
+func TestMacInstallStripsTheConfigKeysTheAgentRefuses(t *testing.T) {
+	rig := newMirrorRig(t)
+	if err := os.MkdirAll(filepath.Join(rig.agentHome, "repos/rn-app.git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rig.agentHome, ".ssh/id_ed25519"), []byte("key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rig.configKeys(t, "core.bare", "core.ignorecase", "core.precomposeunicode", "remote.origin.url")
+
+	out, needsKey := rig.run(t, false)
+	if needsKey {
+		t.Fatalf("an existing mirror should not send the operator back to GitHub:\n%s", out)
+	}
+	left := rig.remainingKeys(t)
+	for _, gone := range []string{"core.ignorecase", "core.precomposeunicode"} {
+		if strings.Contains(left, gone) {
+			t.Errorf("%s is still in the mirror config; the agent rejects the whole mirror over it "+
+				"and never runs a build:\n%s", gone, out)
+		}
+	}
+	for _, kept := range []string{"core.bare", "remote.origin.url"} {
+		if !strings.Contains(left, kept) {
+			t.Errorf("%s was removed too; it is what makes the mirror a mirror", kept)
+		}
+	}
 }

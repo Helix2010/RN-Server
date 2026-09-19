@@ -847,11 +847,13 @@ ensure_mirror() {
   fi
   if [ -d "$AGENT_HOME/repos/rn-app.git" ]; then
     note "仓库镜像已存在"
+    normalize_mirror_config
     return 0
   fi
   # 这一轮刚生成的 key 不可能已经在 GitHub 上，别拿一次必然失败的克隆去浪费人的时间；
   # key 是上一轮留下的，就说明人这一趟是加完回来的，该克隆了
   if [ "$fresh" = 0 ] && clone_mirror; then
+    normalize_mirror_config
     return 0
   fi
   cat <<EOF
@@ -874,6 +876,23 @@ EOF
 #   - env -i：本机其他用户设的 GIT_* 一个都别带进来；
 #   - 不读系统与全局 git 配置、不跑 hook、不用模板目录（模板里的 hook 会以 _rnbuildagent
 #     的身份执行）、除 ssh 之外什么协议都不许、终端不许弹提示（这台机器没人盯着）。
+# macOS 上 git clone 会往镜像的 config 里写 core.ignorecase 与 core.precomposeunicode
+# （文件系统属性）。代理只认一张白名单，多一个键就判"镜像配置不可信"、一条任务都不领。
+#
+# 为什么由装机脚本摘、而不是只等代理放宽：代理来自**安装包**，它那张名单是哪一版由安装包
+# 决定，而安装包要等平台签一版新清单、再走一遍升级才换得掉；这个脚本是服务端当场下发的。
+# 摘掉是安全的——裸仓库没有工作区，这两个键对 fetch 没有任何作用。
+normalize_mirror_config() {
+  local repo="$AGENT_HOME/repos/rn-app.git" key
+  for key in core.ignorecase core.precomposeunicode; do
+    if sudo -n -u "$AGENT_USER" git --git-dir="$repo" config --local --get "$key" >/dev/null 2>&1; then
+      sudo -n -u "$AGENT_USER" git --git-dir="$repo" config --local --unset-all "$key" ||
+        die "摘不掉镜像 config 里的 ${key}"
+      note "已从镜像 config 摘掉 ${key}（macOS 上 git 自己写的，代理的白名单里没有）"
+    fi
+  done
+}
+
 clone_mirror() {
   step "克隆仓库镜像"
   local part="$AGENT_HOME/repos/rn-app.git.part"

@@ -301,10 +301,15 @@ var mirrorConfigKeys = map[string]bool{
 	"core.filemode":                true,
 	"core.bare":                    true,
 	"core.logallrefupdates":        true,
-	"remote.origin.url":            true,
-	"remote.origin.fetch":          true,
-	"remote.origin.mirror":         true,
-	"remote.origin.tagopt":         true,
+	// macOS 上 git clone 自己写的两个：文件系统大小写不敏感、APFS/HFS+ 的 unicode 预组合。
+	// 它们描述的是**文件系统**，不指向任何地方、也不让任何东西执行；而且 git 在 macOS 上
+	// clone 时必写——不认它们等于 Mac 上克隆出来的镜像一律"配置不可信"，一条任务都跑不了。
+	"core.ignorecase":        true,
+	"core.precomposeunicode": true,
+	"remote.origin.url":      true,
+	"remote.origin.fetch":    true,
+	"remote.origin.mirror":   true,
+	"remote.origin.tagopt":   true,
 }
 
 // mirrorForbiddenEntries 是镜像目录里不许存在的东西：
