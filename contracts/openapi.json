@@ -4643,6 +4643,543 @@
         }
       }
     },
+    "/v1/admin/platform/ios-material": {
+      "get": {
+        "summary": "平台登记的两把材料公钥，以及所有已存材料的总览",
+        "description": "app_configs 平台行 build.ios.material 存两把公钥；材料密文在 ios_signing_material 表。服务端没有任何一把私钥，存的每一份都解不开（设计 docs/design/ios-signing-material-distribution-2026-09-19.md）。",
+        "responses": {
+          "200": {
+            "description": "两把公钥与材料总览",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "recipients",
+                    "items"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "recipients": {
+                      "type": "object",
+                      "required": [
+                        "builder",
+                        "uploader"
+                      ],
+                      "properties": {
+                        "builder": {
+                          "type": "object",
+                          "nullable": true,
+                          "required": [
+                            "publicKey",
+                            "sha256",
+                            "registeredBy",
+                            "registeredAt"
+                          ],
+                          "properties": {
+                            "publicKey": {
+                              "type": "string",
+                              "description": "X25519 公钥，标准 base64"
+                            },
+                            "sha256": {
+                              "type": "string"
+                            },
+                            "registeredBy": {
+                              "type": "string"
+                            },
+                            "registeredAt": {
+                              "type": "string",
+                              "format": "date-time"
+                            }
+                          }
+                        },
+                        "uploader": {
+                          "type": "object",
+                          "nullable": true,
+                          "required": [
+                            "publicKey",
+                            "sha256",
+                            "registeredBy",
+                            "registeredAt"
+                          ],
+                          "properties": {
+                            "publicKey": {
+                              "type": "string",
+                              "description": "X25519 公钥，标准 base64"
+                            },
+                            "sha256": {
+                              "type": "string"
+                            },
+                            "registeredBy": {
+                              "type": "string"
+                            },
+                            "registeredAt": {
+                              "type": "string",
+                              "format": "date-time"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "teamId",
+                          "scope",
+                          "purpose",
+                          "recipientSha256",
+                          "version",
+                          "uploadedBy",
+                          "uploadedAt"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "certificate",
+                              "profile",
+                              "upload-key"
+                            ]
+                          },
+                          "teamId": {
+                            "type": "string"
+                          },
+                          "scope": {
+                            "type": "string",
+                            "description": "描述文件是 bundle id；证书与上传 Key 是空串（这个 Team 一份，所有 Mac 共用）"
+                          },
+                          "purpose": {
+                            "type": "string",
+                            "enum": [
+                              "ios-builder-material",
+                              "ios-uploader-material"
+                            ]
+                          },
+                          "recipientSha256": {
+                            "type": "string"
+                          },
+                          "version": {
+                            "type": "integer"
+                          },
+                          "uploadedBy": {
+                            "type": "string"
+                          },
+                          "uploadedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "500": {
+            "description": "IOS_MATERIAL_UNAVAILABLE"
+          }
+        }
+      },
+      "post": {
+        "summary": "上传一份材料密文（浏览器或离线工具封好的 box）",
+        "description": "请求体就是那份 box.json，原样入库、原样下发——服务端一个字节都不改，也读不懂。只检查形状与收件人：密文加密给的公钥必须是当前登记的那一把（按 purpose 选 builder 或 uploader），否则 409 IOS_MATERIAL_RECIPIENT_UNKNOWN——那种密文永远没有机器解得开。同一格（kind, teamId, scope）重复上传就是换一版，版本号加一，只留当前这一份。审计 ios_material_upload。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "v",
+                  "alg",
+                  "purpose",
+                  "kind",
+                  "teamId",
+                  "recipientSha256",
+                  "epk",
+                  "nonce",
+                  "ct",
+                  "createdAt"
+                ],
+                "properties": {
+                  "v": {
+                    "type": "integer"
+                  },
+                  "alg": {
+                    "type": "string"
+                  },
+                  "purpose": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "teamId": {
+                    "type": "string"
+                  },
+                  "bundleId": {
+                    "type": "string",
+                    "description": "只有描述文件有"
+                  },
+                  "recipientSha256": {
+                    "type": "string"
+                  },
+                  "epk": {
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "type": "string"
+                  },
+                  "ct": {
+                    "type": "string"
+                  },
+                  "createdAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "收下了",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "IOS_MATERIAL_INVALID（不是一份合法的 box）"
+          },
+          "409": {
+            "description": "IOS_MATERIAL_RECIPIENT_UNKNOWN（加密给的不是当前登记的那把公钥）"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/ios-material/recipients": {
+      "put": {
+        "summary": "登记两把平台公钥（构建账户一把、上传账户一把）",
+        "description": "私钥在密码管理器里，装机时放到每台 Mac 的对应账户下；这里只收公钥。两把不能是同一把——那样拿到构建账户就同时拿到了上传能力。换公钥会让已经存着的密文作废（新私钥解不开旧密文），响应里的 orphanedMaterial 是作废的份数。审计 ios_material_recipients。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "builderPublicKey",
+                  "uploaderPublicKey",
+                  "expectedVersion",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "builderPublicKey": {
+                    "type": "string"
+                  },
+                  "uploaderPublicKey": {
+                    "type": "string"
+                  },
+                  "expectedVersion": {
+                    "type": "integer"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "confirm": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登记好了",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "version",
+                    "builderSha256",
+                    "uploaderSha256",
+                    "orphanedMaterial"
+                  ],
+                  "properties": {
+                    "version": {
+                      "type": "integer"
+                    },
+                    "builderSha256": {
+                      "type": "string"
+                    },
+                    "uploaderSha256": {
+                      "type": "string"
+                    },
+                    "orphanedMaterial": {
+                      "type": "integer",
+                      "description": "换完之后解不开的已存材料份数"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_IOS_MATERIAL_RECIPIENTS（公钥不是 32 字节 X25519、两把相同、reason 太短、没 confirm）"
+          },
+          "409": {
+            "description": "IOS_MATERIAL_VERSION_CONFLICT"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/ios-material/remove": {
+      "post": {
+        "summary": "删掉一份已存材料",
+        "description": "只删服务端存的密文：**已经装到机器上的那一份不会消失**，那要人去机器上清（运维手册 §5 退役清单）或者吊销机器。审计 ios_material_remove。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "teamId",
+                  "scope",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "teamId": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "confirm": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "删了",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "removed"
+                  ],
+                  "properties": {
+                    "removed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_IOS_MATERIAL_REMOVAL"
+          },
+          "404": {
+            "description": "IOS_MATERIAL_NOT_FOUND"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/ios-material": {
+      "get": {
+        "summary": "这台机器该装哪些 iOS 签名材料（只回清单，不回密文）",
+        "description": "三样材料都是按 (kind, teamId, scope) 一份、所有 macOS 打包机共用：清单不按机器筛。机器拿它与本机已装版本比对，只去取新的。鉴权 x-machine-token（构建机通道）。",
+        "responses": {
+          "200": {
+            "description": "清单",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "teamId",
+                          "scope",
+                          "purpose",
+                          "recipientSha256",
+                          "version",
+                          "uploadedBy",
+                          "uploadedAt"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "certificate",
+                              "profile",
+                              "upload-key"
+                            ]
+                          },
+                          "teamId": {
+                            "type": "string"
+                          },
+                          "scope": {
+                            "type": "string",
+                            "description": "描述文件是 bundle id；证书与上传 Key 是空串（这个 Team 一份，所有 Mac 共用）"
+                          },
+                          "purpose": {
+                            "type": "string",
+                            "enum": [
+                              "ios-builder-material",
+                              "ios-uploader-material"
+                            ]
+                          },
+                          "recipientSha256": {
+                            "type": "string"
+                          },
+                          "version": {
+                            "type": "integer"
+                          },
+                          "uploadedBy": {
+                            "type": "string"
+                          },
+                          "uploadedAt": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED"
+          },
+          "500": {
+            "description": "IOS_MATERIAL_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/ios-material/box": {
+      "get": {
+        "summary": "取一份材料密文，原样下发",
+        "description": "响应体就是入库时收到的那份 box.json，逐字节相同——服务端只是快递员。解开它要对应角色的私钥（构建账户或上传账户），那两把只在 Mac 上。",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "certificate",
+                "profile",
+                "upload-key"
+              ]
+            }
+          },
+          {
+            "name": "teamId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "描述文件填 bundle id；证书与上传 Key 填空串"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "密文（application/json，但对服务端与代理都是不透明字节）"
+          },
+          "404": {
+            "description": "IOS_MATERIAL_NOT_FOUND"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED"
+          },
+          "500": {
+            "description": "IOS_MATERIAL_UNAVAILABLE"
+          }
+        }
+      }
+    },
     "/v1/machine-setup/install.sh": {
       "get": {
         "summary": "The machine installation script",
