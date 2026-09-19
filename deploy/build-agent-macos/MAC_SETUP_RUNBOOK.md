@@ -185,8 +185,20 @@ ls ~/rn-release-ios-key/ 2>/dev/null || echo "干净"
 
 ## 2. B 机：打包机体检
 
-脚本的 `preflight` 会一次性把缺的全列出来再退出，**检查阶段失败不消耗注册码**。所以嫌麻烦
-可以直接跳到第 4 步让它体检。提前对一眼省来回。
+脚本的 `preflight` 会一次性把缺的全列出来再退出，**检查阶段失败不消耗注册码**——报错里那句
+"注册码还没有使用"就是这个意思，补齐之后重跑同一条命令即可。所以嫌麻烦可以直接跳到第 4 步让
+它体检。提前对一眼省来回。
+
+> **先确认你在 B 机上。** macOS 提示符里的主机名是网络给的，换个网络就变，两台机器很容易看
+> 混。装之前在这台机器上跑一次：
+>
+> ```bash
+> scutil --get ComputerName
+> ls ~/rn-release-ios-key/ 2>/dev/null || echo "干净：这台没有发布私钥"
+> ```
+>
+> 列出文件就说明发布私钥在这台机器上，**不能在它上面装打包机**（第 0 节那条铁律）。换一台，
+> 或者先把私钥挪走（拷到签名机、这台 `rm -P` 删干净）。
 
 ```bash
 uname -m                                   # 必须 arm64
@@ -216,6 +228,14 @@ sudo systemsetup -getusingnetworktime      # 必须 On
 ### 常见的补法
 
 ```bash
+# node / pnpm / CocoaPods。**必须用 Homebrew**，因为脚本把
+# PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin 写进 env 文件交给构建进程，
+# 装在别处的工具到时候找不到：nvm 装在 ~/.nvm，gem install cocoapods 可能落在 ~/.gem。
+# Apple Silicon 上 Homebrew 正好装进 /opt/homebrew/bin。
+brew install node pnpm cocoapods
+# 别装 node@22：它是 keg-only，不会链进 /opt/homebrew/bin
+node --version && which node pnpm pod
+
 # 空间用 df -g，不是 df -h：脚本读 df -g / 的第 4 列，按整数 GB 比。
 # APFS 容器里所有卷共享同一个 Avail，df -h 列一大堆看着乱。
 df -g /
