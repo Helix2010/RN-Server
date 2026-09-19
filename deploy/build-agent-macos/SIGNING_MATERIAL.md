@@ -150,6 +150,11 @@ sudo -u _rnbuilder security delete-certificate -Z <旧证书的 SHA-1> "$K"
 租户的 Account Holder / Admin 在 App Store Connect → Users and Access → Integrations →
 App Store Connect API → Team Keys → `+`，角色选 Developer，**`.p8` 只能下载一次**。
 
+> **2026-09-19 起有更省事的一条**：走完第 6 节那三步之后，这把 Key 可以在控制台上传——
+> 租户的「iOS 打包与分发」页 → iOS 签名材料 → 每台机器的上传 Key，选那台 Mac、填 issuer id
+> 与 key id、选 `.p8`，浏览器加密后上传，机器下一轮认领时自己装。下面这段手工放的做法留着
+> 兜底（没登记平台密钥、或者那台机器还没换到含 D 期的版本时用它）。
+
 放到那台 Mac：
 
 ```bash
@@ -436,8 +441,9 @@ ls -ld /opt/rn-build-agent /opt/rn-build-agent/allowed_signers    # 都应该是
 | 2 | 两个**公钥**登记到控制台「平台维护 → iOS 签名材料」 | 控制台（§6.2） |
 | 3 | 两把**私钥**放到每台 Mac 上，核对指纹 | 每台 Mac（§6.3） |
 
-三步走完，证书、描述文件、上传 Key 就在控制台上传一次、机器自己取；第 1.3 节那套人工放
-材料的路留着兜底，没走完这三步时仍然按它做。
+三步走完，证书、描述文件、上传 Key 就在**租户的「iOS 打包与分发」页**上传一次、机器自己取
+（平台的「iOS 签名材料」页只放两把平台公钥和一张只读总览——上传要 Apple Team ID，而那个值
+写在租户页上）。第 1.3 节与第 2 节那套人工放材料的路留着兜底，没走完这三步时仍然按它做。
 
 ### 6.1 生成（全平台一次，在 A 机上）
 
