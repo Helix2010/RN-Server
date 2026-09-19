@@ -444,6 +444,26 @@ func TestMacInstallScriptBuildsRoleAccountsWithDscl(t *testing.T) {
 	}
 }
 
+// 变量名后面紧跟中文时必须写成 ${var}。
+//
+// 这个脚本跑在 macOS 自带的 /bin/bash 上，而那是 **bash 3.2**（2006 年的 GPLv2 版本），
+// 多字节处理比 bash 4/5 弱：`$uid、` 会被它把顿号的头一个字节算进变量名，于是去找一个
+// 不存在的 `uid<byte>`，在 set -u 下当场 unbound variable。同样的写法在 Linux 的 bash 5
+// 上完全正常——所以本地怎么测都测不出来。
+//
+// 这类错**只在报错路径上触发**，正是最需要那条消息的时候。装第一台机器时就是这样：建
+// 账户失败的那条 die 自己先炸了，真正的原因一个字都没打出来。
+func TestMacInstallScriptBracesVariablesBeforeNonASCII(t *testing.T) {
+	unbraced := regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|[0-9])[^\x00-\x7f]`)
+	for i, line := range strings.Split(string(InstallMacOSScript), "\n") {
+		if m := unbraced.FindString(line); m != "" {
+			t.Errorf("install-macos.sh:%d writes %q; macOS ships bash 3.2, which folds the first byte "+
+				"of the following multibyte character into the variable name and then dies with "+
+				"\"unbound variable\" under set -u. Write ${...} instead.", i+1, m)
+		}
+	}
+}
+
 // 机密不进命令行参数：注册码经 stdin 的 curl 配置或环境变量传，钥匙串口令不 echo。
 func TestMacInstallScriptKeepsSecretsOutOfArgv(t *testing.T) {
 	script := string(InstallMacOSScript)

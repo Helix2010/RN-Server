@@ -198,7 +198,7 @@ preflight() {
     xcode_path="$(xcode-select -p 2>/dev/null || true)"
     case "$xcode_path" in
       /Applications/Xcode*.app/*) ;;
-      *) MISSING+=("xcode-select 指向 $xcode_path，不像一个用 xip 装好的 Xcode（不要用 App Store 装：它会静默升级）") ;;
+      *) MISSING+=("xcode-select 指向 ${xcode_path}，不像一个用 xip 装好的 Xcode（不要用 App Store 装：它会静默升级）") ;;
     esac
   fi
   if command -v git >/dev/null 2>&1; then
@@ -217,7 +217,7 @@ preflight() {
     if command -v "$tool" >/dev/null 2>&1; then
       case "$(command -v "$tool")" in
         /usr/local/bin/* | /opt/homebrew/bin/* | /usr/bin/* | /bin/*) ;;
-        *) MISSING+=("$tool 装在 $(command -v "$tool")，不在交给执行进程的 PATH（$BUILD_PATH）里") ;;
+        *) MISSING+=("$tool 装在 $(command -v "$tool")，不在交给执行进程的 PATH（${BUILD_PATH}）里") ;;
       esac
     fi
   done
@@ -332,8 +332,8 @@ ensure_role_account() { # $1 用户名
   # 不能登录：口令写成 *（没有可用的认证方式），并隐藏出登录窗口
   dscl . -create "/Users/$1" Password '*' >/dev/null 2>&1
   dscl . -create "/Users/$1" IsHidden 1 >/dev/null 2>&1
-  id "$1" >/dev/null 2>&1 || die "角色账户 $1 建完仍然解析不了（uid $uid、gid $gid）"
-  note "已建角色账户 $1（uid $uid）"
+  id "$1" >/dev/null 2>&1 || die "角色账户 $1 建完仍然解析不了（uid ${uid}、gid ${gid}）"
+  note "已建角色账户 ${1}（uid ${uid}）"
 }
 
 # ensure_role_group 建一个组。
@@ -388,10 +388,10 @@ describe() {
       --data-binary @- "$SERVER/v1/machine-setup/describe")" || status="000"
   if [ "$status" != 200 ]; then
     if [ -f "$CACHE/describe.json" ]; then
-      warn "describe 返回 $status，用第一次执行时留下的结果继续（注册码可能已经用过）"
+      warn "describe 返回 ${status}，用第一次执行时留下的结果继续（注册码可能已经用过）"
       cp "$CACHE/describe.json" "$body"
     else
-      die "describe 返回 $status：注册码过期或已用过就到控制台重发一个"
+      die "describe 返回 ${status}：注册码过期或已用过就到控制台重发一个"
     fi
   else
     install -d -o root -g wheel -m 0700 "$SETUP_ROOT" "$CACHE"
@@ -491,7 +491,7 @@ PY
   local got_key_sha
   got_key_sha="$(release_key_sha256 "$WORK/release-key.pub")"
   if [ "$got_key_sha" != "$RELEASE_KEY_SHA256" ]; then
-    die "服务端给的发布公钥指纹是 $got_key_sha，与 --release-key-sha256 $RELEASE_KEY_SHA256 不符。
+    die "服务端给的发布公钥指纹是 ${got_key_sha}，与 --release-key-sha256 $RELEASE_KEY_SHA256 不符。
    这个值是公钥**字节**的摘要（bundle-sign key create / key public 打印的那一行、控制台上显示的那一个），
    不是 release-key.pub 这个文件的摘要。确认手里的值取自密码管理器；仍然不符就不要继续装。"
   fi
@@ -511,7 +511,7 @@ PY
   want_manifest="$(sed -n 's/^manifestSha256=//p' "$WORK/signed-bytes")"
   got_manifest="$(sha256_of "$WORK/manifest.json")"
   if [ "$want_manifest" != "$got_manifest" ]; then
-    die "服务端给的清单摘要是 $got_manifest，签名覆盖的是 $want_manifest：这不是被签的那一份清单"
+    die "服务端给的清单摘要是 ${got_manifest}，签名覆盖的是 ${want_manifest}：这不是被签的那一份清单"
   fi
   BUNDLE_COMMIT="$(sed -n 's/^commit=//p' "$WORK/signed-bytes")"
   BUNDLE_SEQUENCE="$(sed -n 's/^sequence=//p' "$WORK/signed-bytes")"
@@ -558,8 +558,8 @@ PY
   BUNDLE_ARCHIVE="$(printf '%s' "$parsed" | sed -n 2p)"
   BUNDLE_SHA256="$(printf '%s' "$parsed" | sed -n 3p)"
   BUNDLE_SIZE="$(printf '%s' "$parsed" | sed -n 4p)"
-  note "发布公钥指纹与带外给的值一致，清单的离线签名验过（序号 $BUNDLE_SEQUENCE）"
-  note "机器 $MACHINE_NAME，安装包 $BUNDLE_ARCHIVE（提交 ${BUNDLE_COMMIT:-未知}）"
+  note "发布公钥指纹与带外给的值一致，清单的离线签名验过（序号 ${BUNDLE_SEQUENCE}）"
+  note "机器 ${MACHINE_NAME}，安装包 ${BUNDLE_ARCHIVE}（提交 ${BUNDLE_COMMIT:-未知}）"
 }
 
 fetch_bundle() {
@@ -582,7 +582,7 @@ fetch_bundle() {
     actual="$(sha256_of "$archive.part")"
     if [ "$size" != "$BUNDLE_SIZE" ] || [ "$actual" != "$BUNDLE_SHA256" ]; then
       rm -f "$archive.part"
-      die "下载的是 $size 字节、sha256 $actual，清单说是 $BUNDLE_SIZE 字节、$BUNDLE_SHA256：拒绝安装"
+      die "下载的是 $size 字节、sha256 ${actual}，清单说是 $BUNDLE_SIZE 字节、${BUNDLE_SHA256}：拒绝安装"
     fi
     chmod 0600 "$archive.part"
     mv -f "$archive.part" "$archive"
@@ -622,7 +622,7 @@ if missing:
 PY
   rm -rf "$BUNDLE"
   mv "$BUNDLE.new" "$BUNDLE"
-  note "安装包核对通过（归档 sha256 $BUNDLE_SHA256）"
+  note "安装包核对通过（归档 sha256 ${BUNDLE_SHA256}）"
 }
 
 put_file() { # $1 源 $2 目标 $3 属主 $4 属组 $5 权限
@@ -653,12 +653,12 @@ install_programs() {
   [ -f "$BUNDLE/allowed_signers" ] || die "安装包里没有 allowed_signers"
   key_sha="$(release_key_sha256 "$BUNDLE/release-key.pub")"
   [ "$key_sha" = "$RELEASE_KEY_SHA256" ] ||
-    die "归档里发布公钥的指纹是 $key_sha，与 --release-key-sha256 不符。
+    die "归档里发布公钥的指纹是 ${key_sha}，与 --release-key-sha256 不符。
    清单验过签、包内文件也与清单一致，却出现这个，说明签出这份清单的密钥不是运维手里的
    那一把——不该继续装。"
   put_file "$BUNDLE/release-key.pub" "$INSTALL_DIR/release-key.pub" root wheel 0644
   put_file "$BUNDLE/allowed_signers" "$INSTALL_DIR/allowed_signers" root wheel 0644
-  note "两把信任根就位（发布公钥指纹 $key_sha）"
+  note "两把信任根就位（发布公钥指纹 ${key_sha}）"
   if [ -f "$BUNDLE/github_known_hosts" ]; then
     put_file "$BUNDLE/github_known_hosts" "$INSTALL_DIR/github_known_hosts" root wheel 0644
   elif [ ! -f "$INSTALL_DIR/github_known_hosts" ]; then
@@ -676,7 +676,7 @@ smoke_test() {
   step "冒烟"
   local code=0
   env -i "$INSTALL_DIR/build-agent" >/dev/null 2>&1 || code=$?
-  [ "$code" = 2 ] || die "空环境下 build-agent 的退出码是 $code，应该是 2（配置不全）"
+  [ "$code" = 2 ] || die "空环境下 build-agent 的退出码是 ${code}，应该是 2（配置不全）"
   sudo -n -u "$RUNNER_USER" "$INSTALL_DIR/build-runner" self-check \
     --jobs-root "$JOBS_ROOT" --protocol 1 --expect-separated >/dev/null ||
     die "build-runner 以 $RUNNER_USER 自检失败：检查 sudoers 与 $JOBS_ROOT 的权限"
@@ -709,7 +709,7 @@ EOF
   cat <<EOF
 
    下面这些**由人放**，脚本不碰（设计 §4.4）：
-     1. 每个 Team 的 Apple Distribution 证书（.p12）导进 $keychain：
+     1. 每个 Team 的 Apple Distribution 证书（.p12）导进 ${keychain}：
           sudo -u $RUNNER_USER security import <证书>.p12 -k $keychain -T /usr/bin/codesign
           sudo -u $RUNNER_USER security set-key-partition-list -S apple-tool:,apple: \\
                -s -k "\$(sudo cat $password_file)" $keychain
@@ -775,7 +775,7 @@ enroll_machine() {
   chown -R "$AGENT_USER:$AGENT_USER" "$AGENT_HOME"
   chmod 0600 "$ENV_FILE"
   chmod 0700 "$AGENT_HOME" "$AGENT_HOME/state"
-  note "已注册，机器令牌写进了 $ENV_FILE（这个脚本没有读它）"
+  note "已注册，机器令牌写进了 ${ENV_FILE}（这个脚本没有读它）"
 }
 
 # ---- 8. 仓库镜像 -----------------------------------------------------------------------------
