@@ -15,23 +15,19 @@ package keystorebox
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/hkdf"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"unicode/utf8"
 
 	"github.com/Helix2010/RN-Server/signing/fingerprint"
 	"github.com/Helix2010/RN-Server/signing/ident"
+	"github.com/Helix2010/RN-Server/signing/internal/sealedbox"
 )
 
 const (
@@ -302,10 +298,10 @@ func (b Box) ValidateShape() error {
 	if !fingerprint.Valid(b.RecipientSHA256) {
 		return errors.New("box recipientSha256 must be 64 lowercase hex characters")
 	}
-	if _, err := decodeFixed(b.EphemeralPublicKey, x25519KeySize); err != nil {
+	if _, err := sealedbox.DecodeFixed(b.EphemeralPublicKey, x25519KeySize); err != nil {
 		return errors.New("box epk must be base64 of 32 bytes")
 	}
-	if _, err := decodeFixed(b.Nonce, gcmNonceSize); err != nil {
+	if _, err := sealedbox.DecodeFixed(b.Nonce, gcmNonceSize); err != nil {
 		return errors.New("box nonce must be base64 of 12 bytes")
 	}
 	ct, err := base64.StdEncoding.Strict().DecodeString(b.Ciphertext)
@@ -368,8 +364,7 @@ func sealWith(p Plaintext, recipientX25519Pub []byte, ephemeral *ecdh.PrivateKey
 	if len(recipientX25519Pub) != x25519KeySize {
 		return Box{}, errors.New("keystorebox: recipient public key must be 32 bytes")
 	}
-	recipient, err := ecdh.X25519().NewPublicKey(recipientX25519Pub)
-	if err != nil {
+	if _, err := ecdh.X25519().NewPublicKey(recipientX25519Pub); err != nil {
 		return Box{}, fmt.Errorf("keystorebox: recipient public key: %w", err)
 	}
 	if err := p.Validate(); err != nil {
@@ -383,25 +378,18 @@ func sealWith(p Plaintext, recipientX25519Pub []byte, ephemeral *ecdh.PrivateKey
 	if err != nil {
 		return Box{}, err
 	}
-	defer wipe(plain)
-	shared, err := ephemeral.ECDH(recipient)
+	defer sealedbox.Wipe(plain)
+	sealed, err := sealedbox.SealWith(kdfLabel, Purpose, plain, recipientX25519Pub, ephemeral, nonce)
 	if err != nil {
-		return Box{}, fmt.Errorf("keystorebox: key agreement: %w", err)
+		return Box{}, fmt.Errorf("keystorebox: %w", err)
 	}
-	defer wipe(shared)
-	epk := ephemeral.PublicKey().Bytes()
-	aead, err := newAEAD(shared, epk, recipientX25519Pub)
-	if err != nil {
-		return Box{}, err
-	}
-	ct := aead.Seal(nil, nonce, plain, additionalData(recipientSHA))
 	box := Box{
 		Version:            Version,
 		Algorithm:          Algorithm,
-		RecipientSHA256:    recipientSHA,
-		EphemeralPublicKey: base64.StdEncoding.EncodeToString(epk),
-		Nonce:              base64.StdEncoding.EncodeToString(nonce),
-		Ciphertext:         base64.StdEncoding.EncodeToString(ct),
+		RecipientSHA256:    sealed.RecipientSHA256,
+		EphemeralPublicKey: sealed.EphemeralPublicKey,
+		Nonce:              sealed.Nonce,
+		Ciphertext:         sealed.Ciphertext,
 	}
 	if err := box.ValidateShape(); err != nil {
 		return Box{}, fmt.Errorf("keystorebox: sealed box failed its own shape check: %w", err)
@@ -426,34 +414,24 @@ func Open(b Box, x25519Private []byte) (Plaintext, error) {
 	if b.RecipientSHA256 != ownSHA {
 		return Plaintext{}, ErrNotAddressedToThisKey
 	}
-	return open(b, priv, additionalData(b.RecipientSHA256))
+	return open(b, priv, Purpose)
 }
 
-func open(b Box, priv *ecdh.PrivateKey, aad []byte) (Plaintext, error) {
-	ownPub := priv.PublicKey().Bytes()
-	ownSHA := fingerprint.SHA256Hex(ownPub)
-	epk, _ := decodeFixed(b.EphemeralPublicKey, x25519KeySize)
-	nonce, _ := decodeFixed(b.Nonce, gcmNonceSize)
-	ct, _ := base64.StdEncoding.Strict().DecodeString(b.Ciphertext)
-	ephemeral, err := ecdh.X25519().NewPublicKey(epk)
-	if err != nil {
+func open(b Box, priv *ecdh.PrivateKey, purpose string) (Plaintext, error) {
+	ownSHA := fingerprint.SHA256Hex(priv.PublicKey().Bytes())
+	plain, err := sealedbox.Open(sealedbox.Sealed{
+		RecipientSHA256:    b.RecipientSHA256,
+		EphemeralPublicKey: b.EphemeralPublicKey,
+		Nonce:              b.Nonce,
+		Ciphertext:         b.Ciphertext,
+	}, kdfLabel, purpose, priv)
+	switch {
+	case errors.Is(err, sealedbox.ErrNotAddressedToThisKey):
+		return Plaintext{}, ErrNotAddressedToThisKey
+	case err != nil:
 		return Plaintext{}, ErrDecrypt
 	}
-	shared, err := priv.ECDH(ephemeral)
-	if err != nil {
-		// 低阶点：只可能是构造出来的密文
-		return Plaintext{}, ErrDecrypt
-	}
-	defer wipe(shared)
-	aead, err := newAEAD(shared, epk, ownPub)
-	if err != nil {
-		return Plaintext{}, err
-	}
-	plain, err := aead.Open(nil, nonce, ct, aad)
-	if err != nil {
-		return Plaintext{}, ErrDecrypt
-	}
-	defer wipe(plain)
+	defer sealedbox.Wipe(plain)
 	var wire wirePlaintext
 	decoder := json.NewDecoder(bytes.NewReader(plain))
 	decoder.DisallowUnknownFields()
@@ -476,38 +454,6 @@ func open(b Box, priv *ecdh.PrivateKey, aad []byte) (Plaintext, error) {
 // RecipientSHA256 返回 X25519 公钥的指纹（pin 文件与 Box 用的那个值）。
 func RecipientSHA256(x25519Pub []byte) string { return fingerprint.SHA256Hex(x25519Pub) }
 
-func newAEAD(shared, epk, recipientPub []byte) (cipher.AEAD, error) {
-	var info strings.Builder
-	info.WriteString(kdfLabel)
-	info.Write(epk)
-	info.Write(recipientPub)
-	key, err := hkdf.Key(sha256.New, shared, nil, info.String(), 32)
-	if err != nil {
-		return nil, err
-	}
-	defer wipe(key)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCM(block)
-}
-
-func additionalData(recipientSHA string) []byte {
-	return []byte(kdfLabel + "\n" + Purpose + "\n" + recipientSHA)
-}
-
-func decodeFixed(s string, size int) ([]byte, error) {
-	raw, err := base64.StdEncoding.Strict().DecodeString(s)
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) != size {
-		return nil, errors.New("wrong length")
-	}
-	return raw, nil
-}
-
 func contains(list []string, v string) bool {
 	for _, item := range list {
 		if item == v {
@@ -515,11 +461,4 @@ func contains(list []string, v string) bool {
 		}
 	}
 	return false
-}
-
-// wipe 尽力清掉内存里的中间值。Go 的字符串清不掉，这只覆盖字节切片。
-func wipe(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
 }

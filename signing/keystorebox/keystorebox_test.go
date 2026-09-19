@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Helix2010/RN-Server/signing/internal/sealedbox"
 	"log/slog"
 	"sort"
 	"strings"
@@ -165,17 +166,14 @@ func TestAdditionalDataIsAuthenticated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, aad := range map[string][]byte{
-		"other purpose":   []byte(kdfLabel + "\nandroid-debug-keystore\n" + box.RecipientSHA256),
-		"other recipient": additionalData(strings.Repeat("1", 64)),
-		"other version":   []byte("rn-build-keystore/v2\n" + Purpose + "\n" + box.RecipientSHA256),
-		"empty":           nil,
-	} {
-		if _, err := open(box, a, aad); !errors.Is(err, ErrDecrypt) {
-			t.Errorf("%s: open = %v, want ErrDecrypt", name, err)
+	// 用途进了认证数据：同一把私钥即便被授予两种身份，一种的密文也不会被当成另一种解开。
+	// 信封本身那几条（换收件人、换标签、改密文）在 internal/sealedbox 的用例里。
+	for _, purpose := range []string{"android-debug-keystore", "ios-signing-material", ""} {
+		if _, err := open(box, a, purpose); !errors.Is(err, ErrDecrypt) {
+			t.Errorf("purpose %q: open = %v, want ErrDecrypt", purpose, err)
 		}
 	}
-	if _, err := open(box, a, additionalData(box.RecipientSHA256)); err != nil {
+	if _, err := open(box, a, Purpose); err != nil {
 		t.Fatalf("control: %v", err)
 	}
 }
@@ -184,22 +182,15 @@ func TestAdditionalDataIsAuthenticated(t *testing.T) {
 // 对"密码学上合法、内容不合法"的明文的处理。
 func encryptRaw(t *testing.T, recipient *ecdh.PrivateKey, plain []byte) Box {
 	t.Helper()
-	eph := newKey(t)
-	shared, err := eph.ECDH(recipient.PublicKey())
+	sealed, err := sealedbox.SealWith(kdfLabel, Purpose, plain, recipient.PublicKey().Bytes(), newKey(t), make([]byte, 12))
 	if err != nil {
 		t.Fatal(err)
 	}
-	aead, err := newAEAD(shared, eph.PublicKey().Bytes(), recipient.PublicKey().Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
-	nonce := make([]byte, 12)
-	sha := RecipientSHA256(recipient.PublicKey().Bytes())
 	return Box{
-		Version: Version, Algorithm: Algorithm, RecipientSHA256: sha,
-		EphemeralPublicKey: base64.StdEncoding.EncodeToString(eph.PublicKey().Bytes()),
-		Nonce:              base64.StdEncoding.EncodeToString(nonce),
-		Ciphertext:         base64.StdEncoding.EncodeToString(aead.Seal(nil, nonce, plain, additionalData(sha))),
+		Version: Version, Algorithm: Algorithm, RecipientSHA256: sealed.RecipientSHA256,
+		EphemeralPublicKey: sealed.EphemeralPublicKey,
+		Nonce:              sealed.Nonce,
+		Ciphertext:         sealed.Ciphertext,
 	}
 }
 

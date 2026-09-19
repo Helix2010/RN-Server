@@ -422,6 +422,56 @@ ls -ld /opt/rn-build-agent /opt/rn-build-agent/allowed_signers    # 都应该是
 
 ---
 
+## 6. 材料分发密钥（密文分发，建设中）
+
+设计见 [`ios-signing-material-distribution-2026-09-19.md`](../../docs/design/ios-signing-material-distribution-2026-09-19.md)。
+目标是把第 1、2 节那些"由人逐台放"的材料改成**控制台传一次、每台 Mac 自己取**，而服务端
+全程只见密文。
+
+**现在可以做的只有一步：生成平台密钥。**上传与自动下发（B、C 期）还没上线，材料仍旧按第
+1.3 节人工放。
+
+### 6.1 生成（全平台一次，在 A 机上）
+
+```bash
+cd <RN-Server 仓库>/signing && go build -o /tmp/ios-material ./cmd/ios-material
+/tmp/ios-material keygen --out ~/rn-ios-material-keys
+```
+
+产出两把，**按角色分开**：
+
+| 文件 | 给谁 | 解什么 |
+| --- | --- | --- |
+| `builder.x25519` | 每台 Mac 的 `_rnbuilder` | Distribution 证书（`.p12` + 口令）、描述文件 |
+| `uploader.x25519` | 每台 Mac 的 `_rnuploader` | App Store Connect 上传 Key（`.p8`） |
+
+合成一把的话，拿到构建账户就同时拿到了上传能力——而那正是 Mac 上三个账户分开要挡的事。
+
+### 6.2 立刻要做的三件事
+
+1. 两把**私钥进密码管理器**，连同 `keygen` 打出来的指纹；
+2. 两个 `.pub` 的内容记下来，B 期上线后登记到控制台；
+3. 确认密码管理器里有了之后，删掉 A 机上的私钥文件（或者让它留在这台不联网的机器上——
+   但**绝不能**进任何联网的机器、更不能进服务端）。
+
+> **私钥一个字节都不要经过服务端。**服务端只转发它读不懂的密文，这是整套设计的前提：
+> 它被攻破也变不出能用的签名材料。私钥要是从服务端下发，这条前提当场作废。
+
+### 6.3 先试一把（可选）
+
+工具现在就能用，可以拿一份假材料走一遍，确认你手上的密钥是对的：
+
+```bash
+printf 'a-fake-password' | /tmp/ios-material encrypt \
+  --pub ~/rn-ios-material-keys/builder.x25519.pub \
+  --team J4JDFC8LCC --kind certificate --p12 /path/to/some.p12 --out /tmp/cert.box.json
+
+/tmp/ios-material verify --key ~/rn-ios-material-keys/builder.x25519 --in /tmp/cert.box.json
+```
+
+`verify` 只打印种类、Team、bundle id 这些**非机密**字段——口令与私钥它一个字都不会印。
+拿 `uploader.x25519` 去解这份证书会失败，那是对的（§6.1 那条隔离）。
+
 ## 5. 一台 Mac 退役时的清单
 
 按顺序做，每一步都要做完：
