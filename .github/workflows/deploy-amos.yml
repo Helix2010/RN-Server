@@ -176,8 +176,13 @@ jobs:
         run: |
           GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
             go build -trimpath -ldflags="-s -w" -o rn-server ./cmd/server
+          # -X main.commit：代理认领时自报的版本。**不打这个戳它就永远报空**，而版本闸的
+          # 判据是"已批准 != 空 && 自报 != 已批准 → 409"——空同样算不相等。于是只要 amos
+          # 上跑着一个没打戳的二进制，平台管理员就**永远不能用版本闸**：钉住任何一版都会
+          # 把这台机器连同它负责的 Android 构建一起挡下来。安装包里的那一份一直打着戳
+          # （build-bundles.sh），只有这里漏了
           GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w" -o build-agent ./cmd/build-agent
+            go build -trimpath -ldflags="-s -w -X main.commit=${{ github.sha }}" -o build-agent ./cmd/build-agent
           ls -l rn-server build-agent
 
       - name: Configure SSH

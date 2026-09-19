@@ -203,7 +203,10 @@ builder 能写的地方只有当前任务的 `work/`、`out/` 与 `/tmp` 一类�
 CI 部署服务端时会把同一提交构建的安装包放到服务端机器的 `/opt/rn-foundation/machine-bundles/current/builder.tar.gz`，归档与其中每个程序的 sha256 打印在 CI 日志「Build machine bundles」一步。可以从那里取（与 CI 日志核对后安装，步骤见 `deploy/amos/SIGNING_GATE_ROLLOUT.md` 5.1），也可以自己编：
 
 ```bash
-GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-agent  ./cmd/build-agent
+# -X main.commit 不能省：代理认领时自报的就是它，不打戳永远报空，而版本闸把"报空"也算作
+# 与已批准值不一致——这台机器会在平台管理员钉住任何一版时被一起挡下来，且控制台上它仍然显示在线
+COMMIT=$(git rev-parse HEAD)
+GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.commit=$COMMIT" -o build-agent  ./cmd/build-agent
 GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-runner ./cmd/build-agent/build-runner
 sha256sum build-agent build-runner                        # 记下来
 scp build-agent build-runner <构建机>:~/
