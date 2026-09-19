@@ -162,7 +162,7 @@ jobs:
         run: |
           deploy/setup/build-bundles.sh "$RUNNER_TEMP/machine-bundles"
           cd "$RUNNER_TEMP/machine-bundles"
-          echo "::notice title=新机器安装包 sha256::$(sha256sum signer.tar.gz builder.tar.gz | awk '{printf "%s %s; ", $2, $1}')"
+          echo "::notice title=新机器安装包 sha256::$(sha256sum signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz | awk '{printf "%s %s; ", $2, $1}')"
 
       - name: Cross-compile for amos
         # 与 deploy/amos/deploy.sh 同一组参数。GOTOOLCHAIN=local：go.mod 固定了版本，
@@ -253,7 +253,7 @@ jobs:
             exit 1
           fi
           ssh amos "rm -rf '$STAGE/machine-bundles.part' && mkdir -p '$STAGE/machine-bundles.part'"
-          for f in manifest.json signer.tar.gz builder.tar.gz; do
+          for f in manifest.json signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz release-key.pub; do
             ssh amos "cat > '$STAGE/machine-bundles.part/$f'" < "$RUNNER_TEMP/machine-bundles/$f"
           done
           ssh amos "rm -rf '$STAGE/machine-bundles' && mv '$STAGE/machine-bundles.part' '$STAGE/machine-bundles'"

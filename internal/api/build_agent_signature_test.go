@@ -258,3 +258,50 @@ func TestDBSignatureOnDiskStillWorks(t *testing.T) {
 		t.Fatalf("a signature left on disk must still be picked up: %s", r.Body.String())
 	}
 }
+
+// 清单里列着 ≠ 文件在服务器上。部署那一段按文件名逐个拷，漏掉一个不会有任何地方报错，
+// 而清单是一次性生成的、照样列着那一组。
+//
+// 2026-09-19 装第一台 Mac 时正是这样：builder-darwin-arm64.tar.gz 与 release-key.pub 从来
+// 没被传上去过（CI 与 rn-foundation-apply 都硬编码了三个文件名），于是控制台说 darwin 那组
+// "没问题"，describe 却一直 503。控制台说假话比它报错更糟——人会去别处找原因。
+func TestDBBundleIsUnavailableWhenItsArchiveIsMissing(t *testing.T) {
+	f := newGateFixture(t, 71)
+	f.installBundles()
+	commit := strings.Repeat("e", 40)
+	private, raw := stageUnsignedBundles(t, f, commit)
+	signature, err := bundlesig.Sign(private, raw, commit, 3, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := uploadSignature(t, f, signature); code != http.StatusOK {
+		t.Fatalf("a valid signature was refused: %d %v", code, body)
+	}
+	if err := os.Remove(filepath.Join(f.s.machineBundleDir, machineBundleBuilderDarwin+".tar.gz")); err != nil {
+		t.Fatal(err)
+	}
+
+	card := decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))
+	bundles, _ := card["bundles"].([]any)
+	var darwin map[string]any
+	for _, entry := range bundles {
+		view, _ := entry.(map[string]any)
+		if view["bundle"] == machineBundleBuilderDarwin {
+			darwin = view
+		}
+	}
+	if darwin == nil {
+		t.Fatalf("the darwin bundle is missing from the card: %v", card)
+	}
+	detail, _ := darwin["error"].(string)
+	if !strings.Contains(detail, "not on the server") {
+		t.Fatalf("a bundle whose archive never shipped must not be reported as fine: %v", darwin)
+	}
+	// linux 那组还在，不能被连累
+	for _, entry := range bundles {
+		view, _ := entry.(map[string]any)
+		if view["bundle"] == machineRoleBuilder && view["error"] != nil {
+			t.Fatalf("the linux bundle must still be usable: %v", view)
+		}
+	}
+}

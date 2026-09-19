@@ -85,6 +85,20 @@ func (s *server) signedBundleFor(ctx context.Context, name string) (signedBundle
 	if signature.Commit != manifest.Commit {
 		return signedBundle{}, errors.New("the stored signature was made for another commit")
 	}
+	// 清单里有这一条，不等于归档真的在服务器上。部署那一段是**按文件名逐个拷**的
+	// （rn-foundation-apply），漏掉一个不会有任何地方报错——而清单是一次性生成的，它照样
+	// 列着那一组。2026-09-19 装第一台 Mac 时就是这样：控制台说 darwin 那组"没问题"，
+	// describe 却一直 503，人只能去猜。
+	archive := filepath.Join(dir, bundle.Archive)
+	info, err := os.Stat(archive)
+	switch {
+	case err != nil:
+		return signedBundle{}, errors.New(bundle.Archive + " is listed in " + machineBundleManifest +
+			" but is not on the server: the deploy step ships the bundle files one by one and this one did not make it")
+	case !info.Mode().IsRegular() || info.Size() != bundle.ArchiveSize:
+		return signedBundle{}, errors.New(bundle.Archive + " on the server does not match the size in " +
+			machineBundleManifest + "; the upload was incomplete")
+	}
 	return signedBundle{Name: name, Dir: dir, Manifest: raw, Signature: signature, Bundle: bundle, Commit: manifest.Commit}, nil
 }
 

@@ -257,7 +257,11 @@ apply_bundles() {
   if [ -L "$src" ] || [ ! -d "$src" ]; then
     die "暂存目录里没有安装包：$src"
   fi
-  [ "$(find "$src" -mindepth 1 -maxdepth 1 | wc -l)" = 3 ] || die "暂存的安装包目录里应该正好是三个文件，不换"
+  # 五个：清单、三组归档，以及发布公钥。**release-key.pub 不是可选的**——Mac 装机要在下载
+  # 归档之前就拿到它来验清单的离线签名，而归档里那一份得先解包才看得见，那时清单还没验过。
+  # 它缺了的症状是 describe 回 503，而控制台上那组安装包看着一切正常（卡片只校验清单里的
+  # 条目，不看文件在不在）。
+  [ "$(find "$src" -mindepth 1 -maxdepth 1 | wc -l)" = 5 ] || die "暂存的安装包目录里应该正好是五个文件，不换"
 
   # 暂存目录属于部署账号，它随时能换掉里面的东西：先把三个文件拷成 root 自己的副本
   # （cp -P 不跟随符号链接，指向别处的链接拷过来还是链接，下面拒绝），之后只核对、只用副本
@@ -266,7 +270,7 @@ apply_bundles() {
   rm -rf "$BUNDLE_ROOT"/.incoming-*
   local tmp="$BUNDLE_ROOT/.incoming-$$"
   install -d -o root -g root -m 0700 "$tmp"
-  for f in manifest.json signer.tar.gz builder.tar.gz; do
+  for f in manifest.json signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz release-key.pub; do
     if [ -L "$src/$f" ] || [ ! -f "$src/$f" ]; then
       rm -rf "$tmp"
       die "暂存的安装包缺 $f，或者它不是普通文件"
@@ -284,10 +288,14 @@ apply_bundles() {
   local sum problem=""
   grep -q '"format": *"rn-machine-bundles/v1"' "$tmp/manifest.json" || problem="manifest.json 的 format 不是 rn-machine-bundles/v1"
   grep -Eq "\"commit\": *\"$commit\"" "$tmp/manifest.json" || problem="manifest.json 不是提交 $commit 的"
-  for f in signer.tar.gz builder.tar.gz; do
+  for f in signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz; do
     sum="$(sha256sum "$tmp/$f")"
     grep -Eq "\"archiveSha256\": *\"${sum%% *}\"" "$tmp/manifest.json" || problem="$f 的 sha256 不在 manifest.json 里（上传不完整？）"
   done
+  # 发布公钥是 Mac 那条链子的信任根。它不在清单里（清单正是靠它验的），所以这里只查形状：
+  # 一行 OpenSSH 公钥。真正的核对在 Mac 上，按运维从密码管理器带来的指纹做
+  grep -Eq '^ssh-ed25519 [A-Za-z0-9+/]+=* ' "$tmp/release-key.pub" ||
+    problem="release-key.pub 不是一行 ssh-ed25519 公钥"
   if [ -n "$problem" ]; then
     rm -rf "$tmp"
     die "$problem，不换"
@@ -296,7 +304,7 @@ apply_bundles() {
   local name="$commit" dest same=yes
   dest="$BUNDLE_ROOT/$name"
   if [ -d "$dest" ]; then
-    for f in manifest.json signer.tar.gz builder.tar.gz; do
+    for f in manifest.json signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz release-key.pub; do
       cmp -s "$tmp/$f" "$dest/$f" || same=no
     done
     if [ "$same" = no ]; then
@@ -320,7 +328,7 @@ apply_bundles() {
   local line
   while read -r line; do
     log "$line"
-  done < <(cd "$dest" && sha256sum signer.tar.gz builder.tar.gz)
+  done < <(cd "$dest" && sha256sum signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz)
 
   # 只留 current 与最近几份
   local kept=0 dir
