@@ -77,6 +77,8 @@ var migrations = []migration{
 	{version: 55, name: "build_machine_liveness", apply: buildMachineLivenessMigration},
 	// 安装包清单的离线签名收在库里，让平台管理员用控制台交签名而不是 ssh 进服务器
 	{version: 56, name: "machine_bundle_signatures", apply: machineBundleSignaturesMigration},
+	// iOS 签名材料的密文：控制台传一次，每台 Mac 自己取。服务端只存密文，没有任何一把私钥
+	{version: 57, name: "ios_signing_material", apply: iosSigningMaterialMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2063,6 +2065,34 @@ func machineBundleSignaturesMigration(ctx context.Context, db *sql.DB) error {
 		PRIMARY KEY (commit_sha)
 	) ENGINE=InnoDB COMMENT='安装包清单的离线签名。平台管理员在离线机器上签完，用控制台交上来，免去 ssh 进服务器放文件——那等于要求持有发布私钥的人同时握着服务器 shell'`); err != nil {
 		return fmt.Errorf("machine bundle signatures migration: %w", err)
+	}
+	return nil
+}
+
+// iosSigningMaterialMigration 建一张存 iOS 签名材料密文的表（设计
+// ios-signing-material-distribution-2026-09-19.md）。
+//
+// 材料在管理员的浏览器或离线机器上加密给平台公钥，**服务端只存、只转发密文**——它没有
+// 任何一把私钥，读不懂。这一点是整套打包机设计的前提：服务端被攻破也变不出能用的签名
+// 材料。明文存服务端、机器来取的做法在设计第 2 节被明确排除。
+//
+// 一格材料只留**当前这一版**：旧证书的密文虽然解不开，但"删掉的东西真的删掉了"是个更好
+// 的性质，换过什么在审计里查。所以主键是那一格，不带版本；version 只是个递增的计数，
+// 给机器判断"我手上这份是不是最新的"。
+func iosSigningMaterialMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS ios_signing_material (
+		kind VARCHAR(20) NOT NULL COMMENT 'certificate=Apple Distribution 证书（每 Team 一份，全机共用）；profile=App Store 描述文件（每 Team 每 bundle id 一份）；upload-key=App Store Connect 上传 Key（每台机器每 Team 一把，丢了能单独吊销）',
+		team_id CHAR(10) NOT NULL COMMENT 'Apple Team ID',
+		scope VARCHAR(100) NOT NULL COMMENT '同一 (kind, team) 下把材料分开的那一维：描述文件是 bundle id，上传 Key 是机器 id，证书是空串。放进主键，免得两行打架',
+		purpose VARCHAR(40) NOT NULL COMMENT '密文的用途标签，决定要用哪一把角色私钥才解得开（ios-builder-material / ios-uploader-material）。服务端只拿它对照与路由，不是判据',
+		recipient_sha256 CHAR(64) NOT NULL COMMENT '收件人公钥指纹。服务端拿它对照登记的平台公钥，好当场发现"加密给了一把没人持有的密钥"——这是帮运维查错，不是安全控制',
+		version BIGINT NOT NULL COMMENT '这一格的第几版，单调递增。机器拿它判断手上那份是不是最新的；覆盖时旧密文直接被替换，不留历史',
+		ciphertext LONGBLOB NOT NULL COMMENT 'iosmaterial.Box 的完整内容，**按字节存**。用 JSON 列的话 MySQL 会把它规范化（键重排、空白去掉），下发回去的就不再是传上来的那几个字节了——而这一层的整个身份是快递员：不看、不改、不解',
+		uploaded_by VARCHAR(100) NOT NULL COMMENT '传这份材料的平台管理员',
+		uploaded_at DATETIME(3) NOT NULL COMMENT '收下的时刻 UTC',
+		PRIMARY KEY (kind, team_id, scope)
+	) ENGINE=InnoDB COMMENT='iOS 签名材料的密文。服务端只是快递员：它没有任何一把私钥，存的每一份都解不开'`); err != nil {
+		return fmt.Errorf("ios signing material migration: %w", err)
 	}
 	return nil
 }

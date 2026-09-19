@@ -235,6 +235,12 @@ func (s *server) routes() *gin.Engine {
 	platform.POST("/build-agent-version", s.approveAgentVersion)
 	// 清单的离线签名走接口交，不必 ssh 进服务器放文件——那等于要求持有发布私钥的人
 	// 同时握着服务器 shell，而这两个角色正是这套设计要分开的
+	// iOS 签名材料：控制台传密文、机器自己取（设计 ios-signing-material-distribution-2026-09-19）。
+	// 服务端只是快递员——它没有任何一把私钥，存的每一份都解不开
+	platform.GET("/ios-material", s.iosMaterialOverview)
+	platform.PUT("/ios-material/recipients", s.registerIOSMaterialRecipients)
+	platform.POST("/ios-material", s.uploadIOSMaterial)
+	platform.POST("/ios-material/remove", s.removeIOSMaterial)
 	platform.GET("/build-agent-version/manifest", s.deployedManifest)
 	platform.POST("/build-agent-version/signature", s.uploadBundleSignature)
 	// 平台离线恢复公钥（build.recovery.recipients）：签名闸生成的密钥都要加密给它，签名闸本机另外 pin
@@ -279,6 +285,9 @@ func (s *server) routes() *gin.Engine {
 	builder.POST("/claim", s.claimBuildJob)
 	// 自升级：已登记的机器拿本机令牌取清单、清单的离线签名与归档。服务端只递文件，
 	// 验签、核序号、核提交都在机器那一侧做（§5.6）
+	// iOS 签名材料：清单与密文。服务端递密文，解密在机器上那两个角色账户里做
+	builder.GET("/ios-material", s.listIOSMaterialForMachine)
+	builder.GET("/ios-material/box", s.getIOSMaterialBox)
 	builder.GET("/bundle", s.describeAgentBundle)
 	builder.GET("/bundle/archive", s.downloadAgentBundle)
 	// 图标一张一张取，不塞进领取响应——那条响应在构建机那边有 1 MiB 上限
