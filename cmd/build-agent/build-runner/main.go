@@ -13,7 +13,7 @@
 //
 //	build-runner build      --jobs-root <abs> --job <id> --kind apk|ota
 //	build-runner cleanup    --jobs-root <abs> --job <id>
-//	build-runner self-check    --jobs-root <abs> --protocol <n> [--expect-separated]
+//	build-runner self-check    --protocol <n> [--jobs-root <abs>] [--expect-separated]
 //	build-runner ios-inventory        --signing-dir <abs>
 //	build-runner install-ios-material     --signing-dir <abs>   （密文走标准输入）
 //	build-runner material-key-fingerprint --signing-dir <abs>
@@ -145,8 +145,15 @@ func dispatch(ctx context.Context, args []string, in io.Reader, out io.Writer, g
 		if flags.expectSeparated && !who.separated {
 			return usagef("build-runner is running as the same user that started it (uid %d); the sudoers rule must target a separate build user", who.uid)
 		}
-		if err := checkRoot(who, flags.root); err != nil {
-			return usageError{err}
+		// --jobs-root 是可选的：给了才查任务根目录。"它必须归控制进程"这条判据是拿
+		// **调用者**（SUDO_UID）当控制进程的，只有控制进程自己来调时才成立。升级程序
+		// 以 root 跑，它调这条只是想验"新二进制在这台机器上跑得起来"——带上 --jobs-root
+		// 的话，判据会变成"任务根目录必须归 root"，而真机上它归控制账户，自检必然失败
+		// （2026-09-20 真机撞上：升级卡在这里，日志说 uid 0 vs uid 201）。
+		if flags.root != "" {
+			if err := checkRoot(who, flags.root); err != nil {
+				return usageError{err}
+			}
 		}
 		fmt.Fprintf(out, "build-runner: ok uid=%d separated=%t\n", who.uid, who.separated)
 		return nil
@@ -201,8 +208,11 @@ func parseFlags(args []string, needJob, needKind, allowExpect bool) (runnerFlags
 	if set.NArg() != 0 {
 		return runnerFlags{}, usagef("unexpected positional arguments")
 	}
-	if err := jobspec.ValidRoot(root.value); err != nil {
-		return runnerFlags{}, usageError{err}
+	// self-check 之外的子命令都要任务根目录；self-check 不给就是"只验二进制"
+	if !(allowExpect && root.value == "") {
+		if err := jobspec.ValidRoot(root.value); err != nil {
+			return runnerFlags{}, usageError{err}
+		}
 	}
 	flags := runnerFlags{root: root.value, job: job.value, expectSeparated: expect, protocol: protocol.value}
 	if needJob && !jobspec.ValidJobID(job.value) {

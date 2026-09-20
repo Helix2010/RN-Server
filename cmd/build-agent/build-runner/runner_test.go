@@ -470,6 +470,33 @@ func TestSelfCheckRequiresSeparationWhenAsked(t *testing.T) {
 	}
 }
 
+// 升级程序以 root 跑，它只想验"新二进制能以执行账户跑起来"。**不给 --jobs-root**：
+// "任务根目录必须归控制进程"这条判据拿的是调用者（SUDO_UID），root 来调时它会变成
+// "必须归 root"，而真机上它归控制账户——2026-09-20 mac-01 就卡在这里，日志说
+// uid 0 vs uid 201，升级反复失败。给了 --jobs-root 的那条路（代理启动时自己调）不变。
+func TestSelfCheckWithoutAJobsRootOnlyChecksTheBinary(t *testing.T) {
+	asRoot := func(key string) string {
+		if key == "SUDO_UID" {
+			return "0"
+		}
+		return ""
+	}
+	if code, out := runRunner(t, asRoot, "self-check", "--protocol", "1", "--expect-separated"); code != 0 {
+		t.Fatalf("the upgrade helper's smoke test failed: exit %d\n%s", code, out)
+	}
+	// 协议不符照样拦得住：少的只是目录那一条
+	if code, out := runRunner(t, asRoot, "self-check", "--protocol", "2", "--expect-separated"); code != exitUsage ||
+		!strings.Contains(out, "together") {
+		t.Fatalf("protocol mismatch slipped through: exit %d\n%s", code, out)
+	}
+	// 给了 --jobs-root 就仍然要归调用者：root 调、目录归当前用户 → 拒
+	root := t.TempDir()
+	code, out := runRunner(t, asRoot, "self-check", "--jobs-root", root, "--protocol", "1", "--expect-separated")
+	if code != exitUsage || !strings.Contains(out, "must belong to the controller") {
+		t.Fatalf("--jobs-root stopped being checked: exit %d\n%s", code, out)
+	}
+}
+
 // 证书检查的几条老规矩（从控制进程挪过来，检查本身现在在执行进程里）
 func TestCertificateNeedleComesFromASingleLine(t *testing.T) {
 	pem := "-----BEGIN CERTIFICATE-----\n" +

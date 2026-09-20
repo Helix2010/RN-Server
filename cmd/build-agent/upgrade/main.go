@@ -112,7 +112,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	err = upgrade(context.Background(), upgradeInput{
 		Server: server, Token: env["BUILD_AGENT_MACHINE_TOKEN"], InstallDir: *installDir,
-		StateDir: stateDir, Workspace: env["BUILD_AGENT_WORKSPACE"], RunnerUser: env["BUILD_AGENT_RUNNER_USER"],
+		StateDir: stateDir, RunnerUser: env["BUILD_AGENT_RUNNER_USER"],
 		Commit: target, Out: stdout,
 	})
 	// 成败都要删标记：不删的话 launchd 永远不会把代理拉起来，这台机器就静悄悄地离线了
@@ -136,7 +136,6 @@ type upgradeInput struct {
 	Token      string
 	InstallDir string
 	StateDir   string
-	Workspace  string
 	RunnerUser string
 	Commit     string
 	Out        io.Writer
@@ -367,6 +366,9 @@ func unpack(archive []byte, staging string, files map[string]string) error {
 	return nil
 }
 
+// sudoPath 只为测试可替换：真机上永远是 /usr/bin/sudo。
+var sudoPath = "/usr/bin/sudo"
+
 // smoke 在换上去之前先试一下新的二进制。
 //
 // 两条都很便宜，挡的却是最难查的一类故障：换上一个跑不起来的二进制之后，launchd 会把它
@@ -381,12 +383,17 @@ func smoke(ctx context.Context, in upgradeInput, staging string) error {
 		return fmt.Errorf("the new build-agent exited with %d in an empty environment, expected 2", exitCode(err))
 	}
 	// build-runner 以执行进程的身份自检：它拒绝 root，也拒绝与启动它的用户同一个 uid
-	if in.RunnerUser == "" || in.RunnerUser == "-" || in.Workspace == "" {
+	if in.RunnerUser == "" || in.RunnerUser == "-" {
 		return nil
 	}
-	runner := exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "-u", in.RunnerUser,
+	// **不带 --jobs-root**：那条检查的判据是"任务根目录必须归调用者（SUDO_UID）"，而这里
+	// 的调用者是 root，真机上任务根目录归控制账户——带上它，自检在任何一台真机上都必然失败
+	// （2026-09-20 mac-01 撞上：uid 0 vs uid 201，升级反复停在这一步）。这一步要验的是
+	// **新二进制**能不能以执行账户跑起来；"这台机器的目录摆对没有"由代理每次启动时自己查，
+	// 那时调用者才真的是控制进程（cmd/build-agent/runnerexec.go checkRunner）。
+	runner := exec.CommandContext(ctx, sudoPath, "-n", "-u", in.RunnerUser,
 		filepath.Join(staging, binPrefix+"build-runner"), "self-check",
-		"--jobs-root", in.Workspace, "--protocol", "1", "--expect-separated")
+		"--protocol", "1", "--expect-separated")
 	output, err := runner.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("the new build-runner failed its self-check as %s: %w: %s",

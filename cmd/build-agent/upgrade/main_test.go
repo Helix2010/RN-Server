@@ -198,6 +198,45 @@ func TestUpgradeInstallsASignedBundle(t *testing.T) {
 	}
 }
 
+// 冒烟那一步以 root 调 sudo，所以**不能**带 --jobs-root：那条检查的判据是"任务根目录
+// 必须归调用者"，root 来调就变成"必须归 root"，而真机上它归控制账户。2026-09-20 mac-01
+// 上就是这样：下载、验签、核摘要全过，卡在自检，日志里一句 uid 0 vs uid 201，升级反复失败。
+func TestUpgradeSmokeTestDoesNotAskTheRunnerToCheckTheJobsRoot(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newBundle(t, private, newCommit, 5, goodAgent)
+	m := newMachine(t, public, fake.server.URL)
+	// 真机上的 env 有这两项；夹具默认没有，于是冒烟那一步一直被跳过——这个坑就是那样漏过去的
+	extra := "BUILD_AGENT_RUNNER_USER=builder\nBUILD_AGENT_WORKSPACE=/var/rn-build-jobs\n"
+	if err := os.WriteFile(m.envFile, []byte(readFile(t, m.envFile)+extra), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(t.TempDir(), "argv")
+	stub := filepath.Join(t.TempDir(), "sudo")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+record+"\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous := sudoPath
+	sudoPath = stub
+	t.Cleanup(func() { sudoPath = previous })
+
+	m.requestUpgrade(t, newCommit)
+	if code, output := m.run(t); code != 0 {
+		t.Fatalf("upgrade: %d %s", code, output)
+	}
+	argv := readFile(t, record)
+	if !strings.Contains(argv, "self-check") || !strings.Contains(argv, "--expect-separated") ||
+		!strings.Contains(argv, "--protocol") {
+		t.Fatalf("the smoke test did not run the new build-runner as the build user:\n%s", argv)
+	}
+	if strings.Contains(argv, "--jobs-root") {
+		t.Fatalf("the smoke test asked for the jobs root while running as root; "+
+			"that check compares the directory owner with the caller, so it can only fail on a real machine:\n%s", argv)
+	}
+}
+
 func TestUpgradeRefusesEverythingItCannotProve(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
