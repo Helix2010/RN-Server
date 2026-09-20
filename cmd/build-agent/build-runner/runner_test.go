@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -536,5 +538,52 @@ func TestVerifyEmbeddedCertificateFindsUTF8AndUTF16(t *testing.T) {
 	}
 	if got := utf16LE("AB"); !bytes.Equal(got, []byte{'A', 0, 'B', 0}) {
 		t.Fatalf("utf16LE = %v", got)
+	}
+}
+
+// 回收残留进程时，**绝不能把自己或自己的祖先算进去**。
+//
+// 原先这里是 `kill(-1, SIGKILL)`，文档说它排除调用者——Linux 上确实如此，但 2026-09-20
+// 在 macOS 真机上，调它的 build 与 cleanup 一进来就被 SIGKILL：零输出、退出码 -1，而不调
+// 它的 self-check / ios-inventory / install-ios-material 全都正常。排查里排除过代码签名、
+// sudoers、`--`、空环境与两层 sudo，只剩这一条。
+func TestReapNeverTargetsItselfOrItsAncestors(t *testing.T) {
+	self := os.Getpid()
+	parent := os.Getppid()
+	const uid = 204
+	// 一张假的进程表：自己、父进程、祖父进程，外加两个同 uid 的残留进程和一个别人的
+	table := fmt.Sprintf("%d %d %d\n%d %d %d\n%d %d %d\n%d %d %d\n%d %d %d\n%d %d %d\n",
+		self, parent, uid,
+		parent, 1, uid,
+		1, 0, 0,
+		4242, 1, uid,
+		4243, 4242, uid,
+		4244, 1, 501)
+	path := filepath.Join(t.TempDir(), "ps")
+	if err := os.WriteFile(path, []byte(table), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := psCommand
+	psCommand = func() *exec.Cmd { return exec.Command("/bin/cat", path) }
+	t.Cleanup(func() { psCommand = restore })
+
+	got := strayPIDs(uid)
+	for _, pid := range got {
+		if pid == self || pid == parent {
+			t.Fatalf("回收把自己或父进程算进去了：%v（self=%d parent=%d）", got, self, parent)
+		}
+	}
+	if len(got) != 2 || got[0] != 4242 || got[1] != 4243 {
+		t.Errorf("该杀的是 [4242 4243]，实际 %v；别人 uid 的 4244 不该在里面", got)
+	}
+}
+
+// 进程表读不出来时什么都不杀：宁可留下残留进程，也不能乱杀一气。
+func TestReapKillsNothingWhenItCannotReadTheProcessTable(t *testing.T) {
+	restore := psCommand
+	psCommand = func() *exec.Cmd { return exec.Command("/bin/sh", "-c", "exit 3") }
+	t.Cleanup(func() { psCommand = restore })
+	if got := strayPIDs(204); len(got) != 0 {
+		t.Errorf("进程表读不出来却还是选出了 %v", got)
 	}
 }

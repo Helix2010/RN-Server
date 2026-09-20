@@ -6,8 +6,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
@@ -120,17 +124,86 @@ func readSpec(layout jobspec.Layout, kind jobspec.Kind) (jobspec.Spec, error) {
 // 以一个任务为界：Gradle daemon、自己 setsid 出去的后台进程、/tmp 里的 Metro 缓存都活不过
 // 下一个任务的开始。
 //
-// kill(-1) 发给调用者有权发信号的全部进程（本 uid 的进程），不含自己；sudo 父进程是 root 的，
-// 不受影响。同一台机器上 builder 只给执行进程用，所以这是安全的。macOS 的语义相同（BSD 的
-// kill(2)：非特权用户发给同 uid 的全部进程，排除调用者本身与系统进程）。
+// **不用 `kill(-1)`**。它的文档说"发给本 uid 的全部进程，排除调用者自己"，Linux 上确实如此，
+// macOS 上**不成立**——2026-09-20 真机上一行就验出来了：
+//
+//	sudo -u _rnbuilder /bin/sh -c '/bin/kill -9 -1; echo survived'   → zsh: killed
+//
+// 表现是 `build` 与 `cleanup` 一进来就被 SIGKILL：零输出、退出码 -1。而不调 reap 的
+// self-check / ios-inventory / install-ios-material 全都正常——差别只有这一条。排查里
+// 排除过代码签名、sudoers、`--`、空环境与两层 sudo。
+//
+// 改成**点名杀**：自己列出本 uid 的进程，跳过自己与自己的整条祖先链（sudo 是 root 的，本来
+// 也杀不动），剩下的一个个发 SIGKILL。副作用是多起一个 ps 子进程，换来的是这一步不会再把
+// 调用者自己带走——而它恰恰是"每个任务都从干净状态开始"这条性质的唯一执行者。
 func reap(who identity) {
 	if !who.separated {
 		return
 	}
-	_ = syscall.Kill(-1, syscall.SIGKILL)
+	for _, pid := range strayPIDs(who.uid) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
 	for _, dir := range reapDirs(runtime.GOOS, who.uid, darwinVarFolders) {
 		sweepOwned(dir, who.uid)
 	}
+}
+
+// psCommand 列出进程表。绝对路径，不走 PATH——这个程序里跑着第三方依赖的代码。
+// 做成变量只为测试。
+var psCommand = func() *exec.Cmd {
+	// macOS 在 /bin/ps，Debian 两处都有；都不在就取不到进程表，reap 什么都不杀
+	path := "/bin/ps"
+	if _, err := os.Stat(path); err != nil {
+		path = "/usr/bin/ps"
+	}
+	return exec.Command(path, "-Ao", "pid=,ppid=,uid=")
+}
+
+// strayPIDs 是这个 uid 名下、除了自己与自己祖先之外的进程。
+//
+// 祖先也要跳过：经 sudo 时父进程是 root，杀不动也无所谓；不经 sudo 的本地形态下 reap 根本
+// 不跑。但把整条链排除掉，这个函数的性质就与"谁调它"无关——不必依赖某一种启动方式。
+func strayPIDs(uid int) []int {
+	out, err := psCommand().Output()
+	if err != nil {
+		return nil
+	}
+	type entry struct{ ppid, uid int }
+	table := map[int]entry{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		owner, err3 := strconv.Atoi(fields[2])
+		if err1 != nil || err2 != nil || err3 != nil {
+			continue
+		}
+		table[pid] = entry{ppid: ppid, uid: owner}
+	}
+	// 自己与自己的祖先：从本进程往上走，链上每一个都留着
+	keep := map[int]bool{}
+	for pid := os.Getpid(); pid > 1; {
+		if keep[pid] {
+			break // 进程表读到一半变了，出现了环；停下比绕死强
+		}
+		keep[pid] = true
+		parent, ok := table[pid]
+		if !ok {
+			break
+		}
+		pid = parent.ppid
+	}
+	var stray []int
+	for pid, e := range table {
+		if e.uid == uid && !keep[pid] && pid > 1 {
+			stray = append(stray, pid)
+		}
+	}
+	sort.Ints(stray)
+	return stray
 }
 
 // darwinVarFolders 是 macOS 每用户临时目录的根。
