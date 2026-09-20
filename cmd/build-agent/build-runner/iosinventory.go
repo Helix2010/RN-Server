@@ -34,7 +34,22 @@ func iosInventory(ctx context.Context, out io.Writer, who identity, dir string) 
 	}
 	material := jobspec.IOSMaterial{Profiles: map[string][]byte{}}
 	keychain := filepath.Join(dir, jobspec.IOSKeychainFileName)
-	if text, err := securityOutput(ctx, "find-identity", "-v", "-p", "codesigning", keychain); err != nil {
+	// 两条命令必须在**同一个进程**里。`find-identity -v` 的 `-v` 要做一次信任评估，而评估
+	// 时中间证书（Apple 的 WWDR）是按**钥匙串搜索列表**找的——它就躺在这个独立钥匙串里，
+	// 可这个钥匙串不在搜索列表上，于是链建不起来，`find-identity` 报 0 个有效身份**且不报错**。
+	//
+	// 2026-09-20 真机上就是这样：叶子证书、WWDR、Apple Root CA 三张都在钥匙串里，
+	// `security verify-cert -p codeSign` 说链没问题，盘点却一个 Team 都不报，日志上只有
+	// 一句"钥匙串里没有 Apple Distribution 身份"。签名那条路一直是对的（iossigning.go
+	// 把 list-keychains 放在同一个 `security -i` 里），盘点这条路从来没跟上。
+	//
+	// 只改这一个进程的搜索列表：`list-keychains -s` 要把设置写进 $HOME，而这个账户的家目录
+	// 是 /var/empty，写不进去——正好，只读的盘点本来也不该在账户上留下状态。解锁不需要，
+	// 真机上验过：光加这一条就够了。
+	if text, err := securityScript(ctx,
+		"list-keychains -s "+keychain,
+		"find-identity -v -p codesigning "+keychain,
+	); err != nil {
 		material.IdentitiesError = oneLine(err.Error())
 	} else {
 		material.Identities = text
@@ -51,8 +66,10 @@ func iosInventory(ctx context.Context, out io.Writer, who identity, dir string) 
 // checkSigningDir 只收这个账户自己的目录。控制进程是唯一的调用方，它比这里更可信，
 // 所以这不是防它——是防"参数写错了就去读别人的目录"，以及让错误当场说清楚。
 func checkSigningDir(who identity, dir string) error {
-	if dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
-		return fmt.Errorf("--signing-dir must be an absolute, clean path (got %q)", dir)
+	// 字母表照 iosSigningPathPattern：这个路径会被拼进 `security -i` 的一行命令，
+	// 而那里按空白切词，带空格的路径会被切成别的参数
+	if dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || !iosSigningPathPattern.MatchString(dir) {
+		return fmt.Errorf("--signing-dir must be an absolute, clean path of letters, digits and ._-/ (got %q)", dir)
 	}
 	info, err := os.Lstat(dir)
 	if err != nil {
@@ -131,6 +148,33 @@ func readCapped(path string) ([]byte, error) {
 		return nil, fmt.Errorf("%d bytes is larger than the %d byte limit for a provisioning profile", info.Size(), jobspec.IOSProfileMaxBytes)
 	}
 	return io.ReadAll(io.LimitReader(file, jobspec.IOSProfileMaxBytes))
+}
+
+// securityScript 把几条 security 子命令经标准输入喂给同一个 `security -i` 进程，收标准输出。
+//
+// 需要"前一条命令的效果对后一条可见"时用它——比如设搜索列表再问身份（见 iosInventory）。
+func securityScript(ctx context.Context, lines ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := securityInteractive(ctx)
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if len(detail) > 200 {
+			detail = detail[:200]
+		}
+		return "", fmt.Errorf("security -i (%s): %w: %s", strings.Join(lines, "; "), err, detail)
+	}
+	return stdout.String(), nil
+}
+
+// securityInteractive 起 `security -i`。测试换掉它——macOS 才有这个程序。
+var securityInteractive = func(ctx context.Context) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "/usr/bin/security", "-i")
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	return cmd
 }
 
 // securityOutput 跑一条 `security` 子命令并收标准输出。超时是为了不让一次卡住的钥匙串

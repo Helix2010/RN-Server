@@ -6,8 +6,10 @@ package main
 // 控制台上这台机器永远"缺材料"，iOS 任务永远派不过来。
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -115,5 +117,44 @@ func TestIOSInventoryIsQuietOnAMachineWithNoMaterialYet(t *testing.T) {
 		if strings.Contains(problem, jobspec.IOSProfilesDirName) {
 			t.Errorf("a machine that has not been given any material yet reported a problem: %s", problem)
 		}
+	}
+}
+
+// 设搜索列表与问身份必须在同一个 security 进程里。
+//
+// find-identity -v 的 -v 要做一次信任评估，而中间证书（Apple 的 WWDR）是按钥匙串搜索
+// 列表找的。两条命令分成两次调用，链就建不起来——报 0 个有效身份，**而且不报错**。
+// 2026-09-20 真机上三张证书都在钥匙串里、verify-cert 说链没问题，盘点却一个 Team 都不报。
+func TestIOSInventoryAsksForIdentitiesInTheProcessThatSetTheSearchList(t *testing.T) {
+	dir := signingDir(t)
+	record := filepath.Join(t.TempDir(), "security-stdin")
+	restore := securityInteractive
+	securityInteractive = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "/bin/sh", "-c", "cat > "+record+"; printf 'pretend identities'")
+	}
+	t.Cleanup(func() { securityInteractive = restore })
+
+	code, out := runRunner(t, func(string) string { return "" }, "ios-inventory", "--signing-dir", dir)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if material := decodeMaterial(t, out); material.Identities != "pretend identities" {
+		t.Errorf("the identities did not come from the interactive call: %q / %q",
+			material.Identities, material.IdentitiesError)
+	}
+	script, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("security -i was never started: %v", err)
+	}
+	keychain := filepath.Join(dir, jobspec.IOSKeychainFileName)
+	search := strings.Index(string(script), "list-keychains -s "+keychain)
+	identities := strings.Index(string(script), "find-identity -v -p codesigning "+keychain)
+	switch {
+	case search < 0:
+		t.Errorf("the search list was never set; the intermediate certificate cannot be found: %s", script)
+	case identities < 0:
+		t.Errorf("the identities were not asked for in this process: %s", script)
+	case search > identities:
+		t.Errorf("the search list was set after the question, which is too late: %s", script)
 	}
 }
