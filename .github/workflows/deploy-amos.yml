@@ -117,12 +117,6 @@ jobs:
         run: go test -race $(go list ./... | grep -v '/internal/api$')
       # 产物写到 RUNNER_TEMP：build-bundles.sh 按 HEAD 算可复现归档，工作区脏了它会拒绝跑
       - run: go build -o "$RUNNER_TEMP/server-link-check" ./cmd/server
-      # signing/ 是独立 module（签名闸与离线工具只依赖标准库），根目录的 ./... 不含它
-      - name: signing module
-        working-directory: signing
-        run: |
-          go vet ./...
-          go test -race ./...
       - run: jq empty contracts/openapi.json
 
       # 编译放在这里，deploy 只负责送。原先 deploy 是另一个 runner：重新 checkout、
@@ -165,8 +159,30 @@ jobs:
         run: |
           echo "::warning title=没有部署::AMOS_DEPLOY_ENABLED 不是 'true'，deploy 会被跳过。它必须建在 Variables 标签页，不是 Secrets——vars.* 读不到 Secret。"
 
+  # signing/ 是独立 module（签名闸与离线工具只依赖标准库），根目录的 ./... 不含它。
+  #
+  # 单独一个 job，与 validate **并行**：它和 internal/api 是 CI 里最慢的两项，串在同一个
+  # job 里两段都在关键路径上（2026-09-20 实测：internal/api 65.7 秒、signing 那一步 160.5
+  # 秒，其中 internal/signer 一个包就占 160 秒——race 在这包上是 5.3 倍，而它做的全是真的
+  # 密码学运算，没有哪个用例特别慢，砍不动）。并行之后关键路径是两者里较长的那个。
+  #
+  # 不需要 MySQL（这个 module 不连库），也不需要 fetch-depth: 0（不比较提交范围）。
+  signing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: signing module
+        working-directory: signing
+        run: |
+          go vet ./...
+          go test -race ./...
+
   deploy:
-    needs: validate
+    needs: [validate, signing]
     if: vars.AMOS_DEPLOY_ENABLED == 'true' && needs.validate.outputs.deploy-needed == 'true'
     # 串行的只有**真正动线上那台机器**的这一段：rn-foundation-apply 会停服务、换二进制、
     # 跑迁移，两次叠在一起就是在一台机器上同时做两次这件事。
