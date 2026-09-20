@@ -174,8 +174,14 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 并重签清单（`allowed_signers` 的 sha256 在签名清单里，本地改会被下一次升级盖回去），是一次
 有记录的授权动作，不是 sed 一行。
 
-**闸仍然欠一次验证**：排一条构建，确认它检出的那个提交带 SSH 签名且在名单里；再故意用一个
-没签名的提交排一条，确认被挡。只改配置不验，等于不知道它有没有真的开着。
+**验收（两条，2026-09-20 完成一条）**：
+
+- ✅ **没签名的被挡** —— 恢复配置后 agent 12:52:11 领走排队中的那条任务，35 秒后失败：
+  `commit 758e21d… is not signed by an allowed signer (): exit status 1. Every commit on the
+  build branch must carry an SSH signature from a key listed in /opt/rn-build-agent/allowed_signers`，
+  日志最后一行停在 `git checkout --quiet --detach 758e21d…`。报错点名了提交也点名了名单文件，
+  不用猜。这一条是关闸那次的副产品——`758e21d` 正好是唯一未签名的提交。
+- ⬜ **签好名的能过** —— 等 `758e21d` 补签后的第一条构建。
 
 > 顺带：PR 合并会撞上这道闸。GitHub 用**它自己的 PGP 密钥**签合并提交，而这里验的是 SSH
 > 签名——`git -c gpg.format=ssh verify-commit`。走 PR 的话要用 **Rebase and merge**，且分支上
