@@ -886,6 +886,22 @@ BUILD_AGENT_IOS_UPLOAD_KEYS=$UPLOAD_DIR
 BUILD_AGENT_MIN_FREE_GB=40
 PATH=$BUILD_PATH
 LANG=en_US.UTF-8
+# 出网代理。**默认注释掉**：直连能用就别加这一层。
+#
+# 什么时候需要它：构建要从公网取东西，而 CocoaPods 装**每一个** pod 都是去 clone 它的
+# git 源（trunk 上的 podspec 写的就是 source: {git: …, tag: …}）。家用网络上 github.com
+# 的 443 常常连不通，表现是 pod install 卡住几十秒然后
+#   fatal: unable to access 'https://github.com/…': Failed to connect to github.com port 443
+# 而代理本身不继承：任务环境是按白名单重新构造的，所以必须写在**这个文件**里才传得进去。
+#
+# 大小写两套都写：libcurl 只认小写的 http_proxy。地址里**不许带账号口令**——这些值对
+# 构建进程可读，而那里跑着第三方依赖的代码。
+#HTTPS_PROXY=http://127.0.0.1:7890
+#https_proxy=http://127.0.0.1:7890
+#HTTP_PROXY=http://127.0.0.1:7890
+#http_proxy=http://127.0.0.1:7890
+#NO_PROXY=localhost,127.0.0.1,api.predict.kim
+#no_proxy=localhost,127.0.0.1,api.predict.kim
 EOF
     # env 文件属于控制进程那个账户，不是 root：launchd 在 exec 之前就切用户，
     # root 0600 的文件它读不到（§4.1）

@@ -265,3 +265,67 @@ func TestMachineEnvKeysAreAssembledPerPlatform(t *testing.T) {
 		}
 	}
 }
+
+// 出网代理是机器级配置，任务环境必须带得过去。
+//
+// 任务环境是按白名单**重新构造**的，不继承控制进程的环境：不把这几个键放进来，机器上
+// 配了代理也传不到构建进程里。而构建非出网不可——CocoaPods 装每一个 pod 都是去 clone
+// 它的 git 源。2026-09-20 真机上 pod install 就卡在这儿：
+// Failed to connect to github.com port 443 after 75017 ms。
+func TestProxyVariablesReachTheBuild(t *testing.T) {
+	layout := Layout{Root: "/var/rn-build-jobs", JobID: "bld_proxy0000001"}
+	base := []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=" + layout.Home(),
+		"GRADLE_USER_HOME=" + layout.GradleUserHome(),
+		"npm_config_store_dir=" + layout.PnpmStore(),
+		"TMPDIR=" + layout.Tmp(),
+		"ANDROID_USER_HOME=" + layout.AndroidUserHome(),
+		"EXPO_PUBLIC_TENANT=anyfun",
+		"EXPO_PUBLIC_API_BASE_URL=https://api.anyfun.win",
+		"EXPO_UPDATES_CODE_SIGNING_CERTIFICATE=",
+		"EXPO_REQUIRE_OTA_SIGNING=0",
+	}
+	// 大小写两套都要认：libcurl 只认小写的 http_proxy
+	for _, entry := range []string{
+		"HTTPS_PROXY=http://127.0.0.1:7890",
+		"https_proxy=http://127.0.0.1:7890",
+		"HTTP_PROXY=http://proxy.lan:3128",
+		"http_proxy=socks5://127.0.0.1:1080",
+		"ALL_PROXY=socks5h://proxy.lan:1080",
+		"NO_PROXY=localhost,127.0.0.1,.lan",
+		"no_proxy=*",
+	} {
+		if err := CheckEnv(layout, append(append([]string(nil), base...), entry), PlatformIOS); err != nil {
+			t.Errorf("%s 被拒了：%v", entry, err)
+		}
+	}
+}
+
+// 代理地址里带账号口令就等于把那组凭据交给这次构建跑的第三方代码。
+func TestProxyCredentialsAreRefused(t *testing.T) {
+	layout := Layout{Root: "/var/rn-build-jobs", JobID: "bld_proxy0000002"}
+	base := []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=" + layout.Home(),
+		"GRADLE_USER_HOME=" + layout.GradleUserHome(),
+		"npm_config_store_dir=" + layout.PnpmStore(),
+		"TMPDIR=" + layout.Tmp(),
+		"ANDROID_USER_HOME=" + layout.AndroidUserHome(),
+		"EXPO_PUBLIC_TENANT=anyfun",
+		"EXPO_PUBLIC_API_BASE_URL=https://api.anyfun.win",
+		"EXPO_UPDATES_CODE_SIGNING_CERTIFICATE=",
+		"EXPO_REQUIRE_OTA_SIGNING=0",
+	}
+	for _, bad := range []string{
+		"HTTPS_PROXY=http://user:pass@proxy.lan:3128",
+		"HTTPS_PROXY=not-a-url",
+		"HTTPS_PROXY=file:///etc/passwd",
+		"HTTP_PROXY=http://proxy.lan:3128/some/path",
+	} {
+		err := CheckEnv(layout, append(append([]string(nil), base...), bad), PlatformIOS)
+		if err == nil {
+			t.Errorf("%s 被放过了", bad)
+		}
+	}
+}

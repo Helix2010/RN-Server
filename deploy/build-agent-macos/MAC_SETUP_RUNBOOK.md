@@ -211,6 +211,10 @@ git --version                              # ≥ 2.30
 node --version                             # ≥ 22
 which node pnpm pod git                    # 必须在 /usr/local/bin、/opt/homebrew/bin、/usr/bin、/bin 之一
 sudo systemsetup -getusingnetworktime      # 必须 On
+
+# 出网：这两个都要通，而且是从**这台机器**通
+curl -sS -o /dev/null -w 'github  %{http_code} %{time_total}s\n' --max-time 30 https://github.com/
+curl -sS -o /dev/null -w 'npm     %{http_code} %{time_total}s\n' --max-time 30 https://registry.npmjs.org/
 ```
 
 ### 每条为什么
@@ -224,6 +228,23 @@ sudo systemsetup -getusingnetworktime      # 必须 On
 | node ≥ 22、git ≥ 2.30 | RN-App 的构建要 |
 | 工具在那四个目录里 | 那条 PATH 会写进 env 文件交给执行进程，装在别处到时候找不到 |
 | 网络对时 On | App Store Connect 的 JWT 只有 20 分钟有效期，时钟漂几分钟就是 401——而那个 401 看着像密钥有问题，能查很久 |
+| **github.com 443 通** | CocoaPods 装**每一个** pod 都是去 clone 它的 git 源（trunk 上的 podspec 写的就是 `source: {git: …, tag: …}`）。不通的表现是 `pod install` 卡几十秒然后 `fatal: unable to access 'https://github.com/…': Failed to connect to github.com port 443`，而那时依赖已经装了一分钟，看着像"构建慢"而不是"网络不通"（2026-09-20 真机）。**注意代理不继承**：任务环境是按白名单重新构造的，要走代理必须写在 env 文件里（见下） |
+
+#### 出网要走代理时
+
+任务环境**不继承**控制进程的环境，所以在 shell 里 `export HTTPS_PROXY=…` 对构建没有任何作用。
+写进 `/var/rn-build-signing` 旁边那个 env 文件（`/var/rn-build-agent/env`，root 拥有），
+装机脚本已经在里面留好了注释掉的示例：
+
+```bash
+sudo sed -i '' 's|^#HTTPS_PROXY=.*|HTTPS_PROXY=http://127.0.0.1:7890|' /var/rn-build-agent/env
+sudo sed -i '' 's|^#https_proxy=.*|https_proxy=http://127.0.0.1:7890|' /var/rn-build-agent/env
+sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
+```
+
+大小写两套都要写：**libcurl 只认小写的 `http_proxy`**，少一种就会出现"某些工具走代理、
+某些不走"这种半通状态。地址里**不许带账号口令**——这些值对构建进程可读，而那里跑着第三方
+依赖的代码；执行进程会当场拒绝带凭据的代理地址。
 
 ### 常见的补法
 
