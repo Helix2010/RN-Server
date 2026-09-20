@@ -125,31 +125,57 @@
 
 这样一次丢失的回应等于什么都没发生，而不是消耗一次重排。
 
+### 启动时配置不过关，服务端那边只看得见「掉线」（2026-09-20 记）
+
+当天把 `BUILD_AGENT_ALLOWED_SIGNERS` 注释掉之后，agent 每 10 秒起一次、每次立刻退出，
+日志里原因写得清清楚楚，**但服务端那边只有 `online: false`**——控制台上跟拔网线、跟机器关机、
+跟进程卡死完全分不开。实际排查里先花了半小时去证明"不是网络"（从 Mac 上 curl 服务端 404
+1.59 秒、curl ASC 302 1.31 秒、`pmset` 没有休眠记录），才想到去看日志。
+
+配置校验失败时 agent 其实**还有条件报一句**：机器令牌就在同一个 env 文件里，令牌本身没问题时
+可以发一次「我起不来，原因是 X」再退出。这样控制台上那台机器会显示「离线 · 配置不完整：
+缺 BUILD_AGENT_ALLOWED_SIGNERS」，而不是一个沉默的红点。
+
+要小心的地方：**报告这条本身不能变成新的失败路径**——报不出去（令牌也坏了、网络也断了）就
+安静退出，绝不能因为报不掉而卡住或改变退出行为；也不能把 env 文件里的值带进去，只报键名。
+
 ## 开回来之前不算完
 
-### mac-01 的提交验签闸是关着的（2026-09-20 关，**未恢复**）
+### iOS 打包机上没有「关闸」这个选项（2026-09-20 试过，撞墙，已恢复）
 
-```bash
-# 现在（关着）
-#BUILD_AGENT_ALLOWED_SIGNERS=/opt/rn-build-agent/allowed_signers
+为了省掉真机打通阶段的签名往返，当天 14:00 前后把 `/var/rn-build-agent/env` 里的
+`BUILD_AGENT_ALLOWED_SIGNERS` 注释掉了，想让改动能直接推 RN-App 的 main。**结果不是「闸关了」，
+是「agent 起不来了」**：
+
+```
+ERROR build agent configuration is incomplete
+error="BUILD_AGENT_ALLOWED_SIGNERS is required on an iOS build machine: without it the
+       agent would build any commit the server points it at, and this machine holds
+       every tenant's signing material"
 ```
 
-**为什么关**：真机打通阶段每改 RN-App 一行都要持有 `rn-app-signing-A` 的人签一次提交再推，
-一天下来为此往返四次，每次都把二十分钟的 `pod install` 推迟。关掉之后改动可以直接推 main。
+这条检查是**必填**而不是「没配就不校验」，写在 `jobspec`/启动配置校验里，正是为了挡住这次这种
+操作。launchd 每 10 秒拉起一次、每次立刻退出（`active count = 0`、`state = spawn scheduled`），
+机器就这么静默掉线 35 分钟，排队的构建一直没人认领。
 
-**关着的实际含义**：能往 RN-App 的 main 推代码的人、以及能改服务端数据库的人，就能在这台
-**装着全部租户 Distribution 私钥**的 Mac 上执行任意代码。这正是设计 §4.3b 那道闸要挡的东西
-（`checkout.go` 里那段注释写得很清楚：签名者的私钥不在 GitHub、也不在服务端）。
-
-**怎么开回来**（阶段 A 端到端跑通之后立刻做）：
+**恢复**（已做）：
 
 ```bash
 sudo sed -i '' 's|^#BUILD_AGENT_ALLOWED_SIGNERS=|BUILD_AGENT_ALLOWED_SIGNERS=|' /var/rn-build-agent/env
 sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 ```
 
-开回来之后**必须验一次**：排一条构建，确认它检出的那个提交带 SSH 签名且在名单里；再故意用
-一个没签名的提交排一条，确认被挡。只改配置不验，等于不知道它有没有真的开着。
+**代价**：关闸那两小时里往 main 推的 `758e21d` 是未签名的，闸一开回来它就成了 main 顶端唯一
+过不了的提交，得由名单里的人 `git commit --amend --no-edit -S` 重签一次再强推。
+
+**结论写死在这里**：真机打通阶段的签名往返**不要靠关闸解决**。闸挡的是「能往 main 推代码的人
+就能在装着全部租户 Distribution 私钥的 Mac 上执行任意代码」（设计 §4.3b），这个性质比几次
+往返值钱。真嫌往返多，正确的做法是把一把专用签名公钥加进 `allowed_signers`——但那要重打安装包
+并重签清单（`allowed_signers` 的 sha256 在签名清单里，本地改会被下一次升级盖回去），是一次
+有记录的授权动作，不是 sed 一行。
+
+**闸仍然欠一次验证**：排一条构建，确认它检出的那个提交带 SSH 签名且在名单里；再故意用一个
+没签名的提交排一条，确认被挡。只改配置不验，等于不知道它有没有真的开着。
 
 > 顺带：PR 合并会撞上这道闸。GitHub 用**它自己的 PGP 密钥**签合并提交，而这里验的是 SSH
 > 签名——`git -c gpg.format=ssh verify-commit`。走 PR 的话要用 **Rebase and merge**，且分支上

@@ -246,6 +246,32 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 某些不走"这种半通状态。地址里**不许带账号口令**——这些值对构建进程可读，而那里跑着第三方
 依赖的代码；执行进程会当场拒绝带凭据的代理地址。
 
+#### 只有 github.com 不通时（2026-09-20 起，mac-01 在用）
+
+CocoaPods 装每个 pod 都是 `git clone` 它的源码仓库，所以 **github.com 是硬依赖**：github 断了
+`pod install` 就过不去，哪怕别的外网都通。没有代理时可以只把 github 的 clone 改写到镜像：
+
+```bash
+sudo git config --system url."https://gitclone.com/github.com/".insteadOf https://github.com/
+
+# 验证构建账户那边真的生效（写的是 github，实际走镜像）
+sudo -u _rnbuilder -H git ls-remote https://github.com/ashleymills/Reachability.swift.git refs/tags/v5.2.4
+```
+
+写 `--system`（`/etc/gitconfig`）而不是某个用户的 `~/.gitconfig`：构建跑在 `_rnbuilder` 下，
+它的家目录是 `/var/empty`。不想要了 `sudo git config --system --unset-all url."<镜像>".insteadOf`。
+
+**这是临时措施，带供应链风险**，用之前先认清两条：
+
+- 镜像能在同一个 tag 底下换内容。**用之前、以及每次依赖有变动之后**，在一台能直连 github 的
+  机器上把 `Podfile.lock` 里 github 来源的那几个 pod 逐个 `git ls-remote` 对一遍 SHA。
+  2026-09-20 对过 `gitclone.com`、`ghfast.top`、`gh-proxy.com` 三家，都与真 github 一致。
+- 只改写 **git clone**。`:http:` 拉 tarball 的那一类 pod（RN 的 `glog`、`folly`、`fmt` 等
+  第三方 podspec）是 curl 下载，这条配置管不着；它们通常已经在 `~/Library/Caches/CocoaPods`
+  里，真碰上再单独处理。
+
+能在路由器上给 github.com 做分流、或者有可用代理的话，**都比这条干净**，优先用那两条。
+
 ### 常见的补法
 
 ```bash
