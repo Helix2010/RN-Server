@@ -121,6 +121,12 @@ type iosScanner struct {
 	// 带上 bundle id 是因为这套端点挂在具体的 App 下（GET /v1/apps/{id}/buildUploads），
 	// 而"这个 Team 有哪些 App"只有盘点知道
 	Probe func(ctx context.Context, teamID string, bundleIDs []string) string
+	// UploadKeyTeams 返回装好了上传 Key 的 Team（ios-upload --list-keys，以上传账户跑）。
+	//
+	// 生产里非有它不可：上传区是 0700 _rnuploader，控制进程连目录都 stat 不了——自己去看
+	// 只会得到 EACCES，然后把每个 Team 都判成"没有上传 Key"，于是开着上传的机器一个 Team
+	// 都报不出来（2026-09-20 真机）。nil = 直接读本地，用于测试与 RUNNER_USER=- 的本地形态
+	UploadKeyTeams func(ctx context.Context) (map[string]bool, error)
 }
 
 func newIOSScanner(cfg config) iosScanner {
@@ -227,6 +233,17 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 	profiles, problems := s.scanProfiles()
 	inv.Problems = append(inv.Problems, problems...)
 
+	// 上传 Key 只问一次，问的是上传账户自己（见 UploadKeyTeams）。取不到就当一把都没有，
+	// 但要把原因说出来——否则表现与"确实没装 Key"一模一样
+	withUploadKey := map[string]bool{}
+	if s.RequireUploadKey {
+		var err error
+		if withUploadKey, err = s.uploadKeyTeams(ctx); err != nil {
+			inv.Problems = append(inv.Problems, "cannot read which teams have an upload key: "+err.Error())
+			withUploadKey = map[string]bool{}
+		}
+	}
+
 	teams := map[string]bool{}
 	for team := range identities {
 		teams[team] = true
@@ -261,13 +278,11 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 				"team "+team+" has a signing identity but no usable provisioning profile")
 			continue
 		}
-		if s.RequireUploadKey {
-			if _, err := os.Stat(filepath.Join(s.UploadKeys, team, uploadKeyFileName)); err != nil {
-				inv.Problems = append(inv.Problems,
-					"team "+team+" has signing material but no upload key in "+filepath.Join(s.UploadKeys, team)+
-						"; uploads are on, so this team is not reported")
-				continue
-			}
+		if s.RequireUploadKey && !withUploadKey[team] {
+			inv.Problems = append(inv.Problems,
+				"team "+team+" has signing material but no upload key in "+filepath.Join(s.UploadKeys, team)+
+					"; uploads are on, so this team is not reported")
+			continue
 		}
 		material := appleTeamMaterial{TeamID: team, ExpiresAt: earliest(expiry[team], bundles.expiresAt)}
 		material.BundleIDs = append(material.BundleIDs, bundles.ids...)
@@ -396,6 +411,28 @@ func parseProvisioningProfile(raw []byte) (teamID, bundleID string, expires time
 		return "", "", time.Time{}, errors.New("the provisioning profile has no ExpirationDate")
 	}
 	return team, bundle, expires, nil
+}
+
+// uploadKeyTeams 问"哪些 Team 装好了上传 Key"。没有注入实现时直接读本地目录——
+// 那条路只在测试与 BUILD_AGENT_RUNNER_USER=- 的本地形态下成立，真机上读不到。
+func (s iosScanner) uploadKeyTeams(ctx context.Context) (map[string]bool, error) {
+	if s.UploadKeyTeams != nil {
+		return s.UploadKeyTeams(ctx)
+	}
+	entries, err := os.ReadDir(s.UploadKeys)
+	if err != nil {
+		return nil, err
+	}
+	teams := map[string]bool{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(s.UploadKeys, entry.Name(), uploadKeyFileName)); err == nil {
+			teams[entry.Name()] = true
+		}
+	}
+	return teams, nil
 }
 
 // keychainIdentities 问钥匙串"哪些 Team 我既有证书又有私钥"。

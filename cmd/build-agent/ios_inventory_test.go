@@ -305,3 +305,91 @@ func TestIOSInventorySaysWhenTheCertificateIsThereButNotAValidIdentity(t *testin
 		t.Errorf("a team with no certificate at all should still say so: %s", problems)
 	}
 }
+
+// 上传 Key 在不在，必须问上传账户，不能自己去 stat。
+//
+// 上传区是 /var/rn-build-upload 0700 _rnuploader，控制进程连目录都进不去：自己去看只会
+// 得到 EACCES，而那与"确实没装 Key"长得一模一样——开着上传的机器于是一个 Team 都报不
+// 出来，控制台上永远"缺材料"（2026-09-20 真机，与 2026-09-19 签名区那次同一个形状）。
+func TestIOSInventoryAsksTheUploadAccountWhichTeamsHaveAKey(t *testing.T) {
+	scanner := testScanner(t, map[string]bool{"AB12CD34EF": true})
+	scanner.RequireUploadKey = true
+	writeProfile(t, filepath.Join(scanner.SigningDir, profilesDirName, "AB12CD34EF"), "w"+profileSuffix,
+		"AB12CD34EF", "com.anyfun.foundation", time.Now().Add(100*24*time.Hour))
+	// 盘上什么都没有：只有上传账户说有，才算有
+	asked := 0
+	scanner.UploadKeyTeams = func(context.Context) (map[string]bool, error) {
+		asked++
+		return map[string]bool{"AB12CD34EF": true}, nil
+	}
+	inventory := scanner.scan(context.Background())
+	if len(inventory.Teams) != 1 {
+		t.Fatalf("the upload account said the key is there, but the team was not reported: %+v", inventory)
+	}
+	if asked != 1 {
+		t.Errorf("the upload account was asked %d times; once per scan is enough", asked)
+	}
+
+	// 问不到的时候不能装作"没装 Key"：那条错要说出来，否则和真的缺 Key 分不开
+	scanner.UploadKeyTeams = func(context.Context) (map[string]bool, error) {
+		return nil, errors.New("permission denied")
+	}
+	inventory = scanner.scan(context.Background())
+	if len(inventory.Teams) != 0 {
+		t.Errorf("a team was reported although the upload key could not be checked: %+v", inventory.Teams)
+	}
+	if !strings.Contains(strings.Join(inventory.Problems, "\n"), "permission denied") {
+		t.Errorf("the reason the check failed did not reach the problems: %v", inventory.Problems)
+	}
+
+	// 关着上传的机器不问，也不因此少报
+	scanner.RequireUploadKey = false
+	scanner.UploadKeyTeams = func(context.Context) (map[string]bool, error) {
+		t.Error("a machine with uploads off asked the upload account anyway")
+		return nil, nil
+	}
+	if inventory := scanner.scan(context.Background()); len(inventory.Teams) != 1 {
+		t.Errorf("a machine that does not upload must still report what it can sign: %+v", inventory)
+	}
+}
+
+// 开着上传时，"哪些 Team 有上传 Key"这个问题也必须经上传程序问——控制进程去 stat
+// 那个 0700 _rnuploader 的目录只会得到 EACCES（2026-09-20 真机）。
+func TestAgentInventoryAsksTheUploadProgramForItsKeys(t *testing.T) {
+	rig := newRig(t)
+	a := rig.agent
+	dir := t.TempDir()
+	answer := `{"identities":"  1) AA \"Apple Distribution: Anyfun (WIREDTEAM1)\"\n","profiles":{"WIREDTEAM1/a.mobileprovision":"` +
+		base64.StdEncoding.EncodeToString(profileBytes(t, "WIREDTEAM1", "com.anyfun.wired", time.Now().Add(100*24*time.Hour))) + `"}}`
+	runner := filepath.Join(dir, "build-runner")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nprintf '%s' '"+answer+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 假的 ios-upload：记下自己被怎么调的，只对 --list-keys 回答
+	uploader := filepath.Join(dir, "ios-upload")
+	script := "#!/bin/sh\necho \"$@\" >> " + dir + "/upload-calls\n" +
+		"case \"$*\" in *--list-keys*) printf '%s' '{\"teams\":[\"WIREDTEAM1\"]}';; esac\n"
+	if err := os.WriteFile(uploader, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.cfg.Runner, a.cfg.RunnerUser = runner, directRunner
+	a.cfg.IOSUploader, a.cfg.IOSUploadUser = uploader, directRunner
+	// 上传区在真机上这个账户也进不去，所以这里故意指一个不存在的目录：
+	// 盘点要是自己去读盘，这个用例就会红
+	a.cfg.IOSUploadKeys = filepath.Join(dir, "no-such-upload-dir")
+	a.cfg.IOSUpload = true
+	if a.cfg.MachineEnv == nil {
+		a.cfg.MachineEnv = map[string]string{}
+	}
+	a.cfg.MachineEnv[jobspec.IOSSigningDirEnv] = t.TempDir()
+	a.cfg.MachineEnv["PATH"] = "/usr/bin:/bin"
+
+	inventory := a.iosInventory(context.Background())
+	if len(inventory.Teams) != 1 || inventory.Teams[0].TeamID != "WIREDTEAM1" {
+		t.Fatalf("the agent reported %+v; %v", inventory.Teams, inventory.Problems)
+	}
+	calls, err := os.ReadFile(filepath.Join(dir, "upload-calls"))
+	if err != nil || !strings.Contains(string(calls), "--list-keys") {
+		t.Fatalf("the upload program was never asked which teams have a key: %q %v", calls, err)
+	}
+}

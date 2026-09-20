@@ -227,6 +227,9 @@ func (a *agent) iosInventory(ctx context.Context) iosInventory {
 	if a.iosProbe != nil {
 		scanner.Probe = a.iosProbe
 	}
+	// 上传区归上传账户（0700 _rnuploader），控制进程连目录都 stat 不了——"哪些 Team 装了
+	// 上传 Key"同样得由那个账户交出来
+	scanner.UploadKeyTeams = a.uploadKeyTeams
 	inventory := scanner.scan(ctx)
 	a.sayOnce("iosTeams", "signing material for "+strings.Join(inventory.teamIDs(), ", "))
 	if len(inventory.Problems) > 0 {

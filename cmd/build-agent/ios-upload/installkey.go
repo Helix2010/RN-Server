@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -85,6 +86,34 @@ func installKey(stdin io.Reader, stdout io.Writer, keysDir string) error {
 	return json.NewEncoder(stdout).Encode(map[string]any{
 		"installed": true, "kind": material.Kind, "teamId": material.TeamID, "keyId": material.KeyID,
 	})
+}
+
+// listKeys 打印这台机器上**装好了上传 Key 的 Team**。
+//
+// 非有这条不可：上传区是 `/var/rn-build-upload` 0700 `_rnuploader`，而"这个 Team 能不能
+// 上传"的判断在控制进程（`_rnbuildagent`）那一侧——它连这个目录都 stat 不了，自己去看
+// 只会得到 EACCES，然后把每个 Team 都当成"没有上传 Key"。与签名区那次（build-runner
+// ios-inventory）同一个形状：判断留在控制进程，原文由持有它的账户交出来。
+//
+// 只报 Team 名，不报 issuer id、key id 或任何密钥内容——控制进程不需要它们。
+func listKeys(stdout io.Writer, keysDir string) error {
+	entries, err := os.ReadDir(keysDir)
+	if err != nil {
+		return fmt.Errorf("cannot read the upload key directory: %w", err)
+	}
+	teams := []string{}
+	for _, entry := range entries {
+		if !entry.IsDir() || !appleTeamIDPattern.MatchString(entry.Name()) {
+			continue
+		}
+		// key.json 是最后写的那个文件（见 installKey），它在就说明这一格是完整的
+		if _, err := os.Stat(filepath.Join(keysDir, entry.Name(), "key.json")); err != nil {
+			continue
+		}
+		teams = append(teams, entry.Name())
+	}
+	sort.Strings(teams)
+	return json.NewEncoder(stdout).Encode(map[string]any{"teams": teams})
 }
 
 // materialKeyFingerprint 打印本机这把材料私钥对应的**公钥**指纹，装机时与控制台核对。

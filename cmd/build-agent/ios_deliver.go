@@ -238,6 +238,37 @@ func (a *agent) probeUploadKey(ctx context.Context, teamID string, bundleIDs []s
 	return "error"
 }
 
+// uploadKeyTeams 问上传账户"哪些 Team 装好了上传 Key"。
+//
+// 控制进程自己看不到：上传区是 0700 _rnuploader，它连目录都 stat 不了。自己去读只会得到
+// EACCES，而那条错与"确实没装 Key"长得一模一样——表现是开着上传的机器一个 Team 都报不
+// 出来，控制台上永远"缺材料"（2026-09-20 真机）。与签名区那次同一个解法：由持有它的账户
+// 交出原文，判断仍留在这一侧。
+func (a *agent) uploadKeyTeams(ctx context.Context) (map[string]bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := a.uploaderCommand(ctx, "--list-keys", "--keys", a.cfg.IOSUploadKeys)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s --list-keys: %w: %s", a.cfg.IOSUploader, err,
+			truncate(strings.TrimSpace(stderr.String()), 200))
+	}
+	var answer struct {
+		Teams []string `json:"teams"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&answer); err != nil {
+		return nil, fmt.Errorf("the upload program did not answer with JSON: %w", err)
+	}
+	teams := map[string]bool{}
+	for _, team := range answer.Teams {
+		teams[team] = true
+	}
+	return teams, nil
+}
+
 // uploaderCommand 构造上传程序的调用：经 sudo 切到上传账户，环境只给 PATH 与 LANG。
 // 与执行进程同一条路子——上传账户持有能传 build 的 Key，它不该看到本机令牌。
 func (a *agent) uploaderCommand(ctx context.Context, args ...string) *exec.Cmd {

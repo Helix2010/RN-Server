@@ -171,3 +171,38 @@ func TestMaterialKeyFingerprintIsTheValueTheConsoleRegisters(t *testing.T) {
 		t.Fatalf("fingerprint %q, the console registers %s", strings.TrimSpace(out.String()), hex.EncodeToString(want[:]))
 	}
 }
+
+// --list-keys 只说"哪些 Team 装好了"，不吐任何密钥内容——控制进程要的就只有这个。
+func TestListKeysNamesTheTeamsAndNothingElse(t *testing.T) {
+	dir := t.TempDir()
+	for _, team := range []string{"J4JDFC8LCC", "AB12CD34EF"} {
+		if err := os.MkdirAll(filepath.Join(dir, team), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// key.json 是 installKey 最后写的那个文件，它在才算这一格完整
+	if err := os.WriteFile(filepath.Join(dir, "J4JDFC8LCC", "key.json"),
+		[]byte(`{"issuerId":"3223da1d-14c5-46fc-80a1-41ecfb6e3c67","keyId":"8WQNTAY7MP"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "J4JDFC8LCC", "AuthKey_8WQNTAY7MP.p8"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 不是 Team ID 的目录不算
+	if err := os.MkdirAll(filepath.Join(dir, "not-a-team"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := listKeys(&out, dir); err != nil {
+		t.Fatalf("--list-keys failed: %v", err)
+	}
+	if got := strings.TrimSpace(out.String()); got != `{"teams":["J4JDFC8LCC"]}` {
+		t.Errorf("--list-keys said %s", got)
+	}
+	for _, leak := range []string{"secret", "8WQNTAY7MP", "3223da1d"} {
+		if strings.Contains(out.String(), leak) {
+			t.Errorf("--list-keys leaked %q to the control process: %s", leak, out.String())
+		}
+	}
+}

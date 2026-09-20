@@ -69,6 +69,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	set.SetOutput(stderr)
 	probe := set.Bool("probe", false, "only check whether this key may use the build upload endpoints")
 	install := set.Bool("install-key", false, "install an upload key handed over as ciphertext on stdin")
+	list := set.Bool("list-keys", false, "print the teams that have an upload key installed on this machine")
 	fingerprint := set.Bool("material-key-fingerprint", false, "print the sha256 of this account's material public key")
 	team := set.String("team", "", "Apple Developer Team ID")
 	keys := set.String("keys", "/var/rn-build-upload", "directory that holds <TEAMID>/key.json and the .p8")
@@ -90,6 +91,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if *install {
 		if err := installKey(stdin, stdout, *keys); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	// --list-keys 和上面两条一样不需要 --team / --expect-*：它回答的是"这台机器上装了
+	// 哪些 Team 的 Key"，而那正是控制进程自己看不到的东西
+	if *list {
+		if err := listKeys(stdout, *keys); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
