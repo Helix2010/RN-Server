@@ -14,7 +14,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -429,5 +431,125 @@ func TestUpgradeLetsTheBuildUserIntoTheStagingDirectory(t *testing.T) {
 	if binary[9] != 'x' {
 		t.Errorf("the staged binary is %s; the build user cannot execute it. The mode comes from the "+
 			"umask this program inherited from launchd — pin it instead of hoping", binary)
+	}
+}
+
+// 归档下到一半连接断了，同一次运行里就该重试，不必绕一圈代理重启。
+//
+// 2026-09-20 真机上一次换版本花了 20 分钟，而升级本身只要 16 秒——时间全在两次
+// connection reset 之后的重试上，每一轮都是：失败 → 删停机标记 → launchd 拉起代理 →
+// 认领 → 409 → 再写标记 → 再触发这个程序 → 整包重下。
+func TestUpgradeRetriesADroppedDownloadInTheSameRun(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getBackoff = 10 * time.Millisecond
+	t.Cleanup(func() { getBackoff = 5 * time.Second })
+	fake := newBundle(t, private, newCommit, 6, goodAgent)
+	// 前两次取归档都在传到一半时断掉，第三次才完整
+	var drops int32
+	inner := fake.server.Config.Handler
+	fake.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/build-agent/bundle/archive" && atomic.AddInt32(&drops, 1) <= 2 {
+			w.Header().Set("content-length", strconv.Itoa(len(fake.archive)))
+			_, _ = w.Write(fake.archive[:len(fake.archive)/2])
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			// 不写完就断：客户端读到一半拿到 unexpected EOF
+			if hijacker, ok := w.(http.Hijacker); ok {
+				conn, _, err := hijacker.Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			}
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+
+	m := newMachine(t, public, fake.server.URL)
+	m.requestUpgrade(t, newCommit)
+	code, output := m.run(t)
+	if code != 0 {
+		t.Fatalf("断了两次之后没能在同一次运行里装上：%d %s", code, output)
+	}
+	if atomic.LoadInt32(&drops) < 3 {
+		t.Fatalf("归档只取了 %d 次，重试没有发生", drops)
+	}
+	if !strings.Contains(output, "retrying") {
+		t.Errorf("重试没有写进输出，人看不出它在做什么：%s", output)
+	}
+	installed, err := os.ReadFile(filepath.Join(m.installDir, "build-agent"))
+	if err != nil || string(installed) != goodAgent {
+		t.Fatalf("二进制没换上：%q %v", installed, err)
+	}
+}
+
+// HTTP 状态码不重试：503 是"清单还没签"，4xx 是这台机器这一刻就不该拿到这份包。
+// 重试它们只是把同一个答案多问几遍，还把失败推迟十几秒才送到人眼前。
+func TestUpgradeDoesNotRetryARefusal(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newBundle(t, private, newCommit, 7, goodAgent)
+	var asked int32
+	fake.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&asked, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("the deployed bundles have no signature yet"))
+	})
+	m := newMachine(t, public, fake.server.URL)
+	m.requestUpgrade(t, newCommit)
+	if code, _ := m.run(t); code == 0 {
+		t.Fatal("服务端明确拒绝了，升级却报成功")
+	}
+	if got := atomic.LoadInt32(&asked); got != 1 {
+		t.Errorf("被拒之后又问了 %d 次；明确的拒绝不该重试", got)
+	}
+}
+
+// 连接不断、也不给字节：看门狗要掐掉它，而不是干等 30 分钟。
+//
+// 真机上失败的那两次正是这一种——`connection reset by peer` 是等了 6–8 分钟之后对端
+// 才把连接掐掉的；在那之前这个程序一直在读一个不会再有字节的连接。
+func TestUpgradeGivesUpOnAStalledConnection(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stallTimeout = 150 * time.Millisecond
+	getBackoff = 10 * time.Millisecond
+	t.Cleanup(func() { stallTimeout, getBackoff = 60*time.Second, 5*time.Second })
+
+	fake := newBundle(t, private, newCommit, 8, goodAgent)
+	inner := fake.server.Config.Handler
+	held := make(chan struct{})
+	t.Cleanup(func() { close(held) })
+	fake.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/build-agent/bundle/archive" {
+			// 响应头都不给：客户端就这么挂着
+			<-held
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+
+	m := newMachine(t, public, fake.server.URL)
+	m.requestUpgrade(t, newCommit)
+	done := make(chan string, 1)
+	go func() {
+		_, output := m.run(t)
+		done <- output
+	}()
+	select {
+	case output := <-done:
+		if !strings.Contains(output, "stalled") {
+			t.Errorf("卡死的连接没有被说成卡死，人看不出原因：%s", output)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("卡死的连接把升级程序一起挂住了；看门狗没起作用")
 	}
 }

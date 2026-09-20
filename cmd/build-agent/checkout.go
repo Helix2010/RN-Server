@@ -138,7 +138,7 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 	if err := checkTenantFileMatchesJob(job); err != nil {
 		return prepared, err
 	}
-	written, err := fetchTenantIcons(ctx, a.api, job, checkout)
+	written, err := fetchTenantIcons(ctx, a.api, job, checkout, buf)
 	if err != nil {
 		return prepared, err
 	}
@@ -580,7 +580,15 @@ func (a *agent) gitOutput(ctx context.Context, args ...string) (string, error) {
 
 // fetchTenantIcons 把服务端列出的图标一张一张取下来，写进 assets/tenants/<目录>/。
 // 文件名由服务端给（约定的那四个），这里仍然挡一次路径逃逸；写入不跟随检出里的符号链接。
-func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout *checkoutFS) (int, error) {
+//
+// 每张图都带重试：这是一次构建最早的几步之一，此刻还没有任何成本沉淀，但**失败的代价
+// 是整条任务判死**——2026-09-20 真机上第一条能跑起来的 iOS 任务就倒在这里，一句
+// "cannot fetch icon icon.png: context deadline exceeded"。取图标是幂等的 GET，
+// 重试一次比让人回控制台重排一次便宜得多。
+//
+// 重试放在 writeFrom **外面**：那条路每次都从头建一个临时文件，在回调里重试会把第二次
+// 的字节接在半截文件后面。
+func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout *checkoutFS, buf *logBuffer) (int, error) {
 	if len(job.Icons) == 0 {
 		return 0, nil
 	}
@@ -590,15 +598,21 @@ func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout
 		if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
 			return written, fmt.Errorf("refusing an icon name that escapes the tenant directory: %q", firstRunes(name, 64))
 		}
-		if err := checkout.writeFrom(filepath.Join(dir, name), func(w io.Writer) error {
-			return api.downloadIcon(ctx, job, name, w)
-		}); err != nil {
+		err := withRetry(ctx, buf, "fetching icon "+name, iconAttempts, func(ctx context.Context) error {
+			return checkout.writeFrom(filepath.Join(dir, name), func(w io.Writer) error {
+				return api.downloadIcon(ctx, job, name, w)
+			})
+		})
+		if err != nil {
 			return written, fmt.Errorf("cannot fetch icon %s: %w", name, err)
 		}
 		written++
 	}
 	return written, nil
 }
+
+// iconAttempts：图标取几次。退避从 5 秒起翻倍，三次合计等 15 秒——比重排一次构建便宜。
+const iconAttempts = 3
 
 // missingTenantIcons 返回 prebuild 会去读、而检出里还没有（或者不是普通文件）的那几个图标。
 func missingTenantIcons(checkout *checkoutFS, directory string) []string {

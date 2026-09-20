@@ -450,6 +450,20 @@ func (c *client) fail(ctx context.Context, jobID string, attempt int, reason, co
 	return err
 }
 
+// abandonClaim 交回一条**从来没开始跑**的认领：认领的回应在路上丢了，这台机器直到
+// 下一次认领才从服务端口中得知自己领过活。服务端按回收定时器同一条规则重排（次数
+// 用完了才判失败），所以人不必回控制台手动重排一次。
+//
+// 与 fail 分开的是 orphaned 这个字段，不是接口：判"还能不能重排"要看任务行上的种类
+// 与次数，那两个值只有服务端手里有。
+func (c *client) abandonClaim(ctx context.Context, jobID string, attempt int, reason string) error {
+	_, _, err := c.send(ctx, http.MethodPost, jobPath(jobID, "/fail"), attempt, map[string]any{
+		"failureReason": truncate(reason, 1000), "commitSha": "", "logTail": []string{},
+		"orphaned": true,
+	})
+	return err
+}
+
 // complete 只给热更新任务用：安装包任务以 /built 结束。
 func (c *client) complete(ctx context.Context, job claimedJob, commit, digest, releaseID string, logTail []string) error {
 	_, _, err := c.send(ctx, http.MethodPost, jobPath(job.ID, "/complete"), job.Attempt, map[string]any{
@@ -570,7 +584,9 @@ func (c *client) downloadIcon(ctx context.Context, job claimedJob, name string, 
 	// 一张图上限 6MB（服务端那一侧的校验），留一倍余量挡住坏掉的响应
 	written, err := io.Copy(w, io.LimitReader(response.Body, 12<<20+1))
 	if err != nil {
-		return err
+		// 读到一半断了与连不上是同一类事，都值得再试一次。少了这一条，家用网络上
+		// 一次抖动就把整条任务判死（2026-09-20 真机：cannot fetch icon icon.png）
+		return retryLater{fmt.Errorf("reading icon %s failed: %w", name, err)}
 	}
 	if written > 12<<20 {
 		return fmt.Errorf("icon %s is larger than 12 MiB", name)

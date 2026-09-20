@@ -57,10 +57,27 @@ const (
 	releaseKeyName   = "release-key.pub"
 	// 二进制在归档里的位置，与 build-bundles.sh 一致
 	binPrefix = "bin/"
-	// downloadTimeout：几十 MB 走家用下行
+	// downloadTimeout 是一次取件的**绝对上限**。真正起作用的是下面那个停滞看门狗：
+	// 家用下行上一个 9 MB 的归档正常十几秒就完，而卡死的连接要么等对端重置（真机上
+	// 实测 6–8 分钟），要么在这里干等半小时——两种都比"没新字节就重来"贵得多
 	downloadTimeout = 30 * time.Minute
+	// getAttempts：一次运行里就把重试用完。
+	//
+	// 不这样的话，重试要绕一整圈：升级失败 → 删停机标记 → launchd 拉起代理 → 认领 →
+	// 409 → 再写标记 → 再触发这个程序 → **整包重下**。2026-09-20 真机上一次换版本因此
+	// 花了 20 分钟，而升级本身只要 16 秒
+	getAttempts     = 3
 	maxArchiveBytes = 512 << 20
 	maxFileBytes    = 256 << 20
+)
+
+// stallTimeout：连着这么久没有新字节（含等响应头）就判连接卡死，掐掉重来。
+// getBackoff：两次重试之间等多久，按次数线性拉长。
+//
+// 做成变量只是为了测试能把它们调小——一次重试就等五秒的测试没人愿意跑。
+var (
+	stallTimeout = 60 * time.Second
+	getBackoff   = 5 * time.Second
 )
 
 // 要换的可执行文件。多出来的文件（env 示例等）不动：这个程序只换代码。
@@ -481,8 +498,48 @@ func writeFailure(stateDir, commit string, cause error) error {
 	return os.WriteFile(filepath.Join(stateDir, "upgrade-failed.json"), append(raw, '\n'), 0o644)
 }
 
-// get 用机器令牌取一条。令牌只在请求头里，不进 URL、不进日志。
+// get 用机器令牌取一条，网络抖动时在**这一次运行里**重试。
+//
+// 只重试传输层的失败（连不上、连接被重置、读到一半卡死）。HTTP 状态码不重试：503
+// 是"清单还没签"，4xx 是这台机器这一刻不该拿到这份包——重试它们只是把同一个答案
+// 多问几遍，还把失败延后了十几秒。
 func get(ctx context.Context, in upgradeInput, path string, limit int64) ([]byte, error) {
+	var last error
+	for attempt := 1; ; attempt++ {
+		body, err := getOnce(ctx, in, path, limit)
+		var transport transportError
+		switch {
+		case err == nil:
+			return body, nil
+		case !errors.As(err, &transport) || attempt >= getAttempts || ctx.Err() != nil:
+			return nil, err
+		}
+		last = err
+		fmt.Fprintf(in.Out, "%s failed (%v); retrying %d of %d\n", path, err, attempt+1, getAttempts)
+		select {
+		case <-ctx.Done():
+			return nil, last
+		case <-time.After(time.Duration(attempt) * getBackoff):
+		}
+	}
+}
+
+// transportError 是"网络没走通"，与"服务端明确答了别的"分开——只有前者值得重试。
+type transportError struct{ err error }
+
+func (e transportError) Error() string { return e.err.Error() }
+func (e transportError) Unwrap() error { return e.err }
+
+// getOnce 发一次请求。令牌只在请求头里，不进 URL、不进日志。
+func getOnce(ctx context.Context, in upgradeInput, path string, limit int64) ([]byte, error) {
+	// 停滞看门狗：每收到新字节就往后推一次；推不动了就取消这次请求。等响应头的那一段
+	// 也算在内——真机上卡住的正是那一段
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stalled := false
+	watchdog := time.AfterFunc(stallTimeout, func() { stalled = true; cancel() })
+	defer watchdog.Stop()
+
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, in.Server+path, nil)
 	if err != nil {
 		return nil, err
@@ -495,18 +552,42 @@ func get(ctx context.Context, in upgradeInput, path string, limit int64) ([]byte
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("cannot reach the server: %w", err)
+		return nil, transportError{stallReason(err, stalled)}
 	}
 	defer response.Body.Close()
+	watchdog.Reset(stallTimeout)
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4<<10))
 		return nil, fmt.Errorf("%s returned %d: %s", path, response.StatusCode, strings.TrimSpace(string(body)))
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, limit))
+	reader := &stallReader{inner: response.Body, seen: func() { watchdog.Reset(stallTimeout) }}
+	body, err := io.ReadAll(io.LimitReader(reader, limit))
 	if err != nil {
-		return nil, err
+		return nil, transportError{stallReason(err, stalled)}
 	}
 	return body, nil
+}
+
+// stallReason 把"看门狗掐的"说成人话——否则表现是一句没头没尾的 context canceled。
+func stallReason(err error, stalled bool) error {
+	if stalled {
+		return fmt.Errorf("no new bytes for %s; the connection stalled", stallTimeout)
+	}
+	return fmt.Errorf("cannot reach the server: %w", err)
+}
+
+// stallReader 每读到字节就把看门狗往后推。
+type stallReader struct {
+	inner io.Reader
+	seen  func()
+}
+
+func (r *stallReader) Read(p []byte) (int, error) {
+	n, err := r.inner.Read(p)
+	if n > 0 {
+		r.seen()
+	}
+	return n, err
 }
 
 func readReleaseKey(path string) (public []byte, err error) {

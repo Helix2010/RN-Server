@@ -446,3 +446,59 @@ func TestBuildJobViewCarriesSigningFields(t *testing.T) {
 		}
 	}
 }
+
+// 认领的回应在路上丢了，任务该**重排**，不该判死。
+//
+// 2026-09-20 真机上第一条 iOS 任务就是这么没的：认领请求到了服务端、任务派了出去，
+// 回应没回到构建机（它那侧 30 秒超时）。七分钟后它再来认领，服务端说"你手上还挂着
+// 一条"，它就把这条一行都没跑过的任务判了死。回收定时器遇到同样的局面是重排。
+func TestDBAClaimThatNeverReachedTheBuilderIsRequeued(t *testing.T) {
+	f := newGateFixture(t, 5)
+	f.queueBuild("4.0.0", 400)
+
+	abandon := func(id string, attempt int) *httptest.ResponseRecorder {
+		return f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/fail", f.builder.Token,
+			attemptHeaders(buildAttemptHeader, attempt), map[string]any{
+				"failureReason": "认领的回应没回来", "commitSha": "", "logTail": []string{}, "orphaned": true,
+			})
+	}
+
+	// 前两次交回都该把任务放回队列：同一台机器立刻又能领到它
+	for attempt := 1; attempt <= maxBuildAttempts-1; attempt++ {
+		job := f.claimBuild()
+		id := job["id"].(string)
+		if got := int(job["attempt"].(float64)); got != attempt {
+			t.Fatalf("attempt %d, want %d", got, attempt)
+		}
+		if r := abandon(id, attempt); r.Code != http.StatusNoContent {
+			t.Fatalf("交回第 %d 次：%d %s", attempt, r.Code, r.Body.String())
+		}
+	}
+
+	// 第三次用完了次数：这一次该按失败记，否则一条领不动的任务会永远转下去
+	job := f.claimBuild()
+	id := job["id"].(string)
+	if got := int(job["attempt"].(float64)); got != maxBuildAttempts {
+		t.Fatalf("attempt %d, want %d", got, maxBuildAttempts)
+	}
+	if r := abandon(id, maxBuildAttempts); r.Code != http.StatusNoContent {
+		t.Fatalf("最后一次交回：%d %s", r.Code, r.Body.String())
+	}
+	if status := f.jobStatus(id).Status; status != jobFailed {
+		t.Fatalf("次数用完之后状态是 %s，该是 failed", status)
+	}
+
+	// 不带 orphaned 的普通失败照旧是终态，一次就判死
+	f.queueBuild("4.0.1", 401)
+	plain := f.claimBuild()
+	plainID := plain["id"].(string)
+	if r := f.do(http.MethodPost, "/v1/build-agent/jobs/"+plainID+"/fail", f.builder.Token,
+		attemptHeaders(buildAttemptHeader, 1), map[string]any{
+			"failureReason": "gradle 炸了", "commitSha": "", "logTail": []string{},
+		}); r.Code != http.StatusNoContent {
+		t.Fatalf("普通失败：%d %s", r.Code, r.Body.String())
+	}
+	if status := f.jobStatus(plainID).Status; status != jobFailed {
+		t.Fatalf("一次真的失败被重排了：%s", status)
+	}
+}

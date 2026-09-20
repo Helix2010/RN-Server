@@ -292,14 +292,18 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 	defer cancel()
 	switch {
 	case result.Active != nil:
-		// 本机手上没有任务（这里是单线程的领取循环），服务端却记着一条：上一条命里被打断的构建。
-		// 中断的构建不续跑——半截的依赖安装与编译状态续下去比重来更危险。明确判失败，
-		// 让控制台立刻看到原因，而不是干等回收定时器。
-		a.log.Warn("the server says this machine still has a build in flight from an earlier run; reporting it as failed",
+		// 本机手上没有任务（这里是单线程的领取循环），服务端却记着一条：上一条命里被打断的
+		// 构建，或者**认领的回应在路上丢了**——后者这台机器一行都没跑过。
+		//
+		// 两种都交回去，不续跑：半截的依赖安装与编译状态续下去比重来更危险。交回带上
+		// orphaned，服务端按回收定时器同一条规则处理（还有次数就置回 queued，用完了判
+		// 失败）。这样网络抖一下不再白排一次构建，而"半截构建不续跑"没有变——重排是从头
+		// 再来（2026-09-20 真机：第一条 iOS 任务就是这么被判死的）。
+		a.log.Warn("the server says this machine still has a build in flight from an earlier run; handing it back",
 			"job", result.Active.JobID, "attempt", result.Active.Attempt)
 		a.report(reportCtx, result.Active.JobID, "failure", func(ctx context.Context) error {
-			return a.api.fail(ctx, result.Active.JobID, result.Active.Attempt,
-				"构建机重启或丢失了领取结果，中断的构建不续跑；需要的话重新排队", "", nil)
+			return a.api.abandonClaim(ctx, result.Active.JobID, result.Active.Attempt,
+				"构建机重启或丢失了领取结果，中断的构建不续跑；还有重试次数的话会自动重排")
 		})
 		return true
 	case result.Refused != nil:

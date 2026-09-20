@@ -551,6 +551,9 @@ func (s *server) failBuildJob(c *gin.Context) {
 		FailureReason string   `json:"failureReason"`
 		CommitSHA     string   `json:"commitSha"`
 		LogTail       []string `json:"logTail"`
+		// Orphaned：这台机器手上有这条任务的认领，但**它一行都没跑过**——认领的回应在
+		// 路上丢了，构建机根本不知道自己领了活。这种情形该重排，不该判死（见下）
+		Orphaned bool `json:"orphaned"`
 	}
 	reason := ""
 	commit := ""
@@ -560,6 +563,9 @@ func (s *server) failBuildJob(c *gin.Context) {
 	}
 	if reason == "" {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_RESULT", "failureReason is required")
+		return
+	}
+	if body.Orphaned && s.requeueOrphanedBuildJob(c, machine, attempt) {
 		return
 	}
 	// 失败的构建也要记下它到底检出了哪个提交；解析提交之前就失败的任务没有这个值
@@ -584,6 +590,50 @@ func (s *server) failBuildJob(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// requeueOrphanedBuildJob 把"派出去了、但构建机从来没开始跑"的任务放回队列。
+//
+// 2026-09-20 真机上第一条 iOS 任务就是这么死的：认领请求到了服务端、任务派了出去，
+// **回应在路上丢了**（构建机那侧 30 秒超时），于是构建机不知道自己领了活。七分钟后
+// 它再来认领，服务端说"你手上还挂着一条"，它按那条路把任务判了死——而那条任务一行
+// 都没跑过。
+//
+// 回收定时器遇到同样的局面是**重排**（build_reaper.go，attempt < maxBuildAttempts 时
+// 置回 queued）。这里用的是同一条规则，只是不必干等心跳超时。"半截的构建不续跑"那条
+// 性质没有变——重排是从头再来，不是接着跑。
+//
+// 守卫条件里带上 kind 与 attempt，判断交给数据库：读一遍再决定会留下一个窗口，期间
+// 回收定时器可能已经动过这一行。回 true 表示这次请求已经答完。
+func (s *server) requeueOrphanedBuildJob(c *gin.Context, machine buildMachine, attempt int) bool {
+	id := c.Param("id")
+	now := time.Now().UTC()
+	locked, matched, err := s.transitionBuildJob(c.Request.Context(), id, jobTransition{
+		Where: `WHERE id=? AND status IN (` + sqlBuilderActive + `) AND attempt=? AND claimed_machine_id=? ` +
+			`AND kind=? AND attempt<?`,
+		WhereArgs: []any{id, attempt, machine.ID, jobKindAPK, maxBuildAttempts},
+		// 与回收定时器同一组赋值：attempt 不在这里加，下一次认领才加
+		Set:     `status='queued',claimed_at=NULL,heartbeat_at=NULL,updated_at=?`,
+		SetArgs: []any{now},
+		// 这一次认领传上来的未签名包与 SBOM 不会再有人用：重排后下一次认领从头交付
+		Release: releaseBuildDelivery,
+	})
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to requeue the build")
+		return true
+	}
+	if !matched {
+		// 守卫不成立（次数用完了、任务已经不在跑了、或者不是安装包任务）：交给调用方
+		// 按普通失败记下去
+		return false
+	}
+	slog.Warn("requeued a build job whose claim never reached the builder",
+		"job", id, "attempt", attempt, "machineId", machine.ID)
+	s.auditNow(newAudit(locked.TenantID, builderSystemActor, "build_job_requeued", "build-job", id,
+		"the builder never received this claim; requeued", "",
+		map[string]any{"jobId": id, "attempt": attempt, "machineId": machine.ID}))
+	c.Status(http.StatusNoContent)
+	return true
 }
 
 // completeOTABuildJob 收热更新任务的结果。安装包任务不走这里（它们交付到 built 为止）。

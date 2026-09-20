@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func baseTenant() map[string]any {
@@ -219,7 +221,7 @@ func TestFetchTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
 	worktree := t.TempDir()
 	job := claimedJob{ID: "bld_x", Attempt: 1, TenantDirectory: "predict-kim",
 		Icons: []string{"icon.png", "android-icon-foreground.png"}}
-	written, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree))
+	written, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree), newLogBuffer(newRedactor()))
 	if err != nil || written != 2 {
 		t.Fatalf("取了 %d 张：%v", written, err)
 	}
@@ -229,7 +231,7 @@ func TestFetchTenantIconsLandsThemWherePrebuildLooks(t *testing.T) {
 	}
 
 	// 一张都不下发时什么也不做，不去动仓库里已有的
-	if n, err := fetchTenantIcons(context.Background(), api, claimedJob{ID: "bld_x"}, testCheckout(t, worktree)); err != nil || n != 0 {
+	if n, err := fetchTenantIcons(context.Background(), api, claimedJob{ID: "bld_x"}, testCheckout(t, worktree), newLogBuffer(newRedactor())); err != nil || n != 0 {
 		t.Fatalf("空下发不该动任何东西：%d %v", n, err)
 	}
 }
@@ -240,7 +242,7 @@ func TestFetchTenantIconsRefusesNamesThatEscape(t *testing.T) {
 	worktree := t.TempDir()
 	for _, name := range []string{"../outside.png", "sub/dir.png", "..", "a/../../b.png"} {
 		job := claimedJob{ID: "bld_x", TenantDirectory: "predict-kim", Icons: []string{name}}
-		if _, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree)); err == nil {
+		if _, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree), newLogBuffer(newRedactor())); err == nil {
 			t.Fatalf("%q 应当被拒", name)
 		}
 	}
@@ -254,4 +256,72 @@ func testCheckout(t *testing.T, dir string) *checkoutFS {
 	}
 	t.Cleanup(func() { fsys.Close() })
 	return fsys
+}
+
+// 服务端说"你手上还挂着一条"时，代理要把它**交回**（orphaned），不是直接判死。
+//
+// 认领的回应在路上丢了，这台机器一行都没跑过；服务端按回收定时器同一条规则重排。
+// 少了 orphaned 这个字段，网络抖一下就白排一次构建（2026-09-20 真机，第一条 iOS 任务）。
+func TestAgentHandsBackAClaimItNeverReceived(t *testing.T) {
+	rig := newRig(t)
+	// 服务端拒绝这次认领并指名那条任务（409 BUILDER_HAS_ACTIVE_JOB）
+	rig.server.queueProblem(http.StatusConflict, codeBuilderHasActiveJob,
+		map[string]any{"jobId": "bld_lostResponse01", "attempt": 2})
+
+	if !rig.agent.pollOnce(context.Background()) {
+		t.Fatal("代理没有处理服务端交回来的那条认领")
+	}
+	calls := rig.server.callsTo("/fail")
+	if len(calls) != 1 {
+		t.Fatalf("对 /fail 的调用有 %d 次", len(calls))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(calls[0].Body, &body); err != nil {
+		t.Fatalf("交回的请求体不是 JSON：%v", err)
+	}
+	if body["orphaned"] != true {
+		t.Errorf("交回没有带 orphaned，服务端会把它当成一次真的失败判死：%s", calls[0].Body)
+	}
+	if calls[0].Attempt != "2" {
+		t.Errorf("交回用的认领编号是 %q，该是服务端给的那个", calls[0].Attempt)
+	}
+}
+
+// 取图标断一次不该判死整条任务：这是一次构建最早的几步之一，此刻还没有任何成本沉淀，
+// 但失败的代价是人回控制台重排一次。2026-09-20 真机上第一条能跑起来的 iOS 任务就倒在
+// 这里：cannot fetch icon icon.png: context deadline exceeded。
+func TestFetchTenantIconsRetriesADroppedResponse(t *testing.T) {
+	retryBaseDelay = 10 * time.Millisecond
+	t.Cleanup(func() { retryBaseDelay = 5 * time.Second })
+
+	var served int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&served, 1) == 1 {
+			// 第一次：报了长度却只给一半就断开，客户端读到 unexpected EOF
+			w.Header().Set("content-length", "64")
+			_, _ = w.Write([]byte("half"))
+			if hijacker, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hijacker.Hijack(); err == nil {
+					_ = conn.Close()
+				}
+			}
+			return
+		}
+		w.Header().Set("content-type", "image/png")
+		_, _ = w.Write([]byte("png-" + filepath.Base(r.URL.Path)))
+	}))
+	defer server.Close()
+
+	api := newClient(config{Server: server.URL, MachineToken: "rnm_test"})
+	worktree := t.TempDir()
+	job := claimedJob{ID: "bld_x", Attempt: 1, TenantDirectory: "predict-kim", Icons: []string{"icon.png"}}
+	written, err := fetchTenantIcons(context.Background(), api, job, testCheckout(t, worktree), newLogBuffer(newRedactor()))
+	if err != nil || written != 1 {
+		t.Fatalf("一次断线就把整条任务判死了：%d %v", written, err)
+	}
+	// 重试不能把第二次的字节接在半截文件后面
+	got, err := os.ReadFile(filepath.Join(worktree, "assets", "tenants", "predict-kim", "icon.png"))
+	if err != nil || string(got) != "png-icon.png" {
+		t.Fatalf("重试之后落盘的不是完整的那一份：%q %v", got, err)
+	}
 }
