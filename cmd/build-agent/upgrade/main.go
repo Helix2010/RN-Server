@@ -64,7 +64,14 @@ const (
 )
 
 // 要换的可执行文件。多出来的文件（env 示例等）不动：这个程序只换代码。
-var upgradeBinaries = []string{"build-agent", "build-runner", "ios-upload"}
+//
+// **自己排最后。**这个程序原先不换自己，于是它自己的 bug 只能靠人跑一遍装机脚本去修——
+// 每台机器一次，而它恰恰是"没人能远程修"的那一个（2026-09-20 就撞上了：冒烟拿 root 的身份
+// 去验控制进程的目录，所有 Mac 的自升级全卡住，修好也发不下去）。换自己是安全的：
+// replaceBinary 走的是「写临时文件 + rename」，正在跑的这个进程仍然用着旧 inode，
+// 下一次触发才是新的。排在最后是为了让前面那几个先换完——前面任何一步失败都不会动到它，
+// 留在机器上的仍然是一个能跑的升级程序。
+var upgradeBinaries = []string{"build-agent", "build-runner", "ios-upload", "rn-build-agent-upgrade"}
 
 var (
 	commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)

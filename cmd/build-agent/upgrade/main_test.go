@@ -44,14 +44,15 @@ type fakeBundleServer struct {
 func newBundle(t *testing.T, private ed25519.PrivateKey, commit string, sequence int64, agentScript string) *fakeBundleServer {
 	t.Helper()
 	files := map[string][]byte{
-		"bin/build-agent":  []byte(agentScript),
-		"bin/build-runner": []byte("#!/bin/sh\nexit 0\n"),
-		"bin/ios-upload":   []byte("#!/bin/sh\nexit 0\n"),
+		"bin/build-agent":            []byte(agentScript),
+		"bin/build-runner":           []byte("#!/bin/sh\nexit 0\n"),
+		"bin/ios-upload":             []byte("#!/bin/sh\nexit 0\n"),
+		"bin/rn-build-agent-upgrade": []byte("#!/bin/sh\nexit 0\n"),
 	}
 	var archive bytes.Buffer
 	gz := gzip.NewWriter(&archive)
 	writer := tar.NewWriter(gz)
-	entries := []string{"bin/build-agent", "bin/build-runner", "bin/ios-upload"}
+	entries := []string{"bin/build-agent", "bin/build-runner", "bin/ios-upload", "bin/rn-build-agent-upgrade"}
 	for _, name := range entries {
 		body := files[name]
 		if err := writer.WriteHeader(&tar.Header{Name: "./" + name, Mode: 0o755, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
@@ -195,6 +196,33 @@ func TestUpgradeInstallsASignedBundle(t *testing.T) {
 	m.requestUpgrade(t, newCommit)
 	if code, output := m.run(t); code != 0 {
 		t.Fatalf("re-running the same upgrade: %d %s", code, output)
+	}
+}
+
+// 升级程序也换自己，而且排在最后。
+//
+// 不换自己的话，它自己的 bug 就没有任何远程修法——每台 Mac 都得有人跑一遍装机脚本，
+// 而它恰恰是唯一一个"坏了就没有第二条路"的程序（2026-09-20 真撞上了）。排最后是为了
+// 前面那几个先换完：前面任何一步失败都不碰它，机器上留下的仍是一个能跑的升级程序。
+func TestUpgradeReplacesItselfLast(t *testing.T) {
+	if got := upgradeBinaries[len(upgradeBinaries)-1]; got != "rn-build-agent-upgrade" {
+		t.Fatalf("the upgrade helper is not replaced last (last is %q); "+
+			"if it goes first, a failure halfway leaves the machine with a new helper and old binaries", got)
+	}
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newBundle(t, private, newCommit, 5, goodAgent)
+	m := newMachine(t, public, fake.server.URL)
+	m.requestUpgrade(t, newCommit)
+	if code, output := m.run(t); code != 0 {
+		t.Fatalf("upgrade: %d %s", code, output)
+	}
+	installed := readFile(t, filepath.Join(m.installDir, "rn-build-agent-upgrade"))
+	if installed == "#!/bin/sh\nexit 9\n" {
+		t.Fatal("the upgrade helper still has the old bytes: it cannot fix itself, " +
+			"so every bug in it needs a person on every machine")
 	}
 }
 
