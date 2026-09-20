@@ -812,6 +812,14 @@ func (s *server) createMachine(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "a macOS build machine must be able to build ios")
 		return
 	}
+	// 反过来同样不成立：Linux 上的 ios 是一台永远跑不起来的机器——代理在非 darwin 上带
+	// BUILD_AGENT_PLATFORMS=ios 直接启动失败。这种机器建出来只会在装机途中报错，而那时
+	// 注册码已经消耗掉了（2026-09-20 真机撞上：装机脚本走到 describe 才说"登记的是 linux"，
+	// 前面的账户、目录、FileVault 检查全白跑一遍）
+	if machineOS != machineOSDarwin && containsString(platforms, buildPlatformIOS) {
+		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "only a macOS build machine can build ios; create it with os=darwin")
+		return
+	}
 	switch {
 	case role != machineRoleBuilder && role != machineRoleSigner:
 		problem(c, http.StatusBadRequest, "INVALID_MACHINE", "role must be builder or signer")
@@ -1350,6 +1358,14 @@ func (s *server) setMachinePlatforms(c *gin.Context) {
 		}
 		if machine.Status == machineStatusRevoked {
 			return http.StatusConflict, "MACHINE_REVOKED", "A revoked machine claims nothing; create a new one", nil
+		}
+		// 同新建那条：iOS 只有 Mac 打得了。这里不拦的话，一台 Linux 构建机被加上 ios 之后
+		// 会在下一次启动时挂掉，而控制台上看着一切正常
+		if machine.osOf() != machineOSDarwin && containsString(platforms, buildPlatformIOS) {
+			return http.StatusConflict, "MACHINE_NOT_MACOS", "Only a macOS build machine can build ios", nil
+		}
+		if machine.osOf() == machineOSDarwin && !containsString(platforms, buildPlatformIOS) {
+			return http.StatusConflict, "MACHINE_IS_MACOS", "A macOS build machine must keep ios; revoke it instead", nil
 		}
 		previous := machine.buildPlatforms()
 		doc.Machines[index].Platforms = platforms

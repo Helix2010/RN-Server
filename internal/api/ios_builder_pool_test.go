@@ -407,6 +407,12 @@ func TestDBMacBuilderMustBeAbleToBuildIOS(t *testing.T) {
 			"os": machineOSDarwin},
 		"unknown os": {"role": machineRoleBuilder, "name": "mac-" + uniqueSuffix(), "signerRole": nil,
 			"platforms": []string{buildPlatformIOS}, "os": "windows"},
+		// 反过来那一半：Linux 上勾 ios。这种机器代理在非 darwin 上直接启动失败，
+		// 而不拦的话错误要等到装机装了一半才出现，注册码已经消耗掉了
+		"ios on linux": {"role": machineRoleBuilder, "name": "lin-" + uniqueSuffix(), "signerRole": nil,
+			"platforms": []string{buildPlatformIOS}, "os": machineOSLinux},
+		"ios without an os": {"role": machineRoleBuilder, "name": "lin-" + uniqueSuffix(), "signerRole": nil,
+			"platforms": []string{buildPlatformIOS}},
 	} {
 		body["expectedVersion"] = registryVersion(t, f)
 		body["reason"] = "should be refused"
@@ -414,6 +420,26 @@ func TestDBMacBuilderMustBeAbleToBuildIOS(t *testing.T) {
 		if r := f.adminDo(http.MethodPost, "/v1/admin/platform/machines", body); r.Code != http.StatusBadRequest {
 			t.Errorf("%s: %d %s", name, r.Code, r.Body.String())
 		}
+	}
+}
+
+// 改平台那条路也得守同一条规矩：给机房那台 Linux 构建机加上 ios，它下次启动就挂
+// （BUILD_AGENT_PLATFORMS=ios 在非 darwin 上直接失败），而控制台上看着一切正常。
+func TestDBOnlyAMacCanBeGivenIOS(t *testing.T) {
+	f := newGateFixture(t, 147)
+	set := func(id string, platforms []string) *httptest.ResponseRecorder {
+		return f.adminDo(http.MethodPost, "/v1/admin/platform/machines/"+id+"/platforms", map[string]any{
+			"platforms": platforms, "expectedVersion": registryVersion(t, f),
+			"reason": "change the platforms", "confirm": true,
+		})
+	}
+	if r := set(f.builder.ID, []string{buildPlatformAndroid, buildPlatformIOS}); r.Code != http.StatusConflict ||
+		problemCode(t, r) != "MACHINE_NOT_MACOS" {
+		t.Fatalf("a linux builder was given ios: %d %s", r.Code, r.Body.String())
+	}
+	// 本来就该有的那条改动照常
+	if r := set(f.builder.ID, []string{buildPlatformAndroid}); r.Code != http.StatusOK {
+		t.Fatalf("android on a linux builder: %d %s", r.Code, r.Body.String())
 	}
 }
 
