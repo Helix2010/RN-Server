@@ -109,9 +109,14 @@ jobs:
           done
           echo "::error::MySQL 服务容器两分钟内没有就绪"
           exit 1
-      # -p 1：几个包的数据库测试共用同一个库（迁移、build.machines 等平台级单行），并行跑会互相踩
-      - run: go test -race -p 1 ./...
-      - run: go build ./cmd/server
+      # -p 1 只给 internal/api。库测共用同一个库（迁移、build.machines 等平台级单行），
+      # 并行跑会互相踩——但那条约束**只对这一个包成立**。原先 `-p 1 ./...` 把全仓都串了
+      # 起来：其余包并行只要 9 秒，串行要几十秒，白等（2026-09-20 实测）。
+      - run: go test -race -p 1 ./internal/api/
+      - name: The rest of the packages, in parallel
+        run: go test -race $(go list ./... | grep -v '/internal/api$')
+      # 产物写到 RUNNER_TEMP：build-bundles.sh 按 HEAD 算可复现归档，工作区脏了它会拒绝跑
+      - run: go build -o "$RUNNER_TEMP/server-link-check" ./cmd/server
       # signing/ 是独立 module（签名闸与离线工具只依赖标准库），根目录的 ./... 不含它
       - name: signing module
         working-directory: signing
@@ -119,6 +124,39 @@ jobs:
           go vet ./...
           go test -race ./...
       - run: jq empty contracts/openapi.json
+
+      # 编译放在这里，deploy 只负责送。原先 deploy 是另一个 runner：重新 checkout、
+      # 重新装 Go、把三个安装包与两个二进制**从头交叉编译一遍**——而这个 job 刚刚才把
+      # 全仓编译过。跨平台那几个（darwin/arm64）在 deploy 那边永远是冷缓存。
+      #
+      # 归档可复现：这里打印的 sha256 就是运维装签名闸时 --expect-sha256 要核对的值。
+      # build-bundles.sh 要求工作区干净，所以上面每一步的产物都写在 RUNNER_TEMP。
+      - name: Build machine bundles and the amos binaries
+        if: steps.changes.outputs.deploy-needed == 'true' && vars.AMOS_DEPLOY_ENABLED == 'true'
+        run: |
+          deploy/setup/build-bundles.sh "$RUNNER_TEMP/machine-bundles"
+          echo "::notice title=新机器安装包 sha256::$(cd "$RUNNER_TEMP/machine-bundles" && sha256sum signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz | awk '{printf "%s %s; ", $2, $1}')"
+          mkdir -p "$RUNNER_TEMP/amos"
+          # 与 deploy/amos/deploy.sh 同一组参数。GOTOOLCHAIN=local：go.mod 固定了版本，
+          # 不让它自己去下别的工具链
+          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/amos/rn-server" ./cmd/server
+          # -X main.commit：代理认领时自报的版本。**不打这个戳它就永远报空**，而版本闸的
+          # 判据是"已批准 != 空 && 自报 != 已批准 → 409"——空同样算不相等。于是只要 amos
+          # 上跑着一个没打戳的二进制，平台管理员就**永远不能用版本闸**
+          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -X main.commit=${{ github.sha }}" -o "$RUNNER_TEMP/amos/build-agent" ./cmd/build-agent
+          ls -l "$RUNNER_TEMP/amos"
+      - name: Hand the payload to deploy
+        if: steps.changes.outputs.deploy-needed == 'true' && vars.AMOS_DEPLOY_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-payload
+          path: |
+            ${{ runner.temp }}/machine-bundles
+            ${{ runner.temp }}/amos
+          retention-days: 1
+          if-no-files-found: error
 
       # 部署被跳过时整个 run 仍然是绿的，没有任何地方说"其实没发出去"。真踩过：
       # 变量建成了 Secret，vars.* 取不到，validate 全绿，amos 上一次连接都没有
@@ -150,40 +188,24 @@ jobs:
       AMOS_USER: rndeploy
       STAGE: /var/lib/rn-foundation-deploy/incoming
     steps:
+      # 仓库还是要的：下面要核对 amos 上那个特权脚本与本仓版本是否一致。但**不装 Go、
+      # 不编译**——validate 已经把安装包与两个二进制编好交过来了（见那个 job 末尾）。
+      # 扫链服务不单独编：它就是 rn-server 的 `indexer` 子命令，rn-foundation-apply
+      # 换二进制时连它一起停、一起起。打包机是另一个二进制，同一个 commit 编出来，
+      # 只有下面 AMOS_DEPLOY_BUILD_AGENT 开着才送上去
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Take the payload from validate
+        uses: actions/download-artifact@v4
         with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build machine bundles
-        # 新机器安装包（签名闸、构建机），install.sh 从服务端下载。必须在工作区还干净时编（下一步会把二进制
-        # 写进仓库根目录）。归档可复现：这里打印的 sha256 就是运维装签名闸时 --expect-sha256 要核对的值
+          name: deploy-payload
+          path: ${{ runner.temp }}
+      - name: Put the binaries where the later steps expect them
+        # upload-artifact 不保留可执行位，而下面是 `ssh amos "cat > …" < 文件`——
+        # 只读文件内容，位不位其实无所谓；补上只是为了 ls 看着不吓人、也便于本地复跑
         run: |
-          deploy/setup/build-bundles.sh "$RUNNER_TEMP/machine-bundles"
-          cd "$RUNNER_TEMP/machine-bundles"
-          echo "::notice title=新机器安装包 sha256::$(sha256sum signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz | awk '{printf "%s %s; ", $2, $1}')"
-
-      - name: Cross-compile for amos
-        # 与 deploy/amos/deploy.sh 同一组参数。GOTOOLCHAIN=local：go.mod 固定了版本，
-        # 不让它自己去下别的工具链。
-        #
-        # 扫链服务不单独编：它就是这个二进制的 `rn-server indexer` 子命令，
-        # rn-foundation-apply 里换二进制时会连它一起停、一起起。
-        #
-        # 打包机是另一个二进制，和服务端同一个 commit 编出来；只有下面
-        # AMOS_DEPLOY_BUILD_AGENT 开着才会送上去
-        run: |
-          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w" -o rn-server ./cmd/server
-          # -X main.commit：代理认领时自报的版本。**不打这个戳它就永远报空**，而版本闸的
-          # 判据是"已批准 != 空 && 自报 != 已批准 → 409"——空同样算不相等。于是只要 amos
-          # 上跑着一个没打戳的二进制，平台管理员就**永远不能用版本闸**：钉住任何一版都会
-          # 把这台机器连同它负责的 Android 构建一起挡下来。安装包里的那一份一直打着戳
-          # （build-bundles.sh），只有这里漏了
-          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w -X main.commit=${{ github.sha }}" -o build-agent ./cmd/build-agent
-          ls -l rn-server build-agent
+          chmod +x "$RUNNER_TEMP/amos/rn-server" "$RUNNER_TEMP/amos/build-agent"
+          mv "$RUNNER_TEMP/amos/rn-server" "$RUNNER_TEMP/amos/build-agent" .
+          ls -l rn-server build-agent "$RUNNER_TEMP/machine-bundles"
 
       - name: Configure SSH
         env:
