@@ -792,6 +792,8 @@ EOF
 
    下面这些**由人放**，脚本不碰（设计 §4.4）：
      1. 每个 Team 的 Apple Distribution 证书（.p12）导进 ${keychain}：
+          sudo -u $RUNNER_USER security unlock-keychain -p "\$(sudo cat $password_file)" $keychain
+        （重启之后钥匙串是锁着的，不先解锁 import 只会说 User interaction is not allowed）
           sudo -u $RUNNER_USER security import <证书>.p12 -k $keychain -T /usr/bin/codesign
           sudo -u $RUNNER_USER security set-key-partition-list -S apple-tool:,apple: \\
                -s -k "\$(sudo cat $password_file)" $keychain

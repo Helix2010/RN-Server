@@ -85,6 +85,10 @@ ios-signing-<TEAMID>-<年份>/
 K=/var/rn-build-signing/rn-signing.keychain-db
 P=/var/rn-build-signing/rn-signing.password
 
+# 先解锁。钥匙串建出来时是解开的，但那个状态活不过一次重启——往锁着的钥匙串里 import
+# 只会得到 "User interaction is not allowed."
+sudo -u _rnbuilder security unlock-keychain -p "$(sudo cat $P)" "$K"
+
 sudo -u _rnbuilder security import ios-dist-<TEAMID>-<年份>.p12 -k "$K" -T /usr/bin/codesign
 # 不做下面这一步，codesign 第一次用会弹 UI 授权，而这台机器没有图形会话
 sudo -u _rnbuilder security set-key-partition-list -S apple-tool:,apple: -s -k "$(sudo cat $P)" "$K"

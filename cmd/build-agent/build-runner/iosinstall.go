@@ -109,10 +109,15 @@ func materialKeyFingerprint(out io.Writer, who identity, dir string) error {
 	return nil
 }
 
-// importCertificate 把 .p12 导进签名钥匙串，并做 set-key-partition-list。
+// importCertificate 解锁签名钥匙串、把 .p12 导进去，再做 set-key-partition-list。
 //
-// 少了后面那一步，codesign 第一次用这把私钥时会弹 UI 授权，而这台机器没有图形会话——
-// 构建会卡在那里直到超时，日志上看不出原因（设计 §4.2）。
+// 少了 set-key-partition-list，codesign 第一次用这把私钥时会弹 UI 授权，而这台机器没有
+// 图形会话——构建会卡在那里直到超时，日志上看不出原因（设计 §4.2）。
+//
+// 少了**解锁**则根本导不进去：钥匙串刚建出来时是解开的，但那个状态活不过一次重启，而这段
+// 代码跑在 launchd 守护进程里，同样没有图形会话。往锁着的钥匙串里 import 只会换来一句
+// "User interaction is not allowed."，退出码 1。构建那条路签名前一直有这一步
+// （iossigning.go），装材料这条路漏了——2026-09-20 真机上第一次传材料，证书就卡在这里。
 func importCertificate(ctx context.Context, dir string, material iosmaterial.Material) error {
 	p12, err := base64.StdEncoding.Strict().DecodeString(material.P12Base64)
 	if err != nil {
@@ -123,11 +128,10 @@ func importCertificate(ctx context.Context, dir string, material iosmaterial.Mat
 	if _, err := os.Stat(keychain); err != nil {
 		return fmt.Errorf("no signing keychain at %s: %w", keychain, err)
 	}
-	keychainPassword, err := os.ReadFile(filepath.Join(dir, "rn-signing.password"))
+	keychainPassword, err := readKeychainPassword(filepath.Join(dir, iosKeychainPasswordName))
 	if err != nil {
-		return fmt.Errorf("cannot read the keychain password: %w", err)
+		return err
 	}
-	defer wipe(keychainPassword)
 
 	// .p12 要落一次盘：security import 只收路径。0600、这个账户自己的目录、用完就删
 	file, err := os.CreateTemp(dir, ".import-*.p12")
@@ -147,21 +151,47 @@ func importCertificate(ctx context.Context, dir string, material iosmaterial.Mat
 		return err
 	}
 
+	// 钥匙串口令的两条命令走 `security -i` 的标准输入，而不是命令行参数：口令出现在
+	// 命令行里，这台机器上任何一个用户 `ps` 一下就看得到（AGENTS.md「机密的操作纪律」，
+	// 与 iossigning.go 同一个理由）。口令的字母表在读入时校验过，拼不出第二条命令。
+	if err := runSecurityScript(ctx, keychainPassword,
+		"unlock-keychain -p "+keychainPassword+" "+keychain,
+		// 不自动上锁：导完还要 set-key-partition-list，之后构建那条路还会再解一次
+		"set-keychain-settings "+keychain,
+	); err != nil {
+		return fmt.Errorf("cannot unlock the signing keychain: %w", err)
+	}
+
 	// -P 把 .p12 的口令放进命令行。这一条**不扩大暴露面**：导进去之后私钥就在这个账户的
 	// 钥匙串里，而钥匙串口令也在这个账户读得到的文件里——能看见这条命令行的人里，真正要
 	// 防的那个（跑在同一个账户下的第三方构建代码）本来就已经能用这把私钥签名了。
 	// 归档里那份 .p12 的口令是每张证书现场随机生成的（运维手册 §1.2），不与别处共用。
+	// 它也**不能**跟着上面两条走标准输入：`security -i` 按空白切词，而这个口令是人定的，
+	// 带空格就会被切成别的参数。
 	importCmd := securityCommand(ctx, "import", file.Name(), "-k", keychain,
 		"-T", "/usr/bin/codesign", "-f", "pkcs12", "-P", material.P12Password)
 	if out, err := importCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("security import: %w: %s", err, firstLine(out))
 	}
-	partition := securityCommand(ctx, "set-key-partition-list", "-S", "apple-tool:,apple:",
-		"-s", "-k", strings.TrimRight(string(keychainPassword), "\r\n"), keychain)
-	if out, err := partition.CombinedOutput(); err != nil {
-		return fmt.Errorf("security set-key-partition-list: %w: %s", err, firstLine(out))
+	if err := runSecurityScript(ctx, keychainPassword,
+		"set-key-partition-list -S apple-tool:,apple: -s -k "+keychainPassword+" "+keychain,
+	); err != nil {
+		return fmt.Errorf("security set-key-partition-list: %w", err)
 	}
 	return nil
+}
+
+// runSecurityScript 把几条 security 子命令经标准输入喂给 `security -i`，失败时把钥匙串
+// 口令从输出里抹掉再往上报——失败路径上的输出是最容易漏掉的一条泄漏路径。
+func runSecurityScript(ctx context.Context, keychainPassword string, lines ...string) error {
+	cmd := securityCommand(ctx, "-i")
+	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", err,
+		firstLine([]byte(strings.ReplaceAll(string(out), keychainPassword, "<keychain password>"))))
 }
 
 // writeProfile 把描述文件放到 profiles/<TEAMID>/<bundle id>.mobileprovision。

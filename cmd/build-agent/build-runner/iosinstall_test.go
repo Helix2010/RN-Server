@@ -92,15 +92,20 @@ func TestInstallProfileLandsWhereTheInventoryLooks(t *testing.T) {
 	}
 }
 
-// 证书要做两件事：导进钥匙串，再 set-key-partition-list。少了第二条，codesign 第一次用
-// 会弹 UI 授权，而这台机器没有图形会话——构建卡到超时，日志上看不出原因。
-func TestInstallCertificateAlsoSetsThePartitionList(t *testing.T) {
+// 证书要做三件事，顺序不能换：先解锁钥匙串，再导进去，最后 set-key-partition-list。
+//
+// 少了解锁，守护进程往锁着的钥匙串里 import 只会换来 "User interaction is not allowed."
+// （2026-09-20 真机）；少了最后一条，codesign 第一次用会弹 UI 授权，而这台机器没有图形
+// 会话——构建卡到超时，日志上看不出原因。
+func TestInstallCertificateUnlocksImportsThenSetsThePartitionList(t *testing.T) {
 	dir, pub := materialFixture(t)
+	record := filepath.Join(t.TempDir(), "security-stdin")
 	var calls []string
 	restore := securityCommand
 	securityCommand = func(ctx context.Context, args ...string) *exec.Cmd {
 		calls = append(calls, strings.Join(args, " "))
-		return exec.CommandContext(ctx, "/bin/true")
+		// 口令现在走标准输入，所以假的 security 要把收到的东西留下来
+		return exec.CommandContext(ctx, "/bin/sh", "-c", "cat >> "+record)
 	}
 	t.Cleanup(func() { securityCommand = restore })
 
@@ -114,15 +119,37 @@ func TestInstallCertificateAlsoSetsThePartitionList(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, out)
 	}
-	if len(calls) != 2 {
+	if len(calls) != 3 {
 		t.Fatalf("security was called %d times: %v", len(calls), calls)
 	}
-	if !strings.HasPrefix(calls[0], "import ") || !strings.Contains(calls[0], "-T /usr/bin/codesign") {
-		t.Errorf("import call: %s", calls[0])
+	if calls[0] != "-i" || calls[2] != "-i" {
+		t.Errorf("the two calls that carry the keychain password must read it from stdin: %v", calls)
 	}
-	if !strings.HasPrefix(calls[1], "set-key-partition-list ") ||
-		!strings.Contains(calls[1], "apple-tool:,apple:") {
-		t.Errorf("partition call: %s", calls[1])
+	if !strings.HasPrefix(calls[1], "import ") || !strings.Contains(calls[1], "-T /usr/bin/codesign") {
+		t.Errorf("import call: %s", calls[1])
+	}
+	script, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("the fake security recorded nothing: %v", err)
+	}
+	keychain := filepath.Join(dir, jobspec.IOSKeychainFileName)
+	unlock := "unlock-keychain -p keychain-password " + keychain
+	partition := "set-key-partition-list -S apple-tool:,apple: -s -k keychain-password " + keychain
+	if !strings.Contains(string(script), unlock) {
+		t.Errorf("the keychain was never unlocked; a locked keychain refuses the import: %s", script)
+	}
+	if !strings.Contains(string(script), partition) {
+		t.Errorf("partition list never set: %s", script)
+	}
+	// 顺序：解锁必须在 import 之前，而 import 是第二次调用
+	if strings.Index(string(script), unlock) > strings.Index(string(script), partition) {
+		t.Errorf("the unlock came after the partition list: %s", script)
+	}
+	// 钥匙串口令一次都不该出现在命令行参数里（ps 看得到）
+	for _, call := range calls {
+		if strings.Contains(call, "keychain-password") {
+			t.Errorf("the keychain password reached a command line: %s", call)
+		}
 	}
 	// .p12 不留在盘上
 	entries, _ := os.ReadDir(dir)
