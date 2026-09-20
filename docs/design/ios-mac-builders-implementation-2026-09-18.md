@@ -125,6 +125,36 @@
 
 这样一次丢失的回应等于什么都没发生，而不是消耗一次重排。
 
+## 开回来之前不算完
+
+### mac-01 的提交验签闸是关着的（2026-09-20 关，**未恢复**）
+
+```bash
+# 现在（关着）
+#BUILD_AGENT_ALLOWED_SIGNERS=/opt/rn-build-agent/allowed_signers
+```
+
+**为什么关**：真机打通阶段每改 RN-App 一行都要持有 `rn-app-signing-A` 的人签一次提交再推，
+一天下来为此往返四次，每次都把二十分钟的 `pod install` 推迟。关掉之后改动可以直接推 main。
+
+**关着的实际含义**：能往 RN-App 的 main 推代码的人、以及能改服务端数据库的人，就能在这台
+**装着全部租户 Distribution 私钥**的 Mac 上执行任意代码。这正是设计 §4.3b 那道闸要挡的东西
+（`checkout.go` 里那段注释写得很清楚：签名者的私钥不在 GitHub、也不在服务端）。
+
+**怎么开回来**（阶段 A 端到端跑通之后立刻做）：
+
+```bash
+sudo sed -i '' 's|^#BUILD_AGENT_ALLOWED_SIGNERS=|BUILD_AGENT_ALLOWED_SIGNERS=|' /var/rn-build-agent/env
+sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
+```
+
+开回来之后**必须验一次**：排一条构建，确认它检出的那个提交带 SSH 签名且在名单里；再故意用
+一个没签名的提交排一条，确认被挡。只改配置不验，等于不知道它有没有真的开着。
+
+> 顺带：PR 合并会撞上这道闸。GitHub 用**它自己的 PGP 密钥**签合并提交，而这里验的是 SSH
+> 签名——`git -c gpg.format=ssh verify-commit`。走 PR 的话要用 **Rebase and merge**，且分支上
+> 的提交由名单里的人签好；产生合并提交的那两种合并方式都会让 main 的顶端过不了闸。
+
 ## 已补的缺口
 
 | 缺口 | 影响 | 怎么补的 |
