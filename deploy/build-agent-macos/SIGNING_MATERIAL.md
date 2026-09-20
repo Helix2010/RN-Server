@@ -51,16 +51,24 @@ chmod 600 ios-dist-<TEAMID>-<年份>.key
    （App Manager 角色要额外勾了「Access to Certificates, Identifiers & Profiles」才做得了。）
 3. 请同一个人为**每个 App** 生成 **App Store** 描述文件（选这张新证书 + 对应 App ID），下载
    `.mobileprovision` 回给平台。描述文件不是机密，但要和证书一起换。
-4. 在离线 Mac 上合成 `.p12`：
+4. 在离线 Mac 上合成 `.p12`。**中间证书一定要打进去**：钥匙串里只有叶子证书时，
+   `security find-identity -v -p codesigning` 一个有效身份都不报（链验不到受信任的根），
+   而盘点看的就是这条——表现是"证书装上了，控制台上却还缺材料"。叶子证书的 `issuer`
+   写着用哪一版（`openssl x509 -in <pem> -noout -issuer`，目前签发的是 **WWDR G3**）：
 
 ```bash
+# 中间证书：https://www.apple.com/certificateauthority/ 上下载对应那一版
+openssl x509 -inform DER -in AppleWWDRCAG3.cer -out wwdr.pem
+
 openssl x509 -inform DER -in distribution.cer -out ios-dist-<TEAMID>-<年份>.pem
-openssl pkcs12 -export -legacy \
+openssl pkcs12 -export -legacy -certfile wwdr.pem \
   -inkey ios-dist-<TEAMID>-<年份>.key \
   -in    ios-dist-<TEAMID>-<年份>.pem \
   -out   ios-dist-<TEAMID>-<年份>.p12
 # 口令：现场随机生成一段，立刻存进密码管理器，不要用能背下来的
 ```
+
+   根证书（Apple Root CA）不用管，macOS 自带。
 
 `-legacy` 是为了让 macOS 的 `security import` 认得（OpenSSL 3 默认的 AES-256 加密方式，
 较老的 Security.framework 读不了）。导入报「MAC verification failed」多半就是缺了它。
@@ -90,6 +98,8 @@ P=/var/rn-build-signing/rn-signing.password
 sudo -u _rnbuilder security unlock-keychain -p "$(sudo cat $P)" "$K"
 
 sudo -u _rnbuilder security import ios-dist-<TEAMID>-<年份>.p12 -k "$K" -T /usr/bin/codesign
+# .p12 里没带中间证书的话，在这里补一张（否则下面 find-identity -v 会是 0 个）
+# sudo -u _rnbuilder security import AppleWWDRCAG3.cer -k "$K"
 # 不做下面这一步，codesign 第一次用会弹 UI 授权，而这台机器没有图形会话
 sudo -u _rnbuilder security set-key-partition-list -S apple-tool:,apple: -s -k "$(sudo cat $P)" "$K"
 
@@ -106,7 +116,15 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 
 `.p12` 用完从这台 Mac 上删掉（它已经进钥匙串了）。传输过去的那份也删。
 
-怎么确认成功：控制台「平台维护 → 打包机与签名闸 → 构建机」，这台机器的「自报的签名材料」
+怎么确认成功：先在机器上问一句——
+
+```bash
+sudo -u _rnbuilder security find-identity -v -p codesigning "$K"   # 要有 1 个有效身份
+```
+
+`0 valid identities found` 而不带 `-v` 又能列出来，就是**缺中间证书**（§1.2 第 4 步）。
+
+然后看控制台「平台维护 → 打包机与签名闸 → 构建机」，这台机器的「自报的签名材料」
 里出现这个 Team，bundle id 数对得上，「缺 X 租户的签名材料」里不再有它。
 
 ### 1.4 年度续期

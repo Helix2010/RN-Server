@@ -243,8 +243,18 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 		bundles := profiles[team]
 		switch {
 		case !identities[team]:
-			inv.Problems = append(inv.Problems,
-				"team "+team+" has provisioning profiles but no Apple Distribution identity in the keychain")
+			// 证书在、却不是"有效身份"，与"根本没导进来"是两回事，给的下一步也完全不同。
+			// 分不开的话，这条错读起来像"证书没装上"，而人刚刚才看着它装上（2026-09-20 真机）。
+			// find-identity -v 的 -v 要求链能验到受信任的根，而归档里往往只有叶子证书——
+			// 缺的是 Apple 的 WWDR 中间证书。expiry 是 find-certificate 解出来的，不看私钥，
+			// 所以它有这个 Team 就说明证书确实在钥匙串里。
+			detail := "team " + team + " has provisioning profiles but no Apple Distribution identity in the keychain"
+			if _, inKeychain := expiry[team]; inKeychain {
+				detail = "team " + team + " has an Apple Distribution certificate in the keychain but it is not a " +
+					"valid code-signing identity; the usual cause is a missing Apple WWDR intermediate certificate " +
+					"(rebuild the .p12 with openssl pkcs12 -export -certfile <WWDR>.pem and upload it again)"
+			}
+			inv.Problems = append(inv.Problems, detail)
 			continue
 		case len(bundles.ids) == 0:
 			inv.Problems = append(inv.Problems,

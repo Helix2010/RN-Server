@@ -278,3 +278,30 @@ func TestAgentInventoryGoesThroughTheRunner(t *testing.T) {
 			"to see any material is through build-runner", inventory.Teams)
 	}
 }
+
+// 证书在钥匙串里、却不是"有效身份"，与"根本没导进来"要分开说：前者的下一步是补中间
+// 证书，后者是把证书装上。2026-09-20 真机上这两件事被同一句话盖住了——人刚看着日志打出
+// "signing material installed"，下一行却说"钥匙串里没有身份"。
+func TestIOSInventorySaysWhenTheCertificateIsThereButNotAValidIdentity(t *testing.T) {
+	scanner := testScanner(t, map[string]bool{})
+	future := time.Now().Add(200 * 24 * time.Hour)
+	scanner.Certificates = func(context.Context, string) (map[string]time.Time, error) {
+		return map[string]time.Time{"AB12CD34EF": future}, nil
+	}
+	writeProfile(t, filepath.Join(scanner.SigningDir, profilesDirName, "AB12CD34EF"),
+		"wallet"+profileSuffix, "AB12CD34EF", "com.anyfun.foundation", future)
+
+	problems := strings.Join(scanner.scan(context.Background()).Problems, "\n")
+	if !strings.Contains(problems, "not a valid code-signing identity") ||
+		!strings.Contains(problems, "WWDR") {
+		t.Errorf("the problem does not point at the missing intermediate: %s", problems)
+	}
+	// 证书根本不在钥匙串里的那条仍然是原来那句
+	scanner.Certificates = func(context.Context, string) (map[string]time.Time, error) {
+		return map[string]time.Time{}, nil
+	}
+	problems = strings.Join(scanner.scan(context.Background()).Problems, "\n")
+	if !strings.Contains(problems, "no Apple Distribution identity in the keychain") {
+		t.Errorf("a team with no certificate at all should still say so: %s", problems)
+	}
+}
