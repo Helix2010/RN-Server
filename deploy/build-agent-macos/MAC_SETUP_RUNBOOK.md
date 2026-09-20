@@ -252,11 +252,17 @@ CocoaPods 装每个 pod 都是 `git clone` 它的源码仓库，所以 **github.
 `pod install` 就过不去，哪怕别的外网都通。没有代理时可以只把 github 的 clone 改写到镜像：
 
 ```bash
-sudo git config --system url."https://gitclone.com/github.com/".insteadOf https://github.com/
+sudo git config --system url."https://gh-proxy.com/https://github.com/".insteadOf https://github.com/
 
 # 验证构建账户那边真的生效（写的是 github，实际走镜像）
-sudo -u _rnbuilder -H git ls-remote https://github.com/ashleymills/Reachability.swift.git refs/tags/v5.2.4
+sudo -u _rnbuilder -H git ls-remote https://github.com/reown-com/yttrium.git refs/tags/0.10.54
+# 期望：be6a7252c93ed974bf2f7da9234221339f623aaa
 ```
+
+**别用缓存型镜像。** 先试的 `gitclone.com` 对小仓库没问题（`ReachabilitySwift` 过了），
+碰到 `reown-com/yttrium` 就连着三次 502——它存自己的副本，没缓存过的大仓库就服务不了，
+而 `pod install` 只要有一个 pod 拉不下来就整条失败。`gh-proxy.com` 与 `ghfast.top` 是纯转发，
+不存副本，实测这个仓库 2–3 秒拿到 5.6M，与直连 github 一致。
 
 写 `--system`（`/etc/gitconfig`）而不是某个用户的 `~/.gitconfig`：构建跑在 `_rnbuilder` 下，
 它的家目录是 `/var/empty`。不想要了 `sudo git config --system --unset-all url."<镜像>".insteadOf`。
@@ -264,8 +270,18 @@ sudo -u _rnbuilder -H git ls-remote https://github.com/ashleymills/Reachability.
 **这是临时措施，带供应链风险**，用之前先认清两条：
 
 - 镜像能在同一个 tag 底下换内容。**用之前、以及每次依赖有变动之后**，在一台能直连 github 的
-  机器上把 `Podfile.lock` 里 github 来源的那几个 pod 逐个 `git ls-remote` 对一遍 SHA。
-  2026-09-20 对过 `gitclone.com`、`ghfast.top`、`gh-proxy.com` 三家，都与真 github 一致。
+  机器上核一遍。2026-09-20 对 `reown-com/yttrium@0.10.54` 做过完整校验：三家镜像与真 github
+  的 `commit`、`tree` 全部相同（`be6a7252…` / `0dde10e6…`），`diff -qr` 逐文件无差异。
+  核的方法（在能直连的机器上跑，不是在打包机上）：
+
+  ```bash
+  for m in https://github.com/ https://gh-proxy.com/https://github.com/; do
+    d=$(mktemp -d)
+    git clone -q "${m}<owner>/<repo>.git" "$d/x" --depth 1 --branch <tag>
+    echo "$m $(git -C "$d/x" rev-parse HEAD^{tree})"
+    rm -rf "$d"
+  done
+  ```
 - 只改写 **git clone**。`:http:` 拉 tarball 的那一类 pod（RN 的 `glog`、`folly`、`fmt` 等
   第三方 podspec）是 curl 下载，这条配置管不着；它们通常已经在 `~/Library/Caches/CocoaPods`
   里，真碰上再单独处理。
