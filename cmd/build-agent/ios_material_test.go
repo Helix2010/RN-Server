@@ -160,3 +160,29 @@ func TestAgentTreatsABrokenRecordAsNothingInstalled(t *testing.T) {
 		t.Fatalf("a broken record was trusted: %v", got)
 	}
 }
+
+// 装不上的时候，执行进程说了什么必须跟着错误一起出来。
+//
+// build-runner 把失败原因写在**标准输出**（"build-runner: error: …"），标准错误是空的。
+// 只读标准错误的那一版里，这条错退化成一句 "exit status 1:"——2026-09-20 真机上证书
+// 装不上就是这样，security import 到底说了什么被整条丢掉，只能上机器手工复现才知道。
+func TestAgentCarriesTheRunnerReasonOutOfAFailedInstall(t *testing.T) {
+	a, server, _ := materialRig(t)
+	failing := "#!/bin/sh\ncat >/dev/null\n" +
+		"echo 'build-runner: error: security import: exit status 1: MAC verification failed'\nexit 1\n"
+	if err := os.WriteFile(a.cfg.Runner, []byte(failing), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server.material = []map[string]any{listEntry("certificate", "J4JDFC8LCC", "", iosmaterial.PurposeBuilder, 1)}
+	server.materialBoxes = map[string][]byte{"certificate/J4JDFC8LCC/": []byte(`{"a":1}`)}
+
+	err := a.installMaterial(context.Background(), materialEntry{
+		Kind: "certificate", TeamID: "J4JDFC8LCC", Purpose: iosmaterial.PurposeBuilder, Version: 1,
+	})
+	if err == nil {
+		t.Fatal("a failing runner was reported as a successful install")
+	}
+	if !strings.Contains(err.Error(), "MAC verification failed") {
+		t.Errorf("the runner's own reason did not reach the error: %v", err)
+	}
+}

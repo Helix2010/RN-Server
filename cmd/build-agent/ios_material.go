@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
@@ -114,7 +113,7 @@ func (a *agent) installMaterial(ctx context.Context, entry materialEntry) error 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%w: %s", err, truncate(strings.TrimSpace(stderr.String()), 300))
+		return fmt.Errorf("%w: %s", err, truncate(runnerFailureDetail(stdout.String(), stderr.String()), 300))
 	}
 	out := stdout.Bytes()
 	var result struct {

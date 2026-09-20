@@ -145,11 +145,8 @@ func (a *agent) iosMaterial(ctx context.Context) (jobspec.IOSMaterial, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = strings.TrimSpace(stdout.String())
-		}
-		return jobspec.IOSMaterial{}, fmt.Errorf("%s ios-inventory: %w: %s", a.cfg.Runner, err, truncate(detail, 300))
+		return jobspec.IOSMaterial{}, fmt.Errorf("%s ios-inventory: %w: %s", a.cfg.Runner, err,
+			truncate(runnerFailureDetail(stdout.String(), stderr.String()), 300))
 	}
 	var material jobspec.IOSMaterial
 	if err := json.Unmarshal(stdout.Bytes(), &material); err != nil {
@@ -158,6 +155,24 @@ func (a *agent) iosMaterial(ctx context.Context) (jobspec.IOSMaterial, error) {
 		return jobspec.IOSMaterial{}, fmt.Errorf("the build runner did not answer with JSON: %s", truncate(strings.TrimSpace(stdout.String()), 300))
 	}
 	return material, nil
+}
+
+// runnerFailureDetail 从一次只读调用的输出里挑出失败原因。
+//
+// 两个被调起的程序约定不一样：build-runner 把原因写在**标准输出**（"build-runner: error: …"，
+// 见它的文件头注释），ios-upload 写在标准错误。只看标准错误的那一侧，build-runner 的失败
+// 会退化成一句 "exit status 1:" ——2026-09-20 真机上证书装不上就是这样，security import
+// 到底说了什么被整条丢掉，只能到机器上手工复现才知道。
+func runnerFailureDetail(stdout, stderr string) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		if reason, ok := strings.CutPrefix(strings.TrimSpace(line), "build-runner: error: "); ok {
+			return reason
+		}
+	}
+	if detail := strings.TrimSpace(stderr); detail != "" {
+		return detail
+	}
+	return strings.TrimSpace(stdout)
 }
 
 // runnerReadCommand 构造一条只读的执行进程调用：经 sudo 切到执行账户，环境只给 PATH
