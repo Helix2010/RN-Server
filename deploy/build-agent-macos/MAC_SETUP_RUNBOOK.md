@@ -296,6 +296,15 @@ sudo -u _rnbuilder -H git ls-remote https://github.com/reown-com/yttrium.git ref
 # 装在别处的工具到时候找不到：nvm 装在 ~/.nvm，gem install cocoapods 可能落在 ~/.gem。
 # Apple Silicon 上 Homebrew 正好装进 /opt/homebrew/bin。
 brew install node pnpm cocoapods
+
+# **装了 Xcode 不等于装了 iOS 平台。** Xcode 26 起平台是可下载组件（约 8.5 GB），
+# 缺了它 `xcodebuild … archive` 会倒在：
+#   xcodebuild: error: Unable to find a destination matching { generic:1, platform:iOS }
+#     … error:iOS 26.5 is not installed. Please download and install the platform
+# 这条命令**幂等**，已经装好会直接返回，所以装机时无脑跑一遍就行。
+# 注意 `xcodebuild -showsdks` **判断不了**这件事：平台没装时 `-sdk iphoneosN` 那一行
+# 照样在（SDK 一直在 Xcode 包里），2026-09-21 就是被它骗过一次。
+sudo xcodebuild -downloadPlatform iOS
 # 别装 node@22：它是 keg-only，不会链进 /opt/homebrew/bin
 node --version && which node pnpm pod
 
