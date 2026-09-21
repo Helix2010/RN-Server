@@ -125,6 +125,38 @@
 
 这样一次丢失的回应等于什么都没发生，而不是消耗一次重排。
 
+### `_rnbuilder` 要有一个可写的家目录，而它本该没有（2026-09-21 记）
+
+装机脚本给三个角色账户都设了 `NFSHomeDirectory /var/empty`（`install-macos.sh` 的
+`ensure_role_account`）——服务账户的标准做法，含义是**跨任务不留状态**。任务自己的
+`HOME` 由 `jobspec.go` 设成 `<work>/home`，用完随任务目录一起删。
+
+**Xcode 不认这套。** 2026-09-21 真机日志里，`xcodebuild` 自己的进程把默认 DerivedData
+算在 `/var/empty/Library/Developer/Xcode/…` 下，也就是说它读的是**密码数据库里的家目录**，
+不是 `$HOME`。后果有两个：
+
+1. DerivedData、日志存储写不进去（已修：archive 显式传 `-derivedDataPath` 到任务目录）；
+2. **描述文件装不进去**——`PROVISIONING_PROFILE_SPECIFIER` 给的是 Name，Xcode 拿它去
+   `~/Library/…/Provisioning Profiles` 里找，而那个 `~` 是 `/var/empty`，只读。
+   表现是 `No profile for team … matching … found`，连着挡住了 build 16 与 build 17。
+
+于是 mac-01 上做了这个让步：
+
+```bash
+sudo install -d -o _rnbuilder -g _rnbuildjobs -m 0700 /var/rn-build-home
+sudo dscl . -create /Users/_rnbuilder NFSHomeDirectory /var/rn-build-home
+```
+
+**代价要说清楚**：跑第三方构建代码的那个账户从此有了一个能跨任务写的目录。它与
+「共享缓存」是同一类风险面——这次任务往里写点什么，下次任务就吃进去了。区别只在于
+这是被 Xcode 逼出来的，不是为了省时间。
+
+**该怎么收尾**：让执行进程在**每个任务开始前**把这个目录清空。`reap` 已经在做形状相近的
+事（按 uid 清残留进程与临时目录），加一条「清空 `_rnbuilder` 的家目录」是自然的延伸；
+要小心的是别把 Xcode 自己的长期缓存一起清掉导致每次构建都重新索引——所以更可能是
+**白名单式保留**（比如只留 `Library/Caches/com.apple.dt.Xcode`）而不是整个删。这条没做，
+装机脚本也还没把这个目录纳入进去（现在是手工建的）。
+
 ### 缓存全是每任务一份，于是每次构建都重掷一次网络的骰子（2026-09-21 记）
 
 `jobspec.go` 的布局把三样缓存都放在 `l.Work()` 底下，而 `Work()` 是
