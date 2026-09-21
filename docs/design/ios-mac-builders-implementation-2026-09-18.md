@@ -125,6 +125,46 @@
 
 这样一次丢失的回应等于什么都没发生，而不是消耗一次重排。
 
+### 缓存全是每任务一份，于是每次构建都重掷一次网络的骰子（2026-09-21 记）
+
+`jobspec.go` 的布局把三样缓存都放在 `l.Work()` 底下，而 `Work()` 是
+`<jobs-root>/<jobID>/work/`——**每个任务全新**：
+
+```go
+func (l Layout) Home() string           { return filepath.Join(l.Work(), "home") }        // CocoaPods 缓存在这底下
+func (l Layout) PnpmStore() string      { return filepath.Join(l.Work(), "pnpm-store") }
+func (l Layout) GradleUserHome() string { return filepath.Join(l.Work(), "gradle-home") }
+```
+
+这是**有意的隔离**，理由很硬：执行进程跑的是几千个第三方依赖的代码，共享缓存等于给它一个
+跨任务的可写面——这次构建往缓存里塞点东西，下次构建就吃进去了。
+
+代价在 iOS 上第一次真正显形。实测（2026-09-21 的 build 14、15）：
+
+| | 每次构建 |
+| --- | --- |
+| `pnpm install` | 1196 个包全新下载（`reused 0`），3–4 分钟 |
+| `pod install` | 所有 pod 重新 clone/下载，**30 分钟以上** |
+| 其中 `YttriumWrapper` | `curl` 取 github release 的 `libyttrium.xcframework.zip`，**三次里挂两次** |
+
+最后那条是关键：那个 zip 不是偶尔运气差，而是**每一次构建都要重下一遍**，所以每次都在重掷
+骰子。prebuild 的三次重试救得回来（build 14 第 2 次成、build 15 第 3 次成），但每次要付
+出等待，而且三次全挂就是整条构建作废。
+
+**别急着把缓存共享掉**——两类缓存的风险不对称，该分开评估：
+
+- **pnpm store 可以共享**：`--frozen-lockfile` 按 lockfile 里的 integrity 逐包校验，
+  被换掉的包在安装时就会被发现。共享它省掉每次 3–4 分钟，风险是可控的。
+- **CocoaPods 缓存不该同等对待**：它没有等价的逐包完整性校验，而且 `prepare_command` 会
+  执行任意 shell（YttriumWrapper 那个就是一段 `curl | unzip | cp`）。共享它等于把"任意
+  构建可写、任意后续构建执行"的面打开。
+- **另一条路是只读预热**：由一个受信任的进程（不是执行账户）把缓存灌好，任务侧只读挂载。
+  代价是多一套预热机制，换来的是"共享但不可写"。
+
+选哪条是要人拍板的，先记在这里。顺带：`libyttrium` 那个 zip 走的是 `curl` 取 github
+release 资产，**`url.insteadOf` 的镜像改写管不着它**（那只改 git clone），所以镜像解决不了
+这一条。
+
 ### `say()` 的去重会把"一直在失败"变成"完全没动静"（2026-09-21 记）
 
 `agent.go` 的 `say()` 按 `消息 + 参数` 整串去重，同一句话连着出现只打第一条。本意是好的
