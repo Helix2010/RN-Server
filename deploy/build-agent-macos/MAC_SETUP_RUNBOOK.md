@@ -697,6 +697,7 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 | `launchctl print` 里 `last exit code = 2` | 这回是程序自己退的：配置不全 / 读不到出处密钥 / 建不了任务根目录。日志里写着是哪一项 |
 | 升级反复失败：`rn-build-agent-upgrade.log` 里一句 `the new build-runner failed its self-check as _rnbuilder: exit status 2: build-runner: error: the jobs root must belong to the controller (uid 0), not uid 201` | **升级程序自己的 bug，不是这台机器摆错了**（2026-09-20 修）。换二进制之前的冒烟以 root 调 `sudo -u _rnbuilder … self-check`，而那条 `--jobs-root` 检查的判据是「任务根目录必须归**调用者**」——调用者是 root，目录归控制账户，于是必挂。表现很像配置问题：下载、验签、逐文件摘要全过，只卡最后一步，标记删掉、代理重启、十几秒后再来一遍（每次都重下一遍整包）。修法是冒烟不再带 `--jobs-root`；机器上那条目录检查没少，代理每次启动仍然查（那时调用者才真的是控制进程）。**遇到这个先在控制台点「不再钉版本」**止住循环，等修好的那一版部署、签名之后再钉 |
 | `No signature`（`git log --show-signature`） | **不一定是没签**。本地没配 `gpg.ssh.allowedSignersFile` 时 git 根本没法验，就用这个很误导的说法。判断签没签看 `git log -1 --format='%G?'`：`N` 才是没签 |
+| 控制台上这台机器离线，最后心跳恰好落在**没人用它的时间点**（夜里、午休），日志尾巴是正常的构建输出、没有任何报错 | 机器睡了。笔记本当打包机时 `pmset -c sleep 0`（只管接电源）**挡不住合盖休眠**——2026-09-20 夜里 mac-01 就是这么丢的：接着电源、`sleep 0` 也设了，合上盖子当地 23:58 最后一次心跳，排队的任务整夜没人领。修：`sudo pmset -a sleep 0 disksleep 0 displaysleep 0` 加 `sudo pmset -a disablesleep 1`（`-a` 覆盖所有供电状态，`disablesleep` 才是管合盖的那个开关），`pmset -g custom` 复核。装机脚本 2026-09-21 起已经这么设 |
 
 ---
 

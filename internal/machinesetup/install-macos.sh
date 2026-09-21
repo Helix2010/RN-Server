@@ -281,10 +281,18 @@ preflight() {
 
 system_settings() {
   step "系统设置：不休眠、断电自启、不自动更新"
-  # 睡着的 Mac 领不到任务，正在构建时睡着会让心跳超时、任务被回收重排
-  pmset -c sleep 0 disksleep 0 >/dev/null 2>&1 || warn "pmset 设置失败，手工确认电源设置"
+  # 睡着的 Mac 领不到任务，正在构建时睡着会让心跳超时、任务被回收重排。
+  #
+  # 用 `-a`（所有供电状态）而不是 `-c`（只管接着电源时）：2026-09-20 夜里 mac-01 就是
+  # 这么丢的——接着电源、`sleep 0` 也设了，合上盖子照样进 clamshell 休眠，当地 23:58
+  # 最后一次心跳，第二天早上还是离线，排队的任务整夜没人领。笔记本当打包机时
+  # `disablesleep` 才是那个真正管合盖的开关，而原先只在电池那一档设它。
+  pmset -a sleep 0 disksleep 0 displaysleep 0 >/dev/null 2>&1 ||
+    warn "pmset 设置失败，手工确认电源设置"
+  # disablesleep 只有便携机有；台式机上这条不存在，跳过即可
   if pmset -g custom 2>/dev/null | grep -q disablesleep; then
-    pmset -b disablesleep 1 >/dev/null 2>&1 || true
+    pmset -a disablesleep 1 >/dev/null 2>&1 ||
+      warn "pmset disablesleep 设置失败：合上盖子这台机器还是会睡"
   fi
   systemsetup -setrestartpowerfailure on >/dev/null 2>&1 || warn "断电自启设置失败（笔记本没有这一项，正常）"
   # 自动更新会在没人看着的时候换掉 Xcode 或重启机器：更新由人排期（§5.3 要求几台 Mac 同一个 Xcode）
