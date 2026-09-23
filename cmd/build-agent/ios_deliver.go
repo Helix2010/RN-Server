@@ -271,7 +271,11 @@ func (a *agent) uploadKeyTeams(ctx context.Context) (map[string]bool, error) {
 
 // uploaderCommand 构造上传程序的调用：经 sudo 切到上传账户，环境只给 PATH 与 LANG。
 // 与执行进程同一条路子——上传账户持有能传 build 的 Key，它不该看到本机令牌。
+//
+// 代理走**参数**（--proxy / --no-proxy），不走环境：sudoers 对上传程序是 NOSETENV，
+// 环境变量进不去（2026-09-23 真机：上传直连 App Store Connect，TCP 超时）。
 func (a *agent) uploaderCommand(ctx context.Context, args ...string) *exec.Cmd {
+	args = append(a.cfg.Proxy.Args(), args...)
 	env := []string{"PATH=" + a.cfg.MachineEnv["PATH"], "LANG=C"}
 	if a.cfg.RunnerUser == directRunner {
 		// 本地测试：不经 sudo。生产里 BUILD_AGENT_RUNNER_USER=- 已经在启动时大声告警过

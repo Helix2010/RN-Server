@@ -233,18 +233,26 @@ curl -sS -o /dev/null -w 'npm     %{http_code} %{time_total}s\n' --max-time 30 h
 #### 出网要走代理时
 
 任务环境**不继承**控制进程的环境，所以在 shell 里 `export HTTPS_PROXY=…` 对构建没有任何作用。
-写进 `/var/rn-build-signing` 旁边那个 env 文件（`/var/rn-build-agent/env`，root 拥有），
-装机脚本已经在里面留好了注释掉的示例：
+写进 env 文件（`/var/rn-build-agent/env`，属于代理账户、0600），装机脚本已经留好了注释掉的示例。
+**只写一个键**：
 
 ```bash
-sudo sed -i '' 's|^#HTTPS_PROXY=.*|HTTPS_PROXY=http://127.0.0.1:7890|' /var/rn-build-agent/env
-sudo sed -i '' 's|^#https_proxy=.*|https_proxy=http://127.0.0.1:7890|' /var/rn-build-agent/env
+sudo sed -i '' 's|^#BUILD_AGENT_PROXY=.*|BUILD_AGENT_PROXY=http://127.0.0.1:7897|' /var/rn-build-agent/env
 sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 ```
 
-大小写两套都要写：**libcurl 只认小写的 `http_proxy`**，少一种就会出现"某些工具走代理、
-某些不走"这种半通状态。地址里**不许带账号口令**——这些值对构建进程可读，而那里跑着第三方
-依赖的代码；执行进程会当场拒绝带凭据的代理地址。
+代理把它展开给三个使用方：构建进程拿到 `HTTP_PROXY`/`http_proxy` 等大小写两套变量（libcurl
+只认小写，少一种就是"某些工具走代理、某些不走"的半通）；上传程序拿到 `--proxy` 参数（它经
+sudo 启动、NOSETENV，环境变量进不去——2026-09-23 真机上就是因此直连 App Store Connect 超时）；
+控制进程自己的 HTTP 请求也按它走。**env 文件里直接写 `HTTPS_PROXY` 这些会被拒绝启动**，
+日志里会说该怎么改。
+
+- 服务端（`BUILD_AGENT_SERVER` 的主机）总是直连，不用写。别的要直连的主机写进
+  `BUILD_AGENT_NO_PROXY`（逗号分隔，域名自动含子域名）。
+- 地址里**不许带账号口令**：这个值对构建进程可读，而那里跑着第三方依赖的代码。
+- 端口看代理软件自己的设置。Clash Verge Rev 默认 7897、老版本 7890；
+  `lsof -nP -iTCP -sTCP:LISTEN | grep -iE 'verge|mihomo|clash'` 能看到。
+- 走代理端口时 Clash 看得到域名，规则照常生效，**不需要开 TUN 与域名嗅探**。
 
 #### 只有 github.com 不通时（2026-09-20 起，mac-01 在用）
 

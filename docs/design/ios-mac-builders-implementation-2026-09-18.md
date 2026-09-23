@@ -230,6 +230,32 @@ release 资产，**`url.insteadOf` 的镜像改写管不着它**（那只改 git
 要小心的地方：**报告这条本身不能变成新的失败路径**——报不出去（令牌也坏了、网络也断了）就
 安静退出，绝不能因为报不掉而卡住或改变退出行为；也不能把 env 文件里的值带进去，只报键名。
 
+### mac-01 上手工做的两条系统级设置，装机脚本还没有（2026-09-23 记）
+
+build 20–25 一路查下来，Xcode 找不到签名证书有两个与代码无关的原因，都是在 mac-01 上手工补的：
+
+1. **LaunchDaemon 会话里，Security 框架只读系统域的钥匙串搜索列表。** 用户域的 `list-keychains -d user`、
+   `default-keychain -d user` 设了、回读也对，`security list-keychains`（不带 `-d`，即生效的那份）却只有
+   `System.keychain`；桌面终端里 `sudo -u _rnbuilder` 读的是用户域，所以复现不出来。补法：
+   `security list-keychains -d system -s /Library/Keychains/System.keychain /var/rn-build-signing/rn-signing.keychain-db`。
+   这只让后台进程**知道**有这个钥匙串，文件权限不变，别的账户照样打不开。
+2. **签名钥匙串里的 WWDR G3 中间证书在信任评估时不被采用**，找不到就联网去取，网络差就判证书无效
+   （`verify-cert -L` 只用本地证书时 `CSSMERR_TP_NOT_TRUSTED`）。补法：把 `AppleWWDRCAG3.cer` 装进
+   `/Library/Keychains/System.keychain`。中间证书是公开的，不新增信任根。
+
+要做：两条写进 `install-macos.sh`（幂等）与 MAC_SETUP_RUNBOOK；RN-App `build-ios-release.mjs` 里为排查加的
+用户域设置与诊断输出（`putKeychainOnXcodeSearchList`）随后删掉或收成一行自检。
+
+### 还有几件从真机上带回来的（2026-09-23 记）
+
+- **iOS 任务照样取三张 Android 图标。** 服务端列图标不分平台（`buildIconsForJob`），多下 3 张、每张近 1MB。
+  但图标进原生指纹：只改安装包任务不改热更新任务，iOS 的 OTA 就永远对不上基线。先查清 iOS 的指纹算不算
+  Android 图标，再两边一起改。
+- **运行中的任务取消不了、45 分钟超时没生效。** `cancelBuildJob` 只认 queued/claimed/built（且条件里只列了
+  `apk`/`ota` 两种 kind）；build 24 的 `pnpm install` 挂住 50 分钟，心跳照常，只能上 Mac `pkill`。
+- **Mac 到机房的带宽（20–30KB/s）会决定"平台代传 TestFlight"怎么做。** 把 `.ipa` 交回平台再传 Apple 的话，
+  回传这一段不能走现在的入口；平台已有华为云 OBS（新加坡）与预签名分块直传，候选是 Mac 直传 OBS。先实测 Mac 到 OBS 的上行。
+
 ## 开回来之前不算完
 
 ### iOS 打包机上没有「关闸」这个选项（2026-09-20 试过，撞墙，已恢复）
@@ -296,6 +322,10 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 | **丢了认领回应的任务被判死**（2026-09-20 真机撞上、已修） | 第一条 iOS 任务就这么没的：认领请求到了服务端、任务派了出去，**回应在路上丢了**（构建机侧 30 秒超时）。七分钟后它再来认领，服务端说「你手上还挂着一条」，它按 `result.Active` 那条路把这条**一行都没跑过**的任务判了死。而回收定时器遇到同样的局面是重排 | 交回时带 `orphaned`：服务端按 `build_reaper.go` 同一条规则处理（`kind=apk` 且 `attempt < maxBuildAttempts` 就置回 `queued`，否则判失败），守卫条件写进 SQL，不先读再决定。「半截构建不续跑」没有变——重排是从头再来 |
 | **取图标断一次就判死整条任务**（2026-09-20 真机撞上、已修） | 第一条**真跑起来**的 iOS 任务倒在`cannot fetch icon icon.png: context deadline exceeded`。这是一次构建最早的几步之一，此刻没有任何成本沉淀，失败的代价却是人回控制台重排一次；而仓库里本来就有 `withRetry` | 图标下载用上 `withRetry`（三次，退避从 5 秒起翻倍），读响应体失败也标成 `retryLater`（原先只有连不上才算）。重试放在 `writeFrom` **外面**——在回调里重试会把第二次的字节接在半截文件后面，用例盯着这一点 |
 | **`kill(-1)` 在 macOS 上会杀掉调用者自己**（2026-09-20 真机撞上、已修） | 第一条真跑起来的 iOS 构建：租户文件、图标、google-services.json 全过了，然后 `build` 与 `cleanup` **零输出、退出码 -1**（被信号杀）。两者唯一的共同点是进门第一件事都调 `reap`，而 `reap` 里是 `syscall.Kill(-1, SIGKILL)`；不调它的 `self-check`/`ios-inventory`/`install-ios-material` 全都正常。原注释写着「macOS 的语义相同（BSD 的 kill(2)：…排除调用者本身）」——**不成立**，一行就验出来：`sudo -u _rnbuilder /bin/sh -c '/bin/kill -9 -1; echo survived'` → `zsh: killed`。排查里先排除过代码签名、sudoers、`--`、空环境与两层 sudo | 改成**点名杀**：读一遍 `ps -Ao pid=,ppid=,uid=`，挑出本 uid 名下的进程，跳过自己与自己的整条祖先链，逐个 SIGKILL；进程表读不出来就一个都不杀（宁可留残留，也不乱杀）。`ps` 走绝对路径，不走 PATH——这个程序里跑着第三方依赖的代码。用例盯死「绝不把自己或祖先算进去」，变异验证过 |
+| **上传程序拿不到代理**（2026-09-23 真机撞上、已修） | 第一次一路打到上传：`ARCHIVE SUCCEEDED`、`EXPORT SUCCEEDED`、包交回，最后 `ios-upload` 连 `api.appstoreconnect.apple.com` TLS 握手超时。Mac 所在网络直连 ASC 是 **TCP 超时**，不是偶发。而原先的代理方案（env 文件里写 `HTTPS_PROXY`，经 `bc023e7` 的白名单传进任务环境）**到不了上传程序**：它经 sudo 启动，sudoers 是 `NOSETENV`，环境整个被清掉 | 代理改成**只配一个键** `BUILD_AGENT_PROXY`（外加可选的 `BUILD_AGENT_NO_PROXY`），新包 `cmd/build-agent/internal/netproxy` 按使用方展开：构建进程拿大小写两套八个变量，上传程序拿 `--proxy/--no-proxy` 参数，控制进程自己的 HTTP 客户端设 `Transport.Proxy`（未配置时直连且**不看进程环境**）。服务端主机自动进不走代理的名单。env 文件里直接写 `HTTPS_PROXY` 等键拒绝启动并说明写法 |
+| **ASC 客户端的 20 秒总时限会掐死分块上传**（2026-09-23 读代码发现、已修） | `ascapi.Client` 默认 `http.Client{Timeout: 20s}`，而这个时限**连响应体一起算**——`UploadPart` 自己给了 15 分钟，一块几十 MB 在家用上行上根本传不完，写请求的 60 秒也被压成 20 秒。前几次都没走到上传，所以没暴露 | 默认客户端不设总时限；`get` 自己套 20 秒 context，`write` 60 秒、`UploadPart` 15 分钟不变。`ios-upload` 显式构造不带总时限、带代理的客户端 |
+| **找 App 记录一次失败就判死**（2026-09-23 真机撞上、已修） | 上面那次超时发生在上传的**第一个**请求，前面已经编译了一个小时，而只有分块上传有重试 | `findAppWithRetry`：连不上重试 3 次，钥匙被拒不重试 |
+| **取图标的 30 秒总时限在慢线路上必然超时**（2026-09-23 真机撞上、已修） | build 30–32 连续三轮倒在 `reading icon icon.png failed: context deadline exceeded`。实测 Mac 连机房只有 20–30KB/s（直连、经代理节点都一样；经 Cloudflare 的域名还会 522），一张 2048×2048 的图标将近 1MB，要 35–50 秒。开发机测不出来：`api.predict.kim` 解析到的就是开发机所在机房的出口 IP | 每次尝试给 3 分钟（走传大文件的那个客户端，由 context 限时），重试从 3 次加到 4 次 |
 
 ## 与设计的偏离
 

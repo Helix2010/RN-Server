@@ -17,6 +17,8 @@ var configKeys = []string{
 	"BUILD_AGENT_STATE_DIR", "BUILD_AGENT_PLATFORMS", "BUILD_AGENT_TIMEOUT_MINUTES", "BUILD_AGENT_RUNNER",
 	"BUILD_AGENT_RUNNER_USER", "BUILD_AGENT_TOKEN", "BUILD_KEYSTORE_PASSPHRASE", "GRADLE_RO_DEP_CACHE",
 	"JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT", "BUILD_AGENT_SSH_KEY", "BUILD_AGENT_SSH_KNOWN_HOSTS",
+	"BUILD_AGENT_PROXY", "BUILD_AGENT_NO_PROXY",
+	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
 }
 
 func applyConfigEnv(t *testing.T, overrides map[string]string) {
@@ -213,5 +215,74 @@ func TestOTATicketToAnotherOriginDoesNotReceiveTheToken(t *testing.T) {
 	}
 	if gotToken != "" || gotAttempt != "" {
 		t.Fatalf("the object store received token %q attempt %q", gotToken, gotAttempt)
+	}
+}
+
+// 代理只配一次：BUILD_AGENT_PROXY 一个键，控制进程展开成构建进程要的大小写两套、
+// 上传程序要的参数；自己的服务端总在不走代理的名单里。
+func TestProxyIsConfiguredOnceAndExpandedForEveryUser(t *testing.T) {
+	applyConfigEnv(t, map[string]string{
+		"BUILD_AGENT_PROXY":    "http://127.0.0.1:7897",
+		"BUILD_AGENT_NO_PROXY": "anyfun.win",
+	})
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNoProxy := "localhost,127.0.0.1,::1,api.example.com,anyfun.win"
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		if cfg.MachineEnv[key] != "http://127.0.0.1:7897" {
+			t.Fatalf("%s = %q", key, cfg.MachineEnv[key])
+		}
+	}
+	if cfg.MachineEnv["NO_PROXY"] != wantNoProxy || cfg.MachineEnv["no_proxy"] != wantNoProxy {
+		t.Fatalf("no-proxy = %q / %q", cfg.MachineEnv["NO_PROXY"], cfg.MachineEnv["no_proxy"])
+	}
+	a := &agent{cfg: cfg}
+	a.cfg.RunnerUser = directRunner
+	args := a.uploaderCommand(context.Background(), "--probe").Args
+	want := []string{cfg.IOSUploader, "--proxy", "http://127.0.0.1:7897", "--no-proxy", wantNoProxy, "--probe"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Fatalf("uploader args = %v, want %v", args, want)
+	}
+}
+
+func TestNoProxyConfiguredMeansDirectEverywhere(t *testing.T) {
+	applyConfigEnv(t, nil)
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range cfg.MachineEnv {
+		if strings.Contains(strings.ToLower(key), "proxy") {
+			t.Fatalf("an unconfigured proxy leaked %s into the job environment", key)
+		}
+	}
+	a := &agent{cfg: cfg}
+	a.cfg.RunnerUser = directRunner
+	if args := a.uploaderCommand(context.Background(), "--probe").Args; len(args) != 2 {
+		t.Fatalf("uploader args = %v", args)
+	}
+}
+
+// 直接写 HTTPS_PROXY 这些是旧写法：它们只管得到一部分使用方，所以拒绝启动，并说清该怎么写。
+func TestProxyVariablesInTheEnvFileAreRefused(t *testing.T) {
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"} {
+		applyConfigEnv(t, map[string]string{key: "http://127.0.0.1:7897"})
+		_, err := loadConfig()
+		if err == nil || !strings.Contains(err.Error(), "BUILD_AGENT_PROXY") {
+			t.Errorf("%s in the env file: err = %v", key, err)
+		}
+	}
+	for name, value := range map[string]string{
+		"credentials": "http://user:secret@127.0.0.1:7897",
+		"no scheme":   "127.0.0.1:7897",
+	} {
+		applyConfigEnv(t, map[string]string{"BUILD_AGENT_PROXY": value})
+		if _, err := loadConfig(); err == nil {
+			t.Errorf("%s was accepted", name)
+		} else if strings.Contains(err.Error(), "secret") {
+			t.Errorf("%s: the error echoes the credentials: %v", name, err)
+		}
 	}
 }

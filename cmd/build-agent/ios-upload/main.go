@@ -30,12 +30,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/netproxy"
 	"github.com/Helix2010/RN-Server/internal/ascapi"
 )
 
@@ -77,7 +79,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	version := set.String("expect-version", "", "CFBundleShortVersionString of this package")
 	build := set.String("expect-build", "", "CFBundleVersion of this package")
 	baseURL := set.String("base-url", "", "App Store Connect base URL; empty = Apple's own (tests only)")
+	// 代理由控制进程按 BUILD_AGENT_PROXY 传进来。走参数而不是环境：sudoers 对这个程序是
+	// NOSETENV，环境变量进不来（见 netproxy 包注释）
+	proxyURL := set.String("proxy", "", "outbound proxy, scheme://host[:port]; empty = direct")
+	noProxy := set.String("no-proxy", "", "comma-separated hosts that bypass the proxy")
 	if err := set.Parse(args); err != nil || set.NArg() != 0 {
+		return 2
+	}
+	proxy, err := netproxy.New(*proxyURL, *noProxy)
+	if err != nil {
+		fmt.Fprintln(stderr, "--proxy / --no-proxy:", err)
 		return 2
 	}
 	// 装 Key 那条路不需要 --team / --expect-*：要装什么全写在密文里，而那一份是
@@ -127,7 +138,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	uploader := ascapi.Uploader{Client: ascapi.Client{Key: key, BaseURL: *baseURL}}
+	// 不设 Client.Timeout：它连响应体一起算，会把一块几十 MB 的分块上传掐死在几十秒上。
+	// 每类请求各自的时限在 ascapi 里按 context 给（读 20 秒、写 60 秒、分块 15 分钟）
+	httpClient := &http.Client{Transport: proxy.Transport()}
+	uploader := ascapi.Uploader{Client: ascapi.Client{Key: key, BaseURL: *baseURL, HTTP: httpClient}}
 	ctx := context.Background()
 	if *probe {
 		return report(stdout, probeUploads(ctx, uploader.Client, *bundleID))
@@ -172,7 +186,7 @@ func probeUploads(ctx context.Context, client ascapi.Client, bundleID string) ou
 }
 
 func upload(ctx context.Context, uploader ascapi.Uploader, stdin io.Reader, stderr io.Writer, bundleID, version, build string) (outcome, error) {
-	app, err := uploader.FindApp(ctx, bundleID)
+	app, err := findAppWithRetry(ctx, uploader.Client, stderr, bundleID)
 	if err != nil {
 		return outcome{}, fmt.Errorf("cannot find the App Store Connect record for %s: %w", bundleID, err)
 	}
@@ -219,6 +233,31 @@ func upload(ctx context.Context, uploader ascapi.Uploader, stdin io.Reader, stde
 		return outcome{}, err
 	}
 	return outcome{Uploaded: true, Detail: fmt.Sprintf("uploaded build %s of %s", build, bundleID)}, nil
+}
+
+// findAppAttempts：找 App 记录试几次。这是上传的第一个请求，也是只读的，重试没有副作用。
+// 2026-09-23 真机上它一次 TLS 握手超时就让整条任务失败——前面已经编译了一个小时。
+const findAppAttempts = 3
+
+// retryPause 是两次尝试之间的等待（第 n 次失败后等 n 倍）。变量是为了测试能调短。
+var retryPause = 2 * time.Second
+
+// findAppWithRetry 找 App 记录，连不上就再试。钥匙被拒不重试：那不会自己好。
+func findAppWithRetry(ctx context.Context, client ascapi.Client, stderr io.Writer, bundleID string) (ascapi.App, error) {
+	var last error
+	for attempt := 1; attempt <= findAppAttempts; attempt++ {
+		app, err := client.FindApp(ctx, bundleID)
+		if err == nil {
+			return app, nil
+		}
+		last = err
+		if errors.Is(err, ascapi.ErrKeyRejected) || ctx.Err() != nil || attempt == findAppAttempts {
+			break
+		}
+		fmt.Fprintf(stderr, "finding the App Store Connect record failed (attempt %d), retrying: %v\n", attempt, err)
+		time.Sleep(time.Duration(attempt) * retryPause)
+	}
+	return ascapi.App{}, last
 }
 
 // uploadPart 传一块，失败重试。家用上行断一下是常态，而重传一块比重传整个包便宜——

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/netproxy"
 )
 
 // 配置全部来自**构建机本地**，只放启动项与这台机器的拓扑。服务端下发的只有任务本身——
@@ -57,6 +59,9 @@ type config struct {
 	RunnerUser string
 	// MachineEnv 是交给执行进程的机器级变量（PATH、JAVA_HOME 等），只取 jobspec 白名单里的键。
 	MachineEnv map[string]string
+	// Proxy 是出网代理（BUILD_AGENT_PROXY）。构建进程、上传程序、控制进程自己的 HTTP
+	// 客户端都从这一份取，各自要的形状见 netproxy 包注释。零值 = 直连。
+	Proxy netproxy.Config
 	// SSHKey 是 GitHub 只读 deploy key 的私钥；KnownHosts 是 root 所有、控制进程改不了的固定
 	// known_hosts（install.sh 装到 /opt/rn-build-agent/github_known_hosts）。控制进程 fetch 仓库镜像时
 	// 只用这两个文件，不读 ~/.ssh/config、~/.ssh/known_hosts（见 checkout.go gitEnv）。
@@ -211,12 +216,34 @@ func loadConfig() (config, error) {
 	if containsPlatform(cfg.Platforms, jobspec.PlatformIOS) && runtime.GOOS != "darwin" {
 		return cfg, fmt.Errorf("BUILD_AGENT_PLATFORMS names ios but this machine runs %s; iOS packages need macOS with Xcode", runtime.GOOS)
 	}
+	// 出网代理只从 BUILD_AGENT_PROXY 一个键来。env 文件里直接写 HTTPS_PROXY 这些是旧写法，
+	// 而且只管得到一部分使用方（上传程序经 sudo 启动，环境被 NOSETENV 清掉），所以当场拒绝，
+	// 别让人以为配上了
+	for _, key := range netproxy.EnvKeys {
+		if os.Getenv(key) != "" {
+			return cfg, fmt.Errorf("%s is not read from the env file: set the proxy once as BUILD_AGENT_PROXY "+
+				"(and BUILD_AGENT_NO_PROXY for hosts that must stay direct); the agent derives every "+
+				"upper- and lower-case variable the build tools need from it", key)
+		}
+	}
+	server, err := url.Parse(cfg.Server)
+	if err != nil || server.Hostname() == "" {
+		return cfg, fmt.Errorf("BUILD_AGENT_SERVER is not a URL (got %q)", cfg.Server)
+	}
+	// 自己的服务端总是直连：领任务、心跳、交产物不该取决于一个第三方代理可不可用
+	if cfg.Proxy, err = netproxy.New(envOr("BUILD_AGENT_PROXY", ""), envOr("BUILD_AGENT_NO_PROXY", ""), server.Hostname()); err != nil {
+		return cfg, fmt.Errorf("BUILD_AGENT_PROXY / BUILD_AGENT_NO_PROXY: %w", err)
+	}
 	// 机器级工具变量：只取白名单里的，逐个校验。执行进程还会再校验一次。
 	// 白名单按 GOOS 组装（jobspec.machineEnvKeysFor）：RN_IOS_SIGNING_DIR 只在 macOS 上认。
+	// 代理那几个键上面已经挡掉，这里读到的一定是空；它们由 cfg.Proxy 合成
 	for _, key := range jobspec.MachineEnvKeys() {
 		if value := os.Getenv(key); value != "" {
 			cfg.MachineEnv[key] = value
 		}
+	}
+	for key, value := range cfg.Proxy.Env() {
+		cfg.MachineEnv[key] = value
 	}
 
 	// 上传 TestFlight 是一个对外可见的动作，所以由装这台机器的人显式打开，

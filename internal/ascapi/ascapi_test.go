@@ -237,3 +237,11 @@ func TestClientOnlyEverIssuesGET(t *testing.T) {
 		}
 	}
 }
+
+// http.Client.Timeout 连响应体一起算：设了它，一块几十 MB 的分块上传会被掐死在 20 秒上，
+// 而 UploadPart 自己给的是 15 分钟。时限只能按请求给。
+func TestDefaultHTTPClientHasNoOverallTimeout(t *testing.T) {
+	if timeout := (Client{}).httpClient().Timeout; timeout != 0 {
+		t.Fatalf("default client timeout = %s; it would cut off long part uploads", timeout)
+	}
+}

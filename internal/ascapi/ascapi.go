@@ -145,11 +145,14 @@ func (c Client) now() time.Time {
 	return time.Now().UTC()
 }
 
+// httpClient 不设 Timeout：http.Client.Timeout 连响应体一起算，会把 UploadPart 那种一块
+// 几十 MB 的上传掐死在 20 秒上（它自己的 context 给的是 15 分钟）。时限一律按请求给：
+// get 20 秒、write 60 秒、UploadPart 15 分钟。
 func (c Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return &http.Client{Timeout: requestTimeout}
+	return &http.Client{}
 }
 
 func (c Client) baseURL() string {
@@ -161,6 +164,8 @@ func (c Client) baseURL() string {
 
 // get 发一次 GET 并把 data 解成 out。只做 GET：见包注释。
 func (c Client) get(ctx context.Context, path string, query url.Values, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
 	token, err := c.Key.token(c.now())
 	if err != nil {
 		return err

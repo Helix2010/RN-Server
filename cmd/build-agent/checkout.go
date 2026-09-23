@@ -611,8 +611,9 @@ func fetchTenantIcons(ctx context.Context, api *client, job claimedJob, checkout
 	return written, nil
 }
 
-// iconAttempts：图标取几次。退避从 5 秒起翻倍，三次合计等 15 秒——比重排一次构建便宜。
-const iconAttempts = 3
+// iconAttempts：图标取几次。退避从 5 秒起翻倍，四次之间合计等 35 秒——比重排一次构建便宜。
+// 每次的上限见 iconAttemptTimeout。
+const iconAttempts = 4
 
 // missingTenantIcons 返回 prebuild 会去读、而检出里还没有（或者不是普通文件）的那几个图标。
 func missingTenantIcons(checkout *checkoutFS, directory string) []string {

@@ -213,13 +213,19 @@ func newClient(cfg config) *client {
 		revoke:  revoke,
 		server:  cfg.Server,
 		token:   cfg.MachineToken,
-		http:    &http.Client{Timeout: defaultHTTPRequestTimeout, CheckRedirect: refuseRedirects},
+		// 出网按 BUILD_AGENT_PROXY（cfg.Proxy）走，不看进程环境。自己的服务端在
+		// 不走代理的名单里（loadConfig 加的），所以配了代理这两个客户端实际上也是直连
+		http: &http.Client{Timeout: defaultHTTPRequestTimeout, CheckRedirect: refuseRedirects, Transport: cfg.Proxy.Transport()},
 		// 几十上百兆的 PUT 经过反代链路时 h2 的流错误比 1.1 常见得多，这条路径也没有
 		// 任何需要多路复用的理由，所以强制 HTTP/1.1。
 		upload: &http.Client{
 			Timeout:       uploadRequestTimeout,
 			CheckRedirect: refuseRedirects,
-			Transport:     &http.Transport{ForceAttemptHTTP2: false, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}},
+			Transport: &http.Transport{
+				Proxy:             cfg.Proxy.Func(),
+				ForceAttemptHTTP2: false,
+				TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+			},
 		},
 	}
 }
@@ -565,14 +571,24 @@ func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path,
 	return nil
 }
 
+// iconAttemptTimeout 是取一张图标一次尝试的上限。
+//
+// 不能用 c.http 那 30 秒：http.Client.Timeout 连响应体一起算，而一张 2048×2048 的图标
+// 将近 1MB。2026-09-23 实测家里的 Mac 连机房只有 20–30KB/s（直连、经代理节点都一样），
+// 一张图要 35–50 秒，build 30–32 连续三轮倒在这里，第一行编译都还没开始。
+const iconAttemptTimeout = 3 * time.Minute
+
 // downloadIcon 取一张图标写进 w（调用方给的是检出里以 O_EXCL 新建的文件），不经过内存里的字符串。
 func (c *client) downloadIcon(ctx context.Context, job claimedJob, name string, w io.Writer) error {
+	ctx, cancel := context.WithTimeout(ctx, iconAttemptTimeout)
+	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.server+jobPath(job.ID, "/icons/"+url.PathEscape(name)), nil)
 	if err != nil {
 		return err
 	}
 	c.authorize(request, job.Attempt)
-	response, err := c.http.Do(request)
+	// 走传大文件的那个客户端（它的总时限是半小时），这一次的上限由上面的 context 给
+	response, err := c.upload.Do(request)
 	if err != nil {
 		return retryLater{err}
 	}

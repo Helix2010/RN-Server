@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/netproxy"
 	"github.com/Helix2010/RN-Server/signing/ident"
 )
 
@@ -189,8 +190,7 @@ func machineEnvKeysFor(platform string) []string {
 	return keys
 }
 
-// proxyEnvKeys 是出网代理。**这是机器级配置**，和 PATH、JAVA_HOME 同级：值来自 root 拥有的
-// env 文件，由装这台机器的人填，租户和任务都改不了它。
+// proxyEnvKeys 是出网代理。**这是机器级配置**，和 PATH、JAVA_HOME 同级：租户和任务都改不了它。
 //
 // 非有不可：构建要从公网取东西——CocoaPods 装**每一个** pod 都是去 clone 它的 git 源
 // （trunk 上的 podspec 写的就是 `source: {git: …, tag: …}`），pnpm 要连 registry。而这套
@@ -200,21 +200,9 @@ func machineEnvKeysFor(platform string) []string {
 // 任务环境是按白名单**重新构造**的，不继承控制进程的环境——所以不把这几个键放进来，
 // 机器上配了代理也传不到构建进程里。
 //
-// 大小写两套都收：libcurl 只认小写的 `http_proxy`，`HTTPS_PROXY` 两种都认，Go 两种都认。
-// 少一种就会出现"某些工具走代理、某些不走"这种最难查的半通状态。
-var proxyEnvKeys = []string{
-	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-	"http_proxy", "https_proxy", "all_proxy", "no_proxy",
-}
-
-// proxyURLPattern：scheme://host[:port]，**不许带用户名口令**。
-//
-// 任务环境对执行进程是可读的，而执行进程里跑着第三方依赖的代码——把 `http://user:pass@…`
-// 放进来等于把那组凭据交给它们。要认证的代理请在机器上用别的方式做（本机转发、系统级配置）。
-var proxyURLPattern = regexp.MustCompile(`^(?:https?|socks5h?)://[A-Za-z0-9._-]+(?::[0-9]{1,5})?/?$`)
-
-// noProxyPattern：逗号分隔的主机、域名、网段。
-var noProxyPattern = regexp.MustCompile(`^[A-Za-z0-9.,:*_/-]*$`)
+// 这些值**不是人写的**：env 文件里只有一个 BUILD_AGENT_PROXY，控制进程按它合成大小写
+// 两套（netproxy.Config.Env），直接写 HTTPS_PROXY 这些键会被拒绝启动。见 netproxy 包注释。
+var proxyEnvKeys = netproxy.EnvKeys
 
 // IOSSigningDirEnv 是签名材料目录（证书归档、profiles/<TEAMID>/、钥匙串）的机器级变量名。
 const IOSSigningDirEnv = "RN_IOS_SIGNING_DIR"
@@ -344,13 +332,12 @@ func CheckEnv(l Layout, env []string, platform string) error {
 					return errors.New("LANG is malformed")
 				}
 			case "NO_PROXY", "no_proxy":
-				if !noProxyPattern.MatchString(value) {
-					return fmt.Errorf("%s must be a comma-separated list of hosts", key)
+				if err := netproxy.ValidNoProxy(value); err != nil {
+					return fmt.Errorf("%s: %w", key, err)
 				}
 			case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy":
-				if !proxyURLPattern.MatchString(value) {
-					return fmt.Errorf("%s must be scheme://host[:port] with no credentials in it "+
-						"(the job environment is readable by the third-party code this build runs)", key)
+				if err := netproxy.ValidURL(value); err != nil {
+					return fmt.Errorf("%s: %w", key, err)
 				}
 			default:
 				if !filepath.IsAbs(value) || filepath.Clean(value) != value {
