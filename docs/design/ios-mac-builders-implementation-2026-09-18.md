@@ -154,8 +154,8 @@ sudo dscl . -create /Users/_rnbuilder NFSHomeDirectory /var/rn-build-home
 **该怎么收尾**：让执行进程在**每个任务开始前**把这个目录清空。`reap` 已经在做形状相近的
 事（按 uid 清残留进程与临时目录），加一条「清空 `_rnbuilder` 的家目录」是自然的延伸；
 要小心的是别把 Xcode 自己的长期缓存一起清掉导致每次构建都重新索引——所以更可能是
-**白名单式保留**（比如只留 `Library/Caches/com.apple.dt.Xcode`）而不是整个删。这条没做，
-装机脚本也还没把这个目录纳入进去（现在是手工建的）。
+**白名单式保留**（比如只留 `Library/Caches/com.apple.dt.Xcode`）而不是整个删。这条没做。
+装机脚本 2026-09-23 起会建这个目录并改 `NFSHomeDirectory`（`RUNNER_HOME`），只动执行账户。
 
 ### 缓存全是每任务一份，于是每次构建都重掷一次网络的骰子（2026-09-21 记）
 

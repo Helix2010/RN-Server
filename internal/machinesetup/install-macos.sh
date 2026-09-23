@@ -60,6 +60,8 @@ readonly AGENT_HOME=/var/rn-build-agent
 readonly JOBS_ROOT=/var/rn-build-jobs
 readonly SIGNING_DIR=/var/rn-build-signing
 readonly UPLOAD_DIR=/var/rn-build-upload
+# 执行账户在目录服务里的家目录。另外两个角色账户仍是 /var/empty——见 ensure_accounts 里的说明
+readonly RUNNER_HOME=/var/rn-build-home
 readonly ENV_FILE=$AGENT_HOME/env
 readonly AGENT_USER=_rnbuildagent
 readonly RUNNER_USER=_rnbuilder
@@ -417,6 +419,17 @@ ensure_accounts() {
   install -d -o "$AGENT_USER" -g "$JOBS_GROUP" -m 2750 "$JOBS_ROOT"
   install -d -o "$RUNNER_USER" -g "$RUNNER_USER" -m 0700 "$SIGNING_DIR" "$SIGNING_DIR/profiles"
   install -d -o "$UPLOAD_USER" -g "$UPLOAD_USER" -m 0700 "$UPLOAD_DIR"
+  # 执行账户要有一个**可写的**家目录，而角色账户的惯例是 /var/empty（跨任务不留状态）。
+  # 让步是被 Xcode 逼出来的：任务的 HOME 由 jobspec 设成 <work>/home，但 xcodebuild 读的是
+  # **密码数据库里的**家目录、不认 ${HOME}——2026-09-21 真机日志里它把默认 DerivedData 算在
+  # /var/empty/Library/Developer/Xcode/ 下；描述文件也是在那个 ~ 底下找的，/var/empty 只读，
+  # 于是 archive 必然倒在 "No profile for team … matching … found"。
+  # 代价是跑第三方代码的账户有了一个跨任务可写的目录（与共享缓存同一类风险面），收尾方向
+  # 记在 RN-Server 的实现文档里：每个任务开始前清空，白名单保留 Xcode 自己的缓存。
+  # 只改执行账户：控制进程与上传账户不跑 Xcode，没有理由给它们家目录。
+  install -d -o "$RUNNER_USER" -g "$JOBS_GROUP" -m 0700 "$RUNNER_HOME"
+  dscl . -create "/Users/$RUNNER_USER" NFSHomeDirectory "$RUNNER_HOME" >/dev/null 2>&1 ||
+    die "设不了 $RUNNER_USER 的家目录：手工 sudo dscl . -create /Users/$RUNNER_USER NFSHomeDirectory $RUNNER_HOME"
   note "目录齐了"
 }
 
