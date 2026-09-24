@@ -92,7 +92,10 @@ for f in "$RELEASE_KEY_PUB" "$ALLOWED_SIGNERS"; do
     echo "   用 RN_RELEASE_KEY_PUB / RN_ALLOWED_SIGNERS 指过去，或者放进 deploy/build-agent-macos/。" >&2
   fi
 done
+# AppleWWDRCAG3.cer：Apple 的公开中间证书，装机时装进系统钥匙串（install-macos.sh 的
+# ensure_wwdr_intermediate；它还会按钉死的摘要再核一次）
 cp "$ROOT/deploy/build-agent-macos/rn-build-agent-macos.env.example" \
+  "$ROOT/deploy/build-agent-macos/AppleWWDRCAG3.cer" \
   "$ROOT/deploy/build-agent-macos/rn-build-agent.sudoers" \
   "$ROOT/deploy/build-agent-macos/run-agent" \
   "$ROOT/deploy/build-agent-macos/win.anyfun.rn-build-agent.plist" \

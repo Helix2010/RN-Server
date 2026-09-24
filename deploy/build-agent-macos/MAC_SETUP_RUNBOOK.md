@@ -253,6 +253,18 @@ sudo 启动、NOSETENV，环境变量进不去——2026-09-23 真机上就是�
 - 端口看代理软件自己的设置。Clash Verge Rev 默认 7897、老版本 7890；
   `lsof -nP -iTCP -sTCP:LISTEN | grep -iE 'verge|mihomo|clash'` 能看到。
 - 走代理端口时 Clash 看得到域名，规则照常生效，**不需要开 TUN 与域名嗅探**。
+- **上传 TestFlight 要连的 Apple 域名，规则集多半判成直连**（很多规则集把 `apple.com` 整个放直连），
+  而家用网络直连它们是 TCP/TLS 超时（2026-09-23 mac-01）。在代理软件里加**前置规则**让这三个走节点：
+
+  | 域名（DOMAIN-SUFFIX） | 干什么 |
+  | --- | --- |
+  | `appstoreconnect.apple.com` | API：找 App、建上传、标记完成 |
+  | `object-storage.apple.com` | 分块真正传到这里（`northamerica-1.object-storage.apple.com` 之类）。build 33 就倒在这 |
+  | `itunes.apple.com` | 旧的上传通道，留着以防 Apple 给回这类地址 |
+
+  验证（走和打包机一样的端口）：
+  `sudo -u _rnuploader curl -x http://127.0.0.1:7897 -sS -o /dev/null -w "%{http_code} %{time_total}s\n" --max-time 20 https://northamerica-1.object-storage.apple.com/`
+  几秒内回 403 即通。
 
 #### 只有 github.com 不通时（2026-09-20 起，mac-01 在用）
 
@@ -541,7 +553,7 @@ sudo bash install-macos.sh --server <API> --code rne_… \
 ### 4.3 脚本会做什么
 
 按顺序：前提检查 → 系统设置 → FileVault → 建三个角色账户与目录 → `describe` 与验签 → 下载核对
-安装包 → 安装程序 → 钥匙串 → 写 env → **注册（注册码在这一步才消耗）** → deploy key → 克隆镜像
+安装包 → 安装程序 → 钥匙串（含两条系统级设置，见下） → 写 env → **注册（注册码在这一步才消耗）** → deploy key → 克隆镜像
 → 装 launchd → 完成。
 
 信任链在「`describe` 与验签」那一步闭合：
@@ -552,6 +564,14 @@ sudo bash install-macos.sh --server <API> --code rne_… \
 ```
 
 可以重复执行：已注册的机器不重新注册、不覆盖已经放好的签名材料，只核对并确保服务在跑。
+
+「钥匙串」那一步除了建签名钥匙串，还做两条**系统级**设置（2026-09-23 在 mac-01 上查出来的，
+缺任何一条 Xcode 都会报 `No signing certificate "iOS Distribution" found`）：
+
+1. **签名钥匙串加进系统域的钥匙串搜索列表。** 打包机是 LaunchDaemon，那个会话里只读系统域的列表，
+   用户域设了也没用。核对：`security list-keychains -d system` 里要有 `rn-signing.keychain-db`。
+2. **Apple WWDR G3 中间证书装进系统钥匙串**（随安装包带，脚本按钉死的摘要核过）。签名钥匙串里那份
+   信任评估不用，缺了就每次联网现取，网络一抖证书就被判无效。
 
 ### 4.4 中途停在 deploy key
 
@@ -717,6 +737,9 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 | 控制台上这台机器离线，最后心跳落在**没人用它的时间点**（夜里、午休），日志尾巴没有任何报错 | 先怀疑机器睡了，但**别就此定案**——「离线」这个现象至少有四个成因，日志能分得开：日志尾巴正常、之后完全静默 = 睡了或进程没了；日志在刷 WARN = 网络断了（见下一行）；日志在刷 `configuration is incomplete` = 配置错了；日志根本不存在 = launchd 没摆起来（见 `last exit code = 78` 那行）。睡眠这一项：装机脚本原先只设 `pmset -c sleep 0`（**`-c` 只管接着电源时**），机器在电池上跑就照默认值睡。修：`sudo pmset -a sleep 0 disksleep 0 displaysleep 0`（`-a` 覆盖所有供电状态），`pmset -g custom` 复核 Battery 与 AC 两段都是 `sleep 0`。装机脚本 2026-09-21 起已经这么设 |
 | `lookup <服务端域名>: no such host`，但 `dig +short <域名> @223.5.5.5` 明明有结果 | **VPN 把系统 DNS 接管了。** 2026-09-21 mac-01 上是 Tailscale：`scutil --dns` 里 `resolver #1` 是 `100.100.100.100`（utun4）、`order: 101200`，而 `networksetup -setdnsservers` 设的那组排在 `order: 200000`，优先级更低，永远轮不到——所以**改网卡 DNS 没有任何效果**，很容易以为"设了不管用"。`/etc/resolv.conf` 在 macOS 上不是判据（文件头自己写着不被使用），看 `scutil --dns` 的 `order`。修：`sudo tailscale set --accept-dns=false`（App Store 版走 `/Applications/Tailscale.app/Contents/MacOS/Tailscale`）。组网不受影响，代价是 `*.ts.net` 那些名字不再解析。**打包机上不要让 VPN 接管 DNS**：它一转发不出去，机器就在"进程活着、心跳全无"这个最难查的状态里待着 |
 | 日志里每 10 秒一条 `cannot register this machine's provenance key`，错误是 `connection reset by peer` 或 `lookup <服务端域名>: no such host` | 机器到服务端的网络断了，不是配置问题。**这台机器此时一条任务都不会认领**：`pollOnce` 里 `ensureKeyAccepted` 不过就直接返回（`agent.go:267`）——出处密钥没确认就开始构建，产物的来源就证明不了。这是有意的，而且会自愈：网络一回来登记成功，下一轮就正常认领，不需要人介入。所以看到这个**去查网络**（先 `curl -sS -m 15 -o /dev/null -w '%{http_code} %{time_total}s\n' <服务端>`），不要去动 agent 的配置。2026-09-20 夜里 mac-01 就是这样：当地 23:58 起连接被重置，到 00:25 连 DNS 都解不出来 |
+| archive 报 `No signing certificate "iOS Distribution" found … with a private key was found`，而桌面终端里 `sudo -u _rnbuilder -H security find-identity -v -p codesigning` 明明有 1 个有效身份 | 桌面终端读的是用户域，打包机（LaunchDaemon）只读**系统域**的搜索列表。看 `security list-keychains -d system` 有没有 `rn-signing.keychain-db`，没有就补：`sudo security list-keychains -d system -s /Library/Keychains/System.keychain /var/rn-build-signing/rn-signing.keychain-db`（新装的机器由装机脚本做，见 4.3） |
+| 指定钥匙串时身份有效、`verify-cert -p codeSign` 也过，但加 `-L`（只用本地证书）就 `CSSMERR_TP_NOT_TRUSTED` | 缺系统钥匙串里的 WWDR G3 中间证书，系统在按 AIA 联网现取。装机脚本会装；老机器手工：`sudo security add-certificates -k /Library/Keychains/System.keychain AppleWWDRCAG3.cer`（摘要 `dcf21878…91601f`） |
+| 上传 TestFlight：`part 1 of N: 上传分块失败 … object-storage.apple.com … TLS handshake timeout` | 分块直连 Apple 存储超时。代理规则里补 `object-storage.apple.com`，见第 2 节「出网要走代理时」 |
 | 上面那条都设好了，合上盖子还是睡 | **Apple Silicon 上没有 `disablesleep` 这个开关**（`pmset -g custom` 的输出里根本不列它；`sudo pmset -a disablesleep 1` 会静默接受然后什么也不做，很容易误以为设上了）。合盖休眠在 M 系列上没有软件开关可关，只能靠硬件条件：**盖子别合**，或者接外接显示器 + 电源（clamshell 模式下才不睡）。把笔记本当常驻打包机时这一条要写进现场约定，光靠 `pmset` 保证不了 |
 
 ---

@@ -73,6 +73,10 @@ readonly UPGRADE_LABEL=win.anyfun.rn-build-agent-upgrade
 readonly BUILD_PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin
 readonly MIN_FREE_GB=60
 readonly BUNDLE_NAME=builder-darwin-arm64
+# Apple WWDR G3 中间证书：随安装包带（在已验签的清单里），这里再钉一次摘要。见 ensure_wwdr_intermediate
+readonly WWDR_G3_FILE=AppleWWDRCAG3.cer
+readonly WWDR_G3_SHA256=dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f
+readonly SYSTEM_KEYCHAIN=/Library/Keychains/System.keychain
 
 SERVER=""
 CODE=""
@@ -809,6 +813,8 @@ EOF
   fi
   chown "$RUNNER_USER:$RUNNER_USER" "$keychain" "$password_file" 2>/dev/null || true
   chmod 0600 "$keychain" "$password_file" 2>/dev/null || true
+  ensure_wwdr_intermediate
+  ensure_system_keychain_search_list "$keychain"
   cat <<EOF
 
    下面这些**由人放**，脚本不碰（设计 §4.4）：
@@ -827,6 +833,62 @@ EOF
    放好之后重启代理，控制台上这台机器就会报出它能打哪些 Team 的包。
 EOF
   install_material_keys
+}
+
+# ensure_wwdr_intermediate 把 Apple WWDR G3 中间证书装进系统钥匙串。
+#
+# 签名钥匙串里本来就有一份（材料归档带着），但**信任评估不用它**：2026-09-23 mac-01 上，
+# 只用本机证书验叶子证书（`security verify-cert -p codeSign -L`）报 CSSMERR_TP_NOT_TRUSTED，
+# 放开网络才过——系统是按证书里的 AIA 地址现下载的中间证书。家用网络一抖、下载失败，
+# Xcode 就判"没有有效的签名证书"，一次 archive 白跑。装进系统钥匙串之后 `-L` 也过。
+#
+# 中间证书是公开的，装进系统钥匙串不新增任何信任根（它自己还要链到系统里的 Apple Root CA）。
+ensure_wwdr_intermediate() {
+  local cert="$BUNDLE/$WWDR_G3_FILE" out
+  if [ ! -f "$cert" ]; then
+    warn "安装包里没有 ${WWDR_G3_FILE}（旧版安装包）。手工补一次：
+     curl -fsSLo /tmp/${WWDR_G3_FILE} https://www.apple.com/certificateauthority/${WWDR_G3_FILE}
+     shasum -a 256 /tmp/${WWDR_G3_FILE}     # 应为 ${WWDR_G3_SHA256}
+     sudo security add-certificates -k ${SYSTEM_KEYCHAIN} /tmp/${WWDR_G3_FILE}"
+    return 0
+  fi
+  [ "$(sha256_of "$cert")" = "$WWDR_G3_SHA256" ] ||
+    die "安装包里的 ${WWDR_G3_FILE} 摘要不对（应为 ${WWDR_G3_SHA256}）。清单验过签还出现这个，不该继续装"
+  if out="$(/usr/bin/security add-certificates -k "$SYSTEM_KEYCHAIN" "$cert" 2>&1)"; then
+    note "Apple WWDR G3 中间证书已装进系统钥匙串"
+  elif printf '%s' "$out" | grep -qi 'already exists'; then
+    note "Apple WWDR G3 中间证书已在系统钥匙串里"
+  else
+    die "装不进 Apple WWDR G3 中间证书：$out"
+  fi
+}
+
+# ensure_system_keychain_search_list 把签名钥匙串加进**系统域**的钥匙串搜索列表。
+#
+# 代理是 LaunchDaemon，那个会话里 Security 框架只读系统域的列表：用户域的
+# `list-keychains -d user`、`default-keychain -d user` 设了、回读也对，生效的那份
+# （不带 -d）却只有 System.keychain，于是 Xcode 找不到证书（2026-09-23 build 20–25 一路查到
+# 的）。桌面终端里 `sudo -u _rnbuilder` 读的是用户域，所以在那里复现不出来。
+#
+# 这只让后台进程**知道**有这个钥匙串：文件仍是 _rnbuilder 0600，别的账户打不开。
+# 原有条目原样保留，签名钥匙串追加在后面；已经在列表里就什么也不做。
+ensure_system_keychain_search_list() { # $1 签名钥匙串
+  local keychain="$1" listed line
+  listed="$(/usr/bin/security list-keychains -d system)" || die "读不出系统域的钥匙串搜索列表"
+  listed="$(printf '%s\n' "$listed" | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
+  # security 打印的是解析过符号链接的路径（/var → /private/var），两种写法都认
+  if printf '%s\n' "$listed" | grep -qxF -e "$keychain" -e "/private$keychain"; then
+    note "签名钥匙串已在系统域的钥匙串搜索列表里"
+    return 0
+  fi
+  set --
+  while IFS= read -r line; do
+    [ -n "$line" ] && set -- "$@" "$line"
+  done <<<"$listed"
+  [ $# -gt 0 ] || set -- "$SYSTEM_KEYCHAIN"
+  /usr/bin/security list-keychains -d system -s "$@" "$keychain" ||
+    die "签名钥匙串加不进系统域的钥匙串搜索列表"
+  note "签名钥匙串已加进系统域的钥匙串搜索列表（后台构建靠它找到签名证书）"
 }
 
 # install_material_keys 装那两把**材料私钥**，并打印各自的公钥指纹让人与控制台核对。

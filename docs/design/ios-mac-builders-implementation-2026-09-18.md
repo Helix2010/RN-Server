@@ -230,7 +230,7 @@ release 资产，**`url.insteadOf` 的镜像改写管不着它**（那只改 git
 要小心的地方：**报告这条本身不能变成新的失败路径**——报不出去（令牌也坏了、网络也断了）就
 安静退出，绝不能因为报不掉而卡住或改变退出行为；也不能把 env 文件里的值带进去，只报键名。
 
-### mac-01 上手工做的两条系统级设置，装机脚本还没有（2026-09-23 记）
+### mac-01 上手工做的两条系统级设置（2026-09-23 记；**装机脚本已补**，见下）
 
 build 20–25 一路查下来，Xcode 找不到签名证书有两个与代码无关的原因，都是在 mac-01 上手工补的：
 
@@ -243,8 +243,14 @@ build 20–25 一路查下来，Xcode 找不到签名证书有两个与代码无
    （`verify-cert -L` 只用本地证书时 `CSSMERR_TP_NOT_TRUSTED`）。补法：把 `AppleWWDRCAG3.cer` 装进
    `/Library/Keychains/System.keychain`。中间证书是公开的，不新增信任根。
 
-要做：两条写进 `install-macos.sh`（幂等）与 MAC_SETUP_RUNBOOK；RN-App `build-ios-release.mjs` 里为排查加的
-用户域设置与诊断输出（`putKeychainOnXcodeSearchList`）随后删掉或收成一行自检。
+**已补（2026-09-24）**：`install-macos.sh` 的 `prepare_signing` 里新增 `ensure_wwdr_intermediate`（证书随安装包带、
+在已验签的清单里，脚本再按钉死的摘要核一次；已在就跳过）与 `ensure_system_keychain_search_list`（原有条目保留、
+签名钥匙串追加；`/var` 与 `/private/var` 两种写法都认，已在就跳过）。测试
+`install_macos_signing_test.go`；MAC_SETUP_RUNBOOK 4.3 与第 7 节报错表同步。mac-01 是手工补过的，重跑装机脚本
+也只会显示"已在"。
+
+还没做：RN-App `build-ios-release.mjs` 里为排查加的用户域设置与诊断输出（`putKeychainOnXcodeSearchList`）
+删掉或收成一行自检——改 RN-App 要签名提交，和打包机专用签名密钥一起做。
 
 ### 还有几件从真机上带回来的（2026-09-23 记）
 
