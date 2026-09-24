@@ -294,14 +294,26 @@ type iosSigningCoverage struct {
 }
 
 func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesDoc, teamID, bundleID string, now time.Time) (iosSigningCoverage, error) {
-	var coverage iosSigningCoverage
 	rows, err := s.machineLivenessByID(ctx)
 	if err != nil {
-		return coverage, err
+		return iosSigningCoverage{}, err
 	}
+	return iosSigningCoverageFrom(registry, rows, teamID, bundleID, now), nil
+}
+
+// iosBuilder 是池子里算数的那种机器：登记为 active、能打 iOS 的构建机。排队、认领与控制台的
+// 「装齐几台」都按它数，吊销的、只打 Android 的都不算。
+func iosBuilder(m buildMachine) bool {
+	return m.Role == machineRoleBuilder && m.Status == machineStatusActive && m.canBuild(buildPlatformIOS)
+}
+
+// iosSigningCoverageFrom 是 iosSigningCoverage 的计算部分，登记与 liveness 由调用方读好——
+// 一次要算很多个租户时（控制台的「Apple 证书与密钥」页）不必每个租户重读一遍。
+func iosSigningCoverageFrom(registry buildMachinesDoc, rows map[string]machineLiveness, teamID, bundleID string, now time.Time) iosSigningCoverage {
+	var coverage iosSigningCoverage
 	want := strings.ToUpper(strings.TrimSpace(teamID)) + "." + strings.TrimSpace(bundleID)
 	for _, m := range registry.Machines {
-		if m.Role != machineRoleBuilder || m.Status != machineStatusActive || !m.canBuild(buildPlatformIOS) {
+		if !iosBuilder(m) {
 			continue
 		}
 		live, ok := rows[m.ID]
@@ -321,7 +333,7 @@ func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesD
 			coverage.IPACapableOnline = coverage.IPACapableOnline || online
 		}
 	}
-	return coverage, nil
+	return coverage
 }
 
 // iosSigningTarget 是一个租户要的签名材料：哪个 Team、哪个 bundle id。
@@ -338,6 +350,16 @@ type iosSigningTarget struct {
 // 这个不变量唯一的监视器：设计里每台 Mac 都应该能打任何租户的包，而材料是人一台台导进
 // 钥匙串的——漏一台就漏一个租户，不看差集的话要等到那个租户排任务时才发现。
 func (s *server) iosSigningTargets(ctx context.Context) ([]iosSigningTarget, error) {
+	targets, _, err := s.iosSigningTargetsAndInvalid(ctx)
+	return targets, err
+}
+
+// iosSigningTargetsAndInvalid 另外交回 release.ios 读不出来的那些租户（只有 TenantID 与 Slug）。
+//
+// 大多数调用方可以不管它们：一条读不出来的配置不该让整页打不开，它在排队、认领时会自己报出来。
+// 但要判"这份材料有没有租户在用"的地方必须知道它们存在——读不出来的租户用的是哪个 Team 不知道，
+// 这时把材料判成"没人用"再给个删除按钮，删掉的可能正是它的证书。
+func (s *server) iosSigningTargetsAndInvalid(ctx context.Context) ([]iosSigningTarget, []iosSigningTarget, error) {
 	// 只算还在的租户：删掉的租户留下的 release.ios 会在每台机器上变成一条永远补不上的
 	// 缺口，而那个租户再也不会排任务
 	rows, err := s.db.QueryContext(ctx,
@@ -345,25 +367,25 @@ func (s *server) iosSigningTargets(ctx context.Context) ([]iosSigningTarget, err
 		  JOIN tenants t ON t.id=c.tenant_id AND t.deleted=0
 		  WHERE c.config_key=? AND c.tenant_id<>0`, releaseIOSIdentityConfigKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	out := []iosSigningTarget{}
+	out, invalid := []iosSigningTarget{}, []iosSigningTarget{}
 	for rows.Next() {
 		var target iosSigningTarget
 		var raw []byte
 		if err := rows.Scan(&target.TenantID, &target.Slug, &raw); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		// 一条读不出来的配置不该让整页打不开：它在别处（排队、认领）会自己报出来
 		identity, err := parseIOSReleaseIdentity(raw)
 		if err != nil || identity.AppleTeamID == "" || identity.BundleID == "" {
+			invalid = append(invalid, target)
 			continue
 		}
 		target.TeamID, target.BundleID = identity.AppleTeamID, identity.BundleID
 		out = append(out, target)
 	}
-	return out, rows.Err()
+	return out, invalid, rows.Err()
 }
 
 // machineLivenessView 是控制台机器卡片要的那一块。

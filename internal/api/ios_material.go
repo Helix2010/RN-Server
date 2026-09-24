@@ -384,13 +384,16 @@ func (s *server) uploadIOSMaterial(c *gin.Context) {
 // removeIOSMaterial POST /v1/admin/platform/ios-material/remove：删一格。
 func (s *server) removeIOSMaterial(c *gin.Context) {
 	var body struct {
-		Kind    string `json:"kind"`
-		TeamID  string `json:"teamId"`
-		Scope   string `json:"scope"`
-		Reason  string `json:"reason"`
-		Confirm bool   `json:"confirm"`
+		Kind   string `json:"kind"`
+		TeamID string `json:"teamId"`
+		Scope  string `json:"scope"`
+		// ExpectedVersion 可选：大于 0 时只删这一版。确认框开着的那几十秒里有人传了新版，
+		// 删掉的就不该是那份新的
+		ExpectedVersion int64  `json:"expectedVersion"`
+		Reason          string `json:"reason"`
+		Confirm         bool   `json:"confirm"`
 	}
-	if decode(c, &body) != nil || !body.Confirm || len([]rune(strings.TrimSpace(body.Reason))) < 3 {
+	if decode(c, &body) != nil || !body.Confirm || body.ExpectedVersion < 0 || len([]rune(strings.TrimSpace(body.Reason))) < 3 {
 		problem(c, http.StatusBadRequest, "INVALID_IOS_MATERIAL", "kind, teamId, reason (at least 3 characters) and confirm=true are required")
 		return
 	}
@@ -401,19 +404,29 @@ func (s *server) removeIOSMaterial(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=?`,
-		body.Kind, body.TeamID, body.Scope)
+	var current int64
+	err = tx.QueryRowContext(ctx, `SELECT version FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=? FOR UPDATE`,
+		body.Kind, body.TeamID, body.Scope).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		problem(c, http.StatusNotFound, "IOS_MATERIAL_NOT_FOUND", "No material is stored for that kind, team and scope")
+		return
+	}
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
 		return
 	}
-	if affected, _ := result.RowsAffected(); affected == 0 {
-		problem(c, http.StatusNotFound, "IOS_MATERIAL_NOT_FOUND", "No material is stored for that kind, team and scope")
+	if body.ExpectedVersion > 0 && current != body.ExpectedVersion {
+		problem(c, http.StatusConflict, "STALE_IOS_MATERIAL", "This material was replaced by a newer version; refresh and decide again")
+		return
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=?`,
+		body.Kind, body.TeamID, body.Scope); err != nil {
+		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
 		return
 	}
 	event := newAudit(platformTenantID, actor(c), "ios_material_remove", iosMaterialAuditTarget,
 		body.Kind+":"+body.TeamID+":"+body.Scope, strings.TrimSpace(body.Reason), requestID(c),
-		map[string]any{"kind": body.Kind, "teamId": body.TeamID, "scope": body.Scope})
+		map[string]any{"kind": body.Kind, "teamId": body.TeamID, "scope": body.Scope, "version": current})
 	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
 		return

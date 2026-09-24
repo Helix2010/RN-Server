@@ -5152,10 +5152,376 @@
         }
       }
     },
+    "/v1/admin/platform/ios-material/tenants": {
+      "get": {
+        "summary": "按租户的 Apple 证书与密钥总览",
+        "description": "控制台「Apple 证书与密钥」页用。材料表按 Team 存，这里按 release.ios 拼成每个租户一行：证书、上传 Key 按 Team 匹配，描述文件按 Team + bundle id（不分大小写）匹配；打包机只算登记为 active、能打 iOS 的构建机，装没装按 (Team, bundle id) 原样比，与认领同一个判据；earliestExpiry 是报了这个 Team 的机器里最早的那个值（含钥匙串里过期的旧证书与同 Team 其它租户的描述文件）；readiness 与排队时的判断同一套。orphans 是没有租户在用的材料，只有 complete 且没有 invalidTenants 时 orphansDeletable 才为 true。设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md。",
+        "responses": {
+          "200": {
+            "description": "按租户的总览",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "complete",
+                    "invalidTenants",
+                    "unconfiguredTenants",
+                    "machines",
+                    "tenants",
+                    "orphans",
+                    "orphansDeletable"
+                  ],
+                  "properties": {
+                    "complete": {
+                      "type": "boolean",
+                      "description": "材料清单没被行数上限截断"
+                    },
+                    "invalidTenants": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "slug"
+                        ],
+                        "properties": {
+                          "slug": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "description": "release.ios 读不出来的租户"
+                    },
+                    "unconfiguredTenants": {
+                      "type": "integer",
+                      "description": "没配 iOS 身份的租户数"
+                    },
+                    "machines": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "name",
+                          "reported",
+                          "online",
+                          "paused"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "reported": {
+                            "type": "boolean",
+                            "description": "上报过"
+                          },
+                          "online": {
+                            "type": "boolean"
+                          },
+                          "paused": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    },
+                    "tenants": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "slug",
+                          "current",
+                          "appName",
+                          "teamId",
+                          "bundleId",
+                          "delivery",
+                          "teamTenants",
+                          "teamTestFlightTenants",
+                          "bundleTenants",
+                          "certificate",
+                          "profile",
+                          "uploadKey",
+                          "uploadKeyUse",
+                          "machines",
+                          "earliestExpiry",
+                          "readiness"
+                        ],
+                        "properties": {
+                          "slug": {
+                            "type": "string"
+                          },
+                          "current": {
+                            "type": "boolean",
+                            "description": "就是发请求的这个租户（控制台只能跳到当前租户的页面）"
+                          },
+                          "appName": {
+                            "type": "string",
+                            "description": "应用身份里的 appName，没填是空串"
+                          },
+                          "teamId": {
+                            "type": "string"
+                          },
+                          "bundleId": {
+                            "type": "string"
+                          },
+                          "delivery": {
+                            "type": "string",
+                            "enum": [
+                              "testflight",
+                              "ipa"
+                            ]
+                          },
+                          "teamTenants": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "同 Team 的其它租户"
+                          },
+                          "teamTestFlightTenants": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "同 Team 的其它全托管租户（与切换时撤不撤上传 Key 同一个判据）"
+                          },
+                          "bundleTenants": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "同 Team 同 bundle id 的其它租户"
+                          },
+                          "certificate": {
+                            "type": "object",
+                            "nullable": true,
+                            "required": [
+                              "teamId",
+                              "scope",
+                              "version",
+                              "uploadedBy",
+                              "uploadedAt",
+                              "stale"
+                            ],
+                            "properties": {
+                              "teamId": {
+                                "type": "string",
+                                "description": "表里存的原样"
+                              },
+                              "scope": {
+                                "type": "string",
+                                "description": "表里存的原样；删除按它精确匹配（bundle id 大小写可能与租户身份不同）"
+                              },
+                              "version": {
+                                "type": "integer"
+                              },
+                              "uploadedBy": {
+                                "type": "string"
+                              },
+                              "uploadedAt": {
+                                "type": "string"
+                              },
+                              "stale": {
+                                "type": "boolean",
+                                "description": "加密给的公钥不是现在登记的那一把：新装的 Mac 解不开，已装好的照常能签"
+                              }
+                            }
+                          },
+                          "profile": {
+                            "type": "object",
+                            "nullable": true,
+                            "required": [
+                              "teamId",
+                              "scope",
+                              "version",
+                              "uploadedBy",
+                              "uploadedAt",
+                              "stale"
+                            ],
+                            "properties": {
+                              "teamId": {
+                                "type": "string",
+                                "description": "表里存的原样"
+                              },
+                              "scope": {
+                                "type": "string",
+                                "description": "表里存的原样；删除按它精确匹配（bundle id 大小写可能与租户身份不同）"
+                              },
+                              "version": {
+                                "type": "integer"
+                              },
+                              "uploadedBy": {
+                                "type": "string"
+                              },
+                              "uploadedAt": {
+                                "type": "string"
+                              },
+                              "stale": {
+                                "type": "boolean",
+                                "description": "加密给的公钥不是现在登记的那一把：新装的 Mac 解不开，已装好的照常能签"
+                              }
+                            }
+                          },
+                          "uploadKey": {
+                            "type": "object",
+                            "nullable": true,
+                            "required": [
+                              "teamId",
+                              "scope",
+                              "version",
+                              "uploadedBy",
+                              "uploadedAt",
+                              "stale"
+                            ],
+                            "properties": {
+                              "teamId": {
+                                "type": "string",
+                                "description": "表里存的原样"
+                              },
+                              "scope": {
+                                "type": "string",
+                                "description": "表里存的原样；删除按它精确匹配（bundle id 大小写可能与租户身份不同）"
+                              },
+                              "version": {
+                                "type": "integer"
+                              },
+                              "uploadedBy": {
+                                "type": "string"
+                              },
+                              "uploadedAt": {
+                                "type": "string"
+                              },
+                              "stale": {
+                                "type": "boolean",
+                                "description": "加密给的公钥不是现在登记的那一把：新装的 Mac 解不开，已装好的照常能签"
+                              }
+                            }
+                          },
+                          "uploadKeyUse": {
+                            "type": "string",
+                            "enum": [
+                              "required",
+                              "kept-for-others",
+                              "should-be-withdrawn",
+                              "not-needed"
+                            ]
+                          },
+                          "machines": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "required": [
+                                "id",
+                                "installed",
+                                "uploadProbe"
+                              ],
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "installed": {
+                                  "type": "boolean"
+                                },
+                                "uploadProbe": {
+                                  "type": "string",
+                                  "nullable": true
+                                }
+                              }
+                            }
+                          },
+                          "earliestExpiry": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "readiness": {
+                            "type": "object",
+                            "required": [
+                              "ready",
+                              "code",
+                              "detail"
+                            ],
+                            "properties": {
+                              "ready": {
+                                "type": "boolean"
+                              },
+                              "code": {
+                                "type": "string",
+                                "nullable": true
+                              },
+                              "detail": {
+                                "type": "string",
+                                "nullable": true
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "orphans": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "teamId",
+                          "scope",
+                          "version",
+                          "uploadedBy",
+                          "uploadedAt",
+                          "stale"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "type": "string"
+                          },
+                          "teamId": {
+                            "type": "string"
+                          },
+                          "scope": {
+                            "type": "string"
+                          },
+                          "version": {
+                            "type": "integer"
+                          },
+                          "uploadedBy": {
+                            "type": "string"
+                          },
+                          "uploadedAt": {
+                            "type": "string"
+                          },
+                          "stale": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    },
+                    "orphansDeletable": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "403": {
+            "description": "Not a platform administrator"
+          },
+          "500": {
+            "description": "IOS_MATERIAL_TENANTS_UNAVAILABLE"
+          }
+        }
+      }
+    },
     "/v1/admin/platform/ios-material/remove": {
       "post": {
         "summary": "删掉一份已存材料",
-        "description": "只删服务端存的密文：**已经装到机器上的那一份不会消失**，那要人去机器上清（运维手册 §5 退役清单）或者吊销机器。审计 ios_material_remove。",
+        "description": "按种类后果不同：证书与描述文件只删服务端存的密文，**已经装到机器上的那一份不会消失**，照样能签，要清掉得去机器上清（运维手册 §5 退役清单）或者吊销机器；上传 Key 删掉之后，打包机下一轮同步（清单完整时）会把本机那份也删掉（墓碑），同 Team 的全托管租户在重新上传之前传不上去。expectedVersion 可选：大于 0 时只删这一版。审计 ios_material_remove。",
         "requestBody": {
           "required": true,
           "content": {
@@ -5178,6 +5544,11 @@
                   },
                   "scope": {
                     "type": "string"
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "可选。大于 0 时必须与当前版本一致，否则 409 STALE_IOS_MATERIAL"
                   },
                   "reason": {
                     "type": "string"
@@ -5214,6 +5585,9 @@
           },
           "404": {
             "description": "IOS_MATERIAL_NOT_FOUND"
+          },
+          "409": {
+            "description": "STALE_IOS_MATERIAL：已经被新版替换，刷新后再决定"
           },
           "401": {
             "description": "Admin authentication required"

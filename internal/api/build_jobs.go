@@ -475,7 +475,7 @@ func (s *server) createBuildJob(c *gin.Context) {
 	if !registry.hasLiveBuilderFor(platform) {
 		problem(c, http.StatusConflict, "NO_BUILDER_FOR_PLATFORM",
 			"没有登记任何能构建 "+platform+" 的构建机，排进去的任务不会有人认领。"+
-				"到「平台维护 → 构建机」登记一台并勾上这个平台（iOS 需要一台装了 Xcode 的 Mac）。")
+				"到「平台维护 → 打包机与签名闸」登记一台并勾上这个平台（iOS 需要一台装了 Xcode 的 Mac）。")
 		return
 	}
 	// iOS 的签名身份不在签名闸上，在那台 Mac 的钥匙串里，所以它有自己的一套必填项

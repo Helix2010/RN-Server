@@ -238,6 +238,8 @@ func (s *server) routes() *gin.Engine {
 	// iOS 签名材料：控制台传密文、机器自己取（设计 ios-signing-material-distribution-2026-09-19）。
 	// 服务端只是快递员——它没有任何一把私钥，存的每一份都解不开
 	platform.GET("/ios-material", s.iosMaterialOverview)
+	// 按租户的总览：控制台「Apple 证书与密钥」页（单独一个接口，读失败不连累租户页的上传卡）
+	platform.GET("/ios-material/tenants", s.iosMaterialTenants)
 	platform.PUT("/ios-material/recipients", s.registerIOSMaterialRecipients)
 	platform.POST("/ios-material", s.uploadIOSMaterial)
 	platform.POST("/ios-material/remove", s.removeIOSMaterial)

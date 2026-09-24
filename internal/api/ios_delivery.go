@@ -174,7 +174,7 @@ func (r iosDeliveryReadiness) problem(mode, teamID, bundleID string) (string, st
 	case !r.coverage.Reported:
 		return "NO_BUILDER_FOR_TEAM", "没有任何一台 iOS 打包机报告过它手上有 Team " + teamID + "、bundle id " + bundleID +
 			" 的签名材料，排进去的任务不会有人认领。把这个 Team 的证书与描述文件下发到至少一台 Mac，" +
-			"到「平台维护 → 构建机」确认它报上来之后再排。"
+			"到「平台维护 → 打包机与签名闸」确认它报上来之后再排。"
 	// 这两句既用在排队被拒时，也用在配置卡上说"切过去能不能排"：写成对交付方式本身的陈述，
 	// 不写"这个租户是……"——配置卡上看的往往是还没选的那一种
 	case mode == iosDeliveryTestFlight && !r.coverage.Uploadable:
@@ -346,21 +346,53 @@ func (s *server) iosTeamSharedWithTestFlightTenants(ctx context.Context, tenant,
 	if err != nil {
 		return nil, err
 	}
+	return testFlightTenantsOnTeam(targets, func(id string) string {
+		mode, err := s.iosDeliveryModeFor(ctx, id)
+		if err != nil {
+			// 读不出来按全托管算：宁可多提醒一句
+			return iosDeliveryTestFlight
+		}
+		return mode
+	}, tenant, teamID), nil
+}
+
+// testFlightTenantsOnTeam 是上面那条判据的计算部分："同一个 Team 下、除了 tenant 以外还有哪些租户
+// 是全托管"。切换时撤不撤上传 Key 与控制台上"这把上传 Key 留给谁用"都按它算，两处不许各写一套。
+func testFlightTenantsOnTeam(targets []iosSigningTarget, modeOf func(tenantID string) string, tenant, teamID string) []string {
 	out := []string{}
 	for _, target := range targets {
 		if target.TenantID == tenant || !strings.EqualFold(target.TeamID, teamID) {
 			continue
 		}
-		mode, err := s.iosDeliveryModeFor(ctx, target.TenantID)
-		if err != nil {
-			// 读不出来按全托管算：宁可多提醒一句
-			mode = iosDeliveryTestFlight
-		}
-		if mode == iosDeliveryTestFlight {
+		if modeOf(target.TenantID) == iosDeliveryTestFlight {
 			out = append(out, target.Slug)
 		}
 	}
-	return out, nil
+	return out
+}
+
+// iosDeliveryModes 一次读出所有租户的交付方式。没配过的不在里面（按全托管）；读不出来的按
+// 全托管记——与 iosTeamSharedWithTestFlightTenants 同一个取向：宁可多留一把 Key、多提醒一句。
+func (s *server) iosDeliveryModes(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT tenant_id,config_value FROM app_configs WHERE config_key=? AND tenant_id<>0`, iosDeliveryConfigKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var tenant string
+		var raw []byte
+		if err := rows.Scan(&tenant, &raw); err != nil {
+			return nil, err
+		}
+		var value iosDeliveryConfig
+		if json.Unmarshal(raw, &value) != nil || !validIOSDelivery(value.Mode) {
+			value.Mode = iosDeliveryTestFlight
+		}
+		out[tenant] = value.Mode
+	}
+	return out, rows.Err()
 }
 
 type iosDeliveryWrite struct {
