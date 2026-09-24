@@ -130,6 +130,9 @@ sequenceDiagram
 平台不碰 Apple。控制台给一个「下载 .ipa」（OBS 预签名 GET，短时有效），租户用 Apple 的 Transporter
 自己传。这比现在"包停在 Mac 上"好：模式 B 第一次有了拿到包的正规途径。
 
+> 2026-09-24：这一条已定为租户接入的第 ② 档（自助上传），先于本稿其余部分实现，回传先经服务端流式、再换 OBS 直传。
+> 详见 `ios-tenant-delivery-tiers-2026-09-24.md`。
+
 ## 4. 安全模型的变化：服务端开始写 Apple 侧状态
 
 原则「服务端不写 Apple 侧任何状态」（`internal/ascapi` 包注释，`TestServerSideNeverConstructsAnUploader` 守着）
