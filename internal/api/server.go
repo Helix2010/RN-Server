@@ -301,7 +301,7 @@ func (s *server) routes() *gin.Engine {
 	// iOS 安装包：没有未签名产物要交付，构建机直接报结果（设计 ios-testflight §4.5.4）
 	// 自助上传的 iOS 任务先把 .ipa 交回来（服务端解包核对身份与描述文件），再报 /ios-release
 	builder.PUT("/jobs/:id/ipa/upload", s.builderJobScope(s.uploadIOSPackage))
-	builder.POST("/jobs/:id/ios-release", s.builderJobScope(s.completeIOSBuildJob))
+	builder.POST("/jobs/:id/ios-release", s.builderResultScope(s.completeIOSBuildJob))
 	// 安装包旧的交付路径：构建机不再能落发布记录
 	builder.POST("/jobs/:id/artifact-uploads", s.builderJobScope(s.retiredAPKArtifactRoute))
 	builder.PUT("/jobs/:id/artifact", s.builderJobScope(s.retiredAPKArtifactRoute))

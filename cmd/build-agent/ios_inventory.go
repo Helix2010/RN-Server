@@ -44,8 +44,6 @@ const (
 	uploadKeyFileName = "key.json"
 	// profileSuffix 是描述文件的扩展名
 	profileSuffix = jobspec.IOSProfileSuffix
-	// appleTeamIDLength：Apple Team ID 固定 10 位大写字母数字
-	appleTeamIDLength = 10
 )
 
 var (

@@ -495,6 +495,18 @@ func (s *server) markBuildJobFailed(ctx context.Context, job buildJob, reason st
 // builderJobScope 校验"这台机器、这次认领、这条任务还在构建中"，并把任务的租户装进上下文。
 // 热更新那几条复用管理端处理函数，它们靠上下文里的 tenantId 定位租户。
 func (s *server) builderJobScope(next gin.HandlerFunc) gin.HandlerFunc {
+	return s.builderJobScopeWith(false, next)
+}
+
+// builderResultScope 是报结果那一条用的：同一台机器、同一次认领、任务**已经成功**也放行，
+// 交给处理函数自己判断是不是同一份结果的重报。重试是常态——结果报上去了、回应在路上丢了，
+// 构建机会再报一次；不放行的话它拿到的是 409 BUILD_ATTEMPT_STALE，日志里写成"认领过期了"，
+// 而真实情况是"已经收下了"。
+func (s *server) builderResultScope(next gin.HandlerFunc) gin.HandlerFunc {
+	return s.builderJobScopeWith(true, next)
+}
+
+func (s *server) builderJobScopeWith(allowSucceeded bool, next gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		machine, ok := machineFromContext(c)
 		if !ok {
@@ -510,7 +522,8 @@ func (s *server) builderJobScope(next gin.HandlerFunc) gin.HandlerFunc {
 		if err != nil {
 			return
 		}
-		if !buildJobTransitionAllowed(eventBuilderHeartbeat, job.Kind, job.Status) || job.Attempt != attempt || job.ClaimedMachineID.String != machine.ID {
+		active := buildJobTransitionAllowed(eventBuilderHeartbeat, job.Kind, job.Status) || allowSucceeded && job.Status == jobSucceeded
+		if !active || job.Attempt != attempt || job.ClaimedMachineID.String != machine.ID {
 			problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
 			return
 		}

@@ -262,8 +262,24 @@ func TestDBIOSReleaseDependsOnTheDeliveryMode(t *testing.T) {
 	if recorder := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", macs[0].Token, headers, report(false)); problemCode(t, recorder) != "IOS_UPLOAD_MISSING" {
 		t.Fatalf("a fully managed build completed without reaching TestFlight: %d %s", recorder.Code, recorder.Body.String())
 	}
-	if recorder := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", macs[0].Token, headers, report(true)); recorder.Code != http.StatusOK {
-		t.Fatalf("complete: %d %s", recorder.Code, recorder.Body.String())
+	completed := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", macs[0].Token, headers, report(true))
+	if completed.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", completed.Code, completed.Body.String())
+	}
+	// 回应在路上丢了、构建机再报一次：同一份结果回原来那条记录，不是"认领过期"
+	again := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", macs[0].Token, headers, report(true))
+	if again.Code != http.StatusOK || decodeBody(t, again)["releaseId"] != decodeBody(t, completed)["releaseId"] {
+		t.Fatalf("a repeated report of the same result: %d %s", again.Code, again.Body.String())
+	}
+	// 同一次认领报了另一份包：说"这条已经有结果了"，不改记录
+	different := report(true)
+	different["ipaSha256"] = strings.Repeat("c", 64)
+	if recorder := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", macs[0].Token, headers, different); problemCode(t, recorder) != "IOS_RESULT_CONFLICT" {
+		t.Fatalf("a different result for a completed claim: %d %s", recorder.Code, recorder.Body.String())
+	}
+	// 别的上报仍然只认在跑的任务：成功之后的心跳是过期的
+	if recorder := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/heartbeat", macs[0].Token, headers, map[string]any{"logTail": []string{}}); problemCode(t, recorder) != "BUILD_ATTEMPT_STALE" {
+		t.Fatalf("a heartbeat after success: %d %s", recorder.Code, recorder.Body.String())
 	}
 
 	// 自助上传：没交回 .ipa 就报完成，拒收
