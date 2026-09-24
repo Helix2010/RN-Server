@@ -175,12 +175,14 @@ func (r iosDeliveryReadiness) problem(mode, teamID, bundleID string) (string, st
 		return "NO_BUILDER_FOR_TEAM", "没有任何一台 iOS 打包机报告过它手上有 Team " + teamID + "、bundle id " + bundleID +
 			" 的签名材料，排进去的任务不会有人认领。把这个 Team 的证书与描述文件下发到至少一台 Mac，" +
 			"到「平台维护 → 构建机」确认它报上来之后再排。"
+	// 这两句既用在排队被拒时，也用在配置卡上说"切过去能不能排"：写成对交付方式本身的陈述，
+	// 不写"这个租户是……"——配置卡上看的往往是还没选的那一种
 	case mode == iosDeliveryTestFlight && !r.coverage.Uploadable:
-		return "NO_UPLOADER_FOR_TEAM", "这个租户是「全托管」，但没有任何一台打包机报告过 Team " + teamID +
-			" 的上传 Key 可用，排进去的任务不会有人认领。先把上传 Key 下发到打包机并确认探测结果，或者把交付方式改成「自助上传」。"
+		return "NO_UPLOADER_FOR_TEAM", "「全托管」要由打包机用这个 Team 的上传 Key 上传，但没有任何一台打包机报告过 Team " + teamID +
+			" 的上传 Key 可用，排进去的任务不会有人认领。先把上传 Key 下发到打包机并确认探测结果，或者用「自助上传」。"
 	case mode == iosDeliveryIPA && !r.coverage.IPACapable:
-		return "NO_IPA_BUILDER_FOR_TEAM", "这个租户是「自助上传」，但手上有 Team " + teamID +
-			" 签名材料的打包机都还不支持把 .ipa 交回平台（打包机程序版本太旧）。批准新版打包机、等它升级之后再排。"
+		return "NO_IPA_BUILDER_FOR_TEAM", "「自助上传」要由打包机把 .ipa 交回平台，但手上有 Team " + teamID +
+			" 签名材料的打包机都还不支持（打包机程序版本太旧）。批准新版打包机、等它升级之后才能排。"
 	}
 	return "", ""
 }
