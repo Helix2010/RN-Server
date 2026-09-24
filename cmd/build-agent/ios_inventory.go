@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
+
+	"github.com/Helix2010/RN-Server/internal/ipa"
 )
 
 // 签名材料盘点（设计 ios-mac-builders-home-network-2026-09-18 §5.2、§4.4）。
@@ -383,34 +385,25 @@ func (s iosScanner) profileFiles() (map[string][]byte, []string) {
 
 // parseProvisioningProfile 从一份 .mobileprovision 的原文里读出 Team ID、bundle id 与到期日。
 //
-// 文件是 CMS 签名块，里面包着一份 XML plist。**不验签**：这份材料是运维放上去的，
-// 而真正的把关在别处——签不出 Apple 认的包，或者签出来 Apple 拒收。这里只需要读出
-// "这台机器能签哪个 App"。
+// 解析与服务端核对自助上传 .ipa 时共用一份（internal/ipa，**不验签**）。这里只需要读出
+// "这台机器能签哪个 App"，所以在共用的那份之上再挡两件事：Team ID 形状不对，和通配描述文件。
 func parseProvisioningProfile(raw []byte) (teamID, bundleID string, expires time.Time, err error) {
-	start := bytes.Index(raw, []byte("<?xml"))
-	end := bytes.LastIndex(raw, []byte("</plist>"))
-	if start < 0 || end < start {
-		return "", "", time.Time{}, errors.New("no XML plist inside the provisioning profile")
-	}
-	dict, err := parseXMLPlist(raw[start : end+len("</plist>")])
+	profile, err := ipa.ParseProfile(raw)
 	if err != nil {
 		return "", "", time.Time{}, err
 	}
-	// application-identifier 是 <TEAMID>.<bundle id>，Team ID 与 bundle id 一次给全
-	identifier := plistString(plistDict(dict, "Entitlements"), "application-identifier")
-	team, bundle, ok := strings.Cut(identifier, ".")
-	if !ok || !appleTeamIDPattern.MatchString(team) {
+	identifier := profile.TeamID + "." + profile.BundleID
+	if !appleTeamIDPattern.MatchString(profile.TeamID) {
 		return "", "", time.Time{}, fmt.Errorf("application-identifier %q is not <TEAMID>.<bundle id>", identifier)
 	}
 	// 通配描述文件（`TEAMID.*`）签不出一个确定的 App，报上去等于谎报能力
-	if !bundleIDPattern.MatchString(bundle) {
+	if !bundleIDPattern.MatchString(profile.BundleID) {
 		return "", "", time.Time{}, fmt.Errorf("application-identifier %q is a wildcard or malformed bundle id", identifier)
 	}
-	expires = plistTime(dict, "ExpirationDate")
-	if expires.IsZero() {
+	if profile.ExpiresAt.IsZero() {
 		return "", "", time.Time{}, errors.New("the provisioning profile has no ExpirationDate")
 	}
-	return team, bundle, expires, nil
+	return profile.TeamID, profile.BundleID, profile.ExpiresAt, nil
 }
 
 // uploadKeyTeams 问"哪些 Team 装好了上传 Key"。没有注入实现时直接读本地目录——

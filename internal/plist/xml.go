@@ -1,4 +1,4 @@
-package main
+package plist
 
 import (
 	"bytes"
@@ -11,17 +11,19 @@ import (
 )
 
 // XML plist 的最小解析器。用在描述文件（`.mobileprovision`）上：那是一个 CMS 签名块，
-// 里面包着一份 XML plist。
+// 里面包着一份 XML plist。Mac 上的控制进程盘点描述文件时读它，服务端核对自助上传的 .ipa
+// 里嵌着的那一份时也读它。
 //
 // **为什么不调 `security cms -D -i` / `plutil`**：这两个都要起子进程去解析一份文件，而
-// 本进程（控制进程）持有本机令牌与出处私钥。描述文件是运维放上去的材料、不是不可信输入，
-// 但同一条原则在 §4.3 第 1 步对 `.ipa` 已经写死了（不对文件调 unzip / plutil），两处用同一
-// 套做法比记住"哪一处可以例外"便宜。纯 Go 还有一个好处：盘点在 Linux 上也能跑，测试不需要
-// 一台 Mac。
+// 调用方（控制进程、服务端）持有令牌与密钥。对 `.ipa` 的规矩在设计 §4.3 第 1 步已经写死
+// （不对文件调 unzip / plutil），两处用同一套做法比记住"哪一处可以例外"便宜。纯 Go 还有
+// 一个好处：在 Linux 上也能跑，测试不需要一台 Mac。
 //
 // 只实现用得到的类型：dict、array、string、integer、real、true/false、date、data（按原始
 // base64 字符串给出，调用方自己解）。遇到不认识的标签直接报错，不猜。
-func parseXMLPlist(data []byte) (map[string]any, error) {
+//
+// ParseXML 解析一份 XML plist，顶层必须是字典。
+func ParseXML(data []byte) (map[string]any, error) {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	for {
 		token, err := decoder.Token()
@@ -153,19 +155,41 @@ func plistValue(decoder *xml.Decoder, start xml.StartElement) (any, error) {
 	return nil, fmt.Errorf("plist has an unsupported element %q", start.Name.Local)
 }
 
-// plistString / plistDict / plistTime 是取值的小工具：类型不对当作没有这个键。
-// 描述文件是运维放的，但读它的代码不该因为一个字段类型变了就 panic。
-func plistString(dict map[string]any, key string) string {
+// String / Dict / Time / Bool 是取值的小工具：类型不对当作没有这个键。
+// 读这些文件的代码不该因为一个字段类型变了就 panic。
+func String(dict map[string]any, key string) string {
 	value, _ := dict[key].(string)
 	return value
 }
 
-func plistDict(dict map[string]any, key string) map[string]any {
+func Dict(dict map[string]any, key string) map[string]any {
 	value, _ := dict[key].(map[string]any)
 	return value
 }
 
-func plistTime(dict map[string]any, key string) time.Time {
+func Time(dict map[string]any, key string) time.Time {
 	value, _ := dict[key].(time.Time)
 	return value
+}
+
+func Bool(dict map[string]any, key string) bool {
+	value, _ := dict[key].(bool)
+	return value
+}
+
+// Parse 认二进制与 XML 两种 plist，顶层必须是字典：Xcode 导出的 Info.plist 是二进制，
+// 手工造的测试数据与描述文件里的那份是 XML。
+func Parse(raw []byte) (map[string]any, error) {
+	if bytes.HasPrefix(raw, []byte("bplist")) {
+		value, err := ParseBinary(raw)
+		if err != nil {
+			return nil, err
+		}
+		fields, ok := value.(map[string]any)
+		if !ok {
+			return nil, errors.New("plist root value is not a dictionary")
+		}
+		return fields, nil
+	}
+	return ParseXML(raw)
 }

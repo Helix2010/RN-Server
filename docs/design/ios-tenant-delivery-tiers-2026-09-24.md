@@ -163,8 +163,8 @@ sequenceDiagram
 - plist 解析器现在在 `cmd/build-agent/bplist.go`（`package main`），要挪到 internal 包给服务端用。
 
 **发布记录**：`file_metadata` 写 `delivery:"ipa"` 与交付件的摘要副本，`hosted` 取新的值（不再写死 `testflight`，审计文案也不再写 "TestFlight build"）；
-**分发产物的那几列（`sha256`、`verified_at`）不填**。这不只是语义问题，还是安全前提：
-- 激活发布要求 `sha256` 与 `verified_at` 非空（`server.go:949-955`），所以 ② 的记录不会被激活，不会触发推送与强更；
+**分发产物的 `sha256` 列不填**。这不只是语义问题，还是安全前提：
+- 激活发布要求 `sha256` 非空（`server.go:949-955`；`verified_at` 入库时就会写上，真正挡住激活的是 `sha256`），所以 ② 的记录不会被激活，不会触发推送与强更；
 - 无需登录的公开下载 `/v1/public/releases/:id/download` 现在靠 `hosted` 挡住 iOS 记录（`simplified_releases.go:899`），要显式把 `delivery:"ipa"` 也挡住，交付件只能走 §3.6 的鉴权下载。
 
 这一条和平台代传设计 §3.2"发布记录带 `object_key`/`sha256`"冲突，**以本文为准**，那份已加注。

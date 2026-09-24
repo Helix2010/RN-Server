@@ -1,4 +1,4 @@
-package main
+package plist
 
 import (
 	"encoding/binary"
@@ -11,10 +11,11 @@ import (
 
 // 二进制 plist（`bplist00`）的只读解析器。
 //
-// 用在 `.ipa` 里的 `Info.plist` 上：Xcode 导出的那一份是二进制格式。控制进程要从包里读出
-// bundle id、版本与 build 号，与任务行比对之后才交给上传账户——**不对这个文件调 plutil
-// 或 unzip**（设计 ios-mac-builders-home-network-2026-09-18 §4.3 第 1 步）：它是执行进程
-// 交上来的东西，而执行进程跑的是第三方代码。用解析器而不是子进程，最坏的结果是解析失败。
+// 用在 `.ipa` 里的 `Info.plist` 上：Xcode 导出的那一份是二进制格式。Mac 上的控制进程要从包里
+// 读出 bundle id、版本与 build 号，与任务行比对之后才交给上传账户；服务端收下自助上传的 .ipa
+// 时再独立读一遍。**不对这个文件调 plutil 或 unzip**（设计 ios-mac-builders-home-network-2026-09-18
+// §4.3 第 1 步）：它是执行进程交上来的东西，而执行进程跑的是第三方代码。用解析器而不是子进程，
+// 最坏的结果是解析失败。
 //
 // 只实现读需要的那些类型。解析全程按不可信输入处理：每一处偏移都查边界，对象引用不允许
 // 指向自己或往回指（防构造出来的环让解析器打转）。
@@ -29,8 +30,8 @@ type bplistParser struct {
 
 const bplistMaxDepth = 32
 
-// parseBinaryPlist 解析一份二进制 plist，返回顶层对象。
-func parseBinaryPlist(data []byte) (any, error) {
+// ParseBinary 解析一份二进制 plist，返回顶层对象。
+func ParseBinary(data []byte) (any, error) {
 	const headerLen, trailerLen = 8, 32
 	if len(data) < headerLen+trailerLen || string(data[:6]) != "bplist" {
 		return nil, errors.New("not a binary plist")

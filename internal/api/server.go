@@ -299,6 +299,8 @@ func (s *server) routes() *gin.Engine {
 	builder.PUT("/jobs/:id/sbom/upload", s.builderJobScope(s.uploadBuildSBOM))
 	builder.POST("/jobs/:id/built", s.builderJobScope(s.markBuildJobBuilt))
 	// iOS 安装包：没有未签名产物要交付，构建机直接报结果（设计 ios-testflight §4.5.4）
+	// 自助上传的 iOS 任务先把 .ipa 交回来（服务端解包核对身份与描述文件），再报 /ios-release
+	builder.PUT("/jobs/:id/ipa/upload", s.builderJobScope(s.uploadIOSPackage))
 	builder.POST("/jobs/:id/ios-release", s.builderJobScope(s.completeIOSBuildJob))
 	// 安装包旧的交付路径：构建机不再能落发布记录
 	builder.POST("/jobs/:id/artifact-uploads", s.builderJobScope(s.retiredAPKArtifactRoute))
@@ -425,6 +427,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/builds", s.createBuildJob)
 	group.GET("/builds/:id", s.buildJobDetail)
 	group.POST("/builds/:id/cancel", s.cancelBuildJob)
+	// 自助上传的 .ipa：鉴权后流式转发，支持 Range，每次下载记审计（ios_ipa_delivery.go）
+	group.GET("/builds/:id/ipa/download", s.downloadIOSPackage)
 	// 「签名中」不能取消（签名闸可能正在签），只能带原因强制判失败
 	group.POST("/builds/:id/force-fail", s.forceFailBuildJob)
 	// 服务端合成的 tenant.json：打包任务下发的是同一份。构建 OTA 的人要拿它，

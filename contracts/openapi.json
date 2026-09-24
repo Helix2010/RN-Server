@@ -3131,6 +3131,44 @@
         }
       }
     },
+    "/v1/admin/builds/{id}/ipa/download": {
+      "get": {
+        "summary": "Download the .ipa of a self-upload iOS build",
+        "description": "Only for succeeded self-upload (delivery=ipa) iOS builds whose package is still retained. Streamed by the server after authentication (no presigned storage link: the tenant's network may not reach the storage region, and a leaked link would hand out an unreleased wallet binary). Single-range Range requests are supported (206 / 416; If-Range compared with the ETag, which is the sha256). The object's size is checked against what the server verified before anything is sent. Every request is audited (ios_ipa_download). The path ends in /download so it is exempt from the database timeout.",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The .ipa (application/octet-stream), Content-Disposition attachment <bundle>-<version>-build<n>.ipa, ETag \"<sha256>\"",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The requested byte range"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "BUILD_JOB_NOT_FOUND, IOS_IPA_NOT_AVAILABLE (not a self-upload iOS build, not succeeded yet, or the package was cleaned up)"
+          },
+          "416": {
+            "description": "Range not satisfiable"
+          },
+          "424": {
+            "description": "IOS_IPA_DOWNLOAD_FAILED, IOS_IPA_OBJECT_CHANGED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          }
+        }
+      }
+    },
     "/v1/admin/build-config": {
       "get": {
         "summary": "Tenant build configuration",
@@ -3834,6 +3872,69 @@
           }
         },
         "deprecated": true
+      }
+    },
+    "/v1/build-agent/jobs/{id}/ipa/upload": {
+      "put": {
+        "summary": "Hand back the .ipa of a self-upload iOS build",
+        "description": "Self-upload (delivery=ipa) iOS jobs only; limit ARTIFACT_MAX_SIZE_MB. The body is streamed (application/octet-stream) into a temporary file and verified before anything is stored: Payload/<app>.app/Info.plist must carry this job's bundle id, version and build number; the embedded provisioning profile must belong to the tenant's Apple team and bundle id and be an App Store profile (no device list, get-task-allow false, not ProvisionsAllDevices); the archive may only contain directories Xcode exports (Payload, SwiftSupport, Symbols, ...). A verified package is written under tenants/<tenant>/build-jobs/<job>/a<attempt>/<random>/<bundle>-<version>-build<n>.ipa and recorded in the job's unsigned_* columns in one transaction that locks the job row and checks the attempt; a re-upload replaces and deletes the previous object. Then report /ios-release with the same ipaSha256 and ipaSize. The path ends in /upload so it is exempt from the database timeout. Design ios-tenant-delivery-tiers-2026-09-24.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{sha256, size}"
+          },
+          "400": {
+            "description": "UPLOAD_EMPTY, UPLOAD_INTERRUPTED, INVALID_BUILD_ATTEMPT"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not a self-upload iOS job), IOS_IDENTITY_INCOMPLETE"
+          },
+          "413": {
+            "description": "UPLOAD_TOO_LARGE"
+          },
+          "415": {
+            "description": "UPLOAD_CONTENT_TYPE_INVALID"
+          },
+          "422": {
+            "description": "IOS_IPA_INVALID (not a readable App Store package: development, Ad Hoc or enterprise profile, missing profile, unexpected archive entries), IOS_ARTIFACT_MISMATCH (bundle id, version, build number or profile team does not match)"
+          },
+          "424": {
+            "description": "UPLOAD_STORAGE_FAILED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          }
+        }
       }
     },
     "/v1/build-agent/jobs/{id}/ios-release": {

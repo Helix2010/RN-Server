@@ -1,20 +1,19 @@
 package main
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"path"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Helix2010/RN-Server/internal/ipa"
 )
 
 // iOS 产物的身份核对与上传（设计 ios-mac-builders-home-network-2026-09-18 §4.3）。
@@ -28,100 +27,15 @@ import (
 //     都没有，执行进程更没有——这是"签名材料在这台机器上没有出口"这条的最后一环。
 
 const (
-	// ipaInfoPlistLimit：Info.plist 是几 KB 的东西。给足余量，但不能让一个构造出来的
-	// 压缩包把控制进程的内存吃光
-	ipaInfoPlistLimit = 1 << 20
 	// iosUploadTimeout：几百 MB 走家用上行，十几分钟是常态
 	iosUploadTimeout = 90 * time.Minute
 )
 
-// ipaIdentity 是从 .ipa 里读出来的身份。
-type ipaIdentity struct {
-	BundleID     string
-	ShortVersion string
-	BuildNumber  string
-}
+// ipaIdentity 是从 .ipa 里读出来的身份。读法与服务端核对自助上传的 .ipa 共用一份（internal/ipa）。
+type ipaIdentity = ipa.Identity
 
-// readIPAIdentity 从 .ipa 里读 Payload/<App>.app/Info.plist。
-//
-// 只认恰好三段的路径：`Payload/x.app/Info.plist`。深一层的 Info.plist 属于 App 里的扩展
-// （watch app、share extension），它们的 bundle id 是 `<主 id>.<后缀>`，认错了会让一个
-// 身份不对的包通过核对。
-func readIPAIdentity(path string) (ipaIdentity, error) {
-	reader, err := zip.OpenReader(path)
-	if err != nil {
-		return ipaIdentity{}, fmt.Errorf("cannot read the iOS package: %w", err)
-	}
-	defer reader.Close()
-	var found *zip.File
-	for _, file := range reader.File {
-		if !isAppInfoPlistPath(file.Name) {
-			continue
-		}
-		if found != nil {
-			return ipaIdentity{}, errors.New("the iOS package carries more than one app bundle")
-		}
-		found = file
-	}
-	if found == nil {
-		return ipaIdentity{}, errors.New("the iOS package has no Payload/<app>.app/Info.plist")
-	}
-	if found.UncompressedSize64 > ipaInfoPlistLimit {
-		return ipaIdentity{}, fmt.Errorf("Info.plist in the iOS package is %d bytes", found.UncompressedSize64)
-	}
-	stream, err := found.Open()
-	if err != nil {
-		return ipaIdentity{}, err
-	}
-	defer stream.Close()
-	// 解压后的大小是压缩包自己声明的，不采信：按上限截断着读
-	raw, err := io.ReadAll(io.LimitReader(stream, ipaInfoPlistLimit+1))
-	if err != nil {
-		return ipaIdentity{}, err
-	}
-	if len(raw) > ipaInfoPlistLimit {
-		return ipaIdentity{}, errors.New("Info.plist in the iOS package is larger than it declared")
-	}
-	fields, err := parseInfoPlist(raw)
-	if err != nil {
-		return ipaIdentity{}, err
-	}
-	identity := ipaIdentity{
-		BundleID:     plistString(fields, "CFBundleIdentifier"),
-		ShortVersion: plistString(fields, "CFBundleShortVersionString"),
-		BuildNumber:  plistString(fields, "CFBundleVersion"),
-	}
-	if identity.BundleID == "" || identity.ShortVersion == "" || identity.BuildNumber == "" {
-		return identity, errors.New("Info.plist in the iOS package is missing CFBundleIdentifier, CFBundleShortVersionString or CFBundleVersion")
-	}
-	return identity, nil
-}
-
-// isAppInfoPlistPath 判断压缩包里的这一条是不是主 App 的 Info.plist。
-func isAppInfoPlistPath(name string) bool {
-	// 压缩包里的路径由不可信一侧写，先排掉能跳出去的形状
-	if name != path.Clean(name) || strings.HasPrefix(name, "/") || strings.Contains(name, "..") {
-		return false
-	}
-	parts := strings.Split(name, "/")
-	return len(parts) == 3 && parts[0] == "Payload" && strings.HasSuffix(parts[1], ".app") && parts[2] == "Info.plist"
-}
-
-// parseInfoPlist 认二进制与 XML 两种 plist：Xcode 导出的是二进制，手工造的测试数据可能是 XML。
-func parseInfoPlist(raw []byte) (map[string]any, error) {
-	if bytes.HasPrefix(raw, []byte("bplist")) {
-		value, err := parseBinaryPlist(raw)
-		if err != nil {
-			return nil, err
-		}
-		fields, ok := value.(map[string]any)
-		if !ok {
-			return nil, errors.New("Info.plist is not a dictionary")
-		}
-		return fields, nil
-	}
-	return parseXMLPlist(raw)
-}
+// readIPAIdentity 从 .ipa 里读 Payload/<App>.app/Info.plist（只认主 App，不认扩展）。
+var readIPAIdentity = ipa.ReadIdentity
 
 // checkIPAMatchesJob 把包里读出来的身份与任务行比一遍。
 //

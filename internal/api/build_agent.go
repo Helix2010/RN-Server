@@ -871,6 +871,20 @@ func (r receivedStream) cycloneDXProblem() string {
 // receiveStreamToObject 把请求体按上限收进临时文件、边收边算 sha256，再写进对象存储并
 // 核对落盘大小。返回的临时文件由调用方清理。status 非 0 表示失败，临时文件已清理。
 func (s *server) receiveStreamToObject(c *gin.Context, client objectstore.Client, key string, limit int64) (receivedStream, int, string, string) {
+	received, status, code, detail := receiveStreamToTemp(c, limit)
+	if status != 0 {
+		return receivedStream{}, status, code, detail
+	}
+	if status, code, detail := s.storeReceivedStream(client, key, received); status != 0 {
+		received.cleanup()
+		return receivedStream{}, status, code, detail
+	}
+	return received, 0, "", ""
+}
+
+// receiveStreamToTemp 只做"收"的那一半：请求体按上限进临时文件、边收边算 sha256。要先核对
+// 内容再决定存不存的调用方（自助上传的 .ipa）单独用它。status 非 0 表示失败，临时文件已清理。
+func receiveStreamToTemp(c *gin.Context, limit int64) (receivedStream, int, string, string) {
 	if mediaType, _, err := mime.ParseMediaType(c.GetHeader("content-type")); err != nil || mediaType != octetStream {
 		return receivedStream{}, http.StatusUnsupportedMediaType, "UPLOAD_CONTENT_TYPE_INVALID", "The body must be sent as application/octet-stream"
 	}
@@ -905,25 +919,27 @@ func (s *server) receiveStreamToObject(c *gin.Context, client objectstore.Client
 		return receivedStream{}, http.StatusBadRequest, "UPLOAD_INTERRUPTED", "The upload body is shorter than Content-Length"
 	}
 	received.size, received.sha256 = written, hex.EncodeToString(hash.Sum(nil))
+	return received, 0, "", ""
+}
+
+// storeReceivedStream 把收下的临时文件写进对象存储并核对落盘大小。临时文件不在这里清理。
+func (s *server) storeReceivedStream(client objectstore.Client, key string, received receivedStream) (int, string, string) {
 	file, err := os.Open(received.path)
 	if err != nil {
-		received.cleanup()
-		return receivedStream{}, http.StatusInternalServerError, "UPLOAD_FAILED", "Unable to store the upload"
+		return http.StatusInternalServerError, "UPLOAD_FAILED", "Unable to store the upload"
 	}
 	defer file.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.ArtifactVerifyTimeout)*time.Second)
 	defer cancel()
-	if err := client.Put(ctx, key, file, written, octetStream); err != nil {
-		received.cleanup()
+	if err := client.Put(ctx, key, file, received.size, octetStream); err != nil {
 		slog.Error("cannot write a build delivery to object storage", "objectKey", key, "error", err)
-		return receivedStream{}, http.StatusFailedDependency, "UPLOAD_STORAGE_FAILED", "Unable to write the upload to object storage"
+		return http.StatusFailedDependency, "UPLOAD_STORAGE_FAILED", "Unable to write the upload to object storage"
 	}
 	stored, err := client.Stat(ctx, key)
-	if err != nil || stored.Size != written {
-		received.cleanup()
-		return receivedStream{}, http.StatusFailedDependency, "UPLOAD_STORAGE_FAILED", "Object storage does not hold the complete upload"
+	if err != nil || stored.Size != received.size {
+		return http.StatusFailedDependency, "UPLOAD_STORAGE_FAILED", "Object storage does not hold the complete upload"
 	}
-	return received, 0, "", ""
+	return 0, "", ""
 }
 
 // ---- 交付 ----
