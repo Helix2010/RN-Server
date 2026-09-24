@@ -93,6 +93,10 @@ sequenceDiagram
 - 核验通过才建发布记录（`platform=ios`，带 `object_key`/`sha256`/`file_size`，与 Android 同一张表），
   状态「已出包」。原 TestFlight 设计 §4.5 的「外部托管发布」路径（不带产物）保留给模式 B 手工登记。
 
+> 2026-09-24 更正（对抗评审）：**不要**把交付件填进发布记录的 `object_key`/`sha256` 列。激活发布只看这几列非空，
+> 无需登录的公开下载也只靠 `hosted` 键挡 iOS 记录，填进去会让 `.ipa` 可被激活、可被匿名下载。
+> 交付件的对象键放 `build_jobs` 新列，发布记录只在 `file_metadata` 里带副本，见 `ios-tenant-delivery-tiers-2026-09-24.md` §3.5。
+
 ### 3.3 上传到 TestFlight（控制台按钮）
 
 - 位置：租户管理 → iOS 打包与分发 → 发布记录的那一行，按钮「上传到 TestFlight」。
