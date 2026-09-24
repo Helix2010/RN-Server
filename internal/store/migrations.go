@@ -2112,6 +2112,11 @@ func iosDeliveryMigration(ctx context.Context, db *sql.DB) error {
 			COMMENT 'iOS 安装包任务的交付方式，排队时从租户的 release.ios.delivery 抄来：testflight=构建机上传 App Store Connect（全托管）；ipa=构建机把 .ipa 交回服务端、租户下载后自己上传（自助上传）。Android、热更新与迁移之前的任务为 NULL，iOS 的 NULL 按 testflight 处理' AFTER kind`); err != nil {
 		return fmt.Errorf("ios delivery migration build_jobs.delivery: %w", err)
 	}
+	if err := addColumnIfMissing(ctx, db, "build_jobs", "delivery_state",
+		`ALTER TABLE build_jobs ADD COLUMN delivery_state JSON NULL
+			COMMENT '自助上传任务交出 .ipa 之后的进展，由租户在控制台标记：{"uploadedAt","uploadedBy","installableAt","installableBy","rejection","rejectedAt","purgedAt"}。平台看不到 Apple 发给租户的状态，只能靠这几个标记决定能不能调版本策略、何时清理交付件。NULL=还没有任何标记' AFTER delivery`); err != nil {
+		return fmt.Errorf("ios delivery migration build_jobs.delivery_state: %w", err)
+	}
 	if err := addColumnIfMissing(ctx, db, "build_machine_liveness", "capabilities",
 		`ALTER TABLE build_machine_liveness ADD COLUMN capabilities JSON NULL
 			COMMENT '这次认领自报的能力列表，例如 ["ios-ipa-delivery"]（能把 .ipa 交回服务端）。服务端据此决定能不能排、能不能派自助上传的 iOS 任务。NULL=旧版代理没报' AFTER platforms`); err != nil {

@@ -3,6 +3,7 @@ package api
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 自助上传的 .ipa（设计 ios-tenant-delivery-tiers-2026-09-24 §3.4–§3.6）：交回时服务端解包核对，
@@ -215,5 +217,191 @@ func TestDBIOSIPADeliveryBelongsToSelfUploadJobsOnly(t *testing.T) {
 	cancelJob(f, id)
 	if len(f.store.objects) != 0 {
 		t.Fatalf("a canceled build must not leave its .ipa behind: %d objects", len(f.store.objects))
+	}
+}
+
+// deliverIPA 走完一条自助上传任务：交回 .ipa、报完成。返回任务 id。
+func deliverIPA(t *testing.T, f *gateFixture, mac gateMachine, version string, build int) string {
+	t.Helper()
+	id, headers := claimIPAJob(t, f, mac, version, build)
+	body := fakeIPA(t, poolTeamA, poolBundle, version, build, false)
+	if recorder := f.do(http.MethodPut, "/v1/build-agent/jobs/"+id+"/ipa/upload", mac.Token, headers, body); recorder.Code != http.StatusOK {
+		t.Fatalf("upload: %d %s", recorder.Code, recorder.Body.String())
+	}
+	sum := sha256.Sum256(body)
+	report := map[string]any{
+		"commitSha": strings.Repeat("a", 40), "ipaSha256": hex.EncodeToString(sum[:]), "ipaSize": len(body),
+		"bundleId": poolBundle, "shortVersion": version, "buildNumber": build,
+		"uploadedToAppStoreConnect": false, "toolchain": "Xcode 26.0", "logTail": []string{},
+	}
+	if recorder := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", mac.Token, headers, report); recorder.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", recorder.Code, recorder.Body.String())
+	}
+	return id
+}
+
+func markIPA(f *gateFixture, id string, body map[string]any) *httptest.ResponseRecorder {
+	f.t.Helper()
+	payload := map[string]any{"reason": "ios ipa status test", "confirm": true}
+	for key, value := range body {
+		payload[key] = value
+	}
+	c, recorder := testContext(f.t, f.tenant, http.MethodPost, "/v1/admin/builds/"+id+"/ipa/status", payload)
+	c.Params = append(c.Params, ginParam("id", id))
+	f.s.markIOSIPAStatus(c)
+	return recorder
+}
+
+func buildDetail(f *gateFixture, id string) map[string]any {
+	f.t.Helper()
+	c, recorder := testContext(f.t, f.tenant, http.MethodGet, "/v1/admin/builds/"+id, nil)
+	c.Params = append(c.Params, ginParam("id", id))
+	f.s.buildJobDetail(c)
+	if recorder.Code != http.StatusOK {
+		f.t.Fatalf("detail: %d %s", recorder.Code, recorder.Body.String())
+	}
+	return decodeBody(f.t, recorder)
+}
+
+// 平台看不到 Apple 那边：进展靠租户标记。更新的构建出来之后，旧交付件标成"已被取代"。
+func TestDBIOSIPAStatusMarksAndSupersession(t *testing.T) {
+	f, macs := newIOSPool(t, 78, 1)
+	switchToIPA(f)
+	first := deliverIPA(t, f, macs[0], "3.3.0", 3300)
+
+	delivery, _ := buildDetail(f, first)["ipaDelivery"].(map[string]any)
+	if delivery["available"] != true || delivery["superseded"] != false || delivery["testflightExpiresNoEarlierThan"] == nil || delivery["retainedUntil"] == nil {
+		t.Fatalf("a fresh delivery: %v", delivery)
+	}
+	if recorder := markIPA(f, first, map[string]any{"status": iosIPAStatusRejected}); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("a rejection without Apple's message was accepted: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := markIPA(f, first, map[string]any{"status": iosIPAStatusInstallable}); recorder.Code != http.StatusOK {
+		t.Fatalf("mark installable: %d %s", recorder.Code, recorder.Body.String())
+	}
+	delivery, _ = buildDetail(f, first)["ipaDelivery"].(map[string]any)
+	// 能装了当然也传上去了；传上去之后交付件只再留 7 天
+	if delivery["installableAt"] == nil || delivery["uploadedAt"] == nil {
+		t.Fatalf("installable implies uploaded: %v", delivery)
+	}
+	recorder := markIPA(f, first, map[string]any{"status": iosIPAStatusRejected, "rejection": "ITMS-90683: Missing purpose string in Info.plist"})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("mark rejected: %d %s", recorder.Code, recorder.Body.String())
+	}
+	delivery, _ = decodeBody(t, recorder)["ipaDelivery"].(map[string]any)
+	if delivery["installableAt"] != nil || !strings.Contains(delivery["rejection"].(string), "ITMS-90683") {
+		t.Fatalf("a rejection must withdraw installable and keep Apple's words: %v", delivery)
+	}
+
+	second := deliverIPA(t, f, macs[0], "3.3.1", 3301)
+	if delivery, _ := buildDetail(f, first)["ipaDelivery"].(map[string]any); delivery["superseded"] != true {
+		t.Fatalf("an older delivery must be marked superseded once a newer build exists: %v", delivery)
+	}
+	if delivery, _ := buildDetail(f, second)["ipaDelivery"].(map[string]any); delivery["superseded"] != false {
+		t.Fatalf("the newest delivery is not superseded: %v", delivery)
+	}
+	// 全托管的构建没有这些
+	if detail := buildDetail(f, second); detail["delivery"] != iosDeliveryIPA {
+		t.Fatalf("delivery: %v", detail["delivery"])
+	}
+}
+
+// 交付件过了保留期只删对象、留记录；下载说"过了保留期"。
+func TestDBIOSIPARetention(t *testing.T) {
+	f, macs := newIOSPool(t, 79, 1)
+	switchToIPA(f)
+	old := deliverIPA(t, f, macs[0], "3.4.0", 3400)
+	uploaded := deliverIPA(t, f, macs[0], "3.4.1", 3401)
+	fresh := deliverIPA(t, f, macs[0], "3.4.2", 3402)
+	if len(f.store.objects) != 3 {
+		t.Fatalf("objects: %d", len(f.store.objects))
+	}
+	now := time.Now().UTC()
+	// 第一条出包 31 天了；第二条出包 10 天、租户 8 天前标了已上传；第三条出包 10 天、没标
+	if _, err := f.db.Exec(`UPDATE build_jobs SET heartbeat_at=? WHERE id=?`, now.Add(-31*24*time.Hour), old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`UPDATE build_jobs SET heartbeat_at=?,delivery_state=? WHERE id=?`, now.Add(-10*24*time.Hour),
+		`{"uploadedAt":"`+now.Add(-8*24*time.Hour).Format(time.RFC3339)+`"}`, uploaded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec(`UPDATE build_jobs SET heartbeat_at=? WHERE id=?`, now.Add(-10*24*time.Hour), fresh); err != nil {
+		t.Fatal(err)
+	}
+	purged := f.s.purgeExpiredIPADeliveries(context.Background(), now)
+	if len(purged) != 2 || !containsString(purged, old) || !containsString(purged, uploaded) {
+		t.Fatalf("purged %v, want %s and %s", purged, old, uploaded)
+	}
+	if len(f.store.objects) != 1 {
+		t.Fatalf("only the fresh delivery may stay in storage: %d objects", len(f.store.objects))
+	}
+	delivery, _ := buildDetail(f, old)["ipaDelivery"].(map[string]any)
+	if delivery["available"] != false || delivery["purgedAt"] == nil || delivery["sha256"] == nil {
+		t.Fatalf("a purged delivery keeps its record but is no longer available: %v", delivery)
+	}
+	if recorder := downloadIPA(f, old, nil); problemCode(t, recorder) != "IOS_IPA_NOT_AVAILABLE" {
+		t.Fatalf("a purged package was served: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := downloadIPA(f, fresh, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("the fresh package must still download: %d %s", recorder.Code, recorder.Body.String())
+	}
+	// 再跑一轮什么都不做
+	if again := f.s.purgeExpiredIPADeliveries(context.Background(), now); len(again) != 0 {
+		t.Fatalf("a second round purged %v", again)
+	}
+}
+
+// 自助上传的租户：iOS 最低支持版本不能调过标了"已可安装"的版本，否则用户被锁在 TestFlight 外面。
+func TestDBIOSMinVersionWaitsForAnInstallableBuild(t *testing.T) {
+	f, macs := newIOSPool(t, 80, 1)
+	var stored map[string]any
+	if err := json.Unmarshal([]byte(initialConfig), &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored["modules"] = map[string]any{"predict": false, "dex": true}
+	raw, _ := json.Marshal(stored)
+	if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,'mobile-bootstrap',?,1,'test',UTC_TIMESTAMP(3))
+		ON DUPLICATE KEY UPDATE config_value=VALUES(config_value),version=1`, f.tenant, raw); err != nil {
+		t.Fatal(err)
+	}
+	version := 1
+	save := func(iosMin string) *httptest.ResponseRecorder {
+		t.Helper()
+		config := map[string]any{}
+		for key, value := range stored {
+			config[key] = value
+		}
+		config["updatePolicy"] = map[string]any{
+			"minSupportedVersion": map[string]any{"android": "0.9.0", "ios": iosMin},
+			"latestVersion":       map[string]any{"android": "1.1.0", "ios": "9.9.9"},
+			"otaChannel":          "production",
+		}
+		c, recorder := testContext(t, f.tenant, http.MethodPatch, "/v1/admin/app-config", map[string]any{
+			"config": config, "expectedVersion": version, "reason": "raise the iOS minimum", "confirm": true,
+		})
+		f.s.updateAppConfig(c)
+		if recorder.Code == http.StatusOK {
+			version++
+		}
+		return recorder
+	}
+	// 全托管的租户不受这条限制（平台传上去的就在 TestFlight 上）
+	if recorder := save("1.0.0"); recorder.Code != http.StatusOK {
+		t.Fatalf("a fully managed tenant: %d %s", recorder.Code, recorder.Body.String())
+	}
+	switchToIPA(f)
+	id := deliverIPA(t, f, macs[0], "3.5.0", 3500)
+	if recorder := save("3.5.0"); problemCode(t, recorder) != "IOS_MIN_VERSION_NOT_INSTALLABLE" {
+		t.Fatalf("raised the minimum past anything installable: %d %s", recorder.Code, recorder.Body.String())
+	}
+	// 调低、不动都不查
+	if recorder := save("1.0.0"); recorder.Code != http.StatusOK {
+		t.Fatalf("an unchanged minimum was refused: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := markIPA(f, id, map[string]any{"status": iosIPAStatusInstallable}); recorder.Code != http.StatusOK {
+		t.Fatalf("mark: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := save("3.5.0"); recorder.Code != http.StatusOK {
+		t.Fatalf("an installable version must be allowed: %d %s", recorder.Code, recorder.Body.String())
 	}
 }

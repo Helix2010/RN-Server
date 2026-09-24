@@ -84,6 +84,8 @@ type reapResult struct {
 	// QueueStalled 是这一轮新告警的"排太久没人领"的任务。它们的状态没有被改动——
 	// 排队不是故障，只是需要有人看一眼
 	QueueStalled []string
+	// IPAPurged 是这一轮清掉的、过了保留期的自助上传交付件（任务 id）
+	IPAPurged []string
 }
 
 func (s *server) reapBuildJobs(ctx context.Context, now time.Time) reapResult {
@@ -91,6 +93,7 @@ func (s *server) reapBuildJobs(ctx context.Context, now time.Time) reapResult {
 	s.reapStaleBuilds(ctx, now, &result)
 	s.reapStaleSignings(ctx, now, &result)
 	s.warnStalledIOSQueue(ctx, now, &result)
+	result.IPAPurged = s.purgeExpiredIPADeliveries(ctx, now)
 	return result
 }
 
@@ -106,7 +109,7 @@ func (s *server) reapBuildJobs(ctx context.Context, now time.Time) reapResult {
 func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result *reapResult) {
 	cutoff := now.Add(-buildQueueStallWarning)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id,tenant_id,version,build_number,created_at FROM build_jobs
+		`SELECT id,tenant_id,version,build_number,COALESCE(delivery,'`+iosDeliveryTestFlight+`'),created_at FROM build_jobs
 		  WHERE status='`+jobQueued+`' AND kind='`+jobKindAPK+`' AND platform='`+buildPlatformIOS+`' AND created_at < ?
 		  ORDER BY created_at LIMIT 50`, cutoff)
 	if err != nil {
@@ -114,14 +117,14 @@ func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result 
 		return
 	}
 	type stalled struct {
-		id, tenant, version string
-		buildNumber         int
-		createdAt           time.Time
+		id, tenant, version, delivery string
+		buildNumber                   int
+		createdAt                     time.Time
 	}
 	var found []stalled
 	for rows.Next() {
 		var item stalled
-		if err := rows.Scan(&item.id, &item.tenant, &item.version, &item.buildNumber, &item.createdAt); err != nil {
+		if err := rows.Scan(&item.id, &item.tenant, &item.version, &item.buildNumber, &item.delivery, &item.createdAt); err != nil {
 			slog.Error("cannot read an iOS build stuck in the queue", "error", err)
 			continue
 		}
@@ -149,10 +152,33 @@ func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result 
 			detail = "这个租户的 iOS 发布身份读不出来或已被删除，这条任务不会有人认领。"
 		default:
 			coverage, err := s.iosSigningCoverage(ctx, registry, identity.Value.AppleTeamID, identity.Value.BundleID, now)
-			if err == nil && !coverage.Reported {
-				detail = "没有任何一台打包机报告过它手上有 Team " + identity.Value.AppleTeamID + "、bundle id " +
-					identity.Value.BundleID + " 的签名材料——排队之后这个租户的 iOS 身份被改过，或者材料从那台 Mac 上没了。" +
-					"这条任务不会有人认领，改回去或者取消它。"
+			if err != nil {
+				break
+			}
+			// 按这条任务自己的交付方式说：全托管卡在"没有能上传的机器"、自助上传卡在"打包机程序太旧"，
+			// 和"没人有材料"一样都不会自己好
+			if code, _ := (iosDeliveryReadiness{coverage: coverage}).problem(item.delivery, identity.Value.AppleTeamID, identity.Value.BundleID); code != "" {
+				switch code {
+				case "NO_BUILDER_FOR_TEAM":
+					detail = "没有任何一台打包机报告过它手上有 Team " + identity.Value.AppleTeamID + "、bundle id " +
+						identity.Value.BundleID + " 的签名材料——排队之后这个租户的 iOS 身份被改过，或者材料从那台 Mac 上没了。" +
+						"这条任务不会有人认领，改回去或者取消它。"
+				case "NO_UPLOADER_FOR_TEAM":
+					detail = "这条任务是「全托管」，但没有任何一台打包机报告过 Team " + identity.Value.AppleTeamID +
+						" 的上传 Key 可用（Key 被删、被吊销，或者探测一直失败）。这条任务不会有人认领，补上 Key 或者取消它。"
+				case "NO_IPA_BUILDER_FOR_TEAM":
+					detail = "这条任务是「自助上传」，但手上有这个 Team 材料的打包机都不支持把 .ipa 交回平台。" +
+						"这条任务不会有人认领，批准新版打包机或者取消它。"
+				}
+				break
+			}
+			// 机器是齐的，那就是被排在前面的任务挡住了：同租户的 iOS 任务按排队顺序领
+			var earlier string
+			if err := s.db.QueryRowContext(ctx,
+				`SELECT id FROM build_jobs WHERE tenant_id=? AND platform='`+buildPlatformIOS+`' AND kind='`+jobKindAPK+`' AND status='`+jobQueued+`'
+				  AND (created_at<? OR (created_at=? AND id<?)) ORDER BY created_at LIMIT 1`,
+				item.tenant, item.createdAt, item.createdAt, item.id).Scan(&earlier); err == nil {
+				detail = "它排在同一个租户更早的任务 " + earlier + " 后面：同租户的 iOS 任务按排队顺序领，那一条没被领走，这一条就一直等着。先处理那一条。"
 			}
 		}
 		reason := fmt.Sprintf("这条 iOS 打包任务（%s / build %d）已经排了 %s 还没有被认领。%s",
@@ -161,7 +187,7 @@ func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result 
 		slog.Warn("an iOS build job has been queued for too long",
 			"job", item.id, "tenant", item.tenant, "queuedFor", now.Sub(item.createdAt).Truncate(time.Minute).String())
 		s.auditNow(newAudit(item.tenant, reaperActor, buildQueueStalledAction, "build-job", item.id, clipRunes(reason, 500), "",
-			map[string]any{"jobId": item.id, "version": item.version, "buildNumber": item.buildNumber,
+			map[string]any{"jobId": item.id, "version": item.version, "buildNumber": item.buildNumber, "delivery": item.delivery,
 				"queuedSeconds": int(now.Sub(item.createdAt).Seconds())}))
 	}
 }

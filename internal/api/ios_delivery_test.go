@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // iOS 交付方式（设计 ios-tenant-delivery-tiers-2026-09-24.md）。这一组钉住：
@@ -283,5 +284,30 @@ func TestDBIOSReleaseDependsOnTheDeliveryMode(t *testing.T) {
 	body["uploadedToAppStoreConnect"] = true
 	if recorder := f.do(http.MethodPost, "/v1/build-agent/jobs/"+id+"/ios-release", macs[0].Token, headers, body); problemCode(t, recorder) != "IOS_DELIVERY_MISMATCH" {
 		t.Fatalf("a self-upload build claimed to have uploaded to TestFlight: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// 排太久的告警按任务自己的交付方式说原因：全托管卡在"没有能上传的机器"，和"没人在线""没人有材料"
+// 要做的处理都不一样。
+func TestDBIOSStalledQueueNamesTheMissingUploader(t *testing.T) {
+	f, macs := newIOSPool(t, 81, 1)
+	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
+		t.Fatalf("claim: %d %s", recorder.Code, recorder.Body.String())
+	}
+	id := decodeBody(t, queueIOS(f, "4.0.0", 4000))["id"].(string)
+	// 排进去之后上传 Key 没了
+	if recorder := iosClaim(f, macs[0], noKeyReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
+		t.Fatalf("a machine without the upload key got the job: %d %s", recorder.Code, recorder.Body.String())
+	}
+	f.setJob(id, "created_at=?", time.Now().UTC().Add(-7*time.Hour))
+	if result := f.s.reapBuildJobs(t.Context(), time.Now().UTC()); len(result.QueueStalled) != 1 {
+		t.Fatalf("no alert: %+v", result)
+	}
+	var reason string
+	if err := f.db.QueryRow(`SELECT reason FROM audit_events WHERE target_id=? AND action=? LIMIT 1`, id, buildQueueStalledAction).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reason, "全托管") || !strings.Contains(reason, "上传 Key") {
+		t.Fatalf("the alert does not name the missing uploader: %s", reason)
 	}
 }

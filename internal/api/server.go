@@ -429,6 +429,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.POST("/builds/:id/cancel", s.cancelBuildJob)
 	// 自助上传的 .ipa：鉴权后流式转发，支持 Range，每次下载记审计（ios_ipa_delivery.go）
 	group.GET("/builds/:id/ipa/download", s.downloadIOSPackage)
+	// 租户标记交出去的 .ipa 的进展：已上传 / 已可安装 / 被 Apple 拒（ios_ipa_status.go）
+	group.POST("/builds/:id/ipa/status", s.markIOSIPAStatus)
 	// 「签名中」不能取消（签名闸可能正在签），只能带原因强制判失败
 	group.POST("/builds/:id/force-fail", s.forceFailBuildJob)
 	// 服务端合成的 tenant.json：打包任务下发的是同一份。构建 OTA 的人要拿它，
@@ -1323,6 +1325,15 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	if storedVersion > 0 && body.ExpectedVersion != storedVersion {
 		problem(c, http.StatusConflict, "STALE_APP_CONFIG",
 			fmt.Sprintf("这份配置在你打开之后被改过（你的版本 %d，当前 %d）。刷新页面拿到最新的再改。", body.ExpectedVersion, storedVersion))
+		return
+	}
+	// 自助上传的租户：iOS 最低支持版本不能调过租户标了"已可安装"的版本（ios_ipa_status.go）。
+	// 只在调高时查——改颜色、改文案不该被一个与版本无关的判断挡住
+	if detail, err := s.iosMinVersionProblem(c.Request.Context(), tenantID(c), stored, body.Config); err != nil {
+		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to check the iOS minimum version against installable builds")
+		return
+	} else if detail != "" {
+		problem(c, http.StatusConflict, "IOS_MIN_VERSION_NOT_INSTALLABLE", detail)
 		return
 	}
 	if incoming, present := body.Config["wallet"]; present && incoming != nil {

@@ -348,6 +348,9 @@
           },
           "400": {
             "description": "INVALID_APP_CONFIG, INVALID_WALLET_CONFIG or INVALID_SERVICES_CONFIG (the Predict module cannot be enabled without a valid services.predict whose chain is among the enabled chains)"
+          },
+          "409": {
+            "description": "STALE_APP_CONFIG, IOS_MIN_VERSION_NOT_INSTALLABLE (self-upload iOS tenant: the iOS minimum supported version was raised past the highest build marked installable)"
           }
         }
       }
@@ -3165,6 +3168,77 @@
           },
           "503": {
             "description": "STORAGE_UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/v1/admin/builds/{id}/ipa/status": {
+      "post": {
+        "summary": "Mark the progress of a self-upload .ipa",
+        "description": "uploaded: the tenant uploaded it to App Store Connect (the .ipa is then kept 7 more days). installable: processed and approved, testers can install it (implies uploaded, clears a rejection). rejected: Apple rejected it; rejection carries Apple's message (clears installable). Only for succeeded self-upload iOS builds. Audited (ios_ipa_status).",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "uploaded",
+                      "installable",
+                      "rejected"
+                    ]
+                  },
+                  "rejection": {
+                    "type": "string",
+                    "maxLength": 2000,
+                    "description": "Required when status is rejected"
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "BuildJob with the updated ipaDelivery",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_IOS_IPA_STATUS"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "BUILD_JOB_NOT_FOUND"
+          },
+          "409": {
+            "description": "IOS_IPA_STATUS_NOT_APPLICABLE (not a succeeded self-upload iOS build)"
           }
         }
       }
@@ -8476,6 +8550,62 @@
           "commitSelfReported": {
             "type": "boolean",
             "description": "Always true: the commit is reported by the builder and not verified by the server."
+          },
+          "ipaDelivery": {
+            "type": "object",
+            "nullable": true,
+            "description": "Self-upload (delivery=ipa) iOS jobs only; null otherwise. The platform cannot see App Store Connect for these tenants, so progress comes from the tenant's own marks.",
+            "properties": {
+              "available": {
+                "type": "boolean",
+                "description": "The build succeeded and its .ipa is still retained (download it from /ipa/download)"
+              },
+              "sha256": {
+                "type": "string",
+                "nullable": true
+              },
+              "size": {
+                "type": "integer",
+                "nullable": true
+              },
+              "uploadedAt": {
+                "type": "string",
+                "nullable": true
+              },
+              "installableAt": {
+                "type": "string",
+                "nullable": true,
+                "description": "The tenant marked it installable (processed and approved). The iOS minimum supported version of a self-upload tenant cannot be raised past the highest installable version"
+              },
+              "rejection": {
+                "type": "string",
+                "nullable": true,
+                "description": "Apple's rejection message as pasted by the tenant"
+              },
+              "rejectedAt": {
+                "type": "string",
+                "nullable": true
+              },
+              "purgedAt": {
+                "type": "string",
+                "nullable": true,
+                "description": "The .ipa passed its retention period and was deleted; the record stays"
+              },
+              "superseded": {
+                "type": "boolean",
+                "description": "A newer iOS build of this tenant succeeded: only upload the newest one"
+              },
+              "testflightExpiresNoEarlierThan": {
+                "type": "string",
+                "nullable": true,
+                "description": "Build completion + 90 days: the earliest this build can expire on TestFlight (an upload cannot happen before the package exists), for early warnings"
+              },
+              "retainedUntil": {
+                "type": "string",
+                "nullable": true,
+                "description": "When the .ipa is deleted: 30 days after the build, or 7 days after the tenant marked it uploaded, whichever is earlier"
+              }
+            }
           }
         }
       },

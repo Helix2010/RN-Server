@@ -63,7 +63,9 @@ type buildJob struct {
 	Kind string
 	// Delivery 只对 iOS 安装包任务有意义：排队时从租户配置抄来的交付方式（ios_delivery.go）。
 	// 其余任务与迁移之前的 iOS 任务为 NULL，iOS 的 NULL 按 testflight 处理
-	Delivery       sql.NullString
+	Delivery sql.NullString
+	// DeliveryState 是自助上传任务交出 .ipa 之后租户标记的进展（ios_ipa_status.go）
+	DeliveryState  []byte
 	BaseReleaseID  sql.NullString
 	Channel        sql.NullString
 	ApplyStrategy  sql.NullString
@@ -106,13 +108,13 @@ type buildJob struct {
 	SignedObjectKey    sql.NullString
 }
 
-const buildJobColumns = `id,tenant_id,platform,kind,delivery,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at,` +
+const buildJobColumns = `id,tenant_id,platform,kind,delivery,delivery_state,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at,` +
 	`attempt,claimed_machine_id,unsigned_object_key,unsigned_size,unsigned_sha256,sbom_object_key,sbom_size,sbom_sha256,native_fingerprint,provenance,` +
 	`sign_attempt,sign_failures,signing_machine_id,signing_claimed_at,signing_heartbeat_at,sign_outcome,signed_object_key`
 
 func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 	var j buildJob
-	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.Kind, &j.Delivery, &j.BaseReleaseID, &j.Channel, &j.ApplyStrategy,
+	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.Kind, &j.Delivery, &j.DeliveryState, &j.BaseReleaseID, &j.Channel, &j.ApplyStrategy,
 		&j.OTAReleaseID, &j.GitRef, &j.CommitSHA, &j.Version, &j.BuildNumber,
 		&j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.HeartbeatAt, &j.ReleaseID, &j.ArtifactSHA256, &j.LogTail,
 		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt,
@@ -191,6 +193,18 @@ func buildJobViewWithMachines(j buildJob, machineNames map[string]string) map[st
 		"signOutcome":        buildJobSignOutcomeView(j.SignOutcome),
 		// commit 由构建机自报，服务端没有 GitHub 凭据去核对（设计「构建机 → 每个任务的隔离」）
 		"commitSelfReported": true,
+		// 自助上传任务交出的 .ipa 与租户标记的进展；"已被取代"要看同租户后面的构建，列表与
+		// 详情另算后覆盖这一项（withIPASupersession）
+		"ipaDelivery": ipaDeliveryView(j, 0),
+	}
+}
+
+// withIPASupersession 用这个租户最高的成功 iOS build 号重算列表里每一行的 ipaDelivery。
+func withIPASupersession(items []map[string]any, jobs []buildJob, latest int) {
+	for i, job := range jobs {
+		if i < len(items) && jobDelivery(job) == iosDeliveryIPA {
+			items[i]["ipaDelivery"] = ipaDeliveryView(job, latest)
+		}
 	}
 }
 
@@ -611,6 +625,12 @@ func (s *server) listBuildJobs(c *gin.Context) {
 	for _, job := range jobs {
 		items = append(items, buildJobViewWithMachines(job, names))
 	}
+	latest, err := s.iosLatestBuildNumber(c.Request.Context(), tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to list builds")
+		return
+	}
+	withIPASupersession(items, jobs, latest)
 	// 下一个包该填什么，由服务端算——控制台不该自己去推。它要看的两张表里有一张
 	// （build_jobs 里排队中的任务）根本不在列表这一页上，而且 semver 的比较规则
 	// 客户端复制一份就会漂。默认值给出来，页面上仍然可以改。
@@ -735,7 +755,16 @@ func (s *server) buildJobDetail(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	c.JSON(http.StatusOK, buildJobViewWithMachines(job, s.machineNamesForView(c.Request.Context())))
+	view := buildJobViewWithMachines(job, s.machineNamesForView(c.Request.Context()))
+	if jobDelivery(job) == iosDeliveryIPA {
+		latest, err := s.iosLatestBuildNumber(c.Request.Context(), tenantID(c))
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to load the build")
+			return
+		}
+		view["ipaDelivery"] = ipaDeliveryView(job, latest)
+	}
+	c.JSON(http.StatusOK, view)
 }
 
 // machineNamesForView 给任务视图补签名闸名称。读不到登记不影响列表：名称只是显示用的，
