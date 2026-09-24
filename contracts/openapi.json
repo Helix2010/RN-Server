@@ -6566,7 +6566,7 @@
       },
       "put": {
         "summary": "Switch the iOS delivery mode",
-        "description": "Only affects builds queued afterwards: the mode is copied into each job when it is queued. Refused while the tenant has unfinished iOS builds. Switching from testflight to ipa requires acknowledgeKeysRevoked=true (the tenant revoked the upload key and App Manager key in App Store Connect) and deletes the stored App Manager key in the same transaction; upload keys already installed on build machines are not removed by this call.",
+        "description": "Only affects builds queued afterwards: the mode is copied into each job when it is queued. Refused while the tenant has unfinished iOS builds. Switching from testflight to ipa requires acknowledgeKeysRevoked=true (the tenant revoked the upload key and App Manager key in App Store Connect) and in the same transaction deletes the stored App Manager key and, unless another tenant on the same Apple team stays fully managed, withdraws the team's upload-key signing material — build machines then delete their local copy on their next material sync. Revoking the keys in App Store Connect is still the tenant's job.",
         "requestBody": {
           "required": true,
           "content": {
@@ -6612,7 +6612,7 @@
         },
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, reminder?}"
+            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, uploadKeyWithdrawn, reminder?}"
           },
           "400": {
             "description": "INVALID_IOS_DELIVERY"

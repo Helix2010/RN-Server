@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -309,5 +310,69 @@ func TestDBIOSStalledQueueNamesTheMissingUploader(t *testing.T) {
 	}
 	if !strings.Contains(reason, "全托管") || !strings.Contains(reason, "上传 Key") {
 		t.Fatalf("the alert does not name the missing uploader: %s", reason)
+	}
+}
+
+func seedUploadKeyMaterial(t *testing.T, f *gateFixture, team string) {
+	t.Helper()
+	if _, err := f.db.Exec(`INSERT INTO ios_signing_material(kind,team_id,scope,purpose,recipient_sha256,version,ciphertext,uploaded_by,uploaded_at)
+		VALUES('upload-key',?,'','ios-uploader-material',?,1,?,'tester',UTC_TIMESTAMP(3))
+		ON DUPLICATE KEY UPDATE version=version+1`, team, strings.Repeat("a", 64), []byte(`{"pretend":"ciphertext"}`)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func uploadKeyStored(t *testing.T, f *gateFixture, team string) bool {
+	t.Helper()
+	var count int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM ios_signing_material WHERE kind='upload-key' AND team_id=?`, team).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
+// 切到自助上传时，这个 Team 的上传 Key 材料一起撤下（打包机据此删本机那份）；同一个 Team 下
+// 还有别的全托管租户时不撤——Team Key 限不了 App，撤了那些租户就传不了。
+func TestDBIOSDeliverySwitchWithdrawsTheTeamUploadKey(t *testing.T) {
+	f, _ := newIOSPool(t, 82, 1)
+	// 测试库是共用的，别的用例留下的租户都在 poolTeamA 下：这里用一个只属于本用例的 Team
+	team := "Q" + strings.ToUpper(uniqueSuffix() + "000000000")[:9]
+	seedGateIOSIdentity(t, f, team, poolBundle)
+	seedUploadKeyMaterial(t, f, team)
+	// 同一个 Team 下另一个租户，全托管
+	other := testTenant(83)
+	seedBuildTenant(t, f.s, other)
+	raw, _ := json.Marshal(iosReleaseIdentity{AppleTeamID: team, BundleID: "com.pool.other"})
+	if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,'test',UTC_TIMESTAMP(3))
+		ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)`, other, releaseIOSIdentityConfigKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	recorder := putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 0, "acknowledgeKeysRevoked": true})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("switch: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if body := decodeBody(t, recorder); body["uploadKeyWithdrawn"] != false || !strings.Contains(body["reminder"].(string), "全托管") {
+		t.Fatalf("a shared team keeps its upload key and says why: %v", body)
+	}
+	if !uploadKeyStored(t, f, team) {
+		t.Fatal("the upload key of a team another fully managed tenant uses was withdrawn")
+	}
+
+	// 那个租户也不用这个 Team 了：切回去再切过来，这回撤下
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, other, releaseIOSIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if recorder := putDelivery(f, map[string]any{"mode": iosDeliveryTestFlight, "expectedVersion": 1}); recorder.Code != http.StatusOK {
+		t.Fatalf("switch back: %d %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 2, "acknowledgeKeysRevoked": true})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("switch again: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if body := decodeBody(t, recorder); body["uploadKeyWithdrawn"] != true {
+		t.Fatalf("the team's upload key must be withdrawn: %v", body)
+	}
+	if uploadKeyStored(t, f, team) {
+		t.Fatal("the upload key material is still stored")
 	}
 }

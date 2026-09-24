@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Helix2010/RN-Server/signing/iosmaterial"
 	"github.com/gin-gonic/gin"
 )
 
@@ -341,7 +342,8 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 			gin.H{"unfinishedJobs": unfinished})
 		return
 	}
-	ascDeleted := false
+	ascDeleted, uploadKeyWithdrawn := false, false
+	sharedWith := []string{}
 	if previous == iosDeliveryTestFlight && body.Mode == iosDeliveryIPA {
 		if !body.AcknowledgeKeysRevoked {
 			problem(c, http.StatusConflict, "IOS_DELIVERY_KEYS_NOT_REVOKED",
@@ -357,6 +359,29 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 		}
 		affected, _ := result.RowsAffected()
 		ascDeleted = affected > 0
+		// 这个 Team 的上传 Key 材料也撤下——除非同一个 Team 下还有别的租户是全托管（Team Key 限不了
+		// App，一个 Team 一把，撤了那些租户就传不了）。撤下之后，打包机下一轮同步发现清单里没有这个
+		// Team 的上传 Key，就请上传账户删掉本机那份（墓碑，cmd/build-agent/ios_material.go）
+		identity, err := s.iosReleaseIdentityRecord(ctx, tenantID(c))
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.ios configuration is invalid")
+			return
+		}
+		if identity != nil {
+			if sharedWith, err = s.iosTeamSharedWithTestFlightTenants(ctx, tenantID(c), identity.Value.AppleTeamID); err != nil {
+				problem(c, http.StatusInternalServerError, "IOS_DELIVERY_QUERY_FAILED", "Unable to read other tenants on this Apple team")
+				return
+			}
+			if len(sharedWith) == 0 {
+				result, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE kind=? AND team_id=?`, iosmaterial.KindUploadKey, identity.Value.AppleTeamID)
+				if err != nil {
+					problem(c, http.StatusInternalServerError, "IOS_DELIVERY_SAVE_FAILED", "Unable to withdraw the upload key of this team")
+					return
+				}
+				withdrawn, _ := result.RowsAffected()
+				uploadKeyWithdrawn = withdrawn > 0
+			}
+		}
 	}
 	raw, _ := json.Marshal(iosDeliveryConfig{Mode: body.Mode})
 	now := time.Now().UTC()
@@ -377,15 +402,28 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "ios_delivery_update", "app-config", iosDeliveryConfigKey, reason, requestID(c),
-		map[string]any{"from": previous, "to": body.Mode, "ascKeyDeleted": ascDeleted, "acknowledgeKeysRevoked": body.AcknowledgeKeysRevoked})
+		map[string]any{"from": previous, "to": body.Mode, "ascKeyDeleted": ascDeleted, "uploadKeyWithdrawn": uploadKeyWithdrawn,
+			"teamSharedWith": sharedWith, "acknowledgeKeysRevoked": body.AcknowledgeKeysRevoked})
 	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "IOS_DELIVERY_SAVE_FAILED", "Unable to save the delivery mode")
 		return
 	}
 	view := iosDeliveryView(&iosDeliveryRecord{Mode: body.Mode, Version: currentVersion + 1, UpdatedBy: actor(c), UpdatedAt: now})
 	view["ascKeyDeleted"] = ascDeleted
+	view["uploadKeyWithdrawn"] = uploadKeyWithdrawn
 	if body.Mode == iosDeliveryIPA {
-		view["reminder"] = "已切到「自助上传」。打包机上已装的这个 Team 的上传 Key 平台删不掉，真正收回授权要靠在 App Store Connect 吊销它。"
+		switch {
+		case len(sharedWith) > 0:
+			shown := sharedWith
+			if len(shown) > 5 {
+				shown = append(append([]string{}, shown[:5]...), fmt.Sprintf("等 %d 个", len(sharedWith)))
+			}
+			view["reminder"] = "已切到「自助上传」。同一个 Apple Team 下还有租户（" + strings.Join(shown, "、") +
+				"）是「全托管」，这个 Team 的上传 Key 仍留在平台与打包机上。Key 本身在 Apple 那边是否作废，取决于 App Store Connect 里有没有吊销。"
+		default:
+			view["reminder"] = "已切到「自助上传」。平台存的 App Store Connect Key 已删除、这个 Team 的上传 Key 已从平台材料里撤下，打包机下一轮同步（几分钟内）会删掉本机那份。" +
+				"平台删掉副本不等于 Key 作废：请确认已在 App Store Connect 吊销。"
+		}
 	}
 	c.JSON(http.StatusOK, view)
 }
