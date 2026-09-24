@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
@@ -78,12 +79,64 @@ func (a *agent) syncIOSMaterial(ctx context.Context) {
 		installed[entry.slot()] = entry.Version
 		changed = true
 	}
+	// 墓碑：本机从服务端装过、而清单里这个 Team 已经没有上传 Key 了（租户切到自助上传、Key 被撤下）
+	// ——请上传账户把本机那一份删掉。服务端删材料只删它自己的密文，不这样做的话，切到自助上传的
+	// 租户的 Key 会一直留在每台 Mac 上（设计 ios-tenant-delivery-tiers-2026-09-24 §3.9）。
+	// 只动本机从清单装上的那几格：装机时手工放的 Key 不在记录里，不碰
+	if removed := a.removeWithdrawnUploadKeys(ctx, entries, installed); removed {
+		changed = true
+	}
 	if changed {
 		if err := writeInstalledMaterial(a.cfg.StateDir, installed); err != nil {
 			// 记不下来的后果是下一轮重装一遍——幂等，但会白跑两个子进程
 			a.log.Error("cannot record which signing material is installed", "error", err)
 		}
 	}
+}
+
+// removeWithdrawnUploadKeys 删掉清单里已经没有的上传 Key，返回是否改了本机记录。
+func (a *agent) removeWithdrawnUploadKeys(ctx context.Context, entries []materialEntry, installed map[string]int64) bool {
+	listed := map[string]bool{}
+	for _, entry := range entries {
+		if entry.Kind == iosmaterial.KindUploadKey {
+			listed[entry.TeamID] = true
+		}
+	}
+	changed := false
+	for slot := range installed {
+		kind, rest, _ := strings.Cut(slot, "/")
+		team, _, _ := strings.Cut(rest, "/")
+		if kind != iosmaterial.KindUploadKey || listed[team] {
+			continue
+		}
+		if err := a.removeUploadKey(ctx, team); err != nil {
+			a.log.Error("cannot remove a withdrawn upload key", "team", team, "error", err)
+			continue
+		}
+		a.log.Info("withdrawn upload key removed", "team", team)
+		delete(installed, slot)
+		changed = true
+	}
+	return changed
+}
+
+// removeUploadKey 请上传账户删掉一个 Team 的上传 Key。
+func (a *agent) removeUploadKey(ctx context.Context, team string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := a.uploaderCommand(ctx, "--remove-key", "--team", team, "--keys", a.cfg.IOSUploadKeys)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, truncate(strings.TrimSpace(stderr.String()), 300))
+	}
+	var result struct {
+		Removed bool `json:"removed"`
+	}
+	if json.Unmarshal(stdout.Bytes(), &result) != nil || !result.Removed {
+		return fmt.Errorf("the upload program did not confirm: %s", truncate(stdout.String(), 200))
+	}
+	return nil
 }
 
 // materialDue 控制取清单的频率。

@@ -140,9 +140,10 @@ func TestClaimInProgressIsRetriedLater(t *testing.T) {
 				ExpiresAt   string   `json:"expiresAt"`
 				UploadProbe string   `json:"uploadProbe"`
 			} `json:"appleTeams"`
-			FreeGb       int64  `json:"freeGb"`
-			Paused       bool   `json:"paused"`
-			PausedReason string `json:"pausedReason"`
+			FreeGb       int64    `json:"freeGb"`
+			Paused       bool     `json:"paused"`
+			PausedReason string   `json:"pausedReason"`
+			Capabilities []string `json:"capabilities"`
 		}
 		if err := decoder.Decode(&strict); err != nil || len(strict.Platforms) == 0 || len(strict.Kinds) == 0 {
 			t.Fatalf("claim body %s does not carry non-empty platforms and kinds (%v)", call.Body, err)

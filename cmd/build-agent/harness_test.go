@@ -238,7 +238,8 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	case strings.HasSuffix(path, "/unsigned/upload"), strings.HasSuffix(path, "/sbom/upload"), strings.HasSuffix(path, "/ota-artifact"):
+	case strings.HasSuffix(path, "/unsigned/upload"), strings.HasSuffix(path, "/sbom/upload"), strings.HasSuffix(path, "/ota-artifact"),
+		strings.HasSuffix(path, "/ipa/upload"):
 		trimmed := strings.TrimSuffix(path, "/upload")
 		f.uploads[trimmed[strings.LastIndex(trimmed, "/")+1:]] = body
 		sum := sha256.Sum256(body)

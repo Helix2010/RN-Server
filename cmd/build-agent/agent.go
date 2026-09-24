@@ -181,7 +181,7 @@ func (a *agent) say(message string, args ...any) {
 // `security` 子进程的代价，换的是"控制台上看到的就是这台机器现在真实有的东西"。
 func (a *agent) claimRequest(ctx context.Context) claimRequest {
 	request := claimRequest{Platforms: a.cfg.Platforms, AgentCommit: agentCommit(), OS: runtime.GOOS,
-		UpgradeError: a.upgradeError}
+		UpgradeError: a.upgradeError, Capabilities: agentCapabilities}
 	// 空闲空间：磁盘满时每条任务都会在 pnpm install 或 archive 那一步失败，各烧掉一个
 	// build 号。报上去让控制台看得见，低于阈值就暂停认领——但仍然来报到，
 	// 否则控制台只能显示"离线"，而磁盘满和关机要做的处理完全不同
@@ -384,7 +384,10 @@ func (a *agent) runJob(ctx context.Context, job claimedJob) {
 		}
 	}()
 
-	commit, err := a.buildAndDeliver(buildCtx, job, buf)
+	// iOS 的交付（传 TestFlight 或把 .ipa 交回服务端）不算在构建时限里：七八十分钟的 archive
+	// 再加十几分钟的慢速上传，碰上一次重试就会超时、丢掉已经打好的包。交付有自己的时限，
+	// 仍然挂在 jobCtx 上——取消、认领过期照样立刻停
+	commit, err := a.buildAndDeliver(buildCtx, jobCtx, cancelTimeout, job, buf)
 	close(beats)
 	<-beatsDone
 
@@ -420,7 +423,10 @@ func (a *agent) runJob(ctx context.Context, job claimedJob) {
 }
 
 // buildAndDeliver 返回检出的提交与第一个错误。安装包任务以 /built 结束，热更新任务以 /complete 结束。
-func (a *agent) buildAndDeliver(ctx context.Context, job claimedJob, buf *logBuffer) (string, error) {
+//
+// deliverCtx 与 stopBuildClock 只给 iOS 用：构建做完之后停掉构建时限，交付在 deliverCtx 上
+// 按自己的时限做（stopBuildClock 之后 ctx 已取消，但原因不是超时，runJob 不会报成"构建超时"）。
+func (a *agent) buildAndDeliver(ctx, deliverCtx context.Context, stopBuildClock context.CancelFunc, job claimedJob, buf *logBuffer) (string, error) {
 	// 盘点与认领之间可能有人动过钥匙串或删掉了描述文件（设计 §5.2 最后一行）。
 	// 在检出仓库、装依赖、跑 archive 之前先核一次：缺材料的话那几十分钟一定白花，
 	// 而且失败会出现在 xcodebuild 的输出里，看起来像构建问题而不是材料问题
@@ -443,7 +449,8 @@ func (a *agent) buildAndDeliver(ctx context.Context, job claimedJob, buf *logBuf
 	}
 	switch {
 	case prepared.Spec.Kind == jobspec.KindAPK && prepared.Spec.Platform == jobspec.PlatformIOS:
-		return prepared.Commit, a.deliverIPA(ctx, job, prepared, buf)
+		stopBuildClock()
+		return prepared.Commit, a.deliverIPA(deliverCtx, job, prepared, buf)
 	case prepared.Spec.Kind == jobspec.KindAPK:
 		return prepared.Commit, a.deliverAPK(ctx, job, prepared, buf)
 	case prepared.Spec.Kind == jobspec.KindOTA:
@@ -527,9 +534,10 @@ func (a *agent) deliverAPK(ctx context.Context, job claimedJob, prepared prepare
 //
 // 与 Android 那条的三点不同，每一条都来自"iOS 的签名与构建分不开"（设计 §4.2）：
 //
-//  1. **产物不上传**。xcodebuild 导出的 .ipa 已经签好名，而用户装的那一份是 Apple
-//     重签、瘦身之后的东西——把这一份当发布产物存起来，只会让发布记录的 sha256 变成
-//     一个对不上任何东西的值。这里只算一遍摘要记进审计；
+//  1. **产物不作为发布产物上传**。xcodebuild 导出的 .ipa 已经签好名，而用户装的那一份是
+//     Apple 重签、瘦身之后的东西——把这一份当发布产物存起来，只会让发布记录的 sha256 变成
+//     一个对不上任何东西的值。全托管时只算一遍摘要记进审计；自助上传时 .ipa 交回服务端，
+//     但那是交给租户的交付件，不是分发产物（设计 ios-tenant-delivery-tiers-2026-09-24 §3.5）；
 //  2. **没有出处签名**。那套是给签名闸验货用的，iOS 没有签名闸这一环；
 //  3. **一步到 succeeded**，不经过 built / signing。
 func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared preparedJob, buf *logBuffer) error {
@@ -553,8 +561,26 @@ func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared prepare
 		return err
 	}
 	buf.add("package identity checked: " + identity.BundleID + " " + identity.ShortVersion + " (" + identity.BuildNumber + ")")
+	// 交付方式是服务端在排队时定的（设计 ios-tenant-delivery-tiers-2026-09-24 §3.2），这里照做，
+	// 不看"这台机器上有没有这个 Team 的上传 Key"自己推断：推断会把丢了 Key 的全托管租户
+	// 悄悄变成自助上传
 	var outcome uploadOutcome
-	if a.cfg.IOSUpload {
+	switch job.Delivery {
+	case deliveryIPA:
+		// 自助上传：交回服务端，服务端解包核对之后存下，租户从控制台下载。不碰上传账户
+		backhaulCtx, cancel := context.WithTimeout(ctx, ipaBackhaulTimeout)
+		defer cancel()
+		if err := withRetry(backhaulCtx, buf, "ipa hand-back", 6, func(ctx context.Context) error {
+			return a.api.uploadStream(ctx, job, "/ipa/upload", ipa.Path, ipa.SHA256, ipa.Size)
+		}); err != nil {
+			return fmt.Errorf("the iOS package was built but could not be handed back to the server: %w", err)
+		}
+		buf.add("handed the .ipa back to the server for the tenant to upload")
+	case deliveryTestFlight, "":
+		if !a.cfg.IOSUpload {
+			// 服务端只把全托管的任务派给上传 Key 可用的机器，走到这里说明两边对不上
+			return errors.New("this build is to be uploaded to App Store Connect, but this machine is not configured to upload (BUILD_AGENT_IOS_UPLOAD)")
+		}
 		if outcome, err = a.uploadIPA(ctx, job, ipa.Path, identity, buf); err != nil {
 			return err
 		}
@@ -563,8 +589,8 @@ func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared prepare
 		} else {
 			buf.add("uploaded to App Store Connect")
 		}
-	} else {
-		buf.add("not uploaded: this machine is not configured to upload (BUILD_AGENT_IOS_UPLOAD)")
+	default:
+		return fmt.Errorf("the server asked for an unknown iOS delivery %q; upgrade the build agent", job.Delivery)
 	}
 	if err := withRetry(ctx, buf, "result report", 8, func(ctx context.Context) error {
 		return a.api.iosRelease(ctx, job, prepared.Commit, ipa.SHA256, ipa.Size, iosReleaseReport{

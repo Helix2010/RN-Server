@@ -29,6 +29,14 @@ import (
 const (
 	// iosUploadTimeout：几百 MB 走家用上行，十几分钟是常态
 	iosUploadTimeout = 90 * time.Minute
+	// ipaBackhaulTimeout：自助上传的 .ipa 交回服务端的总时限（含重试）。家用上行连机房只有
+	// 20–30 KB/s，24 MB 要十几分钟（设计 ios-tenant-delivery-tiers-2026-09-24 §3.4）
+	ipaBackhaulTimeout = 90 * time.Minute
+	// uploadProbeMissing：这台机器开着上传，但没装这个 Team 的上传 Key。与服务端同名取值
+	uploadProbeMissing = "missing"
+	// iOS 任务的交付方式，与服务端 build_jobs.delivery 同名取值
+	deliveryTestFlight = "testflight"
+	deliveryIPA        = "ipa"
 )
 
 // ipaIdentity 是从 .ipa 里读出来的身份。读法与服务端核对自助上传的 .ipa 共用一份（internal/ipa）。

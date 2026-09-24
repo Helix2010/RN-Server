@@ -128,9 +128,12 @@ type claimedJob struct {
 	ClaimedMachineID string `json:"claimedMachineId"`
 	TenantSlug       string `json:"tenantSlug"`
 	// TenantDirectory 是仓库里 tenants/ 下的目录名，与 TenantSlug 是两套命名，只用它拼路径。
-	TenantDirectory    string          `json:"tenantDirectory"`
-	Platform           string          `json:"platform"`
-	Kind               string          `json:"kind"`
+	TenantDirectory string `json:"tenantDirectory"`
+	Platform        string `json:"platform"`
+	Kind            string `json:"kind"`
+	// Delivery 只对 iOS 安装包任务有：testflight=传 App Store Connect；ipa=把 .ipa 交回服务端。
+	// 旧版服务端不带，空按 testflight
+	Delivery           string          `json:"delivery"`
 	BaseReleaseID      string          `json:"baseReleaseId"`
 	Channel            string          `json:"channel"`
 	ApplyStrategy      string          `json:"applyStrategy"`
@@ -352,7 +355,13 @@ type claimRequest struct {
 	// UpgradeError 是上一次自升级失败的摘要。升级是 root 那个程序做的，它失败时这个
 	// 进程还在跑旧版——不报上来，控制台只会看到"版本一直追不上审批值"
 	UpgradeError string `json:"upgradeError,omitempty"`
+	// Capabilities：这一版程序会做的"新"事情。ios-ipa-delivery = 能把 .ipa 交回服务端（自助上传的
+	// iOS 租户）；服务端据此决定能不能排、能不能派那种任务（设计 ios-tenant-delivery-tiers-2026-09-24）
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// agentCapabilities 是这一版程序的能力。与服务端的 machineCapabilityIPADelivery 同名
+var agentCapabilities = []string{"ios-ipa-delivery"}
 
 // appleTeamSelfReport 是自报盘点里的一个 Team。字段名与服务端的严格解析一一对应：
 // 服务端的请求体是 DisallowUnknownFields，多一个字段整条认领就 400。
@@ -530,25 +539,74 @@ func nonNil(lines []string) []string {
 	return lines
 }
 
+// uploadStallTimeout：一次流式上传连续这么久一个字节都没送出去，就断开、交给重试。
+//
+// 单次请求的总时限（uploadRequestTimeout，30 分钟）要容得下家用上行传一个几十 MB 的 .ipa，
+// 于是连接卡死时也要干等 30 分钟才重试（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）。
+// 只看"读文件"这一侧：内核发送缓冲满了、对端不收，读就停住。整份读完之后等服务端回话
+// 不算卡住（服务端要写存储、做核对），那一段仍由总时限兜着。做成变量只是为了测试能调小
+var uploadStallTimeout = 60 * time.Second
+
+var errUploadStalled = errors.New("the upload made no progress")
+
+// progressBody 记下最近一次从文件读出字节的时刻，以及是否已经读完。
+type progressBody struct {
+	file *os.File
+	last *atomic.Int64
+	done *atomic.Bool
+}
+
+func (p progressBody) Read(b []byte) (int, error) {
+	n, err := p.file.Read(b)
+	if n > 0 {
+		p.last.Store(time.Now().UnixNano())
+	}
+	if errors.Is(err, io.EOF) {
+		p.done.Store(true)
+	}
+	return n, err
+}
+
+func (p progressBody) Close() error { return p.file.Close() }
+
 // uploadStream 把控制进程自己的副本以 octet-stream 流式 PUT 到服务端，核对服务端算出的 sha256 与大小。
 func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path, wantSHA256 string, wantSize int64) error {
 	apiPath := jobPath(job.ID, suffix)
-	file, err := os.Open(path)
+	var last atomic.Int64
+	var done atomic.Bool
+	last.Store(time.Now().UnixNano())
+	open := func() (io.ReadCloser, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		done.Store(false)
+		last.Store(time.Now().UnixNano())
+		return progressBody{file: file, last: &last, done: &done}, nil
+	}
+	body, err := open()
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.server+apiPath, file)
+	defer body.Close()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stopWatching := watchUploadProgress(ctx, &last, &done, func() { cancel(errUploadStalled) })
+	defer stopWatching()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, c.server+apiPath, body)
 	if err != nil {
 		return err
 	}
 	request.ContentLength = wantSize
-	// GetBody 让传输层需要重发时能从头再读一遍
-	request.GetBody = func() (io.ReadCloser, error) { return os.Open(path) }
+	// GetBody 让传输层需要重发时能从头再读一遍；重读的那一份同样计进度
+	request.GetBody = open
 	request.Header.Set("content-type", "application/octet-stream")
 	c.authorize(request, job.Attempt)
 	response, err := c.upload.Do(request)
 	if err != nil {
+		if errors.Is(context.Cause(ctx), errUploadStalled) {
+			return retryLater{fmt.Errorf("%s: no bytes went out for %s", apiPath, uploadStallTimeout)}
+		}
 		return retryLater{err}
 	}
 	defer response.Body.Close()
@@ -569,6 +627,34 @@ func (c *client) uploadStream(ctx context.Context, job claimedJob, suffix, path,
 			apiPath, stored.Size, truncate(stored.SHA256, 64), wantSize, wantSHA256)}
 	}
 	return nil
+}
+
+// watchUploadProgress 在上传卡住（没读完、又超过 uploadStallTimeout 没有新字节）时调用 stall。
+// 返回的函数停掉监视。
+func watchUploadProgress(ctx context.Context, last *atomic.Int64, done *atomic.Bool, stall func()) func() {
+	quit := make(chan struct{})
+	every := uploadStallTimeout / 4
+	if every > 5*time.Second {
+		every = 5 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !done.Load() && time.Since(time.Unix(0, last.Load())) > uploadStallTimeout {
+					stall()
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(quit) }
 }
 
 // iconAttemptTimeout 是取一张图标一次尝试的上限。

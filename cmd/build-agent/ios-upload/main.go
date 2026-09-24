@@ -72,6 +72,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	probe := set.Bool("probe", false, "only check whether this key may use the build upload endpoints")
 	install := set.Bool("install-key", false, "install an upload key handed over as ciphertext on stdin")
 	list := set.Bool("list-keys", false, "print the teams that have an upload key installed on this machine")
+	remove := set.Bool("remove-key", false, "delete the upload key of --team from this machine")
 	fingerprint := set.Bool("material-key-fingerprint", false, "print the sha256 of this account's material public key")
 	team := set.String("team", "", "Apple Developer Team ID")
 	keys := set.String("keys", "/var/rn-build-upload", "directory that holds <TEAMID>/key.json and the .p8")
@@ -102,6 +103,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if *install {
 		if err := installKey(stdin, stdout, *keys); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	// --remove-key：服务端撤下了这个 Team 的上传 Key（租户切到自助上传、换了 Key），控制进程
+	// 请这个账户把本机那一份删掉。控制进程自己删不了（上传区 0700 _rnuploader），也不该能读
+	if *remove {
+		if !appleTeamIDPattern.MatchString(*team) {
+			fmt.Fprintln(stderr, "--team must be a 10-character Apple Developer Team ID")
+			return 2
+		}
+		if err := removeKey(stdout, *keys, *team); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}

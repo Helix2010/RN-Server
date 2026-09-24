@@ -206,3 +206,52 @@ func TestListKeysNamesTheTeamsAndNothingElse(t *testing.T) {
 		}
 	}
 }
+
+// --remove-key 只删 <keys>/<TEAMID> 这一格，不跟符号链接；本来就没有算成功。
+func TestRemoveKeyDeletesOnlyThatTeam(t *testing.T) {
+	keys := t.TempDir()
+	for _, team := range []string{"J4JDFC8LCC", "ZZ99YY88XX"} {
+		if err := os.MkdirAll(filepath.Join(keys, team), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(keys, team, "key.json"), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--remove-key", "--team", "J4JDFC8LCC", "--keys", keys}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"removed":true`) || !strings.Contains(stdout.String(), `"existed":true`) {
+		t.Fatalf("output: %s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(keys, "J4JDFC8LCC")); !os.IsNotExist(err) {
+		t.Fatalf("the key directory is still there: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(keys, "ZZ99YY88XX", "key.json")); err != nil {
+		t.Fatalf("another team's key was touched: %v", err)
+	}
+	// 已经没有了：照样成功
+	stdout.Reset()
+	if code := run([]string{"--remove-key", "--team", "J4JDFC8LCC", "--keys", keys}, nil, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), `"existed":false`) {
+		t.Fatalf("removing an absent key: exit %d, %s %s", code, stdout.String(), stderr.String())
+	}
+	// 一格是链接：删链接本身，不顺着删到别处
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(keys, "AB12CD34EF")); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"--remove-key", "--team", "AB12CD34EF", "--keys", keys}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
+		t.Fatalf("removal followed a symlink out of the key directory: %v", err)
+	}
+	// Team ID 形状不对：拼路径之前就拒
+	if code := run([]string{"--remove-key", "--team", "../etc", "--keys", keys}, nil, &stdout, &stderr); code != 2 {
+		t.Fatalf("a malformed team was accepted: exit %d", code)
+	}
+}

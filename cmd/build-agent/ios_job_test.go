@@ -13,11 +13,12 @@ import (
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/fakebuild"
 )
 
-// iOS 安装包任务从领取到交付。
+// iOS 安装包任务从领取到交付（自助上传：.ipa 交回服务端，租户自己传 TestFlight）。
 //
 // 三条和 Android 不一样的地方，每一条都来自"iOS 的签名与构建分不开"（设计
-// ios-testflight-distribution-2026-09-17 §4.2）：不上传产物、没有出处声明、
-// 一步到 succeeded（/ios-release 而不是 /built）。
+// ios-testflight-distribution-2026-09-17 §4.2）：不走未签名包那条交付、没有出处声明、
+// 一步到 succeeded（/ios-release 而不是 /built）。交回的 .ipa 是交给租户的交付件
+// （设计 ios-tenant-delivery-tiers-2026-09-24 §3.5），这台机器没开上传也照样能做。
 func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
 	rig := newRig(t)
@@ -25,6 +26,7 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	rig.agent.iosScan = fakeIOSInventory
 	body := claimBody("bld_e2eIOS000001", "apk")
 	body["platform"] = "ios"
+	body["delivery"] = "ipa"
 	rig.server.queueClaim(body)
 
 	if !rig.agent.pollOnce(context.Background()) {
@@ -71,9 +73,12 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	if report.CommitSHA != rig.commit {
 		t.Fatalf("commit %s, want %s", report.CommitSHA, rig.commit)
 	}
-	// 这台机器没开上传开关：出了包，但没往 App Store Connect 推
+	// 自助上传：包交回了服务端，没往 App Store Connect 推
 	if report.UploadedToAppStoreConnect {
-		t.Fatal("this machine has BUILD_AGENT_IOS_UPLOAD off; it must not report an upload")
+		t.Fatal("a self-upload job must not report an App Store Connect upload")
+	}
+	if handed := rig.server.uploads["ipa"]; string(handed) != string(rig.tools.IPA) {
+		t.Fatalf("the .ipa handed back is not the one the runner built (%d bytes)", len(handed))
 	}
 	// 几台 Mac 装同一个 Xcode 是人工维护的约定，版本漂移只有记下来才看得见
 	if report.Toolchain != fakebuild.XcodeVersion+" (16C5032a)" {
@@ -82,6 +87,32 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	// 构建脚本拿到的是签名目录，不是 --upload：执行进程一把 App Store Connect Key 都没有
 	if dir := readRecorded(t, rig, "ios-signing-dir.txt"); dir == "" {
 		t.Fatal("the build script was not told where the provisioning profiles are")
+	}
+}
+
+// 全托管的任务要传 TestFlight：这台机器没开上传就不能装作做完了——服务端只把这种任务派给
+// 上传 Key 可用的机器，走到这里说明两边对不上，要失败并说清原因。
+func TestIOSTestFlightJobFailsOnAMachineThatDoesNotUpload(t *testing.T) {
+	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
+	rig := newRig(t)
+	rig.agent.cfg.Platforms = []string{"ios"}
+	rig.agent.iosScan = fakeIOSInventory
+	body := claimBody("bld_e2eIOS000003", "apk")
+	body["platform"] = "ios"
+	body["delivery"] = "testflight"
+	rig.server.queueClaim(body)
+	if !rig.agent.pollOnce(context.Background()) {
+		t.Fatal("the agent did not work on the claimed job")
+	}
+	fails := rig.server.callsTo("/fail")
+	if len(fails) != 1 || !strings.Contains(string(fails[0].Body), "BUILD_AGENT_IOS_UPLOAD") {
+		t.Fatalf("expected one failure naming the upload switch, got %+v", fails)
+	}
+	if calls := rig.server.callsTo("/ios-release"); len(calls) != 0 {
+		t.Fatal("a TestFlight job that was not uploaded must not be reported as released")
+	}
+	if calls := rig.server.callsTo("/ipa/upload"); len(calls) != 0 {
+		t.Fatal("a TestFlight job must not hand its .ipa back")
 	}
 }
 

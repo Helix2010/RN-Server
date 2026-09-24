@@ -740,6 +740,9 @@ B 机要从头再来时，按 [`SIGNING_MATERIAL.md`](SIGNING_MATERIAL.md) §5 �
 | archive 报 `No signing certificate "iOS Distribution" found … with a private key was found`，而桌面终端里 `sudo -u _rnbuilder -H security find-identity -v -p codesigning` 明明有 1 个有效身份 | 桌面终端读的是用户域，打包机（LaunchDaemon）只读**系统域**的搜索列表。看 `security list-keychains -d system` 有没有 `rn-signing.keychain-db`，没有就补：`sudo security list-keychains -d system -s /Library/Keychains/System.keychain /var/rn-build-signing/rn-signing.keychain-db`（新装的机器由装机脚本做，见 4.3） |
 | 指定钥匙串时身份有效、`verify-cert -p codeSign` 也过，但加 `-L`（只用本地证书）就 `CSSMERR_TP_NOT_TRUSTED` | 缺系统钥匙串里的 WWDR G3 中间证书，系统在按 AIA 联网现取。装机脚本会装；老机器手工：`sudo security add-certificates -k /Library/Keychains/System.keychain AppleWWDRCAG3.cer`（摘要 `dcf21878…91601f`） |
 | 上传 TestFlight：`part 1 of N: 上传分块失败 … object-storage.apple.com … TLS handshake timeout` | 分块直连 Apple 存储超时。代理规则里补 `object-storage.apple.com`，见第 2 节「出网要走代理时」 |
+| 排 iOS 构建时 `NO_UPLOADER_FOR_TEAM` | 这个租户是「全托管」，但没有任何一台打包机报告过它 Team 的上传 Key 可用。控制台「构建机」卡片里这个 Team 的上传状态：`missing` = 这台 Mac 没装 Key（下发上传 Key 材料），`forbidden` = Key 角色不够，空 = 这台机器没开 `BUILD_AGENT_IOS_UPLOAD`。租户不想交 Key 的话，把它的交付方式改成「自助上传」（设计 ios-tenant-delivery-tiers-2026-09-24） |
+| 排 iOS 构建时 `NO_IPA_BUILDER_FOR_TEAM` | 这个租户是「自助上传」，但手上有它签名材料的打包机程序都太旧，不会把 .ipa 交回平台（认领时不报 `ios-ipa-delivery`）。批准新版打包机、等它自升级 |
+| 服务端撤下了某个 Team 的上传 Key，打包机日志里一条 `withdrawn upload key removed` | 正常：打包机按清单把本机那份删掉了（只删从清单装上的；装机时手工放的不在记录里，不会动）。**这不等于 Key 作废**，Key 在 Apple 那边要另外吊销 |
 | 上面那条都设好了，合上盖子还是睡 | **Apple Silicon 上没有 `disablesleep` 这个开关**（`pmset -g custom` 的输出里根本不列它；`sudo pmset -a disablesleep 1` 会静默接受然后什么也不做，很容易误以为设上了）。合盖休眠在 M 系列上没有软件开关可关，只能靠硬件条件：**盖子别合**，或者接外接显示器 + 电源（clamshell 模式下才不睡）。把笔记本当常驻打包机时这一条要写进现场约定，光靠 `pmset` 保证不了 |
 
 ---

@@ -23,8 +23,10 @@ import (
 	"strings"
 	"syscall"
 
+	"errors"
 	"github.com/Helix2010/RN-Server/internal/ascapi"
 	"github.com/Helix2010/RN-Server/signing/iosmaterial"
+	"io/fs"
 )
 
 const materialKeyFileName = "material-key.x25519"
@@ -190,4 +192,29 @@ func wipeBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// removeKey 删掉一个 Team 的上传 Key 目录（<keys>/<TEAMID>/）。
+//
+// 只删这一格，而且不跟符号链接：Team ID 已经按形状校验过，拼出来的路径就在 keys 下面一层；
+// 那一格如果是个链接，删的是链接本身，不会顺着它删到别处去。本来就没有算成功——要的结果
+// 是"这台机器上没有这把 Key"，已经是了。
+func removeKey(stdout io.Writer, keysDir, team string) error {
+	dir := filepath.Join(keysDir, team)
+	info, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return json.NewEncoder(stdout).Encode(map[string]any{"removed": true, "existed": false})
+	case err != nil:
+		return fmt.Errorf("cannot inspect the upload key of %s: %w", team, err)
+	case info.Mode()&os.ModeSymlink != 0:
+		if err := os.Remove(dir); err != nil {
+			return fmt.Errorf("cannot remove %s: %w", dir, err)
+		}
+	default:
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("cannot remove %s: %w", dir, err)
+		}
+	}
+	return json.NewEncoder(stdout).Encode(map[string]any{"removed": true, "existed": true})
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
 
 	"github.com/Helix2010/RN-Server/internal/ipa"
+	"io/fs"
 )
 
 // 签名材料盘点（设计 ios-mac-builders-home-network-2026-09-18 §5.2、§4.4）。
@@ -62,7 +63,8 @@ type appleTeamMaterial struct {
 	BundleIDs []string
 	// ExpiresAt 是这个 Team 里最早到期的证书或描述文件。零值=不知道
 	ExpiresAt time.Time
-	// UploadProbe 是启动时那次只读探测的结果（ok / forbidden / error），空=没探
+	// UploadProbe 是上传 Key 的只读探测结果（ok / forbidden / error），missing=没装这个 Team 的
+	// 上传 Key，空=没探（这台机器没开上传）
 	UploadProbe string
 }
 
@@ -105,8 +107,10 @@ func (inv iosInventory) covers(teamID, bundleID string) bool {
 type iosScanner struct {
 	SigningDir string
 	UploadKeys string
-	// RequireUploadKey：只有开着上传的机器才要求上传 Key 在位。关着上传时包留在机器上
-	// 由人传，缺 Key 不该让这台机器报不出这个 Team
+	// RequireUploadKey：这台机器开着上传（BUILD_AGENT_IOS_UPLOAD）。开着时逐 Team 查上传 Key：
+	// 装了就探一次，没装报 missing。以前没装就干脆不报这个 Team，于是这台机器也领不到它的
+	// 任务——自助上传的租户根本不交上传 Key，它们的任务照样要能派过来（设计
+	// ios-tenant-delivery-tiers-2026-09-24 §3.3）。服务端按这个状态决定全托管的任务派不派
 	RequireUploadKey bool
 	Now              func() time.Time
 	// Identities 返回钥匙串里有可签名身份（证书 + 私钥）的 Team
@@ -238,11 +242,14 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 	// 上传 Key 只问一次，问的是上传账户自己（见 UploadKeyTeams）。取不到就当一把都没有，
 	// 但要把原因说出来——否则表现与"确实没装 Key"一模一样
 	withUploadKey := map[string]bool{}
+	keysListed := false
 	if s.RequireUploadKey {
 		var err error
 		if withUploadKey, err = s.uploadKeyTeams(ctx); err != nil {
 			inv.Problems = append(inv.Problems, "cannot read which teams have an upload key: "+err.Error())
 			withUploadKey = map[string]bool{}
+		} else {
+			keysListed = true
 		}
 	}
 
@@ -280,16 +287,18 @@ func (s iosScanner) scan(ctx context.Context) iosInventory {
 				"team "+team+" has a signing identity but no usable provisioning profile")
 			continue
 		}
-		if s.RequireUploadKey && !withUploadKey[team] {
-			inv.Problems = append(inv.Problems,
-				"team "+team+" has signing material but no upload key in "+filepath.Join(s.UploadKeys, team)+
-					"; uploads are on, so this team is not reported")
-			continue
-		}
 		material := appleTeamMaterial{TeamID: team, ExpiresAt: earliest(expiry[team], bundles.expiresAt)}
 		material.BundleIDs = append(material.BundleIDs, bundles.ids...)
 		sort.Strings(material.BundleIDs)
-		if s.Probe != nil {
+		switch {
+		case s.RequireUploadKey && !keysListed:
+			// 问不到上传账户：不能装作"没装 Key"（那和真的缺 Key 分不开），也不能装作有。
+			// 报"没探"，服务端就不派全托管的任务过来；原因在 Problems 里
+		case s.RequireUploadKey && !withUploadKey[team]:
+			// 自助上传的租户本来就没有上传 Key：照样报这个 Team，只是说清楚没有 Key。
+			// 全托管的租户缺 Key 时，服务端据此不派它的任务、排队时说出原因
+			material.UploadProbe = uploadProbeMissing
+		case s.Probe != nil:
 			material.UploadProbe = s.Probe(ctx, team, material.BundleIDs)
 		}
 		inv.Teams = append(inv.Teams, material)
@@ -413,6 +422,10 @@ func (s iosScanner) uploadKeyTeams(ctx context.Context) (map[string]bool, error)
 		return s.UploadKeyTeams(ctx)
 	}
 	entries, err := os.ReadDir(s.UploadKeys)
+	if errors.Is(err, fs.ErrNotExist) {
+		// 上传区还没建：一把 Key 都没有，不是"问不到"
+		return map[string]bool{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

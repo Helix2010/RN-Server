@@ -121,8 +121,9 @@ func TestIOSInventoryTakesTheEarliestExpiryOfCertificateAndProfile(t *testing.T)
 	}
 }
 
-// 开着上传的机器缺上传 Key 就不报这个 Team：报了会领到任务，一路打完包在最后一步传不上去。
-// 关着上传时不要求——那种机器本来就是"出包，由人去传"。
+// 开着上传的机器缺上传 Key 时照样报这个 Team，但标成 missing：自助上传的租户本来就不交 Key，
+// 它们的任务要能派过来；全托管的任务服务端按这个状态不派（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）。
+// 关着上传时不探，状态为空。
 func TestIOSInventoryRequiresAnUploadKeyOnlyWhenUploadsAreOn(t *testing.T) {
 	scanner := testScanner(t, map[string]bool{"AB12CD34EF": true})
 	writeProfile(t, filepath.Join(scanner.SigningDir, profilesDirName, "AB12CD34EF"), "w"+profileSuffix,
@@ -132,8 +133,8 @@ func TestIOSInventoryRequiresAnUploadKeyOnlyWhenUploadsAreOn(t *testing.T) {
 	}
 	scanner.RequireUploadKey = true
 	inventory := scanner.scan(context.Background())
-	if len(inventory.Teams) != 0 {
-		t.Fatalf("a team without an upload key was reported: %+v", inventory.Teams)
+	if len(inventory.Teams) != 1 || inventory.Teams[0].UploadProbe != uploadProbeMissing {
+		t.Fatalf("a team without an upload key must be reported as missing its key: %+v", inventory.Teams)
 	}
 	if err := os.MkdirAll(filepath.Join(scanner.UploadKeys, "AB12CD34EF"), 0o700); err != nil {
 		t.Fatal(err)
@@ -335,8 +336,8 @@ func TestIOSInventoryAsksTheUploadAccountWhichTeamsHaveAKey(t *testing.T) {
 		return nil, errors.New("permission denied")
 	}
 	inventory = scanner.scan(context.Background())
-	if len(inventory.Teams) != 0 {
-		t.Errorf("a team was reported although the upload key could not be checked: %+v", inventory.Teams)
+	if len(inventory.Teams) != 1 || inventory.Teams[0].UploadProbe != "" {
+		t.Errorf("a team whose upload key could not be checked must be reported as not probed: %+v", inventory.Teams)
 	}
 	if !strings.Contains(strings.Join(inventory.Problems, "\n"), "permission denied") {
 		t.Errorf("the reason the check failed did not reach the problems: %v", inventory.Problems)

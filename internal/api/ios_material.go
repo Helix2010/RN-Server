@@ -418,7 +418,9 @@ func (s *server) removeIOSMaterial(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
 		return
 	}
-	// 删掉之后机器下次盘点就不再看见它。**已经装到机器上的那一份不会消失**——那要人去那台
+	// 删掉之后机器下次盘点就不再看见它。上传 Key 会被打包机当作墓碑处理：下一轮同步发现清单里
+	// 这个 Team 没有上传 Key 了，就请上传账户删掉本机那一份（cmd/build-agent/ios_material.go，
+	// 只删从清单装上的）。证书与描述文件**已经装到机器上的那一份不会消失**——那要人去那台
 	// 机器上清（运维手册 §5 退役清单），或者吊销机器
 	c.JSON(http.StatusOK, gin.H{"removed": true})
 }

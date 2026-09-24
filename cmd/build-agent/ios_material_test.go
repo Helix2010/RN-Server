@@ -186,3 +186,47 @@ func TestAgentCarriesTheRunnerReasonOutOfAFailedInstall(t *testing.T) {
 		t.Errorf("the runner's own reason did not reach the error: %v", err)
 	}
 }
+
+// 墓碑：本机从清单装过的上传 Key，清单里这个 Team 没有了（租户切到自助上传、Key 被撤下），
+// 就请上传账户删掉本机那一份。服务端删材料只删它自己的密文，打包机上那份要靠这一步。
+// 同一个 Team 换了 scope（还在清单里）不删；装机时手工放、不在本机记录里的 Key 不碰。
+func TestAgentRemovesUploadKeysTheServerWithdrew(t *testing.T) {
+	a, server, dir := materialRig(t)
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + dir + "/ios-upload.calls\n" +
+		"case \"$*\" in *--remove-key*) printf '%s' '{\"removed\":true,\"existed\":true}';; *) cat >/dev/null; printf '%s' '{\"installed\":true}';; esac\n"
+	if err := os.WriteFile(filepath.Join(dir, "ios-upload"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeInstalledMaterial(a.cfg.StateDir, map[string]int64{
+		"certificate/J4JDFC8LCC/":     3,
+		"upload-key/J4JDFC8LCC/":      2, // 清单里没有了：删
+		"upload-key/ZZ99YY88XX/mch_x": 1, // 清单里这个 Team 换成了 Team Key：不删
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server.material = []map[string]any{
+		listEntry("certificate", "J4JDFC8LCC", "", iosmaterial.PurposeBuilder, 3),
+		listEntry("upload-key", "ZZ99YY88XX", "", iosmaterial.PurposeUploader, 1),
+	}
+	server.materialBoxes = map[string][]byte{"upload-key/ZZ99YY88XX/": []byte(`{"pretend":"team key"}`)}
+
+	a.syncIOSMaterial(context.Background())
+
+	calls, err := os.ReadFile(filepath.Join(dir, "ios-upload.calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(calls), "--remove-key --team J4JDFC8LCC") {
+		t.Fatalf("the withdrawn key was not removed: %s", calls)
+	}
+	if strings.Contains(string(calls), "--remove-key --team ZZ99YY88XX") {
+		t.Fatalf("a team still in the list lost its key: %s", calls)
+	}
+	installed := readInstalledMaterial(a.cfg.StateDir)
+	if _, still := installed["upload-key/J4JDFC8LCC/"]; still {
+		t.Fatalf("the removed key is still recorded as installed: %v", installed)
+	}
+	if installed["certificate/J4JDFC8LCC/"] != 3 {
+		t.Fatalf("signing material must not be touched: %v", installed)
+	}
+}
