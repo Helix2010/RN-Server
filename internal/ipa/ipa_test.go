@@ -134,3 +134,108 @@ func TestReadIdentityTakesTheAppNotItsExtensions(t *testing.T) {
 		t.Fatalf("identity: %+v %v", identity, err)
 	}
 }
+
+// 评审（2026-09-24）复现过的几种夹带方式：白名单只看最上层目录时，这些都能混进交给租户的包里。
+func TestInspectRefusesWhatXcodeWouldNotPutThere(t *testing.T) {
+	team, bundle := "J4JDFC8LCC", "com.anyfun.foundation"
+	good := profile(team, bundle, "", `<key>get-task-allow</key><false/>`)
+	cases := map[string]struct {
+		path string
+		want string
+	}{
+		"a file next to the app":      {writeIPA(t, storePackage(good, map[string]string{"Payload/payload.exe": "x"})), "does not export"},
+		"a directory next to the app": {writeIPA(t, storePackage(good, map[string]string{"Payload/extra/tool.sh": "x"})), "does not export"},
+		"a second app, other case":    {writeIPA(t, storePackage(good, map[string]string{"Payload/Other.APP/Info.plist": infoPlist("com.other", "1.0.0", "1")})), "more than one app"},
+		"data in front of the zip":    {prefixed(t, writeIPA(t, storePackage(good, nil))), "does not start with a zip entry"},
+		"a symbolic link":             {withSymlink(t, storePackage(good, nil), "Payload/AnyFun.app/link", "/etc/passwd"), "symbolic link"},
+		"a duplicated entry":          {withDuplicate(t, storePackage(good, nil), "Payload/AnyFun.app/AnyFun"), "twice"},
+		"team identifier mismatch":    {writeIPA(t, storePackage(strings.Replace(good, "<array><string>"+team, "<array><string>ZZ99YY88XX", 1), nil)), "TeamIdentifier"},
+	}
+	for name, tc := range cases {
+		_, err := Inspect(tc.path)
+		if err == nil {
+			t.Errorf("%s was accepted", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v (want it to mention %q)", name, err, tc.want)
+		}
+	}
+}
+
+// 描述文件是服务端解析的不可信输入：层层嵌套的 <array> 不能把解析它的请求栈撑爆
+func TestParseProfileRefusesDeepNesting(t *testing.T) {
+	deep := strings.Repeat("<array>", 100) + strings.Repeat("</array>", 100)
+	raw := `<?xml version="1.0"?><plist version="1.0"><dict><key>x</key>` + deep +
+		`<key>Entitlements</key><dict><key>application-identifier</key><string>J4JDFC8LCC.com.a</string></dict></dict></plist>`
+	if _, err := ParseProfile([]byte(raw)); err == nil || !strings.Contains(err.Error(), "nested deeper") {
+		t.Fatalf("deep nesting was accepted: %v", err)
+	}
+}
+
+func prefixed(t *testing.T, filePath string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "prefixed.ipa")
+	if err := os.WriteFile(out, append(bytes.Repeat([]byte{'#'}, 32<<10), raw...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func withSymlink(t *testing.T, entries map[string]string, name, target string) string {
+	t.Helper()
+	var out bytes.Buffer
+	archive := zip.NewWriter(&out)
+	for entryName, body := range entries {
+		entry, err := archive.Create(entryName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = entry.Write([]byte(body))
+	}
+	header := &zip.FileHeader{Name: name, Method: zip.Store}
+	header.SetMode(os.ModeSymlink | 0o777)
+	entry, err := archive.CreateHeader(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = entry.Write([]byte(target))
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(t.TempDir(), "symlink.ipa")
+	if err := os.WriteFile(filePath, out.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filePath
+}
+
+func withDuplicate(t *testing.T, entries map[string]string, name string) string {
+	t.Helper()
+	var out bytes.Buffer
+	archive := zip.NewWriter(&out)
+	for entryName, body := range entries {
+		entry, err := archive.Create(entryName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = entry.Write([]byte(body))
+	}
+	entry, err := archive.Create(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = entry.Write([]byte("second copy"))
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(t.TempDir(), "duplicate.ipa")
+	if err := os.WriteFile(filePath, out.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filePath
+}

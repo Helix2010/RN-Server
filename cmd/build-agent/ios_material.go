@@ -58,7 +58,7 @@ func (a *agent) syncIOSMaterial(ctx context.Context) {
 	if !a.materialDue() {
 		return
 	}
-	entries, err := a.api.iosMaterial(ctx)
+	entries, complete, err := a.api.iosMaterial(ctx)
 	if err != nil {
 		a.sayOnce("iosMaterialList", "cannot read the signing material list: "+err.Error())
 		return
@@ -83,8 +83,11 @@ func (a *agent) syncIOSMaterial(ctx context.Context) {
 	// ——请上传账户把本机那一份删掉。服务端删材料只删它自己的密文，不这样做的话，切到自助上传的
 	// 租户的 Key 会一直留在每台 Mac 上（设计 ios-tenant-delivery-tiers-2026-09-24 §3.9）。
 	// 只动本机从清单装上的那几格：装机时手工放的 Key 不在记录里，不碰
-	if removed := a.removeWithdrawnUploadKeys(ctx, entries, installed); removed {
-		changed = true
+	// 清单被截断（或者旧版服务端没说）时不做：那时"清单里没有"不等于"撤下了"
+	if complete {
+		if removed := a.removeWithdrawnUploadKeys(ctx, entries, installed); removed {
+			changed = true
+		}
 	}
 	if changed {
 		if err := writeInstalledMaterial(a.cfg.StateDir, installed); err != nil {
@@ -213,18 +216,21 @@ func writeInstalledMaterial(stateDir string, installed map[string]int64) error {
 // ---- 服务端那两条 ----
 
 // iosMaterial 取这台机器该装的材料清单。
-func (c *client) iosMaterial(ctx context.Context) ([]materialEntry, error) {
+// iosMaterial 取清单。complete=服务端明说清单没被截断；旧版服务端不带这个字段，按不完整处理
+// ——墓碑只在清单完整时做，宁可不删也不能误删。
+func (c *client) iosMaterial(ctx context.Context) ([]materialEntry, bool, error) {
 	_, payload, err := c.send(ctx, "GET", "/v1/build-agent/ios-material", 0, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var body struct {
-		Items []materialEntry `json:"items"`
+		Items    []materialEntry `json:"items"`
+		Complete bool            `json:"complete"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
-		return nil, fmt.Errorf("the signing material list is not JSON: %w", err)
+		return nil, false, fmt.Errorf("the signing material list is not JSON: %w", err)
 	}
-	return body.Items, nil
+	return body.Items, body.Complete, nil
 }
 
 // iosMaterialBox 取一份密文，原样返回。控制进程不解析它，也解不开。

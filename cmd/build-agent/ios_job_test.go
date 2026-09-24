@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/fakebuild"
 )
@@ -177,4 +179,46 @@ func readRecorded(t *testing.T, rig *testRig, name string) string {
 		t.Fatalf("the fake build recorded nothing at %s: %v", name, err)
 	}
 	return strings.TrimSpace(string(raw))
+}
+
+// iOS 的交付不算在构建时限里（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）：七八十分钟的
+// archive 加十几分钟的慢速上传，碰上一次重试就会超时、丢掉打好的包。构建做完之后时限停掉，
+// 交付按自己的时限来；交付失败时，原因也不能被报成"构建超时"。
+func TestIOSDeliveryIsNotCutShortByTheBuildTimeout(t *testing.T) {
+	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
+	for _, fail := range []bool{false, true} {
+		rig := newRig(t)
+		rig.agent.cfg.Platforms = []string{"ios"}
+		rig.agent.cfg.Timeout = 3 * time.Second
+		rig.agent.iosScan = fakeIOSInventory
+		rig.server.mu.Lock()
+		rig.server.delays = map[string]time.Duration{"/ipa/upload": 5 * time.Second}
+		rig.server.mu.Unlock()
+		if fail {
+			rig.server.failOnce("/ipa/upload", http.StatusConflict, "BUILD_KIND_MISMATCH")
+		}
+		body := claimBody("bld_e2eIOSclock1", "apk")
+		body["platform"] = "ios"
+		body["delivery"] = "ipa"
+		rig.server.queueClaim(body)
+		if !rig.agent.pollOnce(context.Background()) {
+			t.Fatal("the agent did not work on the claimed job")
+		}
+		fails := rig.server.callsTo("/fail")
+		if !fail {
+			if len(fails) != 0 {
+				t.Fatalf("a delivery that outlived the build timeout was cut short: %s", fails[0].Body)
+			}
+			if calls := rig.server.callsTo("/ios-release"); len(calls) != 1 {
+				t.Fatalf("the job was not completed after a slow hand-back: %d /ios-release calls", len(calls))
+			}
+			continue
+		}
+		if len(fails) != 1 {
+			t.Fatalf("expected one failure, got %d", len(fails))
+		}
+		if reason := string(fails[0].Body); strings.Contains(reason, "timed out") || !strings.Contains(reason, "handed back") {
+			t.Fatalf("a failed hand-back must say so, not blame the build timeout: %s", reason)
+		}
+	}
 }

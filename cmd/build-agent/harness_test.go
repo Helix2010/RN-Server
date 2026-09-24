@@ -83,6 +83,21 @@ type fakeServer struct {
 	// "kind/team/scope" 存密文原文
 	material      []map[string]any
 	materialBoxes map[string][]byte
+	// materialTruncated：清单被服务端的 LIMIT 截断了（响应里 complete=false）
+	materialTruncated bool
+	// delays 让以某个后缀结尾的请求先睡这么久再回（不占着锁，心跳照常进来）
+	delays map[string]time.Duration
+}
+
+func (f *fakeServer) delayFor(path string) time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for suffix, delay := range f.delays {
+		if strings.HasSuffix(path, suffix) {
+			return delay
+		}
+	}
+	return 0
 }
 
 func (f *fakeServer) setHeartbeatCode(code string) {
@@ -185,6 +200,9 @@ func (f *fakeServer) problem(w http.ResponseWriter, status int, code string) {
 
 func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
+	if delay := f.delayFor(r.URL.Path); delay > 0 {
+		time.Sleep(delay)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, recordedCall{Method: r.Method, Path: r.URL.Path, Attempt: r.Header.Get(headerBuildAttempt),
@@ -215,7 +233,7 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	case path == "/v1/build-agent/public-key":
 		f.publicKey(w, body)
 	case path == "/v1/build-agent/ios-material":
-		_ = json.NewEncoder(w).Encode(map[string]any{"items": f.material})
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": f.material, "complete": !f.materialTruncated})
 	case path == "/v1/build-agent/ios-material/box":
 		box, ok := f.materialBoxes[r.URL.Query().Get("kind")+"/"+
 			r.URL.Query().Get("teamId")+"/"+r.URL.Query().Get("scope")]

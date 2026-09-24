@@ -228,13 +228,13 @@ func (s *server) purgeExpiredIPADeliveries(ctx context.Context, now time.Time) [
 	rows.Close()
 	purged := []string{}
 	for _, item := range due {
-		item.state.PurgedAt = iso(now)
-		encoded, _ := json.Marshal(item.state)
+		// 只补一个 purgedAt，不整段写回：上面那次读在事务外，而每清一条都要同步删对象，两步之间
+		// 租户可能刚标了"已可安装"——整段覆盖会把那个标记冲掉，强更阈值校验就当这一版没标过
 		_, matched, err := s.transitionBuildJob(ctx, item.id, jobTransition{
 			Where:     `WHERE id=? AND status='` + jobSucceeded + `' AND unsigned_object_key=?`,
 			WhereArgs: []any{item.id, item.key},
-			Set:       `delivery_state=?,updated_at=?`,
-			SetArgs:   []any{encoded, now},
+			Set:       `delivery_state=JSON_SET(COALESCE(delivery_state,JSON_OBJECT()),'$.purgedAt',?),updated_at=?`,
+			SetArgs:   []any{iso(now), now},
 			Release:   releaseUnsigned,
 		})
 		if err != nil {

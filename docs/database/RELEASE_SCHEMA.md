@@ -98,6 +98,17 @@ ota：queued → claimed → running → succeeded
 | `sign_outcome` | JSON NULL | 最近一次没签成的原因：`{"kind":"deferred|violation|transient","code","detail","machineId","at"}`；签成之后保留作历史 |
 | `signed_object_key` | VARCHAR(512) NULL | 签名闸交回的已签名包：`…/build-jobs/<job>/s<signAttempt>/<随机段>/app-release.apk`，写入规则同 `unsigned_object_key`（校验签名编号与签名闸）。`complete` 只从这个键取包复核，事务里再核对键没变（变了 409 `SIGNED_ARTIFACT_REPLACED`），发布记录的 `object_key` 就是它。每次签名认领清空 |
 
+### 列（迁移 58 新增：iOS 交付方式）
+
+设计 `docs/design/ios-tenant-delivery-tiers-2026-09-24.md`。
+
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `delivery` | VARCHAR(16) NULL | iOS 安装包任务的交付方式，**排队时**从租户的 `release.ios.delivery`（`app_configs`）抄来，之后改配置只影响新排的任务：`testflight`=构建机上传 App Store Connect（全托管）；`ipa`=构建机把 .ipa 交回服务端、租户下载后自己上传（自助上传）。Android、热更新与迁移之前的任务为 NULL；iOS 的 NULL 按 `testflight` 处理 |
+| `delivery_state` | JSON NULL | 自助上传任务交出 .ipa 之后租户在控制台标记的进展：`{"uploadedAt","uploadedBy","installableAt","installableBy","rejection","rejectedAt","purgedAt"}`。平台看不到 Apple 那边，版本策略校验（iOS 最低支持版本不能高于标了 `installableAt` 的版本）与交付件清理都看它。清理只用 `JSON_SET` 补 `purgedAt`，不整段写回 |
+
+**iOS 复用 `unsigned_*` 这几列存自助上传的 .ipa**：iOS 不经过签名闸，这几列在 iOS 任务上本来空着；复用之后回收、取消、失败、重新认领与删除发布的对象清理自动覆盖。键形如 `…/build-jobs/<job>/a<attempt>/<随机段>/<bundleId>-<version>-build<n>.ipa`，只能经 `PUT /jobs/:id/ipa/upload` 写入（服务端先解包核对身份、内嵌描述文件与压缩包结构，对得上才存）；`/unsigned/upload` 对 iOS 任务回 409。交付件保留到出包 30 天或标记已上传 7 天，到期只删对象、置空键，任务行与发布记录保留。
+
 **为什么每次上传一个新键**：键只由编号决定时，同一次认领里一个在反向代理那里超时、被客户端重传顶替的请求，会在任务已经往前走（`/built`、`complete`）之后才写完——覆盖已被引用的对象，又因为状态变了、改不到行而把它删掉，发布记录指向一个不存在的包。每次一个新键之后，迟到或过期的上传只能删掉自己写的那个对象。
 
 ### 不变量
@@ -113,6 +124,7 @@ ota：queued → claimed → running → succeeded
 - 认领是**跨租户**的，取最早那条。解析不出租户、`git_ref` 不是固定分支的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。
 - 回收是服务端独立的定时器（每分钟），条件更新，多实例并发安全。
 - iOS 认领还有两条（迁移 55、设计 `docs/design/ios-mac-builders-home-network-2026-09-18.md` §5.2、§5.3）：**同租户同时只有一条 iOS 安装包任务在途**（两条并行跑完，低号那条的 `/ios-release` 会被拒，而它的 `.ipa` 已经进了 App Store Connect，撤不回来）；任务租户 `release.ios` 的 `appleTeamId` + `bundleId` 必须在这台机器**本次认领自报**的盘点里（`build_machine_liveness.apple_teams`）。两条都写成子查询并用 `FOR UPDATE OF j SKIP LOCKED` 限定锁的范围——不限定的话每次认领都会锁住各租户 `app_configs` 的 `release.ios` 那几行。Android 不加第一条：那会把两台构建机同时打同一个租户的两条任务也串起来。
+- 迁移 58 又加两条（设计 `docs/design/ios-tenant-delivery-tiers-2026-09-24.md` §3.2）：**同租户的 iOS 安装包任务按排队顺序领**（有更早的排队中任务时这一条不能先领——交付方式按任务分路由之后，领取条件不再相同，"按顺序"不再碰巧成立）；**交付方式对得上这台机器**：`testflight` 要本次自报里这个 Team 的 `uploadProbe` 是 `ok` 或 `error`，`ipa` 要本次认领自报了 `ios-ipa-delivery` 能力。
 
 ## build_machine_liveness（迁移 55）
 
@@ -129,7 +141,8 @@ ota：queued → claimed → running → succeeded
 | `agent_commit` | VARCHAR(64) NULL | 这台机器上跑的 `build-agent` 提交（`-ldflags` 注入）。与平台级 `approvedAgentCommit` 不一致时控制台标出。NULL=旧版代理没报 |
 | `os` | VARCHAR(16) NULL | `runtime.GOOS`：`darwin`=Mac 打包机，`linux`=机房构建机。装机脚本与自升级归档按它分 |
 | `platforms` | JSON NULL | 本次认领自报的平台，如 `["ios"]`。记的是**自报的**、不是被登记收窄之后的：收窄掉的恰恰是"它想干但干不了"，而那正是要在控制台上看见的 |
-| `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z","uploadProbe":"ok"}]`（`uploadProbe`：`ok`/`forbidden`/`error`，启动时对上传 Key 做的只读探测，让"角色不够传不上去"在**第一次构建之前**就看得见）。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
+| `capabilities` | JSON NULL | 本次认领自报的能力（迁移 58），如 `["ios-ipa-delivery"]`=能把 .ipa 交回服务端。排队与认领据此决定自助上传的任务能不能排、派给谁。NULL=旧版代理没报 |
+| `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z","uploadProbe":"ok"}]`（`uploadProbe`：`ok`/`forbidden`/`error` 是对上传 Key 的只读探测——每次盘点（随认领，约 10 秒一次）都探，让"角色不够传不上去"在**第一次构建之前**就看得见；`missing`=开着上传但没装这个 Team 的 Key（迁移 58 起照样报这个 Team，自助上传的租户本来就不交 Key）；空=这台机器没开上传或问不到上传账户）。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
 | `signing_expires_at` | DATETIME(3) NULL | 本机最早到期的证书或描述文件，30 天内控制台标黄 |
 | `free_gb` | INT UNSIGNED NULL | 构建盘剩余空间 GiB，认领时自报 |
 | `upgrade_error` | VARCHAR(300) NULL | 上一次自升级失败的原因（升级程序写 `state/upgrade-failed.json`，代理启动后读出来随认领报上来）。**为什么要报上来**：升级是 root 的那个程序做的，它失败时代理还在跑旧版，控制台上看到的只是"版本一直追不上审批值"，不说原因就只能上机器看日志 |

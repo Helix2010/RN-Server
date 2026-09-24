@@ -37,7 +37,7 @@ func ParseXML(data []byte) (map[string]any, error) {
 		if start.Name.Local != "plist" {
 			return nil, fmt.Errorf("plist root element is %q", start.Name.Local)
 		}
-		value, err := plistNext(decoder)
+		value, err := plistNext(decoder, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -49,8 +49,13 @@ func ParseXML(data []byte) (map[string]any, error) {
 	}
 }
 
+// xmlMaxDepth 限制嵌套层数，与二进制那边的 bplistMaxDepth 同一个数：描述文件和 Info.plist
+// 都是几层的字典，深到 32 层只可能是构造出来的。不设上限的话，一份几 MB 的层层嵌套的
+// <array> 就能把解析它的请求栈撑到几百 MB（2026-09-24 评审实测）。
+const xmlMaxDepth = 32
+
 // plistNext 读下一个值元素。到 </plist> 或其它结束标签时返回 io.EOF 之外的 nil 值。
-func plistNext(decoder *xml.Decoder) (any, error) {
+func plistNext(decoder *xml.Decoder, depth int) (any, error) {
 	for {
 		token, err := decoder.Token()
 		if err != nil {
@@ -60,12 +65,15 @@ func plistNext(decoder *xml.Decoder) (any, error) {
 		case xml.EndElement:
 			return nil, io.EOF
 		case xml.StartElement:
-			return plistValue(decoder, element)
+			return plistValue(decoder, element, depth)
 		}
 	}
 }
 
-func plistValue(decoder *xml.Decoder, start xml.StartElement) (any, error) {
+func plistValue(decoder *xml.Decoder, start xml.StartElement, depth int) (any, error) {
+	if depth >= xmlMaxDepth {
+		return nil, fmt.Errorf("plist is nested deeper than %d levels", xmlMaxDepth)
+	}
 	switch start.Name.Local {
 	case "dict":
 		out := map[string]any{}
@@ -85,7 +93,7 @@ func plistValue(decoder *xml.Decoder, start xml.StartElement) (any, error) {
 				if err := decoder.DecodeElement(&key, &element); err != nil {
 					return nil, err
 				}
-				value, err := plistNext(decoder)
+				value, err := plistNext(decoder, depth+1)
 				if err != nil {
 					return nil, fmt.Errorf("plist key %q has no value: %w", key, err)
 				}
@@ -103,7 +111,7 @@ func plistValue(decoder *xml.Decoder, start xml.StartElement) (any, error) {
 			case xml.EndElement:
 				return out, nil
 			case xml.StartElement:
-				value, err := plistValue(decoder, element)
+				value, err := plistValue(decoder, element, depth+1)
 				if err != nil {
 					return nil, err
 				}

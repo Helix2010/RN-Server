@@ -339,6 +339,10 @@ func TestDBIOSIPARetention(t *testing.T) {
 	if delivery["available"] != false || delivery["purgedAt"] == nil || delivery["sha256"] == nil {
 		t.Fatalf("a purged delivery keeps its record but is no longer available: %v", delivery)
 	}
+	// 清理只补 purgedAt，租户已经做的标记不被冲掉
+	if delivery, _ := buildDetail(f, uploaded)["ipaDelivery"].(map[string]any); delivery["uploadedAt"] == nil || delivery["purgedAt"] == nil {
+		t.Fatalf("the purge overwrote the tenant's marks: %v", delivery)
+	}
 	if recorder := downloadIPA(f, old, nil); problemCode(t, recorder) != "IOS_IPA_NOT_AVAILABLE" {
 		t.Fatalf("a purged package was served: %d %s", recorder.Code, recorder.Body.String())
 	}

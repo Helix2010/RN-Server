@@ -4007,6 +4007,9 @@
           },
           "426": {
             "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          },
+          "500": {
+            "description": "RELEASE_IDENTITY_CONFIG_INVALID, BUILD_JOB_SAVE_FAILED"
           }
         }
       }
@@ -5227,7 +5230,7 @@
         "description": "三样材料都是按 (kind, teamId, scope) 一份、所有 macOS 打包机共用：清单不按机器筛。机器拿它与本机已装版本比对，只去取新的。鉴权 x-machine-token（构建机通道）。",
         "responses": {
           "200": {
-            "description": "清单",
+            "description": "清单 The body also carries complete (boolean): false when the list was cut at its row limit. Build machines only treat an upload key missing from a complete list as withdrawn and delete their local copy.",
             "content": {
               "application/json": {
                 "schema": {

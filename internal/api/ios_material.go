@@ -437,7 +437,10 @@ func (s *server) listIOSMaterialForMachine(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items})
+	// complete：清单没被 LIMIT 截断。打包机只在清单完整时才把"清单里没有"当成"已撤下"去删本机
+	// 的上传 Key（墓碑，cmd/build-agent/ios_material.go）——截断时删，就会把排在后面的 Team 的 Key
+	// 从每台 Mac 上删掉
+	c.JSON(http.StatusOK, gin.H{"items": items, "complete": len(items) < iosMaterialMaxRows})
 }
 
 // getIOSMaterialBox GET /v1/build-agent/ios-material/box：取一份密文，原样下发。

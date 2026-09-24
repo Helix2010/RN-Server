@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -26,8 +27,9 @@ const (
 	// infoPlistLimit：Info.plist 是几 KB 的东西。给足余量，但不能让一个构造出来的
 	// 压缩包把内存吃光
 	infoPlistLimit = 1 << 20
-	// profileLimit：描述文件几十 KB，带上设备列表的开发描述文件也就几百 KB
-	profileLimit = 4 << 20
+	// profileLimit：App Store 描述文件没有设备列表，十几 KB；给到 256 KiB，带设备列表的开发
+	// 描述文件超了也无所谓——那种包本来就要拒
+	profileLimit = 256 << 10
 	// maxEntries：一个 React Native App 的 .ipa 是几千个条目，十万是构造出来的
 	maxEntries = 100000
 )
@@ -90,15 +92,20 @@ func isEmbeddedProfilePath(name string) bool {
 }
 
 // appPath 把 Payload/<x>.app/... 这种路径拆开；压缩包里的路径由不可信一侧写，先排掉能跳出去的形状。
+// `.app` 后缀不分大小写：大小写不同的第二个 App 目录也是一个 App（文件系统多半不分大小写）。
 func appPath(name string) ([]string, bool) {
 	if !safePath(name) {
 		return nil, false
 	}
 	parts := strings.Split(name, "/")
-	if len(parts) < 3 || parts[0] != "Payload" || !strings.HasSuffix(parts[1], ".app") || len(parts[1]) <= len(".app") {
+	if len(parts) < 3 || parts[0] != "Payload" || !isAppBundleName(parts[1]) {
 		return nil, false
 	}
 	return parts, true
+}
+
+func isAppBundleName(name string) bool {
+	return len(name) > len(".app") && strings.EqualFold(name[len(name)-len(".app"):], ".app")
 }
 
 func safePath(name string) bool {
@@ -228,15 +235,8 @@ func Inspect(filePath string) (Inspection, error) {
 	if len(reader.File) > maxEntries {
 		return Inspection{}, fmt.Errorf("the iOS package has %d entries", len(reader.File))
 	}
-	for _, file := range reader.File {
-		if !safePath(file.Name) {
-			return Inspection{}, fmt.Errorf("the iOS package has an entry with an unsafe path: %q", file.Name)
-		}
-		top, _, _ := strings.Cut(file.Name, "/")
-		atRoot := !strings.Contains(file.Name, "/") && !file.FileInfo().IsDir()
-		if !storeTopLevel[top] || atRoot {
-			return Inspection{}, fmt.Errorf("the iOS package has an entry Xcode does not export: %q", file.Name)
-		}
+	if err := checkStructure(filePath, reader.File); err != nil {
+		return Inspection{}, err
 	}
 	identity, err := identityOf(&reader.Reader)
 	if err != nil {
@@ -261,6 +261,69 @@ func Inspect(filePath string) (Inspection, error) {
 		return Inspection{}, errors.New("the embedded provisioning profile lists devices: this is a development or Ad Hoc build, not an App Store build")
 	case profile.ProvisionsAllDevices:
 		return Inspection{}, errors.New("the embedded provisioning profile provisions all devices: this is an enterprise build, not an App Store build")
+	case !containsFold(profile.TeamIdentifiers, profile.TeamID):
+		return Inspection{}, errors.New("the embedded provisioning profile's TeamIdentifier does not match its application-identifier")
 	}
 	return Inspection{Identity: identity, Profile: profile}, nil
+}
+
+func containsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// zipLocalHeader 是 zip 本地文件头的签名。Xcode 导出的 .ipa 从第一个字节起就是它；前面拼了
+// 别的数据的"zip"（自解压壳、多语言文件）Go 的 zip 读取器照样能读，但那不是 Xcode 的产物
+var zipLocalHeader = []byte("PK\x03\x04")
+
+// checkStructure 查压缩包结构：只能有 Xcode 按 App Store 方式导出的那些顶层目录；Payload 下
+// 只能有唯一那一个 .app（里面随意）；不能有符号链接、重名条目。iOS 的 .app 是扁平的，
+// 里面的 framework 不带版本目录，也就没有符号链接——出现了就是有人在往包里夹东西。
+func checkStructure(filePath string, files []*zip.File) error {
+	head := make([]byte, len(zipLocalHeader))
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("cannot read the iOS package: %w", err)
+	}
+	_, readErr := io.ReadFull(file, head)
+	_ = file.Close()
+	if readErr != nil || !bytes.Equal(head, zipLocalHeader) {
+		return errors.New("the iOS package does not start with a zip entry; Xcode exports a plain zip")
+	}
+	app := ""
+	seen := map[string]bool{}
+	for _, entry := range files {
+		name := entry.Name
+		if !safePath(name) {
+			return fmt.Errorf("the iOS package has an entry with an unsafe path: %q", name)
+		}
+		key := strings.ToLower(strings.TrimSuffix(name, "/"))
+		if seen[key] {
+			return fmt.Errorf("the iOS package has the entry %q twice", name)
+		}
+		seen[key] = true
+		if entry.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("the iOS package has a symbolic link: %q", name)
+		}
+		parts := strings.Split(strings.TrimSuffix(name, "/"), "/")
+		if !storeTopLevel[parts[0]] || len(parts) == 1 && !entry.FileInfo().IsDir() {
+			return fmt.Errorf("the iOS package has an entry Xcode does not export: %q", name)
+		}
+		if parts[0] != "Payload" || len(parts) == 1 {
+			continue
+		}
+		// Payload 下面第二级只能是那一个 .app
+		if !isAppBundleName(parts[1]) {
+			return fmt.Errorf("the iOS package has an entry Xcode does not export: %q", name)
+		}
+		if app != "" && !strings.EqualFold(app, parts[1]) {
+			return errors.New("the iOS package carries more than one app bundle")
+		}
+		app = parts[1]
+	}
+	return nil
 }

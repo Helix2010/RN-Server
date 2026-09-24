@@ -230,3 +230,20 @@ func TestAgentRemovesUploadKeysTheServerWithdrew(t *testing.T) {
 		t.Fatalf("signing material must not be touched: %v", installed)
 	}
 }
+
+// 清单被截断（服务端 LIMIT）时"清单里没有"不等于"撤下了"：一把 Key 都不删。
+func TestAgentKeepsUploadKeysWhenTheListIsTruncated(t *testing.T) {
+	a, server, dir := materialRig(t)
+	if err := writeInstalledMaterial(a.cfg.StateDir, map[string]int64{"upload-key/J4JDFC8LCC/": 2}); err != nil {
+		t.Fatal(err)
+	}
+	server.material = []map[string]any{}
+	server.materialTruncated = true
+	a.syncIOSMaterial(context.Background())
+	if _, err := os.Stat(filepath.Join(dir, "ios-upload.stdin")); err == nil {
+		t.Fatal("the uploader was called although nothing needed installing")
+	}
+	if readInstalledMaterial(a.cfg.StateDir)["upload-key/J4JDFC8LCC/"] != 2 {
+		t.Fatal("a key was treated as withdrawn from a truncated list")
+	}
+}
