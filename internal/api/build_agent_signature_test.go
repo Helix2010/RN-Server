@@ -221,6 +221,14 @@ func TestDBUploadedSignatureSequenceMustGoUp(t *testing.T) {
 	clearStoredSignatures(t, f)
 	commit := strings.Repeat("d", 40)
 	private, raw := stageUnsignedBundles(t, f, commit)
+	// 控制台拿 highestSequence 预填下一次签名的 --sequence：一份都没签过时是 null
+	highestSequence := func() any {
+		t.Helper()
+		return decodeBody(t, f.adminDo(http.MethodGet, "/v1/admin/platform/build-agent-version", nil))["highestSequence"]
+	}
+	if got := highestSequence(); got != nil {
+		t.Fatalf("nothing is signed yet, highestSequence must be null: %v", got)
+	}
 
 	first, err := bundlesig.Sign(private, raw, commit, 5, time.Now())
 	if err != nil {
@@ -245,6 +253,10 @@ func TestDBUploadedSignatureSequenceMustGoUp(t *testing.T) {
 	}
 	if code, body := uploadSignature(t, f, higher); code != http.StatusOK {
 		t.Fatalf("re-signing with a higher sequence was refused: %d %v", code, body)
+	}
+	// 被拒的那两次（4、重交的 5）不算：最高的是接受过的 6
+	if got := highestSequence(); got != float64(6) {
+		t.Fatalf("highestSequence must be the highest accepted one: %v", got)
 	}
 
 	// 换个提交也不能重用序号：机器只比数字，不管那份清单指向哪一个提交

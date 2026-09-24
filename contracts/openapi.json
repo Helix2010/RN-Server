@@ -4589,7 +4589,7 @@
         "description": "Platform admin. Returns what is deployed on this server right now (per bundle: commit, the offline signature sequence, when it was signed and which release key signed it, plus the archive digest) together with the approved commit. Each bundle carries its own error string instead of failing the whole call, so an unsigned or missing darwin bundle stays visible. Reading this before approving is the point: approving a wrong sha stops every machine from claiming, and the symptom is a queue that quietly stops moving.",
         "responses": {
           "200": {
-            "description": "version, approvedAgentCommit and the deployed bundles"
+            "description": "version, approvedAgentCommit, highestSequence (the highest manifest signature sequence accepted so far, null before the first; the console pre-fills the next --sequence from it) and the deployed bundles"
           },
           "401": {
             "description": "Admin authentication required"
@@ -4598,7 +4598,7 @@
             "description": "Platform admin only"
           },
           "500": {
-            "description": "MACHINE_REGISTRY_INVALID"
+            "description": "MACHINE_REGISTRY_INVALID, BUNDLE_SIGNATURE_UNREADABLE"
           }
         }
       },

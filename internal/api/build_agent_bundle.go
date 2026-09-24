@@ -225,9 +225,21 @@ func (s *server) buildAgentVersion(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "MACHINE_REGISTRY_INVALID", "Stored build.machines configuration cannot be read")
 		return
 	}
+	highest, err := highestBundleSequence(c.Request.Context(), s.db)
+	if err != nil {
+		slog.Error("cannot read the stored bundle signatures", "error", err)
+		problem(c, http.StatusInternalServerError, "BUNDLE_SIGNATURE_UNREADABLE", "cannot read the stored signatures")
+		return
+	}
+	var highestSequence any
+	if highest.Valid {
+		highestSequence = highest.Int64
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"version":             snapshot.Version,
 		"approvedAgentCommit": nullableString(string(snapshot.Doc.ApprovedAgentCommit)),
+		// 已经接受过的最高序号：控制台据此把下一次签名的 --sequence 预先填好（没签过是 null）
+		"highestSequence": highestSequence,
 		"bundles": []gin.H{
 			s.deployedBundleView(c.Request.Context(), "linux/amd64", machineRoleBuilder),
 			s.deployedBundleView(c.Request.Context(), "darwin/arm64", machineBundleBuilderDarwin),

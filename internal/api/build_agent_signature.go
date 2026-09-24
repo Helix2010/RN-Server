@@ -43,6 +43,16 @@ func storedBundleSignature(ctx context.Context, db *sql.DB, commit string) (bund
 	return bundlesig.Parse(raw)
 }
 
+// highestBundleSequence 是已经接受过的最高序号（一份都没有时 Valid=false）。
+//
+// 两处用：接收新签名时拒绝不高于它的（机器只认比自己见过的最高值更高的清单，与提交无关）；
+// 控制台把"下一个序号"预先填进签名命令——离线签名时手记上一次用到几，记错一次就是一次白签。
+func highestBundleSequence(ctx context.Context, db *sql.DB) (sql.NullInt64, error) {
+	var highest sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT MAX(sequence_no) FROM machine_bundle_signatures`).Scan(&highest)
+	return highest, err
+}
+
 // bundleSignatureFor 取覆盖**这一份清单**的签名：库里那份优先，不匹配就回退看安装包目录里
 // 的 manifest.sig。
 //
@@ -145,9 +155,8 @@ func (s *server) uploadBundleSignature(c *gin.Context) {
 	// 机器只认"比我见过的最高值更高"，不管那份清单指向哪一个提交。按提交比的话，给一个新
 	// 提交签一个已经用过的序号会被这里放行，然后在装过机的机器上被当成降级拒掉——而那条
 	// 报错说的是序号太低，不会提示"你重置了序号"。
-	var highest sql.NullInt64
-	if err := s.db.QueryRowContext(c.Request.Context(),
-		`SELECT MAX(sequence_no) FROM machine_bundle_signatures`).Scan(&highest); err != nil {
+	highest, err := highestBundleSequence(c.Request.Context(), s.db)
+	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUNDLE_SIGNATURE_UNREADABLE", "cannot read the stored signatures")
 		return
 	}
