@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// 状态表本身：每条边只引用已知状态；终态没有出边；可取消的是 queued/claimed/built，
+// 状态表本身：每条边只引用已知状态；终态没有出边；可取消的是 queued/claimed/running/built，
 // 能强制判失败的只有 signing；在途集合与迁移 54 的生成列一致。
 func TestBuildJobTransitionTable(t *testing.T) {
 	for _, transition := range buildJobTransitions {
@@ -24,10 +24,10 @@ func TestBuildJobTransitionTable(t *testing.T) {
 			}
 		}
 	}
-	if got := buildJobEventFrom(eventAdminCancel, jobKindAPK); strings.Join(got, ",") != "queued,claimed,built" {
+	if got := buildJobEventFrom(eventAdminCancel, jobKindAPK); strings.Join(got, ",") != "queued,claimed,running,built" {
 		t.Fatalf("cancelable apk statuses: %v", got)
 	}
-	if got := buildJobEventFrom(eventAdminCancel, jobKindOTA); strings.Join(got, ",") != "queued,claimed" {
+	if got := buildJobEventFrom(eventAdminCancel, jobKindOTA); strings.Join(got, ",") != "queued,claimed,running" {
 		t.Fatalf("cancelable ota statuses: %v", got)
 	}
 	if got := buildJobEventFrom(eventAdminForceFail, ""); strings.Join(got, ",") != "signing" {
@@ -188,5 +188,35 @@ func TestDBStatusDrivenQueriesKnowTheSigningStates(t *testing.T) {
 	f.s.markBuildJobFailed(context.Background(), f.jobStatus(jobID), "should not apply")
 	if f.jobStatus(jobID).Status != jobSigning {
 		t.Fatal("markBuildJobFailed touched a signing job")
+	}
+}
+
+// 运行中的任务可以取消，而且取消之后构建机真的会停：它下一次心跳拿到 409 BUILD_ATTEMPT_STALE
+// （打包机据此给执行进程发 SIGTERM，见 cmd/build-agent/agent.go runJob），交付也一样是 409。
+func TestDBCancelingARunningBuildStopsTheBuilderAtItsNextHeartbeat(t *testing.T) {
+	f := newGateFixture(t, 73)
+	jobID := f.queueBuild("7.3.0", 730)
+	f.setJob(jobID, `status='running',attempt=1,claimed_machine_id=?`, f.builder.ID)
+
+	c, recorder := testContext(t, f.tenant, http.MethodPost, "/v1/admin/builds/"+jobID+"/cancel", map[string]any{"reason": "pnpm install hung", "confirm": true})
+	c.Params = append(c.Params, ginParam("id", jobID))
+	f.s.cancelBuildJob(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("canceling a running build: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if status := f.jobStatus(jobID).Status; status != jobCanceled {
+		t.Fatalf("status after cancel = %s", status)
+	}
+	builder := attemptHeaders(buildAttemptHeader, 1)
+	heartbeat := f.do(http.MethodPost, "/v1/build-agent/jobs/"+jobID+"/heartbeat", f.builder.Token, builder, map[string]any{"logTail": []string{}})
+	if heartbeat.Code != http.StatusConflict || !strings.Contains(heartbeat.Body.String(), "BUILD_ATTEMPT_STALE") {
+		t.Fatalf("the builder's next heartbeat must tell it to stop: %d %s", heartbeat.Code, heartbeat.Body.String())
+	}
+	fail := f.do(http.MethodPost, "/v1/build-agent/jobs/"+jobID+"/fail", f.builder.Token, builder, map[string]any{"failureReason": "x", "commitSha": "", "logTail": []string{}})
+	if fail.Code != http.StatusConflict {
+		t.Fatalf("a canceled build must not be reported over: %d %s", fail.Code, fail.Body.String())
+	}
+	if status := f.jobStatus(jobID).Status; status != jobCanceled {
+		t.Fatalf("status changed after cancel: %s", status)
 	}
 }

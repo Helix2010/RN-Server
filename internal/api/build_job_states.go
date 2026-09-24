@@ -85,7 +85,8 @@ var buildJobTransitions = []buildJobTransition{
 	{eventReapBuild, []string{jobKindAPK}, []string{jobClaimed, jobRunning}, []string{jobQueued, jobFailed}},
 	{eventReapBuild, []string{jobKindOTA}, []string{jobClaimed, jobRunning}, []string{jobFailed}},
 	// running 不能取消：取消停不下构建机上的进程，状态会骗人。built 可以：包还没签
-	{eventAdminCancel, []string{jobKindAPK, jobKindOTA}, []string{jobQueued, jobClaimed}, []string{jobCanceled}},
+	// running 也能取消：构建机下一次心跳拿到 409 BUILD_ATTEMPT_STALE，当场停下（agent.go runJob）
+	{eventAdminCancel, []string{jobKindAPK, jobKindOTA}, []string{jobQueued, jobClaimed, jobRunning}, []string{jobCanceled}},
 	{eventAdminCancel, []string{jobKindAPK}, []string{jobBuilt}, []string{jobCanceled}},
 	// signing 不能取消（签名闸可能正在签），只能带原因强制判失败；签名闸之后的迟到上报按编号拒绝
 	{eventAdminForceFail, []string{jobKindAPK}, []string{jobSigning}, []string{jobFailed}},

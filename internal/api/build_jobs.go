@@ -769,9 +769,14 @@ func (s *server) cancelBuildJob(c *gin.Context) {
 	reason := clipRunes(strings.TrimSpace(body.Reason), 500)
 	ctx := c.Request.Context()
 	now := time.Now().UTC()
-	// 只取消还没开工的、或者已经构建完还没开始签的。running 的任务取消了也停不下
-	// 构建机上那个进程，状态会骗人；signing 的签名闸可能正在签，要放弃走 force-fail。
-	// 被取消的 claimed 任务，构建机下一次心跳就拿到 409 BUILD_ATTEMPT_STALE 并中止。
+	// 取消还没开工的、正在构建的、或者已经构建完还没开始签的。signing 的签名闸可能正在签，
+	// 要放弃走 force-fail。
+	//
+	// running 原先不让取消，理由是"停不下构建机上那个进程，状态会骗人"。其实停得下：被取消的
+	// claimed / running 任务，构建机下一次心跳就拿到 409 BUILD_ATTEMPT_STALE，经 sudo 给执行
+	// 进程发 SIGTERM，执行进程连同它的进程组一起结束（agent.go runJob、runnerexec.go）；之后
+	// 它对这条任务的任何上报也都是 409。不让取消的代价倒是真的：2026-09-23 一条 iOS 任务的
+	// pnpm install 挂死 50 分钟，心跳照常、控制台停不掉，只能有人上 Mac 去 pkill。
 	// 已经交付的未签名包与 SBOM 随取消一起删。
 	_, matched, err := s.transitionBuildJob(ctx, c.Param("id"), jobTransition{
 		Where:     `WHERE id=? AND tenant_id=? AND ((kind='apk' AND status IN (` + sqlCancelableAPK + `)) OR (kind='ota' AND status IN (` + sqlCancelableOTA + `)))`,
@@ -788,7 +793,7 @@ func (s *server) cancelBuildJob(c *gin.Context) {
 		return
 	}
 	if !matched {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_CANCELABLE", "Only queued, claimed or built builds can be canceled")
+		problem(c, http.StatusConflict, "BUILD_JOB_NOT_CANCELABLE", "Only queued, claimed, running or built builds can be canceled")
 		return
 	}
 	job, err := s.loadBuildJob(c, tenantID(c), c.Param("id"))

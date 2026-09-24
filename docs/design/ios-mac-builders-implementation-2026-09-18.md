@@ -257,8 +257,10 @@ build 20–25 一路查下来，Xcode 找不到签名证书有两个与代码无
 - **iOS 任务照样取三张 Android 图标。** 服务端列图标不分平台（`buildIconsForJob`），多下 3 张、每张近 1MB。
   但图标进原生指纹：只改安装包任务不改热更新任务，iOS 的 OTA 就永远对不上基线。先查清 iOS 的指纹算不算
   Android 图标，再两边一起改。
-- **运行中的任务取消不了、45 分钟超时没生效。** `cancelBuildJob` 只认 queued/claimed/built（且条件里只列了
-  `apk`/`ota` 两种 kind）；build 24 的 `pnpm install` 挂住 50 分钟，心跳照常，只能上 Mac `pkill`。
+- ~~**运行中的任务取消不了、45 分钟超时没生效。**~~ **已修（2026-09-24）**，而且后半句当时判断错了：
+  任务总时限一直在生效（`agent.go` 的 `context.WithTimeoutCause`），只是 mac-01 的 `BUILD_AGENT_TIMEOUT_MINUTES`
+  设得很大——必须容得下七八十分钟的 archive——所以兜不住"前五分钟就挂死"的 `pnpm install`（build 24）。
+  修法见「已补的缺口」表最后两行：服务端允许取消 running；执行进程给 `pnpm install` 加空闲看门狗。
 - **Mac 到机房的带宽（20–30KB/s）会决定"平台代传 TestFlight"怎么做。** 把 `.ipa` 交回平台再传 Apple 的话，
   回传这一段不能走现在的入口；平台已有华为云 OBS（新加坡）与预签名分块直传，候选是 Mac 直传 OBS。先实测 Mac 到 OBS 的上行。
 
@@ -332,6 +334,8 @@ sudo launchctl kickstart -k system/win.anyfun.rn-build-agent
 | **ASC 客户端的 20 秒总时限会掐死分块上传**（2026-09-23 读代码发现、已修） | `ascapi.Client` 默认 `http.Client{Timeout: 20s}`，而这个时限**连响应体一起算**——`UploadPart` 自己给了 15 分钟，一块几十 MB 在家用上行上根本传不完，写请求的 60 秒也被压成 20 秒。前几次都没走到上传，所以没暴露 | 默认客户端不设总时限；`get` 自己套 20 秒 context，`write` 60 秒、`UploadPart` 15 分钟不变。`ios-upload` 显式构造不带总时限、带代理的客户端 |
 | **找 App 记录一次失败就判死**（2026-09-23 真机撞上、已修） | 上面那次超时发生在上传的**第一个**请求，前面已经编译了一个小时，而只有分块上传有重试 | `findAppWithRetry`：连不上重试 3 次，钥匙被拒不重试 |
 | **取图标的 30 秒总时限在慢线路上必然超时**（2026-09-23 真机撞上、已修） | build 30–32 连续三轮倒在 `reading icon icon.png failed: context deadline exceeded`。实测 Mac 连机房只有 20–30KB/s（直连、经代理节点都一样；经 Cloudflare 的域名还会 522），一张 2048×2048 的图标将近 1MB，要 35–50 秒。开发机测不出来：`api.predict.kim` 解析到的就是开发机所在机房的出口 IP | 每次尝试给 3 分钟（走传大文件的那个客户端，由 context 限时），重试从 3 次加到 4 次 |
+| **运行中的任务控制台取消不了**（2026-09-23 真机撞上、2026-09-24 已修） | build 24 的 `pnpm install` 挂死 50 分钟，心跳照常，控制台回 409「Only queued, claimed or built builds can be canceled」，只能上 Mac `pkill`。不让取消的理由是"停不下构建机上那个进程、状态会骗人"——其实停得下：被取消的任务，构建机下一次心跳拿到 409 `BUILD_ATTEMPT_STALE`，经 sudo 给执行进程发 SIGTERM，执行进程连同进程组一起结束 | 状态表 `admin.cancel` 加上 `running`（apk 与 ota）；`TestDBCancelingARunningBuildStopsTheBuilderAtItsNextHeartbeat` 钉住"取消之后下一次心跳就是 409、上报也是 409"。控制台 `builds-page.tsx` 的可取消集合同步加上 running（RN-Admin）。顺带：上传程序被取消时原来收的是 exec 默认的 SIGKILL，只杀得到 sudo，上传程序成了孤儿会把包传完——改成与执行进程一样经 sudo 发 SIGTERM |
+| **`pnpm install` 挂死只能等总时限**（2026-09-23 真机撞上、2026-09-24 已修） | 总时限要容得下一次完整 archive，挂死的 `pnpm install` 因此要等一两个小时才被杀 | 执行进程的 `j.install`：连续 10 分钟没有任何输出就停下、再来一次（复用本任务 pnpm store 里已下好的包）；连着两次挂死才判失败；挂死以外的失败与任务被取消都不重试。只看 `pnpm install`，不看 `pnpm ios:release`（xcodebuild 的输出写进文件，archive 一个多小时不打一行是正常的）。输出经自建管道转写计时，交给 exec 的仍是 `*os.File`，不重蹈"后台进程握着输出管道、Wait 卡到 WaitDelay"的覆辙 |
 
 ## 与设计的偏离
 

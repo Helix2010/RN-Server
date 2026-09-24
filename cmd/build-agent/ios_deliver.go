@@ -13,6 +13,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -286,5 +287,10 @@ func (a *agent) uploaderCommand(ctx context.Context, args ...string) *exec.Cmd {
 	sudo := append([]string{"-n", "-u", a.cfg.IOSUploadUser, a.cfg.IOSUploader}, args...)
 	cmd := exec.CommandContext(ctx, "/usr/bin/sudo", sudo...)
 	cmd.Env = env
+	// 任务被取消或超时时请它停下，而不是用 exec 默认的 SIGKILL：SIGKILL 只杀得到 sudo，
+	// 上传程序成了孤儿，会把包照样传完——一个已经取消的任务在 TestFlight 上多出一个 build。
+	// SIGTERM 由 sudo 转发给上传程序（Go 程序收到它默认就退出），与执行进程同一个做法（runnerexec.go）
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = runnerStopGrace
 	return cmd
 }

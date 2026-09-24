@@ -84,7 +84,7 @@ func cleanup(out io.Writer, who identity, layout jobspec.Layout) error {
 
 func (j job) buildAPK(ctx context.Context) error {
 	app := j.layout.App()
-	if err := j.run(ctx, "pnpm", "install", "--frozen-lockfile"); err != nil {
+	if err := j.install(ctx); err != nil {
 		return err
 	}
 	// 原生指纹：签名闸会从包里再读一次核对，发布记录用签名闸读出的值。出处声明要求它
@@ -155,7 +155,7 @@ func (j job) buildIPA(ctx context.Context) error {
 	if toolchain != "" {
 		logf(j.out, "toolchain %s", toolchain)
 	}
-	if err := j.run(ctx, "pnpm", "install", "--frozen-lockfile"); err != nil {
+	if err := j.install(ctx); err != nil {
 		return err
 	}
 	// **不传 --upload**：执行进程不上传，也没有任何一把 App Store Connect Key（§4.3）。
@@ -179,7 +179,7 @@ func (j job) buildIPA(ctx context.Context) error {
 
 func (j job) buildOTA(ctx context.Context) error {
 	app := j.layout.App()
-	if err := j.run(ctx, "pnpm", "install", "--frozen-lockfile"); err != nil {
+	if err := j.install(ctx); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(app, "artifacts"), 0o750); err != nil {
