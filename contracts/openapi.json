@@ -3103,8 +3103,8 @@
     },
     "/v1/admin/builds/{id}/cancel": {
       "post": {
-        "summary": "Cancel a queued, claimed or built build",
-        "description": "Only queued or claimed jobs, and apk jobs that are built (delivered, waiting for the signer), can be canceled. Canceling a running build would make the status lie: the process on the builder does not stop. A signing job cannot be canceled because the signer may be signing it - use force-fail. A canceled claimed job makes the builder's next report fail with 409 BUILD_ATTEMPT_STALE. Audited as build_job_cancel. Delivered objects (unsigned package, SBOM) are deleted from storage after the cancel is committed; a failed delete is only logged.",
+        "summary": "Cancel a queued, claimed, running or built build",
+        "description": "Queued, claimed and running jobs, and apk jobs that are built (delivered, waiting for the signer), can be canceled. A canceled claimed or running job makes the builder's next heartbeat or report fail with 409 BUILD_ATTEMPT_STALE; the builder then stops the build (SIGTERM to the runner through sudo) and reports nothing more. A signing job cannot be canceled because the signer may be signing it - use force-fail. Audited as build_job_cancel. Delivered objects (unsigned package, SBOM) are deleted from storage after the cancel is committed; a failed delete is only logged.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3126,7 +3126,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_JOB_NOT_CANCELABLE: only queued, claimed or built builds can be canceled"
+            "description": "BUILD_JOB_NOT_CANCELABLE: only queued, claimed, running or built builds can be canceled"
           }
         }
       }

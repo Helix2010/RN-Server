@@ -836,7 +836,7 @@ func (s *server) forceFailBuildJob(c *gin.Context) {
 		return
 	}
 	if !matched {
-		problem(c, http.StatusConflict, "BUILD_JOB_NOT_FORCE_FAILABLE", "Only builds that are being signed can be force-failed; cancel queued, claimed or built builds instead")
+		problem(c, http.StatusConflict, "BUILD_JOB_NOT_FORCE_FAILABLE", "Only builds that are being signed can be force-failed; cancel queued, claimed, running or built builds instead")
 		return
 	}
 	job, err := s.loadBuildJob(c, tenantID(c), c.Param("id"))
