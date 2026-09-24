@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -82,6 +83,41 @@ func materialTenants(t *testing.T, f *gateFixture) map[string]any {
 		t.Fatalf("material by tenant: %d %s", recorder.Code, recorder.Body.String())
 	}
 	return decodeBody(t, recorder)
+}
+
+// 走真实路由：平台级路由不经过按 Host 解析租户的中间件，"当前租户"要处理函数自己按 Host 认出来。
+// 只调处理函数的用例测不出这一点（上线后才发现每一行都不是当前租户）。
+func TestDBIOSMaterialByTenantKnowsTheCurrentTenantByHost(t *testing.T) {
+	f, _ := newIOSPool(t, 157, 1)
+	team := "H" + strings.ToUpper(uniqueSuffix() + "000000000")[:9]
+	seedGateIOSIdentity(t, f, team, "com.host.app")
+	var slug string
+	if err := f.db.QueryRow(`SELECT slug FROM tenants WHERE id=?`, f.tenant).Scan(&slug); err != nil {
+		t.Fatal(err)
+	}
+	domain := "console-" + strings.ToLower(uniqueSuffix()) + ".example.test"
+	if _, err := f.db.Exec(`INSERT INTO tenant_domain(tenant_id,domain,is_primary,status,deleted,created_at,updated_at) VALUES(?,?,0,'active',0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
+		f.tenant, domain); err != nil {
+		t.Fatal(err)
+	}
+	get := func(host string) map[string]any {
+		request := httptest.NewRequest(http.MethodGet, "/v1/admin/platform/ios-material/tenants", nil)
+		request.Host = host
+		request.Header.Set("x-admin-key", gateAdminKey)
+		recorder := httptest.NewRecorder()
+		f.router.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("material by tenant via %s: %d %s", host, recorder.Code, recorder.Body.String())
+		}
+		return decodeBody(t, recorder)
+	}
+	if row := materialTenantRow(t, get(domain), slug); row["current"] != true {
+		t.Fatalf("the tenant the request came in on must be the current one: %v", row)
+	}
+	// 域名没登记：谁都不是当前租户，但总览照常给
+	if row := materialTenantRow(t, get("unknown.example.test"), slug); row["current"] != false {
+		t.Fatalf("an unknown host has no current tenant: %v", row)
+	}
 }
 
 // 这份总览列出所有租户的 Team 与材料，只给平台管理员。

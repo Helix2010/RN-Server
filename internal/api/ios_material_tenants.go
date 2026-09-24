@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -119,6 +120,7 @@ func (s *server) iosMaterialTenants(c *gin.Context) {
 		return
 	}
 	now := s.now()
+	current := s.requestTenant(c)
 	modeOf := func(id string) string {
 		if mode, ok := modes[id]; ok {
 			return mode
@@ -159,7 +161,7 @@ func (s *server) iosMaterialTenants(c *gin.Context) {
 	for _, target := range targets {
 		team := strings.ToUpper(target.TeamID)
 		view := iosMaterialTenantView{
-			Slug: target.Slug, Current: target.TenantID == tenantID(c), AppName: appNames[target.TenantID],
+			Slug: target.Slug, Current: target.TenantID == current, AppName: appNames[target.TenantID],
 			TeamID: team, BundleID: target.BundleID, Delivery: modeOf(target.TenantID),
 			TeamTenants: []string{}, BundleTenants: []string{},
 			TeamTestFlightTenants: testFlightTenantsOnTeam(targets, modeOf, target.TenantID, team),
@@ -216,6 +218,21 @@ func (s *server) iosMaterialTenants(c *gin.Context) {
 		// "没有租户在用"只在两件事都成立时才可信：清单没被截断；每个配了 iOS 的租户都读得出用哪个 Team
 		"orphansDeletable": complete && len(invalid) == 0,
 	})
+}
+
+// requestTenant 是发请求的那个控制台所属的租户：控制台只能跳到它自己的页面，所以要标出来。
+//
+// 平台级路由不经过按 Host 解析租户的中间件（它们本来就不按租户过滤），这里自己解析一次；
+// 解析不出来（域名没登记、本地调试）就谁都不是当前租户，只是少一个跳转，不报错。
+func (s *server) requestTenant(c *gin.Context) string {
+	if value, ok := c.Get("tenantId"); ok && value != nil {
+		return fmt.Sprint(value)
+	}
+	item, err := s.tenant.resolve(c.Request.Context(), c.Request.Host)
+	if err != nil {
+		return ""
+	}
+	return item.ID
 }
 
 // iosMaterialInUse：有没有租户在用这份材料。证书、上传 Key 按 Team，描述文件按 Team + bundle id。
