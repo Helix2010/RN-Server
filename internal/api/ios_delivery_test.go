@@ -14,7 +14,7 @@ import (
 //
 //   - 交付方式在排队时抄进任务；全托管要有上传 Key 可用的机器，自助上传要有能交回 .ipa 的机器；
 //   - 认领按交付方式派，并且同租户按排队顺序——卡住的那条挡住后面的，build 号不会乱；
-//   - 有没跑完的任务不许切换；从全托管切到自助上传要确认已吊销 Key，服务端存的 App Manager Key 一起删；
+//   - 有没跑完的任务不许切换；从全托管切到自助上传要确认已吊销平台拿着的 Key，服务端存的 App Manager Key 一起删；
 //   - 收尾：全托管报"没上传"拒收，自助上传没交回 .ipa 拒收；iOS 不能走 /unsigned/upload。
 //
 // 需要真实 MySQL（RN_TEST_MYSQL_DSN），否则整组跳过。
@@ -347,8 +347,21 @@ func uploadKeyStored(t *testing.T, f *gateFixture, team string) bool {
 	return count > 0
 }
 
-// 切到自助上传时，这个 Team 的上传 Key 材料一起撤下（打包机据此删本机那份）；同一个 Team 下
-// 还有别的全托管租户时不撤——Team Key 限不了 App，撤了那些租户就传不了。
+func keysToRevoke(t *testing.T, f *gateFixture) (appManagerKey, uploadKey bool) {
+	t.Helper()
+	keys, ok := getDelivery(f)["keysToRevoke"].(map[string]any)
+	if !ok {
+		t.Fatal("the delivery view must say which keys a switch to self-upload asks to revoke")
+	}
+	return keys["appManagerKey"] == true, keys["uploadKey"] == true
+}
+
+// 切到自助上传只要求确认吊销平台真拿着、切过去也不该再拿着的 Key：
+//
+//   - 同一个 Team 下还有别的全托管租户：这个 Team 的上传 Key 不撤，也不能让人去吊销（Team Key 限不了
+//     App，吊销了那些租户就传不了）——只问 App Manager Key，并且明说别吊销上传 Key；
+//   - 平台什么都没拿着：不用确认，否则审计里记下的是一句不真实的"已吊销"；
+//   - 上传 Key 只有这个租户在用：要确认吊销，切过去就撤下（打包机据此删本机那份）。
 func TestDBIOSDeliverySwitchWithdrawsTheTeamUploadKey(t *testing.T) {
 	f, _ := newIOSPool(t, 82, 1)
 	// 测试库是共用的，别的用例留下的租户都在 poolTeamA 下：这里用一个只属于本用例的 Team
@@ -363,29 +376,68 @@ func TestDBIOSDeliverySwitchWithdrawsTheTeamUploadKey(t *testing.T) {
 		ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)`, other, releaseIOSIdentityConfigKey, raw); err != nil {
 		t.Fatal(err)
 	}
-	recorder := putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 0, "acknowledgeKeysRevoked": true})
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("switch: %d %s", recorder.Code, recorder.Body.String())
+	if appManager, upload := keysToRevoke(t, f); appManager || upload {
+		t.Fatalf("nothing of this tenant's is held by the platform, nothing to revoke: appManager=%v upload=%v", appManager, upload)
 	}
-	if body := decodeBody(t, recorder); body["uploadKeyWithdrawn"] != false || !strings.Contains(body["reminder"].(string), "全托管") {
-		t.Fatalf("a shared team keeps its upload key and says why: %v", body)
+	recorder := putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 0})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("a switch with nothing to revoke must not ask for a revocation: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if body := decodeBody(t, recorder); body["uploadKeyWithdrawn"] != false || !strings.Contains(body["reminder"].(string), "不要在 App Store Connect 吊销") {
+		t.Fatalf("a shared team keeps its upload key and warns against revoking it: %v", body)
 	}
 	if !uploadKeyStored(t, f, team) {
 		t.Fatal("the upload key of a team another fully managed tenant uses was withdrawn")
 	}
 
-	// 那个租户也不用这个 Team 了：切回去再切过来，这回撤下
-	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, other, releaseIOSIdentityConfigKey); err != nil {
-		t.Fatal(err)
-	}
+	// 切回去，平台存上这个租户的 App Manager Key：只问这一把，并且提醒别吊销上传 Key
 	if recorder := putDelivery(f, map[string]any{"mode": iosDeliveryTestFlight, "expectedVersion": 1}); recorder.Code != http.StatusOK {
 		t.Fatalf("switch back: %d %s", recorder.Code, recorder.Body.String())
 	}
+	if _, err := f.db.Exec(`INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) VALUES(?,?,?,1,'tester',UTC_TIMESTAMP(3))`,
+		f.tenant, iosASCConfigKey, `{"sealed":"x"}`); err != nil {
+		t.Fatal(err)
+	}
+	if appManager, upload := keysToRevoke(t, f); !appManager || upload {
+		t.Fatalf("only the App Manager key is this tenant's to revoke: appManager=%v upload=%v", appManager, upload)
+	}
+	recorder = putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 2})
+	if recorder.Code != http.StatusConflict || problemCode(t, recorder) != "IOS_DELIVERY_KEYS_NOT_REVOKED" {
+		t.Fatalf("a stored App Manager key must be confirmed revoked: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if detail := recorder.Body.String(); !strings.Contains(detail, "吊销交给平台的App Manager Key") || !strings.Contains(detail, "不要在 App Store Connect 吊销它") {
+		t.Fatalf("the refusal must ask for the App Manager key only and warn against revoking the shared upload key: %s", detail)
+	}
 	recorder = putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 2, "acknowledgeKeysRevoked": true})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("switch with the App Manager key revoked: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if body := decodeBody(t, recorder); body["ascKeyDeleted"] != true || body["uploadKeyWithdrawn"] != false {
+		t.Fatalf("the App Manager key goes, the shared upload key stays: %v", body)
+	}
+
+	// 那个租户也不用这个 Team 了：上传 Key 成了只有这个租户在用的，要确认吊销，切过去就撤下
+	if _, err := f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, other, releaseIOSIdentityConfigKey); err != nil {
+		t.Fatal(err)
+	}
+	if recorder := putDelivery(f, map[string]any{"mode": iosDeliveryTestFlight, "expectedVersion": 3}); recorder.Code != http.StatusOK {
+		t.Fatalf("switch back: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if appManager, upload := keysToRevoke(t, f); appManager || !upload {
+		t.Fatalf("the team's upload key is now this tenant's alone to revoke: appManager=%v upload=%v", appManager, upload)
+	}
+	recorder = putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 4})
+	if recorder.Code != http.StatusConflict || problemCode(t, recorder) != "IOS_DELIVERY_KEYS_NOT_REVOKED" {
+		t.Fatalf("an upload key only this tenant uses must be confirmed revoked: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if detail := recorder.Body.String(); !strings.Contains(detail, "吊销交给平台的上传 Key，") || strings.Contains(detail, "App Manager Key") {
+		t.Fatalf("the refusal must name exactly the upload key: %s", detail)
+	}
+	recorder = putDelivery(f, map[string]any{"mode": iosDeliveryIPA, "expectedVersion": 4, "acknowledgeKeysRevoked": true})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("switch again: %d %s", recorder.Code, recorder.Body.String())
 	}
-	if body := decodeBody(t, recorder); body["uploadKeyWithdrawn"] != true {
+	if body := decodeBody(t, recorder); body["uploadKeyWithdrawn"] != true || !strings.Contains(body["reminder"].(string), "撤下") {
 		t.Fatalf("the team's upload key must be withdrawn: %v", body)
 	}
 	if uploadKeyStored(t, f, team) {

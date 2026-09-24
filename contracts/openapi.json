@@ -6554,7 +6554,7 @@
         "description": "Fully managed (testflight: the platform uploads to TestFlight with the tenant's upload key) or self-upload (ipa: the platform hands over the App Store-signed .ipa and the tenant uploads it). Also returns what a switch has to look at: whether each mode can be queued right now, unfinished iOS builds (a switch is refused while any exist), whether the platform still stores an App Manager key, and other tenants on the same Apple team that stay fully managed (the team's upload key then remains on the build machines). Design ios-tenant-delivery-tiers-2026-09-24.",
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered"
+            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered"
           },
           "401": {
             "description": "Admin authentication required"
@@ -6566,7 +6566,7 @@
       },
       "put": {
         "summary": "Switch the iOS delivery mode",
-        "description": "Only affects builds queued afterwards: the mode is copied into each job when it is queued. Refused while the tenant has unfinished iOS builds. Switching from testflight to ipa requires acknowledgeKeysRevoked=true (the tenant revoked the upload key and App Manager key in App Store Connect) and in the same transaction deletes the stored App Manager key and, unless another tenant on the same Apple team stays fully managed, withdraws the team's upload-key signing material — build machines then delete their local copy on their next material sync. Revoking the keys in App Store Connect is still the tenant's job.",
+        "description": "Only affects builds queued afterwards: the mode is copied into each job when it is queued. Refused while the tenant has unfinished iOS builds. Switching from testflight to ipa requires acknowledgeKeysRevoked=true when the platform holds keys of this tenant to revoke (keysToRevoke: a stored App Manager key, or the team's upload key when no other tenant on the same Apple team stays fully managed — a shared upload key must not be revoked) and in the same transaction deletes the stored App Manager key and, unless another tenant on the same Apple team stays fully managed, withdraws the team's upload-key signing material — build machines then delete their local copy on their next material sync. Revoking the keys in App Store Connect is still the tenant's job.",
         "requestBody": {
           "required": true,
           "content": {
@@ -6603,7 +6603,7 @@
                   },
                   "acknowledgeKeysRevoked": {
                     "type": "boolean",
-                    "description": "Required when switching from testflight to ipa"
+                    "description": "Required when switching from testflight to ipa while keysToRevoke names any key"
                   }
                 }
               }
