@@ -3076,7 +3076,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE. APP_IDENTITY_DRIFT: this build would change the Android package name or signing certificate of the active release, so installed devices cannot upgrade in place; the detail is written for people - after the operator confirms, resend the same request with acknowledgeIdentityChange=true. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs. NO_BUILDER_FOR_TEAM: no iOS builder has ever reported holding this tenant's Apple Team and bundle id, so the job would never be claimed - import the certificate and profiles on at least one Mac first."
+            "description": "BUILD_NUMBER_NOT_INCREASING: this build number is not greater than the highest already used (queued, claimed, running, built and signing jobs hold their number). BUILD_VERSION_NOT_INCREASING: this version is not greater than the latest release for this platform. APP_IDENTITY_INCOMPLETE. APP_IDENTITY_DRIFT: this build would change the Android package name or signing certificate of the active release, so installed devices cannot upgrade in place; the detail is written for people - after the operator confirms, resend the same request with acknowledgeIdentityChange=true. SIGNER_NOT_READY (android apk): the primary signer cannot sign for this tenant yet - no v3 keystore, keystore not sealed to the primary, trust roots cannot be composed (no OTA certificate), or the primary has not decrypted, confirmed (with the current trust roots digest) and trial-signed the current keystore version; the detail lists what is missing and the problem body carries readinessProblems (SignerReadinessProblem[]). Same judgement as the signer claim. OTA_BUILD_ALREADY_QUEUED / OTA_SIGNING_KEY_MISSING for OTA jobs. NO_BUILDER_FOR_TEAM: no iOS builder has ever reported holding this tenant's Apple Team and bundle id, so the job would never be claimed - import the certificate and profiles on at least one Mac first., NO_UPLOADER_FOR_TEAM (fully managed iOS tenant, no registered builder reported a usable upload key for its team), NO_IPA_BUILDER_FOR_TEAM (self-upload iOS tenant, no builder able to hand back an .ipa), IOS_DELIVERY_CONFIG_INVALID"
           },
           "422": {
             "description": "OTA_BASE_RELEASE_INVALID: this release cannot be used as an OTA base - it is not verified/active, it has no runtimeVersion, or it has no recorded native fingerprint (built before the fingerprint was recorded, so there is no way to tell whether the update is JS-only). INVALID_OTA_APPLY_STRATEGY: applyStrategy must be next_launch or immediate."
@@ -3869,7 +3869,7 @@
             "description": "INVALID_BUILD_RESULT"
           },
           "409": {
-            "description": "BUILD_KIND_MISMATCH (not an iOS apk job), IOS_IDENTITY_INCOMPLETE (release.ios was removed while the build ran), IOS_RESULT_CONFLICT, BUILD_ATTEMPT_STALE"
+            "description": "BUILD_KIND_MISMATCH (not an iOS apk job), IOS_IDENTITY_INCOMPLETE (release.ios was removed while the build ran), IOS_RESULT_CONFLICT, BUILD_ATTEMPT_STALE, IOS_UPLOAD_MISSING (a testflight job reported it did not upload), IOS_DELIVERY_MISMATCH (an ipa job reported an App Store Connect upload), IOS_IPA_NOT_DELIVERED (an ipa job has no .ipa delivered under this claim matching ipaSha256 and ipaSize)"
           },
           "422": {
             "description": "IOS_ARTIFACT_MISMATCH: the reported bundleId, shortVersion or buildNumber does not match this job"
@@ -5346,7 +5346,7 @@
     "/v1/build-agent/jobs/{id}/unsigned/upload": {
       "put": {
         "summary": "Upload the unsigned package",
-        "description": "apk jobs only; limit ARTIFACT_MAX_SIZE_MB. The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/<random>/ (a new key for every upload) and records key, size and sha256 in one transaction that locks the job row and checks the attempt. A re-upload in the same claim replaces the recorded key and deletes the replaced object; a stale or late upload (job reaped, canceled or already built) only deletes the object it just wrote. The path ends in /upload so it is exempt from the database timeout.",
+        "description": "Android apk jobs only (iOS jobs get 409 BUILD_PLATFORM_MISMATCH: a self-upload .ipa is delivered through /ipa/upload, which verifies the package); limit ARTIFACT_MAX_SIZE_MB. The body is streamed (application/octet-stream); the server computes size and sha256, writes the object under tenants/<tenant>/build-jobs/<job>/a<attempt>/<random>/ (a new key for every upload) and records key, size and sha256 in one transaction that locks the job row and checks the attempt. A re-upload in the same claim replaces the recorded key and deletes the replaced object; a stale or late upload (job reaped, canceled or already built) only deletes the object it just wrote. The path ends in /upload so it is exempt from the database timeout.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -5374,7 +5374,7 @@
             "description": "UPLOAD_EMPTY, UPLOAD_INTERRUPTED, INVALID_BUILD_ATTEMPT"
           },
           "409": {
-            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an apk job)"
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not an apk job), BUILD_PLATFORM_MISMATCH (iOS job)"
           },
           "413": {
             "description": "UPLOAD_TOO_LARGE"
@@ -6366,6 +6366,87 @@
           },
           "404": {
             "description": "IOS_ASC_NOT_FOUND"
+          }
+        }
+      }
+    },
+    "/v1/admin/ios/delivery": {
+      "get": {
+        "summary": "Read the iOS delivery mode",
+        "description": "Fully managed (testflight: the platform uploads to TestFlight with the tenant's upload key) or self-upload (ipa: the platform hands over the App Store-signed .ipa and the tenant uploads it). Also returns what a switch has to look at: whether each mode can be queued right now, unfinished iOS builds (a switch is refused while any exist), whether the platform still stores an App Manager key, and other tenants on the same Apple team that stay fully managed (the team's upload key then remains on the build machines). Design ios-tenant-delivery-tiers-2026-09-24.",
+        "responses": {
+          "200": {
+            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "IOS_DELIVERY_CONFIG_INVALID, IOS_DELIVERY_QUERY_FAILED, RELEASE_IDENTITY_CONFIG_INVALID"
+          }
+        }
+      },
+      "put": {
+        "summary": "Switch the iOS delivery mode",
+        "description": "Only affects builds queued afterwards: the mode is copied into each job when it is queued. Refused while the tenant has unfinished iOS builds. Switching from testflight to ipa requires acknowledgeKeysRevoked=true (the tenant revoked the upload key and App Manager key in App Store Connect) and deletes the stored App Manager key in the same transaction; upload keys already installed on build machines are not removed by this call.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "mode",
+                  "expectedVersion",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "testflight",
+                      "ipa"
+                    ]
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  },
+                  "acknowledgeKeysRevoked": {
+                    "type": "boolean",
+                    "description": "Required when switching from testflight to ipa"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, reminder?}"
+          },
+          "400": {
+            "description": "INVALID_IOS_DELIVERY"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_IOS_DELIVERY, IOS_DELIVERY_UNCHANGED, IOS_DELIVERY_SWITCH_BLOCKED (body carries unfinishedJobs), IOS_DELIVERY_KEYS_NOT_REVOKED"
+          },
+          "500": {
+            "description": "IOS_DELIVERY_CONFIG_INVALID, IOS_DELIVERY_QUERY_FAILED, IOS_DELIVERY_SAVE_FAILED"
           }
         }
       }
@@ -8137,6 +8218,16 @@
               "ota"
             ]
           },
+          "delivery": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "testflight",
+              "ipa",
+              null
+            ],
+            "description": "iOS installable-package jobs only: how the package is delivered, copied from the tenant's delivery mode when the job was queued. testflight = the build machine uploads to App Store Connect (fully managed); ipa = the build machine hands the .ipa back and the tenant uploads it (self-upload). null for Android and OTA jobs."
+          },
           "baseReleaseId": {
             "type": "string",
             "nullable": true
@@ -8356,6 +8447,15 @@
             "type": "string",
             "maxLength": 300,
             "description": "Why the last self-upgrade failed, read from the state directory at startup. The upgrade helper runs as root and the agent is still on the old version when it fails, so without this the console only shows a machine whose version never catches up with the approved one."
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"
+            },
+            "maxItems": 16,
+            "description": "What this agent build can do beyond the baseline, e.g. ios-ipa-delivery (hands the .ipa back to the server for self-upload tenants). Unknown names are accepted so an agent can ship before the server knows them. Omitted by older agents: self-upload iOS jobs are then neither queued nor dispatched."
           }
         }
       },
@@ -10600,9 +10700,10 @@
             "enum": [
               "ok",
               "forbidden",
-              "error"
+              "error",
+              "missing"
             ],
-            "description": "Result of the read-only probe the machine ran at startup against this team's upload key (GET /v1/apps/{id}/buildUploads?limit=1). ok = the key can use the Build Uploads endpoints; forbidden = the role is not enough, swap this machine's key for an App Manager team key; error = the probe could not run. Omitted when the machine does not upload. Known before the first build, rather than after a build number has been burned."
+            "description": "Result of the read-only probe the machine ran at startup against this team's upload key (GET /v1/apps/{id}/buildUploads?limit=1). ok = the key can use the Build Uploads endpoints; forbidden = the role is not enough, swap this machine's key for an App Manager team key; error = the probe could not run; missing = this machine has no upload key for this team (self-upload tenants never hand one over). Omitted when the machine does not upload. Known before the first build, rather than after a build number has been burned."
           }
         }
       },
@@ -10765,12 +10866,20 @@
                     "ok",
                     "forbidden",
                     "error",
+                    "missing",
                     null
                   ]
                 }
               }
             },
             "description": "Signing material this machine reported holding. Self-reported: an operations dashboard, not a security boundary."
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Capabilities the machine reported on its last claim, e.g. ios-ipa-delivery. Empty for older agents."
           },
           "missingTenants": {
             "type": "array",

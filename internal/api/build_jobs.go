@@ -60,7 +60,10 @@ type buildJob struct {
 	Platform string
 	// Kind 区分"编译安装包"和"构建热更新包"。两者共用这张表、这套状态流转和这套
 	// 回收：它们是同一种实体——一个排队等打包机干的活。
-	Kind           string
+	Kind string
+	// Delivery 只对 iOS 安装包任务有意义：排队时从租户配置抄来的交付方式（ios_delivery.go）。
+	// 其余任务与迁移之前的 iOS 任务为 NULL，iOS 的 NULL 按 testflight 处理
+	Delivery       sql.NullString
 	BaseReleaseID  sql.NullString
 	Channel        sql.NullString
 	ApplyStrategy  sql.NullString
@@ -103,13 +106,13 @@ type buildJob struct {
 	SignedObjectKey    sql.NullString
 }
 
-const buildJobColumns = `id,tenant_id,platform,kind,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at,` +
+const buildJobColumns = `id,tenant_id,platform,kind,delivery,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at,` +
 	`attempt,claimed_machine_id,unsigned_object_key,unsigned_size,unsigned_sha256,sbom_object_key,sbom_size,sbom_sha256,native_fingerprint,provenance,` +
 	`sign_attempt,sign_failures,signing_machine_id,signing_claimed_at,signing_heartbeat_at,sign_outcome,signed_object_key`
 
 func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 	var j buildJob
-	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.Kind, &j.BaseReleaseID, &j.Channel, &j.ApplyStrategy,
+	err := row.Scan(&j.ID, &j.TenantID, &j.Platform, &j.Kind, &j.Delivery, &j.BaseReleaseID, &j.Channel, &j.ApplyStrategy,
 		&j.OTAReleaseID, &j.GitRef, &j.CommitSHA, &j.Version, &j.BuildNumber,
 		&j.Status, &j.ClaimedBy, &j.ClaimedAt, &j.HeartbeatAt, &j.ReleaseID, &j.ArtifactSHA256, &j.LogTail,
 		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt,
@@ -150,6 +153,7 @@ func buildJobViewWithMachines(j buildJob, machineNames map[string]string) map[st
 		"id":             j.ID,
 		"platform":       j.Platform,
 		"kind":           j.Kind,
+		"delivery":       buildJobDeliveryView(j),
 		"baseReleaseId":  nullableString(j.BaseReleaseID.String),
 		"channel":        nullableString(j.Channel.String),
 		"applyStrategy":  nullableString(j.ApplyStrategy.String),
@@ -462,6 +466,7 @@ func (s *server) createBuildJob(c *gin.Context) {
 	}
 	// iOS 的签名身份不在签名闸上，在那台 Mac 的钥匙串里，所以它有自己的一套必填项
 	warnings := []string{}
+	var delivery any
 	if platform == buildPlatformIOS {
 		if detail := s.iosBuildIdentityProblem(c.Request.Context(), tenantID(c)); detail != "" {
 			problem(c, http.StatusConflict, "IOS_IDENTITY_INCOMPLETE", detail)
@@ -475,6 +480,13 @@ func (s *server) createBuildJob(c *gin.Context) {
 			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to read the iOS release identity")
 			return
 		}
+		// 交付方式在这一刻抄进任务：之后改配置只影响新排的任务（ios_delivery.go）
+		mode, err := s.iosDeliveryModeFor(c.Request.Context(), tenantID(c))
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "IOS_DELIVERY_CONFIG_INVALID", "Stored "+iosDeliveryConfigKey+" configuration is invalid")
+			return
+		}
+		delivery = mode
 		if identity != nil {
 			coverage, err := s.iosSigningCoverage(c.Request.Context(), registry,
 				identity.Value.AppleTeamID, identity.Value.BundleID, s.now())
@@ -482,17 +494,14 @@ func (s *server) createBuildJob(c *gin.Context) {
 				problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to read build machine liveness")
 				return
 			}
-			switch {
-			case !coverage.Reported:
-				problem(c, http.StatusConflict, "NO_BUILDER_FOR_TEAM",
-					"没有任何一台 iOS 打包机报告过它手上有 Team "+identity.Value.AppleTeamID+"、bundle id "+
-						identity.Value.BundleID+" 的签名材料，排进去的任务不会有人认领。"+
-						"把这个 Team 的证书与描述文件导进至少一台 Mac 并重启打包机程序，"+
-						"到「平台维护 → 构建机」确认它报上来之后再排。")
+			// 有没有机器能接按"登记语义"判：登记在用的机器最近一次上报过就算，不看在不在线。
+			// 掉线不拦——家里的 Mac 合上盖子就没了，任务照常排队等它回来，只把这件事说出来
+			readiness := iosDeliveryReadiness{coverage: coverage}
+			if code, detail := readiness.problem(mode, identity.Value.AppleTeamID, identity.Value.BundleID); code != "" {
+				problem(c, http.StatusConflict, code, detail)
 				return
-			case !coverage.Online:
-				// 掉线不拦：家里的 Mac 合上盖子就没了，任务照常排队等它回来。
-				// 只把这件事说出来，让排队的人知道这不会马上开始
+			}
+			if !readiness.online(mode) {
 				warnings = append(warnings, "no_ios_builder_online")
 			}
 		}
@@ -524,14 +533,14 @@ func (s *server) createBuildJob(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(c.Request.Context(),
-		`INSERT INTO build_jobs(id,tenant_id,platform,git_ref,version,build_number,status,log_tail,reason,release_notes,created_by,created_at,updated_at)
-		 VALUES(?,?,?,?,?,?,'queued',JSON_ARRAY(),?,?,?,?,?)`,
-		id, tenantID(c), platform, gitRef, version, body.BuildNumber, reason, encodedNotes, actor(c), now, now); err != nil {
+		`INSERT INTO build_jobs(id,tenant_id,platform,delivery,git_ref,version,build_number,status,log_tail,reason,release_notes,created_by,created_at,updated_at)
+		 VALUES(?,?,?,?,?,?,?,'queued',JSON_ARRAY(),?,?,?,?,?)`,
+		id, tenantID(c), platform, delivery, gitRef, version, body.BuildNumber, reason, encodedNotes, actor(c), now, now); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to queue the build")
 		return
 	}
 	event := newAudit(tenantID(c), actor(c), "build_job_create", "build-job", id, reason, requestID(c),
-		map[string]any{"platform": platform, "gitRef": gitRef, "version": version, "buildNumber": body.BuildNumber})
+		map[string]any{"platform": platform, "gitRef": gitRef, "version": version, "buildNumber": body.BuildNumber, "delivery": delivery})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to queue the build")
 		return
@@ -540,8 +549,12 @@ func (s *server) createBuildJob(c *gin.Context) {
 	// 2026-09-13 加 OTA 类型之后，这个响应一直带着 "kind": ""，而管理端按 apk|ota 校验
 	// 响应——于是每一次**成功的** APK 排队都显示成"排队失败"，重试一次就真的多排一个包。
 	// 库里那一行没问题（列默认 'apk'），坏的只是这份响应。
+	deliveryColumn := sql.NullString{}
+	if mode, ok := delivery.(string); ok {
+		deliveryColumn = sql.NullString{Valid: true, String: mode}
+	}
 	view := buildJobView(buildJob{
-		ID: id, TenantID: tenantID(c), Platform: platform, Kind: "apk", GitRef: gitRef, Version: version,
+		ID: id, TenantID: tenantID(c), Platform: platform, Kind: "apk", Delivery: deliveryColumn, GitRef: gitRef, Version: version,
 		BuildNumber: body.BuildNumber, Status: "queued", Reason: reason, ReleaseNotes: encodedNotes,
 		CreatedBy: actor(c), CreatedAt: now, UpdatedAt: now,
 	})

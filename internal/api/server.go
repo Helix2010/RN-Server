@@ -411,6 +411,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 只读同步：拉 build 与测试组，回写公开链接与过期日。提审、开关公开链接、
 	// 增删测试员永远由人在 ASC 上点（§4.6.6）
 	group.POST("/ios/testflight/sync", s.syncIOSTestFlight)
+	// 交付方式：全托管（平台传 TestFlight）/ 自助上传（平台交 .ipa、租户自己传）。
+	// 有没跑完的 iOS 任务时不许切换（ios_delivery.go）
+	group.GET("/ios/delivery", s.getIOSDelivery)
+	group.PUT("/ios/delivery", s.updateIOSDelivery)
 	group.GET("/ota/signing-key", s.getOTASigningKey)
 	group.PUT("/ota/signing-key", s.updateOTASigningKey)
 	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)

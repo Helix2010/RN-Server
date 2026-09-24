@@ -51,6 +51,10 @@ const (
 	uploadProbeOK        = "ok"
 	uploadProbeForbidden = "forbidden"
 	uploadProbeError     = "error"
+	// uploadProbeMissing：这台机器上没装这个 Team 的上传 Key。以前开着上传的机器缺 Key 就干脆
+	// 不报这个 Team（于是也领不到它的任务），自助上传的租户根本不交上传 Key，所以要能报"没有"，
+	// 并且和"装了但探不通"（error）分开
+	uploadProbeMissing = "missing"
 )
 
 // 机器自报的操作系统。装机脚本、自升级归档（builder-darwin-arm64.tar.gz）与控制台
@@ -71,7 +75,7 @@ type appleTeamReport struct {
 	ExpiresAt string `json:"expiresAt"`
 	// UploadProbe 是启动时那次只读探测的结果（设计 §4.3 第 3 条）：ok=这把上传 Key 能用
 	// Build Uploads 那套端点；forbidden=角色不够（Developer 不行就换 App Manager 的 Team Key）；
-	// error=探不通（网络、Key 坏了）。空=没探（这台机器没开上传）。
+	// error=探不通（网络、Key 坏了）；missing=没装这个 Team 的上传 Key。空=没探（这台机器没开上传）。
 	//
 	// 记它的意义在于**第一次构建之前**就知道传不上去：上传发生在一次构建的最后一步，
 	// 等到那时才发现权限不够，已经烧掉了一个 build 号和半小时。
@@ -80,11 +84,13 @@ type appleTeamReport struct {
 
 // machineLiveness 是表里的一行。
 type machineLiveness struct {
-	MachineID        string
-	LastSeenAt       time.Time
-	AgentCommit      string
-	OS               string
-	Platforms        []string
+	MachineID   string
+	LastSeenAt  time.Time
+	AgentCommit string
+	OS          string
+	Platforms   []string
+	// Capabilities 是这次认领自报的能力（例如 ios-ipa-delivery）。旧版代理不报
+	Capabilities     []string
 	AppleTeams       []appleTeamReport
 	SigningExpiresAt sql.NullTime
 	FreeGB           sql.NullInt64
@@ -148,7 +154,7 @@ func normalizeAppleTeamReports(reports []appleTeamReport) ([]appleTeamReport, bo
 			expires = at.UTC().Format(time.RFC3339)
 		}
 		switch report.UploadProbe {
-		case uploadProbeUnknown, uploadProbeOK, uploadProbeForbidden, uploadProbeError:
+		case uploadProbeUnknown, uploadProbeOK, uploadProbeForbidden, uploadProbeError, uploadProbeMissing:
 		default:
 			return nil, false
 		}
@@ -185,6 +191,12 @@ func (s *server) recordMachineLiveness(ctx context.Context, live machineLiveness
 	if err != nil {
 		platforms = []byte("null")
 	}
+	var capabilities any
+	if live.Capabilities != nil {
+		if encoded, err := json.Marshal(live.Capabilities); err == nil {
+			capabilities = string(encoded)
+		}
+	}
 	var teams any
 	if live.AppleTeams != nil {
 		encoded, err := json.Marshal(live.AppleTeams)
@@ -194,16 +206,16 @@ func (s *server) recordMachineLiveness(ctx context.Context, live machineLiveness
 	}
 	now := live.LastSeenAt
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?)
+		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,capabilities,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON DUPLICATE KEY UPDATE
 		   last_seen_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(last_seen_at), last_seen_at),
-		   agent_commit=VALUES(agent_commit),os=VALUES(os),platforms=VALUES(platforms),
+		   agent_commit=VALUES(agent_commit),os=VALUES(os),platforms=VALUES(platforms),capabilities=VALUES(capabilities),
 		   apple_teams=VALUES(apple_teams),signing_expires_at=VALUES(signing_expires_at),free_gb=VALUES(free_gb),
 		   upgrade_error=VALUES(upgrade_error),paused_reason=VALUES(paused_reason),
 		   updated_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(updated_at), updated_at)`,
 		live.MachineID, now, nullableString(live.AgentCommit), nullableString(live.OS), string(platforms),
-		teams, live.SigningExpiresAt, live.FreeGB, nullableString(live.UpgradeError), nullableString(live.PausedReason), now); err != nil {
+		capabilities, teams, live.SigningExpiresAt, live.FreeGB, nullableString(live.UpgradeError), nullableString(live.PausedReason), now); err != nil {
 		slog.Warn("unable to record build machine liveness", "machineId", live.MachineID, "error", err)
 	}
 }
@@ -229,7 +241,7 @@ func (s *server) touchMachineLiveness(ctx context.Context, machineID string, now
 // machineLivenessByID 读全表。行数等于登记过的机器数（上限 64），一次全取比按 id 查几十次便宜。
 func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiveness, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason FROM build_machine_liveness`)
+		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,capabilities,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason FROM build_machine_liveness`)
 	if err != nil {
 		return nil, err
 	}
@@ -238,8 +250,8 @@ func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiv
 	for rows.Next() {
 		var live machineLiveness
 		var agentCommit, os, upgradeError, paused sql.NullString
-		var platforms, teams []byte
-		if err := rows.Scan(&live.MachineID, &live.LastSeenAt, &agentCommit, &os, &platforms, &teams,
+		var platforms, capabilities, teams []byte
+		if err := rows.Scan(&live.MachineID, &live.LastSeenAt, &agentCommit, &os, &platforms, &capabilities, &teams,
 			&live.SigningExpiresAt, &live.FreeGB, &upgradeError, &paused); err != nil {
 			return nil, err
 		}
@@ -251,6 +263,9 @@ func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiv
 		// 解析不了当作没报：这一列是机器自报的展示值，一行坏 JSON 不该让控制台整页 500
 		if len(platforms) > 0 {
 			_ = json.Unmarshal(platforms, &live.Platforms)
+		}
+		if len(capabilities) > 0 {
+			_ = json.Unmarshal(capabilities, &live.Capabilities)
 		}
 		if len(teams) > 0 {
 			_ = json.Unmarshal(teams, &live.AppleTeams)
@@ -269,6 +284,13 @@ type iosSigningCoverage struct {
 	// Online：报过它的机器里至少有一台还在线。都不在线**照常排队**——家里的 Mac
 	// 会睡着、会掉线，队列要能等它回来（这是已定的决策，不是尽力而为）。
 	Online bool
+	// Uploadable：报过它的机器里有一台这个 Team 的上传 Key 装着、Apple 没拒（ok 或 error）。
+	// 全托管的任务只派给这样的机器（ios_delivery.go 的 uploadablePairs 是同一个判据）
+	Uploadable       bool
+	UploadableOnline bool
+	// IPACapable：报过它的机器里有一台的构建机程序能把 .ipa 交回服务端。自助上传的任务只派给这样的机器
+	IPACapable       bool
+	IPACapableOnline bool
 }
 
 func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesDoc, teamID, bundleID string, now time.Time) (iosSigningCoverage, error) {
@@ -286,10 +308,17 @@ func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesD
 		if !ok || !containsString(signingPairs(live.AppleTeams), want) {
 			continue
 		}
+		online := live.online(now)
 		coverage.Reported = true
-		if live.online(now) {
-			coverage.Online = true
-			return coverage, nil
+		coverage.Online = coverage.Online || online
+		// 按"登记语义"判：登记在用、最近一次上报里有，就算数；在不在线只影响提示
+		if containsString(uploadablePairs(live.AppleTeams), want) {
+			coverage.Uploadable = true
+			coverage.UploadableOnline = coverage.UploadableOnline || online
+		}
+		if containsString(live.Capabilities, machineCapabilityIPADelivery) {
+			coverage.IPACapable = true
+			coverage.IPACapableOnline = coverage.IPACapableOnline || online
 		}
 	}
 	return coverage, nil
@@ -350,6 +379,8 @@ func machineLivenessView(live machineLiveness, machine gin.H, wanted []iosSignin
 		"agentCommit": nil,
 		"freeGb":      nil,
 		"appleTeams":  []gin.H{},
+		// capabilities 是机器自报的能力（例如能不能把 .ipa 交回平台）
+		"capabilities": []string{},
 		// missingTenants 是这台机器缺材料的租户（只对能打 iOS 的构建机算）
 		"missingTenants":   []gin.H{},
 		"signingExpiresAt": nil,
@@ -362,6 +393,9 @@ func machineLivenessView(live machineLiveness, machine gin.H, wanted []iosSignin
 		view["agentCommit"] = nullableString(live.AgentCommit)
 		view["pausedReason"] = nullableString(live.PausedReason)
 		view["upgradeError"] = nullableString(live.UpgradeError)
+		if live.Capabilities != nil {
+			view["capabilities"] = live.Capabilities
+		}
 		if live.FreeGB.Valid {
 			view["freeGb"] = live.FreeGB.Int64
 		}

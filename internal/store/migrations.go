@@ -79,6 +79,8 @@ var migrations = []migration{
 	{version: 56, name: "machine_bundle_signatures", apply: machineBundleSignaturesMigration},
 	// iOS 签名材料的密文：控制台传一次，每台 Mac 自己取。服务端只存密文，没有任何一把私钥
 	{version: 57, name: "ios_signing_material", apply: iosSigningMaterialMigration},
+	// iOS 交付方式（全托管 / 自助上传）在排队时写进任务；机器自报它支持哪些交付能力
+	{version: 58, name: "ios_delivery", apply: iosDeliveryMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2093,6 +2095,27 @@ func iosSigningMaterialMigration(ctx context.Context, db *sql.DB) error {
 		PRIMARY KEY (kind, team_id, scope)
 	) ENGINE=InnoDB COMMENT='iOS 签名材料的密文。服务端只是快递员：它没有任何一把私钥，存的每一份都解不开'`); err != nil {
 		return fmt.Errorf("ios signing material migration: %w", err)
+	}
+	return nil
+}
+
+// iosDeliveryMigration 给 iOS 任务加"交付方式"，给构建机在线表加"自报的交付能力"
+// （设计 ios-tenant-delivery-tiers-2026-09-24.md §3.2、§5）。
+//
+// 交付方式在**排队那一刻**从租户配置抄进任务行，之后改配置只影响新排的任务：同一条任务
+// 中途换方式，既难审计也难解释。能力是机器每次认领时自报的，旧版代理不报，于是"自助上传"
+// 的任务在支持它的代理上线之前排不进队列——旧代理领走它只会按全托管去传，或者成功了却
+// 没有交付件。
+func iosDeliveryMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "build_jobs", "delivery",
+		`ALTER TABLE build_jobs ADD COLUMN delivery VARCHAR(16) NULL
+			COMMENT 'iOS 安装包任务的交付方式，排队时从租户的 release.ios.delivery 抄来：testflight=构建机上传 App Store Connect（全托管）；ipa=构建机把 .ipa 交回服务端、租户下载后自己上传（自助上传）。Android、热更新与迁移之前的任务为 NULL，iOS 的 NULL 按 testflight 处理' AFTER kind`); err != nil {
+		return fmt.Errorf("ios delivery migration build_jobs.delivery: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "build_machine_liveness", "capabilities",
+		`ALTER TABLE build_machine_liveness ADD COLUMN capabilities JSON NULL
+			COMMENT '这次认领自报的能力列表，例如 ["ios-ipa-delivery"]（能把 .ipa 交回服务端）。服务端据此决定能不能排、能不能派自助上传的 iOS 任务。NULL=旧版代理没报' AFTER platforms`); err != nil {
+		return fmt.Errorf("ios delivery migration build_machine_liveness.capabilities: %w", err)
 	}
 	return nil
 }

@@ -60,8 +60,10 @@ func iosClaim(f *gateFixture, machine gateMachine, teams []appleTeamReport) *htt
 	})
 }
 
+// teamReport 是一台开着上传、这个 Team 的上传 Key 探测通过的 Mac 的自报——生产里 mac-01 就是这样。
+// 全托管的任务只派给上传 Key 可用的机器（ios_delivery.go），所以默认带上 ok。
 func teamReport(teamID string, bundleIDs ...string) []appleTeamReport {
-	return []appleTeamReport{{TeamID: teamID, BundleIDs: bundleIDs, ExpiresAt: "2027-03-01T00:00:00Z"}}
+	return []appleTeamReport{{TeamID: teamID, BundleIDs: bundleIDs, ExpiresAt: "2027-03-01T00:00:00Z", UploadProbe: uploadProbeOK}}
 }
 
 // queueIOS 以运营的身份排一条 iOS 任务。

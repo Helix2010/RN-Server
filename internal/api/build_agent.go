@@ -101,6 +101,9 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		// UpgradeError：上一次自升级失败的原因。升级是 root 的那个程序做的，它失败时
 		// 代理还在跑旧版，控制台只会看到"版本追不上审批值"——不报上来就只能上机器看日志
 		UpgradeError string `json:"upgradeError"`
+		// Capabilities：这台机器的构建机程序会做哪些"新"事情（例如 ios-ipa-delivery：能把 .ipa
+		// 交回服务端）。服务端据此决定派不派需要它的任务；旧版代理不报
+		Capabilities []string `json:"capabilities"`
 	}
 	if decode(c, &body) != nil || len(body.Platforms) == 0 || len(body.Kinds) == 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
@@ -136,6 +139,11 @@ func (s *server) claimBuildJob(c *gin.Context) {
 			"appleTeams must carry 10-character Apple Team IDs with bundle ids and an optional RFC3339 expiresAt")
 		return
 	}
+	capabilities, ok := normalizeMachineCapabilities(body.Capabilities)
+	if !ok {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "capabilities must be a short list of lowercase names")
+		return
+	}
 	ctx := c.Request.Context()
 	// 在 GET_LOCK 与事务**之外**、在"队列空回 204"提前返回**之前**记一次在线与自报盘点。
 	// 认领这条路径上绝大多数请求都是空转（队列是空的），而"这台机器还活着、手上有这些
@@ -152,7 +160,7 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		MachineID: machine.ID, LastSeenAt: s.now(), AgentCommit: body.AgentCommit, OS: body.OS,
 		// 记自报的平台，不是下面收窄之后的：收窄掉的恰恰是"它想干但干不了"，
 		// 而那正是要在控制台上看见的东西
-		Platforms: body.Platforms, AppleTeams: teams,
+		Platforms: body.Platforms, Capabilities: capabilities, AppleTeams: teams,
 		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB, PausedReason: pausedReason,
 		UpgradeError: sanitizeSignerText(body.UpgradeError, machineUpgradeErrorMaxRunes),
 	})
@@ -223,6 +231,21 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	for _, pair := range pairs {
 		args = append(args, pair)
 	}
+	// 全托管的任务只派给这个 Team 的上传 Key 可用的机器；自助上传的任务只派给能把 .ipa 交回
+	// 服务端的机器（ios_delivery.go）。同样的 IN () 占位
+	uploadPairs := uploadablePairs(teams)
+	if len(uploadPairs) == 0 {
+		uploadPairs = []string{""}
+	}
+	uploadPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(uploadPairs)), ",")
+	for _, pair := range uploadPairs {
+		args = append(args, pair)
+	}
+	ipaCapable := 0
+	if containsString(capabilities, machineCapabilityIPADelivery) {
+		ipaCapable = 1
+	}
+	args = append(args, ipaCapable)
 
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -259,8 +282,8 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		return
 	}
 
-	// 选一条能派给这台机器的任务。平台与类型之外，iOS 还有两条自己的条件
-	// （设计 ios-mac-builders-home-network-2026-09-18 §5.2、§5.3）：
+	// 选一条能派给这台机器的任务。平台与类型之外，iOS 还有四条自己的条件
+	// （设计 ios-mac-builders-home-network-2026-09-18 §5.2、§5.3，ios-tenant-delivery-tiers-2026-09-24 §3.2）：
 	//
 	//  1. **同租户没有别的 iOS 安装包任务在途**：iOS 的发布记录入库要过
 	//     RELEASE_VERSION_NOT_INCREASING（版本与 build 号都要大于上一条）。同租户排两条
@@ -269,8 +292,15 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	//     所以这条只对 iOS 加：给 Android 加上会把"两台构建机同时打同一个租户的两条任务"
 	//     也串起来，而那是今天就成立、也有用例盯着的行为。
 	//  2. 这台机器手上确实有这个租户那个 Team、那个 bundle id 的签名材料（自报盘点）。
+	//  3. **同租户按排队顺序**：这个租户有更早的排队中 iOS 安装包任务时，这一条不能先领。
+	//     第 1 条只挡"同时在跑两条"，排队顺序原先是碰巧成立的——同租户的 iOS 任务领取条件
+	//     完全一样。交付方式按任务分路由之后不再一样：全托管的 N 号因为没有能上传的机器卡住时，
+	//     自助上传的 N+1 号会先打完落库，N 号之后传进 TestFlight 却在 /ios-release 被
+	//     RELEASE_VERSION_NOT_INCREASING 拒掉，包撤不回来。有了这一条，卡住的那条挡住后面的，
+	//     积压告警报出来，由人取消或补上机器。
+	//  4. 交付方式对得上这台机器：全托管要这个 Team 的上传 Key 可用，自助上传要能交回 .ipa。
 	//
-	// 第 2 条用子查询而不是 JOIN，并且把锁**限定在 build_jobs 上**（FOR UPDATE OF j）：
+	// 第 2、4 条用子查询而不是 JOIN，并且把锁**限定在 build_jobs 上**（FOR UPDATE OF j）：
 	// MySQL 的锁定读会把子查询里读到的行一起锁上，不限定的话每次认领都会锁住 app_configs
 	// 里各租户的 release.ios 那几行，而认领是每台机器每 10 秒一次的高频路径——控制台保存
 	// iOS 发布身份会被它挡住。同理第 1 条里的 build_jobs 别名 o 也不该被锁。
@@ -282,10 +312,18 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		          NOT EXISTS (SELECT 1 FROM build_jobs o
 		                       WHERE o.tenant_id=j.tenant_id AND o.platform=j.platform AND o.kind='`+jobKindAPK+`'
 		                         AND o.status IN (`+sqlBuilderActive+`))
+		          AND (j.kind<>'`+jobKindAPK+`' OR NOT EXISTS (SELECT 1 FROM build_jobs e
+		                       WHERE e.tenant_id=j.tenant_id AND e.platform=j.platform AND e.kind='`+jobKindAPK+`' AND e.status='queued'
+		                         AND (e.created_at<j.created_at OR (e.created_at=j.created_at AND e.id<j.id))))
 		          AND EXISTS (SELECT 1 FROM app_configs c
 		                       WHERE c.tenant_id=j.tenant_id AND c.config_key='`+releaseIOSIdentityConfigKey+`'
 		                         AND CONCAT(UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',
-		                                    JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId'))) IN (`+pairPlaceholders+`))))
+		                                    JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId'))) IN (`+pairPlaceholders+`)
+		                         AND (j.kind<>'`+jobKindAPK+`'
+		                              OR (COALESCE(j.delivery,'`+iosDeliveryTestFlight+`')='`+iosDeliveryTestFlight+`'
+		                                  AND CONCAT(UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',
+		                                             JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId'))) IN (`+uploadPlaceholders+`))
+		                              OR (j.delivery='`+iosDeliveryIPA+`' AND ?=1)))))
 		  ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, args...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		c.Status(http.StatusNoContent)
@@ -681,6 +719,14 @@ func (s *server) completeOTABuildJob(c *gin.Context) {
 // ---- 未签名包与 SBOM ----
 
 func (s *server) uploadUnsignedArtifact(c *gin.Context) {
+	// iOS 没有未签名包。自助上传的 .ipa 也记在 unsigned_* 这几列上，但只能走 /ipa/upload——
+	// 那条路会解包核对身份；从这里进来的话，/ios-release 会把一个没核过的文件当成交付件
+	if job, ok := builderJobFromContext(c); !ok {
+		return
+	} else if job.Platform != buildPlatformAndroid {
+		problem(c, http.StatusConflict, "BUILD_PLATFORM_MISMATCH", "Only Android builds deliver an unsigned package; iOS delivers its .ipa through /ipa/upload")
+		return
+	}
 	s.receiveBuildDelivery(c, "unsigned", unsignedAPKObjectName, s.cfg.ArtifactMaxSizeBytes)
 }
 
