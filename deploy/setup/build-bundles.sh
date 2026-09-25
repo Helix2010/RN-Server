@@ -25,11 +25,16 @@
 # 可复现：-trimpath、tar 固定顺序/属主/mtime（取提交时间）、gzip -n。同一提交、同一 Go 版本构建出的归档
 # 逐字节相同，最后打印的 sha256 就是运维 `install.sh --expect-sha256` 要核对的值。
 # 工作区必须干净（含未跟踪文件）；本地试验可以 RN_BUNDLE_ALLOW_DIRTY=1，提交记为 <sha>-dirty。
+#
+# **「提交」是 agent 提交，不是 HEAD**（deploy/setup/agent-commit.sh：打包机构建输入最后一次变化的提交，
+# 设计 docs/design/agent-version-from-build-inputs-2026-09-25.md）。只改服务端的提交不改变它，于是这里产出的
+# 清单与归档逐字节不变、已有的离线签名与控制台的批准继续有效。2026-09-24 到 09-25 连签五次（序号 20–24），
+# 其间打包机的构建输入一次都没变过。
 set -euo pipefail
 
 OUT="${1:?用法: build-bundles.sh <输出目录>}"
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
-COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+COMMIT="$("$ROOT/deploy/setup/agent-commit.sh")"
 if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
   if [ "${RN_BUNDLE_ALLOW_DIRTY:-}" != 1 ]; then
     echo "工作区不干净（含未跟踪文件），拒绝打包；本地试验用 RN_BUNDLE_ALLOW_DIRTY=1" >&2
@@ -37,7 +42,7 @@ if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
   fi
   COMMIT="$COMMIT-dirty"
 fi
-EPOCH="$(git -C "$ROOT" log -1 --format=%ct HEAD)"
+EPOCH="$(git -C "$ROOT" log -1 --format=%ct "${COMMIT%-dirty}")"
 
 TEMPLATES="$ROOT/deploy/signer/templates"
 for f in 'rn-signer-@INSTANCE@.service' 'rn-signer-@INSTANCE@-check.socket' 'rn-signer-@INSTANCE@-check@.service' 'rn-signer-@INSTANCE@.env'; do

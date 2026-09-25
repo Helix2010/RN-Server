@@ -46,6 +46,9 @@ type agent struct {
 	upgradeError string
 	// haltReason 非空表示这一轮之后要停机让位给升级程序（先写标记，再以 75 退出）
 	haltReason string
+	// selfUpgrade：这台机器有 root 的自升级程序（macOS，launchd + rn-build-agent-upgrade）。
+	// 有的收到「先升级」就写停机标记退出、让它来换；没有的（Linux）原地等——新版本只会由部署换上来
+	selfUpgrade bool
 	// lastMaterialSync 是上一次去问"该装哪些签名材料"的时刻。认领每 10 秒一次，而材料
 	// 几个月才动一次，不必每一轮都问
 	lastMaterialSync time.Time
@@ -77,6 +80,7 @@ func newAgent(cfg config, keys *keyring) *agent {
 		keyCheckEvery:    10 * time.Minute,
 		mirrorProtocol:   mirrorProtocolOr(cfg.MirrorProtocol),
 		pinnedFilesOwner: rootUID,
+		selfUpgrade:      runtime.GOOS == "darwin",
 	}
 }
 
@@ -288,6 +292,10 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 		}
 		return false
 	}
+	if result.Upgrade == nil {
+		// 等到了（或者批准的就是我们这一版）：下次再不一致时要重新说一遍
+		delete(a.lastSaid, "upgrade")
+	}
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 	defer cancel()
 	switch {
@@ -314,6 +322,14 @@ func (a *agent) pollOnce(ctx context.Context) bool {
 			})
 		}
 		return true
+	case result.Upgrade != nil && !a.selfUpgrade:
+		// Linux 没有自升级程序：新版本只会由 CI 或手工换上来，换的时候 systemd 会重启我们。
+		// 退出只会被 systemd 10 秒后拉起、再收到 409、再退出——2026-09-25 一次批准前重启了 299 次，
+		// CI 那边却是绿的。原地等：说一次，照常按认领间隔再问，批准之后下一次认领就恢复派活
+		a.sayOnce("upgrade", "the server approved build-agent "+result.Upgrade.AgentCommit+
+			" and hands out no jobs until this machine runs it; this machine runs "+agentCommit()+
+			". Waiting: on Linux a new version arrives by deployment, not by self-upgrade")
+		return false
 	case result.Upgrade != nil:
 		// 服务端在**没有派任务**的时候说"先升级"，所以这一刻手上一定是空的。写停机标记
 		// 再退出：launchd 看到标记就不再拉起我们，root 的升级程序换完二进制删掉它

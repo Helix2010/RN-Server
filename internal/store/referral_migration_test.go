@@ -4,14 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/Helix2010/RN-Server/internal/referral"
-	"github.com/go-sql-driver/mysql"
 )
 
 // 邀请关系的三个迁移必须能重复执行。
@@ -117,22 +113,5 @@ func TestDBLegacyLoginInsertStillWorks(t *testing.T) {
 
 func openReferralTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("RN_TEST_MYSQL_DSN"))
-	if dsn == "" {
-		t.Skip("RN_TEST_MYSQL_DSN not set; database-backed tests skipped")
-	}
-	driverCfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		t.Fatalf("RN_TEST_MYSQL_DSN is not a valid DSN: %v", err)
-	}
-	st, err := Open(config.Config{
-		MySQL:                driverCfg,
-		MySQLConnectionLimit: 5, MySQLMaxIdleConnections: 2, MySQLConnectionMaxLifetime: 600,
-		MySQLConnectionMaxIdleTime: 60, MySQLQueryTimeout: 10,
-		MySQLInitTimeout: 60, MySQLInitMaxAttempts: 3, MySQLInitRetryDelay: 1, MySQLAutoMigrate: true,
-	})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	return st.DB
+	return openStoreTestDB(t)
 }

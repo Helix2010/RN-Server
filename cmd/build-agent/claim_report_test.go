@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -97,6 +99,8 @@ func TestClaimPausesItselfWhenTheDiskIsTooFull(t *testing.T) {
 func TestUpgradeRequiredWritesTheHaltMarkerAndExits75(t *testing.T) {
 	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
 	rig := newRig(t)
+	// 有自升级程序的机器（macOS）才这么做；Linux 那条见下一个用例
+	rig.agent.selfUpgrade = true
 	const approved = "3333333333333333333333333333333333333333"
 	rig.server.queueProblem(http.StatusConflict, "AGENT_UPGRADE_REQUIRED", map[string]any{"agentCommit": approved})
 	// 队列里还有一条任务：要求升级的时候服务端不派活，代理也不该去做它
@@ -114,6 +118,41 @@ func TestUpgradeRequiredWritesTheHaltMarkerAndExits75(t *testing.T) {
 	}
 	if calls := rig.server.callsTo("/built"); len(calls) != 0 {
 		t.Fatal("the agent took a job after it was told to upgrade")
+	}
+}
+
+// Linux 没有自升级程序：收到「先升级」不退出（退出只会被 systemd 10 秒后拉起、再收到 409），
+// 原地等，说一次；批准之后照常领活。也不写停机标记——systemd 不看它，留着只会误导人。
+func TestUpgradeRequiredWithoutAHelperWaitsInPlace(t *testing.T) {
+	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
+	rig := newRig(t)
+	rig.agent.selfUpgrade = false
+	const approved = "3333333333333333333333333333333333333333"
+	for range 3 {
+		rig.server.queueProblem(http.StatusConflict, "AGENT_UPGRADE_REQUIRED", map[string]any{"agentCommit": approved})
+	}
+	var logs bytes.Buffer
+	rig.agent.log = slog.New(slog.NewTextHandler(&logs, nil))
+
+	for range 3 {
+		if worked := rig.agent.pollOnce(context.Background()); worked {
+			t.Fatal("no job was handed out, yet the agent says it worked")
+		}
+	}
+	if rig.agent.haltReason != "" {
+		t.Fatalf("a machine without an upgrade helper must not plan to halt: %q", rig.agent.haltReason)
+	}
+	if _, err := os.Stat(haltPath(rig.agent.cfg.StateDir)); !os.IsNotExist(err) {
+		t.Fatalf("no halt marker on Linux: %v", err)
+	}
+	if n := strings.Count(logs.String(), "hands out no jobs"); n != 1 {
+		t.Fatalf("the wait is said once, not every poll (%d times):\n%s", n, logs.String())
+	}
+
+	// 批准到了（服务端不再回 409）：照常领活
+	rig.server.queueClaim(claimBody("bld_afterApproval", "apk"))
+	if worked := rig.agent.pollOnce(context.Background()); !worked {
+		t.Fatal("once the versions agree the agent must take jobs again")
 	}
 }
 

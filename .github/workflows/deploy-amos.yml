@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       deploy-needed: ${{ steps.changes.outputs.deploy-needed }}
+      agent-commit: ${{ steps.agent.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,11 +39,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # 只改文档的提交不该重新部署。不是为了省那几分钟：**每次部署都会产出一份新的
-      # 安装包，而安装包必须由平台管理员在离线机器上重新签一次**（提交号通过
-      # -X main.commit 编进二进制，提交变了摘要就变）。为一个改错别字的提交让人再走
-      # 一遍离线签名，人就会开始嫌它烦——而那道签名是"服务端被攻破也换不出能过验的
-      # 清单"的全部依据。
+      # 只改文档的提交不该重新部署。安装包与打包机现在按 agent 提交出版本（下面「Work out the
+      # agent commit」），只改文档或服务端都不会逼人重签；但服务端二进制每次部署都要停服务、跑迁移，
+      # 纯文档的提交没必要走这一趟。那道离线签名是"服务端被攻破也换不出能过验的清单"的全部依据，
+      # 别让人因为签得太勤而开始嫌它烦。
       #
       # 跳的只有 deploy。**validate 永远跑**：有测试是读文档的
       # （TestReleaseKeyTableMatchesTheDeployedKey 读 SIGNING_MATERIAL.md，
@@ -88,8 +88,22 @@ jobs:
         if: steps.changes.outputs.deploy-needed != 'true' || vars.AMOS_DEPLOY_ENABLED != 'true'
         run: go build -o "$RUNNER_TEMP/server-link-check" ./cmd/server
 
+      # 打包机程序的版本号：打包机构建输入最后一次变化的提交，不是 HEAD
+      # （设计 docs/design/agent-version-from-build-inputs-2026-09-25.md）。只改服务端时它不变，
+      # 安装包逐字节相同，已有的签名与批准继续有效，deploy 也会跳过安装包与 amos 的打包机
+      - name: Work out the agent commit
+        id: agent
+        run: |
+          commit="$(deploy/setup/agent-commit.sh)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          if [ "$commit" = "$GITHUB_SHA" ]; then
+            echo "::notice title=打包机版本::这一推改了打包机的构建输入，安装包换成 $commit，要离线签名并在控制台批准"
+          else
+            echo "::notice title=打包机版本::打包机的构建输入没变，仍是 $commit；只改了服务端，不用重签"
+          fi
+
       # 归档可复现：这里打印的 sha256 就是运维装签名闸时 --expect-sha256 要核对的值。
-      # build-bundles.sh 按 HEAD 算可复现归档、要求工作区干净，所以产物一律写在 RUNNER_TEMP。
+      # build-bundles.sh 按 agent 提交算可复现归档、要求工作区干净，所以产物一律写在 RUNNER_TEMP。
       - name: Build machine bundles and the amos binaries
         if: steps.changes.outputs.deploy-needed == 'true' && vars.AMOS_DEPLOY_ENABLED == 'true'
         run: |
@@ -102,9 +116,17 @@ jobs:
             go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/amos/rn-server" ./cmd/server
           # -X main.commit：代理认领时自报的版本。**不打这个戳它就永远报空**，而版本闸的
           # 判据是"已批准 != 空 && 自报 != 已批准 → 409"——空同样算不相等。于是只要 amos
-          # 上跑着一个没打戳的二进制，平台管理员就**永远不能用版本闸**
+          # 上跑着一个没打戳的二进制，平台管理员就**永远不能用版本闸**。
+          # 参数与 build-bundles.sh 里 linux 那份完全相同（含 -buildvcs=false，否则 Go 会把 HEAD
+          # 写进二进制），所以它就是安装包里的 builder/bin/build-agent，下面核对这一点
           GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build -trimpath -ldflags="-s -w -X main.commit=${{ github.sha }}" -o "$RUNNER_TEMP/amos/build-agent" ./cmd/build-agent
+            go build -trimpath -buildvcs=false -ldflags="-s -w -X main.commit=${{ steps.agent.outputs.commit }}" -o "$RUNNER_TEMP/amos/build-agent" ./cmd/build-agent
+          want="$(jq -r '.bundles.builder.files[] | select(.name == "bin/build-agent") | .sha256' "$RUNNER_TEMP/machine-bundles/manifest.json")"
+          got="$(sha256sum "$RUNNER_TEMP/amos/build-agent" | cut -d' ' -f1)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::给 amos 编的 build-agent（$got）与安装包里的（$want）不是同一份字节：两处编译参数不一致"
+            exit 1
+          fi
           ls -l "$RUNNER_TEMP/amos"
       - name: Hand the payload to deploy
         if: steps.changes.outputs.deploy-needed == 'true' && vars.AMOS_DEPLOY_ENABLED == 'true'
@@ -149,7 +171,7 @@ jobs:
       - run: go vet ./...
       # 这几个脚本以 root 跑在服务器上（install.sh 由服务端下发给新机器）：shellcheck 不过不发
       - name: shellcheck
-        run: shellcheck internal/machinesetup/install.sh deploy/setup/build-bundles.sh deploy/amos/rn-foundation-apply
+        run: shellcheck internal/machinesetup/install.sh deploy/setup/build-bundles.sh deploy/setup/agent-commit.sh deploy/amos/rn-foundation-apply
       - run: jq empty contracts/openapi.json
       - name: Wait for MySQL
         # 镜像的初始化脚本先起一个不听 TCP 的临时实例、建完库再重启；真连上一次再跑测试，
@@ -165,9 +187,8 @@ jobs:
           echo "::error::MySQL 三分钟内没有就绪"
           exit 1
       # 两个有库测的包共用同一个库（迁移、build.machines 等平台级单行），并行跑会互相踩，
-      # 所以分两步先后跑，而且**顺序不能反**：store 的部分库测用的是 internal/api 用例迁移出来的表
-      # （app_configs 等），新库上先跑 store 会报表不存在。单个包不再加 -p 1：只有一个测试进程，
-      # -p 1 只会让编译也串行（2026-09-25 实测编译 31 秒 → 18 秒）
+      # 所以分两步先后跑。两个包各自在首次连库时跑一遍迁移，先后顺序不再是约束。单个包不再加
+      # -p 1：只有一个测试进程，-p 1 只会让编译也串行（2026-09-25 实测编译 31 秒 → 18 秒）
       - run: go test -race ./internal/api/
       - run: go test -race ./internal/store/
 
@@ -306,6 +327,40 @@ jobs:
           fi
           [ "$want" = "$got" ] || echo "::warning::amos 上的 rn-foundation-apply 与本仓库版本不一致，考虑重跑 setup-ci-deploy.sh"
 
+      # 安装包与 amos 的打包机按 agent 提交出版本：只改服务端时它们与 amos 上的逐字节相同，跳过传输与
+      # apply（打包机不重启）。**守门**：版本号相同、字节却不同，说明 agent-commit.sh 的输入清单漏了东西
+      # （或工具链变了）——不能让一份内容不同的程序顶着已批准的版本号上线。守门只挡安装包与打包机，
+      # 服务端照常发布（「安装包出问题不挡服务端发布」），job 在最后一步失败
+      - name: Compare with what amos already has
+        id: compare
+        env:
+          AGENT_COMMIT: ${{ needs.build.outputs.agent-commit }}
+        run: |
+          manifest="$RUNNER_TEMP/machine-bundles/manifest.json"
+          new_sha="$(sha256sum "$manifest" | cut -d' ' -f1)"
+          [ "$(jq -r .commit "$manifest")" = "$AGENT_COMMIT" ] || { echo "::error::清单的 commit 不是 build 算出的 agent 提交"; exit 1; }
+          current=/opt/rn-foundation/machine-bundles/current/manifest.json
+          old_sha="$(ssh amos "sha256sum $current 2>/dev/null | cut -d' ' -f1")"
+          old_commit="$(ssh amos "jq -r .commit $current 2>/dev/null || true")"
+          if [ "$new_sha" = "$old_sha" ]; then
+            echo "bundles-changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=安装包没变::amos 上已经是 $AGENT_COMMIT 的这一份，不传、不 apply，签名与批准照旧有效"
+          elif [ "$old_commit" = "$AGENT_COMMIT" ]; then
+            echo "bundles-changed=false" >> "$GITHUB_OUTPUT"
+            echo "agent-changed=false" >> "$GITHUB_OUTPUT"
+            echo "mismatch=amos 上 $AGENT_COMMIT 的清单是 $old_sha，这次构建出 $new_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            echo "bundles-changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          new_agent="$(sha256sum build-agent | cut -d' ' -f1)"
+          old_agent="$(ssh amos 'sha256sum /opt/rn-build-agent/build-agent 2>/dev/null | cut -d" " -f1')"
+          if [ "$new_agent" = "$old_agent" ]; then
+            echo "agent-changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "agent-changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload binary
         # 先写 .part 再改名：传到一半断掉时暂存目录里不会留下一个像是完整的二进制
         run: |
@@ -322,6 +377,7 @@ jobs:
       # 核对、原子切换 /opt/rn-foundation/machine-bundles/current，不执行其中任何东西。
       # 已经在跑的签名闸与构建机不从这里升级。
       - name: Upload machine bundles
+        if: steps.compare.outputs.bundles-changed == 'true'
         run: |
           if ! ssh amos 'grep -q "^bundles)" /usr/local/sbin/rn-foundation-apply'; then
             echo "::error::amos 上的 rn-foundation-apply 还不认 bundles 子命令：在那台机器上重跑 deploy/amos/setup-ci-deploy.sh 更新它"
@@ -339,7 +395,9 @@ jobs:
               mv '$STAGE/machine-bundles.part' '$STAGE/machine-bundles'"
 
       - name: Apply machine bundles
-        run: ssh amos "sudo /usr/local/sbin/rn-foundation-apply bundles $GITHUB_SHA"
+        if: steps.compare.outputs.bundles-changed == 'true'
+        # apply 核对清单里的 commit 与这个参数相同：传的是 agent 提交，不是 GITHUB_SHA
+        run: ssh amos "sudo /usr/local/sbin/rn-foundation-apply bundles ${{ needs.build.outputs.agent-commit }}"
 
       # ---- 打包机 ----------------------------------------------------------
       #
@@ -349,12 +407,23 @@ jobs:
       # 就能以受信构建机的名义给签名闸送包，并在签名闸所在的机器上执行任意代码。开关是仓库 Variables 里的 AMOS_DEPLOY_BUILD_AGENT，
       # 不建或不是 'true' 即关；关着时打包机手工部署，见 deploy/build-agent/README.md。
       - name: Upload the build agent
-        if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
+        if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true' && steps.compare.outputs.agent-changed == 'true'
         run: |
           ssh amos "set -eu; cat > '$STAGE/build-agent.part'; mv '$STAGE/build-agent.part' '$STAGE/build-agent'" < build-agent
 
       - name: Apply the build agent
-        if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
+        if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true' && steps.compare.outputs.agent-changed == 'true'
         # 放在服务端之后：代理起来第一件事是连服务端登记公钥。
         # 这一步不会阻塞等构建排空——代理手上有活时，新二进制就位、做完自动生效
         run: ssh amos 'sudo /usr/local/sbin/rn-foundation-apply build-agent'
+
+      # 守门失败放在最后：服务端已经照常发布，安装包与打包机没动。恢复办法：把漏掉的输入补进
+      # deploy/setup/agent-commit.sh（工具链变了的话，改 go.mod 本身就是输入变化）——那个提交改了脚本，
+      # agent 提交随之前进，下一次部署出新版本，照常签名、批准
+      - name: Refuse bundles that changed under the same version
+        if: steps.compare.outputs.mismatch != ''
+        env:
+          MISMATCH: ${{ steps.compare.outputs.mismatch }}
+        run: |
+          echo "::error title=同一版本号、不同字节::$MISMATCH。服务端已发布，安装包与打包机没换。deploy/setup/agent-commit.sh 的输入清单漏了会影响安装包的文件（或工具链变了）：补上之后再推一次，版本号会前进"
+          exit 1

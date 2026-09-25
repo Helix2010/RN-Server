@@ -5,25 +5,59 @@ import (
 	"database/sql"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/go-sql-driver/mysql"
 )
 
-func openMigrationTestDB(t *testing.T) *sql.DB {
+// openStoreTestDB 是这个包所有库测的入口：连测试库，第一次连的时候把迁移跑一遍，之后复用同一个连接池
+// （与 internal/api 的 openTestDB 同一个做法）。
+//
+// 以前 openMigrationTestDB 只连不迁移，有的用例用的表（app_configs 等）是 internal/api 的用例迁移出来的：
+// 新库上先跑这个包就报表不存在，CI 里两步的先后顺序因此成了一条没写下来的约束（2026-09-25 本地复现）。
+// Migrate 有 GET_LOCK、已应用的版本跳过，与 internal/api 在同一个库上各跑一遍是安全的。
+var storeTestDB struct {
+	once sync.Once
+	db   *sql.DB
+	err  error
+}
+
+func openStoreTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := strings.TrimSpace(os.Getenv("RN_TEST_MYSQL_DSN"))
 	if dsn == "" {
 		t.Skip("RN_TEST_MYSQL_DSN not set; database-backed tests skipped")
 	}
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
+	storeTestDB.once.Do(func() {
+		driverCfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			storeTestDB.err = err
+			return
+		}
+		st, err := Open(config.Config{
+			MySQL:                driverCfg,
+			MySQLConnectionLimit: 5, MySQLMaxIdleConnections: 2, MySQLConnectionMaxLifetime: 600,
+			MySQLConnectionMaxIdleTime: 60, MySQLQueryTimeout: 10,
+			MySQLInitTimeout: 60, MySQLInitMaxAttempts: 3, MySQLInitRetryDelay: 1, MySQLAutoMigrate: true,
+		})
+		if err != nil {
+			storeTestDB.err = err
+			return
+		}
+		storeTestDB.db = st.DB
+	})
+	if storeTestDB.err != nil {
+		t.Fatalf("open and migrate the test database: %v", storeTestDB.err)
 	}
-	t.Cleanup(func() { db.Close() })
-	if err := db.Ping(); err != nil {
-		t.Fatalf("ping test database: %v", err)
-	}
-	return db
+	return storeTestDB.db
+}
+
+func openMigrationTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	return openStoreTestDB(t)
 }
 
 // 迁移把"现在生效的刷新间隔"搬进 ttlSeconds。取错值的后果只有线上看得见：存量

@@ -204,9 +204,12 @@ CI 部署服务端时会把同一提交构建的安装包放到服务端机器�
 
 ```bash
 # -X main.commit 不能省：代理认领时自报的就是它，不打戳永远报空，而版本闸把"报空"也算作
-# 与已批准值不一致——这台机器会在平台管理员钉住任何一版时被一起挡下来，且控制台上它仍然显示在线
-COMMIT=$(git rev-parse HEAD)
-GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.commit=$COMMIT" -o build-agent  ./cmd/build-agent
+# 与已批准值不一致——这台机器会在平台管理员钉住任何一版时被一起挡下来，且控制台上它仍然显示在线。
+# 值是 agent 提交（打包机构建输入最后一次变化的提交），**不是 HEAD**：安装包与控制台批准的都是它。
+# 写成 HEAD 的话自报值永远对不上批准值，而 Linux 代理对不上时只是原地等、不退出——控制台上显示在线，
+# 就是一直领不到任务。-buildvcs=false 与安装包同一组参数，编出来的就是安装包里那一份字节
+COMMIT=$(deploy/setup/agent-commit.sh)
+GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -X main.commit=$COMMIT" -o build-agent  ./cmd/build-agent
 GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-runner ./cmd/build-agent/build-runner
 sha256sum build-agent build-runner                        # 记下来
 scp build-agent build-runner <构建机>:~/
