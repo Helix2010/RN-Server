@@ -11588,14 +11588,13 @@
       },
       "MachineLiveness": {
         "type": "object",
-        "description": "What this machine looks like right now, as opposed to what the registry says it is. The two live apart (the registry is a versioned config document written by admins; this comes from the liveness table a machine writes on every claim and heartbeat) but must be read together: pendingInstall counts tenants whose certificate and profile are delivered (stored and sealed to the registered key) but that this machine does not report — only for active iOS builders; which tenants those are is listed on the Apple certificates & keys page (GET /v1/admin/platform/ios-material/tenants?machine=<id>). missingTenants is always an empty array, kept only for consoles that still require it. Always present; a machine that never reported shows nulls and empty arrays rather than making the page fail.",
+        "description": "What this machine looks like right now, as opposed to what the registry says it is. The two live apart (the registry is a versioned config document written by admins; this comes from the liveness table a machine writes on every claim and heartbeat) but must be read together: pendingInstall counts tenants whose certificate and profile are delivered (stored and sealed to the registered key) but that this machine does not report — only for active iOS builders; which tenants those are is listed on the Apple certificates & keys page (GET /v1/admin/platform/ios-material/tenants?machine=<id>). Always present; a machine that never reported shows nulls and empty arrays rather than making the page fail.",
         "required": [
           "lastSeenAt",
           "online",
           "agentCommit",
           "freeGb",
           "appleTeams",
-          "missingTenants",
           "signingExpiresAt",
           "pausedReason",
           "upgradeError",
@@ -11659,27 +11658,6 @@
               "type": "string"
             },
             "description": "Capabilities the machine reported on its last claim, e.g. ios-ipa-delivery. Empty for older agents."
-          },
-          "missingTenants": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "tenantId": {
-                  "type": "string"
-                },
-                "slug": {
-                  "type": "string"
-                },
-                "teamId": {
-                  "type": "string"
-                },
-                "bundleId": {
-                  "type": "string"
-                }
-              }
-            },
-            "description": "Deprecated: always an empty array (kept for older consoles that parse it as required). Use pendingInstall."
           },
           "pendingInstall": {
             "type": "integer",

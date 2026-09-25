@@ -404,8 +404,6 @@ func machineLivenessView(live machineLiveness, machine gin.H, delivered []iosSig
 		"appleTeams":  []gin.H{},
 		// capabilities 是机器自报的能力（例如能不能把 .ipa 交回平台）
 		"capabilities": []string{},
-		// missingTenants：线上旧控制台按必填解析，恒发空数组；新控制台看 pendingInstall。下一版删
-		"missingTenants": []gin.H{},
 		// pendingInstall：材料已下发（证书与描述文件都在平台上、新装的 Mac 解得开）、这台却没装上的
 		// 租户数。材料没传齐的不算——那是租户的事，在「Apple 证书与密钥」页上显示，不挂在机器名下
 		"pendingInstall":   0,

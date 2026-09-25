@@ -517,9 +517,9 @@ func TestDBMachineListCarriesLivenessAndTheSigningGap(t *testing.T) {
 	if live["pendingInstall"] != float64(0) {
 		t.Fatalf("material nobody uploaded is not pending on the machine: %v", live["pendingInstall"])
 	}
-	// 线上旧控制台按必填解析 missingTenants：恒发空数组
-	if gaps, ok := live["missingTenants"].([]any); !ok || len(gaps) != 0 {
-		t.Fatalf("missingTenants must stay an empty array for the old console: %v", live["missingTenants"])
+	// 逐条列缺材料租户的旧字段已经删了：租户多时会挤满卡片（设计 ios-credentials-overview §10.3）
+	if _, still := live["missingTenants"]; still {
+		t.Fatalf("missingTenants is gone; the card only shows pendingInstall: %v", live)
 	}
 
 	// 那个租户的证书与描述文件传上来了（下发了），这台没装上：算一个
