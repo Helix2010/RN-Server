@@ -25,14 +25,22 @@
    - RN 后端拿授权码换 access token，再调 userinfo，得到 `username`（即 cid）、`account`、`email`；
    - 由此带来三点：
      - **租户归属与角色由各系统自己管**：RN 本地维护「哪个 cid 是哪个租户的什么角色」，与 web3-rwa 的 `tenant_admin(tenant_id, cid)` 同一个做法；
-     - **不自动开户**：先由管理员添加成员，被邀请人第一次用 CID 登录时完成绑定；
+     - **不自动开户**：先由管理员在本系统建账号，本人用这个账号登录后绑定 CID 账号，之后只走 CID（用户 09-25 提出的方案，§4.3）；
      - **敏感操作用 RN 自己的 TOTP 再验证**：CID 不告诉我们对方登录时用了几个因素、何时登录的。
 4. **RN 与 pm-cup 的租户对应不经过 CID**。同一个人在两边各自被授权；RN 对 pm-cup 的业务数据关联仍用 `services.predict.scopeId`，登录不用它。
-5. **要认证中心团队给几样东西、答几个问题**（§6）。最关键的三件：
-   - 给 RN、pm-cup 各登记一个应用；
-   - 一个应用能配多个控制台域名；
-   - 「按域名放行」要不要逐人绑定，能不能给 RN 一个只管本应用的受限凭据。
-6. **RN 本地账号只作应急入口**：每个租户一个，由平台建，强制 TOTP；CID 不可用时还能进。账号模型、授权改造不依赖 CID，可以先做（阶段 S0）。
+5. **RN 与 pm-cup 建议登记成两个应用**。用户提议当成同一个应用、按域名区分，技术上能行（web3-rwa 自己就是一个应用配所有商户域名），但有两个坑（§4.6）：
+   - 「按域名放行」从 web3-rwa 的用法看是**整份覆盖**：同一个人被两个系统各推一次域名清单，后推的会冲掉先推的；
+   - client_secret 与管理凭据要两个团队共用。
+   分成两个应用，单点登录的体验没有区别：CID 的登录态在 `login.chainup.com` 上，登一次，两边都能进。
+6. **要认证中心团队给几样东西、答几个问题**（§6）。最关键的是：
+   - CID 没有自助注册（web3-rwa 是用管理接口按邮箱替人开号）；
+   - 「按域名放行」要不要逐人绑定，是覆盖还是追加；
+   - 能不能给 RN 一个只管本应用的受限凭据。
+   这几条决定「登录后引导绑定」能不能让用户自己一步做完。
+7. **本地账号的两种用途**：
+   - 平时只是绑定 CID 之前的过渡：绑定之后本地口令作废；
+   - 另外每个租户保留一个平台建的应急账号（强制 TOTP、不绑定），CID 不可用时还能进；
+   - 账号模型、本地登录、授权改造都不依赖 CID，可以先做（阶段 S0）。
 
 ## 1. 现状
 
@@ -54,6 +62,8 @@ CID 的能力（从 web3-rwa 与 `authorization-java-sdk` 看到的；服务端�
 - 应用登记：`/admin/v1/applications {clientName, domain}` 返回 client_id / secret。
 - 按域名放行：`/admin/v1/applications/{name}/bind-domains [{account, domains}]`，给每个人推一份允许登录的域名。
   web3-rwa 默认绑「租户主域名 + `console.` 前缀」（`TenantDomainServiceImpl.java:170-224`）。
+- **没有自助注册**：web3-rwa 添加商户管理员时，用管理接口 `POST /admin/v1/users` 按邮箱替人开号，拿到 cid 再推域名（`chainup-tenant/.../AdminController.java:349-381`）。
+- **按域名放行疑似整份覆盖**：web3-rwa 每次从自己库里算出这个人的**完整**域名清单再推，没有域名时推空清单（`TenantDomainServiceImpl.java:170-224`）。服务端源码不在本机，要向 CID 团队确认。
 - 管理接口（建用户、绑域名）用的是一个**能管所有应用和所有用户的超级账号**（`BaseController.java:32-42`）。
 - 看不到的：二次验证、登录时间 / 认证方式的回传、后台登出通知、SLA。
 
@@ -78,9 +88,9 @@ CID 不是 OIDC 的代价：
 
 | 初稿里拟新增 | 处理 | 理由 |
 | --- | --- | --- |
-| `tenant_admin_accounts` 租户账号表 | **新建** | 「控制台上的人」是新实体：一个租户多个人，登录时要按 (租户, cid) 查找，有状态、角色、邀请；`app_configs` 一键一行的 JSON 承载不了按人查找与唯一约束 |
+| `tenant_admin_accounts` 租户账号表 | **新建** | 「控制台上的人」是新实体：一个租户多个人，登录时要按 (租户, cid) 查找，有状态、角色、绑定；`app_configs` 一键一行的 JSON 承载不了按人查找与唯一约束 |
 | `tenant_admin_identities` 外部身份表 | **取消，合并进账号表** | 一个账号只绑一个外部身份，两列（`idp`、`idp_subject`）加唯一键即可 |
-| 邀请表 | **取消，合并进账号表** | 邀请就是「还没绑定的账号」：`status=invited` + 邀请码摘要 + 过期时间 |
+| 邀请表 | **取消** | 用「初始口令 + 待绑定」代替邀请链接（§4.3）：还没绑定的账号就是 `status=pending_bind` 的账号，不需要另一张表 |
 | 登录流程临时状态表（state、PKCE） | **取消，用加密 Cookie** | 10 分钟、一次性、只有发起它的浏览器用；用 `secretbox` 加密后放进 Cookie，不落库 |
 | CID 客户端配置 | **复用 `app_configs`**，`tenant_id=0`、键 `auth.cid` | 平台级一份，secret 用 `secretbox` 加密 |
 | 每租户登录方式 | **复用 `app_configs`**，键 `auth.login` | 租户级配置，一键一行 |
@@ -95,24 +105,26 @@ CREATE TABLE tenant_admin_accounts (
   tenant_id BIGINT UNSIGNED NOT NULL COMMENT '所属租户 tenants.id；一个账号只属于一个租户',
   role VARCHAR(16) NOT NULL COMMENT 'admin=租户范围内可写；viewer=按只读白名单访问',
   display_name VARCHAR(120) NOT NULL COMMENT '显示名，添加成员时填写，仅用于界面',
-  email VARCHAR(255) NOT NULL COMMENT '添加成员时填写的邮箱，用于发邀请与界面显示；不作登录依据、不唯一',
-  idp VARCHAR(32) NULL COMMENT '外部身份源：chainup-cid；NULL=未绑定（邀请中）或本地应急账号',
-  idp_subject VARCHAR(120) NULL COMMENT 'CID userinfo 的 username（cid）；绑定后不变',
-  status VARCHAR(16) NOT NULL COMMENT 'invited=已邀请未绑定；active=可登录；disabled=已停用（会话立即失效）',
-  invite_token_hash CHAR(64) NULL COMMENT '邀请码 SHA-256；绑定或过期后置 NULL',
-  invite_expires_at DATETIME(3) NULL COMMENT '邀请过期时间（UTC）；NULL=没有待用的邀请',
-  password_hash VARCHAR(255) NULL COMMENT '仅本地应急账号：scrypt；CID 账号为 NULL',
+  login_name VARCHAR(64) NOT NULL COMMENT '本地登录名，建号时填写，租户内唯一；成员绑定 CID 后不再用于登录',
+  email VARCHAR(255) NOT NULL COMMENT '建号时填写的邮箱，用于界面显示、通知，以及按邮箱替人开 CID 号；不作登录依据、不唯一',
+  kind VARCHAR(16) NOT NULL COMMENT 'member=普通成员（必须绑定 CID）；break_glass=平台建的应急账号（不绑定、只用本地口令 + TOTP）',
+  idp VARCHAR(32) NULL COMMENT '外部身份源：chainup-cid；NULL=尚未绑定，或应急账号',
+  idp_subject VARCHAR(120) NULL COMMENT 'CID userinfo 的 username（cid）；绑定后不变，换绑要先由平台管理员解绑',
+  status VARCHAR(16) NOT NULL COMMENT 'pending_bind=只能用初始口令登录且只能去绑定页；active=可登录（成员只走 CID，应急账号只走本地）；disabled=已停用（会话立即失效）',
+  password_hash VARCHAR(255) NULL COMMENT 'scrypt。成员：初始口令，绑定成功后置 NULL；应急账号：长期口令',
+  password_expires_at DATETIME(3) NULL COMMENT '成员初始口令的过期时间（UTC，建号后 72 小时）；NULL=应急账号或已绑定',
   totp_secret_enc VARBINARY(255) NULL COMMENT 'TOTP 密钥（secretbox 加密）；NULL=尚未登记，首次登录强制登记',
   created_by VARCHAR(120) NOT NULL COMMENT '添加人 actor',
   created_at DATETIME(3) NOT NULL COMMENT '创建时间（UTC）',
   last_login_at DATETIME(3) NULL COMMENT '最近登录时间（UTC）；NULL=从未登录',
   PRIMARY KEY (id),
+  UNIQUE KEY uq_account_login (tenant_id, login_name),
   UNIQUE KEY uq_account_idp (tenant_id, idp, idp_subject),
   KEY ix_account_tenant (tenant_id, status)
 ) ENGINE=InnoDB COMMENT='租户控制台账号：平台或租户 admin 添加，RN-Server 登录与授权时读';
 ```
 
-- 唯一键是 (租户, idp, subject)：同一个 cid 可以分别是 anyfun 和 predict 的成员，各算一个账号、各有角色。
+- 唯一键是 (租户, idp, subject)：同一个 cid 可以分别是 anyfun 和 predict 的成员，各算一个账号、各有角色；同一个租户里一个 cid 只能绑一个账号。
 - 不以 email 作用户名或唯一键：pm-cup 与 CID 的 email 都能改，拿它当身份会接错人。
 - 平台管理员照旧是环境变量里那一个，不进这张表。
 
@@ -149,8 +161,9 @@ CREATE TABLE tenant_admin_accounts (
 
 - **登录页**：主按钮「用 ChainUp 账号登录」；另有一个不显眼的「应急登录」（本地账号）。
 - **成员页（租户 admin 与平台管理员可见）**：
-  - 添加成员：填显示名、邮箱、角色，生成邀请链接；
-  - 停用、改角色、重发邀请；
+  - 添加成员：填显示名、登录名、邮箱、角色，生成初始口令（只显示一次，72 小时内有效）；
+  - 停用、改角色；
+  - 解绑并重置初始口令：本人的 CID 账号丢了或要换时用，只有平台管理员能做；
   - 列表显示绑定状态和最近登录时间。
   - 租户 admin 能不能加别的 admin，见 §9 待定问题。
 - **平台维护**：
@@ -187,7 +200,7 @@ sequenceDiagram
   S->>I: 换令牌（client_secret_basic + code_verifier），服务端直连
   S->>I: userinfo（客户端 Basic + access_token）
   I-->>S: username(cid)、account、email
-  S->>S: 在「域名租户」下按 (chainup-cid, cid) 找账号；邀请中的在此完成绑定
+  S->>S: 在「域名租户」下按 (chainup-cid, cid) 找已绑定的账号；找不到就拒绝，提示先用本系统账号登录并绑定
   S-->>U: 设 rn_admin_session（Strict），302 到 target（相对路径）
 ```
 
@@ -211,21 +224,57 @@ sequenceDiagram
   - 登录后与登出后的跳转一律用相对路径或登记的控制台域名，不用 `externalOrigin`——它拼出来的是 api.*（`server.go:344-348`）。
 - **令牌**：access token 用完即弃，不存、不下发浏览器；userinfo 返回的 `username` 为空或格式不对就拒绝。
 
-### 4.3 成员的添加、绑定与移除
+### 4.3 成员的添加与绑定（先用本系统账号登录，再绑定 CID）
 
-- **添加**：
-  - 平台管理员或租户 admin 在成员页填邮箱、角色，RN 生成一次性邀请链接（24 小时，只存摘要），通过邮件或别的渠道发给本人；
-  - 被邀请人点链接 → 用 CID 登录 → 回调时 RN 把这个 cid 绑到该账号，状态变 active；
-  - 邀请链接本身就是授权凭据。
-  - 如果 CID 确认 userinfo 的 email 经过验证，绑定时再要求 email 一致（§6 第 3 条）。
-- **按域名放行**：如果 CID 要求逐人绑定域名才能登录，有两种办法：
-  1. 首选：CID 给 RN 应用一个只能管本应用用户与域名的受限凭据，RN 在绑定时自动调用；
-  2. 否则：由平台管理员在 CID（或 web3-rwa 平台控制台的「统一认证」页）手工绑定。
-  - 不论哪种，**RN 都不持有那个能管所有应用的超级账号**。
-- **不自动开户**：用 CID 登录、但在这个租户下没有账号的人，一律拒绝，提示「请联系管理员添加」。
-  - 在 CID 那边换了账号（cid 变了）的人，要重新邀请；
-  - 在 RN 停用的人，换个 cid 也进不来。
-- **移除**：在 RN 停用立即生效，因为每次请求都查账号状态；CID 那边停用，下次登录就进不来。
+这是用户 09-25 提出的方案：各系统先支持自己的账号登录，但必须绑定统一账号；没绑定的，登录后引导绑定；绑定之后直接走统一登录。
+这是常见的「账号关联迁移」做法，对 pm-cup 尤其合适：它已经有一批 `tenant_admin` 账号，不用逐个替人开 CID 号再通知。
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending_bind: 管理员建号，发初始口令
+  pending_bind --> pending_bind: 用初始口令登录，只能进绑定页
+  pending_bind --> active: 完成 CID 绑定（本地口令作废）
+  active --> active: 以后只用 CID 登录
+  active --> pending_bind: 平台管理员解绑并重置初始口令
+  pending_bind --> disabled: 停用 / 初始口令过期未绑
+  active --> disabled: 停用
+```
+
+**添加**：租户 admin 或平台管理员建账号，填登录名、邮箱、角色，拿到初始口令（72 小时有效），交给本人。
+
+**第一次登录**：
+- 用登录名 + 初始口令登录，接着登记 TOTP；
+- 这时的会话是「待绑定」状态：除了绑定页、会话查询、登出，别的接口一律 403。
+
+**绑定**：
+1. 本人在绑定页点「绑定 ChainUp 账号」；
+2. RN 从**这个已登录的会话**发起一次 CID 授权：state 与本会话绑定，带 PKCE；
+3. CID 登录后回调，RN 用授权码换令牌、调 userinfo 拿到 cid 和邮箱；
+4. 页面显示「将绑定到 ChainUp 账号 ×××（邮箱）」，本人确认后才落库；
+5. 落库时本地口令置空，状态变 active，写审计，并通知本租户的 admin。
+
+**以后**：只能用 CID 登录。用登录名 + 口令登录会被拒绝，提示「请用 ChainUp 账号登录」。
+
+**CID 账号从哪来**：CID 没有自助注册。
+- 本人已有 CID 账号（例如已经在用 web3-rwa）：直接登录完成绑定——前提是 CID 不要求先给他绑定 RN 的域名；
+- 没有 CID 账号，或者 CID 要求逐人放行域名：绑定页先让本人填邮箱，RN 用受限管理凭据按邮箱开号（已有则查出 cid），并放行本控制台域名，再跳去 CID 登录；
+  回调拿到的 cid 必须与开号返回的一致，才算本人确实掌握这个 CID 账号；
+- 拿不到受限凭据时，只能由平台管理员在 CID（或 web3-rwa 平台控制台的「统一认证」页）替他开号、放行，本人再来绑定；
+- 不论哪种，**RN 都不持有那个能管所有应用的超级账号**。
+
+**要防的**：
+- **绑定 CSRF**：攻击者诱导受害者的会话，完成一次用攻击者 CID 账号的授权，于是受害者的 RN 账号绑到了攻击者名下。
+  防法：state 绑定本会话；PKCE（攻击者的授权码配不上受害者的 verifier）；落库前显示 CID 账号并要本人确认。
+- 发起绑定前 10 分钟内必须输过 TOTP。
+- 初始口令 72 小时不绑就作废，要管理员重置。
+
+**移除与换绑**：
+- 在 RN 停用立即生效（每次请求都查账号状态）；CID 那边停用，下次登录就进不来；
+- 本人的 CID 账号丢了或要换：只能由平台管理员「解绑并重置初始口令」，本人重新走一遍绑定。
+
+**不自动开户**：用 CID 登录、但在这个租户下没有已绑定账号的人，一律拒绝。在 RN 停用的人，换个 cid 也进不来。
+
+**应急账号**：`kind=break_glass`，平台建，只用本地口令 + TOTP，不绑定，不走上面的流程。
 
 ### 4.4 登出
 
@@ -248,30 +297,57 @@ CID 不回传登录时间和认证方式，所以 RN 自己做二次验证：
 
 这样即便 CID 某个账号的口令泄露，也做不了敏感操作。以后 CID 如果能强制二次验证并回传认证时间，再考虑放宽。
 
+### 4.6 RN 与 pm-cup 用一个应用还是两个
+
+用户提议把 pm 和 RN 当成 CID 里的同一个应用，用不同的域名区分。
+
+- **能行的部分**：web3-rwa 就是一个应用配所有商户域名，回调地址按请求域名变化（`redirect-uri: '{baseUrl}/client/v1/oauth/login'`），说明 CID 支持一个应用多个域名。
+- **坑一：按域名放行疑似整份覆盖。**
+  - web3-rwa 每次推的都是某个人的完整域名清单（§1）；
+  - 两个系统共用一个应用时，同一个人被 RN 推一次 `[console.anyfun.win …]`、被 pm 推一次 `[pm 商户后台域名 …]`，后推的会冲掉先推的，这个人就登不进另一边；
+  - 要共用，就得有一方统管两边的域名清单，或者 CID 提供追加 / 删除单个域名的接口。
+- **坑二：凭据共用。**
+  - 一个应用只有一份 client_secret 和一把管理凭据，两个团队各部署一份；
+  - 一方泄露（pm-cup 仓库已经有机密进 git 的先例，§8），另一方也得跟着轮换；
+  - pm 那边拿着管理凭据，能给任何人放行 RN 的域名。RN 本地还有成员核对挡着，但少了一层。
+- **体验没有区别**：CID 的登录态在 `login.chainup.com` 上，与应用个数无关；登一次，两个应用都直接过。
+- **结论**：推荐两个应用，只是多登记一次。如果 CID 团队更愿意用一个应用，先确认放行接口的语义，并定下由谁统管域名清单。
+
 ## 5. pm-cup 那边要做的（交给对方团队）
 
-- 像 web3-rwa 一样接 CID：
-  - 在 CID 登记一个应用；
-  - `tenant_admin` 加 `cid` 列，登录改走 CID（Go 端没有 SDK，用 `golang.org/x/oauth2` 加 userinfo 调用）；
+- 接 CID，用同样的迁移方式：
+  - 在 CID 登记一个应用（推荐与 RN 分开，§4.6）；
+  - `tenant_admin` 加 `cid` 列；
+  - 现有账号先用原来的口令 + 邮件验证码登录，登录后引导绑定 CID；绑定后只走 CID；
+  - Go 端没有 SDK，用 `golang.org/x/oauth2` 加 userinfo 调用；
   - 角色与权限照旧在本地。
+- **绑定必须在走完邮件验证码之后**，只接受正式令牌，不接受 ltemp 临时令牌。否则 §8 那个「口令对了就能绕过验证码」的漏洞会被永久化：
+  拿到口令的人能把别人的账号绑到自己的 CID 名下。
 - 菜单里加「App 管理」，链接到对应 RN 控制台的 `/v1/admin/auth/cid/start?target=…`。
 - 不需要做 OIDC 身份提供方，不需要给 RN 签任何令牌。
 
 ## 6. 要认证中心团队给的、要确认的
 
 1. **登记应用**：
-   - 给 RN、pm-cup 各登记一个应用，发 client_id / secret；
+   - 给 RN、pm-cup 各登记一个应用（§4.6），发 client_id / secret；
    - RN 每个租户一个控制台域名（console.anyfun.win、predict 的控制台域名……），一个应用能否配多个域名？回调地址怎么校验？以后加租户怎么加？
-2. **按域名放行**：`bind-domains` 是否每个用户都必须绑？能否给 RN 应用一个**只能管本应用用户与域名**的受限凭据，而不是全局超级账号？
-3. **身份字段**：
+2. **按域名放行**：
+   - `bind-domains` 是否每个用户都必须绑，授权时是否拦？
+   - 是整份覆盖还是追加？有没有追加 / 删除单个域名的接口？
+   - 能否给 RN 应用一个**只能管本应用用户与域名**的受限凭据，而不是全局超级账号？
+3. **开号**：
+   - 有没有自助注册？
+   - 用管理接口按邮箱开号时，CID 会不会给本人发激活邮件、让本人自己设口令？
+   - 同一邮箱已有账号时，是返回已有的 cid 吗？
+4. **身份字段**：
    - userinfo 的 `username`（cid）是否永久不变、不复用？
    - `email` 是否经过验证？
-4. **二次验证**：CID 有没有 TOTP 等二次验证，能否对某个应用强制？能否强制重新登录，并回传登录时间？
-5. **会话与登出**：CID 的会话多长？有没有后台登出通知？账号停用后，已发出的 access token 是否立即失效？
-6. **路线**：有没有支持 OIDC（id_token、JWKS、discovery）的计划？
-7. **品牌**：商户运营看到的是 ChainUp 登录页，能否按租户域名白标（SDK 的 `{baseHost}` 占位符）？
-8. **可用性**：CID 的可用性与限流是多少？CID 出故障时，所有接入的系统都登不进，RN 为此保留应急账号。
-9. **测试环境**：能否在 `auth-server.dw2nn.com` 给 RN 登记一个测试应用，用来联调？
+5. **二次验证**：CID 有没有 TOTP 等二次验证，能否对某个应用强制？能否强制重新登录，并回传登录时间？
+6. **会话与登出**：CID 的会话多长？有没有后台登出通知？账号停用后，已发出的 access token 是否立即失效？
+7. **路线**：有没有支持 OIDC（id_token、JWKS、discovery）的计划？
+8. **品牌**：商户运营看到的是 ChainUp 登录页，能否按租户域名白标（SDK 的 `{baseHost}` 占位符）？
+9. **可用性**：CID 的可用性与限流是多少？CID 出故障时，所有接入的系统都登不进，RN 为此保留应急账号。
+10. **测试环境**：能否在 `auth-server.dw2nn.com` 给 RN 登记一个测试应用，用来联调？
 
 ## 7. 安全
 
@@ -283,7 +359,9 @@ CID 不回传登录时间和认证方式，所以 RN 自己做二次验证：
 | 登录 CSRF（把受害者登成攻击者的账号） | state 绑在发起时的 `rn_login` Cookie 上 |
 | 开放跳转 | `target` 只收相对路径，并拒绝 `//`、`/\`、`/v1/` 开头 |
 | 从 api.* 发起导致 Cookie 错域 | nginx 的 api.* 站点屏蔽 `/v1/admin/auth/cid/` |
-| 邀请链接泄露 | 24 小时过期、一次性、只存摘要；CID 确认 email 已验证时再加 email 比对；绑定后控制台通知租户 admin |
+| 初始口令泄露，被别人抢先绑定 | 72 小时过期；首次登录要登记 TOTP；绑定前要本人确认 CID 账号；绑定后通知租户 admin；发现绑错由平台管理员解绑重置 |
+| 绑定 CSRF（受害者的账号被绑到攻击者的 CID） | 绑定从已登录会话发起，state 绑定本会话 + PKCE；落库前显示 CID 账号并要本人确认 |
+| 待绑定会话被拿去做别的 | 待绑定状态只能访问绑定页、会话查询、登出 |
 | 租户账号冒充平台 | 平台权限按会话角色判 |
 | 跨租户越权 | `domainTenantScope` 之后校验会话租户；Origin 绑定到同一租户；唯一键含租户 |
 | viewer 拿到敏感导出 | 按路由白名单放行 |
@@ -312,10 +390,10 @@ CID 不回传登录时间和认证方式，所以 RN 自己做二次验证：
 
 | 阶段 | 内容 | 谁做 | 依赖 |
 | --- | --- | --- | --- |
-| S0 | 账号表、会话加列、平台权限按角色、租户校验、viewer 白名单、Origin 绑定、§3.4 接口审计、本地应急账号 + TOTP、成员页（先只能建应急账号） | 我们 | 无，先做；签名材料设计的阶段 1 就是它 |
+| S0 | 账号表、会话加列、平台权限按角色、租户校验、viewer 白名单、Origin 绑定、§3.4 接口审计、本地登录（初始口令、TOTP、待绑定状态）、应急账号、成员页 | 我们 | 无，先做；签名材料设计的阶段 1 就是它。CID 接好之前，成员暂时用本地口令登录，待绑定限制先不开 |
 | S1 | 登记应用、回答 §6 | CID 团队 | 要有人去对接 |
-| S2 | CID 登录（start / callback / userinfo）、邀请与绑定、敏感操作 TOTP 再验证、登出联动、nginx 屏蔽 api.* 上的登录路径 | 我们 | S0、S1 的测试应用 |
-| S3 | pm-cup 接 CID、菜单入口 | pm-cup 团队 | S1 |
+| S2 | CID 登录（start / callback / userinfo）、登录后引导绑定（含按邮箱开号与放行，视 §6 答复）、打开待绑定限制、敏感操作 TOTP 再验证、登出联动、nginx 屏蔽 api.* 上的登录路径 | 我们 | S0、S1 的测试应用 |
+| S3 | pm-cup 接 CID（同样先本地登录再绑定）、菜单入口 | pm-cup 团队 | S1 |
 | S4 | 测试环境联调 → 生产上线（先 predict、再 anyfun） | 各方 | S2、S3 |
 
 ## 10. 要用户决定的
@@ -323,14 +401,15 @@ CID 不回传登录时间和认证方式，所以 RN 自己做二次验证：
 1. 确认用 CID 作统一认证（推荐）。
 2. 谁去对接认证中心团队（§6），谁把 §8 的安全问题转给 pm-cup 与 web3-rwa 团队？
 3. 成员由谁添加：只由平台管理员加，还是租户 admin 也能加人？（推荐：租户 admin 能加 viewer，加 admin 要平台管理员）
-4. 角色先只分 `admin` / `viewer`，够不够？
-5. 应急账号每个租户一个、平台建、强制 TOTP——这样可以吗？
+4. RN 与 pm-cup 在 CID 里用两个应用（推荐），还是一个？
+5. 角色先只分 `admin` / `viewer`，够不够？
+6. 应急账号每个租户一个、平台建、强制 TOTP——这样可以吗？
 
 ## 11. 不做的
 
 - 不让 pm-cup 做身份提供方，也不自建身份平台。
 - RN 不持有 CID 的全局超级管理账号。
-- 不按 email 自动开户、自动合并账号。
+- 不按 email 自动开户、自动合并账号；用 CID 登录但没有已绑定账号的人一律拒绝。
 - 不在 RN 里做找回口令：应急账号由平台管理员重置。
 - 不调 pm-cup 的业务接口，不读 pm-cup、web3-rwa 的数据库。
 
@@ -352,3 +431,7 @@ CID 不回传登录时间和认证方式，所以 RN 自己做二次验证：
   - userinfo 只取 email、cid、account（`AuthenticationUserInfoService.java:23-25`）；
   - 本地按 (tenant_id, cid) 判租户（`TenantFilter.java:63-117`）；
   - `bind-domains` 的请求形状（`AdminEndpoint.java:47-53`）。
+- 2026-09-25 用户提出：
+  - 「pm 与 RN 当成同一个应用、用不同域名接入」；
+  - 「支持各自的账号登录，但必须绑定统一账号，没绑定时登录后引导绑定，之后直接走统一登录」。
+  后一条已采用（§4.3，替代初稿的邀请链接）。前一条分析见 §4.6，推荐仍分两个应用。依据是 web3-rwa 推域名的写法（`TenantDomainServiceImpl.java:170-224`，每次推完整清单）与开号方式（`AdminController.java:349-381`）。
