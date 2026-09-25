@@ -80,6 +80,30 @@ func (s *server) iosDeliveryRecordFor(ctx context.Context, q interface {
 	return &record, nil
 }
 
+// iosDeliveryModeLocked 在事务里用加锁读取交付方式，与 updateIOSDelivery 的切换互斥：
+// 「切到自助上传时删掉 App Manager Key」与「同时保存一把新的」交错的话，会留下一把自助上传
+// 租户的 Key。没配过时锁住的是那个键的空隙，切换那边的 INSERT 同样要等。
+func iosDeliveryModeLocked(ctx context.Context, tx *sql.Tx, tenant string) (string, error) {
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT config_value FROM app_configs WHERE tenant_id=? AND config_key=? FOR UPDATE`,
+		tenant, iosDeliveryConfigKey).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return iosDeliveryTestFlight, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var value iosDeliveryConfig
+	if err := json.Unmarshal(raw, &value); err != nil || !validIOSDelivery(value.Mode) {
+		return "", fmt.Errorf("%s is not a valid delivery mode", iosDeliveryConfigKey)
+	}
+	return value.Mode, nil
+}
+
+// iosASCSelfUploadDetail 是自助上传租户想存 App Manager Key 时的说明。
+const iosASCSelfUploadDetail = "这个租户的交付方式是「自助上传」：平台不保存 App Manager Key——这把 Key 本身就能上传，" +
+	"存了就不是自助上传。TestFlight 公开链接与过期日请手填；要让平台自动同步，先把交付方式切回「全托管」"
+
 // iosDeliveryModeFor 是排队要抄进任务的那个值。
 func (s *server) iosDeliveryModeFor(ctx context.Context, tenant string) (string, error) {
 	record, err := s.iosDeliveryRecordFor(ctx, s.db, tenant)

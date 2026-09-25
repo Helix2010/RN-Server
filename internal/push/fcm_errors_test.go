@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/sideshow/apns2"
 )
 
 // cannedFCM 把 FCM 的一次回应伪造出来。URL 是写死的 fcm.googleapis.com，所以换
@@ -96,5 +98,47 @@ func TestMissingCredentialsAreATerminalCredentialError(t *testing.T) {
 	}
 	if !strings.Contains(problem.detail, "平台默认") {
 		t.Fatalf("报错要说清楚平台默认那一层也没有：%q", problem.detail)
+	}
+}
+
+// APNs 的失败按同样三类分（apnsResponseError）。Key 被吊销、Team ID / Key ID 填错、Key 不能发
+// 这个 bundle id，这几种在有人改配置之前不会自愈：判成凭据错误，事件直接 failed、写清原因，
+// 而不是五次重试之后留一句 "APNs status 403 InvalidProviderToken"。
+func TestAPNsFailuresAreSortedLikeFCM(t *testing.T) {
+	cases := []struct {
+		status     int
+		reason     string
+		credential string // 期望的凭据错误代码；空表示不是凭据错误
+		invalid    bool   // 期望判成 token 失效
+	}{
+		{410, apns2.ReasonUnregistered, "", true},
+		{400, apns2.ReasonBadDeviceToken, "", true},
+		{403, apns2.ReasonInvalidProviderToken, "APNS_CREDENTIAL_REJECTED", false},
+		{403, apns2.ReasonMissingProviderToken, "APNS_CREDENTIAL_REJECTED", false},
+		{400, apns2.ReasonTopicDisallowed, "APNS_TOPIC_DISALLOWED", false},
+		{403, apns2.ReasonExpiredProviderToken, "", false}, // 客户端会换新令牌：留给重试
+		{429, apns2.ReasonTooManyRequests, "", false},
+		{500, apns2.ReasonInternalServerError, "", false},
+	}
+	for _, tc := range cases {
+		err := apnsResponseError(&apns2.Response{StatusCode: tc.status, Reason: tc.reason}, "com.anyfun.foundation")
+		problem, isCredential := asCredentialError(err)
+		_, isInvalid := err.(invalidTokenError)
+		switch {
+		case err == nil:
+			t.Errorf("%s: a refusal must be an error", tc.reason)
+		case tc.credential != "" && (!isCredential || problem.code != tc.credential):
+			t.Errorf("%s: want credential error %s, got %v", tc.reason, tc.credential, err)
+		case tc.credential == "" && isCredential:
+			t.Errorf("%s: must be left to the retry, got credential error %v", tc.reason, err)
+		case tc.invalid != isInvalid:
+			t.Errorf("%s: invalid token = %v, want %v", tc.reason, isInvalid, tc.invalid)
+		}
+	}
+	if problem, _ := asCredentialError(apnsResponseError(&apns2.Response{StatusCode: 400, Reason: apns2.ReasonTopicDisallowed}, "com.anyfun.foundation")); !strings.Contains(problem.detail, "com.anyfun.foundation") {
+		t.Errorf("the topic error must name the bundle id: %q", problem.detail)
+	}
+	if err := apnsResponseError(&apns2.Response{StatusCode: 200}, "com.anyfun.foundation"); err != nil {
+		t.Errorf("a sent notification is not an error: %v", err)
 	}
 }

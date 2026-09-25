@@ -457,13 +457,30 @@ func (d *Dispatcher) sendAPNs(ctx context.Context, tenant, targetToken, packageI
 	if err != nil {
 		return "", err
 	}
-	if !response.Sent() {
-		if response.Reason == "BadDeviceToken" || response.Reason == "Unregistered" || response.Reason == "DeviceTokenNotForTopic" {
-			return response.ApnsID, invalidTokenError{fmt.Errorf("APNs token is invalid: %s", response.Reason)}
-		}
-		return response.ApnsID, fmt.Errorf("APNs status %d %s", response.StatusCode, response.Reason)
+	return response.ApnsID, apnsResponseError(response, topic)
+}
+
+// apnsResponseError 把 APNs 的一次回应分成三类，处理方式与 FCM 的三类一致（sendFCM）：
+//
+//   - token 失效：作废它；
+//   - 凭据或配置错误（Key 无效或被吊销、Team ID / Key ID 填错、这把 Key 不能发这个 topic）：
+//     在有人改配置之前不会自愈，事件直接判 failed、写清原因，不要把三十分钟花在五次重试上；
+//   - 其它（限流、Apple 故障、令牌刚过期）：留给重试。
+func apnsResponseError(response *apns2.Response, topic string) error {
+	if response.Sent() {
+		return nil
 	}
-	return response.ApnsID, nil
+	switch response.Reason {
+	case apns2.ReasonBadDeviceToken, apns2.ReasonUnregistered, apns2.ReasonDeviceTokenNotForTopic:
+		return invalidTokenError{fmt.Errorf("APNs token is invalid: %s", response.Reason)}
+	case apns2.ReasonInvalidProviderToken, apns2.ReasonMissingProviderToken:
+		return credentialError{"APNS_CREDENTIAL_REJECTED",
+			fmt.Sprintf("Apple 回 %d %s：APNs Key 无效或已吊销，或者 Team ID / Key ID 填错", response.StatusCode, response.Reason)}
+	case apns2.ReasonTopicDisallowed:
+		return credentialError{"APNS_TOPIC_DISALLOWED",
+			"Apple 不让这把 APNs Key 发 bundle id " + topic + "：Key 不属于这个 App 所在的 Team，或者被限定到了别的 App"}
+	}
+	return fmt.Errorf("APNs status %d %s", response.StatusCode, response.Reason)
 }
 
 func (d *Dispatcher) finish(ctx context.Context, item event, failures int) error {

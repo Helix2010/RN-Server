@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/signing/iosmaterial"
 )
@@ -117,12 +118,15 @@ func TestDBIOSMaterialIsHandedBackByteForByte(t *testing.T) {
 	builder, _ := materialKeys(t, f)
 	raw := sealMaterial(t, certificateMaterial(), builder)
 
-	if code, body := uploadMaterialBox(t, f, raw); code != http.StatusOK || body["version"] != float64(1) {
+	code, body := uploadMaterialBox(t, f, raw)
+	first, _ := body["version"].(float64)
+	if code != http.StatusOK || first < float64(materialVersionFloor) {
 		t.Fatalf("upload: %d %v", code, body)
 	}
 	// 再传一份：只留当前这一版，版本号往上走
-	if code, body := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder)); code != http.StatusOK || body["version"] != float64(2) {
-		t.Fatalf("second upload: %d %v", code, body)
+	code, body = uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder))
+	if second, _ := body["version"].(float64); code != http.StatusOK || second <= first {
+		t.Fatalf("second upload: %d %v (first %v)", code, body, first)
 	}
 
 	list := decodeBody(t, f.do(http.MethodGet, "/v1/build-agent/ios-material", macs[0].Token, nil, nil))
@@ -279,6 +283,45 @@ func TestDBIOSMaterialRemoval(t *testing.T) {
 	list := decodeBody(t, f.do(http.MethodGet, "/v1/build-agent/ios-material", macs[0].Token, nil, nil))
 	if items, _ := list["items"].([]any); len(items) != 0 {
 		t.Fatalf("a removed material is still listed: %v", items)
+	}
+}
+
+// materialVersionFloor 是 2026-09-25 的毫秒时间戳：新传的材料版本号不会比它小。
+var materialVersionFloor = time.Date(2026, 9, 25, 0, 0, 0, 0, time.UTC).UnixMilli()
+
+// 删掉再传，版本号不能倒回去：打包机按「本机版本 >= 清单版本」跳过，版本号一旦重来，
+// 装过旧证书的机器就永远装不上新的。2026-09-25 之前每格从 1 数起、删行即重来，正是这样。
+func TestDBIOSMaterialVersionSurvivesRemoval(t *testing.T) {
+	f, _ := newIOSPool(t, 87, 1)
+	clearStoredMaterial(t, f)
+	builder, _ := materialKeys(t, f)
+	_, body := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder))
+	before, _ := body["version"].(float64)
+	remove := map[string]any{"kind": "certificate", "teamId": materialTeam, "scope": "",
+		"expectedVersion": int64(before), "reason": "replace the certificate", "confirm": true}
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", remove); r.Code != http.StatusOK {
+		t.Fatalf("remove: %d %s", r.Code, r.Body.String())
+	}
+	code, body := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder))
+	if after, _ := body["version"].(float64); code != http.StatusOK || after <= before {
+		t.Fatalf("the re-uploaded material got version %v, not above the removed %v; machines that installed the old one would skip it", after, before)
+	}
+}
+
+func TestNextIOSMaterialVersionNeverGoesBack(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	if got := nextIOSMaterialVersion(0, now); got != now.UnixMilli() {
+		t.Errorf("a fresh slot takes the timestamp: %d", got)
+	}
+	if got := nextIOSMaterialVersion(3, now); got != now.UnixMilli() {
+		t.Errorf("an old small version is overtaken by the timestamp: %d", got)
+	}
+	// 同一毫秒里连传两次、或者时钟往回拨：仍然比上一版大
+	if got := nextIOSMaterialVersion(now.UnixMilli(), now); got != now.UnixMilli()+1 {
+		t.Errorf("the same millisecond: %d", got)
+	}
+	if got := nextIOSMaterialVersion(now.UnixMilli()+5000, now); got != now.UnixMilli()+5001 {
+		t.Errorf("a clock that went back: %d", got)
 	}
 }
 

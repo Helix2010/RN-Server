@@ -81,6 +81,8 @@ var migrations = []migration{
 	{version: 57, name: "ios_signing_material", apply: iosSigningMaterialMigration},
 	// iOS 交付方式（全托管 / 自助上传）在排队时写进任务；机器自报它支持哪些交付能力
 	{version: 58, name: "ios_delivery", apply: iosDeliveryMigration},
+	// 签名材料的版本号改成毫秒时间戳（删掉再传不再从 1 重来），只改列注释
+	{version: 59, name: "ios_material_version_comment", apply: iosMaterialVersionCommentMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2095,6 +2097,20 @@ func iosSigningMaterialMigration(ctx context.Context, db *sql.DB) error {
 		PRIMARY KEY (kind, team_id, scope)
 	) ENGINE=InnoDB COMMENT='iOS 签名材料的密文。服务端只是快递员：它没有任何一把私钥，存的每一份都解不开'`); err != nil {
 		return fmt.Errorf("ios signing material migration: %w", err)
+	}
+	return nil
+}
+
+// iosMaterialVersionCommentMigration 只改 ios_signing_material.version 的列注释。
+//
+// 版本号原来是每格从 1 数起、删行之后重来，打包机按「本机装到的版本 >= 清单版本」跳过，删掉再传的
+// 证书就永远装不上。现在新版本取毫秒时间戳、至少比旧版本大 1（api.nextIOSMaterialVersion），
+// 列类型本来就是 BIGINT，只有注释要跟上。
+func iosMaterialVersionCommentMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `ALTER TABLE ios_signing_material MODIFY COLUMN version BIGINT NOT NULL COMMENT `+
+		`'这一格的版本号：上传时的毫秒时间戳（UTC），且至少比旧版本大 1，删掉再传也不会变小。机器拿它判断手上那份是不是最新的（本机版本 >= 它就不再装）；`+
+		`2026-09-25 之前传的行是 1、2、3 这样的小整数，小于任何时间戳。覆盖时旧密文直接被替换，不留历史'`); err != nil {
+		return fmt.Errorf("ios material version comment migration: %w", err)
 	}
 	return nil
 }

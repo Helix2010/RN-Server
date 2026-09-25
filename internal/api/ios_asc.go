@@ -183,6 +183,16 @@ func (s *server) updateIOSASCCredentials(c *gin.Context) {
 		problem(c, http.StatusServiceUnavailable, "STORAGE_MASTER_KEY_REQUIRED", "保存 App Store Connect 密钥之前必须先配置 STORAGE_MASTER_KEY")
 		return
 	}
+	// 自助上传的租户不收：先查一次，免得白白拿 Key 去 Apple 核对；落库前在事务里加锁再查一次
+	mode, err := s.iosDeliveryModeFor(c.Request.Context(), tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "IOS_DELIVERY_CONFIG_INVALID", "Stored "+iosDeliveryConfigKey+" configuration is invalid")
+		return
+	}
+	if mode == iosDeliveryIPA {
+		problem(c, http.StatusConflict, "IOS_DELIVERY_SELF_UPLOAD", iosASCSelfUploadDetail)
+		return
+	}
 	// 没有 iOS 发布身份就没有可验证的 bundle id——先登记身份再装钥匙，顺序反过来
 	// 的话"验证通过"证明不了这把钥匙属于这个租户
 	identity, err := s.iosReleaseIdentityRecord(c.Request.Context(), tenantID(c))
@@ -236,6 +246,13 @@ func (s *server) updateIOSASCCredentials(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+	if mode, err := iosDeliveryModeLocked(c.Request.Context(), tx, tenantID(c)); err != nil {
+		problem(c, http.StatusInternalServerError, "IOS_ASC_SAVE_FAILED", "Unable to save the App Store Connect key")
+		return
+	} else if mode == iosDeliveryIPA {
+		problem(c, http.StatusConflict, "IOS_DELIVERY_SELF_UPLOAD", iosASCSelfUploadDetail)
+		return
+	}
 	var result sql.Result
 	newVersion := 1
 	if currentVersion > 0 {

@@ -73,6 +73,25 @@ func switchToIPA(f *gateFixture) {
 	}
 }
 
+// 自助上传的租户不收 App Manager Key：这把 Key 本身就能上传，存了就不是自助上传。
+// 切过去时服务端会删掉存着的那把（上面那条测试），这里钉住「删了之后也存不回去」。
+func TestDBIOSSelfUploadTenantCannotStoreAnAppManagerKey(t *testing.T) {
+	f, _ := newIOSPool(t, 74, 1)
+	switchToIPA(f)
+	c, recorder := testContext(t, f.tenant, http.MethodPut, "/v1/admin/ios/asc-credentials", map[string]any{
+		"issuerId": "69a6de70-0000-0000-0000-000000000000", "keyId": "ABCDE12345", "privateKey": apnsAuthKey(t),
+		"expectedVersion": 0, "reason": "try to store a key", "confirm": true,
+	})
+	f.s.updateIOSASCCredentials(c)
+	if recorder.Code != http.StatusConflict || problemCode(t, recorder) != "IOS_DELIVERY_SELF_UPLOAD" {
+		t.Fatalf("a self-upload tenant stored an App Manager key: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var stored int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM app_configs WHERE tenant_id=? AND config_key=?`, f.tenant, iosASCConfigKey).Scan(&stored); err != nil || stored != 0 {
+		t.Fatalf("nothing may be stored: %d %v", stored, err)
+	}
+}
+
 // 全托管的任务只排得进、只派得给上传 Key 可用的机器。没装 Key 的 Mac 报上来的只算"有签名材料"。
 func TestDBIOSTestFlightJobNeedsAnUploader(t *testing.T) {
 	f, macs := newIOSPool(t, 71, 1)

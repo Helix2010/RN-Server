@@ -202,7 +202,7 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 	if row["certificate"] == nil || row["uploadKey"] == nil || row["profile"] == nil {
 		t.Fatalf("alpha's certificate, upload key and profile (bundle id in another case) are all stored: %v", row)
 	}
-	if certificate := row["certificate"].(map[string]any); certificate["stale"] != false || certificate["version"] != float64(1) {
+	if certificate := row["certificate"].(map[string]any); certificate["stale"] != false || certificate["version"].(float64) < float64(materialVersionFloor) {
 		t.Fatalf("certificate slot: %v", certificate)
 	}
 	// 删除按表里存的原样精确匹配，所以 slot 要交回存的 scope，而不是租户身份里的写法
@@ -306,19 +306,26 @@ func TestDBIOSMaterialRemovalChecksTheVersion(t *testing.T) {
 	f, _ := newIOSPool(t, 155, 1)
 	clearStoredMaterial(t, f)
 	builder, _ := materialKeys(t, f)
-	uploadSealed(t, f, certificateMaterial(), builder)
-	uploadSealed(t, f, certificateMaterial(), builder)
-	body := func(version int) map[string]any {
+	version := func() int64 {
+		code, body := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder))
+		v, _ := body["version"].(float64)
+		if code != http.StatusOK || v <= 0 {
+			t.Fatalf("upload: %d %v", code, body)
+		}
+		return int64(v)
+	}
+	older, current := version(), version()
+	body := func(version int64) map[string]any {
 		return map[string]any{"kind": iosmaterial.KindCertificate, "teamId": materialTeam, "scope": "",
 			"expectedVersion": version, "reason": "the certificate was revoked at Apple", "confirm": true}
 	}
-	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(1)); r.Code != http.StatusConflict || problemCode(t, r) != "STALE_IOS_MATERIAL" {
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(older)); r.Code != http.StatusConflict || problemCode(t, r) != "STALE_IOS_MATERIAL" {
 		t.Fatalf("removing an older version than the stored one: %d %s", r.Code, r.Body.String())
 	}
-	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(2)); r.Code != http.StatusOK {
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(current)); r.Code != http.StatusOK {
 		t.Fatalf("removing the current version: %d %s", r.Code, r.Body.String())
 	}
-	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(2)); r.Code != http.StatusNotFound {
+	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(current)); r.Code != http.StatusNotFound {
 		t.Fatalf("removing twice: %d %s", r.Code, r.Body.String())
 	}
 }

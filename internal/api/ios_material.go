@@ -339,21 +339,23 @@ func (s *server) uploadIOSMaterial(c *gin.Context) {
 	scope := scopeFor(box)
 
 	now := time.Now().UTC()
-	var version int64
-	err = s.db.QueryRowContext(ctx,
-		`SELECT version FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=?`,
-		box.Kind, box.TeamID, scope).Scan(&version)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
-		return
-	}
-	version++
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to store the material")
 		return
 	}
 	defer tx.Rollback()
+	// 读旧版本要在事务里加锁：两个人同时传同一格时，不加锁会算出同一个版本号，后传的那份
+	// 在装过前一份的机器上被当成"已经装了"
+	var previous int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT version FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=? FOR UPDATE`,
+		box.Kind, box.TeamID, scope).Scan(&previous)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
+		return
+	}
+	version := nextIOSMaterialVersion(previous, now)
 	// 一格只留当前这一版：旧密文直接被替换，换过什么在审计里查
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO ios_signing_material(kind,team_id,scope,purpose,recipient_sha256,version,ciphertext,uploaded_by,uploaded_at)
@@ -379,6 +381,19 @@ func (s *server) uploadIOSMaterial(c *gin.Context) {
 		"version": version, "recipientSha256": box.RecipientSHA256,
 		"uploadedAt": now.Format(time.RFC3339),
 	})
+}
+
+// nextIOSMaterialVersion 给一格材料的新版本号：当前的毫秒时间戳，但至少比旧版本大 1。
+//
+// 版本号不能随删除重来。打包机按「本机装到的版本 >= 清单上的版本」跳过已装的材料，而删除是
+// 直接删行：删掉再传的那份如果从 1 开始，一台装过第 3 版的机器会一直把它当成旧的，新证书
+// 永远装不上。用时间戳就不必另外记住「这一格曾经到过第几版」；以前的小版本号（1、2、3……）
+// 自然小于任何时间戳，已经装在机器上的那些照样会被新传的替换。
+func nextIOSMaterialVersion(previous int64, now time.Time) int64 {
+	if version := now.UnixMilli(); version > previous {
+		return version
+	}
+	return previous + 1
 }
 
 // removeIOSMaterial POST /v1/admin/platform/ios-material/remove：删一格。
