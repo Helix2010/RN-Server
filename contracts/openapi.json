@@ -5155,7 +5155,60 @@
     "/v1/admin/platform/ios-material/tenants": {
       "get": {
         "summary": "按租户的 Apple 证书与密钥总览",
-        "description": "控制台「Apple 证书与密钥」页用。材料表按 Team 存，这里按 release.ios 拼成每个租户一行：证书、上传 Key 按 Team 匹配，描述文件按 Team + bundle id（不分大小写）匹配；打包机只算登记为 active、能打 iOS 的构建机，装没装按 (Team, bundle id) 原样比，与认领同一个判据；earliestExpiry 是报了这个 Team 的机器里最早的那个值（含钥匙串里过期的旧证书与同 Team 其它租户的描述文件）；readiness 与排队时的判断同一套。orphans 是没有租户在用的材料，只有 complete 且没有 invalidTenants 时 orphansDeletable 才为 true。设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md。",
+        "description": "控制台「Apple 证书与密钥」页用。材料表按 Team 存，这里按 release.ios 拼成每个租户一行：证书、上传 Key 按 Team 匹配，描述文件按 Team + bundle id（不分大小写）匹配；打包机只算登记为 active、能打 iOS 的构建机，装没装按 (Team, bundle id) 原样比，与认领同一个判据；earliestExpiry 是报了这个 Team 的机器里最早的那个值（含钥匙串里过期的旧证书与同 Team 其它租户的描述文件）；readiness 与排队时的判断同一套。orphans 是没有租户在用的材料，只有 complete 且没有 invalidTenants 时 orphansDeletable 才为 true。设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md。 第二轮（设计 §10）：每行多 status（ready/missing/attention）、problems（code 按优先级：certificate-missing、profile-missing、upload-key-missing、material-stale、bundle-duplicated、upload-key-should-be-withdrawn、no-builders、not-installed、not-ready）与 delivered（证书与描述文件都在平台上、新装的 Mac 解得开）。筛选与分页在服务端：q（slug/应用名/Team/bundle id 子串）、status、machine（材料已下发但这台没装上）、cursor、limit；按 slug 升序。counts 按 q 与 machine 筛过、不按 status。",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "description": "slug / 应用名 / Team / bundle id 子串，不分大小写"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ready",
+                "missing",
+                "attention"
+              ]
+            }
+          },
+          {
+            "name": "machine",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "机器 id：只列材料已下发、但这台没装上的租户（与打包机列表的 pendingInstall 同一判据）"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "按租户的总览",
@@ -5170,7 +5223,12 @@
                     "machines",
                     "tenants",
                     "orphans",
-                    "orphansDeletable"
+                    "orphansDeletable",
+                    "total",
+                    "nextCursor",
+                    "hasMore",
+                    "limit",
+                    "counts"
                   ],
                   "properties": {
                     "complete": {
@@ -5247,7 +5305,10 @@
                           "uploadKeyUse",
                           "machines",
                           "earliestExpiry",
-                          "readiness"
+                          "readiness",
+                          "status",
+                          "problems",
+                          "delivered"
                         ],
                         "properties": {
                           "slug": {
@@ -5456,6 +5517,56 @@
                                 "nullable": true
                               }
                             }
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "missing",
+                              "attention"
+                            ]
+                          },
+                          "problems": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "required": [
+                                "code"
+                              ],
+                              "properties": {
+                                "code": {
+                                  "type": "string",
+                                  "enum": [
+                                    "certificate-missing",
+                                    "profile-missing",
+                                    "upload-key-missing",
+                                    "material-stale",
+                                    "bundle-duplicated",
+                                    "upload-key-should-be-withdrawn",
+                                    "no-builders",
+                                    "not-installed",
+                                    "not-ready"
+                                  ]
+                                },
+                                "slugs": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "count": {
+                                  "type": "integer"
+                                },
+                                "detail": {
+                                  "type": "string",
+                                  "description": "not-ready 时是排队判据的原话"
+                                }
+                              }
+                            }
+                          },
+                          "delivered": {
+                            "type": "boolean",
+                            "description": "证书与描述文件都在平台上、且加密给的是现在登记的公钥"
                           }
                         }
                       }
@@ -5500,6 +5611,40 @@
                     },
                     "orphansDeletable": {
                       "type": "boolean"
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "筛选后的总数"
+                    },
+                    "nextCursor": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "hasMore": {
+                      "type": "boolean"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "counts": {
+                      "type": "object",
+                      "required": [
+                        "ready",
+                        "missing",
+                        "attention"
+                      ],
+                      "properties": {
+                        "ready": {
+                          "type": "integer"
+                        },
+                        "missing": {
+                          "type": "integer"
+                        },
+                        "attention": {
+                          "type": "integer"
+                        }
+                      },
+                      "description": "按 q 与 machine 筛过、不按 status"
                     }
                   }
                 }
@@ -5514,6 +5659,9 @@
           },
           "500": {
             "description": "IOS_MATERIAL_TENANTS_UNAVAILABLE"
+          },
+          "400": {
+            "description": "INVALID_IOS_MATERIAL_FILTER"
           }
         }
       }
@@ -11418,7 +11566,7 @@
       },
       "MachineLiveness": {
         "type": "object",
-        "description": "What this machine looks like right now, as opposed to what the registry says it is. The two live apart (the registry is a versioned config document written by admins; this comes from the liveness table a machine writes on every claim and heartbeat) but must be read together: missingTenants is the only monitor of the pool invariant - every Mac should be able to build every tenant, yet the material is imported machine by machine, by hand. Always present; a machine that never reported shows nulls and empty arrays rather than making the page fail.",
+        "description": "What this machine looks like right now, as opposed to what the registry says it is. The two live apart (the registry is a versioned config document written by admins; this comes from the liveness table a machine writes on every claim and heartbeat) but must be read together: pendingInstall counts tenants whose certificate and profile are delivered (stored and sealed to the registered key) but that this machine does not report — only for active iOS builders; which tenants those are is listed on the Apple certificates & keys page (GET /v1/admin/platform/ios-material/tenants?machine=<id>). missingTenants is always an empty array, kept only for consoles that still require it. Always present; a machine that never reported shows nulls and empty arrays rather than making the page fail.",
         "required": [
           "lastSeenAt",
           "online",
@@ -11428,7 +11576,8 @@
           "missingTenants",
           "signingExpiresAt",
           "pausedReason",
-          "upgradeError"
+          "upgradeError",
+          "pendingInstall"
         ],
         "properties": {
           "lastSeenAt": {
@@ -11508,7 +11657,12 @@
                 }
               }
             },
-            "description": "Tenants with an iOS release identity whose (team, bundle id) this machine did not report. Only computed for builders that can build ios; empty for everything else."
+            "description": "Deprecated: always an empty array (kept for older consoles that parse it as required). Use pendingInstall."
+          },
+          "pendingInstall": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tenants whose material is delivered but not installed on this machine (0 for signers, Android-only and revoked machines)"
           },
           "signingExpiresAt": {
             "type": "string",

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"testing"
 
@@ -75,9 +77,11 @@ func uploadSealed(t *testing.T, f *gateFixture, m iosmaterial.Material, key *sea
 
 // materialTenants 以夹具租户的身份调：路由那条路不带 Host，会落到默认租户上，"当前租户"就测不出来。
 // 路由与平台管理员把关由 TestDBIOSMaterialByTenantIsPlatformOnly 单独钉。
-func materialTenants(t *testing.T, f *gateFixture) map[string]any {
+// materialTenants 按 q 搜一页。测试库是共用的，别的用例留下的租户远超一页：要看某个租户就按
+// 它独有的 Team 或 slug 搜，别指望它落在第一页
+func materialTenants(t *testing.T, f *gateFixture, q string) map[string]any {
 	t.Helper()
-	c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/platform/ios-material/tenants", nil)
+	c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/platform/ios-material/tenants?q="+url.QueryEscape(q), nil)
 	f.s.iosMaterialTenants(c)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("material by tenant: %d %s", recorder.Code, recorder.Body.String())
@@ -101,7 +105,7 @@ func TestDBIOSMaterialByTenantKnowsTheCurrentTenantByHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	get := func(host string) map[string]any {
-		request := httptest.NewRequest(http.MethodGet, "/v1/admin/platform/ios-material/tenants", nil)
+		request := httptest.NewRequest(http.MethodGet, "/v1/admin/platform/ios-material/tenants?q="+url.QueryEscape(slug), nil)
 		request.Host = host
 		request.Header.Set("x-admin-key", gateAdminKey)
 		recorder := httptest.NewRecorder()
@@ -185,7 +189,7 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 		t.Fatalf("claim: %d %s", r.Code, r.Body.String())
 	}
 
-	body := materialTenants(t, f)
+	body := materialTenants(t, f, team)
 	machines, _ := body["machines"].([]any)
 	if len(machines) != 1 || machines[0].(map[string]any)["id"] != macs[0].ID || machines[0].(map[string]any)["online"] != true {
 		t.Fatalf("only the active iOS builder counts: %v", machines)
@@ -246,20 +250,20 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 
 	// alpha 也切到自助上传：同 Team 没有全托管租户了，这把上传 Key 按设计就该撤下
 	setIOSDelivery(t, f, f.tenant, iosDeliveryIPA)
-	if row := materialTenantRow(t, materialTenants(t, f), beta); row["uploadKeyUse"] != iosUploadKeyWithdraw {
+	if row := materialTenantRow(t, materialTenants(t, f, team), beta); row["uploadKeyUse"] != iosUploadKeyWithdraw {
 		t.Fatalf("an upload key nobody on the team needs should be withdrawn: %v", row)
 	}
 	remove := map[string]any{"kind": iosmaterial.KindUploadKey, "teamId": team, "scope": "", "reason": "withdrawn by hand", "confirm": true}
 	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", remove); r.Code != http.StatusOK {
 		t.Fatalf("remove the upload key: %d %s", r.Code, r.Body.String())
 	}
-	if row := materialTenantRow(t, materialTenants(t, f), alpha); row["uploadKeyUse"] != iosUploadKeyNotNeeded || row["uploadKey"] != nil {
+	if row := materialTenantRow(t, materialTenants(t, f, team), alpha); row["uploadKeyUse"] != iosUploadKeyNotNeeded || row["uploadKey"] != nil {
 		t.Fatalf("a self-upload tenant without an upload key needs none: %v", row)
 	}
 
 	// 换了平台加密公钥：存着的每一份都加密给了旧公钥
 	materialKeys(t, f)
-	if row := materialTenantRow(t, materialTenants(t, f), alpha); row["certificate"].(map[string]any)["stale"] != true {
+	if row := materialTenantRow(t, materialTenants(t, f, team), alpha); row["certificate"].(map[string]any)["stale"] != true {
 		t.Fatalf("material sealed to the old key must be marked stale: %v", row)
 	}
 }
@@ -283,7 +287,8 @@ func TestDBIOSMaterialOrphansAreNotDeletableWithAnUnreadableTenant(t *testing.T)
 		_, _ = f.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, broken, releaseIOSIdentityConfigKey)
 	})
 
-	body := materialTenants(t, f)
+	// 读不出来的租户与没人用的材料不分页，不带条件看全表
+	body := materialTenants(t, f, "")
 	found := false
 	for _, raw := range body["invalidTenants"].([]any) {
 		found = found || raw.(map[string]any)["slug"] == slug
@@ -315,5 +320,119 @@ func TestDBIOSMaterialRemovalChecksTheVersion(t *testing.T) {
 	}
 	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(2)); r.Code != http.StatusNotFound {
 		t.Fatalf("removing twice: %d %s", r.Code, r.Body.String())
+	}
+}
+
+func materialTenantsQuery(t *testing.T, f *gateFixture, query string) (int, map[string]any) {
+	t.Helper()
+	c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/platform/ios-material/tenants?"+query, nil)
+	f.s.iosMaterialTenants(c)
+	return recorder.Code, decodeBody(t, recorder)
+}
+
+func problemCodes(row map[string]any) []string {
+	out := []string{}
+	for _, raw := range row["problems"].([]any) {
+		out = append(out, raw.(map[string]any)["code"].(string))
+	}
+	return out
+}
+
+// 状态判定、筛选与分页都在服务端（设计 §10.1、§10.2）：齐了 / 缺材料 / 要处理由服务端算；
+// q、status、machine 筛选与游标分页也在这里，控制台不拿全量自己切。
+func TestDBIOSMaterialByTenantStatusFiltersAndPages(t *testing.T) {
+	f, macs := newIOSPool(t, 158, 1)
+	clearStoredMaterial(t, f)
+	builder, uploader := materialKeys(t, f)
+	team := "S" + strings.ToUpper(uniqueSuffix() + "000000000")[:9]
+	seedGateIOSIdentity(t, f, team, "com.s.alpha")
+	var alpha string
+	if err := f.db.QueryRow(`SELECT slug FROM tenants WHERE id=?`, f.tenant).Scan(&alpha); err != nil {
+		t.Fatal(err)
+	}
+	beta := seedIOSTenant(t, f, 159, team, "com.s.beta", iosDeliveryIPA)
+	gamma := seedIOSTenant(t, f, 160, team, "com.s.gamma", iosDeliveryIPA)
+	// delta 没传描述文件、Mac 也没报它：缺材料，而且不算"这台机器没装上"
+	delta := seedIOSTenant(t, f, 161, team, "com.s.delta", iosDeliveryIPA)
+	uploadSealed(t, f, teamCertificate(team), builder)
+	uploadSealed(t, f, teamUploadKey(team), uploader)
+	uploadSealed(t, f, profileMaterial(team, "com.s.alpha"), builder)
+	uploadSealed(t, f, profileMaterial(team, "com.s.gamma"), builder)
+	// Mac 报了 alpha 与 beta，没报 gamma
+	if r := iosClaim(f, macs[0], []appleTeamReport{{TeamID: team, BundleIDs: []string{"com.s.alpha", "com.s.beta"},
+		ExpiresAt: "2027-03-01T00:00:00Z", UploadProbe: uploadProbeOK}}); r.Code != http.StatusNoContent {
+		t.Fatalf("claim: %d %s", r.Code, r.Body.String())
+	}
+
+	code, body := materialTenantsQuery(t, f, "q="+strings.ToLower(team))
+	if code != http.StatusOK || body["total"] != float64(4) {
+		t.Fatalf("searching by team finds its four tenants: %d %v", code, body)
+	}
+	if counts := body["counts"].(map[string]any); counts["ready"] != float64(1) || counts["missing"] != float64(2) || counts["attention"] != float64(1) {
+		t.Fatalf("counts by status: %v", counts)
+	}
+	row := materialTenantRow(t, body, alpha)
+	if row["status"] != iosMaterialReady || len(problemCodes(row)) != 0 {
+		t.Fatalf("alpha has everything and can be queued: %v", row)
+	}
+	// beta 缺描述文件；排不进去的原因（没有能交回 .ipa 的机器）是另一件事，照样列出来
+	row = materialTenantRow(t, body, beta)
+	if codes := problemCodes(row); row["status"] != iosMaterialMissing || len(codes) != 2 || codes[0] != "profile-missing" || codes[1] != "not-ready" {
+		t.Fatalf("beta misses its profile and no builder can hand back an .ipa: %v", row)
+	}
+	// delta 缺描述文件，Mac 也没报它；"没有打包机报过它"已经由缺描述文件说了，不再重复
+	row = materialTenantRow(t, body, delta)
+	if codes := problemCodes(row); row["status"] != iosMaterialMissing || len(codes) != 1 || codes[0] != "profile-missing" || row["delivered"] != false {
+		t.Fatalf("delta misses its profile and nothing else needs saying: %v", row)
+	}
+	// gamma 的材料已下发、Mac 没装上；"没有打包机报过它"已经由 not-installed 说了，不再重复
+	row = materialTenantRow(t, body, gamma)
+	if codes := problemCodes(row); row["status"] != iosMaterialAttention || len(codes) != 1 || codes[0] != "not-installed" || row["delivered"] != true {
+		t.Fatalf("gamma is delivered but not installed: %v", row)
+	}
+
+	_, body = materialTenantsQuery(t, f, "q="+team+"&status=missing")
+	if rows := body["tenants"].([]any); len(rows) != 2 || body["total"] != float64(2) {
+		t.Fatalf("status=missing: %v", body["tenants"])
+	}
+	// counts 不按 status 筛：点顶部汇总就是切状态
+	if counts := body["counts"].(map[string]any); counts["ready"] != float64(1) {
+		t.Fatalf("counts ignore the status filter: %v", counts)
+	}
+	// machine：已下发、这台没装上。缺材料的 delta 同样没装上，但不算——那是租户的事
+	_, body = materialTenantsQuery(t, f, "q="+team+"&machine="+macs[0].ID)
+	if rows := body["tenants"].([]any); len(rows) != 1 || rows[0].(map[string]any)["slug"] != gamma {
+		t.Fatalf("machine filter lists delivered-but-not-installed tenants only: %v", body["tenants"])
+	}
+
+	// 按 slug 升序、一页一个，游标接着翻
+	seen := []string{}
+	cursor := ""
+	for page := 0; page < 5; page++ {
+		query := "q=" + team + "&limit=1"
+		if cursor != "" {
+			query += "&cursor=" + cursor
+		}
+		code, body := materialTenantsQuery(t, f, query)
+		if code != http.StatusOK {
+			t.Fatalf("page %d: %d %v", page, code, body)
+		}
+		for _, raw := range body["tenants"].([]any) {
+			seen = append(seen, raw.(map[string]any)["slug"].(string))
+		}
+		next, _ := body["nextCursor"].(string)
+		if next == "" {
+			break
+		}
+		cursor = next
+	}
+	if len(seen) != 4 || !sort.StringsAreSorted(seen) {
+		t.Fatalf("paging one by one must visit every tenant once, in slug order: %v", seen)
+	}
+
+	for _, bad := range []string{"status=bogus", "cursor=not-a-cursor!", "limit=0", "limit=201"} {
+		if code, _ := materialTenantsQuery(t, f, bad); code != http.StatusBadRequest {
+			t.Fatalf("%s must be refused: %d", bad, code)
+		}
 	}
 }

@@ -671,8 +671,8 @@ func (s *server) listMachines(c *gin.Context) {
 	items := machineViews(snapshot.Doc)
 	// 登记只说这台机器是谁；它现在活着没有、手上有哪些 Team 的签名材料、跑的是哪一版
 	// 程序，都在心跳表里（设计 ios-mac-builders-home-network-2026-09-18 §5.4）。
-	// 这两件事分开存，但在控制台上必须一起看——"这台机器缺谁的材料"是池子这个不变量
-	// 唯一的监视器
+	// 这两件事分开存，但在控制台上必须一起看。"缺哪个租户"逐条看在「Apple 证书与密钥」页，
+	// 这里每台只给一个数：材料已下发、它还没装上的有几个（设计 ios-credentials-overview §10.3）
 	liveness, err := s.machineLivenessByID(ctx)
 	if err != nil {
 		slog.Error("cannot read build machine liveness", "error", err)
@@ -685,10 +685,17 @@ func (s *server) listMachines(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.ios configuration is invalid")
 		return
 	}
+	// 材料读不出来不该让整份机器登记打不开：这一项只是个计数，读不出来就当 0，记日志
+	delivered := []iosSigningTarget{}
+	if index, err := s.readIOSMaterialIndex(ctx); err != nil {
+		slog.Error("cannot read the iOS signing material; pendingInstall is left at 0", "error", err)
+	} else {
+		delivered = index.deliveredTargets(wanted)
+	}
 	now := s.now()
 	for _, item := range items {
 		id, _ := item["id"].(string)
-		item["liveness"] = machineLivenessView(liveness[id], item, wanted, now)
+		item["liveness"] = machineLivenessView(liveness[id], item, delivered, now)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"version":             snapshot.Version,

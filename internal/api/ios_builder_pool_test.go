@@ -445,12 +445,17 @@ func TestDBOnlyAMacCanBeGivenIOS(t *testing.T) {
 	}
 }
 
-// 机器列表要把"登记"与"现在的样子"一起给出来：控制台上那张卡片要回答的是
-// "这台机器活着没有、手上有哪些 Team 的材料、缺谁的"，而这三件事分在两处存
-// （设计 §5.2、§5.4）。
+// 机器列表要把"登记"与"现在的样子"一起给出来：控制台上那张卡片要回答的是"这台机器活着没有、
+// 手上有哪些 Team 的材料、有没有已下发却没装上的"，而这几件事分在两处存（设计 §5.2、§5.4）。
+//
+// "缺谁的材料"不再逐条列在机器上（设计 ios-credentials-overview §10.3）：每台只给一个数
+// pendingInstall——材料**已下发**（证书与描述文件都在平台上、新装的 Mac 解得开）、这台却没装上的
+// 租户数。材料根本没传的租户不算：那是租户的事，挂在机器名下会让人以为机器坏了。
 func TestDBMachineListCarriesLivenessAndTheSigningGap(t *testing.T) {
 	f, macs := newIOSPool(t, 75, 1)
-	// 另一个租户也登记了 iOS 身份，但这台 Mac 没有它的材料：差集要把它列出来
+	clearStoredMaterial(t, f)
+	builder, _ := materialKeys(t, f)
+	// 另一个租户也登记了 iOS 身份，这台 Mac 没有它的材料
 	other := testTenant(76)
 	if _, err := f.db.Exec(`INSERT INTO tenants(id,slug,status,start_date,expiry_date,deleted,created_at,updated_at)
 		VALUES(?,?,1,CURDATE(),DATE_ADD(CURDATE(), INTERVAL 1 YEAR),0,UTC_TIMESTAMP(3),UTC_TIMESTAMP(3))`,
@@ -465,57 +470,66 @@ func TestDBMachineListCarriesLivenessAndTheSigningGap(t *testing.T) {
 		VALUES(?,?,?,1,'test',UTC_TIMESTAMP(3))`, other, releaseIOSIdentityConfigKey, raw); err != nil {
 		t.Fatal(err)
 	}
+	// 再登记一台吊销的 iOS 构建机：它不在池子里，不该有"该装谁的材料"
+	revoked := newGateMachine(t, machineRoleBuilder, "mac-revoked-"+uniqueSuffix()).record("")
+	revoked.Platforms, revoked.Status = []string{buildPlatformIOS}, machineStatusRevoked
+	mac := macs[0].record("")
+	mac.Platforms = []string{buildPlatformIOS}
+	f.writeMachines(f.primary.record(signerRolePrimary), f.standby.record(signerRoleStandby), mac, revoked)
 	if recorder := iosClaim(f, macs[0], teamReport(poolTeamA, poolBundle)); recorder.Code != http.StatusNoContent {
 		t.Fatalf("claim: %d %s", recorder.Code, recorder.Body.String())
 	}
 
-	listed := f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil)
-	if listed.Code != http.StatusOK {
-		t.Fatalf("list machines: %d %s", listed.Code, listed.Body.String())
+	list := func() (map[string]any, []any) {
+		t.Helper()
+		listed := f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil)
+		if listed.Code != http.StatusOK {
+			t.Fatalf("list machines: %d %s", listed.Code, listed.Body.String())
+		}
+		body := decodeBody(t, listed)
+		items, _ := body["items"].([]any)
+		return body, items
 	}
-	body := decodeBody(t, listed)
+	liveOf := func(items []any, id string) map[string]any {
+		t.Helper()
+		for _, item := range items {
+			if entry, _ := item.(map[string]any); entry["id"] == id {
+				live, _ := entry["liveness"].(map[string]any)
+				return live
+			}
+		}
+		t.Fatalf("machine %s is not in the list: %v", id, items)
+		return nil
+	}
+
+	body, items := list()
 	if _, present := body["approvedAgentCommit"]; !present {
 		t.Fatal("the machine list must say which agent version is approved")
 	}
-	items, _ := body["items"].([]any)
-	var mac map[string]any
-	for _, item := range items {
-		entry, _ := item.(map[string]any)
-		if entry["id"] == macs[0].ID {
-			mac = entry
-		}
-	}
-	if mac == nil {
-		t.Fatalf("the Mac is not in the list: %v", items)
-	}
-	live, _ := mac["liveness"].(map[string]any)
+	live := liveOf(items, macs[0].ID)
 	if live == nil || live["online"] != true || live["lastSeenAt"] == nil {
 		t.Fatalf("liveness: %v", live)
 	}
-	teams, _ := live["appleTeams"].([]any)
-	if len(teams) != 1 {
+	if teams, _ := live["appleTeams"].([]any); len(teams) != 1 {
 		t.Fatalf("self-reported teams: %v", live["appleTeams"])
 	}
-	// 差集是跨租户算的（测试库里还有别的用例留下的租户），只断言该在的在、不该在的不在
-	missing, _ := live["missingTenants"].([]any)
-	var gapForOther map[string]any
-	for _, item := range missing {
-		gap, _ := item.(map[string]any)
-		if gap["tenantId"] == other {
-			gapForOther = gap
-		}
-		if gap["tenantId"] == f.tenant {
-			t.Fatalf("a tenant this machine can build was listed as a gap: %v", gap)
-		}
+	// 另一个租户的材料一份都没传：那不是这台机器的问题
+	if live["pendingInstall"] != float64(0) {
+		t.Fatalf("material nobody uploaded is not pending on the machine: %v", live["pendingInstall"])
 	}
-	if gapForOther == nil || gapForOther["teamId"] != poolTeamB || gapForOther["bundleId"] != "com.other.app" {
-		t.Fatalf("the signing gap must name the tenant this machine cannot build: %v", missing)
+	// 线上旧控制台按必填解析 missingTenants：恒发空数组
+	if gaps, ok := live["missingTenants"].([]any); !ok || len(gaps) != 0 {
+		t.Fatalf("missingTenants must stay an empty array for the old console: %v", live["missingTenants"])
 	}
-	if gapForOther["slug"] == "" {
-		t.Fatalf("a gap must name the tenant, not just its id: %v", gapForOther)
+
+	// 那个租户的证书与描述文件传上来了（下发了），这台没装上：算一个
+	uploadSealed(t, f, teamCertificate(poolTeamB), builder)
+	uploadSealed(t, f, profileMaterial(poolTeamB, "com.other.app"), builder)
+	_, items = list()
+	if pending, _ := liveOf(items, macs[0].ID)["pendingInstall"].(float64); pending < 1 {
+		t.Fatalf("delivered material the machine does not report must be pending: %v", pending)
 	}
-	// 签名闸与只打 Android 的机器没有"缺哪个 Team"这个概念：给它们算差集只会在控制台上
-	// 铺一片与它们无关的黄色
+	// 签名闸、吊销的机器没有这个概念：给它们算只会在控制台上铺一片与它们无关的黄色
 	for _, item := range items {
 		entry, _ := item.(map[string]any)
 		if entry["id"] == macs[0].ID {
@@ -525,8 +539,8 @@ func TestDBMachineListCarriesLivenessAndTheSigningGap(t *testing.T) {
 		if entryLive == nil {
 			t.Fatalf("every machine must carry a liveness block: %v", entry)
 		}
-		if gaps, _ := entryLive["missingTenants"].([]any); len(gaps) != 0 {
-			t.Fatalf("a non-iOS machine was given a signing gap: %v", entry)
+		if entryLive["pendingInstall"] != float64(0) {
+			t.Fatalf("a machine outside the iOS pool was given pending material: %v", entry)
 		}
 	}
 }

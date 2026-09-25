@@ -70,13 +70,11 @@ type listPage struct {
 // parseListPage 读 limit 与 cursor。坏游标是客户端错误，报出来，不悄悄从第一页翻。
 func parseListPage(c *gin.Context, keys ...sortKey) (listPage, string) {
 	page := listPage{limit: adminListDefaultLimit}
-	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
-		value, err := strconv.Atoi(raw)
-		if err != nil || value < 1 || value > adminListMaxLimit {
-			return page, fmt.Sprintf("limit must be between 1 and %d", adminListMaxLimit)
-		}
-		page.limit = value
+	limit, bad := parseListLimit(c)
+	if bad != "" {
+		return page, bad
 	}
+	page.limit = limit
 	raw := strings.TrimSpace(c.Query("cursor"))
 	if raw == "" {
 		return page, ""
@@ -92,6 +90,19 @@ func parseListPage(c *gin.Context, keys ...sortKey) (listPage, string) {
 	clause, args := keysetBefore(columns, values)
 	page.after.add(clause, args...)
 	return page, ""
+}
+
+// parseListLimit 读 limit：空=默认值，超出范围是客户端错误。不在 SQL 里分页的列表（例如先算完再切页的）也用它
+func parseListLimit(c *gin.Context) (int, string) {
+	raw := strings.TrimSpace(c.Query("limit"))
+	if raw == "" {
+		return adminListDefaultLimit, ""
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > adminListMaxLimit {
+		return adminListDefaultLimit, fmt.Sprintf("limit must be between 1 and %d", adminListMaxLimit)
+	}
+	return value, ""
 }
 
 // keysetBefore 生成倒序键集的"下一页"条件：

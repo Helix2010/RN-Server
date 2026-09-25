@@ -392,8 +392,9 @@ func (s *server) iosSigningTargetsAndInvalid(ctx context.Context) ([]iosSigningT
 //
 // 恒有值（机器从没报到过时各项为 null / 空数组）：一个新字段不该有能力让整页打不开，
 // 而"从来没上线过"本身就是要显示出来的状态。
-func machineLivenessView(live machineLiveness, machine gin.H, wanted []iosSigningTarget, now time.Time) gin.H {
+func machineLivenessView(live machineLiveness, machine gin.H, delivered []iosSigningTarget, now time.Time) gin.H {
 	role, _ := machine["role"].(string)
+	status, _ := machine["status"].(string)
 	platforms, _ := machine["platforms"].([]string)
 	view := gin.H{
 		"lastSeenAt":  nil,
@@ -403,8 +404,11 @@ func machineLivenessView(live machineLiveness, machine gin.H, wanted []iosSignin
 		"appleTeams":  []gin.H{},
 		// capabilities 是机器自报的能力（例如能不能把 .ipa 交回平台）
 		"capabilities": []string{},
-		// missingTenants 是这台机器缺材料的租户（只对能打 iOS 的构建机算）
-		"missingTenants":   []gin.H{},
+		// missingTenants：线上旧控制台按必填解析，恒发空数组；新控制台看 pendingInstall。下一版删
+		"missingTenants": []gin.H{},
+		// pendingInstall：材料已下发（证书与描述文件都在平台上、新装的 Mac 解得开）、这台却没装上的
+		// 租户数。材料没传齐的不算——那是租户的事，在「Apple 证书与密钥」页上显示，不挂在机器名下
+		"pendingInstall":   0,
 		"signingExpiresAt": nil,
 		"pausedReason":     nil,
 		"upgradeError":     nil,
@@ -433,22 +437,19 @@ func machineLivenessView(live machineLiveness, machine gin.H, wanted []iosSignin
 		}
 		view["appleTeams"] = teams
 	}
-	// 差集只对"能打 iOS 的构建机"算：签名闸与只打 Android 的机器没有这个概念，
-	// 给它们算一份缺口只会让控制台上出现一片与它们无关的黄色
-	if role != machineRoleBuilder || !containsString(platforms, buildPlatformIOS) {
+	// 只对登记为 active、能打 iOS 的构建机算，与「Apple 证书与密钥」页的分母同一口径：签名闸、
+	// 只打 Android 的、已吊销的机器没有"该装谁的材料"这回事
+	if role != machineRoleBuilder || status != machineStatusActive || !containsString(platforms, buildPlatformIOS) {
 		return view
 	}
 	held := signingPairs(live.AppleTeams)
-	missing := []gin.H{}
-	for _, target := range wanted {
-		if containsString(held, strings.ToUpper(target.TeamID)+"."+target.BundleID) {
-			continue
+	pending := 0
+	for _, target := range delivered {
+		// 与认领、与那一页的 machine 筛选同一个判据：(Team, bundle id) 原样比
+		if !containsString(held, strings.ToUpper(target.TeamID)+"."+strings.TrimSpace(target.BundleID)) {
+			pending++
 		}
-		missing = append(missing, gin.H{
-			"tenantId": target.TenantID, "slug": target.Slug,
-			"teamId": target.TeamID, "bundleId": target.BundleID,
-		})
 	}
-	view["missingTenants"] = missing
+	view["pendingInstall"] = pending
 	return view
 }
