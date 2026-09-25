@@ -350,11 +350,11 @@ runner 的任务说明里加 `TenantID`。
 
 | 阶段 | 内容 | 仓库 | 要签清单 / 用户签名 |
 | --- | --- | --- | --- |
-| 0 | 自助上传时拒收 App Manager Key；材料版本号永不重用（修删后重传被跳过）；控制台的 ASC 卡、材料卡徽章按交付方式显示；推送：租户视图不带平台字段、「测试」不改平台那一行、`InvalidProviderToken` 判为凭据错误 | RN-Server、RN-Admin | 否 |
+| 0 ✅ | 自助上传时拒收 App Manager Key；材料版本号永不重用（修删后重传被跳过）；控制台的 ASC 卡、材料卡徽章按交付方式显示；APNs 的 `InvalidProviderToken` / `TopicDisallowed` 判为凭据错误。**2026-09-25 已上线**（RN-Server `f05284e`、RN-Admin `eb9d6b7`，不用重签） | RN-Server、RN-Admin | 否 |
 | 1 | 租户本地账号（即账号设计的 S0：会话角色、租户校验、接口审计、账号管理页）。接统一认证是账号设计的 S2，不挡本文后续阶段 | RN-Server、RN-Admin | 否 |
 | 2 | Mac：临时钥匙串核对 + 按指纹幂等导入、描述文件核对（含 `aps-environment`）、按租户 id 落盘、全种类按租户墓碑与钥匙串引用计数、按租户盘点、取清单时带能力、同时认两种清单、v2 材料、ios-upload `--tenant`、runner 只复制本租户描述文件并传 SHA-1 | RN-Server（打包机） | 要签、批准 |
 | 3 | RN-App：接收证书 SHA-1 与描述文件目录，写进 `CODE_SIGN_IDENTITY` 与导出选项 `signingCertificate`，不传时照旧；release 构建给 `expo-notifications` 传 `mode: "production"` | RN-App | 用户签名提交 |
-| 4 | 服务端：材料按租户存 + 迁移（legacy 标记）、租户材料接口、按交付方式收、切换交付方式时按租户删、派活与排队按租户、平台页只读 + 紧急删除；推送：去掉平台回落并迁移、APNs 的 Team 核对、按 token 的环境发送、自助上传的 .ipa 核对 `aps-environment` | RN-Server | 否 |
+| 4 | 服务端：材料按租户存 + 迁移（legacy 标记）、租户材料接口、按交付方式收、切换交付方式时按租户删、派活与排队按租户、平台页只读 + 紧急删除；推送：去掉平台回落并迁移（连同租户视图不带平台字段、「测试」不改平台那一行——这两项原列阶段 0，没有平台回落就不存在了，挪到这里一起做）、APNs 的 Team 核对、按 token 的环境发送、自助上传的 .ipa 核对 `aps-environment` | RN-Server | 否 |
 | 5 | 控制台：租户侧材料清单与上传（v2 封装，含「推送（可选）」）、描述文件浏览器端解析、Mac 核对结果展示、换 Firebase 项目时的提示 | RN-Admin | 否 |
 | 6 | 去掉 v1、旧布局与 Team 级旧路径；真机验证：anyfun、predict 各交一套，同 Team 两张不同证书各自打包成功，紧急删除后 Mac 上确实撤掉 | 全部 | 要签（打包机去掉旧代码） |
 
