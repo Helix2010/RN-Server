@@ -20,11 +20,13 @@ import (
 	"github.com/Helix2010/RN-Server/internal/config"
 )
 
+// pngOf 生成一张给定尺寸的 PNG。被测的只读 DecodeConfig（尺寸与格式），不看像素：用两色调色板 +
+// 最快压缩，4096 见方从 11 秒降到 1 秒（RGBA + 默认压缩要把 64MB 像素压一遍，race 下更慢）
 func pngOf(width, height int) string {
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	img.Set(0, 0, color.RGBA{A: 255})
+	img := image.NewPaletted(image.Rect(0, 0, width, height), color.Palette{color.Transparent, color.Black})
+	img.SetColorIndex(0, 0, 1)
 	var buf bytes.Buffer
-	_ = png.Encode(&buf, img)
+	_ = (&png.Encoder{CompressionLevel: png.BestSpeed}).Encode(&buf, img)
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 

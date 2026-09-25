@@ -18,29 +18,16 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  # 三个 job 并行：build（决定要不要部署、不连库的测试、编安装包与二进制）、validate（要 MySQL 的
+  # 库测与静态检查）、signing（签名闸 module，按用例分两片）。deploy 等三者都过。
+  #
+  # 2026-09-25 拆开之前，编译挂在 validate 末尾，理由是"能复用 validate 的缓存"——实测不成立：
+  # 安装包的 -trimpath 与 darwin/arm64 交叉编译和 vet/test 的缓存条目不通用，一点都复用不上，
+  # 于是 84 秒的冷编译整段压在关键路径上。推送到服务可用原先约 7.5 分钟（其中 CI 6 分 50 秒）。
+  build:
     runs-on: ubuntu-latest
     outputs:
       deploy-needed: ${{ steps.changes.outputs.deploy-needed }}
-    # 数据库测试（TestDB*、迁移测试）没有 RN_TEST_MYSQL_DSN 时一律 skip，而 skip 在 go test 里
-    # 算通过：签名闸的状态机、完成事务、迁移全在这一类里，不给库等于 CI 假绿。
-    # 库是一次性的容器，口令只在这个 job 里有效，不是机密
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: rn-test
-          MYSQL_DATABASE: rn_test
-        ports:
-          - 33061:3306
-        # 健康检查通过之前 Actions 不会开始跑 steps
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -prn-test --silent"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 30
-    env:
-      RN_TEST_MYSQL_DSN: root:rn-test@tcp(127.0.0.1:33061)/rn_test?parseTime=true&charset=utf8mb4
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,39 +79,17 @@ jobs:
             echo "deploy-needed=true" >> "$GITHUB_OUTPUT"
             echo "有文档以外的改动，照常部署"
           fi
-      - run: test -z "$(gofmt -l cmd internal signing)"
-      - run: go vet ./...
-      # 这几个脚本以 root 跑在服务器上（install.sh 由服务端下发给新机器）：shellcheck 不过不发
-      - name: shellcheck
-        run: shellcheck internal/machinesetup/install.sh deploy/setup/build-bundles.sh deploy/amos/rn-foundation-apply
-      - name: Wait for MySQL
-        # 服务容器健康之后 mysqld 偶尔还在做首次初始化后的重启；真连上一次再跑测试，
-        # 免得第一个包在连库上失败、被误读成代码问题
-        env:
-          MYSQL_PWD: rn-test
-        run: |
-          for i in $(seq 1 60); do
-            if mysqladmin ping -h 127.0.0.1 -P 33061 -uroot --silent; then exit 0; fi
-            sleep 2
-          done
-          echo "::error::MySQL 服务容器两分钟内没有就绪"
-          exit 1
-      # -p 1 只给 internal/api。库测共用同一个库（迁移、build.machines 等平台级单行），
-      # 并行跑会互相踩——但那条约束**只对这一个包成立**。原先 `-p 1 ./...` 把全仓都串了
-      # 起来：其余包并行只要 9 秒，串行要几十秒，白等（2026-09-20 实测）。
-      - run: go test -race -p 1 ./internal/api/
-      - name: The rest of the packages, in parallel
-        run: go test -race $(go list ./... | grep -v '/internal/api$')
-      # 产物写到 RUNNER_TEMP：build-bundles.sh 按 HEAD 算可复现归档，工作区脏了它会拒绝跑
-      - run: go build -o "$RUNNER_TEMP/server-link-check" ./cmd/server
-      - run: jq empty contracts/openapi.json
+      # 不连库的包在这里跑。internal/api 与 internal/store 有库测，留在有 MySQL 的 validate：
+      # 没有 RN_TEST_MYSQL_DSN 时库测一律 skip，而 skip 算通过——放到这里就是假绿
+      - name: Packages without database tests, in parallel
+        run: go test -race $(go list ./... | grep -vE '/internal/(api|store)$')
+      # 不部署时也要确认 cmd/server 链接得起来；部署时下面编 amos 二进制已经覆盖了这一点
+      - name: Link check
+        if: steps.changes.outputs.deploy-needed != 'true' || vars.AMOS_DEPLOY_ENABLED != 'true'
+        run: go build -o "$RUNNER_TEMP/server-link-check" ./cmd/server
 
-      # 编译放在这里，deploy 只负责送。原先 deploy 是另一个 runner：重新 checkout、
-      # 重新装 Go、把三个安装包与两个二进制**从头交叉编译一遍**——而这个 job 刚刚才把
-      # 全仓编译过。跨平台那几个（darwin/arm64）在 deploy 那边永远是冷缓存。
-      #
       # 归档可复现：这里打印的 sha256 就是运维装签名闸时 --expect-sha256 要核对的值。
-      # build-bundles.sh 要求工作区干净，所以上面每一步的产物都写在 RUNNER_TEMP。
+      # build-bundles.sh 按 HEAD 算可复现归档、要求工作区干净，所以产物一律写在 RUNNER_TEMP。
       - name: Build machine bundles and the amos binaries
         if: steps.changes.outputs.deploy-needed == 'true' && vars.AMOS_DEPLOY_ENABLED == 'true'
         run: |
@@ -159,31 +124,95 @@ jobs:
         run: |
           echo "::warning title=没有部署::AMOS_DEPLOY_ENABLED 不是 'true'，deploy 会被跳过。它必须建在 Variables 标签页，不是 Secrets——vars.* 读不到 Secret。"
 
+  validate:
+    runs-on: ubuntu-latest
+    # 数据库测试（TestDB*、迁移测试）没有 RN_TEST_MYSQL_DSN 时一律 skip，而 skip 在 go test 里
+    # 算通过：签名闸的状态机、完成事务、迁移全在这一类里，不给库等于 CI 假绿。
+    # 库是一次性的容器，口令只在这个 job 里有效，不是机密
+    env:
+      RN_TEST_MYSQL_DSN: root:rn-test@tcp(127.0.0.1:33061)/rn_test?parseTime=true&charset=utf8mb4
+    steps:
+      # 第一步就在后台起库，初始化（30–50 秒）与下面的 checkout、装 Go、vet 重叠。原先是服务容器：
+      # Actions 要等它健康了才开始跑任何 step，而且服务容器传不了 mysqld 的启动参数。
+      # 两个参数关掉每次提交的刷盘：一次性的测试库，掉电丢数据无所谓，库测会快不少
+      - name: Start MySQL in the background
+        run: |
+          docker run -d --name rn-test-mysql -p 127.0.0.1:33061:3306 \
+            -e MYSQL_ROOT_PASSWORD=rn-test -e MYSQL_DATABASE=rn_test \
+            mysql:8.0 --innodb-flush-log-at-trx-commit=2 --sync-binlog=0
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: test -z "$(gofmt -l cmd internal signing)"
+      - run: go vet ./...
+      # 这几个脚本以 root 跑在服务器上（install.sh 由服务端下发给新机器）：shellcheck 不过不发
+      - name: shellcheck
+        run: shellcheck internal/machinesetup/install.sh deploy/setup/build-bundles.sh deploy/amos/rn-foundation-apply
+      - run: jq empty contracts/openapi.json
+      - name: Wait for MySQL
+        # 镜像的初始化脚本先起一个不听 TCP 的临时实例、建完库再重启；真连上一次再跑测试，
+        # 免得第一个包在连库上失败、被误读成代码问题
+        env:
+          MYSQL_PWD: rn-test
+        run: |
+          for i in $(seq 1 90); do
+            if mysqladmin ping -h 127.0.0.1 -P 33061 -uroot --silent; then exit 0; fi
+            sleep 2
+          done
+          docker logs --tail 50 rn-test-mysql
+          echo "::error::MySQL 三分钟内没有就绪"
+          exit 1
+      # 两个有库测的包共用同一个库（迁移、build.machines 等平台级单行），并行跑会互相踩，
+      # 所以分两步先后跑，而且**顺序不能反**：store 的部分库测用的是 internal/api 用例迁移出来的表
+      # （app_configs 等），新库上先跑 store 会报表不存在。单个包不再加 -p 1：只有一个测试进程，
+      # -p 1 只会让编译也串行（2026-09-25 实测编译 31 秒 → 18 秒）
+      - run: go test -race ./internal/api/
+      - run: go test -race ./internal/store/
+
   # signing/ 是独立 module（签名闸与离线工具只依赖标准库），根目录的 ./... 不含它。
   #
-  # 单独一个 job，与 validate **并行**：它和 internal/api 是 CI 里最慢的两项，串在同一个
-  # job 里两段都在关键路径上（2026-09-20 实测：internal/api 65.7 秒、signing 那一步 160.5
-  # 秒，其中 internal/signer 一个包就占 160 秒——race 在这包上是 5.3 倍，而它做的全是真的
-  # 密码学运算，没有哪个用例特别慢，砍不动）。并行之后关键路径是两者里较长的那个。
-  #
-  # 不需要 MySQL（这个 module 不连库），也不需要 fetch-depth: 0（不比较提交范围）。
+  # internal/signer 一个包在 race 下要 160–190 秒（做的全是真的密码学运算，race 在这包上是 5 倍多），
+  # 用例之间没有 t.Parallel。按用例名对半分到两个 runner 上跑，各自一个进程，不必为了并行去改测试里的
+  # 共享状态；其余包和 vet 放在第 0 片。不需要 MySQL，也不需要 fetch-depth: 0。
   signing:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: signing module
+          # 不写的话它和根 module 的 job 共用一个缓存键（都按根目录 go.sum 算），先跑完的一方
+          # 抢先存下自己的缓存，另一方以后就一直是冷的
+          cache-dependency-path: signing/go.sum
+      - name: signing module (shard ${{ matrix.shard }} of 2)
         working-directory: signing
         run: |
-          go vet ./...
-          go test -race ./...
+          if [ "${{ matrix.shard }}" = 0 ]; then
+            go vet ./...
+            go test -race $(go list ./... | grep -v '/internal/signer$')
+          fi
+          mapfile -t all < <(go test -race -list '.' ./internal/signer | grep -E '^(Test|Fuzz|Example)')
+          mine=()
+          for i in "${!all[@]}"; do
+            if [ $((i % 2)) = "${{ matrix.shard }}" ]; then mine+=("${all[$i]}"); fi
+          done
+          # 分片为空时 -run 什么都不跑、照样绿：宁可红
+          if [ "${#all[@]}" -lt 10 ] || [ "${#mine[@]}" -eq 0 ]; then
+            echo "::error::internal/signer 的用例清单不对（共 ${#all[@]} 个，本片 ${#mine[@]} 个）"
+            exit 1
+          fi
+          echo "internal/signer：共 ${#all[@]} 个，本片 ${#mine[@]} 个"
+          go test -race -run "^($(IFS='|'; echo "${mine[*]}"))\$" ./internal/signer
 
   deploy:
-    needs: [validate, signing]
-    if: vars.AMOS_DEPLOY_ENABLED == 'true' && needs.validate.outputs.deploy-needed == 'true'
+    needs: [build, validate, signing]
+    if: vars.AMOS_DEPLOY_ENABLED == 'true' && needs.build.outputs.deploy-needed == 'true'
     # 串行的只有**真正动线上那台机器**的这一段：rn-foundation-apply 会停服务、换二进制、
     # 跑迁移，两次叠在一起就是在一台机器上同时做两次这件事。
     #
@@ -205,12 +234,12 @@ jobs:
       STAGE: /var/lib/rn-foundation-deploy/incoming
     steps:
       # 仓库还是要的：下面要核对 amos 上那个特权脚本与本仓版本是否一致。但**不装 Go、
-      # 不编译**——validate 已经把安装包与两个二进制编好交过来了（见那个 job 末尾）。
+      # 不编译**——build 已经把安装包与两个二进制编好交过来了。
       # 扫链服务不单独编：它就是 rn-server 的 `indexer` 子命令，rn-foundation-apply
       # 换二进制时连它一起停、一起起。打包机是另一个二进制，同一个 commit 编出来，
       # 只有下面 AMOS_DEPLOY_BUILD_AGENT 开着才送上去
       - uses: actions/checkout@v4
-      - name: Take the payload from validate
+      - name: Take the payload from build
         uses: actions/download-artifact@v4
         with:
           name: deploy-payload
@@ -244,6 +273,11 @@ jobs:
             BatchMode yes
             ConnectTimeout 15
             StrictHostKeyChecking yes
+            # 连接复用：这个 job 要连十几次，每次握手约 2 秒。第一次连上后留一个主连接，之后的
+            # 每一条 ssh 都走它。账号、命令、sudo 边界都不变
+            ControlMaster auto
+            ControlPath ~/.ssh/cm-%C
+            ControlPersist 10m
           CONF
           chmod 600 ~/.ssh/config
 
@@ -273,11 +307,9 @@ jobs:
           [ "$want" = "$got" ] || echo "::warning::amos 上的 rn-foundation-apply 与本仓库版本不一致，考虑重跑 setup-ci-deploy.sh"
 
       - name: Upload binary
+        # 先写 .part 再改名：传到一半断掉时暂存目录里不会留下一个像是完整的二进制
         run: |
-          ssh amos "mkdir -p '$STAGE'"
-          # 先写 .part 再改名：传到一半断掉时暂存目录里不会留下一个像是完整的二进制
-          ssh amos "cat > '$STAGE/rn-server.part'" < rn-server
-          ssh amos "mv '$STAGE/rn-server.part' '$STAGE/rn-server'"
+          ssh amos "set -eu; mkdir -p '$STAGE'; cat > '$STAGE/rn-server.part'; mv '$STAGE/rn-server.part' '$STAGE/rn-server'" < rn-server
 
       - name: Apply
         # 停服务、换二进制、跑迁移、健康检查、失败回滚都在 amos 那个脚本里。
@@ -295,11 +327,16 @@ jobs:
             echo "::error::amos 上的 rn-foundation-apply 还不认 bundles 子命令：在那台机器上重跑 deploy/amos/setup-ci-deploy.sh 更新它"
             exit 1
           fi
-          ssh amos "rm -rf '$STAGE/machine-bundles.part' && mkdir -p '$STAGE/machine-bundles.part'"
-          for f in manifest.json signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz release-key.pub; do
-            ssh amos "cat > '$STAGE/machine-bundles.part/$f'" < "$RUNNER_TEMP/machine-bundles/$f"
-          done
-          ssh amos "rm -rf '$STAGE/machine-bundles' && mv '$STAGE/machine-bundles.part' '$STAGE/machine-bundles'"
+          # 五个文件一个 tar 流送过去（原来一个文件一次 ssh）。apply 会把它们拷成 root 的副本、
+          # 逐个核对是非空的普通文件、sha256 在清单里，这里只负责送到
+          tar -C "$RUNNER_TEMP/machine-bundles" -cf - \
+            manifest.json signer.tar.gz builder.tar.gz builder-darwin-arm64.tar.gz release-key.pub |
+            ssh amos "set -eu
+              rm -rf '$STAGE/machine-bundles.part'
+              mkdir -p '$STAGE/machine-bundles.part'
+              tar -C '$STAGE/machine-bundles.part' -xf -
+              rm -rf '$STAGE/machine-bundles'
+              mv '$STAGE/machine-bundles.part' '$STAGE/machine-bundles'"
 
       - name: Apply machine bundles
         run: ssh amos "sudo /usr/local/sbin/rn-foundation-apply bundles $GITHUB_SHA"
@@ -314,8 +351,7 @@ jobs:
       - name: Upload the build agent
         if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
         run: |
-          ssh amos "cat > '$STAGE/build-agent.part'" < build-agent
-          ssh amos "mv '$STAGE/build-agent.part' '$STAGE/build-agent'"
+          ssh amos "set -eu; cat > '$STAGE/build-agent.part'; mv '$STAGE/build-agent.part' '$STAGE/build-agent'" < build-agent
 
       - name: Apply the build agent
         if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true'
