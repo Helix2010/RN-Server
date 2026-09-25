@@ -1,9 +1,11 @@
-# iOS 签名材料改由租户自己提交（含前提：租户账号）（2026-09-25）
+# iOS 签名材料与推送凭据改由租户自己提交（含前提：租户账号）（2026-09-25）
 
 ## 0. 结论
 
-用户要求：Distribution 证书、App Store 描述文件、上传 Key、App Manager Key 由**租户**提交，平台管理员不代交；
-不同交付方式要交的材料不同。
+用户要求：
+- Distribution 证书、App Store 描述文件、上传 Key、App Manager Key 由**租户**提交，平台管理员不代交；
+- 不同交付方式要交的材料不同；
+- 推送凭据（FCM、APNs）也由租户提交。
 
 现在做不到，有两个根上的原因：
 
@@ -14,15 +16,22 @@
    anyfun 与 predict 同在 J4JDFC8LCC 下，平台上只有一张证书、一把上传 Key。谁能换它，谁就能让同 Team 的别人构建失败——
    所以当初只能收在平台管理员手里。
 
-方案分三部分，按顺序上线：
+方案分四部分，按顺序上线：
 
-- **A. 租户账号**：平台管理员给每个租户建账号；会话绑定租户，只能在自己的控制台域名上登录、只能动自己租户的数据；
-  平台权限按会话角色判，不再按用户名。开放之前把现有租户接口逐个审一遍（有的会带出别的租户的信息）。
+- **A. 租户账号**：单独写成一篇（`tenant-console-accounts-and-sso-2026-09-25.md`）：
+  - 先上 RN 本地租户账号；
+  - 再接入公司统一认证 ChainUp 认证中心（CID），与 pm-cup2026、web3-rwa 一样作为子业务；
+  - 会话绑定租户，平台权限按会话角色判断。
 - **B. 材料按租户存、租户自己交**：主键加租户；同 Team 的租户各交各的，互不影响；按交付方式规定哪些要交、哪些拒收。
   平台管理员只保留只读总览与紧急删除（删除真的会从 Mac 上撤掉）。
 - **C. Mac 打包机按租户隔离，并在安装前核对内容**：提交者从受信的平台管理员变成了租户，Mac 是最后一道关——
   证书真属于这个 Team、描述文件的 bundle id 与类型对得上、材料确实是这个租户交的才装；构建时只给本租户的描述文件，
   签名身份按证书指纹钉死。
+- **D. 推送凭据由租户提交**：租户接口已经有了。要做的是：
+  - 去掉「没配就用平台那一行」的回落；
+  - APNs 核对 Team；
+  - 按设备 token 的环境发送；
+  - 包里的 `aps-environment` 改成 `production`。
 
 另有一组**不依赖账号的修补（阶段 0）**可以先做：
 - 自助上传时服务端拒收 App Manager Key；
@@ -66,65 +75,13 @@ flowchart LR
 
 ## 2. A. 租户账号（前提）
 
-### 2.1 账号模型
+租户账号，以及接入公司统一认证（ChainUp 认证中心，与 pm-cup2026、web3-rwa 共用），单独写成一篇：`tenant-console-accounts-and-sso-2026-09-25.md`（下称「账号设计」）。原来写在这一节的内容已经挪过去。本文依赖其中这几条：
 
-- 新表 `tenant_admin_accounts`：
-  - `id`、`tenant_id`、`username`（租户内唯一）；
-  - `password_hash`：沿用现有 scrypt 格式（`server.go:2287` `verifyPassword`）；
-  - `status`（active / disabled）；
-  - `created_by`、`created_at`、`password_changed_at`、`last_login_at`。
-- 平台管理员照旧是环境变量里那一个账号（`ADMIN_USERNAME` + `PLATFORM_ADMIN_USERNAMES`），不进这张表；`x-admin-key`
-  明确定为平台身份。
-- 不开放自助注册：
-  - 账号只由平台管理员在控制台建，初始口令只显示一次；
-  - 租户可以自己改口令；
-  - 平台管理员可以停用、重置口令，要填原因，进审计。
-
-### 2.2 登录与会话
-
-- `admin_sessions` 加三列：`role`（platform / tenant）、`tenant_id`（平台会话为 NULL）、`account_id`。
-- 登录时按域名定租户：
-  - 登录接口不在 `domainTenantScope` 之下（`server.go:211-214`），所以在处理函数里直接调 `s.tenant.resolve(Host)`；
-  - 这样解析不会错到别的租户：console.* 的 `/v1/` 已被 nginx 改写成对应的 api.*，而 `tenant_domain` 有唯一键。
-- 核对顺序：
-  - 先按平台管理员核对；不是的话，在按域名解析出的租户下查租户账号；
-  - **租户账号只能在自己租户的控制台域名上登录**：在 console.anyfun.win 输入 predict 的账号，按查无此人处理；
-  - 查无此人时也跑一次 scrypt，让响应时间不泄露账号是否存在。
-- 限速：
-  - 沿用按 IP 的计数；
-  - 另加按「租户 + 用户名」的**退避**，不做硬锁定——硬锁定能被别人拿来定向锁号。
-- `authenticate()` 每次请求都按 `account_id` 查账号状态：停用或重置口令之后，已有的会话立即失效。
-- 会话接口多返回 `role`、`tenantId`、`username`。
-
-### 2.3 授权
-
-- **平台权限按会话角色判**：
-  - 条件改成 `role = platform 且 tenant_id IS NULL`，不再拿用户名比对名单；
-  - 不改的话，租户建一个与平台管理员同名的账号，就拿到了全部 `/platform` 权限；
-  - 租户会话的 actor 写成 `tenant:<租户id>:<用户名>`，与平台账号的名字不可能重合，审计也不会撞名。
-- **租户范围接口**（`/v1/admin/...`）：
-  - 租户会话的 `tenant_id` 必须等于按域名解析出的租户，否则 403；
-  - 这条检查放在 `current` 路由组里、`domainTenantScope` **之后**的一个中间件里（`server.go:337-338`）；不能放进 `authenticate()`，因为它先于 `domainTenantScope` 执行，那时还不知道域名对应哪个租户；
-  - 平台会话照旧可以在任何一个租户的控制台上操作那个租户。
-- **Origin**：
-  - 现在任何租户域名都算可信 Origin（`server.go:604-633` `originAllowed`）；
-  - 改成：Origin 所属的租户必须与 Host 的租户相同（平台控制台域名除外）。
-
-### 2.4 开放之前要审的现有租户接口
-
-租户账号一开，`registerTenantRoutes` 下的每个接口都会被租户直接调用。已知要改的：
-
-- `GET /v1/admin/ios/delivery` 会返回同 Team 下其它全托管租户的 **slug**（`ios_delivery.go:330,343`）。
-  材料按租户存之后，切换交付方式不再依赖别的租户（§3.3），所以这一项改成只返回一个布尔值：同一个 Team 下还有没有别的 App。
-- 任务视图里带打包机名字：对租户只显示「iOS 打包机 / Android 打包机」。
-- `repoDirectory`（RN-App 仓库里的 `tenants/<目录>`）现在租户能改（`build_config.go:190-245`）。它决定打哪一份代码，改成只有平台管理员能改。
-- `release.ios` 的 bundle id 跨租户没有唯一校验：保存时要拒绝别的租户已经在用的 bundle id。
-- 其余接口逐个过一遍，结论记进实现 PR。
-
-### 2.5 控制台
-
-- 平台维护下新增「租户账号」页，只有平台管理员看得到：列表、新建（初始口令只显示一次）、停用、重置口令。
-- 右上角显示当前账号与所属租户。租户账号的导航里没有平台维护。
+- 会话带 `role`、`tenant_id`、`account_id`、`auth_time`；平台权限按会话角色判断，不按用户名（账号设计 §3.3）；
+- 租户范围的接口，在 `domainTenantScope` 之后校验「会话租户 = 域名租户」（账号设计 §3.3）；
+- 只有 `admin` 角色的租户账号能交、删材料，`viewer` 只能看；
+- 上传或删除签名材料、推送凭据，以及切换交付方式，都算敏感操作，要求 15 分钟内在 RN 输过 TOTP（账号设计 §4.5）；
+- 开放租户账号之前，先把现有的租户接口审一遍（账号设计 §3.4）。
 
 ## 3. B. 材料按租户存、租户自己交
 
@@ -299,7 +256,68 @@ runner 的任务说明里加 `TenantID`。
 - 上线顺序：**先发新版打包机并批准（阶段 2）→ RN-App 兼容版（阶段 3）→ 再迁移服务端数据（阶段 4）**。中间任何时刻旧机器照旧能打。
 - 前提：§4.2 的「导入按指纹幂等」要先做好，否则迁移后每台 Mac 的证书格都会装失败。
 
-## 5. 控制台
+## 5. D. 推送凭据改由租户提交
+
+### 5.1 现状
+
+- 通道：
+  - 在用的只有 FCM（服务账号 JSON）和 APNs（只收 .p8 Token 认证）；
+  - 华为推送只有全局环境变量，App 也从不上报 hms token，实际上没在用；
+  - 其它厂商的通道不存在。
+- 存储：
+  - 按租户存在 `app_configs` 的 `push.fcm`、`push.apns` 里，用服务端主密钥加密；
+  - 服务端要拿它发推送，所以必须解得开。这和签名材料「服务端解不开」是两套模型，是有意这样设计的，不改。
+- 接口：
+  - 租户范围的 GET/PUT/DELETE/test 已经有了（`server.go:457-464`），控制台「推送凭据」页也不限平台管理员；
+  - 另外还有一组改平台默认那一行的接口（`server.go:254-257`）；
+  - 所以**租户账号一上线，租户就能自己交**。要改的是下面这些问题。
+- 问题：
+  1. 自己没配，就回落到平台那一行（tenant 0，`pushcreds.go:95`、`apns.go:80`）。租户以为没配推送，其实在用平台的 Firebase 项目或 APNs Key。
+  2. 继承时，租户视图会带出平台那一行的 `projectId`、`clientEmail`、`updatedBy` 等字段（`push_credentials.go:284-296`）；租户点「测试」，会改写平台那一行的验证时间（`push_credentials.go:265-275`）。
+  3. 不拿 APNs Key 的 Team 去和 `release.ios` 的 Team 比对，只靠保存时发一条探活推送；改了 bundle id 之后也不重新验证。
+  4. APNs 回 403 `InvalidProviderToken` 时，不当作凭据错误，而是按普通错误重试，最多 5 次（`dispatcher.go:460-464,489`）。
+  5. 环境按凭据配一个，但设备 token 各有各的环境。环境配错时 APNs 回 `BadDeviceToken`，token 会被直接作废（`dispatcher.go:461-462`），设备要重新注册才能恢复。具体情况：
+     - `push_tokens` 有 `environment` 列（`migrations.go:671`），但注册时不校验，缺省填 `production`（`installations.go:206,215`）；
+     - App 上报的值是 `development` / `production`（`installation-service.ts:384-388`）；
+     - 派发取 token 时不查这一列（`dispatcher.go:274`）；
+     - APNs 客户端每份凭据只建一个，环境固定（`apns.go:230-233`、`dispatcher_apns.go:36-50`）。
+  6. RN-App 里的 `expo-notifications` 插件没传参数（`app.config.ts:295`），默认往 entitlements 写 `aps-environment=development`。App Store / TestFlight 包要的是 `production`；导出时这个值会不会被描述文件里的替换掉，还没有核实。
+  7. 本租户和平台都没有凭据行时，派发会退回环境变量里的旧凭据（`dispatcher.go:104-118,330-331`、`dispatcher_apns.go:25-26`）。只删平台那一行的话，之后新建的租户会悄悄用上环境变量里的平台凭据。
+
+### 5.2 改法
+
+- **去掉平台回落**：FCM、APNs 都去掉，和 App Manager Key 一样只认租户自己的那一份。迁移步骤：
+  1. 先只读查一遍生产上哪些租户在继承；
+  2. 对这些租户，服务端解开平台那一行，按租户的附加数据重新加密，存成它自己的一行；
+  3. 最后删掉平台那一行和 `/platform/push/*` 接口，**同一版里删掉环境变量兜底**（`FCM_*`、`APNS_*` 与 legacy sender）。
+- 租户视图只显示自己的那一行；「测试」也只动自己那一行。
+- **APNs 核对**：
+  - 保存时，凭据里的 Team ID 必须等于本租户 `release.ios` 的 Team，再用 topic 探活确认；
+  - 租户改了 Team 或 bundle id，推送凭据标为「待重新验证」，并在控制台提示。
+- **按 token 的环境发送**：
+  - 注册时校验 `environment` 只能是 `development` / `production`，存量缺省值按安装包类型回填；
+  - 派发时带上 token 的环境：`development` 走 APNs sandbox，`production` 走正式环境；
+  - APNs 客户端按（租户，环境）缓存；
+  - Apple 现在允许把一把 Key 限定到单一环境或 topic（待核实），所以保存与「测试」时两个环境各探一次，控制台显示哪个环境可用，凭据里不再配置环境；
+  - 这样 `BadDeviceToken` 才可信，作废 token 的逻辑可以保留。
+- 403 `InvalidProviderToken` 判为凭据错误，`TopicDisallowed` 判为配置错误（Key 不能发这个 bundle id）：停止重试，标记失效，在控制台上显示出来。
+- **推送权限（`aps-environment`）**：
+  - RN-App 的 release 构建给 `expo-notifications` 传 `mode: "production"`。这要用户签名提交，归进阶段 3；
+  - Mac 核对描述文件（§4.2）时多查一项：租户配了 APNs，描述文件的 Entitlements 里就必须有 `aps-environment=production`，否则提示「这个 App ID 没开推送」；
+  - 自助上传时服务端解包核对 .ipa，也加这一项，而且要看**签名后二进制里的 entitlements**，不能只看描述文件；
+  - 先对一次现有导出的 .ipa 跑 `codesign -d --entitlements`，确认导出时 `development` 会不会被描述文件替换掉。
+- **同一个 Team 共用 APNs Key**：
+  - 各租户各交各的，存的是各自的副本；一方在 Apple 后台吊销这把 Key，另一方也会一起断。控制台上像上传 Key 那样提示；
+  - Apple 对每个 Team 能建的 APNs Key 数量有限制（具体上限待核实），同一个 Team 的租户交同一把就行。
+- **换 Firebase 项目**：
+  - FCM 凭据必须和包里的 google-services.json 属于同一个项目，保存时已经比对了（`push_credentials.go:95-102`）；
+  - 租户换项目就等于换 google-services.json，要发全量包；旧版本设备的 token 属于旧项目，新凭据发不过去（`SENDER_ID_MISMATCH`）；
+  - 控制台在项目变化时明确提示：过渡期内，旧版本设备收不到推送；
+  - 要做到不中断，就得按 token 记住它属于哪个项目，同时保留两套凭据。这不在本期。
+- **与交付方式无关**：推送在全托管和自助上传下都一样，都是可选项。材料清单里单列一项「推送（可选）」，包括 FCM 服务账号 + google-services.json，以及 APNs Key。
+- 华为推送的全局环境变量和死代码另行讨论删除，不在本期。
+
+## 6. 控制台
 
 - **租户的 iOS 页**：材料卡对租户账号开放。
   - 顶部是按当前交付方式的清单，逐项显示「已交 / 缺 / 不需要 / 不能交 / Mac 核对不过（原因）」，点击跳到对应位置。
@@ -309,7 +327,7 @@ runner 的任务说明里加 `TenantID`。
 - **命名统一**：上传 Key（Developer 角色，交给打包机上传用）、App Manager Key（只读同步用），两个叫法全站一致。
 - **平台页**：「Apple 证书与密钥」改为只读 + 紧急删除；新增「租户账号」页。
 
-## 6. 安全
+## 7. 安全
 
 | 威胁 | 以前 | 之后 |
 | --- | --- | --- |
@@ -320,7 +338,7 @@ runner 的任务说明里加 `TenantID`。
 | 租户起名冒充平台管理员 | 只有一个账号 | 平台权限按会话角色判；租户 actor 带前缀 |
 | 撞租户账号口令 / 定向锁号 | 只有一个账号 | 按 IP 限速 + 按账号退避（不硬锁）、scrypt、查无此人也恒时、停用即踢会话、审计 |
 | 跨租户越权调接口 | 只有一个账号，不存在 | `domainTenantScope` 之后统一校验会话租户 = 域名租户；Origin 绑定到同一租户 |
-| 从现有接口看到别的租户 | 只有平台管理员在看 | 按 §2.4 逐个审 |
+| 从现有接口看到别的租户 | 只有平台管理员在看 | 按账号设计 §3.4 逐个审 |
 
 残余风险：
 
@@ -328,43 +346,45 @@ runner 的任务说明里加 `TenantID`。
 - Apple 那一侧不隔离：几个租户共用同一张证书或同一把 Team Key 时，一个租户在 Apple 后台吊销它，别的租户会一起断。
   平台能做的是在控制台上提示，并建议各租户各用各的证书与 Key。
 
-## 7. 分阶段
+## 8. 分阶段
 
 | 阶段 | 内容 | 仓库 | 要签清单 / 用户签名 |
 | --- | --- | --- | --- |
-| 0 | 自助上传时拒收 App Manager Key；材料版本号永不重用（修删后重传被跳过）；控制台的 ASC 卡、材料卡徽章按交付方式显示 | RN-Server、RN-Admin | 否 |
-| 1 | 租户账号：表、登录（恒时、退避）、会话 role/tenant_id/account_id、平台权限按角色、`domainTenantScope` 之后的租户校验、Origin 绑定、审计 actor；按 §2.4 审计并修改接口（slug、机器名、`repoDirectory` 收归平台、bundle id 唯一）；控制台账号管理页 | RN-Server、RN-Admin | 否 |
-| 2 | Mac：临时钥匙串核对 + 按指纹幂等导入、描述文件核对、按租户 id 落盘、全种类按租户墓碑与钥匙串引用计数、按租户盘点、取清单时带能力、同时认两种清单、v2 材料、ios-upload `--tenant`、runner 只复制本租户描述文件并传 SHA-1 | RN-Server（打包机） | 要签、批准 |
-| 3 | RN-App：接收证书 SHA-1 与描述文件目录，写进 `CODE_SIGN_IDENTITY` 与导出选项 `signingCertificate`；不传时照旧 | RN-App | 用户签名提交 |
-| 4 | 服务端：材料按租户存 + 迁移（legacy 标记）、租户材料接口、按交付方式收、切换交付方式时按租户删、派活与排队按租户、平台页只读 + 紧急删除 | RN-Server | 否 |
-| 5 | 控制台：租户侧材料清单与上传（v2 封装）、描述文件浏览器端解析、Mac 核对结果展示 | RN-Admin | 否 |
+| 0 | 自助上传时拒收 App Manager Key；材料版本号永不重用（修删后重传被跳过）；控制台的 ASC 卡、材料卡徽章按交付方式显示；推送：租户视图不带平台字段、「测试」不改平台那一行、`InvalidProviderToken` 判为凭据错误 | RN-Server、RN-Admin | 否 |
+| 1 | 租户本地账号（即账号设计的 S0：会话角色、租户校验、接口审计、账号管理页）。接统一认证是账号设计的 S2，不挡本文后续阶段 | RN-Server、RN-Admin | 否 |
+| 2 | Mac：临时钥匙串核对 + 按指纹幂等导入、描述文件核对（含 `aps-environment`）、按租户 id 落盘、全种类按租户墓碑与钥匙串引用计数、按租户盘点、取清单时带能力、同时认两种清单、v2 材料、ios-upload `--tenant`、runner 只复制本租户描述文件并传 SHA-1 | RN-Server（打包机） | 要签、批准 |
+| 3 | RN-App：接收证书 SHA-1 与描述文件目录，写进 `CODE_SIGN_IDENTITY` 与导出选项 `signingCertificate`，不传时照旧；release 构建给 `expo-notifications` 传 `mode: "production"` | RN-App | 用户签名提交 |
+| 4 | 服务端：材料按租户存 + 迁移（legacy 标记）、租户材料接口、按交付方式收、切换交付方式时按租户删、派活与排队按租户、平台页只读 + 紧急删除；推送：去掉平台回落并迁移、APNs 的 Team 核对、按 token 的环境发送、自助上传的 .ipa 核对 `aps-environment` | RN-Server | 否 |
+| 5 | 控制台：租户侧材料清单与上传（v2 封装，含「推送（可选）」）、描述文件浏览器端解析、Mac 核对结果展示、换 Firebase 项目时的提示 | RN-Admin | 否 |
 | 6 | 去掉 v1、旧布局与 Team 级旧路径；真机验证：anyfun、predict 各交一套，同 Team 两张不同证书各自打包成功，紧急删除后 Mac 上确实撤掉 | 全部 | 要签（打包机去掉旧代码） |
 
-## 8. 要用户决定的
+## 9. 已定与待定
 
-1. 租户账号：谁来建、每个租户几个账号、要不要二次验证（TOTP）？
-2. 平台管理员是否完全不代交？用户已说「不能是平台管理员」，这里按「只保留紧急删除」写。
-3. APNs 推送凭据、Android 相关凭据，是否也照这个模式改由租户提交？这不在本文范围，模式可以复用。
+2026-09-25 用户答复：
 
-## 9. 不做的
+1. 租户账号：先说要和 pm-cup2026 的租户端打通、用单点登录；后来改为用 web3-rwa 已接的公司统一认证（ChainUp 认证中心），RN、pm-cup 都作为子业务接入。设计见账号设计，其中 §10 还有几项待定。
+2. 平台管理员：「保留」。只保留只读总览和紧急删除，不代交材料。
+3. 推送凭据：改由租户提交，见 §5。Android 签名密钥仍由签名闸生成和保管，不在本文范围。
+
+## 10. 不做的
 
 - 不替租户向 Apple 申请证书或描述文件：那要 Admin / App Manager 级别的 Key，与自助上传档「平台不持有能操作租户 App 的 Key」冲突。
 - 不让租户在 Mac 上运行自定义脚本。
 - 不在 Go 里补 RC2/3DES 的 .p12 解码：临时钥匙串用的是 macOS 自己的解析，与真正导入走同一条路，还少写一套分组密码代码。
 
-## 10. 评审记录
+## 11. 评审记录
 
 2026-09-25 初稿写完后，做了一轮只读可行性评审（对照 RN-Server、RN-Admin、RN-App 代码）。下面各条已抽查代码确认，并据此修改了本文：
 
 | 问题 | 证据 | 改动 |
 | --- | --- | --- |
 | 初稿说「同一张证书导两次是幂等的」——错 | `iosinstall.go:171-175` 把 `security import` 的非零退出都当失败；装机脚本对 add-certificates 的 already exists 专门放行（`install-macos.sh:859`） | §4.2：按 SHA-1 判断是否已有，already exists 当成功；就绪看钥匙串，不看装机记录 |
-| 平台权限按用户名判，租户起同名账号即越权 | `chain_scan_admin.go:26-48` | §2.3：按会话角色判，actor 加前缀 |
+| 平台权限按用户名判，租户起同名账号即越权 | `chain_scan_admin.go:26-48` | 按会话角色判，actor 加前缀（现在账号设计 §3.3） |
 | `signing/pkcs12` 不收 legacy，而 .p12 必须用 legacy | `pkcs12.go` 包注释、`SIGNING_MATERIAL.md:64,73` | §4.2：改走临时钥匙串 |
 | 删后重传，版本从 1 开始，被 Mac 跳过（现有缺陷） | `ios_material.go` 上传取旧版本 +1、删除直接删行；代理用 `have >= Version` | §3.1：版本号永不重用，放进阶段 0 |
 | runner 复制全部描述文件、只认一层目录；导出选项没有 `signingCertificate` | `iossigning.go:118-160`、`ios-release-identity.js:58-76` | §4.3：只复制本租户的；RN-App 加导出选项并向后兼容 |
-| 租户校验不能放进 `authenticate()` | `server.go:213-214` 先于 `337-338` 执行 | §2.3：放在 `domainTenantScope` 之后 |
-| 现有租户接口带出别的租户的 slug；租户能改 `repoDirectory`；bundle id 跨租户不唯一 | `ios_delivery.go:330,343`、`build_config.go:190-245` | 新增 §2.4 |
+| 租户校验不能放进 `authenticate()` | `server.go:213-214` 先于 `337-338` 执行 | 放在 `domainTenantScope` 之后（现在账号设计 §3.3） |
+| 现有租户接口带出别的租户的 slug；租户能改 `repoDirectory`；bundle id 跨租户不唯一 | `ios_delivery.go:330,343`、`build_config.go:190-245` | 新增接口审计一节（现在账号设计 §3.4） |
 | 能力在认领时才上报，而材料同步在认领之前 | `agent.go:188,225` | §4.5：取清单时带上能力 |
 | 证书、描述文件删了不会从 Mac 上消失，紧急删除等于无效 | `ios_material.go` 删除处的注释 | §4.1：全种类墓碑 + 钥匙串引用计数 |
 | 租户不在密文里，「Mac 是边界」的说法不成立 | `iosmaterial` 格式 | §3.1：v2 材料带租户 id，迁移过来的行标 legacy |
