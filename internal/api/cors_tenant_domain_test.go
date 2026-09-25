@@ -1,9 +1,13 @@
 package api
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Helix2010/RN-Server/internal/config"
+	"github.com/gin-gonic/gin"
 )
 
 // 加租户不该需要改配置文件再重启。这几条守住"从域名表推导"这条路的边界。
@@ -42,5 +46,30 @@ func TestOriginAllowedStillHonoursWildcard(t *testing.T) {
 	s := &server{cfg: config.Config{CORSOrigins: []string{"*"}}}
 	if !s.originAllowed("https://anything.example") {
 		t.Fatal("通配符没生效")
+	}
+}
+
+// 控制台与 API 同源之后，控制台拼给终端用户的链接要用服务端说的源，而不是控制台自己的域名。
+// nginx 转发时 Host 已改写成 api.*，这里给的就是它；生产一律 https，与安装命令、下载地址同一个判据。
+func TestCurrentTenantCarriesThePublicOrigin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		env, want string
+	}{
+		{"production", "https://api.example.com"},
+		{"development", "http://api.example.com"},
+	} {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/admin/tenant", nil)
+		c.Request.Host = "api.example.com"
+		c.Set("tenant", gin.H{"id": "1", "slug": "t"})
+		(&server{cfg: config.Config{Environment: tc.env}}).currentTenant(c)
+		var body struct {
+			PublicOrigin string `json:"publicOrigin"`
+		}
+		if recorder.Code != http.StatusOK || json.Unmarshal(recorder.Body.Bytes(), &body) != nil || body.PublicOrigin != tc.want {
+			t.Fatalf("%s: publicOrigin %q (%d %s), want %q", tc.env, body.PublicOrigin, recorder.Code, recorder.Body.String(), tc.want)
+		}
 	}
 }

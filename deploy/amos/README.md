@@ -80,8 +80,12 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
 照抄过来服务端会一律回 `TENANT_DOMAIN_NOT_FOUND`。顺带一提那个文件没有 `.conf`
 后缀，而 `nginx.conf` include 的是 `conf.d/*.conf`，所以它一直没被加载过。
 
-控制台把 API 地址**编译进包里**（`VITE_API_BASE_URL`），所以两个租户是两份产物，
-不是同一份配两个 `server_name`。加租户就在 `deploy.sh` 的 `TENANTS` 里加一行。
+控制台**只有一份产物**（`/opt/rn-foundation/admin/console`），三个 `console.*` 的 `root` 都指向它。
+控制台请求 API 走同源相对路径 `/v1/...`，由 `nginx-snippet-console.inc` 里的 `location ^~ /v1/` 转给
+rn-server，转发时 Host 按 `nginx-rn-foundation.conf` 顶上的 `map` 改写成这个租户的 `api.*`——后端认租户、
+拼下载地址与新机器安装命令时看到的仍是 `api.*`。给终端用户的链接由服务端在 `GET /v1/admin/tenant` 的
+`publicOrigin` 里告诉控制台。设计见 RN-Admin `docs/design/console-single-build-same-origin-2026-09-25.md`。
+（2026-09-25 之前是一个租户一份产物、API 地址编进包里，控制台跨域访问 `api.*`。）
 
 ## 与 web4 共用一个数据库，安全吗（web4 已于 2026-09-12 退役）
 
@@ -248,9 +252,14 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 
 ### 加一个租户
 
-租户清单只有一份：`RN-Admin/deploy/tenants.txt`，CI 和 `deploy.sh` 读的是同一个
-文件。加一行还不够，另外两件事：nginx 里要有对应域名的 `server` 块，链路上按 SNI
-放行的那台设备的白名单里也要有这个域名。
+控制台不用重新构建，CI 也不用改。要做的：
+
+1. DNS 与证书：`console.<域名>`、`api.<域名>`；
+2. nginx：两个域名的 `server` 块（控制台的 `root` 同样是 `/opt/rn-foundation/admin/console`），并在
+   `nginx-rn-foundation.conf` 顶上的 `map` 里加一行 `console.<域名> api.<域名>;`——漏了这一行，那个控制台的
+   `/v1/` 一律 500；
+3. `tenant_domain` 里登记这两个域名；
+4. 链路上按 SNI 放行的那台设备的白名单里也要有这两个域名。
 
 ## 注意事项
 

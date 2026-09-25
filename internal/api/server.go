@@ -341,13 +341,18 @@ func (s *server) routes() *gin.Engine {
 	return r
 }
 
+// currentTenant 顺带给 publicOrigin：拼给终端用户的链接（发版下载、/app/download 下载页、语言包）要用的源。
+// 控制台与 API 同源之后，控制台自己的源是 console.*，不能拿来拼这些链接——/app/download 走控制台域名会落进
+// SPA 回退。nginx 转发 console.* 的 /v1/ 时把 Host 改写成了这个租户的 api.*（RN-Admin 设计
+// console-single-build-same-origin-2026-09-25），所以这里的 externalOrigin 就是 https://api.*，
+// 与服务端自己拼下载地址、安装命令用的是同一个源。
 func (s *server) currentTenant(c *gin.Context) {
 	item, ok := c.Get("tenant")
 	if !ok {
 		problem(c, 404, "TENANT_NOT_FOUND", "Tenant not found")
 		return
 	}
-	c.JSON(200, gin.H{"tenant": item})
+	c.JSON(200, gin.H{"tenant": item, "publicOrigin": s.externalOrigin(c)})
 }
 
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {

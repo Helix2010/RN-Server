@@ -1,4 +1,5 @@
-# 控制台静态站点的公共部分。root 由各 server 块自己给——每个租户一份产物。
+# 控制台的公共部分：静态站点 + 同源的 /v1/ 转发。三个 console.* 的 root 都是同一份产物
+# /opt/rn-foundation/admin/console（RN-Admin 设计 console-single-build-same-origin-2026-09-25）。
 index index.html;
 
 gzip on;
@@ -13,6 +14,25 @@ gzip_types text/plain text/css text/xml text/javascript application/json
 add_header Referrer-Policy        "no-referrer" always;
 add_header X-Content-Type-Options "nosniff"     always;
 add_header X-Frame-Options        "SAMEORIGIN"  always;
+
+# 控制台请求 API 走同源相对路径 /v1/...，这里转给 rn-server。
+#
+# ^~ 必须有：下面那条 ~* \.(js|css|png|...)$ 的正则 location 优先于普通前缀，不带 ^~ 的话
+# /v1/.../xxx.png 会被它截走、按静态文件 404。
+location ^~ /v1/ {
+    # map 里没有这个控制台域名：不能转——Host 会原样是 console.*，后端虽然认得出租户，但拼出来的
+    # 下载地址、新机器的安装命令都会变成控制台域名，构建机就被绑到了控制台上。直接报错，第一眼就能发现
+    if ($rn_upstream_host = $host) {
+        return 500;
+    }
+    include /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc;
+    # api.* 今天不压 JSON；gzip 会把强 ETag 改成弱 ETag。与跨域时代保持一致
+    gzip off;
+    # 后端自己也发这三个头；隐藏掉，由 server 级的 add_header ... always 统一给，免得每个响应各出现两次
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+}
 
 location = /healthz {
     access_log off;

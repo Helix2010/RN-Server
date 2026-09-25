@@ -1323,9 +1323,31 @@
     },
     "/v1/admin/tenant": {
       "get": {
+        "summary": "Current tenant (resolved from the request Host) and the public origin for end-user links",
         "responses": {
           "200": {
-            "description": "Current tenant"
+            "description": "Current tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "tenant",
+                    "publicOrigin"
+                  ],
+                  "properties": {
+                    "tenant": {
+                      "type": "object"
+                    },
+                    "publicOrigin": {
+                      "type": "string",
+                      "format": "uri",
+                      "description": "scheme://host of the tenant's API domain. The console builds end-user links (release downloads, /app/download, language packs) from it: the console itself is served same-origin on console.*, whose origin must not appear in those links."
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 从开发机部署 amos 上的 RN-Foundation（API + 扫链 + 各租户的控制台）。
+# 从开发机部署 amos 上的 RN-Foundation（API + 扫链 + 控制台）。
 #
 #   ./deploy.sh            全量：服务端 + 全部控制台
 #   ./deploy.sh server     只更新服务端与扫链
@@ -30,12 +30,9 @@ require_apply() {
   }
 }
 
-# 租户清单只有一份，在 RN-Admin 里；CI 读的是同一个文件
-read_tenants() {
-  local list="$ADMIN_REPO/deploy/tenants.txt"
-  [ -f "$list" ] || { echo "找不到租户清单 $list" >&2; exit 1; }
-  grep -vE '^[[:space:]]*(#|$)' "$list"
-}
+# 控制台只有一份产物：请求 API 走同源 /v1/，由各 console.* 的 nginx 转给 rn-server，包里不编 API 地址
+# （RN-Admin 设计 console-single-build-same-origin-2026-09-25）。apply 的 admin 子命令收的是目录名
+ADMIN_DIR=console
 
 build_server() {
   echo "== 编译服务端 =="
@@ -61,29 +58,25 @@ ship_server() {
 build_admin() {
   echo "== 构建控制台 =="
   (cd "$ADMIN_REPO" && pnpm install --frozen-lockfile >/dev/null)
-  while read -r slug api; do
-    echo "   $slug -> $api"
-    (cd "$ADMIN_REPO" && rm -rf dist && VITE_API_BASE_URL="$api" pnpm build >/dev/null)
-    [ -s "$ADMIN_REPO/dist/index.html" ] || { echo "   $slug 构建产物里没有 index.html" >&2; exit 1; }
-    mkdir -p "$STAGING_LOCAL/admin/$slug"
-    cp -r "$ADMIN_REPO/dist/." "$STAGING_LOCAL/admin/$slug/"
-  done < <(read_tenants)
+  # 生产包不认 VITE_API_BASE_URL（只给 pnpm dev 用），开发机 .env 里的本地地址编不进去
+  (cd "$ADMIN_REPO" && rm -rf dist && pnpm build >/dev/null)
+  [ -s "$ADMIN_REPO/dist/index.html" ] || { echo "   构建产物里没有 index.html" >&2; exit 1; }
+  mkdir -p "$STAGING_LOCAL/admin/$ADMIN_DIR"
+  cp -r "$ADMIN_REPO/dist/." "$STAGING_LOCAL/admin/$ADMIN_DIR/"
 }
 
 ship_admin() {
   echo "== 上传控制台 =="
   # 用 tar 走管道，不用 rsync：amos 上没有 rsync，为了发几个静态文件去装一个工具
   # 不值得。整目录换过去，顺带拿到 --delete 的效果
-  while read -r slug _; do
-    # shellcheck disable=SC2029
-    tar -C "$STAGING_LOCAL/admin/$slug" -czf - . | ssh "$HOST" "
-      set -eu
-      sudo mkdir -p '$STAGE/admin'
-      sudo rm -rf '$STAGE/admin/$slug'
-      sudo mkdir -p '$STAGE/admin/$slug'
-      sudo tar -C '$STAGE/admin/$slug' -xzf -
-      sudo $APPLY admin '$slug'"
-  done < <(read_tenants)
+  # shellcheck disable=SC2029
+  tar -C "$STAGING_LOCAL/admin/$ADMIN_DIR" -czf - . | ssh "$HOST" "
+    set -eu
+    sudo mkdir -p '$STAGE/admin'
+    sudo rm -rf '$STAGE/admin/$ADMIN_DIR'
+    sudo mkdir -p '$STAGE/admin/$ADMIN_DIR'
+    sudo tar -C '$STAGE/admin/$ADMIN_DIR' -xzf -
+    sudo $APPLY admin '$ADMIN_DIR'"
 }
 
 require_apply
