@@ -22,7 +22,7 @@
    - anyfun 这类不接预测平台的租户，同样可以用 CID 登录。
 3. **它不是 OIDC，只能回答「这个人是谁」**：
    - 协议是 OAuth2 授权码 + PKCE，scope 只有 `profile`，没有 id_token 和 JWKS；
-   - RN 后端拿授权码换 access token，再调 userinfo，得到 `username`（即 cid）、`account`、`email`；
+   - RN 后端拿授权码换 access token，再调 userinfo，得到 `username`（账号 uuid，即 cid）与 `email`（09-26 源码核对：没有 `account` 字段，§4.9）；
    - 由此带来三点：
      - **租户归属与角色由各系统自己管**：RN 本地维护「哪个 cid 是哪个租户的什么角色」，与 web3-rwa 的 `tenant_admin(tenant_id, cid)` 同一个做法；
      - **不自动开户**：先由管理员在本系统建账号，本人用这个账号登录后绑定 CID 账号，之后只走 CID（用户 09-25 提出的方案，§4.3）；
@@ -45,7 +45,9 @@
    - 集中登录域名：跨应用单点登录；
    - 挂在应用域名下（web3-rwa 测试环境就是这种）：各应用用自己的登录页，同一个账号，但每个域名要各登一次。
    RN 用哪种，要和 CID 团队定。
+   2026-09-26 给认证中心加了「同父域名共享登录态」（§4.9）：挂在应用域名下时，只要 RN 控制台与 pm 商户后台在同一个父域名下，也能登一次两边都进。
 9. **SDK 已写好并用模拟 CID 跑通两种方式**：`/home/ubuntu/fy/work/cid-go-sdk`（只依赖标准库，RN 与 pm 都能用），附两个示例应用。拿到真应用就能联调（§4.8）。
+10. **开发期先用我们自己部署的认证中心**（用户 2026-09-26）：认证中心源码已在 `web3-rwa/authorization-center`，在 dd 上部署了一套，示例应用已对它跑通绑定、跨域名免登、退出联动（§4.9）。S2 不再等 CID 团队登记应用。
 
 ## 1. 现状
 
@@ -57,7 +59,7 @@
 | 权限 | 只分平台 / 非平台，按用户名判（`chain_scan_admin.go:26-48`） | 角色 → 菜单 → 权限码 | 本地 `role_ids` → 权限码 |
 | 租户解析 | 按 Host | 按前端塞的 `X-Tenant-Domain` 头（经 Next rewrite 转发，后端看不到原始 Host） | 按域名 |
 
-CID 的能力（从 web3-rwa 与 `authorization-java-sdk` 看到的；服务端源码不在本机）：
+CID 的能力（09-25 从 web3-rwa 与 `authorization-java-sdk` 看到的；09-26 拿到服务端源码后核对的结果见 §4.9）：
 
 - 端点：
   - 授权 `…/auth/v1/oauth/authorize`，支持 `{baseHost}` 占位符，疑似能按租户域名白标；
@@ -197,7 +199,7 @@ sequenceDiagram
   S->>S: 生成 state、PKCE；连同 target 加密进 Cookie rn_login（SameSite=Lax，10 分钟）
   S-->>U: 302 到 CID 授权端点（response_type=code, scope=profile, S256）
   U->>I: 授权请求（CID 已登录则直接过）
-  I-->>U: 302 回 C/v1/admin/auth/cid/callback?code&state
+  I-->>U: 302 回 C/client/v1/oauth/login?code&state
   U->>S: 回调（带 rn_login）
   S->>I: 换令牌（client_secret_basic + code_verifier），服务端直连
   S->>I: userinfo（客户端 Basic + access_token）
@@ -210,14 +212,14 @@ sequenceDiagram
 
 ### 4.2 回调与 Cookie 的细节
 
-- **回调地址**：`https://console.<租户域名>/v1/admin/auth/cid/callback`，按租户域名各一个，都要在 CID 登记（§6 第 1 条）。
+- **回调地址**：`https://console.<租户域名>/client/v1/oauth/login`，按租户域名各一个，都要在 CID 登记（§6 第 1 条）。路径是认证中心固定的，不能自定义（09-26 源码核对，§4.9）；console.* 的 nginx 要把这个路径转给 RN-Server。
   nginx 把 console.* 的 `/v1/` 转给 RN-Server 时，Host 已改写成 api.*（`nginx-rn-foundation.conf:25-30`）。所以回调地址不从 Host 拼，而是取本租户登记的控制台域名。
 - **只能从 console.* 发起**：
   - 后端分不清请求来自 console.* 还是 api.*（两者到后端时 Host 一样）；
   - 如果从 api.* 进入 start，`rn_login` 会设在 api.* 上，回调必然失败；
   - 解决：nginx 的 api.* 站点屏蔽 `/v1/admin/auth/cid/`。这要改 amos 上的 nginx，交给用户执行脚本。
 - **Cookie**：
-  - `rn_login` 是 HttpOnly、Secure、Path=/v1/admin/auth/cid，**SameSite=Lax**。从 CID 跳回是跨站的顶层导航，Strict 的 Cookie 带不过来；
+  - `rn_login` 是 HttpOnly、Secure、Path=/client/v1/oauth/login（在 start 的响应里设、回调时读），**SameSite=Lax**。从 CID 跳回是跨站的顶层导航，Strict 的 Cookie 带不过来；
   - 授权请求固定 `response_mode=query`（CID 若用 form_post，Lax 也带不过来）；
   - Cookie 名按 state 区分（`rn_login_<state 前 8 位>`），多个标签页同时登录不会互相覆盖；
   - 会话 Cookie 仍是 Strict：回调响应本身就能设下它（顶层导航的响应可以设任何 SameSite 的 Cookie），之后控制台页面的请求是同站的，照常带上。
@@ -356,6 +358,68 @@ RN 如果用「挂在应用域名下」，要多做三件事：
   - 换令牌与 userinfo 的地址从这台机器连得上：生产 `login.chainup.com` 连得上；测试环境 `auth-server.dw2nn.com` 能解析但连不上，而测试环境给出的配置里是集群内网地址；
   - 如果是挂在应用域名下，还需要认证中心面向浏览器那一侧的地址（示例应用自己代理 `/auth/v1/*`）。
 
+### 4.9 开发期用自建认证中心（2026-09-26）
+
+用户把认证中心源码放进了 `web3-rwa/authorization-center`（Spring Boot 3.1 + Spring Authorization Server，Java 17），并决定开发期先用我们自己部署的这一套，不等 CID 团队登记应用。
+
+**部署**（dd 上，开发用，不是生产）：
+
+- 代码取自分支 `feat/session-cookie-parent-domain`（已推送、未合并），在 `~/fy/work/cid-local/build` 构建；
+- 容器 `cid-server`（127.0.0.1:9099）与 `cid-redis`，随机器重启自动拉起；配置在 `~/fy/work/cid-local/application-local.yaml`；
+- 库是用户配的远程 MySQL `auth_server`，里面有真实应用，写库先问用户；
+- 用的是「挂在应用域名下」：浏览器访问 `https://<应用域名>/auth/v1/*`，经 Cloudflare Tunnel 与 dd 的 nginx 转到 9099；换令牌与 userinfo 走 `http://127.0.0.1:9099`，只有 dd 本机连得上；
+- 管理接口 `/admin/*` 不对外；
+- 已登记两个应用：RN `rn-cid.dexfun.win`、pm `pm-cid.dexfun.win`。测试账号在 `~/fy/work/.secrets/cid-local-test-users.env`。
+
+**同父域名共享登录态**（这次加的，`authorization-center` 025be10）：
+
+- `application_domain` 新增 `session_cookie_domain` 列，填父域名（如 `dexfun.win`），NULL 表示不共享（原行为）；
+- 请求的主机名落在这个父域名下时，认证中心的登录态 Cookie `X-Auth-Token` 带 `Domain=<父域名>`；会话本来就存在 Redis 里，所以同父域名下的应用登一次就够；
+- 认证中心每分钟重读这一列，改库不用重启；
+- 对 §4.7 的修正：挂在应用域名下时，**同父域名的应用之间也能单点登录**，不同父域名的仍各登一次。
+  - 同一租户的 RN 控制台（`console.<租户域名>`）与 pm 商户后台都在租户域名下时，两边登一次即可；
+  - 不同租户的父域名不同，登录态天然不串，这正是想要的；
+- 代价：这个 Cookie 会发给父域名下的所有子域名，任何一个子域名的后端都能拿到它，等同于登录凭证。
+  - 例如 anyfun 开了以后，`api.anyfun.win`（RN-Server）也会收到它；
+  - 只给专门接入认证中心的应用所在的父域名开；接入前确认这些子域名的服务都不记录请求 Cookie。
+
+**实测**（`~/fy/work/cid-local/bin/sso-e2e.sh`：用 curl 扮演浏览器，走示例应用的完整流程）：两个账号、两个方向（先登 rn 或先登 pm）各一轮，全部通过。每轮验证四点：
+
+- 第一个应用绑定时要登录认证中心；
+- 第二个应用绑定时不出登录页，直接发授权码；
+- 两个应用自己的会话清掉后，「统一登录」都免输口令；
+- 在一边退出，另一边也要重新登录。
+
+**源码核对**（修正 §1、§4.6、§6 里的推测）：
+
+| 问题 | 源码里的实际情况 |
+| --- | --- |
+| 按域名放行是覆盖还是追加 | `bind-domains` 按「(账号, 应用)」**整份覆盖**：先查出这个人在本应用下的旧域名，删掉不在新清单里的（`AdminOpService.bindApplicationDomains`）。覆盖只限同一个应用，**两个应用互不影响**，§4.6 推荐两个应用的理由成立 |
+| 是否必须逐人放行 | 看域名的 `binding_user_type`：`strict`（默认）要求这个人被放行了这个域名，否则**不发授权码、静默跳走**；`loose` 放行所有账号 |
+| 自助注册 | 有，`/auth/v1/signup`，要邮箱验证码，前提是认证中心配好了发信通道。管理接口建号时生成随机 10 位口令并用邮件发出 |
+| userinfo 返回什么 | `username`（账号 uuid，即 cid），加上各登录标识，如 `email`。**没有 `account` 字段**，§0 第 3 条的说法要改 |
+| 应用凭据 | 管理接口建的应用，**client_secret 就等于 client_id**。自建期间可以在库里改；生产必须让 CID 团队改 |
+| 回调地址 | 固定为 `<域名>/client/v1/oauth/login`，不能自定义，与 §4.2 设想的 `/v1/admin/auth/cid/callback` 不同（见下文「对 RN 实现的影响」） |
+| 新登记的应用与域名 | 启动时载入，之后每 15 分钟刷新一次，所以最多要等 15 分钟 |
+| 没登录时 | 跳到 `https://<Host>/login?X-Auth-Token=<会话号>`：路径固定是 `/login`，协议强制 https |
+| 会话 | 存在 Redis，默认 3600 秒；连续失败超过 5 次锁号 |
+| 登出 | `…/auth/v1/logout?back=` 的 `back` **不校验**（代码里留着 todo），是开放跳转；没有后台登出通知（代码里写着「未实现」） |
+| 二次验证、OIDC | 都没有 |
+| 出错时 | HTTP 200，错误码放在 JSON 的 `code` 里 |
+
+**对 RN 实现的影响**：
+
+1. **回调**：用认证中心固定的 `https://console.<租户域名>/client/v1/oauth/login`。
+   - console.* 的 nginx 要把这个路径转给 RN-Server；
+   - `rn_login` Cookie 的 Path 相应改成 `/client/v1/oauth/login`。
+2. **nginx**：console.* 上 `/auth/v1/` 转给认证中心，**保留原始 Host**。认证中心靠 Host 认出是哪个应用、哪个域名；这一点与现在 `/v1/` 改写成 api.* 的做法不同。
+3. **RN-Admin**：加 `/login` 路由（§3.5）。
+4. **换令牌与 userinfo 的地址**：开发期 RN-Server 跑在 dd 上，连 127.0.0.1:9099。
+   - amos 上的 RN-Server 连不到 dd：dd 没有公网入口，`/internal/` 也没有对外；
+   - 上测试环境之前，要么把认证中心部署到 amos 能连到的地方，要么给回调链路单独开受限入口。到时候再定。
+5. **在自建认证中心上加租户控制台域名**：通过库或 dd 本机的管理接口，写 `application_domain`（同一租户要共享登录态时，填 `session_cookie_domain`）。写库前先问用户。
+6. **userinfo 的 `username` 当作 cid**：为空或不是 uuid 格式时拒绝。
+
 ## 5. pm-cup 那边要做的（交给对方团队）
 
 - 接 CID，用同样的迁移方式：
@@ -432,6 +496,14 @@ RN 如果用「挂在应用域名下」，要多做三件事：
   - 6 个 Java 文件的注释里有明文 Basic 凭据；
   - 6 个 yml 里提交了 client-secret；
   - 管理接口用的是能管所有应用和用户的超级账号。
+- **authorization-center（认证中心本身，09-26 读源码与自建联调时发现）**：
+  - 管理接口建的应用，client_secret 就是 client_id，拿到 client_id 就能冒充这个应用换令牌；
+  - 登出的 `back` 参数不校验，是开放跳转；
+  - `binding_user_type=strict` 时，没被放行的人登录后不报错，被静默跳走，排查困难；
+  - 出错时返回 HTTP 200，错误码放在 JSON 的 `code` 里；
+  - 管理员是代码里写死的一个账号；
+  - `auth_server-prod.sql` 缺 `binding_user_type` 列，与代码不一致；
+  - 测试插件 surefire 2.19.1 跑不了 JUnit 5，而且默认跳过测试，CI 实际不跑单测。
 
 ## 9. 分阶段
 
@@ -439,7 +511,7 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 | --- | --- | --- | --- |
 | S0 | 账号表、会话加列、平台权限按会话角色、租户校验、Origin 绑定、§3.4 接口审计、本地登录（初始口令、TOTP、待绑定状态）、平台端成员页 | 我们 | 无，先做；签名材料设计的阶段 1 就是它。CID 接好之前，成员暂时用本地口令登录，待绑定限制先不开 |
 | S1 | 登记应用、回答 §6 | CID 团队（用户对接）；应用与账号在 RWA 平台端「统一认证」页添加 | 无 |
-| S2 | 先用 SDK 的两个示例应用对真 CID 联调（§4.8）；再在 RN 里接：CID 登录（start / callback / userinfo）、登录后引导绑定、打开待绑定限制、敏感操作 TOTP 再验证、登出联动、nginx 屏蔽 api.* 上的登录路径；挂在应用域名下时还有 `/auth/v1/` 转发与 RN-Admin `/login` 路由（§4.7） | 我们 | S0、S1 |
+| S2 | 先用 SDK 的两个示例应用对真 CID 联调（§4.8）；再在 RN 里接：CID 登录（start / callback / userinfo）、登录后引导绑定、打开待绑定限制、敏感操作 TOTP 再验证、登出联动、nginx 屏蔽 api.* 上的登录路径；挂在应用域名下时还有 `/auth/v1/` 转发与 RN-Admin `/login` 路由（§4.7） | 我们 | S0；S1 或自建认证中心（开发期用自建的，§4.9） |
 | S3 | pm-cup 接 CID（同样先本地登录再绑定）、菜单入口 | pm-cup 团队 | S1 |
 | S4 | 测试环境联调 → 生产上线（先 predict、再 anyfun） | 各方 | S2、S3 |
 | S5 | 应急账号（平台建、强制 TOTP、不绑定）；需要时加只读角色 | 我们 | 后续 |
@@ -454,7 +526,9 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 4. RN **先不分角色**。
 5. **应急账号后续再加**。
 
-待定：§6 里 CID 团队的答复，尤其是部署方式与换令牌地址（§4.7）。§8 的安全问题由谁转给 pm-cup 与 web3-rwa 团队，也还没定。
+2026-09-26 用户：开发期先用我们自己部署的认证中心（§4.9）；同父域名共享登录态已实现并推送（`authorization-center` 分支 `feat/session-cookie-parent-domain`，未合并）。
+
+待定：§6 里 CID 团队的答复（09-26 已按源码核对了一部分，§4.9），尤其是生产用哪种部署方式、amos 怎么连到换令牌地址。§8 的安全问题由谁转给 pm-cup 与 web3-rwa 团队，也还没定。
 
 ## 11. 不做的
 
@@ -487,3 +561,4 @@ RN 如果用「挂在应用域名下」，要多做三件事：
   - 「支持各自的账号登录，但必须绑定统一账号，没绑定时登录后引导绑定，之后直接走统一登录」。
   后一条已采用（§4.3，替代初稿的邀请链接）。前一条分析见 §4.6，推荐仍分两个应用。依据是 web3-rwa 推域名的写法（`TenantDomainServiceImpl.java:170-224`，每次推完整清单）与开号方式（`AdminController.java:349-381`）。
 - 2026-09-25 用户给出 web3-rwa 测试环境的 CID 配置：授权与退出地址是 `https://{baseHost}/…`，换令牌与 userinfo 走集群内网。据此补了 §4.7（两种部署方式），并对照商户后台登录页的写法（`chainup-rwa-tenant/src/views/login/components/LoginForm.tsx:109-130`）实现了 SDK 的反向代理与示例应用的登录页；§4.8 记录了验证结果。
+- 2026-09-26 用户把认证中心源码放进 `web3-rwa/authorization-center`，在 dd 上自建了一套；应用户要求加了「同父域名共享登录态」，标识放在库表 `application_domain.session_cookie_domain` 而不是配置文件（用户：「数据库表中加个标识……更通用不用改配置文件」）。示例应用对它实测通过后，用户决定开发期先用自建的。§4.9 记录部署、实测与源码核对；据此改了 §0 第 3 条（userinfo 字段）、§4.1 与 §4.2（回调路径固定为 `/client/v1/oauth/login`）、§9 的 S2 依赖。
