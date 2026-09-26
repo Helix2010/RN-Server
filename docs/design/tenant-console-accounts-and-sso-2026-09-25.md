@@ -429,6 +429,42 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 5. **在自建认证中心上加租户控制台域名**：通过库或 dd 本机的管理接口，写 `application_domain`（同一租户要共享登录态时，填 `session_cookie_domain`）。写库前先问用户。
 6. **userinfo 的 `username` 当作 cid**：为空或不是 uuid 格式时拒绝。
 
+### 4.10 RN 这边的实现记录（2026-09-26）
+
+分支 `feat/tenant-accounts-cid`，RN-Server 从 308b29e 开始，RN-Admin e4bc52d，都只在本地提交、没推送。表结构见 RN-Server `docs/database/ADMIN_ACCOUNTS_SCHEMA.md`，决策记录是 ADR-0021。
+
+**范围**是用户 09-26 定的最小闭环：账号表、会话分平台 / 租户、租户隔离、Origin 同租户、本地初始口令加待绑定、平台端成员页，再接认证中心（统一登录、引导绑定、确认、退出联动）。
+
+**与本文设计不一样的地方**：
+
+| 设计里写的 | 实现 | 理由 |
+| --- | --- | --- |
+| 账号表有 `kind`、`totp_secret_enc` | 没加 | 应急账号与 TOTP 这次不做（TOTP 用户要求先定设计）；到时候迁移加列 |
+| 首次登录登记 TOTP；绑定前 10 分钟内要输过 TOTP；敏感操作要 15 分钟内的 TOTP | 没做 | 同上 |
+| 会话 8 小时，另加 1 小时空闲超时 | 只有原来的 8 小时 | 空闲超时不在这次范围里 |
+| 绑定成功后通知本租户的 admin | 没做 | 平台没有通知通道；绑定已写审计 `tenant_account_bind` |
+| 临时 Cookie 叫 `rn_login_<state 前 8 位>`，Path=/v1/admin/auth/cid | 叫 `rn_cid_flow_<state 前 8 位>`，Path=`/client/v1/oauth/login` | 回调路径是认证中心固定的（§4.9） |
+| 回调后怎么记「要绑哪个」没细说 | 放进 `rn_cid_bind` 加密 Cookie（5 分钟，Path=/v1/admin/auth/cid），本人确认时再核对会话 | 不落库；与发起状态同一种做法 |
+| 成员页里租户 admin 也能建号 | 只有平台管理员 | 用户 09-25 定；另外先不分角色，租户里没有「admin」 |
+| 停用、重置 | 都要填原因、写审计，并删掉这个账号的全部会话 | 管理端标准：高风险动作要原因与审计 |
+| 控制台域名从哪来 | nginx 写 `X-RN-Console-Host`，服务端核对它与 Host 属于同一租户 | nginx 把 console.* 的 Host 改写成了 api.* |
+
+**验证**：
+
+- RN-Server：CI 同款门禁全过（gofmt、vet、race 单测、api 与 store 的库测）。新增的库测走真实路由，覆盖 11 个场景；在独立的测试库上连跑两次结果一致；`internal/cid` 有单测。
+- RN-Admin：`pnpm check` 全过（54 个测试文件、682 项），`pnpm layout:audit` 没跑。
+- 对真的认证中心做了端到端联调（`~/fy/work/cid-local/bin/rn-cid-e2e.sh`）：
+  - 本机起了一个 RN-Server 开发实例，库是 `rn_dev_cid`；认证中心走 `https://login.dexfun.win`；
+  - 两个测试账号各跑一遍，并重跑一遍确认可以重复执行，全部通过；
+  - 覆盖的步骤：平台管理员配统一登录、建成员、初始口令登录只能去绑定、去认证中心登录、回调、确认绑定、初始口令作废、单点登录、回到 target、退出联动。
+
+**上线前还要做的**：
+
+1. 应用 amos 的 nginx 模板，交给用户执行；
+2. 在认证中心给每个租户登记 `https://console.<租户域名>/client/v1/oauth/login`，写库先问用户；
+3. 在平台维护 › 统一登录里填客户端配置。amos 上的换令牌与 userinfo 地址用 `http://172.17.19.2:9098/…`；
+4. 给真实租户开放账号之前，补上 TOTP 与 §3.4 的租户接口审计。
+
 ## 5. pm-cup 那边要做的（交给对方团队）
 
 - 接 CID，用同样的迁移方式：
