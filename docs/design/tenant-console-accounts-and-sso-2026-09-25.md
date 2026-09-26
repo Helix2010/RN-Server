@@ -467,6 +467,17 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 
 ## 5. pm-cup 那边要做的（交给对方团队）
 
+> **2026-09-26 更新**：用户让我们直接做 pm 这边。
+>
+> - **在哪**：pm 仓库，本地分支 `feat/tenant-admin-cid`，未推送；推送和 PR 由用户做。
+> - **设计与实施记录**：pm 仓库 `docs/specs/2026-09-26-tenant-admin-unified-login-design.md`，§6 是实施记录。
+> - **与下面原计划的出入**：
+>   - 没用 `golang.org/x/oauth2`，和 RN 的 `internal/cid` 一样直接用 net/http；
+>   - pm 按 `X-Tenant-Domain` 请求头认租户，所以回调做成「前端页面接住，再用 XHR 交给后端」，不是 RN 那样浏览器直接导航到后端回调；
+>   - ltemp 临时令牌越权（§8）已无条件修掉，绑定只接受正式令牌；
+>   - 「App 管理」菜单没做，不在这次范围里。
+> - **验证**：真认证中心的端到端联调脚本是 `~/fy/work/cid-local/bin/pm-cid-e2e.sh`。
+
 - 接 CID，用同样的迁移方式：
   - 在 CID 登记一个应用（推荐与 RN 分开，§4.6）；
   - `tenant_admin` 加 `cid` 列；
