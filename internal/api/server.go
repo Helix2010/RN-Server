@@ -69,6 +69,10 @@ type server struct {
 	machineBundleDir string
 	// clock 是 s.now() 的时间源；nil = time.Now。只有测试会设
 	clock func() time.Time
+	// mailTests 是「发测试邮件」按操作人的小时窗口计数，零值可用
+	mailTests windowCounter
+	// bindCodes 是统一登录绑定验证码（进程内存，单实例），零值可用
+	bindCodes bindCodeStore
 }
 
 type attempt struct {
@@ -223,6 +227,7 @@ func (s *server) routes() *gin.Engine {
 	protected.POST("/auth/logout", s.logout)
 	// 绑定统一认证账号：回调之后本人在控制台确认，确认了才落库
 	protected.GET("/auth/cid/bind", s.getPendingCIDBind)
+	protected.POST("/auth/cid/bind/code", s.sendCIDBindCode)
 	protected.POST("/auth/cid/bind/confirm", s.confirmCIDBind)
 	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放；租户账号的会话一律进不来
 	platform := protected.Group("/platform")
@@ -231,6 +236,11 @@ func (s *server) routes() *gin.Engine {
 	platform.GET("/auth/cid", s.getCIDConfig)
 	platform.PUT("/auth/cid", s.updateCIDConfig)
 	platform.DELETE("/auth/cid", s.deleteCIDConfig)
+	// 平台发信（app_configs 平台级 mail.smtp，口令加密存；ADR-0022）
+	platform.GET("/mail", s.getMailConfig)
+	platform.PUT("/mail", s.updateMailConfig)
+	platform.DELETE("/mail", s.deleteMailConfig)
+	platform.POST("/mail/test", s.sendTestMail)
 	// 构建机与签名闸的登记（build.machines）：新建发令牌、吊销、接受公钥、切换主备路由。
 	// 控制台接受只影响路由；签名闸与离线工具以本机记录和离线 pin 文件为准
 	platform.GET("/machines", s.listMachines)

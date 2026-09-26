@@ -27,10 +27,15 @@ import (
 //	GET /client/v1/oauth/login?code&state     ← 认证中心固定的回调路径，不能自定义
 //	    核 state、换令牌、查 userinfo（服务端直连，令牌用完即弃）。
 //	    login：按 (租户, 统一认证账号) 找已绑定的账号，设会话 Cookie，回到 target；
-//	    bind：把「要绑定的统一认证账号」加密进 rn_cid_bind（Path=/v1/admin/auth/cid，5 分钟），
-//	          跳到控制台的确认页；本人确认后才落库（防绑定 CSRF，设计 §4.3「要防的」）。
+//	    bind：认证中心没给邮箱就拒绝（no_email：绑定要往这个邮箱发验证码）；把「要绑定的统一认证账号」
+//	          加密进 rn_cid_bind（Path=/v1/admin/auth/cid，10 分钟），跳到控制台的确认页；
+//	          本人收到验证码并确认后才落库（防绑定 CSRF 与绑错，设计 §4.3「要防的」，cid_bind_code.go）。
 //	GET  /v1/admin/auth/cid/bind            确认页取「将绑定到哪个账号」
-//	POST /v1/admin/auth/cid/bind/confirm    落库：本地口令作废，账号变 active
+//	POST /v1/admin/auth/cid/bind/code       给那个统一认证账号的邮箱发验证码
+//	POST /v1/admin/auth/cid/bind/confirm    {codeToken, code} 落库：本地口令作废，账号变 active
+//
+// rn_cid_bind 用 SameSite=Lax：读它的两个 POST 跨站带不上 Lax Cookie，GET 只把结果回给本人的浏览器；
+// 不用 Strict，是为了不依赖各浏览器怎么对待「经跨站跳转进来的页面」上的 Strict Cookie。
 //
 // 回调与会话 Cookie 都在控制台域名上。nginx 转发 console.* 的请求时把 Host 改写成了 api.*，
 // 所以控制台域名从 X-RN-Console-Host 头取（nginx 写的），并核对它与 Host 属于同一个租户；
@@ -42,7 +47,7 @@ const (
 	cidFlowCookie     = "rn_cid_flow_"
 	cidBindCookie     = "rn_cid_bind"
 	cidFlowTTL        = 10 * time.Minute
-	cidBindTTL        = 5 * time.Minute
+	cidBindTTL        = 10 * time.Minute // 要留出去邮箱收验证码的时间（验证码也是 10 分钟）
 	consoleHostHeader = "X-RN-Console-Host"
 )
 
@@ -503,6 +508,10 @@ func (s *server) cidCallback(c *gin.Context) {
 
 func (s *server) cidCallbackBind(c *gin.Context, flow cidFlow, user cid.User) {
 	ctx := c.Request.Context()
+	if !strings.Contains(user.Email, "@") {
+		cidFail(c, "no_email")
+		return
+	}
 	var accountID sql.NullString
 	err := s.db.QueryRowContext(ctx, `SELECT account_id FROM admin_sessions WHERE token_hash=? AND tenant_id=? AND expires_at>? LIMIT 1`,
 		flow.SessionHash, tenantID(c), time.Now().UTC()).Scan(&accountID)
@@ -529,7 +538,7 @@ func (s *server) cidCallbackBind(c *gin.Context, flow cidFlow, user cid.User) {
 		return
 	}
 	http.SetCookie(c.Writer, &http.Cookie{Name: cidBindCookie, Value: sealed, Path: "/v1/admin/auth/cid",
-		MaxAge: int(cidBindTTL.Seconds()), HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
+		MaxAge: int(cidBindTTL.Seconds()), HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
 	c.Header("Cache-Control", "no-store")
 	c.Redirect(http.StatusFound, "/cid/bind-confirm")
 }
@@ -563,9 +572,21 @@ func (s *server) getPendingCIDBind(c *gin.Context) {
 }
 
 func (s *server) confirmCIDBind(c *gin.Context) {
+	var body struct {
+		CodeToken string `json:"codeToken"`
+		Code      string `json:"code"`
+	}
+	if decodeLimited(c, &body, 4<<10) != nil {
+		problem(c, 400, "INVALID_CID_BIND", "codeToken and code are required")
+		return
+	}
 	pending, session := s.pendingBindFor(c)
 	if pending == nil {
 		problem(c, 404, "CID_BIND_NOT_PENDING", "There is no unified login account waiting to be bound; start binding again")
+		return
+	}
+	if !s.bindCodes.verify(session.AccountID, body.CodeToken, body.Code, pending.Subject, pending.Email, s.now()) {
+		problem(c, 400, "CID_BIND_CODE_INVALID", "The verification code is invalid or expired")
 		return
 	}
 	ctx := c.Request.Context()
@@ -597,7 +618,7 @@ func (s *server) confirmCIDBind(c *gin.Context) {
 		problem(c, 500, "CID_BIND_FAILED", "Unable to bind the account")
 		return
 	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: cidBindCookie, Value: "", Path: "/v1/admin/auth/cid", MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(c.Writer, &http.Cookie{Name: cidBindCookie, Value: "", Path: "/v1/admin/auth/cid", MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
 	acc, err := s.tenantAccountByID(ctx, session.TenantID, session.AccountID)
 	if err == nil && acc != nil {
 		session.Account = acc

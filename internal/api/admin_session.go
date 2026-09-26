@@ -53,6 +53,7 @@ var pendingBindRoutes = map[string]bool{
 	"GET /v1/admin/auth/session":           true,
 	"POST /v1/admin/auth/logout":           true,
 	"GET /v1/admin/auth/cid/bind":          true,
+	"POST /v1/admin/auth/cid/bind/code":    true,
 	"POST /v1/admin/auth/cid/bind/confirm": true,
 }
 

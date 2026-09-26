@@ -1,4 +1,4 @@
-# 租户控制台账号与统一登录（tenant_admin_accounts / admin_sessions / app_configs auth.cid）
+# 租户控制台账号与统一登录（tenant_admin_accounts / admin_sessions / app_configs auth.cid、mail.smtp）
 
 设计：`docs/design/tenant-console-accounts-and-sso-2026-09-25.md`（§3.2 账号表、§3.3 会话、§4 接入统一认证、§4.9 自建认证中心）；决策：ADR-0021；接口 JSON 见 `contracts/openapi.json`。
 
@@ -10,7 +10,9 @@
 | `tenant_admin_identities` 外部身份表 | 取消，合并进账号表 | 一个账号只绑一个外部身份：`idp` + `idp_subject` 两列加唯一键即可 |
 | 邀请表 | 取消 | 用「初始口令 + 待绑定」代替邀请链接：还没绑定的账号就是 `status=pending_bind` 的账号 |
 | 登录流程临时状态（state、PKCE） | 取消，用加密 Cookie | 10 分钟、一次性、只有发起它的浏览器用；`secretbox` 加密后放进 Cookie，不落库 |
-| 绑定确认前的「要绑哪个统一认证账号」 | 取消，用加密 Cookie | 5 分钟、一次性；同上 |
+| 绑定确认前的「要绑哪个统一认证账号」 | 取消，用加密 Cookie | 10 分钟、一次性；同上 |
+| 绑定验证码 | 取消，放进程内存 | 10 分钟、一次性、输错 5 次作废；RN-Server 单实例，重启后重发即可（`cid_bind_code.go`） |
+| 发信账号 | 复用 `app_configs`，`tenant_id=0`、键 `mail.smtp` | 平台级一份；口令用 `secretbox` 加密（ADR-0022） |
 | 统一认证的客户端配置 | 复用 `app_configs`，`tenant_id=0`、键 `auth.cid` | 平台级一份；客户端密钥用 `secretbox` 加密 |
 | 会话 | 复用 `admin_sessions`，加三列（迁移 61） | 见下 |
 | 审计 | 复用 `audit_events` | 租户账号的 actor 是 `tenant:<租户 id>:<账号 id>` |
@@ -72,3 +74,17 @@
 - 回调地址固定为 `https://<控制台域名>/client/v1/oauth/login`（认证中心不能自定义），每个租户的控制台域名都要在认证中心登记。
 
 谁写：平台管理员（`PUT /v1/admin/platform/auth/cid`，带 `expectedVersion`，审计 `cid_config_update`）。谁读：统一登录的发起、回调、登出。
+
+## app_configs：mail.smtp（平台级，tenant_id=0）
+
+```json
+{"host":"smtp.example.com","port":587,"username":"noreply@example.com",
+ "passwordEncrypted":"<base64 secretbox，AAD mail-smtp:password；无 username 时为空>","fromAddress":"noreply@example.com","fromName":"RN 平台"}
+```
+
+- `host` 只写主机名；`port` 空 = 587。465 走隐式 TLS，其它端口必须 STARTTLS，只有本机地址允许明文（本地调试）；
+- 口令不经任何接口返回，界面只显示 `hasPassword`；
+- 统一登录的绑定验证码靠它发：没配就不能完成绑定（503 `MAIL_NOT_CONFIGURED`），不退回不校验。
+
+谁写：平台管理员（`PUT /v1/admin/platform/mail`，带 `expectedVersion`，审计 `mail_config_update`；`POST /v1/admin/platform/mail/test` 试发，审计 `mail_test_sent`）。
+谁读：`POST /v1/admin/auth/cid/bind/code`（审计 `tenant_account_bind_code_sent`：收件人掩码，不含验证码）。

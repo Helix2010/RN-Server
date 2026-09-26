@@ -215,8 +215,15 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	}
 	clearCID()
 	t.Cleanup(clearCID)
+	// mail.smtp 同理（绑定验证码要发信）
+	clearMail := func() {
+		_, _ = db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, platformTenantID, mailConfigKey)
+	}
+	clearMail()
+	t.Cleanup(clearMail)
 	router := New(cfg, &store.Store{DB: db})
 	cidServer := newFakeCIDServer(t)
+	smtpServer := startTestSMTP(t)
 	newBrowser := func(tenant accountsTestTenant) *browser {
 		return &browser{router: router, tenant: tenant, cookies: map[string]string{}}
 	}
@@ -334,7 +341,30 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		}
 		// 别的租户的页面不能替他确认
 		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, map[string]string{"Origin": "https://" + tenantB.console}), 403, "UNTRUSTED_ORIGIN")
-		view := member.mustCode(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, nil), 200)
+		// 确认要带发到统一认证账号邮箱的验证码；平台没配发信就发不了，也就绑不了（不退回不校验）
+		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, nil), 400, "CID_BIND_CODE_INVALID")
+		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")
+		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("绑定验证码要发信", 0), nil), 200)
+		sent := member.mustCode(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 200)
+		codeToken, _ := sent["codeToken"].(string)
+		mailBody := smtpServer.last(t, "zs@chainup.test")
+		if codeToken == "" || !strings.Contains(mailBody, "zhang.san") || !strings.Contains(mailBody, tenantA.console) {
+			t.Fatalf("code response %v, mail:\n%s", sent, mailBody)
+		}
+		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 429, "CID_BIND_CODE_RATE_LIMITED")
+		mailed := mailCode(t, mailBody)
+		wrong := "000000"
+		if mailed == wrong {
+			wrong = "111111"
+		}
+		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{"codeToken": codeToken, "code": wrong}, nil), 400, "CID_BIND_CODE_INVALID")
+		// 发码写了审计：收件人掩码、不含验证码
+		var codeAudit string
+		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_bind_code_sent' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&codeAudit); err != nil ||
+			strings.Contains(codeAudit, "zs@chainup.test") || strings.Contains(codeAudit, mailed) {
+			t.Fatalf("bind code audit = %q %v", codeAudit, err)
+		}
+		view := member.mustCode(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{"codeToken": codeToken, "code": mailed}, nil), 200)
 		account := object(view["account"])
 		if view["bindRequired"] != false || account["status"] != accountActive || account["boundEmail"] != "zs@chainup.test" {
 			t.Fatalf("confirm = %v", view)
@@ -397,6 +427,12 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
 		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=already_bound" {
 			t.Fatalf("second bind of the same subject redirected to %s", got)
+		}
+		// 认证中心没给邮箱：发不了验证码，不让绑
+		authorize = location(t, second.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
+		code, state = cidServer.approve(t, authorize, "6b7c8d9e-0f1a-4b2c-9d3e-4f5a6b7c8d9e", "")
+		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=no_email" {
+			t.Fatalf("bind without an email redirected to %s", got)
 		}
 	})
 
