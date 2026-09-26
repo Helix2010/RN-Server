@@ -414,9 +414,10 @@ RN 如果用「挂在应用域名下」，要多做三件事：
    - `rn_login` Cookie 的 Path 相应改成 `/client/v1/oauth/login`。
 2. **nginx**：console.* 上 `/auth/v1/` 转给认证中心，**保留原始 Host**。认证中心靠 Host 认出是哪个应用、哪个域名；这一点与现在 `/v1/` 改写成 api.* 的做法不同。
 3. **RN-Admin**：加 `/login` 路由（§3.5）。
-4. **换令牌与 userinfo 的地址**：开发期 RN-Server 跑在 dd 上，连 127.0.0.1:9099。
-   - amos 上的 RN-Server 连不到 dd：dd 没有公网入口，`/internal/` 也没有对外；
-   - 上测试环境之前，要么把认证中心部署到 amos 能连到的地方，要么给回调链路单独开受限入口。到时候再定。
+4. **换令牌与 userinfo 的地址**：
+   - RN-Server 跑在 dd 上时，直接连 127.0.0.1:9099；
+   - amos 与 dd 是同一宿主机上的两台虚拟机，内网互通：09-26 实测 amos → dd:80 通，dd:9099 只监听 127.0.0.1，所以不通；
+   - amos 上的 RN-Server 要用时，在 dd 的 nginx 上加一个只对内网开放的入口。这个入口只转发换令牌与 userinfo，只允许 amos 的内网地址访问。认证中心不用挪。
 5. **在自建认证中心上加租户控制台域名**：通过库或 dd 本机的管理接口，写 `application_domain`（同一租户要共享登录态时，填 `session_cookie_domain`）。写库前先问用户。
 6. **userinfo 的 `username` 当作 cid**：为空或不是 uuid 格式时拒绝。
 
