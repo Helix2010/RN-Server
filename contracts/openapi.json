@@ -7376,7 +7376,7 @@
       "post": {
         "responses": {
           "200": {
-            "description": "本人确认绑定：body {codeToken, code}（发到统一认证账号邮箱的验证码，10 分钟，输错 5 次作废；不对 400 CID_BIND_CODE_INVALID）；账号变 active、本地口令作废，返回新的 Session；统一认证账号已绑本租户别的账号 409 CID_ACCOUNT_ALREADY_BOUND"
+            "description": "本人确认绑定：body {codeToken, code}（发到统一认证账号邮箱的验证码，10 分钟，输错 5 次作废；不对 400 CID_BIND_CODE_INVALID）；账号变 active、本地口令作废，返回新的 Session；随后给账号登记的邮箱发绑定通知（同步，最多 10 秒；发不出去只写审计 tenant_account_bind_notice，不影响结果）；统一认证账号已绑本租户别的账号 409 CID_ACCOUNT_ALREADY_BOUND"
           }
         },
         "requestBody": {

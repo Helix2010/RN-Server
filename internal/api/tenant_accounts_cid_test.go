@@ -369,6 +369,17 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		if view["bindRequired"] != false || account["status"] != accountActive || account["boundEmail"] != "zs@chainup.test" {
 			t.Fatalf("confirm = %v", view)
 		}
+		// 绑定通知发到控制台账号登记的邮箱：写明账号与控制台；统一账号邮箱只给掩码
+		notice := smtpServer.last(t, "zs@example.com")
+		if !strings.Contains(notice, "zhang.san") || !strings.Contains(notice, tenantA.console) || !strings.Contains(notice, "z***@chainup.test") ||
+			strings.Contains(notice, "zs@chainup.test") {
+			t.Fatalf("bind notice:\n%s", notice)
+		}
+		var noticeAudit string
+		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_bind_notice' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&noticeAudit); err != nil ||
+			!strings.Contains(noticeAudit, `"sent": true`) || strings.Contains(noticeAudit, "zs@example.com") {
+			t.Fatalf("bind notice audit = %q %v", noticeAudit, err)
+		}
 		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
 		wantProblem(t, member.do("GET", "/v1/admin/auth/cid/bind", nil, nil), 404, "CID_BIND_NOT_PENDING")
 	})
@@ -434,6 +445,28 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=no_email" {
 			t.Fatalf("bind without an email redirected to %s", got)
 		}
+		// 绑定通知发不出去不影响绑定：码发出去之后发信坏了，确认照样成功，审计记下没发出去
+		authorize = location(t, second.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
+		code, state = cidServer.approve(t, authorize, "7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", "ls@chainup.test")
+		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/cid/bind-confirm" {
+			t.Fatalf("bind callback redirected to %s", got)
+		}
+		codeToken, _ := second.mustCode(t, second.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 200)["codeToken"].(string)
+		mailed := mailCode(t, smtpServer.last(t, "ls@chainup.test"))
+		mailView := platform.mustCode(t, platform.do("GET", "/v1/admin/platform/mail", nil, nil), 200)
+		broken := map[string]any{"host": "127.0.0.1", "port": 1, "fromAddress": "noreply@rn.test", "expectedVersion": mailView["version"], "reason": "发信坏了"}
+		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", broken, nil), 200)
+		view := second.mustCode(t, second.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{"codeToken": codeToken, "code": mailed}, nil), 200)
+		if object(view["account"])["status"] != accountActive {
+			t.Fatalf("confirm with broken mail = %v", view)
+		}
+		var noticeAudit string
+		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_bind_notice' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&noticeAudit); err != nil ||
+			!strings.Contains(noticeAudit, `"sent": false`) || !strings.Contains(noticeAudit, "MAIL_CONNECT_FAILED") {
+			t.Fatalf("failed bind notice audit = %q %v", noticeAudit, err)
+		}
+		restored := smtpServer.settings("发信修好了", int(platform.mustCode(t, platform.do("GET", "/v1/admin/platform/mail", nil, nil), 200)["version"].(float64)))
+		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", restored, nil), 200)
 	})
 
 	t.Run("退出时给出认证中心的退出地址", func(t *testing.T) {

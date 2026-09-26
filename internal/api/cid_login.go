@@ -32,7 +32,7 @@ import (
 //	          本人收到验证码并确认后才落库（防绑定 CSRF 与绑错，设计 §4.3「要防的」，cid_bind_code.go）。
 //	GET  /v1/admin/auth/cid/bind            确认页取「将绑定到哪个账号」
 //	POST /v1/admin/auth/cid/bind/code       给那个统一认证账号的邮箱发验证码
-//	POST /v1/admin/auth/cid/bind/confirm    {codeToken, code} 落库：本地口令作废，账号变 active
+//	POST /v1/admin/auth/cid/bind/confirm    {codeToken, code} 落库：本地口令作废，账号变 active；再给账号登记的邮箱发绑定通知
 //
 // rn_cid_bind 用 SameSite=Lax：读它的两个 POST 跨站带不上 Lax Cookie，GET 只把结果回给本人的浏览器；
 // 不用 Strict，是为了不依赖各浏览器怎么对待「经跨站跳转进来的页面」上的 Strict Cookie。
@@ -619,6 +619,7 @@ func (s *server) confirmCIDBind(c *gin.Context) {
 		return
 	}
 	http.SetCookie(c.Writer, &http.Cookie{Name: cidBindCookie, Value: "", Path: "/v1/admin/auth/cid", MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
+	s.sendCIDBindNotice(c, session, pending.Email, now)
 	acc, err := s.tenantAccountByID(ctx, session.TenantID, session.AccountID)
 	if err == nil && acc != nil {
 		session.Account = acc

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -25,6 +26,10 @@ import (
 //
 // 验证码只属于「这个账号 + 这个统一认证账号」，10 分钟，用一次作废，输错 5 次作废。存在进程内存里
 // （RN-Server 单实例；重启后重发即可）。
+//
+// 绑定通知（用户 2026-09-26 要求）：落库之后给控制台账号登记的邮箱发一封「你的账号绑到了哪个统一账号」。
+// 验证码防不住的那种情况（会话被盗、绑到攻击者自己的统一账号）靠它让账号的主人发现。绑定已经落库，
+// 通知发不出去只写审计与日志，不改变这次绑定的结果。
 
 const (
 	bindCodeTTL         = 10 * time.Minute
@@ -32,6 +37,8 @@ const (
 	bindCodeResendAfter = time.Minute
 	bindCodePerHour     = 5  // 每个账号
 	bindCodeIPPerHour   = 20 // 每个来源 IP
+	// 通知是同步发的：绑定的响应最多多等这么久（mail.Send 整个会话受截止时间约束）
+	bindNoticeTimeout = 10 * time.Second
 )
 
 type bindCode struct {
@@ -138,6 +145,53 @@ Valid for %d minutes. If you are not the one binding, ignore this email and do n
 <p>Valid for %d minutes. If you are not the one binding, ignore this email and do not share the code.</p>
 </body></html>`, e(console), e(loginName), e(to), code, int(bindCodeTTL.Minutes()), e(loginName), e(console), e(to), int(bindCodeTTL.Minutes()))
 	return mail.Message{To: to, Subject: "绑定统一登录账号验证码 / Unified login binding code", Text: text, HTML: htmlBody}
+}
+
+// bindNoticeMessage 中英双语。统一账号的邮箱掩码显示：控制台账号登记的邮箱未必是本人的（管理员填错），
+// 掩码后本人仍认得出「不是我的」，也不把别人的邮箱整个交出去。
+func bindNoticeMessage(loginName, console, cidEmail string, at time.Time) mail.Message {
+	when := at.UTC().Format("2006-01-02 15:04 UTC")
+	masked := maskEmail(cidEmail)
+	text := fmt.Sprintf(`控制台 %s 的成员账号 %s 已于 %s 绑定统一登录账号 %s。之后这个账号只能用该统一登录账号登录，原来的初始口令已作废。
+
+如果不是您本人操作，请立即联系平台管理员，在「控制台成员」里对这个账号「解绑并重置口令」。
+
+The console member %s on %s was bound to the unified login account %s at %s. From now on it can sign in only with that account; the initial password no longer works.
+
+If this was not you, contact the platform administrator right away to unbind the account and reset its password (Console members → Unbind and reset password).
+`, console, loginName, when, masked, loginName, console, masked, when)
+	e := html.EscapeString
+	htmlBody := fmt.Sprintf(`<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;color:#0f172a;line-height:1.6">
+<p>控制台 <b>%s</b> 的成员账号 <b>%s</b> 已于 %s 绑定统一登录账号 <b>%s</b>。之后这个账号只能用该统一登录账号登录，原来的初始口令已作废。</p>
+<p style="color:#b91c1c">如果不是您本人操作，请立即联系平台管理员，在「控制台成员」里对这个账号「解绑并重置口令」。</p>
+<hr style="border:none;border-top:1px solid #e2e8f0">
+<p>The console member <b>%s</b> on <b>%s</b> was bound to the unified login account <b>%s</b> at %s. From now on it can sign in only with that account; the initial password no longer works.</p>
+<p style="color:#b91c1c">If this was not you, contact the platform administrator right away to unbind the account and reset its password (Console members → Unbind and reset password).</p>
+</body></html>`, e(console), e(loginName), when, e(masked), e(loginName), e(console), e(masked), when)
+	return mail.Message{Subject: "控制台账号已绑定统一登录 / Console account bound to unified login", Text: text, HTML: htmlBody}
+}
+
+// sendCIDBindNotice 在绑定落库之后调用。请求断开也照发（WithoutCancel），最多等 bindNoticeTimeout。
+func (s *server) sendCIDBindNotice(c *gin.Context, session *adminSession, cidEmail string, at time.Time) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), bindNoticeTimeout)
+	defer cancel()
+	to := session.Account.Email
+	problemCode := ""
+	cfg, err := s.mailConfig(ctx)
+	switch {
+	case err != nil:
+		problemCode = "MAIL_CONFIG_INVALID"
+		slog.Warn("bind notice not sent: mail config unreadable", "tenant", session.TenantID, "account", session.AccountID, "error", err)
+	case cfg == nil:
+		problemCode = "MAIL_NOT_CONFIGURED"
+		slog.Warn("bind notice not sent: mail not configured", "tenant", session.TenantID, "account", session.AccountID)
+	default:
+		msg := bindNoticeMessage(session.Account.LoginName, s.consoleHost(c), cidEmail, at)
+		msg.To = to
+		problemCode, _ = s.sendMail(ctx, *cfg, msg)
+	}
+	s.auditNow(newAudit(session.TenantID, session.Actor, "tenant_account_bind_notice", "tenant-account", session.AccountID, "绑定通知", requestID(c),
+		map[string]any{"to": maskEmail(to), "sent": problemCode == "", "problem": nullableString(problemCode)}))
 }
 
 func (s *server) sendCIDBindCode(c *gin.Context) {
