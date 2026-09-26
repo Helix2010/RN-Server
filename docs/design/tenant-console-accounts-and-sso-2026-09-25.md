@@ -362,14 +362,16 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 
 用户把认证中心源码放进了 `web3-rwa/authorization-center`（Spring Boot 3.1 + Spring Authorization Server，Java 17），并决定开发期先用我们自己部署的这一套，不等 CID 团队登记应用。
 
-**部署**（dd 上，开发用，不是生产）：
+**部署**（用户 09-26 规定：认证中心部署在 dev1，amos 只放 RN 相关服务；运维说明 `~/fy/work/cid-local/README.md`）：
 
-- 代码取自分支 `feat/session-cookie-parent-domain`（已推送、未合并），在 `~/fy/work/cid-local/build` 构建；
-- 容器 `cid-server`（127.0.0.1:9099）与 `cid-redis`，随机器重启自动拉起；配置在 `~/fy/work/cid-local/application-local.yaml`；
+- 代码取自分支 `feat/session-cookie-parent-domain`（已推送、未合并），用 `bin/deploy.sh` 从指定提交构建，旧包留在 `releases/` 供回滚；
+- 容器 `cid-server`（127.0.0.1:9099）与 `cid-redis`，随机器重启自动拉起，日志轮转；配置在 `~/fy/work/cid-local/application-local.yaml`；
 - 库是用户配的远程 MySQL `auth_server`，里面有真实应用，写库先问用户；
-- 用的是「挂在应用域名下」：浏览器访问 `https://<应用域名>/auth/v1/*`，经 Cloudflare Tunnel 与 dd 的 nginx 转到 9099；换令牌与 userinfo 走 `http://127.0.0.1:9099`，只有 dd 本机连得上；
-- 管理接口 `/admin/*` 不对外；
-- 已登记两个应用：RN `rn-cid.dexfun.win`、pm `pm-cid.dexfun.win`。测试账号在 `~/fy/work/.secrets/cid-local-test-users.env`。
+- 用的是「挂在应用域名下」：浏览器访问 `https://<应用域名>/auth/v1/*`；
+- 服务端直连（换令牌、userinfo）：dev1 本机用 `127.0.0.1:9099`；amos 用 `172.17.19.2:9098`。9098 是 nginx 的内网入口，只放行 amos，只转发 `/auth/v1/*` 与 `/internal/v1/userinfo`。09-26 已从 amos 实测换令牌的客户端认证正常；
+- 管理接口 `/admin/*` 只在 dev1 本机能访问；
+- 已登记两个应用（RWA 平台端添加），凭据在 `~/fy/work/.secrets/cid-apps.env`，测试账号在 `cid-local-test-users.env`；
+- 联调用的示例应用与 `rn-cid` / `pm-cid.dexfun.win` 两个入口，测通后已按用户要求拆掉。库里这两个应用登记的仍是这两个域名，接入时换成真实域名。
 
 **同父域名共享登录态**（这次加的，`authorization-center` 025be10）：
 
@@ -417,7 +419,7 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 4. **换令牌与 userinfo 的地址**：
    - RN-Server 跑在 dd 上时，直接连 127.0.0.1:9099；
    - amos 与 dd 是同一宿主机上的两台虚拟机，内网互通：09-26 实测 amos → dd:80 通，dd:9099 只监听 127.0.0.1，所以不通；
-   - amos 上的 RN-Server 要用时，在 dd 的 nginx 上加一个只对内网开放的入口。这个入口只转发换令牌与 userinfo，只允许 amos 的内网地址访问。认证中心不用挪。
+   - amos 上的 RN-Server 用 `http://172.17.19.2:9098`（上文的内网入口，已建好）；amos 的 nginx 把 console.* 的 `/auth/v1/` 也转到这里。
 5. **在自建认证中心上加租户控制台域名**：通过库或 dd 本机的管理接口，写 `application_domain`（同一租户要共享登录态时，填 `session_cookie_domain`）。写库前先问用户。
 6. **userinfo 的 `username` 当作 cid**：为空或不是 uuid 格式时拒绝。
 
