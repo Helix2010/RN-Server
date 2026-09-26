@@ -279,21 +279,29 @@ func (s *server) createTenantAccount(c *gin.Context) {
 }
 
 func (s *server) disableTenantAccount(c *gin.Context) {
-	s.changeTenantAccount(c, "tenant_account_disable", "停用控制台成员")
+	s.changeTenantAccount(c, "tenant_account_disable")
 }
 
 func (s *server) resetTenantAccount(c *gin.Context) {
-	s.changeTenantAccount(c, "tenant_account_reset", "解绑并重置初始口令")
+	s.changeTenantAccount(c, "tenant_account_reset")
 }
 
 // changeTenantAccount 做停用与重置：两者都立刻删掉这个账号的全部会话。
 // 重置 = 解除统一认证绑定 + 新的初始口令 + 回到待绑定，本人重新走一遍绑定；也用来让停用的账号复用。
-func (s *server) changeTenantAccount(c *gin.Context, action, reason string) {
+func (s *server) changeTenantAccount(c *gin.Context, action string) {
 	id, ok := parseAccountID(c.Param("id"))
 	if !ok {
 		problem(c, 404, "TENANT_ACCOUNT_NOT_FOUND", "Tenant account not found")
 		return
 	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if decode(c, &body) != nil || utf8.RuneCountInString(strings.TrimSpace(body.Reason)) < 3 {
+		problem(c, 400, "REASON_REQUIRED", "reason is required (at least 3 characters); it is written to the audit log")
+		return
+	}
+	reason := strings.TrimSpace(body.Reason)
 	ctx := c.Request.Context()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

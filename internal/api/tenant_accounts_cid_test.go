@@ -210,7 +210,9 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	}
 	// auth.cid 是平台级的一份，测试库又是持久的：上一次运行留下的配置指向早已关掉的假认证中心。
 	// 这个键只有本测试写，开始前与结束后都清掉
-	clearCID := func() { _, _ = db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, platformTenantID, cidConfigKey) }
+	clearCID := func() {
+		_, _ = db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, platformTenantID, cidConfigKey)
+	}
 	clearCID()
 	t.Cleanup(clearCID)
 	router := New(cfg, &store.Store{DB: db})
@@ -422,11 +424,12 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		location(t, fresh.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil))
 		fresh.mustCode(t, fresh.do("GET", "/v1/admin/tenant", nil, nil), 200)
 
-		platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{}, nil), 200)
+		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": " "}, nil), 400, "REASON_REQUIRED")
+		platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": "离职停用"}, nil), 200)
 		wantProblem(t, fresh.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{}, nil), 409, "TENANT_ACCOUNT_ALREADY_DISABLED")
+		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": "离职停用"}, nil), 409, "TENANT_ACCOUNT_ALREADY_DISABLED")
 
-		body := platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/reset", map[string]any{}, nil), 200)
+		body := platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/reset", map[string]any{"reason": "换绑统一账号"}, nil), 200)
 		account := object(body["account"])
 		if account["status"] != accountPendingBind || account["bound"] != false || account["boundSubject"] != nil {
 			t.Fatalf("reset = %v", body)
@@ -436,8 +439,8 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		if view["bindRequired"] != true {
 			t.Fatalf("after reset the member must bind again: %v", view)
 		}
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{}, map[string]string{"Origin": "https://" + tenantB.console}), 403, "UNTRUSTED_ORIGIN")
-		wantProblem(t, newBrowser(tenantB).do("POST", "/v1/admin/tenant-accounts/"+memberID+"/reset", map[string]any{}, nil), 401, "ADMIN_AUTH_REQUIRED")
+		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": "离职停用"}, map[string]string{"Origin": "https://" + tenantB.console}), 403, "UNTRUSTED_ORIGIN")
+		wantProblem(t, newBrowser(tenantB).do("POST", "/v1/admin/tenant-accounts/"+memberID+"/reset", map[string]any{"reason": "换绑统一账号"}, nil), 401, "ADMIN_AUTH_REQUIRED")
 	})
 
 	t.Run("初始口令过期就登不进", func(t *testing.T) {
