@@ -2184,10 +2184,9 @@ func problem(c *gin.Context, status int, code, detail string) {
 	c.Header("Content-Type", "application/problem+json")
 	c.JSON(status, gin.H{"type": "about:blank", "title": http.StatusText(status), "status": status, "code": code, "detail": detail, "requestId": requestID(c)})
 }
-func requestID(c *gin.Context) string          { v, _ := c.Get("requestId"); return fmt.Sprint(v) }
-func actor(c *gin.Context) string              { v, _ := c.Get("actorId"); return fmt.Sprint(v) }
-func tenantID(c *gin.Context) string           { v, _ := c.Get("tenantId"); return fmt.Sprint(v) }
-func valueFrom(c *gin.Context, key string) any { v, _ := c.Get(key); return v }
+func requestID(c *gin.Context) string { v, _ := c.Get("requestId"); return fmt.Sprint(v) }
+func actor(c *gin.Context) string     { v, _ := c.Get("actorId"); return fmt.Sprint(v) }
+func tenantID(c *gin.Context) string  { v, _ := c.Get("tenantId"); return fmt.Sprint(v) }
 
 func randomID(n int) string {
 	b := make([]byte, n)
