@@ -22,7 +22,8 @@ import (
 
 var scanProbeHTTP = &http.Client{Timeout: 45 * time.Second}
 
-// requirePlatformAdmin 在 authenticate() 之后：账号必须在配置文件声明的平台管理员列表里。
+// requirePlatformAdmin 在 authenticate() 之后：账号必须在配置文件声明的平台管理员列表里，
+// 而且不能是租户账号的会话（它的 actor 与列表里的名字撞上也不行，见 platformAdminRequest）。
 func (s *server) requirePlatformAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if len(s.cfg.PlatformAdminUsernames) == 0 {
@@ -30,7 +31,7 @@ func (s *server) requirePlatformAdmin() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if !s.isPlatformAdmin(actor(c)) {
+		if !s.platformAdminRequest(c) {
 			problem(c, 403, "PLATFORM_ADMIN_REQUIRED", "This account is not a platform administrator")
 			c.Abort()
 			return

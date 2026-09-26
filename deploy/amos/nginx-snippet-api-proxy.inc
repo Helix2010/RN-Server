@@ -17,6 +17,8 @@ proxy_set_header X-Real-IP         $remote_addr;
 proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 proxy_set_header X-Forwarded-Host  $rn_upstream_host;
+# 统一登录用：控制台域名（api.* 上是空，等于不发）。见 rn-foundation.conf 顶上的 map $rn_console_host
+proxy_set_header X-RN-Console-Host $rn_console_host;
 
 proxy_http_version 1.1;
 proxy_set_header Connection "";

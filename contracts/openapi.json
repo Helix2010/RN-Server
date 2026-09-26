@@ -453,7 +453,7 @@
         },
         "responses": {
           "200": {
-            "description": "Authenticated"
+            "description": "Authenticated。用户名等于 ADMIN_USERNAME 走平台账号；否则按请求域名的租户找待绑定的租户账号用初始口令登录。已绑定的账号 409 ACCOUNT_BOUND_USE_CID；初始口令过期 401 INITIAL_PASSWORD_EXPIRED"
           }
         }
       }
@@ -462,7 +462,7 @@
       "post": {
         "responses": {
           "200": {
-            "description": "Logged out"
+            "description": "已登出；租户会话且配了统一登录时带 cidLogoutUrl，控制台跳过去把认证中心也退掉"
           }
         }
       }
@@ -471,7 +471,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session 含 platformAdmin：账号是否在 PLATFORM_ADMIN_USERNAMES 里"
+            "description": "Session：platformAdmin（平台会话且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、loginMethod（password|cid）、tenantId（租户会话的租户，平台会话为 null）、account（租户账号：id、displayName、loginName、email、status、boundEmail）、bindRequired"
           }
         }
       }
@@ -7266,6 +7266,218 @@
             "description": "MACHINE_NOT_A_BUILDER, MACHINE_REVOKED, STALE_MACHINE_REGISTRY"
           }
         }
+      }
+    },
+    "/v1/admin/auth/methods": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "登录页用：{password:true, cid:<统一登录是否已配置>}；免登录"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/cid/start": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "302 去认证中心授权（出错时 302 回 /?cidError=<码>）"
+          }
+        },
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "login=统一登录；bind=待绑定账号绑定统一认证账号（要已登录会话）"
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "登录后回到的控制台相对路径，不合规时回 /"
+          }
+        ]
+      }
+    },
+    "/client/v1/oauth/login": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "认证中心的回调（路径固定）：login 设会话后 302 回 target；bind 302 到控制台 /cid/bind-confirm；出错 302 /?cidError=<码>"
+          }
+        },
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "授权码"
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "发起时的 state"
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "认证中心拒绝时的错误"
+          }
+        ]
+      }
+    },
+    "/v1/admin/auth/cid/bind": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "待确认的绑定：{account, cid:{email}, expiresAt}；没有 404 CID_BIND_NOT_PENDING"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/cid/bind/confirm": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "本人确认绑定：账号变 active、本地口令作废，返回新的 Session；统一认证账号已绑本租户别的账号 409 CID_ACCOUNT_ALREADY_BOUND"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/auth/cid": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "统一登录客户端配置（app_configs 平台级 auth.cid）：{configured, config:{authorizeUrl, logoutUrl, tokenUrl, userinfoUrl, clientId, hasClientSecret}, callbackPath, version}；密钥永不返回"
+          }
+        }
+      },
+      "put": {
+        "responses": {
+          "200": {
+            "description": "保存：authorizeUrl、logoutUrl（https，可带 {baseHost}）、tokenUrl、userinfoUrl（https 或本机 / 内网 http）、clientId、clientSecret（留空沿用）、expectedVersion、reason"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "关掉统一登录"
+          }
+        },
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "原因"
+          }
+        ]
+      }
+    },
+    "/v1/admin/tenant-accounts": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "当前域名租户的控制台成员（只有平台管理员）：{items:[{id, displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}"
+          }
+        }
+      },
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/tenant-accounts/{id}/disable": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "停用：会话立即失效"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/admin/tenant-accounts/{id}/reset": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "解绑并重置初始口令：回到待绑定，返回 {account, initialPassword, passwordExpiresAt}；会话立即失效"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
       }
     }
   },

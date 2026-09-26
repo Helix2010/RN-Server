@@ -208,15 +208,29 @@ func (s *server) routes() *gin.Engine {
 	// 这条路由内部按同一套可见性挑出"现在该给你的那一版"再 302 过去。
 	r.GET("/v1/public/releases/latest/download", s.domainTenantScope(), s.publicLatestReleaseDownload)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
+	// 统一登录的回调：认证中心固定回到 <控制台域名>/client/v1/oauth/login，不能自定义
+	// （设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。nginx 把控制台域名的这条路径转过来
+	r.GET(cidCallbackPath, s.domainTenantScope(), s.cidCallback)
 	admin := r.Group("/v1/admin")
 	admin.POST("/auth/login", s.login)
+	// 登录页要知道统一登录开没开；免登录
+	admin.GET("/auth/methods", s.authMethods)
+	// 发起统一登录（mode=login 免登录；mode=bind 要一个待绑定账号的会话，处理函数自己查）
+	admin.GET("/auth/cid/start", s.domainTenantScope(), s.startCIDLogin)
 	protected := admin.Group("")
 	protected.Use(s.authenticate())
 	protected.GET("/auth/session", s.session)
 	protected.POST("/auth/logout", s.logout)
-	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放
+	// 绑定统一认证账号：回调之后本人在控制台确认，确认了才落库
+	protected.GET("/auth/cid/bind", s.getPendingCIDBind)
+	protected.POST("/auth/cid/bind/confirm", s.confirmCIDBind)
+	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放；租户账号的会话一律进不来
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin())
+	// 统一登录的客户端配置（app_configs 平台级 auth.cid，客户端密钥加密存）
+	platform.GET("/auth/cid", s.getCIDConfig)
+	platform.PUT("/auth/cid", s.updateCIDConfig)
+	platform.DELETE("/auth/cid", s.deleteCIDConfig)
 	// 构建机与签名闸的登记（build.machines）：新建发令牌、吊销、接受公钥、切换主备路由。
 	// 控制台接受只影响路由；签名闸与离线工具以本机记录和离线 pin 文件为准
 	platform.GET("/machines", s.listMachines)
@@ -335,8 +349,15 @@ func (s *server) routes() *gin.Engine {
 	gate.POST("/jobs/:id/release", s.releaseSigningJob)
 	gate.POST("/jobs/:id/reject", s.rejectSigningJob)
 	current := protected.Group("")
-	current.Use(s.domainTenantScope())
+	current.Use(s.domainTenantScope(), requireAdminSessionTenant())
 	current.GET("/tenant", s.currentTenant)
+	// 控制台成员（租户账号）：只有平台管理员能管，管的是当前域名的租户（用户 2026-09-25 定）
+	members := current.Group("/tenant-accounts")
+	members.Use(s.requirePlatformAdmin())
+	members.GET("", s.listTenantAccounts)
+	members.POST("", s.createTenantAccount)
+	members.POST("/:id/disable", s.disableTenantAccount)
+	members.POST("/:id/reset", s.resetTenantAccount)
 	s.registerTenantRoutes(current)
 	return r
 }
@@ -645,99 +666,6 @@ func (s *server) ready(c *gin.Context) {
 func (s *server) docs(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(200, `<!doctype html><html><head><title>RN Foundation API</title></head><body><h1>RN Foundation API</h1><p><a href="/openapi.json">OpenAPI contract</a></p></body></html>`)
-}
-
-func (s *server) authenticate() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if cookie, err := c.Cookie("rn_admin_session"); err == nil && cookie != "" {
-			hash := sha256Hex(cookie)
-			var actor string
-			var expires time.Time
-			err := s.db.QueryRowContext(c.Request.Context(), `SELECT actor_id, expires_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`, hash, time.Now().UTC()).Scan(&actor, &expires)
-			if err == nil {
-				if !safeMethod(c.Request.Method) && !s.originAllowed(c.GetHeader("Origin")) {
-					problem(c, 403, "UNTRUSTED_ORIGIN", "Untrusted admin request origin")
-					c.Abort()
-					return
-				}
-				c.Set("actorId", actor)
-				c.Set("authMethod", "session")
-				c.Set("expiresAt", iso(expires))
-				c.Next()
-				return
-			}
-		}
-		// x-admin-key 自动化通道：身份来自配置里绑定的 actor，不是请求自报的 x-admin-id。
-		// 自报身份任何持钥者都能随便写，写进 audit_events 的 actor 就成了攻击者可控的字段，
-		// 事后追责等于没有依据（安全评审 N17）。请求仍然可以带那个头，只是不再被采纳。
-		if key := c.GetHeader("x-admin-key"); s.cfg.AdminAPIKey != "" && constantEqual(key, s.cfg.AdminAPIKey) {
-			// 密钥对了还要看来源：这把密钥长期有效、没有账号绑定，泄露之后
-			// 唯一还能拦住它的就是"不是从我们的机器发出来的"（安全评审 N17）
-			if !s.adminIPs.allows(c.ClientIP()) {
-				slog.Warn("admin api key used from an address outside the allowlist", "clientIp", c.ClientIP(), "path", c.Request.URL.Path)
-				problem(c, http.StatusForbidden, "ADMIN_SOURCE_NOT_ALLOWED", "This automation credential is not accepted from this address")
-				c.Abort()
-				return
-			}
-			if claimed := strings.TrimSpace(c.GetHeader("x-admin-id")); claimed != "" && claimed != s.cfg.AdminAPIActor {
-				slog.Warn("ignoring self-declared admin identity on api-key request", "claimed", claimed, "actor", s.cfg.AdminAPIActor, "path", c.Request.URL.Path)
-			}
-			c.Set("actorId", s.cfg.AdminAPIActor)
-			c.Set("authMethod", "api-key")
-			c.Set("expiresAt", nil)
-			c.Next()
-			return
-		}
-		problem(c, 401, "ADMIN_AUTH_REQUIRED", "Admin authentication required")
-		c.Abort()
-	}
-}
-
-func (s *server) login(c *gin.Context) {
-	var input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := decode(c, &input); err != nil || input.Username == "" || input.Password == "" || len(input.Password) > 1024 {
-		problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
-		return
-	}
-	if s.rateLimited(c.ClientIP()) {
-		problem(c, 429, "LOGIN_RATE_LIMITED", "Too many login attempts")
-		return
-	}
-	valid := constantEqual(strings.TrimSpace(input.Username), s.cfg.AdminUsername) && verifyPassword(input.Password, s.cfg.AdminPasswordHash)
-	if !valid {
-		s.failedLogin(c.ClientIP())
-		problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
-		return
-	}
-	s.mu.Lock()
-	delete(s.attempts, c.ClientIP())
-	s.mu.Unlock()
-	token := randomID(32)
-	now := time.Now().UTC()
-	expires := now.Add(time.Duration(s.cfg.AdminSessionTTL) * time.Second)
-	if _, err := s.db.ExecContext(c.Request.Context(), `INSERT INTO admin_sessions (token_hash,actor_id,expires_at,created_at) VALUES (?,?,?,?)`, sha256Hex(token), s.cfg.AdminUsername, expires, now); err != nil {
-		problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
-		return
-	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: "rn_admin_session", Value: token, Path: "/v1/admin", MaxAge: s.cfg.AdminSessionTTL, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
-	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"authenticated": true, "platformAdmin": s.isPlatformAdmin(s.cfg.AdminUsername), "actorId": s.cfg.AdminUsername, "expiresAt": iso(expires), "method": "session"})
-}
-
-func (s *server) session(c *gin.Context) {
-	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"authenticated": true, "actorId": actor(c), "expiresAt": valueFrom(c, "expiresAt"), "method": valueFrom(c, "authMethod"), "platformAdmin": s.isPlatformAdmin(actor(c))})
-}
-
-func (s *server) logout(c *gin.Context) {
-	if token, err := c.Cookie("rn_admin_session"); err == nil {
-		_, _ = s.db.ExecContext(c.Request.Context(), `DELETE FROM admin_sessions WHERE token_hash=?`, sha256Hex(token))
-	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: "rn_admin_session", Value: "", Path: "/v1/admin", MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
-	c.JSON(200, gin.H{"authenticated": false})
 }
 
 func (s *server) rateLimited(ip string) bool {
