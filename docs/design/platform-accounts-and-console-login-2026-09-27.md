@@ -1,6 +1,6 @@
 # 平台管理员也进账号表、走统一登录；登录页放进控制台（2026-09-27）
 
-> 状态：设计，待确认后实施。前置文档：[tenant-console-accounts-and-sso-2026-09-25.md](tenant-console-accounts-and-sso-2026-09-25.md)（下称「账号设计」）。
+> 状态：发布 1 已实施（本地提交，待推送与合并），发布 2 待发布 1 验收后再做。前置文档：[tenant-console-accounts-and-sso-2026-09-25.md](tenant-console-accounts-and-sso-2026-09-25.md)（下称「账号设计」）。
 
 ## 1. 用户的决定（2026-09-27）
 
@@ -178,3 +178,29 @@ sequenceDiagram
 - 认证中心是 dev1 上的单实例，经 Cloudflare 隧道对外（换令牌走内网，不经隧道）：它停摆 = RN 控制台全员登不进（用户已接受）。
 - 认证中心本身没有登录失败锁定，只靠 nginx 限流；而 amos 看不到真实客户端 IP，限流实际是全局的（每分钟 60 次）：挡得住高速撞库，挡不住慢速的，还可能被人故意打满、让正常用户一时登不进；要靠邮箱二次验证兜底。
 - 控制台页面经手统一账号口令（3.8）。
+
+## 7. 发布 1 实施记录（2026-09-27）
+
+RN-Server 分支 `feat/platform-accounts`、RN-Admin 分支 `feat/platform-accounts`，都从各自的 origin/main 开。
+
+**与上面设计不一样的地方**：
+
+| 设计里写的 | 实现 | 理由 |
+| --- | --- | --- |
+| nginx 按 IP 限流，每分钟 20 次 | 全局每分钟 60 次、突发 20 | amos 看不到真实客户端 IP（网关按 SNI 转发 TCP），按 IP 等于全局；20 次太容易被人打满 |
+| 控制台成员页加一栏「平台管理员」 | 平台维护里单独一页「平台管理员」，与控制台成员同一个组件 | 成员页管的是当前域名的租户，平台管理员不属于任何租户，放一页里容易看错 |
+| 没提 | 有平台账号时不能删发信配置（409 `MAIL_REQUIRED_FOR_SECOND_FACTOR`） | 平台账号做写操作都要邮箱二次验证，删了发信就再没人能改回来（只剩服务器上的管理密钥） |
+| 没提 | 平台账号相关的审计动作用 `platform_account_*` 前缀，记在平台（`tenant_id=0`） | 与租户成员的 `tenant_account_*` 分开，审计页按租户过滤时不会混进来 |
+| 没提 | 顺带补上控制台 `index.html` 一直缺的 `X-Frame-Options` 等安全头 | `location = /index.html` 写了 `add_header`，nginx 就不再继承外层的三个安全头 |
+| 没提 | 验证码与绑定通知邮件里「成员账号」改成中性的「账号」 | 平台管理员也收这些邮件 |
+
+**验证**：
+
+- RN-Server：`gofmt`、`go vet ./...`、不连库的包 `go test -race` 全过；`internal/api` 与 `internal/store` 库测在独立测试库上除 7 条 keystore 用例外全过——那 7 条在未改动的代码上用同样参数（`-race`）同样失败，是本机 `-race` 下列 keystore 超过请求时限，与本改动无关。新增 `TestDBPlatformAccounts`（建号命令、任何域名的初始口令登录、绑定、统一登录后的平台会话、写操作要二次验证、双重身份在回调与确认两处都挡住、不能动自己与最后一个、发信配置保护、命令行重置）连跑三遍一致。
+- nginx 模板：本机起了一份，实测 `/login` 的 CSP 与 `X-Frame-Options: DENY`、首页补上的安全头、`/auth/v1/` 转发、登录接口第 22 次开始 429。
+- 认证中心挂在应用域名下：在 dev1 上模拟 amos 转发（`Host: console.anyfun.win`、`X-Forwarded-Proto: https`）用测试账号走了一遍：没登录 → 302 `https://console.anyfun.win/login?X-Auth-Token=…`；登录接口回 `{"code":"ok","data":{"redirect_url":"https://console.anyfun.win/auth/v1/oauth/authorize?…"}}`；跟过去 → 302 回 `https://console.anyfun.win/client/v1/oauth/login?code&state`。口令错回 `{"code":"401","msg":"Bad credentials"}`。认证中心在控制台域名上设 `X-Auth-Token`、`XSRF-TOKEN` 两个 `Path=/` 的 Cookie，与 RN 的 Cookie 不重名。
+- RN-Admin：`pnpm check` 全过（58 个测试文件、706 项）。
+- 两次提交都不改 `go.mod` 与打包机构建输入，打包机不用重签。
+
+**上线步骤**（第 4 节表格的前四步）：合并两个 PR → 用户在 amos 上装 nginx 的两个文件（`rn-foundation.conf`、`rn-foundation-snippet-console.inc`）→ 统一登录配置的授权与退出地址改成 `https://{baseHost}/auth/v1/…`（写线上配置，先问）→ 用户在 amos 上执行建号命令建自己的平台账号、绑定、用统一登录进平台维护验收。之后再做发布 2。
+
