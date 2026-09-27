@@ -130,6 +130,9 @@ func (s *server) verifySecondFactor(c *gin.Context) {
 	}
 	now := s.now()
 	if !s.secondFactorCodes.verify(session.AccountID, body.CodeToken, body.Code, session.TokenHash, strings.TrimSpace(session.Account.Email), now) {
+		// 失败也留痕（不记验证码）：每账号每小时最多 25 次猜测，事后要查得到
+		s.auditNow(newAudit(session.TenantID, session.Actor, "tenant_account_second_factor_failed", "tenant-account", session.AccountID, "二次验证码不对或已过期", requestID(c),
+			map[string]any{}))
 		problem(c, http.StatusBadRequest, "SECOND_FACTOR_CODE_INVALID", "The verification code is invalid or expired")
 		return
 	}

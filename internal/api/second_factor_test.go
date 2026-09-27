@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +67,24 @@ func TestDBSecondFactor(t *testing.T) {
 	platform.mustCode(t, platform.do("PUT", "/v1/admin/release-identity/ios", identity("com.sf.p"+sfx, 0), nil), 200)
 	wantProblem(t, platform.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 400, "SECOND_FACTOR_NOT_APPLICABLE")
 
+	// 钱包段（RPC、WalletConnect、转出上链开关）下发给所有用户：改它也要二次验证；原样带回不算改
+	appConfig := func(projectID string) map[string]any {
+		return map[string]any{"expectedVersion": 1, "reason": "改钱包", "confirm": true, "config": map[string]any{
+			"ttlSeconds": 3600, "localization": map[string]any{}, "theme": map[string]any{}, "support": map[string]any{},
+			"features": map[string]any{"crashAutoReport": false},
+			"updatePolicy": map[string]any{
+				"minSupportedVersion": map[string]any{"android": "1.0.0", "ios": "1.0.0"},
+				"latestVersion":       map[string]any{"android": "1.0.0", "ios": "1.0.0"},
+			},
+			"modules": map[string]any{"predict": false},
+			"wallet":  map[string]any{"walletConnectProjectId": projectID},
+		}}
+	}
+	seed, _ := json.Marshal(appConfig("sfproject0000000" + sfx)["config"])
+	seedTenantConfig(t, db, tenant.id, "mobile-bootstrap", string(seed))
+	wantProblem(t, member.do("PATCH", "/v1/admin/app-config", appConfig("attackerproject00000"), nil), 403, "SECOND_FACTOR_REQUIRED")
+	member.mustCode(t, member.do("PATCH", "/v1/admin/app-config", appConfig("sfproject0000000"+sfx), nil), 200)
+
 	// 没配发信就发不了码，也就做不了敏感操作（不退回不校验）
 	wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")
 	platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("二次验证要发信", 0), nil), 200)
@@ -86,6 +105,10 @@ func TestDBSecondFactor(t *testing.T) {
 		wrong = "111111"
 	}
 	wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/verify", map[string]any{"codeToken": token, "code": wrong}, nil), 400, "SECOND_FACTOR_CODE_INVALID")
+	var failures int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tenant_id=? AND action='tenant_account_second_factor_failed'`, tenant.id).Scan(&failures); err != nil || failures != 1 {
+		t.Fatalf("failed verification audits = %d %v", failures, err)
+	}
 	verified := member.mustCode(t, member.do("POST", "/v1/admin/auth/second-factor/verify", map[string]any{"codeToken": token, "code": code}, nil), 200)
 	if verified["secondFactorUntil"] == nil {
 		t.Fatalf("verify = %v", verified)

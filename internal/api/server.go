@@ -431,8 +431,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
-	// 只给平台会话：预测平台的配置归平台管理员（§3.4），而且探测会去连任意 https 地址
-	group.POST("/predict/probe", s.requirePlatformAdmin(), s.probePredictService)
+	// 只给平台会话：预测平台的配置归平台（§3.4），而且探测会去连任意 https 地址。
+	// 与保存 services.predict 同一个判据（isPlatformSession），能存的就能测
+	group.POST("/predict/probe", requirePlatformSession(), s.probePredictService)
 	group.GET("/branding", s.getBranding)
 	group.PATCH("/branding", s.updateBranding)
 	group.GET("/tokens", s.listTokens)
@@ -1139,11 +1140,15 @@ func (s *server) listAudits(c *gin.Context) {
 	}
 	defer rows.Close()
 	items, cursors := []auditEvent{}, []string{}
+	platformView := isPlatformSession(c)
 	for rows.Next() {
 		item, created, err := scanAudit(rows, tenant)
 		if err != nil {
 			problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to read audit events")
 			return
+		}
+		if !platformView {
+			redactAuditForTenant(&item)
 		}
 		items, cursors = append(items, item), append(cursors, encodeListCursor(created, item.ID))
 	}
@@ -1153,6 +1158,27 @@ func (s *server) listAudits(c *gin.Context) {
 	}
 	items, next := finishListPage(items, cursors, page.limit)
 	c.JSON(200, listResponse(items, total, next, page.limit))
+}
+
+// tenantHiddenAuditKeys 是审计摘要里指向平台基础设施与别的租户的字段。审计按租户存、租户会话能读，
+// 读的时候拿掉（设计 tenant-console-accounts-and-sso §3.4）；平台会话照旧看全。
+var tenantHiddenAuditKeys = map[string]bool{
+	"machineId": true, "machineName": true, "claimedBy": true, "signingMachineId": true,
+	"generatorMachineId": true, "generatorName": true, "signerMachineId": true, "signerName": true,
+	// 旧版 ios_delivery_update 记的是同 Team 其它租户的 slug（现在只记个数）
+	"teamSharedWith": true,
+}
+
+func redactAuditForTenant(item *auditEvent) {
+	for key := range item.Summary {
+		if tenantHiddenAuditKeys[key] {
+			delete(item.Summary, key)
+		}
+	}
+	// 签名闸报检查结果的那条把机器名记在 name 里
+	if item.Action == "build_keystore_check_update" {
+		delete(item.Summary, "name")
+	}
 }
 
 func parseAuditListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
@@ -1294,6 +1320,14 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	if incoming, present := body.Config["wallet"]; present && incoming != nil {
 		if err := validateWalletSection(incoming); err != nil {
 			problem(c, 400, "INVALID_WALLET_CONFIG", err.Error())
+			return
+		}
+		// 钱包段（链的 RPC 地址、WalletConnect、转出是否真的上链）下发给这个租户的所有用户：
+		// 租户会话改它要 15 分钟内过邮箱二次验证（ADR-0023）。原样带回不算改
+		walletChanged := !sameJSON(normalizeWallet(object(incoming)), normalizeWallet(object(storedWalletSection(stored))))
+		if walletChanged && !isPlatformSession(c) && !secondFactorFresh(currentAdminSession(c), s.now()) {
+			problem(c, http.StatusForbidden, "SECOND_FACTOR_REQUIRED",
+				"Changing the wallet section needs email verification within the last 15 minutes; request a code and verify it first")
 			return
 		}
 	} else if carried := storedWalletSection(stored); carried != nil {

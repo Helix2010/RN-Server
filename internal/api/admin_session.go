@@ -51,6 +51,18 @@ func (a *adminSession) tenantScoped() bool { return a != nil && a.TenantID != ""
 // 只看自己租户的东西（设计 tenant-console-accounts-and-sso §3.4）。
 func isPlatformSession(c *gin.Context) bool { return !currentAdminSession(c).tenantScoped() }
 
+// requirePlatformSession 挂在只给平台会话的租户路由上（判据同 isPlatformSession）。
+func requirePlatformSession() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isPlatformSession(c) {
+			c.Next()
+			return
+		}
+		problem(c, http.StatusForbidden, "PLATFORM_ADMIN_REQUIRED", "Only the platform administrator can do this")
+		c.Abort()
+	}
+}
+
 // tenantActor 是租户账号在审计里的 actor。带冒号，与 ADMIN_USERNAME 的取值空间分开。
 func tenantActor(tenant, account string) string { return "tenant:" + tenant + ":" + account }
 

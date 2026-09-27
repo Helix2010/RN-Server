@@ -353,7 +353,7 @@
             "description": "STALE_APP_CONFIG, IOS_MIN_VERSION_NOT_INSTALLABLE (self-upload iOS tenant: the iOS minimum supported version was raised past the highest build marked installable)"
           },
           "403": {
-            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：SERVICES_CONFIG_PLATFORM_ONLY：services.predict 只能原样带回，只有平台管理员能改"
+            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：SERVICES_CONFIG_PLATFORM_ONLY：services.predict 只能原样带回，只有平台管理员能改; SECOND_FACTOR_REQUIRED：租户会话改 wallet 段（RPC、WalletConnect、onchainSends）要 15 分钟内通过邮箱二次验证"
           }
         }
       }

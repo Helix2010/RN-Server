@@ -255,11 +255,12 @@ func (s *server) reapStaleBuilds(ctx context.Context, now time.Time, result *rea
 				map[string]any{"jobId": item.id, "attempt": item.attempt, "machineId": nullableString(item.machineID), "was": item.status}))
 			continue
 		}
-		reason := fmt.Sprintf("构建机 %s 超过 %s 没有回报进度，任务按失败处理。", item.machineName, buildJobHeartbeatTimeout)
+		// 失败原因租户也看得到：不写构建机叫什么（设计 tenant-console-accounts-and-sso §3.4），平台在任务视图的 claimedBy 里看
+		reason := fmt.Sprintf("构建机超过 %s 没有回报进度，任务按失败处理。", buildJobHeartbeatTimeout)
 		if item.kind == jobKindAPK {
-			reason = fmt.Sprintf("已经被认领 %d 次，构建机每次都超过 %s 没有回报进度（最近一次是 %s），不再自动重排。"+
+			reason = fmt.Sprintf("已经被认领 %d 次，构建机每次都超过 %s 没有回报进度，不再自动重排。"+
 				"多半是同一个原因反复把构建机拖死；看最近一次的日志尾部，修好之后重新排一个任务。",
-				item.attempt, buildJobHeartbeatTimeout, item.machineName)
+				item.attempt, buildJobHeartbeatTimeout)
 		} else {
 			reason += "热更新任务不自动重排，确认原因之后重新排一个。"
 		}

@@ -194,7 +194,12 @@ func (s *server) testReleaseStorage(c *gin.Context) {
 		problem(c, http.StatusFailedDependency, "STORAGE_TEST_FAILED", "Unable to access the configured release storage bucket")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": record.Value.Bucket, "checkedAt": iso(time.Now())})
+	// 继承平台存储时，租户会话拿不到平台的桶名（与 GET 一致，设计 tenant-console-accounts-and-sso §3.4）
+	var bucket any = record.Value.Bucket
+	if record.SourceTenant != tenantID(c) && !isPlatformSession(c) {
+		bucket = nil
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": bucket, "inherited": record.SourceTenant != tenantID(c), "checkedAt": iso(time.Now())})
 }
 
 func (s *server) releaseStorageRecord(ctx context.Context, tenant string) (releaseStorageRecord, error) {

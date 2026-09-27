@@ -215,6 +215,24 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		}
 	})
 
+	t.Run("租户读自己的审计时看不到机器与别的租户", func(t *testing.T) {
+		action := "build_keystore_check_update"
+		target := "iso-audit-" + sfx
+		if _, err := db.Exec(`INSERT INTO audit_events(id,tenant_id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			"aud_iso_"+sfx, tenantA.id, "signer", action, "app-config", target, "a signer reported", "",
+			`{"machineId":"mch_iso","name":"signer-hk-1","decrypt":"ok","teamSharedWith":["`+slugB+`"]}`, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		mine := member.do("GET", "/v1/admin/audit-events?q="+target, nil, nil)
+		body := mine.Body.String()
+		if mine.Code != 200 || strings.Contains(body, "signer-hk-1") || strings.Contains(body, "mch_iso") || strings.Contains(body, slugB) || !strings.Contains(body, `"decrypt":"ok"`) {
+			t.Fatalf("tenant audit view = %d %s", mine.Code, body)
+		}
+		if !strings.Contains(platform.do("GET", "/v1/admin/audit-events?q="+target, nil, nil).Body.String(), "signer-hk-1") {
+			t.Fatal("the platform session still sees the machine in the audit")
+		}
+	})
+
 	t.Run("原来不写审计的租户写接口现在写，操作者是成员", func(t *testing.T) {
 		member.mustCode(t, member.do("POST", "/v1/admin/upload-sessions/cleanup-expired", map[string]any{}, nil), 200)
 		var actorID string
