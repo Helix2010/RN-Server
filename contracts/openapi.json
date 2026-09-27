@@ -7567,6 +7567,174 @@
           }
         }
       }
+    },
+    "/v1/admin/platform/tenants": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "租户列表（平台控制台不进入任何租户，各页按它分组、选租户）：{items:[{id, slug, status（active|disabled）, appName, domains:[生效中的域名]}]}"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/tenant-accounts": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "全部租户的控制台成员，只读：{items:[{tenantId, id, displayName, email, subject, status, lastLoginAt, createdBy, createdAt}]}。账号由外部系统维护"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/build-directories": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "租户打包目录：{items:[{tenantId, slug, appName, status, repoDirectory（生效值，没配过就是 slug）, defaulted, version（build.android 那一行的版本，0 = 还没有）}]}"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/build-directories/{tenantId}": {
+      "put": {
+        "parameters": [
+          {
+            "name": "tenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "租户 id"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "改这个租户的打包目录：repoDirectory（空 = slug）、expectedVersion、reason、confirm=true；只改 build.android 的 repoDirectory，其余原样，没有这一行就新建。目录不合法 400 INVALID_BUILD_DIRECTORY，版本不对 409 STALE_BUILD_CONFIG，租户不存在 404 TENANT_NOT_FOUND。响应同列表的一行"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/predict-links": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "外部系统关联（预测平台）：{items:[{tenantId, slug, appName, status, predict:{domain, scopeId, chain, endpoints?}|null, predictEnabled（租户开没开预测市场模块）, version（mobile-bootstrap 生效那一行的版本）}]}"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/predict-links/{tenantId}": {
+      "put": {
+        "parameters": [
+          {
+            "name": "tenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "租户 id"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "改这个租户的预测平台关联：predict（{domain, scopeId, chain, endpoints?}，null = 取消关联）、expectedVersion、reason、confirm=true；只改 mobile-bootstrap 的 services.predict，与租户页保存同样通知 App。不合法或预测市场模块开着却取消关联 400 INVALID_SERVICES_CONFIG，版本不对 409 STALE_APP_CONFIG。响应同列表的一行"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/predict/probe": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "测试预测平台连接：{domain, scopeId, chain, endpoints?}；连不上或 scopeId 对不上 424 PREDICT_PROBE_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/push/credentials": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "平台默认推送凭据（所有没单独配的租户继承它）：{fcm:{configured, version, projectId, clientEmail, privateKeyIdHint, verifiedAt, updatedBy, updatedAt, inheritors}, apns:{configured, version, teamId, keyIdHint, environment, verifiedAt, updatedBy, updatedAt, inheritors}, hms}；改、删用 PUT/DELETE /v1/admin/platform/push/credentials/{fcm,apns}"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/release-storage": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "平台默认发布存储（tenant 0 那一行，所有没单独配的租户继承它）：同租户的 GET /v1/admin/release-storage，另加 inheritors（在继承的租户数）"
+          }
+        }
+      },
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "改平台默认发布存储：字段同租户的 PUT /v1/admin/release-storage（凭据留空沿用平台那一行自己的）"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/release-storage/test": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "用平台默认发布存储真连一次桶：{ok, provider, bucket, inherited:false, checkedAt}；没配 412 STORAGE_NOT_CONFIGURED，连不上 424 STORAGE_TEST_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/release-storage/cors": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "直传模式下桶要放行的来源：全平台所有生效租户域名的并集（共用的桶要放行所有租户），形状同租户的 GET /v1/admin/release-storage/cors"
+          }
+        }
+      }
     }
   },
   "components": {

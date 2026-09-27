@@ -117,6 +117,8 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `PORT` | `3000` | 不带角色子命令（`rn-server`）时的监听端口。按角色起的进程用参数给端口：`rn-server app\|tenant\|platform --port N`，amos 上写在三个 unit 的 `ExecStart` 里（设计 `docs/design/service-and-console-split-2026-09-27.md`），不受这个键影响 |
 | `TRUSTED_PROXIES` | 空 | 允许设置 `X-Forwarded-For` 的上跳。**空 = 谁都不信**，`ClientIP` 取直连对端。不填时 `ADMIN_API_ALLOWED_IPS` 只是摆设（安全评审 N17） |
 | `PLATFORM_ADMIN_USERNAMES` | 空 | 自动化通道里哪些 actor（`ADMIN_API_ACTOR`）能进平台级接口（扫链管理、打包机与签名闸、平台推送默认、发 OTA 的脚本），逗号分隔。**空 = 自动化通道进不了平台路由**。控制台账号是不是平台管理员看 `tenant_admin_accounts`（`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`），不看这个列表 |
+| `PLATFORM_CONSOLE_HOST` | 空 | 平台控制台的域名，比如 `platform.anyfun.win`（不带协议与端口）。平台端的统一登录拿它拼回调与退出地址，平台控制台的改动请求只认这个来源。**空 = 没有平台控制台**，平台端不发起统一登录（设计 `docs/design/service-and-console-split-2026-09-27.md` §4.3） |
+| `MACHINE_API_ORIGIN` | 空 | 新机器装机命令里写的服务端地址，比如 `https://api.anyfun.win`。平台控制台不在任何租户域名上，不能拿请求的 Host 拼，否则机器会被绑到平台控制台的域名上。空 = 沿用请求的源（从租户控制台转过来的请求是这个租户的 `api.*`）。生产只收 https |
 | `CORS_ORIGINS` | 开发 `*`，生产空 | **额外**放行的来源。租户自己的域名由 `tenant_domain` 表推导（见 `originAllowed`），通常不需要写。生产显式写 `*` 会拒绝启动 |
 | `HTTP_READ_TIMEOUT_SECONDS` | `3600` | 大产物上传要靠它，别调小 |
 | `HTTP_WRITE_TIMEOUT_SECONDS` | `3600` | |

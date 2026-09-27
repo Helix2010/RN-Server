@@ -1,6 +1,10 @@
 package api
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/gin-gonic/gin"
+)
 
 // Role 是一个 rn-server 进程承担哪一部分接口（设计 service-and-console-split-2026-09-27 §3）。
 // 同一个二进制按角色起三个进程，每个进程只注册自己的路由：App 服务里根本没有 /v1/admin，
@@ -41,3 +45,17 @@ func (r Role) serves(part Role) bool { return r == RoleAll || r == part }
 
 // RunsWorkers：打包任务回收、推送派发各只能有一份，放在平台端（不带子命令时也跑）。
 func (r Role) RunsWorkers() bool { return r.serves(RolePlatform) }
+
+// platformConsole：这个请求是不是平台控制台的（设计 service-and-console-split-2026-09-27 §4.3、§4.4）。
+// 平台端进程收到的管理请求都是（机器接口不走会话，不受影响），租户端进程收到的都不是；不带角色的
+// 全量进程（本地开发、库测）按 Host 是不是 PLATFORM_CONSOLE_HOST 分。
+func (s *server) platformConsole(c *gin.Context) bool {
+	switch s.role {
+	case RolePlatform:
+		return true
+	case RoleTenant:
+		return false
+	}
+	host, err := normalizeHost(c.Request.Host)
+	return err == nil && s.cfg.PlatformConsoleHost != "" && host == s.cfg.PlatformConsoleHost
+}

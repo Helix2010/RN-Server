@@ -305,9 +305,13 @@ func (s *server) deleteCIDConfig(c *gin.Context) {
 
 // ---- 登录与绑定 ----
 
-// consoleHost 是浏览器地址栏里的控制台域名。nginx 转发 console.* 时写 X-RN-Console-Host；
-// 没有这个头（直连 api.*、本机调试）就用 Host。头里的域名必须与 Host 属于同一个租户，否则不采信。
+// consoleHost 是浏览器地址栏里的控制台域名。平台控制台就是 PLATFORM_CONSOLE_HOST（配置，不看请求头）。
+// 租户控制台：nginx 转发 console.* 时写 X-RN-Console-Host；没有这个头（直连 api.*、本机调试）就用 Host。
+// 头里的域名必须与 Host 属于同一个租户，否则不采信。
 func (s *server) consoleHost(c *gin.Context) string {
+	if s.platformConsole(c) && s.cfg.PlatformConsoleHost != "" {
+		return s.cfg.PlatformConsoleHost
+	}
 	host, err := normalizeHost(c.Request.Host)
 	if err != nil {
 		host = c.Request.Host
@@ -381,6 +385,28 @@ func safeConsoleTarget(raw string) string {
 	return raw
 }
 
+// consoleScope 挂在统一登录的发起与回调上：租户控制台先按域名认出租户（流程 Cookie 绑这个租户）；
+// 平台控制台不属于任何租户，不认（设计 service-and-console-split-2026-09-27 §4.3）。
+func (s *server) consoleScope() gin.HandlerFunc {
+	tenantScope := s.domainTenantScope()
+	return func(c *gin.Context) {
+		if s.platformConsole(c) {
+			c.Next()
+			return
+		}
+		tenantScope(c)
+	}
+}
+
+// flowAAD 是流程 Cookie 的加密附加数据：租户控制台绑租户 id，平台控制台是固定的 platform（租户 id 是数字，撞不上）。
+// 在一个控制台发起的流程拿到另一个控制台的回调上解不开。
+func (s *server) flowAAD(c *gin.Context) string {
+	if s.platformConsole(c) {
+		return cidFlowAAD("platform")
+	}
+	return cidFlowAAD(tenantID(c))
+}
+
 // cidFail 回到控制台首页并带一个错误码，由控制台显示原因。只放固定的码，不回显任何外部输入。
 func cidFail(c *gin.Context, code string) {
 	c.Header("Cache-Control", "no-store")
@@ -399,6 +425,11 @@ func (s *server) startCIDLogin(c *gin.Context) {
 		cidFail(c, "not_configured")
 		return
 	}
+	if s.platformConsole(c) && s.cfg.PlatformConsoleHost == "" {
+		slog.Error("unified login for the platform console needs PLATFORM_CONSOLE_HOST")
+		cidFail(c, "misconfigured")
+		return
+	}
 	if c.Query("mode") != "login" {
 		problem(c, 400, "INVALID_CID_MODE", "mode must be login")
 		return
@@ -413,7 +444,7 @@ func (s *server) startCIDLogin(c *gin.Context) {
 		return
 	}
 	flow.State, flow.Verifier = started.State, started.CodeVerifier
-	sealed, err := s.sealCookie(flow, cidFlowAAD(tenantID(c)))
+	sealed, err := s.sealCookie(flow, s.flowAAD(c))
 	if err != nil {
 		cidFail(c, "internal")
 		return
@@ -437,7 +468,7 @@ func (s *server) cidCallback(c *gin.Context) {
 	// 不论成败都清掉：一次性
 	http.SetCookie(c.Writer, &http.Cookie{Name: cookieName, Value: "", Path: cidCallbackPath, MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
 	var flow cidFlow
-	if err != nil || s.openCookie(raw, cidFlowAAD(tenantID(c)), &flow) != nil || !constantEqual(flow.State, state) || time.Now().UTC().After(flow.ExpiresAt) {
+	if err != nil || s.openCookie(raw, s.flowAAD(c), &flow) != nil || !constantEqual(flow.State, state) || time.Now().UTC().After(flow.ExpiresAt) {
 		cidFail(c, "state")
 		return
 	}
@@ -477,6 +508,7 @@ func (s *server) cidCallback(c *gin.Context) {
 		cidFail(c, "internal")
 		return
 	}
+	// 平台控制台不属于任何租户：tenantID 为空，只认平台记录
 	acc, refused := accountForLogin(accounts, tenantID(c))
 	if refused == "identity_conflict" {
 		ids := make([]string, 0, len(accounts))
@@ -503,7 +535,8 @@ func (s *server) cidCallback(c *gin.Context) {
 
 // accountForLogin 按统一认证账号的全部记录决定这次登录用哪个身份（设计 console-accounts-external-maintenance §4.1）：
 //   - 既有平台记录又有任何一条租户记录 → identity_conflict（外部系统写错了，不猜）；
-//   - 只有平台记录 → 平台管理员；
+//   - 平台控制台（tenant 为空）：只认平台记录，没有就 no_access（设计 service-and-console-split-2026-09-27 §4.2）；
+//   - 只有平台记录 → 平台管理员（过渡期：平台管理员还能在租户控制台登录，拆分第二步的后半段去掉）；
 //   - 有当前域名所属租户的记录 → 这个租户的成员；
 //   - 其余 → no_access。
 //
@@ -525,6 +558,8 @@ func accountForLogin(accounts []*tenantAccount, tenant string) (*tenantAccount, 
 	switch {
 	case platform != nil && members > 0:
 		return nil, "identity_conflict"
+	case tenant == "" && platform == nil:
+		return nil, "no_access"
 	case platform != nil:
 		acc = platform
 	case here == nil:
