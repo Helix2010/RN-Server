@@ -188,6 +188,18 @@ func location(t *testing.T, recorder *httptest.ResponseRecorder) string {
 	return recorder.Header().Get("Location")
 }
 
+// passSecondFactor 走一遍邮箱二次验证：发码、从收到的信里取码、验证。
+func passSecondFactor(t *testing.T, b *browser, smtpServer *testSMTP, email string) {
+	t.Helper()
+	sent := b.mustCode(t, b.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 200)
+	token, _ := sent["codeToken"].(string)
+	code := mailCode(t, smtpServer.last(t, email))
+	verified := b.mustCode(t, b.do("POST", "/v1/admin/auth/second-factor/verify", map[string]any{"codeToken": token, "code": code}, nil), 200)
+	if verified["secondFactorUntil"] == nil {
+		t.Fatalf("verify = %v", verified)
+	}
+}
+
 func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	db := openTestDB(t)
 	tenantA := accountsTestTenantRow(t, db, "a")
@@ -320,6 +332,13 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	})
 
 	t.Run("绑定：回调之后本人确认才落库", func(t *testing.T) {
+		// 发起绑定前要过邮箱二次验证（发到成员自己登记的邮箱）；平台没配发信就发不了码，也就绑不了（不退回不校验）
+		if got := location(t, member.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil)); got != "/?cidError=second_factor_required" {
+			t.Fatalf("bind start without the second factor redirected to %s", got)
+		}
+		wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")
+		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("绑定验证码要发信", 0), nil), 200)
+		passSecondFactor(t, member, smtpServer, "zs@example.com")
 		authorize := location(t, member.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
 		if !strings.HasPrefix(authorize, "https://login.test/auth/v1/oauth/authorize?") ||
 			!strings.Contains(authorize, url.QueryEscape("https://"+tenantA.console+cidCallbackPath)) {
@@ -343,8 +362,6 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, map[string]string{"Origin": "https://" + tenantB.console}), 403, "UNTRUSTED_ORIGIN")
 		// 确认要带发到统一认证账号邮箱的验证码；平台没配发信就发不了，也就绑不了（不退回不校验）
 		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, nil), 400, "CID_BIND_CODE_INVALID")
-		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")
-		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("绑定验证码要发信", 0), nil), 200)
 		sent := member.mustCode(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 200)
 		codeToken, _ := sent["codeToken"].(string)
 		mailBody := smtpServer.last(t, "zs@chainup.test")
@@ -434,6 +451,7 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 			map[string]string{"displayName": "李四", "loginName": "lisi", "email": "ls@example.com"}, nil), 201)
 		second := newBrowser(tenantA)
 		second.mustCode(t, second.do("POST", "/v1/admin/auth/login", map[string]string{"username": "lisi", "password": body["initialPassword"].(string)}, nil), 200)
+		passSecondFactor(t, second, smtpServer, "ls@example.com")
 		authorize := location(t, second.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
 		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
 		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=already_bound" {

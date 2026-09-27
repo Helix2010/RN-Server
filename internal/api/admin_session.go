@@ -41,6 +41,8 @@ type adminSession struct {
 	AccountID   string // 空 = 平台会话
 	LoginMethod string
 	Account     *tenantAccount // 租户会话才有
+	// SecondFactorAt 是这个会话最近一次通过邮箱二次验证的时间，零值 = 没验过（second_factor.go）
+	SecondFactorAt time.Time
 }
 
 func (a *adminSession) tenantScoped() bool { return a != nil && a.TenantID != "" }
@@ -59,6 +61,9 @@ var pendingBindRoutes = map[string]bool{
 	"GET /v1/admin/auth/cid/bind":          true,
 	"POST /v1/admin/auth/cid/bind/code":    true,
 	"POST /v1/admin/auth/cid/bind/confirm": true,
+	// 发起绑定前要先过邮箱二次验证（second_factor.go）
+	"POST /v1/admin/auth/second-factor/code":   true,
+	"POST /v1/admin/auth/second-factor/verify": true,
 }
 
 // loadAdminSession 读并校验请求带的会话 Cookie。没有、过期、租户对不上、账号停用都返回 nil。
@@ -71,9 +76,10 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 	ctx := c.Request.Context()
 	session := adminSession{TokenHash: sha256Hex(cookie)}
 	var tenant, account, method sql.NullString
+	var secondFactor sql.NullTime
 	err = s.db.QueryRowContext(ctx,
-		`SELECT actor_id, expires_at, tenant_id, account_id, login_method FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
-		session.TokenHash, time.Now().UTC()).Scan(&session.Actor, &session.ExpiresAt, &tenant, &account, &method)
+		`SELECT actor_id, expires_at, tenant_id, account_id, login_method, second_factor_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
+		session.TokenHash, time.Now().UTC()).Scan(&session.Actor, &session.ExpiresAt, &tenant, &account, &method, &secondFactor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -88,6 +94,9 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 		return &session, nil
 	}
 	session.TenantID, session.AccountID = tenant.String, account.String
+	if secondFactor.Valid {
+		session.SecondFactorAt = secondFactor.Time.UTC()
+	}
 	host, err := s.tenant.resolve(ctx, c.Request.Host)
 	if err != nil || host.ID != session.TenantID {
 		// 别的租户的会话拿到这个域名上来：当没登录，而不是 403——对这个域名来说它确实没登录
@@ -341,6 +350,8 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 		"tenantId":      nil,
 		"account":       nil,
 		"bindRequired":  false,
+		// 租户会话的邮箱二次验证在这个时间之前有效；null = 没验过或已过期（平台会话不用）
+		"secondFactorUntil": nil,
 	}
 	if session == nil {
 		// 自动化通道
@@ -355,6 +366,9 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 		return view
 	}
 	view["tenantId"] = session.TenantID
+	if until := session.SecondFactorAt.Add(secondFactorWindow); !session.SecondFactorAt.IsZero() && time.Now().Before(until) {
+		view["secondFactorUntil"] = iso(until)
+	}
 	if session.Account != nil {
 		view["account"] = session.Account.sessionView()
 		view["bindRequired"] = session.Account.Status == accountPendingBind

@@ -21,6 +21,7 @@ import (
 // 租户会话看不到别的租户与平台的基础设施、改不了平台级的设置；平台会话照旧。
 
 // activeTenantSession 在库里直接放一个已绑定的成员和它的统一登录会话，返回会话令牌。
+// 会话记为刚通过邮箱二次验证：这里测的是租户隔离，不是二次验证（那在 second_factor_test.go）。
 func activeTenantSession(t *testing.T, db *sql.DB, tenant accountsTestTenant) string {
 	t.Helper()
 	now := time.Now().UTC()
@@ -34,8 +35,8 @@ func activeTenantSession(t *testing.T, db *sql.DB, tenant accountsTestTenant) st
 	id, _ := result.LastInsertId()
 	account := strconv.FormatInt(id, 10)
 	token := randomID(32)
-	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,login_method,expires_at,created_at) VALUES (?,?,?,?,?,?,?)`,
-		sha256Hex(token), tenantActor(tenant.id, account), tenant.id, account, loginMethodCID, now.Add(time.Hour), now); err != nil {
+	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,login_method,expires_at,created_at,second_factor_at) VALUES (?,?,?,?,?,?,?,?)`,
+		sha256Hex(token), tenantActor(tenant.id, account), tenant.id, account, loginMethodCID, now.Add(time.Hour), now, now); err != nil {
 		t.Fatalf("insert tenant session: %v", err)
 	}
 	return token

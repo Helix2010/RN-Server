@@ -474,7 +474,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session：platformAdmin（平台会话且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、loginMethod（password|cid）、tenantId（租户会话的租户，平台会话为 null）、account（租户账号：id、displayName、loginName、email、status、boundEmail）、bindRequired"
+            "description": "Session：platformAdmin（平台会话且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、loginMethod（password|cid）、tenantId（租户会话的租户，平台会话为 null）、account（租户账号：id、displayName、loginName、email、status、boundEmail）、bindRequired 租户会话另有 secondFactorUntil（邮箱二次验证的有效期，null=没验过或已过期）。"
           }
         }
       }
@@ -933,6 +933,9 @@
         "responses": {
           "201": {
             "description": "OTA state transition, canary audience change or rollback directive"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -1161,6 +1164,9 @@
           },
           "422": {
             "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint); 租户会话（tenant-console-accounts-and-sso §3.4）：STORAGE_CREDENTIALS_REQUIRED：继承平台存储时不带凭据保存会被拒（不能借平台的密钥换成自己的地址）"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -1268,6 +1274,9 @@
           },
           "503": {
             "description": "STORAGE_UNAVAILABLE (release storage not configured, or an http endpoint in production)"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -1320,6 +1329,9 @@
           },
           "422": {
             "description": "CANARY_AUDIENCE_REQUIRED, CANARY_AUDIENCE_INVALID, CANARY_AUDIENCE_TOO_LARGE, CANARY_INSTALLATION_UNKNOWN or CANARY_AUDIENCE_LOOKUP_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2865,6 +2877,9 @@
           },
           "422": {
             "description": "RELEASE_SIGNER_RETIRED: signerSha256 is a retired tenant signing certificate and can never be registered again"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2909,6 +2924,9 @@
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2957,6 +2975,9 @@
           },
           "500": {
             "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2990,6 +3011,9 @@
           },
           "500": {
             "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -3380,6 +3404,9 @@
           },
           "503": {
             "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -3434,6 +3461,9 @@
           },
           "503": {
             "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -3467,6 +3497,9 @@
           },
           "503": {
             "description": "RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -7069,6 +7102,9 @@
           },
           "503": {
             "description": "STORAGE_MASTER_KEY_REQUIRED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       },
@@ -7097,6 +7133,9 @@
           },
           "404": {
             "description": "IOS_ASC_NOT_FOUND"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -7178,6 +7217,9 @@
           },
           "500": {
             "description": "IOS_DELIVERY_CONFIG_INVALID, IOS_DELIVERY_QUERY_FAILED, IOS_DELIVERY_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -7605,6 +7647,70 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/second-factor/code": {
+      "post": {
+        "summary": "租户会话的邮箱二次验证：给成员登记的邮箱发验证码（设计 tenant-console-accounts-and-sso §4.5）",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{codeToken, expiresAt, resendAfter, email（掩码）}；码 10 分钟、用一次、错 5 次作废，只属于这个会话"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "400": {
+            "description": "SECOND_FACTOR_NOT_APPLICABLE：平台会话不用"
+          },
+          "409": {
+            "description": "SECOND_FACTOR_NO_EMAIL"
+          },
+          "429": {
+            "description": "SECOND_FACTOR_CODE_RATE_LIMITED：每账号 1 分钟 1 次、1 小时 5 次，每 IP 1 小时 20 次"
+          },
+          "502": {
+            "description": "MAIL_SEND_FAILED"
+          },
+          "503": {
+            "description": "MAIL_NOT_CONFIGURED：平台没配发信（不退回不校验）"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/second-factor/verify": {
+      "post": {
+        "summary": "租户会话的邮箱二次验证：提交验证码",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{secondFactorUntil}：这个会话 15 分钟内可以做敏感操作"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "400": {
+            "description": "INVALID_SECOND_FACTOR、SECOND_FACTOR_CODE_INVALID、SECOND_FACTOR_NOT_APPLICABLE"
           }
         }
       }

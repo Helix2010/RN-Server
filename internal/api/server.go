@@ -73,6 +73,8 @@ type server struct {
 	mailTests windowCounter
 	// bindCodes 是统一登录绑定验证码（进程内存，单实例），零值可用
 	bindCodes bindCodeStore
+	// secondFactorCodes：租户会话的邮箱二次验证码（second_factor.go），存法与限流同绑定验证码
+	secondFactorCodes bindCodeStore
 }
 
 type attempt struct {
@@ -229,6 +231,9 @@ func (s *server) routes() *gin.Engine {
 	protected.GET("/auth/cid/bind", s.getPendingCIDBind)
 	protected.POST("/auth/cid/bind/code", s.sendCIDBindCode)
 	protected.POST("/auth/cid/bind/confirm", s.confirmCIDBind)
+	// 租户会话的邮箱二次验证：敏感操作与发起绑定前要 15 分钟内验过（second_factor.go）
+	protected.POST("/auth/second-factor/code", s.sendSecondFactorCode)
+	protected.POST("/auth/second-factor/verify", s.verifySecondFactor)
 	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放；租户账号的会话一律进不来
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin())
@@ -387,6 +392,10 @@ func (s *server) currentTenant(c *gin.Context) {
 }
 
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
+	// sf：敏感操作，租户会话要 15 分钟内通过邮箱二次验证（设计 tenant-console-accounts-and-sso §4.5）。
+	// 范围：签名密钥与签名材料、推送凭据、App Manager Key、发布身份、存储凭据、切换交付方式、
+	// 发版与热更新的放量 / 回滚 / 删除。平台会话不受影响
+	sf := s.requireSecondFactor()
 	group.GET("/overview", s.overview)
 	group.GET("/installations/overview", s.installationOverview)
 	group.GET("/installations", s.listInstallations)
@@ -412,12 +421,12 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/push/outbox", s.listPushOutbox)
 	group.GET("/push/deliveries", s.listPushDeliveries)
 	group.GET("/releases", s.listReleases)
-	group.POST("/releases", s.createReleaseFromArtifact)
+	group.POST("/releases", sf, s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)
-	group.POST("/releases/:id/:action", s.releaseAction)
+	group.POST("/releases/:id/:action", sf, s.releaseAction)
 	// 清理历史产物。不是状态迁移：发布记录一旦删掉就不在升级决策里了，所以正在下发的
 	// 版本删不掉，且必须先清掉建在它上面的 OTA。见 release_purge.go
-	group.DELETE("/releases/:id", s.purgeRelease)
+	group.DELETE("/releases/:id", sf, s.purgeRelease)
 	group.GET("/audit-events", s.listAudits)
 	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
@@ -437,31 +446,31 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/localization/documents", s.updateLocalizationDocuments)
 	group.POST("/localization/publish", s.publishLocalization)
 	group.GET("/release-storage", s.getReleaseStorage)
-	group.PUT("/release-storage", s.updateReleaseStorage)
+	group.PUT("/release-storage", sf, s.updateReleaseStorage)
 	group.GET("/release-storage/cors", s.bucketCORSRequirements)
 	group.POST("/release-storage/test", s.testReleaseStorage)
 	group.GET("/release-identity/android", s.getAndroidReleaseIdentity)
-	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)
+	group.PUT("/release-identity/android", sf, s.updateAndroidReleaseIdentity)
 	group.GET("/release-identity/ios", s.getIOSReleaseIdentity)
-	group.PUT("/release-identity/ios", s.updateIOSReleaseIdentity)
+	group.PUT("/release-identity/ios", sf, s.updateIOSReleaseIdentity)
 	// App Store Connect 接入（模式 A）。没装密钥的租户走模式 B，只填分发入口——
 	// 扫码分发与 App 内更新入口只需要那一个字符串（设计 ios-testflight §4.6）
 	group.GET("/ios/asc-credentials", s.getIOSASCCredentials)
-	group.PUT("/ios/asc-credentials", s.updateIOSASCCredentials)
-	group.DELETE("/ios/asc-credentials", s.deleteIOSASCCredentials)
+	group.PUT("/ios/asc-credentials", sf, s.updateIOSASCCredentials)
+	group.DELETE("/ios/asc-credentials", sf, s.deleteIOSASCCredentials)
 	// 只读同步：拉 build 与测试组，回写公开链接与过期日。提审、开关公开链接、
 	// 增删测试员永远由人在 ASC 上点（§4.6.6）
 	group.POST("/ios/testflight/sync", s.syncIOSTestFlight)
 	// 交付方式：全托管（平台传 TestFlight）/ 自助上传（平台交 .ipa、租户自己传）。
 	// 有没跑完的 iOS 任务时不许切换（ios_delivery.go）
 	group.GET("/ios/delivery", s.getIOSDelivery)
-	group.PUT("/ios/delivery", s.updateIOSDelivery)
+	group.PUT("/ios/delivery", sf, s.updateIOSDelivery)
 	group.GET("/ota/signing-key", s.getOTASigningKey)
-	group.PUT("/ota/signing-key", s.updateOTASigningKey)
-	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)
+	group.PUT("/ota/signing-key", sf, s.updateOTASigningKey)
+	group.POST("/ota/signing-key/generate", sf, s.generateOTASigningKey)
 	// bootstrap 响应签名（N3）。与 OTA 那把分开：共用一把等于把两个信任域焊在一起。
 	group.GET("/bootstrap/signing-key", s.getBootstrapSigningKey)
-	group.POST("/bootstrap/signing-key/generate", s.generateBootstrapSigningKey)
+	group.POST("/bootstrap/signing-key/generate", sf, s.generateBootstrapSigningKey)
 	group.GET("/builds", s.listBuildJobs)
 	group.POST("/builds", s.createBuildJob)
 	group.GET("/builds/:id", s.buildJobDetail)
@@ -487,20 +496,20 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 推送凭据：google-services.json 的服务端另一半，所以挨着 build-config 放。
 	// 两者必须属于同一个 Firebase 项目，视图里直接给出比对结果。
 	group.GET("/push/credentials", s.getPushCredentials)
-	group.PUT("/push/credentials/fcm", s.updatePushCredentialsFCM)
-	group.DELETE("/push/credentials/fcm", s.deletePushCredentialsFCM)
+	group.PUT("/push/credentials/fcm", sf, s.updatePushCredentialsFCM)
+	group.DELETE("/push/credentials/fcm", sf, s.deletePushCredentialsFCM)
 	group.POST("/push/credentials/fcm/test", s.testPushCredentialsFCM)
 	// APNs 的 topic 取自 release.ios 的 bundleId，所以这三条隐含依赖 iOS 发布身份
-	group.PUT("/push/credentials/apns", s.updatePushCredentialsAPNs)
-	group.DELETE("/push/credentials/apns", s.deletePushCredentialsAPNs)
+	group.PUT("/push/credentials/apns", sf, s.updatePushCredentialsAPNs)
+	group.DELETE("/push/credentials/apns", sf, s.deletePushCredentialsAPNs)
 	group.POST("/push/credentials/apns/test", s.testPushCredentialsAPNs)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	// 导入已有密钥（离线工具产出的 v3 文件，高级）
-	group.PUT("/build-keystore", s.saveBuildKeystore)
+	group.PUT("/build-keystore", sf, s.saveBuildKeystore)
 	// 一键生成：记一条生成请求，由主签名闸在本机生成后交回
-	group.POST("/build-keystore/generate", s.generateBuildKeystore)
+	group.POST("/build-keystore/generate", sf, s.generateBuildKeystore)
 	// 导出当前密钥的密文文件（离线恢复用）
-	group.GET("/build-keystore/export", s.exportBuildKeystore)
+	group.GET("/build-keystore/export", sf, s.exportBuildKeystore)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
@@ -510,8 +519,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 热更新修订只能由 kind=ota 的构建任务产出：管理端不再能直接上传热更新包
 	// （设计 android-signing-gate-2026-09-16「热更新」），票据、回传与落修订只在
 	// /v1/build-agent/jobs/:id/ota-* 上
-	group.POST("/ota/releases/:id/:action", s.otaAction)
-	group.DELETE("/ota/releases/:id", s.purgeOTARelease)
+	group.POST("/ota/releases/:id/:action", sf, s.otaAction)
+	group.DELETE("/ota/releases/:id", sf, s.purgeOTARelease)
 	group.POST("/upload-sessions", s.createUploadSession)
 	group.POST("/upload-sessions/cleanup-expired", s.cleanupExpiredUploadSessions)
 	group.GET("/upload-sessions/:id", s.getUploadSession)

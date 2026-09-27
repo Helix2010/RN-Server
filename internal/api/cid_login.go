@@ -405,6 +405,11 @@ func (s *server) startCIDLogin(c *gin.Context) {
 			cidFail(c, "bind_not_allowed")
 			return
 		}
+		// 发起绑定前要 15 分钟内过邮箱二次验证：初始口令泄露时，别人抢不先绑（second_factor.go）
+		if !secondFactorFresh(session, s.now()) {
+			cidFail(c, "second_factor_required")
+			return
+		}
 		flow.SessionHash = session.TokenHash
 		flow.Target = "/"
 	default:

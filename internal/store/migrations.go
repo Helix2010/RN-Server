@@ -88,6 +88,9 @@ var migrations = []migration{
 	{version: 60, name: "tenant_admin_accounts", apply: tenantAdminAccountsMigration},
 	// 管理端会话分平台 / 租户：租户会话记下租户与账号，平台权限不再只看用户名
 	{version: 61, name: "admin_session_tenant", apply: adminSessionTenantMigration},
+	// 租户会话的二次验证（邮箱验证码）：记在会话上，敏感操作要 15 分钟内验过
+	// （设计 tenant-console-accounts-and-sso §4.5，2026-09-27 定为邮箱验证码）
+	{version: 62, name: "admin_session_second_factor", apply: adminSessionSecondFactorMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2203,6 +2206,15 @@ func adminSessionTenantMigration(ctx context.Context, db *sql.DB) error {
 	if err := addIndexIfMissing(ctx, db, "admin_sessions", "ix_session_account",
 		`ALTER TABLE admin_sessions ADD KEY ix_session_account (account_id) COMMENT '停用、重置账号时删掉它的全部会话'`); err != nil {
 		return fmt.Errorf("admin session tenant migration index: %w", err)
+	}
+	return nil
+}
+
+func adminSessionSecondFactorMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "admin_sessions", "second_factor_at",
+		`ALTER TABLE admin_sessions ADD COLUMN second_factor_at DATETIME(3) NULL
+			COMMENT '租户会话最近一次通过邮箱二次验证的时间；敏感操作要在 15 分钟内。NULL=这个会话还没验过。平台会话不用' AFTER login_method`); err != nil {
+		return fmt.Errorf("admin session second factor migration: %w", err)
 	}
 	return nil
 }
