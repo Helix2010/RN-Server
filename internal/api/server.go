@@ -127,7 +127,13 @@ type auditEvent struct {
 	TenantID   string         `json:"tenantId"`
 }
 
+// New 承担全部接口（RoleAll）：不带子命令时与库测用。
 func New(cfg config.Config, storage *store.Store) http.Handler {
+	return NewForRole(cfg, storage, RoleAll)
+}
+
+// NewForRole 只承担这个角色的接口（设计 service-and-console-split-2026-09-27 §3）。
+func NewForRole(cfg config.Config, storage *store.Store, role Role) http.Handler {
 	if cfg.Environment == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -142,16 +148,20 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 		panic(err)
 	}
 	s := &server{cfg: cfg, db: storage.DB, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify, verifyAPNs: pushcreds.VerifyAPNs}
-	return s.routes()
+	return s.routesFor(role)
 }
 
-// routes 挂中间件与全部路由。和 New 分开，是为了让库测能在换掉对象存储等依赖之后
+// routes 挂中间件与全部路由（RoleAll）。和 New 分开，是为了让库测能在换掉对象存储等依赖之后
 // 走一遍真实的路由表（鉴权中间件、任务作用域、超时豁免都在路由上）。
-func (s *server) routes() *gin.Engine {
+func (s *server) routes() *gin.Engine { return s.routesFor(RoleAll) }
+
+// routesFor 只挂这个角色承担的路由（设计 service-and-console-split-2026-09-27 §3.2）。
+// 中间件与 /health 每个角色都有；统一登录与会话接口租户端、平台端各一份（各自的控制台域名上登录）。
+func (s *server) routesFor(role Role) *gin.Engine {
 	cfg := s.cfg
 	r := gin.New()
 	// 不配就谁都不信：ClientIP 取直连对端，而不是任何人都能写的 X-Forwarded-For。
-	// 这同时让下面的登录限流按真实来源计数（在此之前它也是可绕过的）。
+	// 管理密钥的来源限制与各类限流都靠它按真实来源计数。
 	if err := r.SetTrustedProxies(cfg.TrustedProxies); err != nil {
 		panic(err)
 	}
@@ -159,6 +169,24 @@ func (s *server) routes() *gin.Engine {
 	r.Use(recoverPanics(), s.requestContext(), s.databaseTimeout(), s.securityHeaders(), s.cors())
 	r.GET("/health/live", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "live"}) })
 	r.GET("/health/ready", s.ready)
+	if role.serves(RoleApp) {
+		s.registerAppRoutes(r)
+	}
+	if role.serves(RoleTenant) || role.serves(RolePlatform) {
+		protected := s.registerAdminAuthRoutes(r)
+		if role.serves(RolePlatform) {
+			s.registerPlatformRoutes(protected)
+			s.registerMachineRoutes(r)
+		}
+		if role.serves(RoleTenant) {
+			s.registerTenantAdminRoutes(protected)
+		}
+	}
+	return r
+}
+
+// registerAppRoutes：App 用的公开接口（App 端）。
+func (s *server) registerAppRoutes(r *gin.Engine) {
 	r.GET("/openapi.json", func(c *gin.Context) { c.File("contracts/openapi.json") })
 	r.GET("/docs", s.docs)
 	r.GET("/v1/mobile/bootstrap", s.bootstrap)
@@ -204,6 +232,10 @@ func (s *server) routes() *gin.Engine {
 	// 这条路由内部按同一套可见性挑出"现在该给你的那一版"再 302 过去。
 	r.GET("/v1/public/releases/latest/download", s.domainTenantScope(), s.publicLatestReleaseDownload)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
+}
+
+// registerAdminAuthRoutes：统一登录、会话、邮箱二次验证（租户端、平台端各一份），返回要求登录的路由组。
+func (s *server) registerAdminAuthRoutes(r *gin.Engine) *gin.RouterGroup {
 	// 统一登录的回调：认证中心固定回到 <控制台域名>/client/v1/oauth/login，不能自定义
 	// （设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。nginx 把控制台域名的这条路径转过来
 	r.GET(cidCallbackPath, s.domainTenantScope(), s.cidCallback)
@@ -219,6 +251,11 @@ func (s *server) routes() *gin.Engine {
 	// 账号会话的邮箱二次验证：敏感操作前要 15 分钟内验过（second_factor.go）
 	protected.POST("/auth/second-factor/code", s.sendSecondFactorCode)
 	protected.POST("/auth/second-factor/verify", s.verifySecondFactor)
+	return protected
+}
+
+// registerPlatformRoutes：/v1/admin/platform（平台端）。
+func (s *server) registerPlatformRoutes(protected *gin.RouterGroup) {
 	// 平台级路由：不按租户过滤，只对平台管理员开放（可用的平台管理员账号，或 PLATFORM_ADMIN_USERNAMES 里的
 	// 自动化 actor）；租户账号的会话一律进不来。平台管理员账号做写操作要 15 分钟内过二次验证
 	platform := protected.Group("/platform")
@@ -284,6 +321,10 @@ func (s *server) routes() *gin.Engine {
 	platform.GET("/wallet/blocks", s.listPlatformWalletBlocks)
 	platform.POST("/wallet/blocks", s.createPlatformWalletBlock)
 	platform.POST("/wallet/blocks/:id/revoke", s.revokePlatformWalletBlock)
+}
+
+// registerMachineRoutes：打包机、签名闸与新机器注册（平台端）。机器配置的地址是 api.*，nginx 按路径转过来。
+func (s *server) registerMachineRoutes(r *gin.Engine) {
 	// 新机器本机注册：不走机器令牌（此时还没有），靠控制台签发的一次性注册码；按来源 IP 限速。
 	// 安装包下载是流式的，按路由精确豁免数据库超时（exemptRouteFromDatabaseTimeout）
 	setup := r.Group("/v1/machine-setup")
@@ -350,6 +391,10 @@ func (s *server) routes() *gin.Engine {
 	gate.POST("/jobs/:id/complete", s.completeSigning)
 	gate.POST("/jobs/:id/release", s.releaseSigningJob)
 	gate.POST("/jobs/:id/reject", s.rejectSigningJob)
+}
+
+// registerTenantAdminRoutes：按域名认租户的管理接口（租户端）。
+func (s *server) registerTenantAdminRoutes(protected *gin.RouterGroup) {
 	current := protected.Group("")
 	current.Use(s.domainTenantScope(), requireAdminSessionTenant())
 	current.GET("/tenant", s.currentTenant)
@@ -357,7 +402,6 @@ func (s *server) routes() *gin.Engine {
 	// （设计 console-accounts-external-maintenance-2026-09-27）
 	current.GET("/tenant-accounts", s.requirePlatformAdmin(), s.listTenantAccounts)
 	s.registerTenantRoutes(current)
-	return r
 }
 
 // currentTenant 顺带给 publicOrigin：拼给终端用户的链接（发版下载、/app/download 下载页、语言包）要用的源。

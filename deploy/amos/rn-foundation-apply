@@ -37,7 +37,6 @@ AGENT_PREVIOUS=/opt/rn-build-agent/build-agent.prev
 # 构建机冒烟用的身份：执行用户 builder，比正式运行控制进程的 rn-build-agent 权限更小
 # （读不到令牌与出处密钥），也不是 root。冒烟只验"跑得起来"，不需要控制进程的任何东西
 AGENT_USER=builder
-ENV_FILE=/etc/rn-foundation.env
 # 打包机冒烟用的临时目录；非空时退出前删掉
 SMOKE_DIR=""
 trap '[ -z "$SMOKE_DIR" ] || rm -rf "$SMOKE_DIR"' EXIT
@@ -50,26 +49,42 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 exec 9>/var/lib/rn-foundation-deploy/.apply.lock
 flock -w 300 9 || die "另一个部署正在进行，等了 5 分钟还没轮到"
 
-# 端口从配置里读，别在两个地方各写一遍一个会变的数字
-# 一条 awk 搞定，不接管道：`… | head -1` 在 pipefail 下会因为 SIGPIPE 让整个
-# 命令替换返回非零，配上 set -e 就是脚本从中间无声地断掉——这个坑踩过一次了
-app_port() {
-  local port
-  port="$(awk -F= '/^PORT=/{gsub(/[^0-9]/, "", $2); print $2; exit}' "$ENV_FILE" 2>/dev/null || true)"
-  printf '%s' "${port:-13080}"
+# API 按角色拆成三个进程（设计 docs/design/service-and-console-split-2026-09-27.md），同一个二进制。
+# 平台端排第一：打包任务回收与推送派发两个后台任务在它里面
+API_UNITS=(rn-foundation-platform rn-foundation-tenant rn-foundation-app)
+
+# 端口从 unit 的 ExecStart（`rn-server <角色> --port N`）里读，别在两个地方各写一遍。
+# awk 读完整份输出再在 END 里打印，不会让 systemctl 吃 SIGPIPE（`… | head -1` 在 pipefail 下
+# 会让整个命令替换返回非零，配上 set -e 就是脚本从中间无声地断掉——这个坑踩过一次了）
+unit_port() { # $1 = unit
+  systemctl cat "$1" 2>/dev/null |
+    awk '/^ExecStart=/{for (i = 1; i < NF; i++) if ($i == "--port") p = $(i + 1)} END{print p}' || true
 }
 
-wait_ready() { # $1 = 最多等几秒
-  local port deadline
-  port="$(app_port)"
+wait_ready() { # $1 = 最多等几秒；三个进程都就绪才算
+  local deadline unit port
   deadline=$(( $(date +%s) + $1 ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if curl -fsS --max-time 3 "http://127.0.0.1:$port/health/ready" >/dev/null 2>&1; then
-      return 0
+  for unit in "${API_UNITS[@]}"; do
+    port="$(unit_port "$unit")"
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+      log "$unit 的 ExecStart 里读不到 --port"
+      return 1
     fi
-    sleep 2
+    until curl -fsS --max-time 3 "http://127.0.0.1:$port/health/ready" >/dev/null 2>&1; do
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        log "$unit（端口 $port）没有就绪"
+        return 1
+      fi
+      sleep 2
+    done
   done
-  return 1
+}
+
+api_journal() {
+  local unit
+  for unit in "${API_UNITS[@]}"; do
+    journalctl -u "$unit" -n 20 --no-pager -o cat >&2 || true
+  done
 }
 
 apply_server() {
@@ -81,7 +96,7 @@ apply_server() {
 
   log "停服务"
   # 先停扫链再停 API：扫链依赖 API 先就绪，反过来停会多打一轮连接失败的日志
-  systemctl stop rn-foundation-indexer rn-foundation-server || true
+  systemctl stop rn-foundation-indexer "${API_UNITS[@]}" || true
 
   if [ -f "$BINARY" ]; then
     cp -a "$BINARY" "$PREVIOUS"
@@ -101,9 +116,9 @@ apply_server() {
   fi
 
   log "启动"
-  systemctl start rn-foundation-server
+  systemctl start "${API_UNITS[@]}" || true
   if ! wait_ready 90; then
-    journalctl -u rn-foundation-server -n 40 --no-pager -o cat >&2
+    api_journal
     rollback_server "健康检查没通过"
     die "新版本起不来，已回滚二进制"
   fi
@@ -121,7 +136,7 @@ rollback_server() {
   if [ -f "$PREVIOUS" ]; then
     install -m 0755 -o root -g root "$PREVIOUS" "$BINARY"
     rm -f "$PREVIOUS"
-    systemctl start rn-foundation-server || true
+    systemctl restart "${API_UNITS[@]}" || true
     systemctl start rn-foundation-indexer || true
     if wait_ready 60; then
       log "已回到上一版"

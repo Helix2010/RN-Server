@@ -15,7 +15,7 @@ add_header Referrer-Policy        "no-referrer" always;
 add_header X-Content-Type-Options "nosniff"     always;
 add_header X-Frame-Options        "SAMEORIGIN"  always;
 
-# 控制台请求 API 走同源相对路径 /v1/...，这里转给 rn-server。
+# 控制台请求 API 走同源相对路径 /v1/...，这里转给 rn-server 的租户端。
 #
 # ^~ 必须有：下面那条 ~* \.(js|css|png|...)$ 的正则 location 优先于普通前缀，不带 ^~ 的话
 # /v1/.../xxx.png 会被它截走、按静态文件 404。
@@ -25,6 +25,7 @@ location ^~ /v1/ {
     if ($rn_upstream_host = $host) {
         return 500;
     }
+    set $rn_service rn_tenant;
     include /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc;
     # api.* 今天不压 JSON；gzip 会把强 ETag 改成弱 ETag。与跨域时代保持一致
     gzip off;
@@ -34,13 +35,29 @@ location ^~ /v1/ {
     proxy_hide_header Referrer-Policy;
 }
 
+# 过渡期：平台管理员还在租户控制台上做平台维护，这些页面调的 /v1/admin/platform/ 归平台端。会话在库里，
+# 两个进程都认。平台控制台（platform.anyfun.win）上线、租户端不再认平台会话之后，这一段删掉
+# （RN-Server 设计 service-and-console-split-2026-09-27 §6）。其余与上面的 /v1/ 一样
+location ^~ /v1/admin/platform/ {
+    if ($rn_upstream_host = $host) {
+        return 500;
+    }
+    set $rn_service rn_platform;
+    include /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc;
+    gzip off;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+}
+
 # 统一登录的回调：认证中心固定把浏览器送回 <控制台域名>/client/v1/oauth/login，不能自定义
-# （RN-Server 设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。与 /v1/ 一样转给 rn-server。
+# （RN-Server 设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。与 /v1/ 一样转给租户端。
 # 用 = 精确匹配：/client/ 下别的路径仍然落到下面的 SPA。
 location = /client/v1/oauth/login {
     if ($rn_upstream_host = $host) {
         return 500;
     }
+    set $rn_service rn_tenant;
     include /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc;
     proxy_hide_header X-Frame-Options;
     proxy_hide_header X-Content-Type-Options;

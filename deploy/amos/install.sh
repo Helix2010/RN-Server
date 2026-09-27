@@ -7,8 +7,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-for f in rn-foundation-server.service rn-foundation-indexer.service \
-         rn-foundation-migrate.service \
+for f in rn-foundation-app.service rn-foundation-tenant.service rn-foundation-platform.service \
+         rn-foundation-indexer.service rn-foundation-migrate.service \
          rn-foundation.env.example nginx-rn-foundation.conf \
          nginx-snippet-api.inc nginx-snippet-api-proxy.inc nginx-snippet-console.inc; do
   [ -f "$f" ] || { echo "缺少 $f" >&2; exit 1; }
@@ -31,9 +31,10 @@ else
 fi
 
 echo "== systemd =="
-sudo install -m 0644 rn-foundation-server.service  /etc/systemd/system/
-sudo install -m 0644 rn-foundation-indexer.service /etc/systemd/system/
-sudo install -m 0644 rn-foundation-migrate.service /etc/systemd/system/
+# API 是同一个二进制按角色起的三个进程（设计 docs/design/service-and-console-split-2026-09-27.md）
+for unit in rn-foundation-app rn-foundation-tenant rn-foundation-platform rn-foundation-indexer rn-foundation-migrate; do
+  sudo install -m 0644 "$unit.service" /etc/systemd/system/
+done
 sudo systemctl daemon-reload
 
 echo "== 证书占位 =="
@@ -73,10 +74,10 @@ cat <<'NEXT'
 装好了。接下来按顺序：
 
   1. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*（MYSQL_DSN 一行、STORAGE_MASTER_KEY、
-     两个管理端凭据；ADMIN_API_KEY 用 openssl rand -hex 32 生成。构建机与签名闸的令牌
+     管理密钥 ADMIN_API_KEY 与它的 actor；ADMIN_API_KEY 用 openssl rand -hex 32 生成。构建机与签名闸的令牌
      不在这里，在控制台「打包机与签名闸」新建机器时签发）
      填完跑 `rn-server config` 核对一遍——它打印实际生效的值，机密只显示长度
   2. 从开发机跑 deploy.sh，把二进制和两份控制台产物送上来
-  3. sudo systemctl enable --now rn-foundation-server rn-foundation-indexer
+  3. sudo systemctl enable --now rn-foundation-platform rn-foundation-tenant rn-foundation-app rn-foundation-indexer
   4. CERTBOT_EMAIL=<邮箱> ./setup-tls.sh 申请证书并打开自动续期
 NEXT

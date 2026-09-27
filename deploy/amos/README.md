@@ -47,9 +47,21 @@
 | `/usr/local/sbin/rn-foundation-apply` | 特权收口脚本，换二进制／换控制台／换打包机都走它（`server` / `admin <slug>` / `build-agent`） |
 | `/var/lib/rn-foundation-deploy/incoming/` | 部署暂存目录，属 `rndeploy` |
 
-三个 systemd unit：`rn-foundation-server`（监听 `127.0.0.1:13080`）、
-`rn-foundation-indexer`（不监听任何端口）、`rn-foundation-migrate`（oneshot，
-只在部署时被调用）。
+API 是同一个二进制按角色起的三个进程，共用 `/etc/rn-foundation.env` 与同一个库
+（设计 `docs/design/service-and-console-split-2026-09-27.md`，2026-09-27 起）：
+
+| unit | 监听 | 承担 |
+| --- | --- | --- |
+| `rn-foundation-platform` | `127.0.0.1:13080` | `/v1/admin/platform`、打包机与签名闸（`/v1/build-agent`、`/v1/signer`、`/v1/machine-setup`）；打包任务回收、推送派发两个后台任务 |
+| `rn-foundation-app` | `127.0.0.1:13081` | App 用的公开接口：`/v1/mobile`、`/v1/public`、`/v1/ota`、`/app`、`/.well-known` |
+| `rn-foundation-tenant` | `127.0.0.1:13082` | 租户控制台的 `/v1/admin`（平台部分除外）与统一登录 |
+
+端口写在各自 unit 的 `ExecStart`（`rn-server <角色> --port N`）里。平台端沿用 13080，是因为签名闸直连
+`http://127.0.0.1:13080`。另有 `rn-foundation-indexer`（扫链，不监听任何端口）与 `rn-foundation-migrate`
+（oneshot，只在部署时被调用）。
+
+**用管理密钥直连端口的自动化**（比如发 OTA）：租户接口 `/v1/admin/*` 连 13082、带 `Host: api.<租户域名>`；
+平台接口 `/v1/admin/platform/*` 连 13080。
 
 证书两套，按域名的暴露方式分：
 
@@ -62,18 +74,23 @@
 
 | 域名 | 租户 | 由谁服务 | 公网能否到本机 443 |
 | --- | --- | --- | --- |
-| `api.predict.kim` | 100000002 | nginx 反代到 `127.0.0.1:13080` | 能 |
+| `api.predict.kim` | 100000002 | nginx 反代：机器接口到平台端，其余到 App 端 | 能 |
 | `console.predict.kim` | 100000002 | nginx 直接发静态文件 | 能 |
-| `api.any123.top` | 100000003 | nginx 反代到 `127.0.0.1:13080` | **不可达** |
+| `api.any123.top` | 100000003 | 同上 | **不可达** |
 | `console.any123.top` | 100000003 | nginx 直接发静态文件 | **终止在 206.223.224.29**，那台服务的是 `cca.cryptostack.ai` 的证书 |
 
 四行已写进 `tenant_domain`（2026-09-12）。any123.top 两个域名的入站链路还没通，
 证书里因此只有 predict.kim 那两个——一个域名验不过整张证书都签不出来，不能硬凑。
 链路打通后重跑 `setup-tls.sh`，它会自己探测并把新域名加进来。
 
-**这台机器的入站只有 443**，没有 80，也没有 13080。所以 nginx 直接听 443，应用在
-`127.0.0.1:13080`（`BIND_ADDRESS=127.0.0.1`，不写的话 Go 会绑所有网卡，裸机没有
-Docker 的端口映射兜底，13080 就绕过 nginx 直接对外了）。
+**这台机器的入站只有 443**，没有 80，也没有 13080–13082。所以 nginx 直接听 443，应用的三个进程在
+回环上（`BIND_ADDRESS=127.0.0.1`，不写的话 Go 会绑所有网卡，裸机没有
+Docker 的端口映射兜底，这几个端口就绕过 nginx 直接对外了）。
+
+nginx 按路径分给三个进程（`nginx-rn-foundation.conf` 顶上的三个 `upstream`，各 location 用
+`set $rn_service` 选）：`api.*` 上机器接口到平台端、其余到 App 端，所以 App 端碰不到管理接口；`console.*`
+的 `/v1/` 与统一登录回调到租户端。过渡期平台管理员还在租户控制台上做平台维护，`console.*` 的
+`/v1/admin/platform/` 到平台端——平台控制台（platform.anyfun.win）上线后这一段删掉。
 
 **租户是按 Host 头认的**（`tenant_domain` 表）。所以反代必须原样传 `$host`；
 amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0.0.1:13080`，
@@ -82,7 +99,7 @@ amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0
 
 控制台**只有一份产物**（`/opt/rn-foundation/admin/console`），三个 `console.*` 的 `root` 都指向它。
 控制台请求 API 走同源相对路径 `/v1/...`，由 `nginx-snippet-console.inc` 里的 `location ^~ /v1/` 转给
-rn-server，转发时 Host 按 `nginx-rn-foundation.conf` 顶上的 `map` 改写成这个租户的 `api.*`——后端认租户、
+租户端，转发时 Host 按 `nginx-rn-foundation.conf` 顶上的 `map` 改写成这个租户的 `api.*`——后端认租户、
 拼下载地址与新机器安装命令时看到的仍是 `api.*`。给终端用户的链接由服务端在 `GET /v1/admin/tenant` 的
 `publicOrigin` 里告诉控制台。设计见 RN-Admin `docs/design/console-single-build-same-origin-2026-09-25.md`。
 （2026-09-25 之前是一个租户一份产物、API 地址编进包里，控制台跨域访问 `api.*`。）
@@ -120,7 +137,7 @@ ssh amos 'cd ~/rn-foundation-deploy && ./install.sh'
 
 # 3. 填 /etc/rn-foundation.env 里的 CHANGE_ME_*
 #    MYSQL_DSN 一行（user:password@tcp(host:port)/database?params）、STORAGE_MASTER_KEY、
-#    与 ADMIN_*。ADMIN_API_KEY 另生成：openssl rand -hex 32。构建机与签名闸的令牌不在这里，
+#    与 ADMIN_API_KEY（另生成：openssl rand -hex 32）。构建机与签名闸的令牌不在这里，
 #    在控制台「打包机与签名闸」新建机器时签发（只显示一次）
 #    填完 `rn-server config` 核对：它打印实际生效的值并标出哪些来自 env
 
@@ -128,7 +145,7 @@ ssh amos 'cd ~/rn-foundation-deploy && ./install.sh'
 ./deploy/amos/deploy.sh
 
 # 5. 开机自启
-ssh amos 'sudo systemctl enable --now rn-foundation-server rn-foundation-indexer'
+ssh amos 'sudo systemctl enable --now rn-foundation-platform rn-foundation-tenant rn-foundation-app rn-foundation-indexer'
 
 # 6. 证书与自动续期。先用测试环境验链路，再签正式的
 ssh amos 'cd ~/rn-foundation-deploy && CERTBOT_EMAIL=<邮箱> STAGING=1 ./setup-tls.sh'
@@ -163,6 +180,27 @@ nginx 配置里的证书路径指向软链接 `/etc/nginx/ssl/rn-foundation`：�
 的判成能用。探不到的域名直接排除在证书之外——一个域名验不过，整张证书都签不出来。
 
 先用 `STAGING=1` 跑一遍验链路：正式环境对失败有频率限制，测试环境没有。
+
+## 从一个进程切成三个（一次性，2026-09-27）
+
+顺序不能反：
+
+1. 合并之后 CI 先把新二进制部署上去。这时 amos 上还是旧的 `rn-foundation-apply` 和 `rn-foundation-server`：
+   新二进制不带子命令时承担全部接口，行为和原来一样。
+2. 把 `deploy/amos` 送上 amos，以 root 跑 `service-split-switch.sh`。它会：
+   - 备份旧 unit、`rn-foundation-apply`、nginx 配置；
+   - 拿部署锁，装三个 unit 与新的 `rn-foundation-apply`（sudoers 不变，不用重跑 `setup-ci-deploy.sh`）；
+   - 停旧进程、起三个新进程、换 nginx，经 nginx 逐项核对分流；
+   - 核对都过了才删旧 unit，任何一步失败都自动退回。
+
+   先核对二进制：旧二进制不认角色子命令，会在 13080 上起全量进程，三个 unit 抢同一个端口。
+3. 出问题要退回：`sudo bash service-split-switch.sh --rollback <备份目录>`。
+4. 稳定之后把这个脚本从仓库删掉。
+
+```bash
+scp -r deploy/amos amos:~/rn-foundation-split
+ssh -t amos 'sudo bash ~/rn-foundation-split/service-split-switch.sh'
+```
 
 ## 日常更新
 
@@ -319,7 +357,7 @@ ClientHello，一定被丢，会得出「443 完全不通」的错误结论。�
 里面的 `location` 不在 `server` 块里，nginx 直接起不来。
 
 **`BIND_ADDRESS` 不能省。** 应用默认绑 `*:PORT`。Docker 部署时端口映射替我们限制
-了暴露面，裸机没有这层，不写的话 13080 绕过 nginx 直接对外，TLS 和它上面的一切
+了暴露面，裸机没有这层，不写的话 13080–13082 绕过 nginx 直接对外，TLS 和它上面的一切
 都白设。
 
 **`.env` 里含 `$` 的值要加单引号。** 口令、DSN 里都可能带 `$`。systemd 读

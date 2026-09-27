@@ -88,5 +88,6 @@ admin)  build_admin;  ship_admin ;;
 esac
 
 echo "== 健康检查 =="
-ssh "$HOST" 'systemctl is-active rn-foundation-server rn-foundation-indexer | tr "\n" " "; echo
-  curl -fsS http://127.0.0.1:13080/health/ready && echo'
+# 平台端 13080、App 端 13081、租户端 13082（端口写在各自 unit 的 ExecStart 里）
+ssh "$HOST" 'systemctl is-active rn-foundation-platform rn-foundation-tenant rn-foundation-app rn-foundation-indexer | tr "\n" " "; echo
+  for port in 13080 13081 13082; do curl -fsS "http://127.0.0.1:$port/health/ready" && echo; done'

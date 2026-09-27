@@ -1,0 +1,52 @@
+# RN-Foundation API 的一个角色（设计 docs/design/service-and-console-split-2026-09-27.md）。
+# 同一个二进制按角色起三个进程：rn-foundation-app、rn-foundation-tenant、rn-foundation-platform，
+# 共用同一份配置与同一个库。端口写在 ExecStart 的 --port 里，不能用 Environment=PORT=：
+# EnvironmentFile 里的 PORT 会覆盖它，三个进程就会抢同一个端口。
+#
+# App 端：/v1/mobile、/v1/public、/v1/ota、/app、/.well-known。
+#
+# 与打包机代理同一套部署规范：程序在 /opt，配置在
+# /etc 下 0600，systemd 拉起，不引入 Docker。
+#
+#   /opt/rn-foundation/rn-server        程序本体
+#   /etc/rn-foundation.env              配置，0600 root，含数据库口令
+#   /var/lib/rn-foundation/             状态（当前只有临时文件）
+#
+# **开发阶段这台机器同时是构建机和签名闸（主、备）所在的机器。** Android 签名密钥的
+# 密文（build.keystore）在这个进程能读到的数据库里，解开它的私钥在签名闸的状态目录
+# /var/lib/rn-signer-a|b 里（ADR-0019）；构建机的令牌与出处密钥在 /etc/rn-build-agent.env、
+# /var/lib/rn-build-agent 里。两半原本应分在不同机器上，同机之后，这个进程的一次 RCE 加一次
+# 提权就能把两半凑齐。下面的 InaccessiblePaths 挡住的是同机非 root 的那条路径，挡不住提权
+# ——真要恢复这条边界，上生产时得把签名闸与构建机挪到各自的机器上。
+[Unit]
+Description=RN Foundation API（App 端）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rnfoundation
+Group=rnfoundation
+EnvironmentFile=/etc/rn-foundation.env
+WorkingDirectory=/opt/rn-foundation
+ExecStart=/opt/rn-foundation/rn-server app --port 13081
+Restart=always
+RestartSec=10
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 构建机的东西对这个进程一律不可见
+InaccessiblePaths=/etc/rn-build-agent.env /var/lib/rn-build-agent /opt/rn-build-agent /var/cache/rn-build-agent
+# 签名闸（deploy/signer/）的配置、状态、运行时目录、检查进程 socket 与程序对这个进程同样不可见。
+# 带 - 的路径不存在时跳过：/run 下的目录与 socket 只有在本服务启动时已经存在才会被遮住，
+# 它们自身的属主与 0700/0600 权限仍是主防线，这里是纵深防御
+InaccessiblePaths=-/etc/rn-signer-a.env -/etc/rn-signer-b.env -/var/lib/rn-signer-a -/var/lib/rn-signer-b -/run/rn-signer-a -/run/rn-signer-b -/run/rn-signer-a-check.sock -/run/rn-signer-b-check.sock -/opt/rn-signer
+ReadWritePaths=/var/lib/rn-foundation
+
+[Install]
+WantedBy=multi-user.target

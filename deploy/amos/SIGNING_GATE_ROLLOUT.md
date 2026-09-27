@@ -455,7 +455,7 @@ sudo -u rn-signer-b /opt/rn-signer/bin/signer trust-peer --peer amos-signer-a --
 
 ## 6. 部署后核对清单
 
-- [ ] `systemctl is-active` 签名闸、构建机、`rn-foundation-server`、`rn-foundation-indexer` 全部 active
+- [ ] `systemctl is-active` 签名闸、构建机、API 的三个进程（`rn-foundation-platform`、`rn-foundation-tenant`、`rn-foundation-app`）、`rn-foundation-indexer` 全部 active
 - [ ] `sudo -u builder ls /var/lib/rn-signer-a` 被拒；`sudo -u builder ls /var/lib/rn-build-agent` 被拒
 - [ ] 控制台所有机器“已接受”；主签名闸路由主、本机角色主；本机信任提示为空
 - [ ] 两个租户签名密钥区“就绪”，恢复收件人里有恢复公钥
