@@ -35,8 +35,8 @@ func activeTenantSession(t *testing.T, db *sql.DB, tenant accountsTestTenant) st
 	id, _ := result.LastInsertId()
 	account := strconv.FormatInt(id, 10)
 	token := randomID(32)
-	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,idp_subject,login_method,expires_at,created_at,second_factor_at) VALUES (?,?,?,?,?,?,?,?,?)`,
-		sha256Hex(token), tenantActor(tenant.id, account), tenant.id, account, subject, loginMethodCID, now.Add(time.Hour), now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,idp_subject,expires_at,created_at,second_factor_at) VALUES (?,?,?,?,?,?,?,?)`,
+		sha256Hex(token), tenantActor(tenant.id, account), tenant.id, account, subject, now.Add(time.Hour), now, now); err != nil {
 		t.Fatalf("insert tenant session: %v", err)
 	}
 	return token

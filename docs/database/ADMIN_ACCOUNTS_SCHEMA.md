@@ -9,7 +9,7 @@
 | 初稿里拟新增 | 处理 | 理由 |
 | --- | --- | --- |
 | `tenant_admin_accounts` | **新建**（迁移 60） | 「控制台上的人」是新实体：一个租户多个人，登录时要按 (租户, 统一认证账号) 查人，要唯一约束与状态；`app_configs` 一键一行的 JSON 承载不了 |
-| `tenant_admin_identities` 外部身份表 | 取消，合并进账号表 | 一个账号只对应一个外部身份：`idp` + `idp_subject` 两列加唯一键即可 |
+| `tenant_admin_identities` 外部身份表 | 取消，合并进账号表 | 一个账号只对应一个外部身份：`idp_subject` 一列加唯一键即可（迁移 64 起只有统一认证一种，`idp` 列删掉） |
 | 登录流程临时状态（state、PKCE） | 取消，用加密 Cookie | 10 分钟、一次性、只有发起它的浏览器用；`secretbox` 加密后放进 Cookie，不落库 |
 | 二次验证码 | 取消，放进程内存 | 10 分钟、一次性、输错 5 次作废；RN-Server 单实例，重启后重发即可（`second_factor.go`） |
 | 发信账号 | 复用 `app_configs`，`tenant_id=0`、键 `mail.smtp` | 平台级一份；口令用 `secretbox` 加密（ADR-0022） |
@@ -31,15 +31,14 @@
 | `tenant_key` | BIGINT UNSIGNED 生成列 | 数据库 | `IFNULL(tenant_id, 0)`，只给唯一键用（MySQL 唯一索引不比较 NULL） |
 | `display_name` | VARCHAR(120)，默认 `''` | 外部系统 | 显示名，也用在二次验证邮件里（空串时用邮箱） |
 | `email` | VARCHAR(255) | 外部系统 | **二次验证码发到这里**，必须是本人能收信的邮箱；不唯一、不作身份依据。CHECK `ck_tenant_admin_email`（`LIKE '_%@_%._%'`） |
-| `idp` | VARCHAR(32)，默认 `chainup-cid` | 外部系统（可不写） | 外部身份源 |
 | `idp_subject` | VARCHAR(120) | 外部系统 | 统一认证 userinfo 的 `username`（账号 uuid，**小写**）。CHECK `ck_tenant_admin_subject`（区分大小写的 uuid 正则）。改了它就是换了人，旧会话随即失效 |
 | `status` | VARCHAR(16)，默认 `active` | 外部系统 | `active` / `disabled`，CHECK `ck_tenant_admin_status` |
 | `created_by` | VARCHAR(120)，默认 `''` | 外部系统（可不写） | 谁分配的，只用于显示 |
-| `created_at` / `updated_at` | DATETIME(3)，默认当前时间 | 数据库 | `updated_at` 行被改时自动更新；RN 写 `last_login_at` 时不动它 |
+| `created_at` | DATETIME(3)，默认当前时间 | 外部系统（可不写） | 分配时刻，列表里显示 |
 | `last_login_at` | DATETIME(3) NULL | RN | 最近一次统一登录成功的时刻 |
 
-唯一键：`uq_tenant_admin_idp (tenant_key, idp, idp_subject)`——同一个统一认证账号在一个租户里最多一条，平台管理员里最多一条；可以分别是多个租户的成员。
-索引：`ix_tenant_admin_subject (idp, idp_subject)`（回调按统一认证账号查出全部记录）、`ix_tenant_admin_tenant (tenant_id, status)`。
+唯一键：`uq_tenant_admin_subject (idp_subject, tenant_key)`——同一个统一认证账号在一个租户里最多一条，平台管理员里最多一条；可以分别是多个租户的成员。账号 id 在前，回调按它查出全部记录也走这个索引。
+索引：`ix_tenant_admin_tenant (tenant_id, status)`（成员列表）。迁移 64 删掉了 RN 不再读的列：`login_name`、`password_hash`、`password_expires_at`、`idp_email`、`bound_at`、`idp`（恒为 `chainup-cid`）、`updated_at`。
 
 登录规则（`cid_login.go` `accountForLogin`）：同时有平台记录与任何租户记录 → 拒绝（`cidError=identity_conflict`，记日志）；只有平台记录 → 平台会话；
 有当前域名租户的记录 → 租户会话；其余 → `no_access`；选中的记录不是 `active` → `disabled`。不自动开户。
@@ -52,10 +51,11 @@
 | 列 | 说明 |
 | --- | --- |
 | `tenant_id` | 租户会话的租户；NULL=平台会话（平台管理员账号，或环境变量里的管理员账号） |
-| `account_id` | 会话的账号（租户成员或平台管理员）；NULL=环境变量里的管理员账号。索引 `ix_session_account` |
+| `account_id` | 会话的账号（租户成员或平台管理员）；NULL=环境变量里的管理员账号 |
 | `idp_subject`（迁移 64） | 登录时账号的统一认证账号 id；每个请求核对账号当前的 `idp_subject`，对不上就当没登录。迁移时现有账号会话已回填；NULL=环境变量账号 |
-| `login_method` | `cid`=统一登录；`password`=环境变量账号（过渡期）；NULL=迁移之前的会话，按 `password` 处理 |
 | `second_factor_at`（迁移 62） | 账号会话最近一次通过邮箱二次验证的时间；敏感操作要在 15 分钟内（ADR-0023），平台管理员账号的平台级写操作也要。NULL=这个会话还没验过；环境变量账号不用 |
+
+迁移 64 删掉了 `login_method` 列（账号会话与环境变量账号靠 `account_id` 区分）与索引 `ix_session_account`（只给已删掉的停用、重置接口用）。
 
 鉴权：租户会话只在请求域名属于同一个租户时有效（否则当没登录）；平台管理员账号的会话在任何控制台域名上有效；每个请求回表，账号要是 `active`、按会话类型查得到、`idp_subject` 不变；租户会话永远不是平台管理员。
 

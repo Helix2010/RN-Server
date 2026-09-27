@@ -93,8 +93,8 @@ func TestDBSecondFactor(t *testing.T) {
 	})
 	adminToken := randomID(32)
 	now := time.Now().UTC()
-	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,account_id,idp_subject,login_method,expires_at,created_at) VALUES (?,?,?,?,?,?,?)`,
-		sha256Hex(adminToken), platformActor(adminID), adminID, adminSubject, loginMethodCID, now.Add(time.Hour), now); err != nil {
+	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,account_id,idp_subject,expires_at,created_at) VALUES (?,?,?,?,?,?)`,
+		sha256Hex(adminToken), platformActor(adminID), adminID, adminSubject, now.Add(time.Hour), now); err != nil {
 		t.Fatal(err)
 	}
 	platformAccount := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: adminToken}}

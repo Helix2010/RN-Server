@@ -90,8 +90,8 @@ func TestDBPlatformAccounts(t *testing.T) {
 			t.Fatalf("login callback redirected to %s", got)
 		}
 		view := root.mustCode(t, root.do("GET", "/v1/admin/auth/session", nil, nil), 200)
-		if view["platformAdmin"] != true || view["tenantId"] != nil || view["loginMethod"] != loginMethodCID ||
-			view["secondFactorUntil"] != nil || object(view["account"])["scope"] != scopePlatform {
+		if view["platformAdmin"] != true || view["tenantId"] != nil || view["actorId"] != platformActor(rootID) || view["secondFactorUntil"] != nil ||
+			object(view["account"])["id"] != rootID || object(view["account"])["email"] != rootEmail {
 			t.Fatalf("platform cid session = %v", view)
 		}
 		elsewhere := newBrowser(tenantA)
@@ -116,7 +116,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 	t.Run("平台管理员只有只读列表", func(t *testing.T) {
 		list := root.mustCode(t, root.do("GET", "/v1/admin/platform/accounts", nil, nil), 200)
 		items, _ := list["items"].([]any)
-		if len(items) != 1 || object(items[0])["id"] != rootID || object(items[0])["subject"] != rootSubject || object(items[0])["tenantId"] != nil {
+		if len(items) != 1 || object(items[0])["id"] != rootID || object(items[0])["subject"] != rootSubject || object(items[0])["status"] != accountActive {
 			t.Fatalf("platform accounts = %v", list)
 		}
 		markVerified(root)
@@ -147,7 +147,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 	})
 
 	t.Run("停用平台记录：会话下一个请求就失效，登录报停用", func(t *testing.T) {
-		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status=? WHERE id=?`, accountDisabled, rootID); err != nil {
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status='disabled' WHERE id=?`, rootID); err != nil {
 			t.Fatal(err)
 		}
 		wantProblem(t, root.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")

@@ -50,17 +50,14 @@ var cidHTTPClient = cid.DefaultHTTPClient()
 // cidSubjectPattern：认证中心的账号 id 是 uuid。对不上就拒绝，不猜——换了格式要先看清楚再放行。
 var cidSubjectPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
-// cidIdentity 把 userinfo 规范成我们存的样子：账号 id 统一小写；邮箱只作显示与发信，过长就不要。
+// cidSubject 从 userinfo 取统一认证账号 id，统一成小写（表里存的样子，CHECK 只收小写 uuid）。
+// userinfo 里的邮箱不用：二次验证发到外部系统写在账号记录里的邮箱。
 // SDK 只挡空白与控制字符，uuid 这条是 RN 自己的要求。错误里不带对方给的值。
-func cidIdentity(info *cid.User) (cid.User, error) {
+func cidSubject(info *cid.User) (string, error) {
 	if info == nil || !cidSubjectPattern.MatchString(info.Subject) {
-		return cid.User{}, errors.New("unified login returned an account id that is not a uuid")
+		return "", errors.New("unified login returned an account id that is not a uuid")
 	}
-	email := strings.TrimSpace(info.Email)
-	if len(email) > 255 {
-		email = ""
-	}
-	return cid.User{Subject: strings.ToLower(info.Subject), Email: email}, nil
+	return strings.ToLower(info.Subject), nil
 }
 
 func cidSecretAAD() string            { return "auth-cid:client-secret" }
@@ -461,16 +458,16 @@ func (s *server) cidCallback(c *gin.Context) {
 		return
 	}
 	info, err := client.UserInfo(ctx, exchanged.AccessToken)
-	var user cid.User
+	var subject string
 	if err == nil {
-		user, err = cidIdentity(info)
+		subject, err = cidSubject(info)
 	}
 	if err != nil {
 		slog.Warn("unified login userinfo failed", "error", err, "tenant", tenantID(c))
 		cidFail(c, "userinfo")
 		return
 	}
-	accounts, err := s.accountsBySubject(ctx, user.Subject)
+	accounts, err := s.accountsBySubject(ctx, subject)
 	if err != nil {
 		cidFail(c, "internal")
 		return
@@ -481,14 +478,14 @@ func (s *server) cidCallback(c *gin.Context) {
 		for _, a := range accounts {
 			ids = append(ids, a.Scope+":"+a.ID)
 		}
-		slog.Warn("unified login refused: the account is both a platform administrator and a tenant member", "subject", user.Subject, "accounts", ids, "tenant", tenantID(c))
+		slog.Warn("unified login refused: the account is both a platform administrator and a tenant member", "subject", subject, "accounts", ids, "tenant", tenantID(c))
 	}
 	if refused != "" {
 		cidFail(c, refused)
 		return
 	}
 	// 平台管理员的会话不属于任何租户（tenant_id 为 NULL），在任何控制台域名上都有效
-	_, token, err := s.createAdminSession(ctx, acc.actor(), acc.TenantID, acc.ID, acc.IDPSubject, loginMethodCID)
+	_, token, err := s.createAdminSession(ctx, acc.actor(), acc.TenantID, acc.ID, acc.IDPSubject)
 	if err != nil {
 		cidFail(c, "internal")
 		return

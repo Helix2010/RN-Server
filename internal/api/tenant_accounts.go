@@ -18,13 +18,11 @@ import (
 // 只读列表，只给平台管理员看。
 
 const (
-	accountActive   = "active"
-	accountDisabled = "disabled"
+	// accountActive 是能登录的状态；另一个状态 disabled 由外部系统写，RN 只认 active（表上有 CHECK）
+	accountActive = "active"
 
 	scopeTenant   = "tenant"
 	scopePlatform = "platform"
-
-	idpChainupCID = "chainup-cid"
 )
 
 type tenantAccount struct {
@@ -33,16 +31,14 @@ type tenantAccount struct {
 	TenantID    string // 平台管理员为空
 	DisplayName string
 	Email       string
-	IDP         string
 	IDPSubject  string
 	Status      string
 	CreatedBy   string
 	CreatedAt   time.Time
-	UpdatedAt   time.Time
 	LastLoginAt *time.Time
 }
 
-const tenantAccountColumns = `id,scope,tenant_id,display_name,email,idp,idp_subject,status,created_by,created_at,updated_at,last_login_at`
+const tenantAccountColumns = `id,scope,tenant_id,display_name,email,idp_subject,status,created_by,created_at,last_login_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -50,8 +46,8 @@ func scanTenantAccount(row rowScanner) (*tenantAccount, error) {
 	var acc tenantAccount
 	var tenant sql.NullString
 	var lastLogin sql.NullTime
-	if err := row.Scan(&acc.ID, &acc.Scope, &tenant, &acc.DisplayName, &acc.Email, &acc.IDP, &acc.IDPSubject,
-		&acc.Status, &acc.CreatedBy, &acc.CreatedAt, &acc.UpdatedAt, &lastLogin); err != nil {
+	if err := row.Scan(&acc.ID, &acc.Scope, &tenant, &acc.DisplayName, &acc.Email, &acc.IDPSubject,
+		&acc.Status, &acc.CreatedBy, &acc.CreatedAt, &lastLogin); err != nil {
 		return nil, err
 	}
 	acc.TenantID = tenant.String
@@ -115,32 +111,22 @@ func isoPointer(t *time.Time) any {
 	return iso(*t)
 }
 
-// sessionView 是会话接口里给本人看的那一份：不带统一认证的账号 id。
+// sessionView 是会话接口里给本人看的那一份（控制台右上角用）：不带统一认证的账号 id。
 func (a *tenantAccount) sessionView() gin.H {
-	return gin.H{
-		"id":          a.ID,
-		"scope":       a.Scope,
-		"displayName": a.DisplayName,
-		"email":       a.Email,
-		"status":      a.Status,
-	}
+	return gin.H{"id": a.ID, "displayName": a.DisplayName, "email": a.Email}
 }
 
-// adminView 是只读列表给平台管理员看的那一份。
+// adminView 是只读列表给平台管理员看的那一份。平台管理员与租户成员各有各的接口，scope、租户不用再给。
 func (a *tenantAccount) adminView() gin.H {
 	return gin.H{
 		"id":          a.ID,
-		"scope":       a.Scope,
-		"tenantId":    nullableString(a.TenantID),
 		"displayName": a.DisplayName,
 		"email":       a.Email,
-		"idp":         a.IDP,
 		"subject":     a.IDPSubject,
 		"status":      a.Status,
 		"lastLoginAt": isoPointer(a.LastLoginAt),
 		"createdBy":   a.CreatedBy,
 		"createdAt":   iso(a.CreatedAt),
-		"updatedAt":   iso(a.UpdatedAt),
 	}
 }
 
@@ -166,10 +152,10 @@ func platformAccountByID(ctx context.Context, db querier, id string) (*tenantAcc
 		`SELECT `+tenantAccountColumns+` FROM tenant_admin_accounts WHERE id=? AND scope=? LIMIT 1`, id, scopePlatform))
 }
 
-// accountsBySubject 取这个统一认证账号在平台与各租户的全部记录（ix_tenant_admin_subject），回调据此认人。
+// accountsBySubject 取这个统一认证账号在平台与各租户的全部记录（uq_tenant_admin_subject），回调据此认人。
 func (s *server) accountsBySubject(ctx context.Context, subject string) ([]*tenantAccount, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+tenantAccountColumns+` FROM tenant_admin_accounts WHERE idp=? AND idp_subject=? ORDER BY id`, idpChainupCID, subject)
+		`SELECT `+tenantAccountColumns+` FROM tenant_admin_accounts WHERE idp_subject=? ORDER BY id`, subject)
 	if err != nil {
 		return nil, err
 	}
@@ -185,12 +171,11 @@ func (s *server) accountsBySubject(ctx context.Context, subject string) ([]*tena
 	return accounts, rows.Err()
 }
 
-// touchTenantAccountLogin 写最近登录时间。显式写回 updated_at：它表示「外部系统最近一次改这一行」，
-// 不该被 RN 的登录顶掉（不写的话 ON UPDATE 会自动改它）。
+// touchTenantAccountLogin 写最近登录时间：这张表里 RN 唯一写的列。
 func (s *server) touchTenantAccountLogin(ctx context.Context, id string) {
 	now := time.Now().UTC()
 	// 只是「最近登录」的显示用字段，写失败不影响登录
-	_, _ = s.db.ExecContext(ctx, `UPDATE tenant_admin_accounts SET last_login_at=?, updated_at=updated_at WHERE id=?`, now, id)
+	_, _ = s.db.ExecContext(ctx, `UPDATE tenant_admin_accounts SET last_login_at=? WHERE id=?`, now, id)
 }
 
 // ---- 只读列表（只给平台管理员） ----

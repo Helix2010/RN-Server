@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,11 +28,7 @@ import (
 //
 // 自动化通道（x-admin-key）不落会话，身份来自配置，按平台会话处理（与改动之前一致）。
 
-const (
-	adminSessionCookie = "rn_admin_session"
-	loginMethodCID     = "cid"
-	loginMethodLocal   = "password"
-)
+const adminSessionCookie = "rn_admin_session"
 
 // adminSession 是一次请求带来的会话。
 type adminSession struct {
@@ -43,9 +38,8 @@ type adminSession struct {
 	TenantID  string // 空 = 平台会话
 	AccountID string // 空 = 环境变量账号
 	// Subject 是登录时账号的统一认证账号 id；每个请求核对账号当前的 idp_subject
-	Subject     string
-	LoginMethod string
-	Account     *tenantAccount // 账号会话才有
+	Subject string
+	Account *tenantAccount // 账号会话才有
 	// SecondFactorAt 是这个会话最近一次通过邮箱二次验证的时间，零值 = 没验过（second_factor.go）
 	SecondFactorAt time.Time
 }
@@ -94,20 +88,16 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 	}
 	ctx := c.Request.Context()
 	session := adminSession{TokenHash: sha256Hex(cookie)}
-	var tenant, account, subject, method sql.NullString
+	var tenant, account, subject sql.NullString
 	var secondFactor sql.NullTime
 	err = s.db.QueryRowContext(ctx,
-		`SELECT actor_id, expires_at, tenant_id, account_id, idp_subject, login_method, second_factor_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
-		session.TokenHash, time.Now().UTC()).Scan(&session.Actor, &session.ExpiresAt, &tenant, &account, &subject, &method, &secondFactor)
+		`SELECT actor_id, expires_at, tenant_id, account_id, idp_subject, second_factor_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
+		session.TokenHash, time.Now().UTC()).Scan(&session.Actor, &session.ExpiresAt, &tenant, &account, &subject, &secondFactor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
-	}
-	session.LoginMethod = loginMethodLocal
-	if method.Valid && method.String != "" {
-		session.LoginMethod = method.String
 	}
 	session.AccountID = account.String
 	session.Subject = subject.String
@@ -296,7 +286,7 @@ func (s *server) login(c *gin.Context) {
 		return
 	}
 	s.clearLoginFailures(c.ClientIP())
-	session, token, err := s.createAdminSession(c.Request.Context(), s.cfg.AdminUsername, "", "", "", loginMethodLocal)
+	session, token, err := s.createAdminSession(c.Request.Context(), s.cfg.AdminUsername, "", "", "")
 	if err != nil {
 		problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
 		return
@@ -306,16 +296,18 @@ func (s *server) login(c *gin.Context) {
 	c.JSON(200, s.sessionView(c, session, "session"))
 }
 
-func (s *server) createAdminSession(ctx context.Context, actorID, tenant, account, subject, method string) (*adminSession, string, error) {
+// createAdminSession 落一条会话。账号会话（统一登录）带租户（平台管理员为空）、账号与统一认证账号 id；
+// 环境变量账号三者都为空。
+func (s *server) createAdminSession(ctx context.Context, actorID, tenant, account, subject string) (*adminSession, string, error) {
 	token := randomID(32)
 	now := time.Now().UTC()
 	expires := now.Add(time.Duration(s.cfg.AdminSessionTTL) * time.Second)
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,idp_subject,login_method,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)`,
-		sha256Hex(token), actorID, nullIfEmpty(tenant), nullIfEmpty(account), nullIfEmpty(subject), method, expires, now); err != nil {
+		`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,idp_subject,expires_at,created_at) VALUES (?,?,?,?,?,?,?)`,
+		sha256Hex(token), actorID, nullIfEmpty(tenant), nullIfEmpty(account), nullIfEmpty(subject), expires, now); err != nil {
 		return nil, "", err
 	}
-	return &adminSession{TokenHash: sha256Hex(token), Actor: actorID, ExpiresAt: expires, TenantID: tenant, AccountID: account, Subject: subject, LoginMethod: method}, token, nil
+	return &adminSession{TokenHash: sha256Hex(token), Actor: actorID, ExpiresAt: expires, TenantID: tenant, AccountID: account, Subject: subject}, token, nil
 }
 
 func nullIfEmpty(v string) any {
@@ -340,12 +332,12 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 	view := gin.H{
 		"authenticated": true,
 		"method":        method,
-		"loginMethod":   nil,
 		"expiresAt":     nil,
 		"actorId":       actor(c),
 		"platformAdmin": false,
-		"tenantId":      nil,
-		"account":       nil,
+		// 租户会话的租户；平台会话为 null。控制台据此把平台级设置做成只读（use-platform-session.ts）
+		"tenantId": nil,
+		"account":  nil,
 		// 账号会话的邮箱二次验证在这个时间之前有效；null = 没验过或已过期（环境变量账号与自动化通道不用）
 		"secondFactorUntil": nil,
 	}
@@ -356,7 +348,6 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 	}
 	view["actorId"] = session.Actor
 	view["expiresAt"] = iso(session.ExpiresAt)
-	view["loginMethod"] = session.LoginMethod
 	view["platformAdmin"] = s.platformAdminSession(session, session.Actor)
 	if session.tenantScoped() {
 		view["tenantId"] = session.TenantID
@@ -432,13 +423,4 @@ func requireAdminSessionTenant() gin.HandlerFunc {
 		}
 		c.Next()
 	}
-}
-
-// parseAccountID 只接受正整数 id。
-func parseAccountID(raw string) (string, bool) {
-	n, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || n == 0 {
-		return "", false
-	}
-	return strconv.FormatUint(n, 10), true
 }

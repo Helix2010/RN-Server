@@ -42,16 +42,17 @@ flowchart LR
 | `scope` | 写 | `platform`=平台管理员；`tenant`=租户成员 |
 | `tenant_id` | 写 | 租户成员填 `tenants.id`；平台管理员填 NULL。CHECK `ck_tenant_admin_scope` 保证与 `scope` 一致 |
 | `tenant_key` | 不写（生成列） | `IFNULL(tenant_id,0)`，唯一键用 |
-| `idp` | 可不写 | 默认 `chainup-cid` |
 | `idp_subject` | 写 | 认证中心的账号 id（userinfo 的 `username`），**小写 uuid**。CHECK `ck_tenant_admin_subject` 挡住大写和非 uuid |
 | `email` | 写 | **二次验证码发到这个邮箱**，必须是本人能收信的邮箱。CHECK `ck_tenant_admin_email` 只做最粗的格式检查 |
 | `display_name` | 写 | 界面上显示的名字，可以为空串 |
 | `status` | 写 | `active` / `disabled`，默认 `active`。CHECK `ck_tenant_admin_status` |
 | `created_by` | 可写 | 谁分配的（外部系统自己的操作人），默认空串，只用于显示 |
-| `created_at` / `updated_at` | 可不写 | 数据库默认当前时间，`updated_at` 行被改时自动更新 |
-| `last_login_at` | 不写 | RN 登录成功时写（写的时候不动 `updated_at`） |
+| `created_at` | 可不写 | 数据库默认当前时间，列表里显示为「分配时间」 |
+| `last_login_at` | 不写 | RN 登录成功时写 |
 
-唯一键 `uq_tenant_admin_idp (tenant_key, idp, idp_subject)`：同一个统一账号在一个租户里最多一条，平台管理员里最多一条。索引 `ix_tenant_admin_subject (idp, idp_subject)`：登录时按统一账号查出它的所有记录。
+唯一键 `uq_tenant_admin_subject (idp_subject, tenant_key)`：同一个统一账号在一个租户里最多一条，平台管理员里最多一条；账号 id 在前，登录时按它查出全部记录也走这个索引。
+
+表里只留 RN 用得到的列。外部系统要记「最近改动时间」「改动人」这类自己的账，记在它自己那边。
 
 外部系统改了什么，RN 什么时候知道：
 
@@ -77,7 +78,7 @@ GRANT SELECT (tenant_id, domain, status, deleted) ON <rn 库>.tenant_domain TO '
 
 ### 4.1 统一登录回调
 
-回调拿到统一账号 id（小写）后，查出 `idp='chainup-cid' AND idp_subject=?` 的全部记录，然后：
+回调拿到统一账号 id（小写）后，查出 `idp_subject=?` 的全部记录，然后：
 
 | 记录 | 结果 |
 | --- | --- |
@@ -126,8 +127,14 @@ GRANT SELECT (tenant_id, domain, status, deleted) ON <rn 库>.tenant_domain TO '
 每一步都能重复执行：
 
 1. 删掉过不了新约束的行，连同这些账号的会话：`idp_subject` 为 NULL（从没绑定过）、不是小写 uuid、邮箱不像邮箱、状态不是 `active` / `disabled`。这些行在新规则下登不进来或收不到二次验证码，不删的话第 4 步加 CHECK 会失败。线上 2026-09-27 只读核对过：只有一个租户成员 fuyu（已绑定、`active`），没有平台账号，所以这一步在线上什么都不删。
-2. 删索引 `uq_tenant_admin_login`、`ix_tenant_admin_login_name`，删列 `login_name`、`password_hash`、`password_expires_at`、`idp_email`、`bound_at`。
-3. `idp` 改成 NOT NULL，默认 `chainup-cid`；`idp_subject` 改成 NOT NULL；`display_name` 与 `created_by` 默认空串；`status` 默认 `active`；`created_at`、`updated_at` 默认当前时间，`updated_at` 自动更新。
+2. 先建新唯一键 `uq_tenant_admin_subject (idp_subject, tenant_key)`，再删旧的，中间没有「没有唯一键」的窗口。删掉 RN 不再读的：
+   - 索引 `uq_tenant_admin_login`、`ix_tenant_admin_login_name`、`uq_tenant_admin_idp`、`ix_tenant_admin_subject`；
+   - 列 `login_name`、`password_hash`、`password_expires_at`、`idp_email`、`bound_at`；
+   - 列 `idp`：只有统一认证一种，恒为 `chainup-cid`，什么都不区分；
+   - 列 `updated_at`：外部系统的记账，RN 不读；
+   - `admin_sessions.login_method`：控制台不用，账号会话与环境变量账号靠 `account_id` 区分；
+   - 索引 `admin_sessions.ix_session_account`：只给已删掉的停用、重置接口用。
+3. `idp_subject` 改成 NOT NULL；`display_name` 与 `created_by` 默认空串；`status` 默认 `active`；`created_at` 默认当前时间。
 4. 加 CHECK：`ck_tenant_admin_status`、`ck_tenant_admin_subject`（`REGEXP_LIKE(idp_subject, '^[0-9a-f]{8}-…$', 'c')`，区分大小写）、`ck_tenant_admin_email`（`email LIKE '_%@_%._%'`）。在本机 MySQL 8.0.46 上试过，大写 uuid、`fuyu` 这样的登录名、没有 @ 的邮箱都会被拒。
 5. `admin_sessions` 加 `idp_subject`，并把现有账号会话回填成账号当前的统一账号 id：这些会话本来就是这个人登出来的，不用让人重新登录。
 6. 更新表与列的注释：写明由外部系统写入，RN 只读。
@@ -164,11 +171,13 @@ RN-Server 与 RN-Admin 的分支都叫 `feat/external-accounts`，都从各自�
 | 二次验证码的存法与限流沿用绑定验证码 | 挪进 `second_factor.go`，改名 `emailCodeStore`；RN-Admin 的文案键 `bindCode*` 同样改成 `emailCode*` | 绑定没了，只剩二次验证在用 |
 | 登录页 | 口令表单只在 `methods.password` 为 true 时显示（配了环境变量账号） | 发布 2 删掉环境变量账号之后，登录页只剩「统一登录」，不用再改控制台 |
 | 删发信配置的保护看「存在平台账号」 | 改成看「存在可用的平台账号」 | 停用的平台管理员登不进来，不需要二次验证 |
+| 表契约里有 `idp`、`updated_at` | 两列都删了，会话的 `login_method` 与索引 `ix_session_account` 也删了（用户要求清干净没用到的表与属性） | RN 没有地方读它们 |
+| 没提 | 接口里没人用的字段一并去掉：会话的 `loginMethod`、`account.scope`、`account.status`（`tenantId` 保留：控制台据此把平台级设置做成只读）；列表的 `scope`、`tenantId`、`idp`、`updatedAt`；统一登录回调不再取 userinfo 里的邮箱 | 控制台都不用；列表按接口已经分开了平台与租户 |
 
 **验证**：
 
 - RN-Server：`gofmt`、`go vet ./...` 通过；不连库的包 `go test -race` 全过；`internal/api`、`internal/store` 在新建的独立测试库上 `go test -race -p 1` 全过（包括全部库测）。
-- 迁移 64 在旧数据上跑过：用 origin/main 的代码建库到迁移 63，造了待绑定、已绑定、账号 id 不合规的租户成员、已绑定的平台管理员和它们的会话，再用新代码升级。结果：该删的行连同会话都删了；保留的行，会话的 `idp_subject` 已回填；环境变量账号的会话没动。
+- 迁移 64 在旧数据上跑过：用 origin/main 的代码建库到迁移 63，造了待绑定、已绑定、账号 id 不合规的租户成员、已绑定的平台管理员和它们的会话，再用新代码升级。结果：该删的行连同会话都删了；保留的行，会话的 `idp_subject` 已回填；环境变量账号的会话没动。升级后 `tenant_admin_accounts` 只剩 id、scope、tenant_id、tenant_key、display_name、email、idp_subject、status、created_by、created_at、last_login_at，索引只剩主键、`uq_tenant_admin_subject`、`ix_tenant_admin_tenant`；`admin_sessions` 没有 `login_method` 与 `ix_session_account` 了。
 - 新的库测：`TestDBTenantAccountsAndUnifiedLogin`（外部系统写行后统一登录、没有记录 `no_access`、多租户按域名选、换人、停用、改租户、删行后会话失效、`last_login_at` 不动 `updated_at`、数据库挡住写错的行）、`TestDBPlatformAccounts`（平台会话在任何域名有效、二次验证、只读列表、身份冲突拒绝登录、停用、发信配置保护）；另有 `TestAccountForLogin` 覆盖回调规则的每种组合。
 - RN-Admin：`pnpm check` 全过（58 个测试文件、696 项）。`pnpm layout:audit` 没跑：它要真实浏览器和能登录的环境。列表只是去掉操作列、加了一列统一账号 ID，上线后再在真实环境跑一次。
 - 不改 `go.mod`，不碰打包机的构建输入，打包机不用重签。

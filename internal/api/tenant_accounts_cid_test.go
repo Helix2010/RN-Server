@@ -274,7 +274,7 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 
 	platform := newBrowser(tenantA)
 	view := platform.mustCode(t, platform.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
-	if view["platformAdmin"] != true || view["tenantId"] != nil {
+	if view["platformAdmin"] != true || view["tenantId"] != nil || view["account"] != nil {
 		t.Fatalf("platform session view = %v", view)
 	}
 
@@ -338,20 +338,18 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		}
 		view := member.mustCode(t, member.do("GET", "/v1/admin/auth/session", nil, nil), 200)
 		account := object(view["account"])
-		if view["loginMethod"] != loginMethodCID || view["tenantId"] != tenantA.id || view["platformAdmin"] != false ||
-			account["id"] != memberID || account["email"] != "zs@example.com" || account["scope"] != scopeTenant {
+		if view["actorId"] != tenantActor(tenantA.id, memberID) || view["tenantId"] != tenantA.id || view["platformAdmin"] != false ||
+			account["id"] != memberID || account["email"] != "zs@example.com" {
 			t.Fatalf("cid session = %v", view)
 		}
 		if _, ok := view["bindRequired"]; ok {
 			t.Fatalf("bindRequired must be gone: %v", view)
 		}
 		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
-		// RN 只写 last_login_at，不动外部系统的 updated_at
+		// RN 在这张表里只写 last_login_at
 		var lastLogin sql.NullTime
-		var created, updated time.Time
-		if err := db.QueryRow(`SELECT last_login_at, created_at, updated_at FROM tenant_admin_accounts WHERE id=?`, memberID).Scan(&lastLogin, &created, &updated); err != nil ||
-			!lastLogin.Valid || !updated.Equal(created) {
-			t.Fatalf("last_login_at=%v created=%v updated=%v err=%v", lastLogin, created, updated, err)
+		if err := db.QueryRow(`SELECT last_login_at FROM tenant_admin_accounts WHERE id=?`, memberID).Scan(&lastLogin); err != nil || !lastLogin.Valid {
+			t.Fatalf("last_login_at=%v err=%v", lastLogin, err)
 		}
 		// 开放跳转：target 只收本站相对路径
 		if got := cidLogin(newBrowser(tenantA), subject, "//evil.example/x"); got != "/" {
@@ -399,7 +397,7 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 			t.Fatalf("list = %v", list)
 		}
 		item := object(items[0])
-		if item["id"] != memberID || item["subject"] != subject || item["tenantId"] != tenantA.id || item["createdBy"] != "ext-ops" || item["lastLoginAt"] == nil {
+		if item["id"] != memberID || item["subject"] != subject || item["status"] != accountActive || item["createdBy"] != "ext-ops" || item["lastLoginAt"] == nil {
 			t.Fatalf("list item = %v", item)
 		}
 	})
@@ -440,7 +438,7 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	})
 
 	t.Run("外部系统停用、改成别的租户、删掉：会话都在下一个请求失效", func(t *testing.T) {
-		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status=? WHERE id=?`, accountDisabled, memberID); err != nil {
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status='disabled' WHERE id=?`, memberID); err != nil {
 			t.Fatal(err)
 		}
 		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")

@@ -474,7 +474,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session：platformAdmin（可用的平台管理员账号，或没有账号且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、loginMethod（password|cid）、tenantId（租户会话的租户，平台会话为 null）、account（账号会话：id、scope、displayName、email、status；环境变量账号为 null）、secondFactorUntil（账号会话邮箱二次验证的有效期，null=没验过或已过期）。"
+            "description": "Session：platformAdmin（可用的平台管理员账号，或没有账号且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、tenantId（租户会话的租户，平台会话为 null）、account（账号会话：id、displayName、email；环境变量账号与自动化通道为 null）、secondFactorUntil（账号会话邮箱二次验证的有效期，null=没验过或已过期）。"
           }
         }
       }
@@ -7506,7 +7506,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "当前域名租户的控制台成员，只读（只有平台管理员能看）：{items:[{id, scope, tenantId（平台管理员为 null）, displayName, email, idp, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt, updatedAt}]}。账号由外部系统写进 tenant_admin_accounts，RN 不建号、不改（设计 console-accounts-external-maintenance-2026-09-27）"
+            "description": "当前域名租户的控制台成员，只读（只有平台管理员能看）：{items:[{id, displayName, email, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt}]}。账号由外部系统写进 tenant_admin_accounts，RN 不建号、不改（设计 console-accounts-external-maintenance-2026-09-27）"
           }
         }
       }
@@ -7579,7 +7579,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "平台管理员账号，只读（只有平台管理员能看）：{items:[{id, scope, tenantId（平台管理员为 null）, displayName, email, idp, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt, updatedAt}]}。账号由外部系统维护；平台管理员账号做平台级写操作要 15 分钟内过邮箱二次验证（403 SECOND_FACTOR_REQUIRED）"
+            "description": "平台管理员账号，只读（只有平台管理员能看）：{items:[{id, displayName, email, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt}]}。账号由外部系统维护；平台管理员账号做平台级写操作要 15 分钟内过邮箱二次验证（403 SECOND_FACTOR_REQUIRED）"
           }
         }
       }

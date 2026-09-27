@@ -7,26 +7,21 @@ import (
 	"github.com/Helix2010/authorization-go-sdk/cid"
 )
 
-// RN 对 userinfo 的额外要求（cid_login.go cidIdentity）：SDK 只挡空白与控制字符。
-func TestCIDIdentity(t *testing.T) {
+// RN 对 userinfo 的额外要求（cid_login.go cidSubject）：SDK 只挡空白与控制字符。
+func TestCIDSubject(t *testing.T) {
 	const subject = "1c9670fc-87c8-4655-9366-d8eebbea7c74"
-	user, err := cidIdentity(&cid.User{Subject: strings.ToUpper(subject), Email: " a@example.com "})
-	if err != nil || user.Subject != subject || user.Email != "a@example.com" {
-		t.Fatalf("user = %+v, err = %v", user, err)
+	got, err := cidSubject(&cid.User{Subject: strings.ToUpper(subject), Email: "a@example.com"})
+	if err != nil || got != subject {
+		t.Fatalf("subject = %q, err = %v", got, err)
 	}
 	// 账号 id 不是 uuid：拒绝，错误里不带对方给的值
 	for _, weird := range []string{"admin", "10002", subject + "x", ""} {
-		if _, err := cidIdentity(&cid.User{Subject: weird, Email: "a@example.com"}); err == nil || (weird != "" && strings.Contains(err.Error(), weird)) {
+		if _, err := cidSubject(&cid.User{Subject: weird, Email: "a@example.com"}); err == nil || (weird != "" && strings.Contains(err.Error(), weird)) {
 			t.Errorf("subject %q: err = %v", weird, err)
 		}
 	}
-	if _, err := cidIdentity(nil); err == nil {
+	if _, err := cidSubject(nil); err == nil {
 		t.Error("a nil user must be rejected")
-	}
-	// 邮箱只作显示与发信，过长就不要
-	user, err = cidIdentity(&cid.User{Subject: subject, Email: strings.Repeat("a", 250) + "@example.com"})
-	if err != nil || user.Email != "" {
-		t.Fatalf("long email: user = %+v, err = %v", user, err)
 	}
 }
 
@@ -35,8 +30,8 @@ func TestAccountForLogin(t *testing.T) {
 	platform := &tenantAccount{ID: "1", Scope: scopePlatform, Status: accountActive}
 	inA := &tenantAccount{ID: "2", Scope: scopeTenant, TenantID: "7", Status: accountActive}
 	inB := &tenantAccount{ID: "3", Scope: scopeTenant, TenantID: "8", Status: accountActive}
-	disabledInA := &tenantAccount{ID: "4", Scope: scopeTenant, TenantID: "7", Status: accountDisabled}
-	disabledPlatform := &tenantAccount{ID: "5", Scope: scopePlatform, Status: accountDisabled}
+	disabledInA := &tenantAccount{ID: "4", Scope: scopeTenant, TenantID: "7", Status: "disabled"}
+	disabledPlatform := &tenantAccount{ID: "5", Scope: scopePlatform, Status: "disabled"}
 	for _, tc := range []struct {
 		name     string
 		accounts []*tenantAccount
