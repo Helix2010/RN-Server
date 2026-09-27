@@ -7629,7 +7629,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "外部系统关联（预测平台）：{items:[{tenantId, slug, appName, status, predict:{domain, scopeId, chain, endpoints?}|null, predictEnabled（租户开没开预测市场模块）, version（mobile-bootstrap 生效那一行的版本）}]}"
+            "description": "外部系统关联（预测平台）：{items:[{tenantId, slug, appName, status, predict:{domain, scopeId, chain, endpoints?}|null, predictEnabled（租户开没开预测市场模块）, chains（租户启用的链；模块开着时关联的链必须在里面）, version（mobile-bootstrap 生效那一行的版本）}]}"
           }
         }
       }

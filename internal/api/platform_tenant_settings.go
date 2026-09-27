@@ -317,13 +317,17 @@ func mobileBootstrapFor(ctx context.Context, q interface {
 }
 
 // predictLinkView：predict 是规范化后的关联（没配或配坏了是 null），predictEnabled 是租户开没开预测市场模块——
-// 开着的租户不能取消关联，否则 App 拿不到配置。
+// 开着的租户不能取消关联，否则 App 拿不到配置；chains 是租户启用的链，预测市场模块开着时关联的链必须在里面。
 func predictLinkView(tenant platformTenant, config map[string]any, version int) gin.H {
 	services := normalizeServices(config["services"])
 	modules := normalizeModules(object(config["modules"]))
+	chains, _ := normalizeWallet(object(config["wallet"]))["chains"].([]any)
+	if chains == nil {
+		chains = []any{}
+	}
 	return gin.H{
 		"tenantId": tenant.ID, "slug": tenant.Slug, "appName": tenant.AppName, "status": tenant.Status,
-		"predict": services["predict"], "predictEnabled": truth(modules["predict"]), "version": version,
+		"predict": services["predict"], "predictEnabled": truth(modules["predict"]), "chains": chains, "version": version,
 	}
 }
 
@@ -446,11 +450,19 @@ func (s *server) updatePredictLink(c *gin.Context) {
 
 // getPlatformPushCredentials GET /v1/admin/platform/push/credentials：平台默认那一行，加上有多少个租户在继承它。
 func (s *server) getPlatformPushCredentials(c *gin.Context) {
-	ctx := c.Request.Context()
-	view, err := s.pushCredentialsView(ctx, pushcreds.PlatformTenant, true)
+	view, err := s.platformPushView(c.Request.Context())
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIALS_QUERY_FAILED", "Unable to load push credentials")
 		return
+	}
+	c.JSON(http.StatusOK, view)
+}
+
+// platformPushView 是平台控制台上的推送凭据视图（GET 与写、删之后的响应共用）。
+func (s *server) platformPushView(ctx context.Context) (gin.H, error) {
+	view, err := s.pushCredentialsView(ctx, pushcreds.PlatformTenant, true)
+	if err != nil {
+		return nil, err
 	}
 	// 平台那一行没有 google-services.json 与 bundle id 可对，这几项对它没有意义
 	fcm, apns := view["fcm"].(gin.H), view["apns"].(gin.H)
@@ -458,7 +470,7 @@ func (s *server) getPlatformPushCredentials(c *gin.Context) {
 	delete(fcm, "projectMatches")
 	delete(apns, "topic")
 	fcm["inheritors"], apns["inheritors"] = s.pushCredentialInheritors(ctx), s.apnsCredentialInheritors(ctx)
-	c.JSON(http.StatusOK, view)
+	return view, nil
 }
 
 // releaseStorageInheritors 数有多少个没删除的租户没有自己的发布存储——也就是在用平台默认那一行的。

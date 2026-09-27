@@ -16,6 +16,7 @@ import (
 	"github.com/Helix2010/RN-Server/internal/config"
 	"github.com/Helix2010/RN-Server/internal/pushcreds"
 	"github.com/Helix2010/RN-Server/internal/secretbox"
+	"github.com/gin-gonic/gin"
 )
 
 // apnsServer 与 pushServer 同构：主密钥齐了，探活换成本地桩。
@@ -141,10 +142,15 @@ func TestDBAPNsPlatformRowSkipsProbe(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("平台行应当能在没有 bundle id 时保存：%d %s", recorder.Code, recorder.Body.String())
 	}
-	// 租户没有自己那一行时继承平台的
+	// 响应是平台控制台的视图：平台自己那一行，带继承它的租户数（不按请求上的租户取）
 	view, _ := decodeBody(t, recorder)["apns"].(map[string]any)
-	if view["inherited"] != true {
-		t.Fatalf("租户 1 应当显示为继承：%v", view)
+	if view["inherited"] != false || view["sourceTenant"] != pushcreds.PlatformTenant || view["inheritors"] == nil {
+		t.Fatalf("平台行保存后的视图：%v", view)
+	}
+	// 租户没有自己那一行时继承平台的
+	tenantView, err := s.pushCredentialsView(context.Background(), tenant, false)
+	if err != nil || tenantView["apns"].(gin.H)["inherited"] != true {
+		t.Fatalf("租户应当显示为继承：%v %v", tenantView, err)
 	}
 }
 

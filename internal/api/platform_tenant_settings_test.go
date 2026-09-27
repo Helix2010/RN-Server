@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -115,12 +116,12 @@ func TestDBPlatformTenantSettings(t *testing.T) {
 				"latestVersion":       map[string]any{"android": "1.0.0", "ios": "1.0.0"},
 			},
 			"modules": map[string]any{"predict": false},
-			"wallet":  map[string]any{"chains": []any{map[string]any{"chainId": "bsc", "enabled": true}}},
+			"wallet":  map[string]any{"chains": []any{"bsc"}},
 		}
 		raw, _ := json.Marshal(seeded)
 		seedTenantConfig(t, db, tenantA.id, "mobile-bootstrap", string(raw))
 		list := admin.mustCode(t, admin.do("GET", "/v1/admin/platform/predict-links", nil, nil), 200)
-		if a := itemFor(list, tenantA.id); a["predict"] != nil || a["predictEnabled"] != false || a["version"] != float64(1) {
+		if a := itemFor(list, tenantA.id); a["predict"] != nil || a["predictEnabled"] != false || a["version"] != float64(1) || fmt.Sprint(a["chains"]) != "[bsc]" {
 			t.Fatalf("before = %v", a)
 		}
 		link := func(predict any, version int) map[string]any {

@@ -195,8 +195,7 @@ func (s *server) writePushAPNs(c *gin.Context, tenant string) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIAL_SAVE_FAILED", "Unable to save push credentials")
 		return
 	}
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
-	c.JSON(http.StatusOK, view)
+	c.JSON(http.StatusOK, s.pushCredentialsAfterWrite(c, tenant))
 }
 
 func (s *server) deletePushCredentialsAPNs(c *gin.Context) { s.removePushAPNs(c, tenantID(c)) }
@@ -243,7 +242,7 @@ func (s *server) removePushAPNs(c *gin.Context, tenant string) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIAL_DELETE_FAILED", "Unable to delete push credentials")
 		return
 	}
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
+	view := s.pushCredentialsAfterWrite(c, tenant)
 	view["inheritorsAffected"] = inheritors
 	c.JSON(http.StatusOK, view)
 }

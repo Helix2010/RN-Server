@@ -170,8 +170,24 @@ func (s *server) writePushFCM(c *gin.Context, tenant string) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIAL_SAVE_FAILED", "Unable to save push credentials")
 		return
 	}
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
-	c.JSON(http.StatusOK, view)
+	c.JSON(http.StatusOK, s.pushCredentialsAfterWrite(c, tenant))
+}
+
+// pushCredentialsAfterWrite 是写、删之后回给控制台的视图：改的是平台默认那一行就给平台控制台的视图，否则给
+// 这个租户的。按参数里的 tenant 取，不用 tenantID(c)——平台控制台上没有租户（它是 "<nil>"）。读不出来给空对象，
+// 写已经成功了，控制台会再拉一次。
+func (s *server) pushCredentialsAfterWrite(c *gin.Context, tenant string) gin.H {
+	var view gin.H
+	var err error
+	if tenant == pushcreds.PlatformTenant {
+		view, err = s.platformPushView(c.Request.Context())
+	} else {
+		view, err = s.pushCredentialsView(c.Request.Context(), tenant, isPlatformSession(c))
+	}
+	if err != nil || view == nil {
+		return gin.H{}
+	}
+	return view
 }
 
 func (s *server) deletePushCredentialsFCM(c *gin.Context) { s.removePushFCM(c, tenantID(c)) }
@@ -222,7 +238,7 @@ func (s *server) removePushFCM(c *gin.Context, tenant string) {
 	}
 	// 删完之后生效的是哪一个项目，要在响应里说清楚——租户那一层删掉会回落到
 	// 平台默认，那通常不是"推送关掉了"的意思。
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
+	view := s.pushCredentialsAfterWrite(c, tenant)
 	view["inheritorsAffected"] = inheritors
 	c.JSON(http.StatusOK, view)
 }

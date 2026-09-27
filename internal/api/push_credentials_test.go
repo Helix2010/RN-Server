@@ -265,3 +265,25 @@ func TestDBExpectedVersionIgnoresTheInheritedRow(t *testing.T) {
 	putFCM(t, s, tenant, fcmServiceAccount("anyfun"), 1, http.StatusOK)
 	putFCM(t, s, tenant, fcmServiceAccount("anyfun"), 1, http.StatusConflict)
 }
+
+// 平台控制台改、删平台默认之后，响应是平台控制台的视图：不按请求上的租户取（平台控制台上没有租户，
+// tenantID 是 "<nil>"），带继承的租户数，不带只对租户有意义的 google-services 比对（设计 service-and-console-split §8）。
+func TestDBPlatformPushWriteRespondsWithThePlatformView(t *testing.T) {
+	s := pushServer(t)
+	defer s.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, pushcreds.PlatformTenant, pushcreds.FCMConfigKey)
+	c, recorder := testContext(t, pushcreds.PlatformTenant, "PUT", "/v1/admin/platform/push/credentials/fcm",
+		map[string]any{"serviceAccountJson": fcmServiceAccount("anyfun"), "expectedVersion": 0, "reason": "平台默认推送", "confirm": true})
+	delete(c.Keys, "tenantId")
+	c.Set("actorId", "tester")
+	s.updatePlatformPushCredentialsFCM(c)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+	}
+	fcm, _ := decodeBody(t, recorder)["fcm"].(map[string]any)
+	if fcm["configured"] != true || fcm["inherited"] != false || fcm["inheritors"] == nil || fcm["clientEmail"] == nil {
+		t.Fatalf("platform view after the write: %v", fcm)
+	}
+	if _, has := fcm["projectMatches"]; has {
+		t.Fatalf("the platform row has no google-services.json to match: %v", fcm)
+	}
+}
