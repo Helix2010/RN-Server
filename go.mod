@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/Helix2010/RN-Server/signing v0.0.0
+	github.com/Helix2010/authorization-go-sdk v0.1.1
 	github.com/avast/apkverifier v0.0.0-20260710162049-d0e1a791cd5a
 	github.com/aws/aws-sdk-go-v2 v1.39.6
 	github.com/aws/aws-sdk-go-v2/config v1.31.4

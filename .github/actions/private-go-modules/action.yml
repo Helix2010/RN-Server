@@ -1,0 +1,51 @@
+# 让这个 job 里的 go 命令拉得到私有依赖 github.com/Helix2010/authorization-go-sdk（统一登录客户端）。
+#
+# 用的是那个仓库的**只读 deploy key**（仓库 Secret AUTHORIZATION_SDK_DEPLOY_KEY，建在 Secrets 标签页、
+# 不是某个 environment 下——build 与 validate 没有 environment）。钥匙只挂在一个专用的 SSH 主机别名上，
+# 只有这个仓库的地址会被改写过去：checkout 用的 https + GITHUB_TOKEN 与别的 git 操作都不受影响。
+# 本机开发的配法见 README「私有依赖」。
+name: Private Go modules
+description: Let go fetch github.com/Helix2010/authorization-go-sdk with its read-only deploy key
+inputs:
+  deploy-key:
+    description: Private half of the read-only deploy key of Helix2010/authorization-go-sdk
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Configure access to authorization-go-sdk
+      shell: bash
+      env:
+        DEPLOY_KEY: ${{ inputs.deploy-key }}
+      run: |
+        set -euo pipefail
+        # 没配 Secret 时 go 只会报一句看不出原因的 "could not read Username"：先在这里说清楚
+        if [ -z "$DEPLOY_KEY" ]; then
+          echo "::error title=缺少 AUTHORIZATION_SDK_DEPLOY_KEY::依赖 github.com/Helix2010/authorization-go-sdk 是私有仓库。在那个仓库加一把只读 deploy key，私钥存成本仓库的 Actions Secret AUTHORIZATION_SDK_DEPLOY_KEY（README「私有依赖」）"
+          exit 1
+        fi
+        install -m 700 -d ~/.ssh
+        key=~/.ssh/authorization-go-sdk
+        printf '%s\n' "$DEPLOY_KEY" > "$key"
+        chmod 600 "$key"
+        if ! ssh-keygen -y -f "$key" >/dev/null 2>&1; then
+          echo "::error title=AUTHORIZATION_SDK_DEPLOY_KEY 不是有效的私钥::贴进 Secret 的应当是 ssh-keygen 生成的私钥全文（含 BEGIN/END 两行）"
+          exit 1
+        fi
+        # GitHub 公布的 ed25519 主机密钥（api.github.com/meta，指纹 SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU），
+        # 钉死而不是 ssh-keyscan：扫到什么信什么等于不校验
+        printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> ~/.ssh/known_hosts
+        cat >> ~/.ssh/config <<CONF
+        Host github-authorization-go-sdk
+          HostName github.com
+          HostKeyAlias github.com
+          User git
+          IdentityFile $key
+          IdentitiesOnly yes
+          StrictHostKeyChecking yes
+          BatchMode yes
+        CONF
+        chmod 600 ~/.ssh/config
+        git config --global url."ssh://git@github-authorization-go-sdk/Helix2010/authorization-go-sdk".insteadOf "https://github.com/Helix2010/authorization-go-sdk"
+        # 私有模块不去公共代理与校验和库（也就不把仓库名报给它们）；go.sum 仍然逐字节核对
+        echo "GOPRIVATE=github.com/Helix2010/authorization-go-sdk" >> "$GITHUB_ENV"

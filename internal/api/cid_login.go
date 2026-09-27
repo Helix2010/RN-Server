@@ -9,10 +9,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/Helix2010/RN-Server/internal/cid"
+	"github.com/Helix2010/authorization-go-sdk/cid"
 	"github.com/gin-gonic/gin"
 )
 
@@ -50,6 +51,26 @@ const (
 	cidBindTTL        = 10 * time.Minute // 要留出去邮箱收验证码的时间（验证码也是 10 分钟）
 	consoleHostHeader = "X-RN-Console-Host"
 )
+
+// cidHTTPClient 给每次现组的 cid.Client 共用：配置能在运行中改，所以每个请求都重新 New，
+// 共用一个客户端才复用得上连接（它自带 HTTP/2 心跳，SDK 另外保证不跟随重定向）。
+var cidHTTPClient = cid.DefaultHTTPClient()
+
+// cidSubjectPattern：认证中心的账号 id 是 uuid。对不上就拒绝，不猜——换了格式要先看清楚再放行。
+var cidSubjectPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// cidIdentity 把 userinfo 规范成我们存的样子：账号 id 统一小写；邮箱只作显示与发信，过长就不要。
+// SDK 只挡空白与控制字符，uuid 这条是 RN 自己的要求。错误里不带对方给的值。
+func cidIdentity(info *cid.User) (cid.User, error) {
+	if info == nil || !cidSubjectPattern.MatchString(info.Subject) {
+		return cid.User{}, errors.New("unified login returned an account id that is not a uuid")
+	}
+	email := strings.TrimSpace(info.Email)
+	if len(email) > 255 {
+		email = ""
+	}
+	return cid.User{Subject: strings.ToLower(info.Subject), Email: email}, nil
+}
 
 func cidSecretAAD() string            { return "auth-cid:client-secret" }
 func cidFlowAAD(tenant string) string { return "auth-cid:flow:" + tenant }
@@ -108,9 +129,11 @@ func (s *server) cidClient(ctx context.Context) (*cid.Client, *cidRecord, error)
 		return nil, record, errors.New("stored client secret cannot be decrypted")
 	}
 	client, err := cid.New(cid.Config{
-		AuthorizeURL: record.Value.AuthorizeURL, LogoutURL: record.Value.LogoutURL,
-		TokenURL: record.Value.TokenURL, UserinfoURL: record.Value.UserinfoURL,
-		ClientID: record.Value.ClientID, ClientSecret: secret,
+		Endpoints: cid.Endpoints{
+			AuthorizeURL: record.Value.AuthorizeURL, LogoutURL: record.Value.LogoutURL,
+			TokenURL: record.Value.TokenURL, UserInfoURL: record.Value.UserinfoURL,
+		},
+		ClientID: record.Value.ClientID, ClientSecret: secret, HTTPClient: cidHTTPClient,
 	})
 	return client, record, err
 }
@@ -201,9 +224,13 @@ func (s *server) updateCIDConfig(c *gin.Context) {
 		}
 		encrypted = current.Value.ClientSecretEncrypted
 	}
-	client, err := cid.New(cid.Config{AuthorizeURL: body.AuthorizeURL, LogoutURL: body.LogoutURL, TokenURL: body.TokenURL,
-		UserinfoURL: body.UserinfoURL, ClientID: body.ClientID, ClientSecret: secret})
-	if err != nil {
+	endpoints := cid.Endpoints{
+		AuthorizeURL: strings.TrimSpace(body.AuthorizeURL), LogoutURL: strings.TrimSpace(body.LogoutURL),
+		TokenURL: strings.TrimSpace(body.TokenURL), UserInfoURL: strings.TrimSpace(body.UserinfoURL),
+	}
+	clientID := strings.TrimSpace(body.ClientID)
+	// 地址规则由 SDK 定：给浏览器的必须 https；服务端直连的只有本机、内网 IP 可以 http
+	if _, err := cid.New(cid.Config{Endpoints: endpoints, ClientID: clientID, ClientSecret: secret}); err != nil {
 		problem(c, 422, "INVALID_CID_CONFIG", err.Error())
 		return
 	}
@@ -215,9 +242,8 @@ func (s *server) updateCIDConfig(c *gin.Context) {
 		}
 		encrypted = base64.RawStdEncoding.EncodeToString(ciphertext)
 	}
-	cfg := client.Config()
-	value := cidStored{AuthorizeURL: cfg.AuthorizeURL, LogoutURL: cfg.LogoutURL, TokenURL: cfg.TokenURL,
-		UserinfoURL: cfg.UserinfoURL, ClientID: cfg.ClientID, ClientSecretEncrypted: encrypted}
+	value := cidStored{AuthorizeURL: endpoints.AuthorizeURL, LogoutURL: endpoints.LogoutURL, TokenURL: endpoints.TokenURL,
+		UserinfoURL: endpoints.UserInfoURL, ClientID: clientID, ClientSecretEncrypted: encrypted}
 	stored, _ := json.Marshal(value)
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -245,8 +271,8 @@ func (s *server) updateCIDConfig(c *gin.Context) {
 		return
 	}
 	event := newAudit(platformTenantID, actor(c), "cid_config_update", "app-config", cidConfigKey, body.Reason, requestID(c),
-		map[string]any{"authorizeUrl": cfg.AuthorizeURL, "logoutUrl": cfg.LogoutURL, "tokenUrl": cfg.TokenURL,
-			"userinfoUrl": cfg.UserinfoURL, "clientId": cfg.ClientID, "secretChanged": body.ClientSecret != "", "databaseVersion": currentVersion + 1})
+		map[string]any{"authorizeUrl": value.AuthorizeURL, "logoutUrl": value.LogoutURL, "tokenUrl": value.TokenURL,
+			"userinfoUrl": value.UserinfoURL, "clientId": value.ClientID, "secretChanged": body.ClientSecret != "", "databaseVersion": currentVersion + 1})
 	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
 		problem(c, 500, "CID_CONFIG_SAVE_FAILED", "Unable to save the unified login configuration")
 		return
@@ -418,27 +444,23 @@ func (s *server) startCIDLogin(c *gin.Context) {
 	}
 	host := s.consoleHost(c)
 	flow.RedirectURI = "https://" + host + cidCallbackPath
-	state, err := cid.NewState()
+	// state 与 PKCE 由 SDK 生成；时效与「只认发起它的浏览器」仍由我们的加密 Cookie 管
+	authorizeURL, started, err := client.Start(cid.StartOptions{RedirectURI: flow.RedirectURI, Host: host})
 	if err != nil {
 		cidFail(c, "internal")
 		return
 	}
-	verifier, challenge, err := cid.NewPKCE()
-	if err != nil {
-		cidFail(c, "internal")
-		return
-	}
-	flow.State, flow.Verifier = state, verifier
+	flow.State, flow.Verifier = started.State, started.CodeVerifier
 	sealed, err := s.sealCookie(flow, cidFlowAAD(tenantID(c)))
 	if err != nil {
 		cidFail(c, "internal")
 		return
 	}
 	// 名字按 state 区分：多个标签页同时登录不会互相覆盖
-	http.SetCookie(c.Writer, &http.Cookie{Name: cidFlowCookie + state[:8], Value: sealed, Path: cidCallbackPath,
+	http.SetCookie(c.Writer, &http.Cookie{Name: cidFlowCookie + flow.State[:8], Value: sealed, Path: cidCallbackPath,
 		MaxAge: int(cidFlowTTL.Seconds()), HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
 	c.Header("Cache-Control", "no-store")
-	c.Redirect(http.StatusFound, client.AuthorizeURL(host, flow.RedirectURI, state, challenge))
+	c.Redirect(http.StatusFound, authorizeURL)
 }
 
 func (s *server) cidCallback(c *gin.Context) {
@@ -471,13 +493,18 @@ func (s *server) cidCallback(c *gin.Context) {
 		cidFail(c, "not_configured")
 		return
 	}
-	accessToken, err := client.Exchange(ctx, code, flow.RedirectURI, flow.Verifier)
+	// 令牌只在这里用一次；认证中心同时发的 refresh_token 直接丢掉，我们不代表用户长期访问认证中心
+	exchanged, err := client.Exchange(ctx, code, flow.RedirectURI, flow.Verifier)
 	if err != nil {
 		slog.Warn("unified login code exchange failed", "error", err, "tenant", tenantID(c))
 		cidFail(c, "exchange")
 		return
 	}
-	user, err := client.UserInfo(ctx, accessToken)
+	info, err := client.UserInfo(ctx, exchanged.AccessToken)
+	var user cid.User
+	if err == nil {
+		user, err = cidIdentity(info)
+	}
 	if err != nil {
 		slog.Warn("unified login userinfo failed", "error", err, "tenant", tenantID(c))
 		cidFail(c, "userinfo")
