@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,34 +15,31 @@ import (
 )
 
 // 管理端会话分平台 / 租户（设计 tenant-console-accounts-and-sso-2026-09-25 §3.3、
-// platform-accounts-and-console-login-2026-09-27 §3.2）。
+// platform-accounts-and-console-login-2026-09-27 §3.2、console-accounts-external-maintenance-2026-09-27 §4.2）。
 //
 //   - 平台会话：admin_sessions.tenant_id 为 NULL，在任何租户的控制台域名上都有效。两种来源：
-//     平台管理员账号（tenant_admin_accounts 里 scope=platform，account_id 有值，actor 是 platform:<id>，
-//     每个请求回表查状态）；环境变量里那一个管理员账号（ADMIN_USERNAME，account_id 为 NULL，过渡期保留）。
+//     平台管理员账号（tenant_admin_accounts 里 scope=platform，account_id 有值，actor 是 platform:<id>）；
+//     环境变量里那一个管理员账号（ADMIN_USERNAME，account_id 为 NULL，过渡期保留）。
 //   - 租户会话：租户成员登出来的，记下租户与账号。
 //     **只在这个租户的域名上有效**：请求域名的租户与会话租户不一致，一律当没登录；
-//     每个请求都回表查账号状态，停用立即生效；永远不是平台管理员，不管它的 actor 长什么样。
-//   - 待绑定（pending_bind）的账号（平台管理员与租户成员一样）只能查会话、登出、走二次验证与绑定那几条接口，
-//     别的一律 403 BIND_REQUIRED。
+//     永远不是平台管理员，不管它的 actor 长什么样。
+//   - 账号会话每个请求都回表：账号要是 active，统一认证账号 id 要等于登录时记下的那个。账号由外部系统维护，
+//     停用、删除、换人、改 scope 都在下一个请求生效。
 //
 // 自动化通道（x-admin-key）不落会话，身份来自配置，按平台会话处理（与改动之前一致）。
 
-const (
-	adminSessionCookie = "rn_admin_session"
-	loginMethodCID     = "cid"
-	loginMethodLocal   = "password"
-)
+const adminSessionCookie = "rn_admin_session"
 
 // adminSession 是一次请求带来的会话。
 type adminSession struct {
-	TokenHash   string
-	Actor       string
-	ExpiresAt   time.Time
-	TenantID    string // 空 = 平台会话
-	AccountID   string // 空 = 平台会话
-	LoginMethod string
-	Account     *tenantAccount // 租户会话才有
+	TokenHash string
+	Actor     string
+	ExpiresAt time.Time
+	TenantID  string // 空 = 平台会话
+	AccountID string // 空 = 环境变量账号
+	// Subject 是登录时账号的统一认证账号 id；每个请求核对账号当前的 idp_subject
+	Subject string
+	Account *tenantAccount // 账号会话才有
 	// SecondFactorAt 是这个会话最近一次通过邮箱二次验证的时间，零值 = 没验过（second_factor.go）
 	SecondFactorAt time.Time
 }
@@ -83,19 +79,7 @@ func tenantActor(tenant, account string) string { return "tenant:" + tenant + ":
 // platformActor 是平台管理员账号在审计里的 actor。
 func platformActor(account string) string { return "platform:" + account }
 
-// pendingBindRoutes 是待绑定账号能走的接口（c.FullPath() 模板）。其余一律 403。
-var pendingBindRoutes = map[string]bool{
-	"GET /v1/admin/auth/session":           true,
-	"POST /v1/admin/auth/logout":           true,
-	"GET /v1/admin/auth/cid/bind":          true,
-	"POST /v1/admin/auth/cid/bind/code":    true,
-	"POST /v1/admin/auth/cid/bind/confirm": true,
-	// 发起绑定前要先过邮箱二次验证（second_factor.go）
-	"POST /v1/admin/auth/second-factor/code":   true,
-	"POST /v1/admin/auth/second-factor/verify": true,
-}
-
-// loadAdminSession 读并校验请求带的会话 Cookie。没有、过期、租户对不上、账号停用都返回 nil。
+// loadAdminSession 读并校验请求带的会话 Cookie。没有、过期、租户对不上、账号不可用或换了人都返回 nil。
 // 出库错误单独返回，调用方按 500 处理，不要当成「没登录」把人踢回登录页。
 func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 	cookie, err := c.Cookie(adminSessionCookie)
@@ -104,22 +88,19 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 	}
 	ctx := c.Request.Context()
 	session := adminSession{TokenHash: sha256Hex(cookie)}
-	var tenant, account, method sql.NullString
+	var tenant, account, subject sql.NullString
 	var secondFactor sql.NullTime
 	err = s.db.QueryRowContext(ctx,
-		`SELECT actor_id, expires_at, tenant_id, account_id, login_method, second_factor_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
-		session.TokenHash, time.Now().UTC()).Scan(&session.Actor, &session.ExpiresAt, &tenant, &account, &method, &secondFactor)
+		`SELECT actor_id, expires_at, tenant_id, account_id, idp_subject, second_factor_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
+		session.TokenHash, time.Now().UTC()).Scan(&session.Actor, &session.ExpiresAt, &tenant, &account, &subject, &secondFactor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	session.LoginMethod = loginMethodLocal
-	if method.Valid && method.String != "" {
-		session.LoginMethod = method.String
-	}
 	session.AccountID = account.String
+	session.Subject = subject.String
 	if secondFactor.Valid {
 		session.SecondFactorAt = secondFactor.Time.UTC()
 	}
@@ -128,12 +109,12 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 			// 环境变量里的管理员账号
 			return &session, nil
 		}
-		// 平台管理员账号：任何控制台域名都有效，但每个请求都回表查状态
+		// 平台管理员账号：任何控制台域名都有效，但每个请求都回表
 		acc, err := platformAccountByID(ctx, s.db, session.AccountID)
 		if err != nil {
 			return nil, err
 		}
-		if acc == nil || acc.Status == accountDisabled {
+		if !session.accountStillValid(acc) {
 			return nil, nil
 		}
 		session.Account = acc
@@ -149,11 +130,17 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	if acc == nil || acc.Status == accountDisabled {
+	if !session.accountStillValid(acc) {
 		return nil, nil
 	}
 	session.Account = acc
 	return &session, nil
+}
+
+// accountStillValid：账号还在（按会话的类型查得到）、是 active、统一认证账号 id 没被外部系统换掉。
+// 迁移 64 之前的账号会话已回填 idp_subject；空值一律不认。
+func (a *adminSession) accountStillValid(acc *tenantAccount) bool {
+	return acc != nil && acc.Status == accountActive && a.Subject != "" && strings.EqualFold(acc.IDPSubject, a.Subject)
 }
 
 func (s *server) authenticate() gin.HandlerFunc {
@@ -167,12 +154,6 @@ func (s *server) authenticate() gin.HandlerFunc {
 		if session != nil {
 			if !safeMethod(c.Request.Method) && !s.adminOriginAllowed(c) {
 				problem(c, 403, "UNTRUSTED_ORIGIN", "Untrusted admin request origin")
-				c.Abort()
-				return
-			}
-			if session.hasAccount() && session.Account.Status == accountPendingBind &&
-				!pendingBindRoutes[c.Request.Method+" "+c.FullPath()] {
-				problem(c, http.StatusForbidden, "BIND_REQUIRED", "Bind a unified login account before using the console")
 				c.Abort()
 				return
 			}
@@ -219,7 +200,7 @@ func currentAdminSession(c *gin.Context) *adminSession {
 	return session
 }
 
-// platformAdminRequest：租户会话永远不是平台管理员；平台管理员账号要已绑定、可用；
+// platformAdminRequest：租户会话永远不是平台管理员；平台管理员账号要可用；
 // 没有账号的（环境变量账号、自动化通道）照旧看 PLATFORM_ADMIN_USERNAMES。
 func (s *server) platformAdminRequest(c *gin.Context) bool {
 	return s.platformAdminSession(currentAdminSession(c), actor(c))
@@ -276,8 +257,8 @@ func (s *server) originTenant(origin string) (string, bool) {
 	return item.ID, true
 }
 
-// login 三条路：用户名等于 ADMIN_USERNAME 走环境变量账号（过渡期保留）；否则先找平台管理员账号，再按请求域名的
-// 租户找租户成员。账号只有待绑定时能用初始口令登录，已绑定的要走统一登录。
+// login 是口令登录，只剩环境变量里的管理员账号能用（过渡期保留，发布 2 删掉）。控制台账号没有本地口令，
+// 只走统一登录（设计 console-accounts-external-maintenance-2026-09-27 §5）。
 func (s *server) login(c *gin.Context) {
 	var input struct {
 		Username string `json:"username"`
@@ -292,91 +273,41 @@ func (s *server) login(c *gin.Context) {
 		return
 	}
 	username := strings.TrimSpace(input.Username)
-	if s.cfg.AdminUsername != "" && constantEqual(username, s.cfg.AdminUsername) {
-		if !verifyPassword(input.Password, s.cfg.AdminPasswordHash) {
-			s.failedLogin(c.ClientIP())
-			problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
-			return
-		}
-		s.clearLoginFailures(c.ClientIP())
-		session, token, err := s.createAdminSession(c.Request.Context(), s.cfg.AdminUsername, "", "", loginMethodLocal)
-		if err != nil {
-			problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
-			return
-		}
-		s.setSessionCookie(c, token)
-		c.Header("Cache-Control", "no-store")
-		c.JSON(200, s.sessionView(c, session, "session"))
-		return
-	}
-	s.accountLogin(c, strings.ToLower(username), input.Password)
-}
-
-func (s *server) accountLogin(c *gin.Context, loginName, password string) {
-	ctx := c.Request.Context()
-	fail := func() {
+	if s.cfg.AdminUsername == "" || !constantEqual(username, s.cfg.AdminUsername) {
+		// 陪算一次 scrypt，免得靠响应时间分出用户名对不对
+		verifyPassword(input.Password, dummyPasswordHash())
 		s.failedLogin(c.ClientIP())
 		problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
-	}
-	acc, hash, err := s.platformAccountForLogin(ctx, loginName)
-	if err != nil {
-		problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
 		return
 	}
-	if acc == nil {
-		tenant, err := s.tenant.resolve(ctx, c.Request.Host)
-		if err != nil {
-			verifyPassword(password, dummyPasswordHash())
-			fail()
-			return
-		}
-		if acc, hash, err = s.tenantAccountForLogin(ctx, tenant.ID, loginName); err != nil {
-			problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
-			return
-		}
-	}
-	if acc == nil || acc.Status == accountDisabled {
-		verifyPassword(password, dummyPasswordHash())
-		fail()
-		return
-	}
-	if acc.Status == accountActive {
-		// 已绑定的账号本地口令已经作废。记一次失败，免得有人拿这个回答批量探登录名
+	if !verifyPassword(input.Password, s.cfg.AdminPasswordHash) {
 		s.failedLogin(c.ClientIP())
-		problem(c, http.StatusConflict, "ACCOUNT_BOUND_USE_CID", "This account is bound to a unified login account; sign in with unified login")
-		return
-	}
-	if hash == "" || !verifyPassword(password, hash) {
-		fail()
-		return
-	}
-	if acc.PasswordExpiresAt == nil || !time.Now().UTC().Before(*acc.PasswordExpiresAt) {
-		problem(c, 401, "INITIAL_PASSWORD_EXPIRED", "The initial password has expired; ask a platform administrator to reset it")
+		problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
 		return
 	}
 	s.clearLoginFailures(c.ClientIP())
-	session, token, err := s.createAdminSession(ctx, acc.actor(), acc.TenantID, acc.ID, loginMethodLocal)
+	session, token, err := s.createAdminSession(c.Request.Context(), s.cfg.AdminUsername, "", "", "")
 	if err != nil {
 		problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
 		return
 	}
-	s.touchTenantAccountLogin(ctx, acc.ID)
-	session.Account = acc
 	s.setSessionCookie(c, token)
 	c.Header("Cache-Control", "no-store")
 	c.JSON(200, s.sessionView(c, session, "session"))
 }
 
-func (s *server) createAdminSession(ctx context.Context, actorID, tenant, account, method string) (*adminSession, string, error) {
+// createAdminSession 落一条会话。账号会话（统一登录）带租户（平台管理员为空）、账号与统一认证账号 id；
+// 环境变量账号三者都为空。
+func (s *server) createAdminSession(ctx context.Context, actorID, tenant, account, subject string) (*adminSession, string, error) {
 	token := randomID(32)
 	now := time.Now().UTC()
 	expires := now.Add(time.Duration(s.cfg.AdminSessionTTL) * time.Second)
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,login_method,expires_at,created_at) VALUES (?,?,?,?,?,?,?)`,
-		sha256Hex(token), actorID, nullIfEmpty(tenant), nullIfEmpty(account), method, expires, now); err != nil {
+		`INSERT INTO admin_sessions (token_hash,actor_id,tenant_id,account_id,idp_subject,expires_at,created_at) VALUES (?,?,?,?,?,?,?)`,
+		sha256Hex(token), actorID, nullIfEmpty(tenant), nullIfEmpty(account), nullIfEmpty(subject), expires, now); err != nil {
 		return nil, "", err
 	}
-	return &adminSession{TokenHash: sha256Hex(token), Actor: actorID, ExpiresAt: expires, TenantID: tenant, AccountID: account, LoginMethod: method}, token, nil
+	return &adminSession{TokenHash: sha256Hex(token), Actor: actorID, ExpiresAt: expires, TenantID: tenant, AccountID: account, Subject: subject}, token, nil
 }
 
 func nullIfEmpty(v string) any {
@@ -401,13 +332,12 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 	view := gin.H{
 		"authenticated": true,
 		"method":        method,
-		"loginMethod":   nil,
 		"expiresAt":     nil,
 		"actorId":       actor(c),
 		"platformAdmin": false,
-		"tenantId":      nil,
-		"account":       nil,
-		"bindRequired":  false,
+		// 租户会话的租户；平台会话为 null。控制台据此把平台级设置做成只读（use-platform-session.ts）
+		"tenantId": nil,
+		"account":  nil,
 		// 账号会话的邮箱二次验证在这个时间之前有效；null = 没验过或已过期（环境变量账号与自动化通道不用）
 		"secondFactorUntil": nil,
 	}
@@ -418,7 +348,6 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 	}
 	view["actorId"] = session.Actor
 	view["expiresAt"] = iso(session.ExpiresAt)
-	view["loginMethod"] = session.LoginMethod
 	view["platformAdmin"] = s.platformAdminSession(session, session.Actor)
 	if session.tenantScoped() {
 		view["tenantId"] = session.TenantID
@@ -429,10 +358,7 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 	if until := session.SecondFactorAt.Add(secondFactorWindow); !session.SecondFactorAt.IsZero() && time.Now().Before(until) {
 		view["secondFactorUntil"] = iso(until)
 	}
-	if session.Account != nil {
-		view["account"] = session.Account.sessionView()
-		view["bindRequired"] = session.Account.Status == accountPendingBind
-	}
+	view["account"] = session.Account.sessionView()
 	return view
 }
 
@@ -464,11 +390,12 @@ func (s *server) logout(c *gin.Context) {
 	c.JSON(200, body)
 }
 
-// authMethods 是登录页要知道的：统一登录开没开。免登录，不泄露任何配置细节。
+// authMethods 是登录页要知道的：口令登录（只有环境变量账号，配了才有）与统一登录开没开。
+// 免登录，不泄露任何配置细节。
 func (s *server) authMethods(c *gin.Context) {
 	client, _, err := s.cidClient(c.Request.Context())
 	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"password": true, "cid": err == nil && client != nil})
+	c.JSON(200, gin.H{"password": s.cfg.AdminUsername != "", "cid": err == nil && client != nil})
 }
 
 var (
@@ -476,7 +403,7 @@ var (
 	dummyHash     string
 )
 
-// dummyPasswordHash 给「账号不存在」那条路陪算一次 scrypt，免得靠响应时间就能分出登录名存不存在。
+// dummyPasswordHash 给「用户名不对」那条路陪算一次 scrypt，免得靠响应时间就能分出用户名对不对。
 func dummyPasswordHash() string {
 	dummyHashOnce.Do(func() {
 		dummyHash, _ = hashPassword(randomID(18))
@@ -496,13 +423,4 @@ func requireAdminSessionTenant() gin.HandlerFunc {
 		}
 		c.Next()
 	}
-}
-
-// parseAccountID 只接受正整数 id。
-func parseAccountID(raw string) (string, bool) {
-	n, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || n == 0 {
-		return "", false
-	}
-	return strconv.FormatUint(n, 10), true
 }

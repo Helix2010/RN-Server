@@ -94,6 +94,9 @@ var migrations = []migration{
 	{version: 62, name: "admin_session_second_factor", apply: adminSessionSecondFactorMigration},
 	// 平台管理员也进账号表、走统一登录（设计 platform-accounts-and-console-login-2026-09-27 §3.1）
 	{version: 63, name: "platform_admin_accounts", apply: platformAdminAccountsMigration},
+	// 控制台账号改由外部系统写入，RN 只读：去掉登录名、初始口令、绑定与 RN 不再读的列，会话记下登录时的统一账号
+	// （设计 console-accounts-external-maintenance-2026-09-27 §6）
+	{version: 64, name: "external_console_accounts", apply: externalConsoleAccountsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2299,6 +2302,130 @@ func platformAdminAccountsMigration(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// externalConsoleAccountsMigration：tenant_admin_accounts 改由外部系统（统一登录的平台端）写入，RN 只读
+// （设计 console-accounts-external-maintenance-2026-09-27 §3、§6）。每一步都能重复执行（中途失败重跑也行：
+// 下面只引用不会被删的列）。
+//
+// 过不了新约束的行（从没绑定过统一认证、账号 id 不是小写 uuid、邮箱不像邮箱、状态是 pending_bind）在新规则下
+// 登不进来或收不到二次验证码，连同它们的会话一起删掉，否则下面加 CHECK 会失败。线上迁移前只读核对过：
+// 只有一个已绑定的成员，不会删到。
+//
+// RN 不再读的列与索引一并删掉：登录名、初始口令与绑定的列；idp（只有统一认证一种，恒为 chainup-cid）；
+// updated_at（外部系统的记账，RN 不读）；会话的 login_method（控制台不用，账号会话与环境变量账号靠
+// account_id 区分）与 ix_session_account（只给已删掉的停用、重置接口用）。
+func externalConsoleAccountsMigration(ctx context.Context, db *sql.DB) error {
+	for _, statement := range []string{
+		`DELETE FROM tenant_admin_accounts WHERE idp_subject IS NULL OR status NOT IN ('active','disabled')
+			OR NOT REGEXP_LIKE(idp_subject, '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', 'c') OR email NOT LIKE '_%@_%._%'`,
+		`DELETE s FROM admin_sessions s LEFT JOIN tenant_admin_accounts a ON a.id=s.account_id WHERE s.account_id IS NOT NULL AND a.id IS NULL`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("external console accounts migration cleanup: %w", err)
+		}
+	}
+	// 先建新的唯一键再删旧的：中间没有「没有唯一键」的窗口。账号 id 在前，回调按它查全部记录直接走这个索引
+	if err := addIndexIfMissing(ctx, db, "tenant_admin_accounts", "uq_tenant_admin_subject",
+		`ALTER TABLE tenant_admin_accounts ADD UNIQUE KEY uq_tenant_admin_subject (idp_subject, tenant_key) COMMENT '同一个统一认证账号在一个租户里最多一条、平台管理员里最多一条；统一登录回调按账号 id 查它的全部记录'`); err != nil {
+		return fmt.Errorf("external console accounts migration subject key: %w", err)
+	}
+	for _, index := range []struct{ table, name string }{
+		{"tenant_admin_accounts", "uq_tenant_admin_login"},
+		{"tenant_admin_accounts", "ix_tenant_admin_login_name"},
+		{"tenant_admin_accounts", "uq_tenant_admin_idp"},
+		{"tenant_admin_accounts", "ix_tenant_admin_subject"},
+		{"admin_sessions", "ix_session_account"},
+	} {
+		if err := dropIndexIfPresent(ctx, db, index.table, index.name); err != nil {
+			return fmt.Errorf("external console accounts migration drop %s: %w", index.name, err)
+		}
+	}
+	for _, column := range []struct{ table, name string }{
+		{"tenant_admin_accounts", "login_name"},
+		{"tenant_admin_accounts", "password_hash"},
+		{"tenant_admin_accounts", "password_expires_at"},
+		{"tenant_admin_accounts", "idp_email"},
+		{"tenant_admin_accounts", "bound_at"},
+		{"tenant_admin_accounts", "idp"},
+		{"tenant_admin_accounts", "updated_at"},
+		{"admin_sessions", "login_method"},
+	} {
+		if err := dropColumnIfPresent(ctx, db, column.table, column.name); err != nil {
+			return fmt.Errorf("external console accounts migration drop %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE tenant_admin_accounts
+		MODIFY display_name VARCHAR(120) NOT NULL DEFAULT '' COMMENT '显示名，外部系统写，只用于界面；可以为空串',
+		MODIFY email VARCHAR(255) NOT NULL COMMENT '二次验证码发到这个邮箱（必须是本人能收信的），外部系统写；不作登录依据、不唯一',
+		MODIFY idp_subject VARCHAR(120) NOT NULL COMMENT '统一认证 userinfo 的 username（账号 uuid，小写），外部系统写；登录时按它认人。改了它就是换了人，旧会话随即失效',
+		MODIFY status VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT 'active=能登录；disabled=停用，会话在下一个请求失效。外部系统写',
+		MODIFY created_by VARCHAR(120) NOT NULL DEFAULT '' COMMENT '谁分配的（外部系统自己的操作人），只用于显示',
+		MODIFY created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '分配时刻 UTC',
+		MODIFY last_login_at DATETIME(3) NULL COMMENT '最近一次统一登录成功的时刻 UTC，RN 写；NULL=从未登录'`); err != nil {
+		return fmt.Errorf("external console accounts migration columns: %w", err)
+	}
+	for _, check := range []struct{ name, expr string }{
+		{"ck_tenant_admin_status", `status IN ('active','disabled')`},
+		// 区分大小写：RN 把认证中心给的账号 id 转成小写再查，外部系统写了大写就永远对不上
+		{"ck_tenant_admin_subject", `REGEXP_LIKE(idp_subject, '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', 'c')`},
+		{"ck_tenant_admin_email", `email LIKE '_%@_%._%'`},
+	} {
+		var count int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tenant_admin_accounts' AND CONSTRAINT_NAME=?`,
+			check.name).Scan(&count); err != nil {
+			return fmt.Errorf("external console accounts migration inspect %s: %w", check.name, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE tenant_admin_accounts ADD CONSTRAINT `+check.name+` CHECK (`+check.expr+`)`); err != nil {
+			return fmt.Errorf("external console accounts migration %s: %w", check.name, err)
+		}
+	}
+	if err := addColumnIfMissing(ctx, db, "admin_sessions", "idp_subject",
+		`ALTER TABLE admin_sessions ADD COLUMN idp_subject VARCHAR(120) NULL
+			COMMENT '账号会话登录时的统一认证账号 id；每个请求核对账号当前的 idp_subject，对不上（外部系统换了人）就当没登录。NULL=环境变量里的管理员账号' AFTER account_id`); err != nil {
+		return fmt.Errorf("external console accounts migration session subject: %w", err)
+	}
+	for _, statement := range []string{
+		// 现有账号会话本来就是这个人登出来的：回填，不用让人重新登录
+		`UPDATE admin_sessions s JOIN tenant_admin_accounts a ON a.id=s.account_id SET s.idp_subject=a.idp_subject WHERE s.idp_subject IS NULL`,
+		`ALTER TABLE tenant_admin_accounts COMMENT='控制台账号：租户成员（scope=tenant）与平台管理员（scope=platform）。由外部系统（统一登录的平台端）分配写入，RN 只读（登录成功时写 last_login_at）；同一个统一认证账号可以分别是多个租户的成员，同时有平台与租户记录时 RN 拒绝登录'`,
+		`ALTER TABLE admin_sessions MODIFY account_id BIGINT UNSIGNED NULL
+			COMMENT '会话对应的 tenant_admin_accounts.id（租户成员或平台管理员）；鉴权时每次回表查状态与统一认证账号。NULL=环境变量里的管理员账号'`,
+		`ALTER TABLE admin_sessions MODIFY second_factor_at DATETIME(3) NULL
+			COMMENT '账号会话（租户成员与平台管理员）最近一次通过邮箱二次验证的时间；敏感操作要在 15 分钟内。NULL=这个会话还没验过。环境变量账号不用'`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("external console accounts migration comments: %w", err)
+		}
+	}
+	return nil
+}
+
+func dropIndexIfPresent(ctx context.Context, db *sql.DB, table, index string) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?`, table, index).Scan(&count); err != nil {
+		return fmt.Errorf("inspect: %w", err)
+	}
+	if count == 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `ALTER TABLE `+table+` DROP INDEX `+index)
+	return err
+}
+
+func dropColumnIfPresent(ctx context.Context, db *sql.DB, table, column string) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, table, column).Scan(&count); err != nil {
+		return fmt.Errorf("inspect: %w", err)
+	}
+	if count == 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN `+column)
+	return err
 }
 
 // addIndexIfMissing 让加索引的迁移可以重复执行：MySQL 没有 ADD INDEX IF NOT EXISTS。

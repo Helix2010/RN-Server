@@ -21,22 +21,15 @@ import (
 //
 // 流程（浏览器都在 console.<租户域名> 上）：
 //
-//	GET /v1/admin/auth/cid/start?mode=login|bind&target=/xxx
-//	    生成 state 与 PKCE，连同 mode、target、回调地址加密进临时 Cookie rn_cid_flow_<state 前 8 位>
+//	GET /v1/admin/auth/cid/start?mode=login&target=/xxx
+//	    生成 state 与 PKCE，连同 target、回调地址加密进临时 Cookie rn_cid_flow_<state 前 8 位>
 //	    （Path=/client/v1/oauth/login，SameSite=Lax，10 分钟），302 去认证中心授权。
-//	    mode=bind 必须来自一个待绑定账号的已登录会话，会话 id 的哈希也进 Cookie。
 //	GET /client/v1/oauth/login?code&state     ← 认证中心固定的回调路径，不能自定义
-//	    核 state、换令牌、查 userinfo（服务端直连，令牌用完即弃）。
-//	    login：按 (租户, 统一认证账号) 找已绑定的账号，设会话 Cookie，回到 target；
-//	    bind：认证中心没给邮箱就拒绝（no_email：绑定要往这个邮箱发验证码）；把「要绑定的统一认证账号」
-//	          加密进 rn_cid_bind（Path=/v1/admin/auth/cid，10 分钟），跳到控制台的确认页；
-//	          本人收到验证码并确认后才落库（防绑定 CSRF 与绑错，设计 §4.3「要防的」，cid_bind_code.go）。
-//	GET  /v1/admin/auth/cid/bind            确认页取「将绑定到哪个账号」
-//	POST /v1/admin/auth/cid/bind/code       给那个统一认证账号的邮箱发验证码
-//	POST /v1/admin/auth/cid/bind/confirm    {codeToken, code} 落库：本地口令作废，账号变 active；再给账号登记的邮箱发绑定通知
+//	    核 state、换令牌、查 userinfo（服务端直连，令牌用完即弃），按统一认证账号认人（accountForLogin），
+//	    设会话 Cookie，回到 target。
 //
-// rn_cid_bind 用 SameSite=Lax：读它的两个 POST 跨站带不上 Lax Cookie，GET 只把结果回给本人的浏览器；
-// 不用 Strict，是为了不依赖各浏览器怎么对待「经跨站跳转进来的页面」上的 Strict Cookie。
+// 账号由外部系统写进 tenant_admin_accounts，RN 不建号、不绑定、不自动开户
+// （设计 console-accounts-external-maintenance-2026-09-27 §4.1）。
 //
 // 回调与会话 Cookie 都在控制台域名上。nginx 转发 console.* 的请求时把 Host 改写成了 api.*，
 // 所以控制台域名从 X-RN-Console-Host 头取（nginx 写的），并核对它与 Host 属于同一个租户；
@@ -46,9 +39,7 @@ const (
 	cidConfigKey      = "auth.cid"
 	cidCallbackPath   = "/client/v1/oauth/login"
 	cidFlowCookie     = "rn_cid_flow_"
-	cidBindCookie     = "rn_cid_bind"
 	cidFlowTTL        = 10 * time.Minute
-	cidBindTTL        = 10 * time.Minute // 要留出去邮箱收验证码的时间（验证码也是 10 分钟）
 	consoleHostHeader = "X-RN-Console-Host"
 )
 
@@ -59,22 +50,18 @@ var cidHTTPClient = cid.DefaultHTTPClient()
 // cidSubjectPattern：认证中心的账号 id 是 uuid。对不上就拒绝，不猜——换了格式要先看清楚再放行。
 var cidSubjectPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
-// cidIdentity 把 userinfo 规范成我们存的样子：账号 id 统一小写；邮箱只作显示与发信，过长就不要。
+// cidSubject 从 userinfo 取统一认证账号 id，统一成小写（表里存的样子，CHECK 只收小写 uuid）。
+// userinfo 里的邮箱不用：二次验证发到外部系统写在账号记录里的邮箱。
 // SDK 只挡空白与控制字符，uuid 这条是 RN 自己的要求。错误里不带对方给的值。
-func cidIdentity(info *cid.User) (cid.User, error) {
+func cidSubject(info *cid.User) (string, error) {
 	if info == nil || !cidSubjectPattern.MatchString(info.Subject) {
-		return cid.User{}, errors.New("unified login returned an account id that is not a uuid")
+		return "", errors.New("unified login returned an account id that is not a uuid")
 	}
-	email := strings.TrimSpace(info.Email)
-	if len(email) > 255 {
-		email = ""
-	}
-	return cid.User{Subject: strings.ToLower(info.Subject), Email: email}, nil
+	return strings.ToLower(info.Subject), nil
 }
 
 func cidSecretAAD() string            { return "auth-cid:client-secret" }
 func cidFlowAAD(tenant string) string { return "auth-cid:flow:" + tenant }
-func cidBindAAD(tenant string) string { return "auth-cid:bind:" + tenant }
 
 // cidStored 是 app_configs 平台级 auth.cid 的 config_value。客户端密钥整份加密。
 type cidStored struct {
@@ -280,7 +267,7 @@ func (s *server) updateCIDConfig(c *gin.Context) {
 	c.JSON(200, cidConfigView(&cidRecord{Value: value, Version: currentVersion + 1, UpdatedBy: actor(c), UpdatedAt: now}))
 }
 
-// deleteCIDConfig 关掉统一登录。已绑定的账号之后登不进来，直到重新配置；平台账号不受影响。
+// deleteCIDConfig 关掉统一登录。控制台账号之后都登不进来，直到重新配置；环境变量账号（过渡期）不受影响。
 func (s *server) deleteCIDConfig(c *gin.Context) {
 	reason := strings.TrimSpace(c.Query("reason"))
 	if len(reason) < 3 {
@@ -342,19 +329,8 @@ func (s *server) consoleHost(c *gin.Context) string {
 type cidFlow struct {
 	State       string    `json:"s"`
 	Verifier    string    `json:"v"`
-	Mode        string    `json:"m"`
 	Target      string    `json:"t"`
 	RedirectURI string    `json:"r"`
-	SessionHash string    `json:"h,omitempty"`
-	ExpiresAt   time.Time `json:"e"`
-}
-
-// cidPendingBind 是回调之后、本人确认之前的「要绑定哪个统一认证账号」。
-type cidPendingBind struct {
-	SessionHash string    `json:"h"`
-	AccountID   string    `json:"a"`
-	Subject     string    `json:"sub"`
-	Email       string    `json:"email"`
 	ExpiresAt   time.Time `json:"e"`
 }
 
@@ -418,30 +394,11 @@ func (s *server) startCIDLogin(c *gin.Context) {
 		cidFail(c, "not_configured")
 		return
 	}
-	flow := cidFlow{Mode: c.Query("mode"), Target: safeConsoleTarget(c.Query("target")), ExpiresAt: time.Now().UTC().Add(cidFlowTTL)}
-	switch flow.Mode {
-	case "login":
-	case "bind":
-		session, err := s.loadAdminSession(c)
-		if err != nil {
-			cidFail(c, "internal")
-			return
-		}
-		if session == nil || !session.hasAccount() || session.Account.Status != accountPendingBind {
-			cidFail(c, "bind_not_allowed")
-			return
-		}
-		// 发起绑定前要 15 分钟内过邮箱二次验证：初始口令泄露时，别人抢不先绑（second_factor.go）
-		if !secondFactorFresh(session, s.now()) {
-			cidFail(c, "second_factor_required")
-			return
-		}
-		flow.SessionHash = session.TokenHash
-		flow.Target = "/"
-	default:
-		problem(c, 400, "INVALID_CID_MODE", "mode must be login or bind")
+	if c.Query("mode") != "login" {
+		problem(c, 400, "INVALID_CID_MODE", "mode must be login")
 		return
 	}
+	flow := cidFlow{Target: safeConsoleTarget(c.Query("target")), ExpiresAt: time.Now().UTC().Add(cidFlowTTL)}
 	host := s.consoleHost(c)
 	flow.RedirectURI = "https://" + host + cidCallbackPath
 	// state 与 PKCE 由 SDK 生成；时效与「只认发起它的浏览器」仍由我们的加密 Cookie 管
@@ -501,38 +458,34 @@ func (s *server) cidCallback(c *gin.Context) {
 		return
 	}
 	info, err := client.UserInfo(ctx, exchanged.AccessToken)
-	var user cid.User
+	var subject string
 	if err == nil {
-		user, err = cidIdentity(info)
+		subject, err = cidSubject(info)
 	}
 	if err != nil {
 		slog.Warn("unified login userinfo failed", "error", err, "tenant", tenantID(c))
 		cidFail(c, "userinfo")
 		return
 	}
-	if flow.Mode == "bind" {
-		s.cidCallbackBind(c, flow, user)
-		return
-	}
-	// 先找平台管理员，再找这个域名所属租户的成员。同一个统一账号不会两者都是（绑定时挡住），先后只是写法
-	acc, err := s.platformAccountBySubject(ctx, user.Subject)
-	if err == nil && acc == nil {
-		acc, err = s.tenantAccountBySubject(ctx, tenantID(c), user.Subject)
-	}
+	accounts, err := s.accountsBySubject(ctx, subject)
 	if err != nil {
 		cidFail(c, "internal")
 		return
 	}
-	if acc == nil {
-		cidFail(c, "unbound")
-		return
+	acc, refused := accountForLogin(accounts, tenantID(c))
+	if refused == "identity_conflict" {
+		ids := make([]string, 0, len(accounts))
+		for _, a := range accounts {
+			ids = append(ids, a.Scope+":"+a.ID)
+		}
+		slog.Warn("unified login refused: the account is both a platform administrator and a tenant member", "subject", subject, "accounts", ids, "tenant", tenantID(c))
 	}
-	if acc.Status != accountActive {
-		cidFail(c, "disabled")
+	if refused != "" {
+		cidFail(c, refused)
 		return
 	}
 	// 平台管理员的会话不属于任何租户（tenant_id 为 NULL），在任何控制台域名上都有效
-	_, token, err := s.createAdminSession(ctx, acc.actor(), acc.TenantID, acc.ID, loginMethodCID)
+	_, token, err := s.createAdminSession(ctx, acc.actor(), acc.TenantID, acc.ID, acc.IDPSubject)
 	if err != nil {
 		cidFail(c, "internal")
 		return
@@ -543,205 +496,37 @@ func (s *server) cidCallback(c *gin.Context) {
 	c.Redirect(http.StatusFound, flow.Target)
 }
 
-func (s *server) cidCallbackBind(c *gin.Context, flow cidFlow, user cid.User) {
-	ctx := c.Request.Context()
-	if !strings.Contains(user.Email, "@") {
-		cidFail(c, "no_email")
-		return
+// accountForLogin 按统一认证账号的全部记录决定这次登录用哪个身份（设计 console-accounts-external-maintenance §4.1）：
+//   - 既有平台记录又有任何一条租户记录 → identity_conflict（外部系统写错了，不猜）；
+//   - 只有平台记录 → 平台管理员；
+//   - 有当前域名所属租户的记录 → 这个租户的成员；
+//   - 其余 → no_access。
+//
+// 选中的账号不是 active → disabled。
+func accountForLogin(accounts []*tenantAccount, tenant string) (*tenantAccount, string) {
+	var platform, here *tenantAccount
+	members := 0
+	for _, a := range accounts {
+		if a.platform() {
+			platform = a
+			continue
+		}
+		members++
+		if a.TenantID == tenant {
+			here = a
+		}
 	}
-	var sessionTenant, accountID sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT tenant_id, account_id FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`,
-		flow.SessionHash, time.Now().UTC()).Scan(&sessionTenant, &accountID)
-	if err != nil || !accountID.Valid {
-		cidFail(c, "bind_session")
-		return
-	}
-	var acc *tenantAccount
+	acc := here
 	switch {
-	case !sessionTenant.Valid:
-		// 待绑定的平台管理员：会话不属于任何租户，在哪个控制台域名上绑都行
-		acc, err = platformAccountByID(ctx, s.db, accountID.String)
-	case sessionTenant.String == tenantID(c):
-		acc, err = s.tenantAccountByID(ctx, tenantID(c), accountID.String)
-	default:
-		cidFail(c, "bind_session")
-		return
+	case platform != nil && members > 0:
+		return nil, "identity_conflict"
+	case platform != nil:
+		acc = platform
+	case here == nil:
+		return nil, "no_access"
 	}
-	if err != nil || acc == nil || acc.Status != accountPendingBind {
-		cidFail(c, "bind_not_allowed")
-		return
+	if acc.Status != accountActive {
+		return nil, "disabled"
 	}
-	if conflict, err := s.bindConflict(ctx, acc, user.Subject); err != nil {
-		cidFail(c, "internal")
-		return
-	} else if conflict != "" {
-		cidFail(c, conflict)
-		return
-	}
-	sealed, err := s.sealCookie(cidPendingBind{SessionHash: flow.SessionHash, AccountID: acc.ID, Subject: user.Subject, Email: user.Email,
-		ExpiresAt: time.Now().UTC().Add(cidBindTTL)}, cidBindAAD(acc.auditTenant()))
-	if err != nil {
-		cidFail(c, "internal")
-		return
-	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: cidBindCookie, Value: sealed, Path: "/v1/admin/auth/cid",
-		MaxAge: int(cidBindTTL.Seconds()), HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
-	c.Header("Cache-Control", "no-store")
-	c.Redirect(http.StatusFound, "/cid/bind-confirm")
-}
-
-// bindConflict 在回调时先挡一遍（确认落库时在事务里加锁再挡一遍，confirmCIDBind）：
-//   - 同一个租户里已有账号绑了它、或另一个平台管理员绑了它 → already_bound；
-//   - 同一个统一账号不能既是平台管理员又是租户成员（用户 2026-09-27 定）→ already_member / already_platform。
-func (s *server) bindConflict(ctx context.Context, acc *tenantAccount, subject string) (string, error) {
-	platformOwner, err := s.platformAccountBySubject(ctx, subject)
-	if err != nil {
-		return "", err
-	}
-	if acc.platform() {
-		if platformOwner != nil {
-			return "already_bound", nil
-		}
-		member, err := s.subjectIsTenantMember(ctx, subject)
-		if err != nil || !member {
-			return "", err
-		}
-		return "already_member", nil
-	}
-	if platformOwner != nil {
-		return "already_platform", nil
-	}
-	other, err := s.tenantAccountBySubject(ctx, acc.TenantID, subject)
-	if err != nil || other == nil {
-		return "", err
-	}
-	return "already_bound", nil
-}
-
-// pendingBindFor 读 rn_cid_bind，核对它属于当前会话与当前账号。
-func (s *server) pendingBindFor(c *gin.Context) (*cidPendingBind, *adminSession) {
-	session := currentAdminSession(c)
-	if !session.hasAccount() || session.Account.Status != accountPendingBind {
-		return nil, session
-	}
-	raw, err := c.Cookie(cidBindCookie)
-	if err != nil {
-		return nil, session
-	}
-	var pending cidPendingBind
-	if s.openCookie(raw, cidBindAAD(session.Account.auditTenant()), &pending) != nil || time.Now().UTC().After(pending.ExpiresAt) ||
-		!constantEqual(pending.SessionHash, session.TokenHash) || pending.AccountID != session.AccountID {
-		return nil, session
-	}
-	return &pending, session
-}
-
-func (s *server) getPendingCIDBind(c *gin.Context) {
-	pending, session := s.pendingBindFor(c)
-	c.Header("Cache-Control", "no-store")
-	if pending == nil {
-		problem(c, 404, "CID_BIND_NOT_PENDING", "There is no unified login account waiting to be bound; start binding again")
-		return
-	}
-	c.JSON(200, gin.H{"account": session.Account.sessionView(), "cid": gin.H{"email": nullableString(pending.Email)}, "expiresAt": iso(pending.ExpiresAt)})
-}
-
-func (s *server) confirmCIDBind(c *gin.Context) {
-	var body struct {
-		CodeToken string `json:"codeToken"`
-		Code      string `json:"code"`
-	}
-	if decodeLimited(c, &body, 4<<10) != nil {
-		problem(c, 400, "INVALID_CID_BIND", "codeToken and code are required")
-		return
-	}
-	pending, session := s.pendingBindFor(c)
-	if pending == nil {
-		problem(c, 404, "CID_BIND_NOT_PENDING", "There is no unified login account waiting to be bound; start binding again")
-		return
-	}
-	if !s.bindCodes.verify(session.AccountID, body.CodeToken, body.Code, pending.Subject, pending.Email, s.now()) {
-		problem(c, 400, "CID_BIND_CODE_INVALID", "The verification code is invalid or expired")
-		return
-	}
-	ctx := c.Request.Context()
-	now := time.Now().UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		problem(c, 500, "CID_BIND_FAILED", "Unable to bind the account")
-		return
-	}
-	defer tx.Rollback()
-	// 同一个统一账号不能既是平台管理员又是租户成员：锁住绑了它的所有行（ix_tenant_admin_subject）再判断，
-	// 两边同时绑定时后一个等前一个提交、看到它的结果。同一租户里重复绑定仍由唯一键挡
-	if code, err := bindConflictLocked(ctx, tx, session.Account, pending.Subject); err != nil {
-		problem(c, 500, "CID_BIND_FAILED", "Unable to bind the account")
-		return
-	} else if code != "" {
-		problem(c, 409, code, bindConflictDetail[code])
-		return
-	}
-	result, err := tx.ExecContext(ctx,
-		`UPDATE tenant_admin_accounts SET idp=?,idp_subject=?,idp_email=?,status=?,password_hash=NULL,password_expires_at=NULL,bound_at=?,updated_at=? WHERE id=? AND tenant_key=? AND status=?`,
-		idpChainupCID, pending.Subject, nullIfEmpty(pending.Email), accountActive, now, now, session.AccountID, session.Account.auditTenant(), accountPendingBind)
-	if isDuplicateEntry(err) {
-		problem(c, 409, "CID_ACCOUNT_ALREADY_BOUND", "This unified login account is already bound to another account of this tenant")
-		return
-	}
-	if err != nil {
-		problem(c, 500, "CID_BIND_FAILED", "Unable to bind the account")
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		problem(c, 409, "CID_BIND_NOT_PENDING", "The account is no longer waiting to be bound")
-		return
-	}
-	event := newAudit(session.auditTenant(), session.Actor, session.Account.auditAction("bind"), session.Account.auditTarget(), session.AccountID, "绑定统一认证账号", requestID(c),
-		map[string]any{"idp": idpChainupCID, "subject": pending.Subject, "email": nullableString(pending.Email), "loginName": session.Account.LoginName})
-	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
-		problem(c, 500, "CID_BIND_FAILED", "Unable to bind the account")
-		return
-	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: cidBindCookie, Value: "", Path: "/v1/admin/auth/cid", MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteLaxMode})
-	s.sendCIDBindNotice(c, session, pending.Email, now)
-	space := tenantSpace(session.TenantID)
-	if session.Account.platform() {
-		space = platformSpace
-	}
-	if acc, err := accountInSpace(ctx, s.db, space, session.AccountID); err == nil && acc != nil {
-		session.Account = acc
-	}
-	c.Header("Cache-Control", "no-store")
-	c.JSON(200, s.sessionView(c, session, "session"))
-}
-
-var bindConflictDetail = map[string]string{
-	"CID_ACCOUNT_ALREADY_BOUND":     "This unified login account is already bound to another platform administrator",
-	"CID_ACCOUNT_IS_TENANT_MEMBER":  "This unified login account is a tenant member; it cannot also be a platform administrator",
-	"CID_ACCOUNT_IS_PLATFORM_ADMIN": "This unified login account is a platform administrator; it cannot also be a tenant member",
-}
-
-// bindConflictLocked 是 bindConflict 在确认事务里的版本：FOR UPDATE 锁住绑了这个统一账号的所有行。
-func bindConflictLocked(ctx context.Context, tx *sql.Tx, acc *tenantAccount, subject string) (string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT scope FROM tenant_admin_accounts WHERE idp=? AND idp_subject=? AND id<>? FOR UPDATE`, idpChainupCID, subject, acc.ID)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	code := ""
-	for rows.Next() {
-		var scope string
-		if err := rows.Scan(&scope); err != nil {
-			return "", err
-		}
-		switch {
-		case acc.platform() && scope == scopePlatform:
-			code = "CID_ACCOUNT_ALREADY_BOUND"
-		case acc.platform():
-			code = "CID_ACCOUNT_IS_TENANT_MEMBER"
-		case scope == scopePlatform:
-			code = "CID_ACCOUNT_IS_PLATFORM_ADMIN"
-		}
-	}
-	return code, rows.Err()
+	return acc, ""
 }

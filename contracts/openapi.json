@@ -456,7 +456,7 @@
         },
         "responses": {
           "200": {
-            "description": "Authenticated。用户名等于 ADMIN_USERNAME 走平台账号；否则按请求域名的租户找待绑定的租户账号用初始口令登录。已绑定的账号 409 ACCOUNT_BOUND_USE_CID；初始口令过期 401 INITIAL_PASSWORD_EXPIRED"
+            "description": "Authenticated。只剩环境变量里的管理员账号（ADMIN_USERNAME）能用口令登录（过渡期保留）；控制台账号没有本地口令，只走统一登录。用户名或口令不对一律 401 INVALID_CREDENTIALS"
           }
         }
       }
@@ -474,7 +474,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session：platformAdmin（平台会话且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、loginMethod（password|cid）、tenantId（租户会话的租户，平台会话为 null）、account（租户账号：id、displayName、loginName、email、status、boundEmail）、bindRequired 租户会话另有 secondFactorUntil（邮箱二次验证的有效期，null=没验过或已过期）。"
+            "description": "Session：platformAdmin（可用的平台管理员账号，或没有账号且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、tenantId（租户会话的租户，平台会话为 null）、account（账号会话：id、displayName、email；环境变量账号与自动化通道为 null）、secondFactorUntil（账号会话邮箱二次验证的有效期，null=没验过或已过期）。"
           }
         }
       }
@@ -7323,7 +7323,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "登录页用：{password:true, cid:<统一登录是否已配置>}；免登录"
+            "description": "登录页用：{password:<配了环境变量账号>, cid:<统一登录是否已配置>}；免登录"
           }
         }
       }
@@ -7332,7 +7332,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "302 去认证中心授权（出错时 302 回 /?cidError=<码>）"
+            "description": "302 去认证中心授权（出错时 302 回 /?cidError=<码>）；mode 不是 login 时 400 INVALID_CID_MODE"
           }
         },
         "parameters": [
@@ -7343,7 +7343,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "login=统一登录；bind=待绑定账号绑定统一认证账号（要已登录会话）"
+            "description": "只能是 login"
           },
           {
             "name": "target",
@@ -7361,7 +7361,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "认证中心的回调（路径固定）：login 设会话后 302 回 target；bind 302 到控制台 /cid/bind-confirm；出错 302 /?cidError=<码>"
+            "description": "认证中心的回调（路径固定）：按统一认证账号在 tenant_admin_accounts 的全部记录认人，设会话后 302 回 target。出错 302 /?cidError=<码>：no_access（没有平台记录，也没有当前域名租户的记录）、disabled（选中的记录已停用）、identity_conflict（同时有平台记录与租户记录，拒绝并记日志）、state、denied、exchange、userinfo、not_configured、internal"
           }
         },
         "parameters": [
@@ -7393,53 +7393,6 @@
             "description": "认证中心拒绝时的错误"
           }
         ]
-      }
-    },
-    "/v1/admin/auth/cid/bind": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "待确认的绑定：{account, cid:{email}, expiresAt}；没有 404 CID_BIND_NOT_PENDING"
-          }
-        }
-      }
-    },
-    "/v1/admin/auth/cid/bind/code": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "给待绑定的统一认证账号邮箱发验证码：{codeToken, expiresAt, resendAfter}。平台没配发信 503 MAIL_NOT_CONFIGURED；1 分钟 1 次、每账号每小时 5 次 429 CID_BIND_CODE_RATE_LIMITED；发送失败 502 MAIL_SEND_FAILED"
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object"
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/admin/auth/cid/bind/confirm": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "本人确认绑定：body {codeToken, code}（发到统一认证账号邮箱的验证码，10 分钟，输错 5 次作废；不对 400 CID_BIND_CODE_INVALID）；账号变 active、本地口令作废，返回新的 Session；随后给账号登记的邮箱发绑定通知（同步，最多 10 秒；发不出去只写审计 tenant_account_bind_notice，不影响结果）；统一认证账号已绑本租户别的账号 409 CID_ACCOUNT_ALREADY_BOUND"
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object"
-              }
-            }
-          }
-        }
       }
     },
     "/v1/admin/platform/auth/cid": {
@@ -7553,107 +7506,14 @@
       "get": {
         "responses": {
           "200": {
-            "description": "当前域名租户的控制台成员（只有平台管理员）：{items:[{id, scope, displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}"
-          }
-        }
-      },
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Created"
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object"
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/admin/tenant-accounts/{id}/disable": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "停用：会话立即失效"
-          }
-        },
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "minLength": 3
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/admin/tenant-accounts/{id}/reset": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "解绑并重置初始口令：回到待绑定，返回 {account, initialPassword, passwordExpiresAt}；会话立即失效"
-          }
-        },
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "minLength": 3
-                  }
-                }
-              }
-            }
+            "description": "当前域名租户的控制台成员，只读（只有平台管理员能看）：{items:[{id, displayName, email, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt}]}。账号由外部系统写进 tenant_admin_accounts，RN 不建号、不改（设计 console-accounts-external-maintenance-2026-09-27）"
           }
         }
       }
     },
     "/v1/admin/auth/second-factor/code": {
       "post": {
-        "summary": "租户会话的邮箱二次验证：给成员登记的邮箱发验证码（设计 tenant-console-accounts-and-sso §4.5）",
+        "summary": "账号会话的邮箱二次验证：给账号记录里的邮箱发验证码（设计 tenant-console-accounts-and-sso §4.5）",
         "requestBody": {
           "required": true,
           "content": {
@@ -7672,7 +7532,7 @@
             "description": "Admin authentication required"
           },
           "400": {
-            "description": "SECOND_FACTOR_NOT_APPLICABLE：平台会话不用"
+            "description": "SECOND_FACTOR_NOT_APPLICABLE：没有账号的会话（环境变量账号、自动化）不用"
           },
           "409": {
             "description": "SECOND_FACTOR_NO_EMAIL"
@@ -7719,104 +7579,9 @@
       "get": {
         "responses": {
           "200": {
-            "description": "平台管理员账号（只有平台管理员能看）：{items:[{id, scope:\"platform\", displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}。平台管理员账号做写操作要 15 分钟内过邮箱二次验证（403 SECOND_FACTOR_REQUIRED）"
+            "description": "平台管理员账号，只读（只有平台管理员能看）：{items:[{id, displayName, email, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt}]}。账号由外部系统维护；平台管理员账号做平台级写操作要 15 分钟内过邮箱二次验证（403 SECOND_FACTOR_REQUIRED）"
           }
         }
-      },
-      "post": {
-        "responses": {
-          "201": {
-            "description": "{account, initialPassword（只出现这一次）, passwordExpiresAt}。登录名不能与任何账号重名（409 LOGIN_NAME_TAKEN）"
-          }
-        },
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object"
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/admin/platform/accounts/{id}/disable": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "停用：会话立即失效"
-          }
-        },
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "minLength": 3
-                  }
-                }
-              }
-            }
-          }
-        },
-        "description": "停用平台管理员账号（立即删掉它的会话）。不能对自己做（409 CANNOT_CHANGE_OWN_ACCOUNT），不能让最后一个可用的平台管理员失效（409 LAST_PLATFORM_ADMIN）"
-      }
-    },
-    "/v1/admin/platform/accounts/{id}/reset": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "解绑并重置初始口令：回到待绑定，返回 {account, initialPassword, passwordExpiresAt}；会话立即失效"
-          }
-        },
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "reason"
-                ],
-                "properties": {
-                  "reason": {
-                    "type": "string",
-                    "minLength": 3
-                  }
-                }
-              }
-            }
-          }
-        },
-        "description": "解绑并重置初始口令，回到待绑定。不能对自己做（409 CANNOT_CHANGE_OWN_ACCOUNT），不能让最后一个可用的平台管理员失效（409 LAST_PLATFORM_ADMIN）"
       }
     }
   },

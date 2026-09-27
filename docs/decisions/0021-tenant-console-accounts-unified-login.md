@@ -1,6 +1,6 @@
 # ADR-0021：租户控制台账号与统一登录（ChainUp 认证中心）
 
-状态：Accepted（2026-09-26）
+状态：Accepted（2026-09-26）。第 4、5、7 条（RN 建号、初始口令、待绑定、本人绑定）已被 ADR-0024 取代（2026-09-27）：账号改由外部系统写入，RN 只鉴别。
 
 完整设计：`docs/design/tenant-console-accounts-and-sso-2026-09-25.md`（下称「设计」）；表与配置：`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`；接口：`contracts/openapi.json`。
 

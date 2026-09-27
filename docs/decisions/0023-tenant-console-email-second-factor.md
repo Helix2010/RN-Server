@@ -1,6 +1,6 @@
 # ADR-0023：租户控制台的邮箱二次验证
 
-状态：Accepted（2026-09-27）
+状态：Accepted（2026-09-27）。第 5 条（发起绑定前要验）随绑定流程一起删掉（ADR-0024）；第 1 条已扩到平台管理员账号（设计 platform-accounts-and-console-login §3.5）；验证码发到外部系统写在账号记录里的邮箱。
 
 表：`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`（`admin_sessions.second_factor_at`，迁移 62）；接口：`contracts/openapi.json`；实现：`internal/api/second_factor.go`；上下文：ADR-0021、ADR-0022，设计 tenant-console-accounts-and-sso-2026-09-25 §4.5。
 

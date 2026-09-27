@@ -1,5 +1,7 @@
 # 租户控制台账号与统一认证（ChainUp 认证中心）（2026-09-25）
 
+> 2026-09-27：账号的生命周期（RN 建号、初始口令、待绑定、本人绑定、控制台里停用与解绑重置）已被 [console-accounts-external-maintenance-2026-09-27.md](console-accounts-external-maintenance-2026-09-27.md) 取代：账号改由外部系统写入 `tenant_admin_accounts`，RN 只鉴别。本文的会话隔离、Origin 检查、统一登录接入与二次验证仍有效。
+
 ## 0. 结论
 
 背景：

@@ -2,10 +2,12 @@ package api
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,9 +21,10 @@ import (
 	"github.com/Helix2010/RN-Server/internal/store"
 )
 
-// 租户控制台账号与统一登录走真实路由的回归（设计 tenant-console-accounts-and-sso-2026-09-25 §3、§4）。
-// 两个租户、各自 console.* 与 api.* 两个域名（nginx 把 console.* 的 Host 改写成 api.*，并写 X-RN-Console-Host）；
-// 认证中心用本地假实现，按真实形状应答（出错时 HTTP 200 + {code,msg}）。
+// 控制台账号与统一登录走真实路由的回归（设计 tenant-console-accounts-and-sso-2026-09-25 §3、§4，
+// console-accounts-external-maintenance-2026-09-27）。账号由外部系统写进 tenant_admin_accounts，测试里用
+// externalAccount 直接写库来模拟。两个租户、各自 console.* 与 api.* 两个域名（nginx 把 console.* 的 Host
+// 改写成 api.*，并写 X-RN-Console-Host）；认证中心用本地假实现，按真实形状应答（出错时 HTTP 200 + {code,msg}）。
 
 type accountsTestTenant struct {
 	id      string
@@ -48,6 +51,30 @@ func accountsTestTenantRow(t *testing.T, db *sql.DB, label string) accountsTestT
 	}
 	tenant.id = strconv.FormatInt(id, 10)
 	return tenant
+}
+
+// testSubject 是一个随机的统一认证账号 id（小写 uuid）：测试库是持久的，平台记录按账号 id 唯一。
+func testSubject() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// externalAccount 模拟外部系统写一行账号：只写契约里外部系统要写的列，其余靠数据库默认值
+// （设计 console-accounts-external-maintenance §3）。tenant 为空 = 平台管理员。
+func externalAccount(t *testing.T, db *sql.DB, tenant, subject, email string) string {
+	t.Helper()
+	scope := scopeTenant
+	if tenant == "" {
+		scope = scopePlatform
+	}
+	result, err := db.Exec(`INSERT INTO tenant_admin_accounts (scope,tenant_id,idp_subject,email,display_name,created_by) VALUES (?,?,?,?,?,?)`,
+		scope, nullIfEmpty(tenant), subject, email, "外部-"+subject[:8], "ext-ops")
+	if err != nil {
+		t.Fatalf("insert %s account: %v", scope, err)
+	}
+	id, _ := result.LastInsertId()
+	return strconv.FormatInt(id, 10)
 }
 
 // fakeCIDServer 模拟认证中心的换令牌与 userinfo。grant 登记「用户在认证中心登录成功后发出的授权码」。
@@ -227,80 +254,37 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	}
 	clearCID()
 	t.Cleanup(clearCID)
-	// mail.smtp 同理（绑定验证码要发信）
-	clearMail := func() {
-		_, _ = db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, platformTenantID, mailConfigKey)
-	}
-	clearMail()
-	t.Cleanup(clearMail)
 	router := New(cfg, &store.Store{DB: db})
 	cidServer := newFakeCIDServer(t)
-	smtpServer := startTestSMTP(t)
 	newBrowser := func(tenant accountsTestTenant) *browser {
 		return &browser{router: router, tenant: tenant, cookies: map[string]string{}}
 	}
-	subject := "3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b"
+	// cidLogin 从发起走到回调，返回回调之后跳去哪
+	cidLogin := func(b *browser, subject, target string) string {
+		t.Helper()
+		start := "/v1/admin/auth/cid/start?mode=login"
+		if target != "" {
+			start += "&target=" + url.QueryEscape(target)
+		}
+		authorize := location(t, b.do("GET", start, nil, nil))
+		code, state := cidServer.approve(t, authorize, subject, "someone@chainup.test")
+		return location(t, b.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil))
+	}
+	subject := testSubject()
 
 	platform := newBrowser(tenantA)
 	view := platform.mustCode(t, platform.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
-	if view["platformAdmin"] != true || view["tenantId"] != nil {
+	if view["platformAdmin"] != true || view["tenantId"] != nil || view["account"] != nil {
 		t.Fatalf("platform session view = %v", view)
 	}
 
-	var memberPassword, memberID string
-	t.Run("平台管理员建成员拿到一次性的初始口令", func(t *testing.T) {
-		body := platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts",
-			map[string]string{"displayName": "张三", "loginName": "Zhang.San", "email": "zs@example.com"}, nil), 201)
-		memberPassword, _ = body["initialPassword"].(string)
-		account := object(body["account"])
-		memberID, _ = account["id"].(string)
-		if len(memberPassword) != initialPasswordLen || account["status"] != accountPendingBind || account["loginName"] != "zhang.san" {
-			t.Fatalf("create = %v", body)
-		}
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts",
-			map[string]string{"displayName": "重复", "loginName": "zhang.san", "email": "x@example.com"}, nil), 409, "LOGIN_NAME_TAKEN")
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts",
-			map[string]string{"displayName": "撞名", "loginName": platformUser, "email": "x@example.com"}, nil), 422, "INVALID_LOGIN_NAME")
-		list := platform.mustCode(t, platform.do("GET", "/v1/admin/tenant-accounts", nil, nil), 200)
-		if items, _ := list["items"].([]any); len(items) != 1 {
-			t.Fatalf("list = %v", list)
-		}
-		// 审计不带口令
-		var summary string
-		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_create' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&summary); err != nil {
-			t.Fatalf("audit: %v", err)
-		}
-		if strings.Contains(summary, memberPassword) {
-			t.Fatal("the initial password must not reach the audit log")
-		}
-	})
-
-	member := newBrowser(tenantA)
-	t.Run("初始口令登录后只能去绑定", func(t *testing.T) {
-		view := member.mustCode(t, member.do("POST", "/v1/admin/auth/login", map[string]string{"username": "ZHANG.SAN", "password": memberPassword}, nil), 200)
-		if view["bindRequired"] != true || view["platformAdmin"] != false || view["tenantId"] != tenantA.id || view["loginMethod"] != loginMethodLocal {
-			t.Fatalf("member session view = %v", view)
-		}
-		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 403, "BIND_REQUIRED")
-		wantProblem(t, member.do("GET", "/v1/admin/platform/auth/cid", nil, nil), 403, "BIND_REQUIRED")
-		member.mustCode(t, member.do("GET", "/v1/admin/auth/session", nil, nil), 200)
-		wantProblem(t, member.do("POST", "/v1/admin/auth/login", map[string]string{"username": "zhang.san", "password": "wrong-password"}, nil), 401, "INVALID_CREDENTIALS")
-	})
-
-	t.Run("会话与账号都不跨租户", func(t *testing.T) {
-		elsewhere := newBrowser(tenantB)
-		elsewhere.cookies = map[string]string{adminSessionCookie: member.cookies[adminSessionCookie]}
-		wantProblem(t, elsewhere.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
-		wantProblem(t, elsewhere.do("POST", "/v1/admin/auth/login", map[string]string{"username": "zhang.san", "password": memberPassword}, nil), 401, "INVALID_CREDENTIALS")
-	})
-
 	t.Run("平台管理员配置统一登录，密钥不回显", func(t *testing.T) {
-		// 没配之前：登录页看到统一登录没开，发起直接回首页报原因
-		methods := member.mustCode(t, member.do("GET", "/v1/admin/auth/methods", nil, nil), 200)
-		if methods["cid"] != false {
+		// 没配之前：登录页看到统一登录没开，发起直接回首页报原因。口令登录只剩环境变量账号，配了才显示
+		methods := platform.mustCode(t, newBrowser(tenantA).do("GET", "/v1/admin/auth/methods", nil, nil), 200)
+		if methods["cid"] != false || methods["password"] != true {
 			t.Fatalf("methods = %v", methods)
 		}
-		if got := location(t, member.do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil)); got != "/?cidError=not_configured" {
+		if got := location(t, newBrowser(tenantA).do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil)); got != "/?cidError=not_configured" {
 			t.Fatalf("start without config redirected to %s", got)
 		}
 		body := platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/auth/cid", map[string]any{
@@ -326,217 +310,182 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 			"authorizeUrl": "http://login.test/a", "logoutUrl": "https://login.test/l", "tokenUrl": cidServer.URL + "/t",
 			"userinfoUrl": cidServer.URL + "/u", "clientId": "rn-client", "expectedVersion": 2, "reason": "明文授权地址",
 		}, nil), 422, "INVALID_CID_CONFIG")
-		if member.mustCode(t, member.do("GET", "/v1/admin/auth/methods", nil, nil), 200)["cid"] != true {
+		if newBrowser(tenantA).mustCode(t, newBrowser(tenantA).do("GET", "/v1/admin/auth/methods", nil, nil), 200)["cid"] != true {
 			t.Fatal("methods must report cid=true once configured")
 		}
 	})
 
-	t.Run("绑定：回调之后本人确认才落库", func(t *testing.T) {
-		// 发起绑定前要过邮箱二次验证（发到成员自己登记的邮箱）；平台没配发信就发不了码，也就绑不了（不退回不校验）
-		if got := location(t, member.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil)); got != "/?cidError=second_factor_required" {
-			t.Fatalf("bind start without the second factor redirected to %s", got)
+	t.Run("没有记录就进不来，不自动开户", func(t *testing.T) {
+		if got := cidLogin(newBrowser(tenantA), subject, ""); got != "/?cidError=no_access" {
+			t.Fatalf("subject without any record redirected to %s", got)
 		}
-		wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")
-		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("绑定验证码要发信", 0), nil), 200)
-		passSecondFactor(t, member, smtpServer, "zs@example.com")
-		authorize := location(t, member.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
-		if !strings.HasPrefix(authorize, "https://login.test/auth/v1/oauth/authorize?") ||
-			!strings.Contains(authorize, url.QueryEscape("https://"+tenantA.console+cidCallbackPath)) {
-			t.Fatalf("authorize url = %s", authorize)
+		// RN 不再建号、不再绑定
+		if got := newBrowser(tenantA).do("POST", "/v1/admin/tenant-accounts", map[string]string{"displayName": "张三", "email": "zs@example.com"}, nil).Code; got != http.StatusNotFound {
+			t.Fatalf("creating a member must be gone, got %d", got)
 		}
-		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
-		// state 对不上（别的标签页、伪造的回调）：拒绝
-		if got := location(t, member.do("GET", cidCallbackPath+"?code="+code+"&state=forged-state-value", nil, nil)); got != "/?cidError=state" {
-			t.Fatalf("forged state redirected to %s", got)
+		wantProblem(t, platform.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil), 400, "INVALID_CID_MODE")
+		if got := platform.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, nil).Code; got != http.StatusNotFound {
+			t.Fatalf("bind confirm must be gone, got %d", got)
 		}
-		if got := location(t, member.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/cid/bind-confirm" {
-			t.Fatalf("bind callback redirected to %s", got)
-		}
-		// 回调只是记下「要绑哪个」，账号还没变
-		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 403, "BIND_REQUIRED")
-		pending := member.mustCode(t, member.do("GET", "/v1/admin/auth/cid/bind", nil, nil), 200)
-		if object(pending["cid"])["email"] != "zs@chainup.test" {
-			t.Fatalf("pending bind = %v", pending)
-		}
-		// 别的租户的页面不能替他确认
-		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, map[string]string{"Origin": "https://" + tenantB.console}), 403, "UNTRUSTED_ORIGIN")
-		// 确认要带发到统一认证账号邮箱的验证码；平台没配发信就发不了，也就绑不了（不退回不校验）
-		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{}, nil), 400, "CID_BIND_CODE_INVALID")
-		sent := member.mustCode(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 200)
-		codeToken, _ := sent["codeToken"].(string)
-		mailBody := smtpServer.last(t, "zs@chainup.test")
-		if codeToken == "" || !strings.Contains(mailBody, "zhang.san") || !strings.Contains(mailBody, tenantA.console) {
-			t.Fatalf("code response %v, mail:\n%s", sent, mailBody)
-		}
-		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 429, "CID_BIND_CODE_RATE_LIMITED")
-		mailed := mailCode(t, mailBody)
-		wrong := "000000"
-		if mailed == wrong {
-			wrong = "111111"
-		}
-		wantProblem(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{"codeToken": codeToken, "code": wrong}, nil), 400, "CID_BIND_CODE_INVALID")
-		// 发码写了审计：收件人掩码、不含验证码
-		var codeAudit string
-		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_bind_code_sent' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&codeAudit); err != nil ||
-			strings.Contains(codeAudit, "zs@chainup.test") || strings.Contains(codeAudit, mailed) {
-			t.Fatalf("bind code audit = %q %v", codeAudit, err)
-		}
-		view := member.mustCode(t, member.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{"codeToken": codeToken, "code": mailed}, nil), 200)
-		account := object(view["account"])
-		if view["bindRequired"] != false || account["status"] != accountActive || account["boundEmail"] != "zs@chainup.test" {
-			t.Fatalf("confirm = %v", view)
-		}
-		// 绑定通知发到控制台账号登记的邮箱：写明账号与控制台；统一账号邮箱只给掩码
-		notice := smtpServer.last(t, "zs@example.com")
-		if !strings.Contains(notice, "zhang.san") || !strings.Contains(notice, tenantA.console) || !strings.Contains(notice, "z***@chainup.test") ||
-			strings.Contains(notice, "zs@chainup.test") {
-			t.Fatalf("bind notice:\n%s", notice)
-		}
-		var noticeAudit string
-		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_bind_notice' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&noticeAudit); err != nil ||
-			!strings.Contains(noticeAudit, `"sent": true`) || strings.Contains(noticeAudit, "zs@example.com") {
-			t.Fatalf("bind notice audit = %q %v", noticeAudit, err)
-		}
-		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
-		wantProblem(t, member.do("GET", "/v1/admin/auth/cid/bind", nil, nil), 404, "CID_BIND_NOT_PENDING")
 	})
 
-	t.Run("绑定之后本地口令作废，只能统一登录", func(t *testing.T) {
-		wantProblem(t, newBrowser(tenantA).do("POST", "/v1/admin/auth/login", map[string]string{"username": "zhang.san", "password": memberPassword}, nil), 409, "ACCOUNT_BOUND_USE_CID")
-		fresh := newBrowser(tenantA)
-		authorize := location(t, fresh.do("GET", "/v1/admin/auth/cid/start?mode=login&target="+url.QueryEscape("/build/ios?tab=1"), nil, nil))
-		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
-		if got := location(t, fresh.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/build/ios?tab=1" {
+	var memberID string
+	member := newBrowser(tenantA)
+	t.Run("外部系统写了记录，统一登录回来就是这个租户的会话", func(t *testing.T) {
+		memberID = externalAccount(t, db, tenantA.id, subject, "zs@example.com")
+		if got := cidLogin(member, subject, "/build/ios?tab=1"); got != "/build/ios?tab=1" {
 			t.Fatalf("login callback redirected to %s", got)
 		}
-		view := fresh.mustCode(t, fresh.do("GET", "/v1/admin/auth/session", nil, nil), 200)
-		if view["loginMethod"] != loginMethodCID || view["tenantId"] != tenantA.id || view["platformAdmin"] != false {
+		view := member.mustCode(t, member.do("GET", "/v1/admin/auth/session", nil, nil), 200)
+		account := object(view["account"])
+		if view["actorId"] != tenantActor(tenantA.id, memberID) || view["tenantId"] != tenantA.id || view["platformAdmin"] != false ||
+			account["id"] != memberID || account["email"] != "zs@example.com" {
 			t.Fatalf("cid session = %v", view)
 		}
-		// 授权码只能用一次
+		if _, ok := view["bindRequired"]; ok {
+			t.Fatalf("bindRequired must be gone: %v", view)
+		}
+		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
+		// RN 在这张表里只写 last_login_at
+		var lastLogin sql.NullTime
+		if err := db.QueryRow(`SELECT last_login_at FROM tenant_admin_accounts WHERE id=?`, memberID).Scan(&lastLogin); err != nil || !lastLogin.Valid {
+			t.Fatalf("last_login_at=%v err=%v", lastLogin, err)
+		}
+		// 开放跳转：target 只收本站相对路径
+		if got := cidLogin(newBrowser(tenantA), subject, "//evil.example/x"); got != "/" {
+			t.Fatalf("unsafe target must fall back to /, got %s", got)
+		}
+		// 授权码只能用一次；state 对不上拒绝
+		fresh := newBrowser(tenantA)
+		authorize := location(t, fresh.do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil))
+		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
+		if got := location(t, fresh.do("GET", cidCallbackPath+"?code="+code+"&state=forged-state-value", nil, nil)); got != "/?cidError=state" {
+			t.Fatalf("forged state redirected to %s", got)
+		}
 		if got := location(t, newBrowser(tenantA).do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=state" {
 			t.Fatalf("replayed callback without the flow cookie redirected to %s", got)
 		}
-		// 开放跳转：target 只收本站相对路径
-		evil := newBrowser(tenantA)
-		authorize = location(t, evil.do("GET", "/v1/admin/auth/cid/start?mode=login&target="+url.QueryEscape("//evil.example/x"), nil, nil))
-		code, state = cidServer.approve(t, authorize, subject, "zs@chainup.test")
-		if got := location(t, evil.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/" {
-			t.Fatalf("unsafe target must fall back to /, got %s", got)
-		}
-		// 统一认证账号没绑本租户：拒绝，不自动开户
-		stranger := newBrowser(tenantA)
-		authorize = location(t, stranger.do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil))
-		code, state = cidServer.approve(t, authorize, "99999999-aaaa-4bbb-8ccc-dddddddddddd", "who@chainup.test")
-		if got := location(t, stranger.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=unbound" {
-			t.Fatalf("unbound subject redirected to %s", got)
-		}
-		// 同一个统一认证账号在 B 租户没有账号：B 的控制台照样进不去
-		other := newBrowser(tenantB)
-		authorize = location(t, other.do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil))
-		code, state = cidServer.approve(t, authorize, subject, "zs@chainup.test")
-		if got := location(t, other.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=unbound" {
-			t.Fatalf("subject without an account in tenant B redirected to %s", got)
-		}
-		member.cookies = fresh.cookies
+		// 控制台账号没有本地口令：拿显示名、邮箱当用户名都登不进
+		wantProblem(t, newBrowser(tenantA).do("POST", "/v1/admin/auth/login", map[string]string{"username": "zs@example.com", "password": "anything-at-all"}, nil), 401, "INVALID_CREDENTIALS")
 	})
 
-	t.Run("租户会话永远不是平台管理员", func(t *testing.T) {
+	t.Run("同一个统一账号在别的租户要另有记录，会话不跨租户", func(t *testing.T) {
+		elsewhere := newBrowser(tenantB)
+		elsewhere.cookies = map[string]string{adminSessionCookie: member.cookies[adminSessionCookie]}
+		wantProblem(t, elsewhere.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
+		if got := cidLogin(newBrowser(tenantB), subject, ""); got != "/?cidError=no_access" {
+			t.Fatalf("subject without a record in tenant B redirected to %s", got)
+		}
+		externalAccount(t, db, tenantB.id, subject, "zs-b@example.com")
+		inB := newBrowser(tenantB)
+		if got := cidLogin(inB, subject, ""); got != "/" {
+			t.Fatalf("login in tenant B redirected to %s", got)
+		}
+		if view := inB.mustCode(t, inB.do("GET", "/v1/admin/auth/session", nil, nil), 200); view["tenantId"] != tenantB.id || object(view["account"])["email"] != "zs-b@example.com" {
+			t.Fatalf("tenant B session = %v", view)
+		}
+		// A 的会话照旧只认 A
+		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
+	})
+
+	t.Run("租户会话永远不是平台管理员，只读列表只给平台管理员", func(t *testing.T) {
 		wantProblem(t, member.do("GET", "/v1/admin/platform/auth/cid", nil, nil), 403, "PLATFORM_ADMIN_REQUIRED")
 		wantProblem(t, member.do("GET", "/v1/admin/tenant-accounts", nil, nil), 403, "PLATFORM_ADMIN_REQUIRED")
-	})
-
-	t.Run("同一个统一认证账号不能绑同租户两个成员", func(t *testing.T) {
-		body := platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts",
-			map[string]string{"displayName": "李四", "loginName": "lisi", "email": "ls@example.com"}, nil), 201)
-		second := newBrowser(tenantA)
-		second.mustCode(t, second.do("POST", "/v1/admin/auth/login", map[string]string{"username": "lisi", "password": body["initialPassword"].(string)}, nil), 200)
-		passSecondFactor(t, second, smtpServer, "ls@example.com")
-		authorize := location(t, second.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
-		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
-		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=already_bound" {
-			t.Fatalf("second bind of the same subject redirected to %s", got)
+		list := platform.mustCode(t, platform.do("GET", "/v1/admin/tenant-accounts", nil, nil), 200)
+		items, _ := list["items"].([]any)
+		if len(items) != 1 {
+			t.Fatalf("list = %v", list)
 		}
-		// 认证中心没给邮箱：发不了验证码，不让绑
-		authorize = location(t, second.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
-		code, state = cidServer.approve(t, authorize, "6b7c8d9e-0f1a-4b2c-9d3e-4f5a6b7c8d9e", "")
-		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=no_email" {
-			t.Fatalf("bind without an email redirected to %s", got)
+		item := object(items[0])
+		if item["id"] != memberID || item["subject"] != subject || item["status"] != accountActive || item["createdBy"] != "ext-ops" || item["lastLoginAt"] == nil {
+			t.Fatalf("list item = %v", item)
 		}
-		// 绑定通知发不出去不影响绑定：码发出去之后发信坏了，确认照样成功，审计记下没发出去
-		authorize = location(t, second.do("GET", "/v1/admin/auth/cid/start?mode=bind", nil, nil))
-		code, state = cidServer.approve(t, authorize, "7c8d9e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f", "ls@chainup.test")
-		if got := location(t, second.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/cid/bind-confirm" {
-			t.Fatalf("bind callback redirected to %s", got)
-		}
-		codeToken, _ := second.mustCode(t, second.do("POST", "/v1/admin/auth/cid/bind/code", map[string]any{}, nil), 200)["codeToken"].(string)
-		mailed := mailCode(t, smtpServer.last(t, "ls@chainup.test"))
-		mailView := platform.mustCode(t, platform.do("GET", "/v1/admin/platform/mail", nil, nil), 200)
-		broken := map[string]any{"host": "127.0.0.1", "port": 1, "fromAddress": "noreply@rn.test", "expectedVersion": mailView["version"], "reason": "发信坏了"}
-		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", broken, nil), 200)
-		view := second.mustCode(t, second.do("POST", "/v1/admin/auth/cid/bind/confirm", map[string]any{"codeToken": codeToken, "code": mailed}, nil), 200)
-		if object(view["account"])["status"] != accountActive {
-			t.Fatalf("confirm with broken mail = %v", view)
-		}
-		var noticeAudit string
-		if err := db.QueryRow(`SELECT summary FROM audit_events WHERE tenant_id=? AND action='tenant_account_bind_notice' ORDER BY created_at DESC LIMIT 1`, tenantA.id).Scan(&noticeAudit); err != nil ||
-			!strings.Contains(noticeAudit, `"sent": false`) || !strings.Contains(noticeAudit, "MAIL_CONNECT_FAILED") {
-			t.Fatalf("failed bind notice audit = %q %v", noticeAudit, err)
-		}
-		restored := smtpServer.settings("发信修好了", int(platform.mustCode(t, platform.do("GET", "/v1/admin/platform/mail", nil, nil), 200)["version"].(float64)))
-		platform.mustCode(t, platform.do("PUT", "/v1/admin/platform/mail", restored, nil), 200)
 	})
 
 	t.Run("退出时给出认证中心的退出地址", func(t *testing.T) {
 		out := newBrowser(tenantA)
-		out.cookies = map[string]string{adminSessionCookie: member.cookies[adminSessionCookie]}
+		if got := cidLogin(out, subject, ""); got != "/" {
+			t.Fatalf("login redirected to %s", got)
+		}
 		body := out.mustCode(t, out.do("POST", "/v1/admin/auth/logout", map[string]any{}, nil), 200)
 		want := "https://login.test/auth/v1/logout?back=" + url.QueryEscape("https://"+tenantA.console+"/")
 		if body["cidLogoutUrl"] != want {
 			t.Fatalf("cidLogoutUrl = %v, want %s", body["cidLogoutUrl"], want)
 		}
 		wantProblem(t, out.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
-		// 平台会话不走统一登录，不给退出地址
+		// 环境变量账号不走统一登录，不给退出地址
 		p := newBrowser(tenantA)
 		p.mustCode(t, p.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
 		if p.mustCode(t, p.do("POST", "/v1/admin/auth/logout", map[string]any{}, nil), 200)["cidLogoutUrl"] != nil {
-			t.Fatal("platform logout must not bounce through unified login")
+			t.Fatal("env admin logout must not bounce through unified login")
 		}
 	})
 
-	t.Run("停用立即生效，重置后回到待绑定", func(t *testing.T) {
-		fresh := newBrowser(tenantA)
-		authorize := location(t, fresh.do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil))
-		code, state := cidServer.approve(t, authorize, subject, "zs@chainup.test")
-		location(t, fresh.do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil))
-		fresh.mustCode(t, fresh.do("GET", "/v1/admin/tenant", nil, nil), 200)
-
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": " "}, nil), 400, "REASON_REQUIRED")
-		platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": "离职停用"}, nil), 200)
-		wantProblem(t, fresh.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": "离职停用"}, nil), 409, "TENANT_ACCOUNT_ALREADY_DISABLED")
-
-		body := platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/reset", map[string]any{"reason": "换绑统一账号"}, nil), 200)
-		account := object(body["account"])
-		if account["status"] != accountPendingBind || account["bound"] != false || account["boundSubject"] != nil {
-			t.Fatalf("reset = %v", body)
-		}
-		again := newBrowser(tenantA)
-		view := again.mustCode(t, again.do("POST", "/v1/admin/auth/login", map[string]string{"username": "zhang.san", "password": body["initialPassword"].(string)}, nil), 200)
-		if view["bindRequired"] != true {
-			t.Fatalf("after reset the member must bind again: %v", view)
-		}
-		wantProblem(t, platform.do("POST", "/v1/admin/tenant-accounts/"+memberID+"/disable", map[string]any{"reason": "离职停用"}, map[string]string{"Origin": "https://" + tenantB.console}), 403, "UNTRUSTED_ORIGIN")
-		wantProblem(t, newBrowser(tenantB).do("POST", "/v1/admin/tenant-accounts/"+memberID+"/reset", map[string]any{"reason": "换绑统一账号"}, nil), 401, "ADMIN_AUTH_REQUIRED")
-	})
-
-	t.Run("初始口令过期就登不进", func(t *testing.T) {
-		body := platform.mustCode(t, platform.do("POST", "/v1/admin/tenant-accounts",
-			map[string]string{"displayName": "王五", "loginName": "wangwu", "email": "ww@example.com"}, nil), 201)
-		id := object(body["account"])["id"]
-		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET password_expires_at=? WHERE id=?`, time.Now().UTC().Add(-time.Minute), id); err != nil {
+	t.Run("外部系统换人：旧会话下一个请求就失效，新的人能登", func(t *testing.T) {
+		successor := testSubject()
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET idp_subject=? WHERE id=?`, successor, memberID); err != nil {
 			t.Fatal(err)
 		}
-		wantProblem(t, newBrowser(tenantA).do("POST", "/v1/admin/auth/login", map[string]string{"username": "wangwu", "password": body["initialPassword"].(string)}, nil), 401, "INITIAL_PASSWORD_EXPIRED")
+		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
+		if got := cidLogin(newBrowser(tenantA), subject, ""); got != "/?cidError=no_access" {
+			t.Fatalf("the replaced person redirected to %s", got)
+		}
+		member = newBrowser(tenantA)
+		if got := cidLogin(member, successor, ""); got != "/" {
+			t.Fatalf("the successor redirected to %s", got)
+		}
+		subject = successor
+	})
+
+	t.Run("外部系统停用、改成别的租户、删掉：会话都在下一个请求失效", func(t *testing.T) {
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status='disabled' WHERE id=?`, memberID); err != nil {
+			t.Fatal(err)
+		}
+		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
+		if got := cidLogin(newBrowser(tenantA), subject, ""); got != "/?cidError=disabled" {
+			t.Fatalf("disabled account redirected to %s", got)
+		}
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status=? WHERE id=?`, accountActive, memberID); err != nil {
+			t.Fatal(err)
+		}
+		member = newBrowser(tenantA)
+		cidLogin(member, subject, "")
+		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
+		// 挪到别的租户：按会话的租户回表查不到
+		other := accountsTestTenantRow(t, db, "c")
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET tenant_id=? WHERE id=?`, other.id, memberID); err != nil {
+			t.Fatal(err)
+		}
+		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
+		if _, err := db.Exec(`UPDATE tenant_admin_accounts SET tenant_id=? WHERE id=?`, tenantA.id, memberID); err != nil {
+			t.Fatal(err)
+		}
+		member = newBrowser(tenantA)
+		cidLogin(member, subject, "")
+		if _, err := db.Exec(`DELETE FROM tenant_admin_accounts WHERE id=?`, memberID); err != nil {
+			t.Fatal(err)
+		}
+		wantProblem(t, member.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
+	})
+
+	t.Run("数据库挡住外部系统写错的行", func(t *testing.T) {
+		for name, insert := range map[string][]any{
+			"大写的账号 id": {scopeTenant, tenantA.id, strings.ToUpper(testSubject()), "a@example.com", accountActive},
+			"不是 uuid":  {scopeTenant, tenantA.id, "fuyu", "a@example.com", accountActive},
+			"平台记录带租户":  {scopePlatform, tenantA.id, testSubject(), "a@example.com", accountActive},
+			"租户记录没有租户": {scopeTenant, nil, testSubject(), "a@example.com", accountActive},
+			"不认识的状态":   {scopeTenant, tenantA.id, testSubject(), "a@example.com", "pending_bind"},
+			"邮箱不像邮箱":   {scopeTenant, tenantA.id, testSubject(), "nobody", accountActive},
+		} {
+			if _, err := db.Exec(`INSERT INTO tenant_admin_accounts (scope,tenant_id,idp_subject,email,status) VALUES (?,?,?,?,?)`, insert...); err == nil {
+				t.Fatalf("%s: the row must be rejected", name)
+			}
+		}
+		// 同一个统一账号在同一个租户里只能有一条
+		dup := testSubject()
+		externalAccount(t, db, tenantA.id, dup, "d@example.com")
+		if _, err := db.Exec(`INSERT INTO tenant_admin_accounts (scope,tenant_id,idp_subject,email) VALUES (?,?,?,?)`, scopeTenant, tenantA.id, dup, "d2@example.com"); err == nil {
+			t.Fatal("a second record of the same subject in one tenant must be rejected")
+		}
 	})
 }

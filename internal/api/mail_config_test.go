@@ -254,16 +254,16 @@ func TestDBPlatformMailConfig(t *testing.T) {
 	wantProblem(t, platform.do("DELETE", "/v1/admin/platform/mail?reason=撤掉发信", nil, nil), 404, "MAIL_NOT_CONFIGURED")
 }
 
-func TestBindCodeStore(t *testing.T) {
+func TestEmailCodeStore(t *testing.T) {
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	var store bindCodeStore
+	var store emailCodeStore
 	put := func() {
-		store.sent("acc-1", bindCode{token: "tok", code: "123456", subject: "sub", email: "a@x.test", expiresAt: now.Add(bindCodeTTL)}, now)
+		store.sent("acc-1", emailCode{token: "tok", code: "123456", subject: "sub", email: "a@x.test", expiresAt: now.Add(emailCodeTTL)}, now)
 	}
 
 	// 输错 4 次后输对：通过，而且只能用一次
 	put()
-	for i := 0; i < bindCodeMaxAttempts-1; i++ {
+	for i := 0; i < emailCodeMaxAttempts-1; i++ {
 		if store.verify("acc-1", "tok", "000000", "sub", "a@x.test", now) {
 			t.Fatal("a wrong code verified")
 		}
@@ -273,7 +273,7 @@ func TestBindCodeStore(t *testing.T) {
 	}
 	// 输错 5 次作废
 	put()
-	for i := 0; i < bindCodeMaxAttempts; i++ {
+	for i := 0; i < emailCodeMaxAttempts; i++ {
 		store.verify("acc-1", "tok", "000000", "sub", "a@x.test", now)
 	}
 	if store.verify("acc-1", "tok", "123456", "sub", "a@x.test", now) {
@@ -281,7 +281,7 @@ func TestBindCodeStore(t *testing.T) {
 	}
 	// codeToken 不对不计次数
 	put()
-	for i := 0; i < bindCodeMaxAttempts*2; i++ {
+	for i := 0; i < emailCodeMaxAttempts*2; i++ {
 		store.verify("acc-1", "other", "000000", "sub", "a@x.test", now)
 	}
 	if !store.verify("acc-1", "tok", "123456", "sub", "a@x.test", now) {
@@ -292,7 +292,7 @@ func TestBindCodeStore(t *testing.T) {
 		at             time.Time
 		subject, email string
 	}{
-		{now.Add(bindCodeTTL + time.Second), "sub", "a@x.test"},
+		{now.Add(emailCodeTTL + time.Second), "sub", "a@x.test"},
 		{now, "other-sub", "a@x.test"},
 		{now, "sub", "b@x.test"},
 	} {
@@ -303,12 +303,12 @@ func TestBindCodeStore(t *testing.T) {
 	}
 
 	// 发码限流：同一个账号 1 分钟 1 次、1 小时 5 次；同一个 IP 1 小时 20 次
-	var limits bindCodeStore
+	var limits emailCodeStore
 	send := func(at time.Time) bool {
 		if !limits.allowSend("acc-1", "10.0.0.1", at) {
 			return false
 		}
-		limits.sent("acc-1", bindCode{token: "tok", code: "123456", subject: "sub", email: "a@x.test", expiresAt: at.Add(bindCodeTTL)}, at)
+		limits.sent("acc-1", emailCode{token: "tok", code: "123456", subject: "sub", email: "a@x.test", expiresAt: at.Add(emailCodeTTL)}, at)
 		return true
 	}
 	if !send(now) || send(now.Add(30*time.Second)) {
@@ -320,23 +320,23 @@ func TestBindCodeStore(t *testing.T) {
 			sent++
 		}
 	}
-	if sent != bindCodePerHour {
-		t.Fatalf("an account gets %d codes per hour, got %d", bindCodePerHour, sent)
+	if sent != emailCodePerHour {
+		t.Fatalf("an account gets %d codes per hour, got %d", emailCodePerHour, sent)
 	}
-	var perIP bindCodeStore
+	var perIP emailCodeStore
 	allowed := 0
 	for i := 0; i < 30; i++ {
 		if perIP.allowSend("acc-"+strconv.Itoa(i), "10.0.0.2", now) {
 			allowed++
 		}
 	}
-	if allowed != bindCodeIPPerHour {
-		t.Fatalf("an IP gets %d codes per hour, got %d", bindCodeIPPerHour, allowed)
+	if allowed != emailCodeIPPerHour {
+		t.Fatalf("an IP gets %d codes per hour, got %d", emailCodeIPPerHour, allowed)
 	}
 
 	// 投递失败（allowSend 之后没有 sent）：不开始 1 分钟的重发间隔，已经发到邮箱里的旧码继续有效
-	var retry bindCodeStore
-	retry.sent("acc-1", bindCode{token: "old", code: "111111", subject: "sub", email: "a@x.test", expiresAt: now.Add(bindCodeTTL)}, now)
+	var retry emailCodeStore
+	retry.sent("acc-1", emailCode{token: "old", code: "111111", subject: "sub", email: "a@x.test", expiresAt: now.Add(emailCodeTTL)}, now)
 	later := now.Add(2 * time.Minute)
 	if !retry.allowSend("acc-1", "10.0.0.3", later) || !retry.allowSend("acc-1", "10.0.0.3", later.Add(time.Second)) {
 		t.Fatal("a failed delivery must not start the resend interval")
@@ -347,8 +347,8 @@ func TestBindCodeStore(t *testing.T) {
 }
 
 // 验证码不能经 %v、%#v、slog 漏出去
-func TestBindCodeNeverPrintsCode(t *testing.T) {
-	code := bindCode{token: "Sentinel-Token-9c1d", code: "987654", subject: "sub", email: "someone@x.test", expiresAt: time.Now()}
+func TestEmailCodeNeverPrintsCode(t *testing.T) {
+	code := emailCode{token: "Sentinel-Token-9c1d", code: "987654", subject: "sub", email: "someone@x.test", expiresAt: time.Now()}
 	var logged strings.Builder
 	slog.New(slog.NewTextHandler(&logged, nil)).Info("bind", "code", code)
 	for _, out := range []string{fmt.Sprintf("%v %+v %#v %s", code, code, code, code), logged.String()} {
