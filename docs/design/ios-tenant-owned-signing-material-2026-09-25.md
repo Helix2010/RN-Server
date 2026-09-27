@@ -390,3 +390,156 @@ runner 的任务说明里加 `TenantID`。
 | 租户不在密文里，「Mac 是边界」的说法不成立 | `iosmaterial` 格式 | §3.1：v2 材料带租户 id，迁移过来的行标 legacy |
 | 目录用 slug / TenantDirectory 会被租户改或撞；10 位租户 id 与 Team ID 正则撞 | `jobspec.go:237` | §4.1：用租户 id，多一层 `tenants/` |
 | 小偏差：`signingPairs` 的定义位置、`NO_BUILDER_FOR_TEAM` 的行号；切换交付方式时上传 Key 其实也会删 | —— | §1、§3.3 已改 |
+
+## 12. 实现约定（2026-09-27）
+
+2026-09-27 用户确认：Apple 材料（证书、描述文件、上传 Key）全部由租户上传；一个租户的上传不能影响别的租户；上传前要做格式检查。
+本节把阶段 2–5 各仓库之间的接口定死，四处按它各自实现。推送（第 5 节 D）不在这一轮。
+
+### 12.1 密文 v2（`signing/iosmaterial`）
+
+- `Box.Version`：1 = 旧格式（没有租户），2 = 带租户。常量 `VersionLegacy = 1`、`VersionTenant = 2`。
+- v2 在 Box 外层与 Material 明文里各加 `tenantId`（字符串，`^[1-9][0-9]{0,19}$`）：
+  - v1 两处都不许有；v2 两处都必须有，而且相等（`Open` 里与 kind/teamId/bundleId 一起比）；
+  - 解密构造不变：同一个 KDF 标签 `rn-ios-material/v1`，附加数据仍然是用途。租户在明文里，受 AEAD 保护，不必再进附加数据。
+- `Seal`：`Material.TenantID` 非空就封成 v2，否则 v1。浏览器（RN-Admin）只封 v2。
+- `ParseBox` 两种都收。服务端的租户上传口只收 v2（§12.4）。
+- 浏览器实现与 Go 实现用同一个固定向量互相核对：`browser_vector_test.go` 加一条 v2 向量。
+
+### 12.2 打包机取清单（阶段 2 ↔ 阶段 4）
+
+- 能力名 `tenant-signing-material`：
+  - 进 `agentCapabilities`，认领时照常报；
+  - 取清单时放在查询串里：`GET /v1/build-agent/ios-material?capability=tenant-signing-material`。
+- 服务端对带能力的请求回按租户的清单：
+
+  ```json
+  {"layout":"tenant","complete":true,"items":[
+    {"tenantId":"1000000001","kind":"certificate","teamId":"J4JDFC8LCC","scope":"",
+     "purpose":"ios-builder-material","recipientSha256":"…","version":1759000000000,"legacy":false}
+  ]}
+  ```
+
+  - `legacy=true`：从旧的按 Team 的行复制过来的 v1 密文（§3.5）。Mac 只对这种项接受 v1；
+  - 没带能力的请求、以及还没升级的服务端：照旧回按 Team 的清单，没有 `layout` 字段（等价于 `"layout":"team"`）。
+- 取密文：`GET /v1/build-agent/ios-material/box?tenantId=…&kind=…&teamId=…&scope=…`。不带 `tenantId` 就取旧的按 Team 的那一行。
+- 打包机把最近一次清单的布局记进本机记录：
+  - 收到过 `layout=tenant` 就进入**租户模式**，不再回落；
+  - 租户模式下才在认领里报 `tenantMaterial`（§12.3）。旧版服务端的认领请求体是 `DisallowUnknownFields`，提前报会 400。
+- 本机记录 `ios-material.json` 改成：
+
+  ```json
+  {"layout":"tenant","installed":{"<租户>/<kind>/<team>/<scope>":1759000000000}}
+  ```
+
+  - 旧格式（顶层就是 slot → 版本）读进来当作 `layout=team`。
+- 同步顺序：先证书，再描述文件，最后上传 Key。描述文件要核对「包含本租户那张证书」，证书得先装上。
+- 核对不过的那一版记在内存里（slot → 版本 + 原因），同一版不再反复试，直到清单上出现新版本；进程重启后再试一次。
+
+### 12.3 认领自报 `tenantMaterial`（阶段 2 ↔ 阶段 4）
+
+租户模式下，认领请求体多一个字段（`appleTeams` 照旧报，给控制台显示与过渡用）：
+
+```json
+"tenantMaterial":[
+  {"tenantId":"1000000001","teamId":"J4JDFC8LCC","bundleIds":["win.anyfun.app"],
+   "certificateSha1":"<40 位大写十六进制>","certificateReady":true,"expiresAt":"2027-01-01T00:00:00Z",
+   "uploadProbe":"ok","apsEnvironment":"production","problems":["…"]}
+]
+```
+
+- 每个 (租户, Team) 一项，最多 64 项；`problems` 最多 8 条，每条最多 300 字。
+- `certificateReady`：本机索引里这个 (租户, Team) 的 SHA-1 出现在签名钥匙串 `find-identity -v -p codesigning` 的结果里。
+- `bundleIds`：只列核对通过、没过期的描述文件。
+- `uploadProbe` 的取值同 `appleTeams`：`ok` / `forbidden` / `error` / `missing` / 空（这台机器没开上传）。
+- `apsEnvironment`：描述文件 Entitlements 里的 `aps-environment`，没有就空。现在只报不判，推送那一轮再用。
+- 服务端：
+  - 存进 `build_machine_liveness` 的新列 `tenant_material`；
+  - 可签对从 `TEAM.bundle` 变成 `<租户>:TEAM.bundle`，只收 `certificateReady=true` 的项；
+  - 认领 SQL 按任务的 `tenant_id` 拼，同时比对当前 `release.ios` 的 Team 与 bundle。
+- 报了 `tenantMaterial` 的机器只按租户对派活；没报的（旧机器）照旧按 Team 对。
+
+### 12.4 服务端（阶段 4）
+
+- 表 `ios_signing_material`：
+  - 加 `tenant_id BIGINT UNSIGNED NOT NULL DEFAULT 0` 与 `legacy TINYINT(1) NOT NULL DEFAULT 0`；
+  - 主键改为 `(tenant_id, kind, team_id, scope)`；
+  - `tenant_id=0` 的是旧的按 Team 的行，只下发给不带能力的请求，阶段 6 删除。
+- 迁移（Go 函数，幂等）：对每个配了 `release.ios` 的租户，从 `tenant_id=0` 复制，复制的行标 `legacy=1`，版本号照抄：
+  - 证书：按 Team；
+  - 描述文件：按 (Team, bundle id)，bundle id 不分大小写；
+  - 上传 Key：按 Team，只复制给交付方式是全托管的租户。
+- 租户接口：租户端，要 `admin` 角色与二次验证。
+  - `GET /v1/admin/ios/material`：
+    - `tenantId`、两把公钥、当前 Team / bundle / 交付方式；
+    - 本租户的各格：版本、上传人、时间、legacy、stale；
+    - 按交付方式的要求清单；
+    - Mac 核对结果：按机器汇总，不带机器 id 与名字；
+    - 最近的平台紧急删除记录。
+  - `POST /v1/admin/ios/material`：请求体是 v2 密文。依次校验：
+    - v2；`tenantId` = 会话租户；
+    - Team = `release.ios` 的 Team；描述文件的 bundle id = `release.ios` 的 bundle id（原样比）；
+    - 收件人是登记的那把公钥；
+    - 自助上传时拒收上传 Key（`IOS_DELIVERY_SELF_UPLOAD`）；
+    - 按租户限频；进审计。
+  - `POST /v1/admin/ios/material/remove`：`{kind, teamId, scope, expectedVersion, reason, confirm}`，只删本租户的行。
+- 平台接口（只读 + 紧急删除）：
+  - `POST /v1/admin/platform/ios-material` 删除，平台不代交；
+  - `POST /v1/admin/platform/ios-material/remove` 要带 `tenantId`（`"0"` 表示旧的按 Team 的行），审计记在那个租户名下；
+  - 总览与按租户总览改读按租户的行。
+- 切到自助上传：无条件删本租户的上传 Key 行；`iosKeysToRevokeFor` 按租户查。
+- 认领响应加 `tenantId`。排队判据、平台页的「装没装上」都按租户算（报了 `tenantMaterial` 的机器按租户对，旧机器按 Team 对）。
+
+### 12.5 Mac（阶段 2）
+
+- 租户 id 一律用清单或任务里服务端给的值，按 `^[1-9][0-9]{0,19}$` 校验后才拼路径。
+- 布局：
+  - `profiles/tenants/<租户>/<TEAM>/<bundle>.mobileprovision`；
+  - `keys/tenants/<租户>/<TEAM>/`；
+  - 证书索引 `tenant-certificates.json`：`{"<租户>/<TEAM>":"<SHA-1>"}`，放在签名目录，0600，原子写。
+- `build-runner install-ios-material --signing-dir D --tenant T [--legacy]`：
+  - v2：材料里的租户必须等于 `--tenant`；
+  - v1：只在带 `--legacy` 时收；不带 `--tenant` 时走旧布局，与现在相同。
+  - 证书按 §4.2 核对：
+    - 临时钥匙串里 `find-identity -v` 取 SHA-1；
+    - x509 核对 OU = Team、CN 前缀、未过期、链到 WWDR G3（证书内嵌进程序，测试核对它与 `deploy/build-agent-macos/AppleWWDRCAG3.cer` 字节相同）；
+    - 主钥匙串里没有这个 SHA-1 才导入；写索引。
+  - 描述文件按 §4.2 核对，`DeveloperCertificates` 要含索引里本租户那张证书的 SHA-1。
+  - 输出一行 JSON：成功时带 `certificateSha1`；失败时退出码非 0，原因写在 `build-runner: error: …`。
+- `build-runner remove-ios-material --signing-dir D --tenant T --kind K --team TEAM [--scope BUNDLE]`：
+  - 描述文件删文件；
+  - 证书删索引项，已经没有索引项引用的 SHA-1 才 `delete-identity -Z`。
+- 上传账户 `ios-upload`：
+  - `--install-key`、`--remove-key`、上传与 `--probe` 都认 `--tenant T`，读写 `keys/tenants/T/TEAM/`；
+  - `--install-key --tenant T` 收 v2（租户必须相等），v1 要再带 `--legacy`；
+  - `--list-keys` 的输出加 `"tenants":{"<租户>":["TEAM"]}`。
+- 墓碑：
+  - 租户模式、清单完整时，本机记录里有、清单里没有的租户格一律撤：描述文件、证书索引、上传 Key 都撤；
+  - 旧布局的格在本租户新格装齐之后删：旧描述文件与旧上传 Key 目录删掉，钥匙串里的身份不动。
+- 构建：
+  - `jobspec.Spec` 加 `tenantId`、`appleTeamId`；
+  - runner 在两者都有、索引里有这个 (租户, Team) 时：
+    - 只复制 `profiles/tenants/<租户>/` 下的描述文件；
+    - 给构建脚本加 `--profiles-dir <D>/profiles/tenants/<租户> --signing-certificate <SHA-1>`；
+  - 租户模式下缺索引项直接失败，不回落到旧布局。
+- 领到任务后的复核：租户模式按 (租户, Team, bundle) 查，旧模式照旧。
+
+### 12.6 RN-App（阶段 3）
+
+- `pnpm ios:release <slug> --signing-dir D [--profiles-dir P] [--signing-certificate SHA1]`：
+  - `--profiles-dir`：在 `P/<TEAM>/` 下找描述文件，不给时是 `D/profiles`；
+  - `--signing-certificate`：40 位十六进制，写进 pbxproj 的 `CODE_SIGN_IDENTITY`，并在导出选项里加 `signingCertificate`；不给时照旧用 `Apple Distribution`；
+  - 两个新参数的值都不能被当成租户位置参数。
+- release 构建给 `expo-notifications` 传 `mode: "production"`。
+- 提交由用户签名。
+
+### 12.7 控制台（阶段 5）
+
+- 租户的「iOS 打包与分发」页，材料卡：
+  - 顶部是按交付方式的清单：已交 / 缺 / 不需要 / 不能交 / Mac 核对不过（原因）；
+  - 证书：.p12 + 口令，浏览器只查扩展名、大小、非空；
+  - 描述文件：浏览器解析 Team、bundle id、类型（有设备列表或 `ProvisionsAllDevices` 就不是 App Store）、到期日，与当前 `release.ios` 对不上就不让传；
+  - 上传 Key：只在全托管时出现。浏览器查 `.p8` 是 PEM 的 PKCS#8 私钥、Key ID 10 位、Issuer ID 是 UUID；
+  - 封 v2，`tenantId` 取 `GET /v1/admin/ios/material` 返回的那个；
+  - 删自己的材料；显示平台的紧急删除记录。
+- 平台「Apple 证书与密钥」页：只读总览 + 按租户的紧急删除（要填原因）。
