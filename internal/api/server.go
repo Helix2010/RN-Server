@@ -234,9 +234,15 @@ func (s *server) routes() *gin.Engine {
 	// 租户会话的邮箱二次验证：敏感操作与发起绑定前要 15 分钟内验过（second_factor.go）
 	protected.POST("/auth/second-factor/code", s.sendSecondFactorCode)
 	protected.POST("/auth/second-factor/verify", s.verifySecondFactor)
-	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放；租户账号的会话一律进不来
+	// 平台级路由：不按租户过滤，只对平台管理员开放（已绑定的平台管理员账号，或 PLATFORM_ADMIN_USERNAMES 里的
+	// 环境变量账号 / 自动化 actor）；租户账号的会话一律进不来。平台管理员账号做写操作要 15 分钟内过二次验证
 	platform := protected.Group("/platform")
-	platform.Use(s.requirePlatformAdmin())
+	platform.Use(s.requirePlatformAdmin(), s.requireSecondFactorOnWrite())
+	// 平台管理员账号（设计 platform-accounts-and-console-login §3.6）：不能停用、重置自己，不能让最后一个失效
+	platform.GET("/accounts", s.listPlatformAccounts)
+	platform.POST("/accounts", s.createPlatformAccount)
+	platform.POST("/accounts/:id/disable", s.disablePlatformAccount)
+	platform.POST("/accounts/:id/reset", s.resetPlatformAccount)
 	// 统一登录的客户端配置（app_configs 平台级 auth.cid，客户端密钥加密存）
 	platform.GET("/auth/cid", s.getCIDConfig)
 	platform.PUT("/auth/cid", s.updateCIDConfig)
@@ -368,7 +374,7 @@ func (s *server) routes() *gin.Engine {
 	current.GET("/tenant", s.currentTenant)
 	// 控制台成员（租户账号）：只有平台管理员能管，管的是当前域名的租户（用户 2026-09-25 定）
 	members := current.Group("/tenant-accounts")
-	members.Use(s.requirePlatformAdmin())
+	members.Use(s.requirePlatformAdmin(), s.requireSecondFactorOnWrite())
 	members.GET("", s.listTenantAccounts)
 	members.POST("", s.createTenantAccount)
 	members.POST("/:id/disable", s.disableTenantAccount)

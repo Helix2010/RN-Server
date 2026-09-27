@@ -274,6 +274,17 @@ func (s *server) deleteMailConfig(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	// 平台管理员账号做写操作都要过邮箱二次验证，验证码靠这份配置发出去：删了就再没人能改回来
+	// （只剩服务器上的管理密钥）。要换发信账号直接改，不用先删
+	var platformAccounts int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_admin_accounts WHERE scope=? AND status<>?`, scopePlatform, accountDisabled).Scan(&platformAccounts); err != nil {
+		problem(c, 500, "MAIL_CONFIG_DELETE_FAILED", "Unable to delete the email settings")
+		return
+	}
+	if platformAccounts > 0 {
+		problem(c, 409, "MAIL_REQUIRED_FOR_SECOND_FACTOR", "Platform administrators need email to pass the second factor; change the settings instead of deleting them")
+		return
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		problem(c, 500, "MAIL_CONFIG_DELETE_FAILED", "Unable to delete the email settings")

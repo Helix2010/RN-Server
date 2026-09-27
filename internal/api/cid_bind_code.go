@@ -125,23 +125,23 @@ func newBindCode() (code, token string, err error) {
 
 // bindCodeMessage 中英双语：成员的控制台语言在这里拿不到，收件人也未必是同一个人。
 func bindCodeMessage(to, code, loginName, console string) mail.Message {
-	text := fmt.Sprintf(`控制台 %s 的成员账号 %s 正在绑定这个统一登录账号（%s）。绑定后，可以用这个统一登录账号进入该控制台。
+	text := fmt.Sprintf(`控制台 %s 上的账号 %s 正在绑定这个统一登录账号（%s）。绑定后，可以用这个统一登录账号进入该控制台。
 
 验证码：%s
 %d 分钟内有效。如果不是您本人在绑定，请忽略这封邮件，不要把验证码告诉任何人。
 
-The console member %s on %s is being bound to this unified login account (%s). Once bound, this account can sign in to that console.
+The console account %s on %s is being bound to this unified login account (%s). Once bound, this account can sign in to that console.
 
 Code: %s
 Valid for %d minutes. If you are not the one binding, ignore this email and do not share the code.
 `, console, loginName, to, code, int(bindCodeTTL.Minutes()), loginName, console, to, code, int(bindCodeTTL.Minutes()))
 	e := html.EscapeString
 	htmlBody := fmt.Sprintf(`<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;color:#0f172a;line-height:1.6">
-<p>控制台 <b>%s</b> 的成员账号 <b>%s</b> 正在绑定这个统一登录账号（%s）。绑定后，可以用这个统一登录账号进入该控制台。</p>
+<p>控制台 <b>%s</b> 上的账号 <b>%s</b> 正在绑定这个统一登录账号（%s）。绑定后，可以用这个统一登录账号进入该控制台。</p>
 <p style="font-size:32px;font-weight:700;letter-spacing:8px;font-family:'Courier New',monospace">%s</p>
 <p>%d 分钟内有效。如果不是您本人在绑定，请忽略这封邮件，不要把验证码告诉任何人。</p>
 <hr style="border:none;border-top:1px solid #e2e8f0">
-<p>The console member <b>%s</b> on <b>%s</b> is being bound to this unified login account (%s). Once bound, this account can sign in to that console.</p>
+<p>The console account <b>%s</b> on <b>%s</b> is being bound to this unified login account (%s). Once bound, this account can sign in to that console.</p>
 <p>Valid for %d minutes. If you are not the one binding, ignore this email and do not share the code.</p>
 </body></html>`, e(console), e(loginName), e(to), code, int(bindCodeTTL.Minutes()), e(loginName), e(console), e(to), int(bindCodeTTL.Minutes()))
 	return mail.Message{To: to, Subject: "绑定统一登录账号验证码 / Unified login binding code", Text: text, HTML: htmlBody}
@@ -152,21 +152,21 @@ Valid for %d minutes. If you are not the one binding, ignore this email and do n
 func bindNoticeMessage(loginName, console, cidEmail string, at time.Time) mail.Message {
 	when := at.UTC().Format("2006-01-02 15:04 UTC")
 	masked := maskEmail(cidEmail)
-	text := fmt.Sprintf(`控制台 %s 的成员账号 %s 已于 %s 绑定统一登录账号 %s。之后这个账号只能用该统一登录账号登录，原来的初始口令已作废。
+	text := fmt.Sprintf(`控制台 %s 上的账号 %s 已于 %s 绑定统一登录账号 %s。之后这个账号只能用该统一登录账号登录，原来的初始口令已作废。
 
-如果不是您本人操作，请立即联系平台管理员，在「控制台成员」里对这个账号「解绑并重置口令」。
+如果不是您本人操作，请立即联系平台管理员，对这个账号「解绑并重置口令」。
 
-The console member %s on %s was bound to the unified login account %s at %s. From now on it can sign in only with that account; the initial password no longer works.
+The console account %s on %s was bound to the unified login account %s at %s. From now on it can sign in only with that account; the initial password no longer works.
 
-If this was not you, contact the platform administrator right away to unbind the account and reset its password (Console members → Unbind and reset password).
+If this was not you, contact the platform administrator right away to unbind the account and reset its password.
 `, console, loginName, when, masked, loginName, console, masked, when)
 	e := html.EscapeString
 	htmlBody := fmt.Sprintf(`<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;color:#0f172a;line-height:1.6">
-<p>控制台 <b>%s</b> 的成员账号 <b>%s</b> 已于 %s 绑定统一登录账号 <b>%s</b>。之后这个账号只能用该统一登录账号登录，原来的初始口令已作废。</p>
-<p style="color:#b91c1c">如果不是您本人操作，请立即联系平台管理员，在「控制台成员」里对这个账号「解绑并重置口令」。</p>
+<p>控制台 <b>%s</b> 上的账号 <b>%s</b> 已于 %s 绑定统一登录账号 <b>%s</b>。之后这个账号只能用该统一登录账号登录，原来的初始口令已作废。</p>
+<p style="color:#b91c1c">如果不是您本人操作，请立即联系平台管理员，对这个账号「解绑并重置口令」。</p>
 <hr style="border:none;border-top:1px solid #e2e8f0">
-<p>The console member <b>%s</b> on <b>%s</b> was bound to the unified login account <b>%s</b> at %s. From now on it can sign in only with that account; the initial password no longer works.</p>
-<p style="color:#b91c1c">If this was not you, contact the platform administrator right away to unbind the account and reset its password (Console members → Unbind and reset password).</p>
+<p>The console account <b>%s</b> on <b>%s</b> was bound to the unified login account <b>%s</b> at %s. From now on it can sign in only with that account; the initial password no longer works.</p>
+<p style="color:#b91c1c">If this was not you, contact the platform administrator right away to unbind the account and reset its password.</p>
 </body></html>`, e(console), e(loginName), when, e(masked), e(loginName), e(console), e(masked), when)
 	return mail.Message{Subject: "控制台账号已绑定统一登录 / Console account bound to unified login", Text: text, HTML: htmlBody}
 }
@@ -181,16 +181,16 @@ func (s *server) sendCIDBindNotice(c *gin.Context, session *adminSession, cidEma
 	switch {
 	case err != nil:
 		problemCode = "MAIL_CONFIG_INVALID"
-		slog.Warn("bind notice not sent: mail config unreadable", "tenant", session.TenantID, "account", session.AccountID, "error", err)
+		slog.Warn("bind notice not sent: mail config unreadable", "tenant", session.auditTenant(), "account", session.AccountID, "error", err)
 	case cfg == nil:
 		problemCode = "MAIL_NOT_CONFIGURED"
-		slog.Warn("bind notice not sent: mail not configured", "tenant", session.TenantID, "account", session.AccountID)
+		slog.Warn("bind notice not sent: mail not configured", "tenant", session.auditTenant(), "account", session.AccountID)
 	default:
 		msg := bindNoticeMessage(session.Account.LoginName, s.consoleHost(c), cidEmail, at)
 		msg.To = to
 		problemCode, _ = s.sendMail(ctx, *cfg, msg)
 	}
-	s.auditNow(newAudit(session.TenantID, session.Actor, "tenant_account_bind_notice", "tenant-account", session.AccountID, "绑定通知", requestID(c),
+	s.auditNow(newAudit(session.auditTenant(), session.Actor, session.Account.auditAction("bind_notice"), session.Account.auditTarget(), session.AccountID, "绑定通知", requestID(c),
 		map[string]any{"to": maskEmail(to), "sent": problemCode == "", "problem": nullableString(problemCode)}))
 }
 
@@ -226,7 +226,7 @@ func (s *server) sendCIDBindCode(c *gin.Context) {
 	}
 	expiresAt := now.Add(bindCodeTTL)
 	problemCode, sendErr := s.sendMail(ctx, *cfg, bindCodeMessage(pending.Email, code, session.Account.LoginName, s.consoleHost(c)))
-	s.auditNow(newAudit(session.TenantID, session.Actor, "tenant_account_bind_code_sent", "tenant-account", session.AccountID, "发送绑定验证码", requestID(c),
+	s.auditNow(newAudit(session.auditTenant(), session.Actor, session.Account.auditAction("bind_code_sent"), session.Account.auditTarget(), session.AccountID, "发送绑定验证码", requestID(c),
 		map[string]any{"to": maskEmail(pending.Email), "sent": sendErr == nil, "problem": nullableString(problemCode)}))
 	if sendErr != nil {
 		problem(c, 502, mailProblemSendFail, "Unable to send the verification code; try again later")

@@ -7553,7 +7553,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "当前域名租户的控制台成员（只有平台管理员）：{items:[{id, displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}"
+            "description": "当前域名租户的控制台成员（只有平台管理员）：{items:[{id, scope, displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}"
           }
         }
       },
@@ -7713,6 +7713,110 @@
             "description": "INVALID_SECOND_FACTOR、SECOND_FACTOR_CODE_INVALID、SECOND_FACTOR_NOT_APPLICABLE"
           }
         }
+      }
+    },
+    "/v1/admin/platform/accounts": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "平台管理员账号（只有平台管理员能看）：{items:[{id, scope:\"platform\", displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}。平台管理员账号做写操作要 15 分钟内过邮箱二次验证（403 SECOND_FACTOR_REQUIRED）"
+          }
+        }
+      },
+      "post": {
+        "responses": {
+          "201": {
+            "description": "{account, initialPassword（只出现这一次）, passwordExpiresAt}。登录名不能与任何账号重名（409 LOGIN_NAME_TAKEN）"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/accounts/{id}/disable": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "停用：会话立即失效"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "停用平台管理员账号（立即删掉它的会话）。不能对自己做（409 CANNOT_CHANGE_OWN_ACCOUNT），不能让最后一个可用的平台管理员失效（409 LAST_PLATFORM_ADMIN）"
+      }
+    },
+    "/v1/admin/platform/accounts/{id}/reset": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "解绑并重置初始口令：回到待绑定，返回 {account, initialPassword, passwordExpiresAt}；会话立即失效"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "解绑并重置初始口令，回到待绑定。不能对自己做（409 CANNOT_CHANGE_OWN_ACCOUNT），不能让最后一个可用的平台管理员失效（409 LAST_PLATFORM_ADMIN）"
       }
     }
   },

@@ -67,6 +67,14 @@ func main() {
 		}
 		return
 	}
+	// 平台管理员账号的建号与找回：控制台里没有可用的平台管理员时只能在服务器上做（platform_account.go）
+	if len(os.Args) >= 3 && os.Args[1] == "admin" && os.Args[2] == "platform-account" {
+		if err := runPlatformAccountCommand(cfg, database, os.Args[3:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "platform-account:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && os.Args[1] == "indexer" {
 		runIndexer(cfg, database)
 		return

@@ -47,6 +47,43 @@ location = /client/v1/oauth/login {
     proxy_hide_header Referrer-Policy;
 }
 
+# 统一账号的登录页放在控制台里（RN-Server 设计 platform-accounts-and-console-login-2026-09-27 §3.8）：
+# 认证中心「挂在应用域名下」，/auth/v1/* 经 dev1 的内网入口（只放行 amos，只转 /auth/v1/* 与 userinfo）转给它，
+# Host 原样——认证中心按 Host 认应用与登记的域名，没登录时把浏览器送回 https://<Host>/login?X-Auth-Token=…。
+# RN 自己的 Cookie 都在 /v1/admin、/client/v1/oauth/login 下，不会带到这里
+location ^~ /auth/v1/ {
+    proxy_pass http://172.17.19.2:9098;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout    30s;
+}
+# 口令登录接口限流（zone 在 rn-foundation.conf）：认证中心自己没有登录失败锁定
+location = /auth/v1/login {
+    limit_req zone=rn_cid_login burst=20 nodelay;
+    limit_req_status 429;
+    proxy_pass http://172.17.19.2:9098;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout    30s;
+}
+
+# 控制台的统一账号登录页：同一份 SPA，但这一页经手统一账号口令，单独加严格的 CSP（只许同源脚本与请求，
+# 不许被嵌进别的页面）。try_files 的第一个参数是文件：在本 location 里直接出 index.html，响应头就是下面这些；
+# 写成最后一个参数会内部跳到 /index.html、换成那边的头。
+# location 里只要有 add_header，外层的就不再继承，所以三个通用安全头在这里再写一遍
+location = /login {
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'; object-src 'none'" always;
+    add_header Cache-Control          "no-cache, must-revalidate" always;
+    add_header Referrer-Policy        "no-referrer" always;
+    add_header X-Content-Type-Options "nosniff"     always;
+    add_header X-Frame-Options        "DENY"        always;
+    try_files /index.html =404;
+}
+
 location = /healthz {
     access_log off;
     add_header Content-Type text/plain;
@@ -71,5 +108,10 @@ location / {
 
 location = /index.html {
     add_header Cache-Control "no-cache, must-revalidate";
+    # 这里有了 add_header，server 级的三个安全头就不再继承（nginx 的规则）：以前控制台的 HTML 一直没带
+    # X-Frame-Options 等，可以被别的站点嵌进 iframe。补上
+    add_header Referrer-Policy        "no-referrer" always;
+    add_header X-Content-Type-Options "nosniff"     always;
+    add_header X-Frame-Options        "SAMEORIGIN"  always;
     expires -1;
 }
