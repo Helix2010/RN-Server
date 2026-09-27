@@ -488,6 +488,7 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 **验证**：
 
 - RN-Server：CI 同款门禁全过（gofmt、vet、race 单测、api 与 store 的库测）。新增的库测走真实路由，覆盖 11 个场景；在独立的测试库上连跑两次结果一致；`internal/cid` 有单测。
+  - 09-27 起认证中心客户端换成公司 SDK `github.com/Helix2010/authorization-go-sdk`（v0.1.1，私有仓库，吸收了 RN 与 pm 的实测做法），`internal/cid` 删掉；RN 只留自己多要的一条：账号 id 必须是 uuid、统一小写（`cidIdentity`，测试在 `internal/api/cid_identity_test.go`）。CI 用那个仓库的只读 deploy key 拉它，配法见 README「私有依赖」。
 - RN-Admin：`pnpm check` 全过（加上验证码与发信页之后是 55 个测试文件、687 项），`pnpm layout:audit` 没跑。
 - 对真的认证中心做了端到端联调（`~/fy/work/cid-local/bin/rn-cid-e2e.sh`）：
   - 本机起了一个 RN-Server 开发实例，库是 `rn_dev_cid`；认证中心走 `https://login.dexfun.win`；
@@ -499,11 +500,13 @@ RN 如果用「挂在应用域名下」，要多做三件事：
 
 **上线前还要做的**：
 
-1. 应用 amos 的 nginx 模板，交给用户执行；
-2. 在认证中心给每个租户登记 `https://console.<租户域名>/client/v1/oauth/login`，写库先问用户；
-3. 在平台维护 › 统一登录里填客户端配置。amos 上的换令牌与 userinfo 地址用 `http://172.17.19.2:9098/…`；
-4. 在平台维护 › 邮件发送里配 SMTP 发件账号，并发一封测试邮件。**不配就没人能完成绑定**；
+1. ~~应用 amos 的 nginx 模板，交给用户执行~~：09-27 用户已装；
+2. ~~在认证中心给每个租户登记 `https://console.<租户域名>/client/v1/oauth/login`，写库先问用户~~：09-27 经用户同意登记了 console.anyfun.win、console.any123.top、console.predict.kim（认证中心约 15 分钟后才载入）；以后每加一个控制台域名都要登记一条；
+3. ~~在平台维护 › 统一登录里填客户端配置~~：09-27 已填，授权与退出走 `https://login.dexfun.win`，换令牌与 userinfo 走 `http://172.17.19.2:9098/…`；
+4. ~~在平台维护 › 邮件发送里配 SMTP 发件账号，并发一封测试邮件~~：09-27 复用认证中心的 Lark 发件账号（smtp.larksuite.com:465），测试邮件已发出。**删掉它就没人能完成绑定**；
 5. ~~给真实租户开放账号之前，补上 TOTP 与 §3.4 的租户接口审计~~：09-27 已做（§3.4 实施记录、§4.5 实施）；**成员登记的邮箱必须真是本人的**——二次验证与绑定通知都发到那里。
+
+09-27 线上验收（AnyFun 租户，测试成员 fuyu）：初始口令登录 → 邮箱二次验证 → 认证中心登录 → 统一账号邮箱收码确认绑定 → 绑定通知；之后统一登录直接进、口令登录 409。审计六类记录齐全，服务端无报错。
 
 ## 5. pm-cup 那边要做的（交给对方团队）
 

@@ -410,7 +410,7 @@ func (s *server) logout(c *gin.Context) {
 	if currentAdminSession(c).tenantScoped() {
 		if client, _, err := s.cidClient(c.Request.Context()); err == nil && client != nil {
 			host := s.consoleHost(c)
-			body["cidLogoutUrl"] = client.LogoutURL(host, "https://"+host+"/")
+			body["cidLogoutUrl"] = client.LogoutURL("https://"+host+"/", host)
 		}
 	}
 	c.JSON(200, body)

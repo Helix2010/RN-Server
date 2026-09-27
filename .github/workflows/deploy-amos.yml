@@ -38,6 +38,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # 统一登录客户端 github.com/Helix2010/authorization-go-sdk 是私有仓库：go 命令（包括下面 agent-commit.sh
+      # 里的 go list）要用它的只读 deploy key 才拉得到
+      - uses: ./.github/actions/private-go-modules
+        with:
+          deploy-key: ${{ secrets.AUTHORIZATION_SDK_DEPLOY_KEY }}
 
       # 只改文档的提交不该重新部署。安装包与打包机现在按 agent 提交出版本（下面「Work out the
       # agent commit」），只改文档或服务端都不会逼人重签；但服务端二进制每次部署都要停服务、跑迁移，
@@ -167,6 +172,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: ./.github/actions/private-go-modules
+        with:
+          deploy-key: ${{ secrets.AUTHORIZATION_SDK_DEPLOY_KEY }}
       - run: test -z "$(gofmt -l cmd internal signing)"
       - run: go vet ./...
       # 这几个脚本以 root 跑在服务器上（install.sh 由服务端下发给新机器）：shellcheck 不过不发

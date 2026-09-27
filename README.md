@@ -37,6 +37,18 @@ go run ./cmd/server
 
 管理员密码只保存 scrypt 哈希，明文不得进入仓库或日志。
 
+## 私有依赖
+
+统一登录的客户端是私有仓库 `github.com/Helix2010/authorization-go-sdk`（公司认证中心的 Go SDK）。**本仓库里任何 go 命令**都要能拉到它，不只是编 `cmd/server`：`go list`、打包机的 `build-bundles.sh`、`deploy/amos/deploy.sh` 都会读整个模块图。第一次拉取之前配一次：
+
+```bash
+go env -w GOPRIVATE=github.com/Helix2010/authorization-go-sdk   # 不去公共代理和校验和库，go.sum 照样核对
+# 用你能读这个仓库的 SSH 身份；主机别名按自己的 ~/.ssh/config 改（比如本机用的是 amos.github.com）
+git config --global url."git@github.com:Helix2010/authorization-go-sdk".insteadOf "https://github.com/Helix2010/authorization-go-sdk"
+```
+
+模块缓存里有了之后，平时编译不再联网。CI 用的是那个仓库的只读 deploy key：Actions Secret `AUTHORIZATION_SDK_DEPLOY_KEY`（建在仓库级 Secrets，不是某个 environment 下），由 `.github/actions/private-go-modules` 装上。`Dockerfile` 要用 `docker build --ssh default .`。
+
 ## 设计入口
 
 - [总体架构](docs/ARCHITECTURE.md)
