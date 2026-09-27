@@ -133,9 +133,10 @@ sequenceDiagram
       proxy_set_header X-Forwarded-Proto https;
       proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
   }
-  # 口令登录接口单独限流（与 login.dexfun.win 相同：每 IP 每分钟 20 次，突发 10）
+  # 口令登录接口单独限流。amos 看不到真实客户端 IP（公网入口是网关按 SNI 转发的 TCP，access log 里只有一个来源），
+  # 所以按 IP 的限流实际是全局的：每分钟 60 次、突发 20
   location = /auth/v1/login {
-      limit_req zone=rn_cid_login burst=10 nodelay;
+      limit_req zone=rn_cid_login burst=20 nodelay;
       limit_req_status 429;
       proxy_pass http://172.17.19.2:9098;
       proxy_set_header Host              $host;
@@ -144,7 +145,7 @@ sequenceDiagram
   }
   ```
 
-  `/login` 本来就落到控制台的 SPA（`try_files … /index.html`），不用改。dev1 的内网入口已经原样透传 Host 与 `X-Forwarded-Proto`，只放行 amos，只转 `/auth/v1/*` 与 `/internal/v1/userinfo`，不用改。RN 自己的 Cookie 路径都在 `/v1/admin`、`/client/v1/oauth/login` 下，不会带到 `/auth/v1/`。
+  `/login` 单独一个 location：在本 location 里直接出 `index.html`（`try_files /index.html =404`，第一个参数是文件就不会内部跳转），带上严格 CSP 与 `X-Frame-Options: DENY`。顺带发现：`location = /index.html` 写了 `add_header Cache-Control`，按 nginx 的规则 server 级的三个安全头就不再继承，控制台的 HTML 一直没带 `X-Frame-Options` 等——这次在那里补上。dev1 的内网入口已经原样透传 Host 与 `X-Forwarded-Proto`，只放行 amos，只转 `/auth/v1/*` 与 `/internal/v1/userinfo`，不用改。RN 自己的 Cookie 路径都在 `/v1/admin`、`/client/v1/oauth/login` 下，不会带到 `/auth/v1/`。
 - **RN-Admin 的 `/login` 页**：地址上有 `X-Auth-Token` 时显示「统一账号登录」表单（账号或邮箱、口令），用 FormData 交给同源的 `/auth/v1/login`（请求头带 `X-Auth-Token`、`remember_me=false`、`lang` 按界面语言），成功后**只跟随同源的** `redirect_url`，别的一律当异常；失败显示认证中心给的原因。口令不存、不进日志。写法照 `cid-local/login-page/login.js` 与 SDK 的示例应用。
 - **代价**：
   - 与 pm 之间的跨域名单点登录没了（pm 继续用 `login.dexfun.win`），每个控制台域名也要各登一次；
@@ -175,5 +176,5 @@ sequenceDiagram
 ## 6. 残留风险
 
 - 认证中心是 dev1 上的单实例，经 Cloudflare 隧道对外（换令牌走内网，不经隧道）：它停摆 = RN 控制台全员登不进（用户已接受）。
-- 认证中心本身没有登录失败锁定，只靠 nginx 按 IP 限流；统一账号口令被慢速撞库时挡不住，要靠邮箱二次验证兜底。
+- 认证中心本身没有登录失败锁定，只靠 nginx 限流；而 amos 看不到真实客户端 IP，限流实际是全局的（每分钟 60 次）：挡得住高速撞库，挡不住慢速的，还可能被人故意打满、让正常用户一时登不进；要靠邮箱二次验证兜底。
 - 控制台页面经手统一账号口令（3.8）。

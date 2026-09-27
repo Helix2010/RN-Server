@@ -22,21 +22,22 @@ import (
 
 var scanProbeHTTP = &http.Client{Timeout: 45 * time.Second}
 
-// requirePlatformAdmin 在 authenticate() 之后：账号必须在配置文件声明的平台管理员列表里，
-// 而且不能是租户账号的会话（它的 actor 与列表里的名字撞上也不行，见 platformAdminRequest）。
+// requirePlatformAdmin 在 authenticate() 之后：已绑定、可用的平台管理员账号；或者没有账号的会话
+// （环境变量账号、自动化通道）且 actor 在配置文件声明的列表里。租户账号的会话永远进不来
+// （它的 actor 与列表里的名字撞上也不行，见 platformAdminRequest）。
 func (s *server) requirePlatformAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if len(s.cfg.PlatformAdminUsernames) == 0 {
-			problem(c, 403, "PLATFORM_ADMIN_NOT_CONFIGURED", "PLATFORM_ADMIN_USERNAMES is empty; platform pages are disabled")
+		if s.platformAdminRequest(c) {
+			c.Next()
+			return
+		}
+		if len(s.cfg.PlatformAdminUsernames) == 0 && !currentAdminSession(c).hasAccount() {
+			problem(c, 403, "PLATFORM_ADMIN_NOT_CONFIGURED", "PLATFORM_ADMIN_USERNAMES is empty and this session has no platform account")
 			c.Abort()
 			return
 		}
-		if !s.platformAdminRequest(c) {
-			problem(c, 403, "PLATFORM_ADMIN_REQUIRED", "This account is not a platform administrator")
-			c.Abort()
-			return
-		}
-		c.Next()
+		problem(c, 403, "PLATFORM_ADMIN_REQUIRED", "This account is not a platform administrator")
+		c.Abort()
 	}
 }
 

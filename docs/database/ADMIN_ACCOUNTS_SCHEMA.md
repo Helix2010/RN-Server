@@ -1,6 +1,7 @@
-# 租户控制台账号与统一登录（tenant_admin_accounts / admin_sessions / app_configs auth.cid、mail.smtp）
+# 控制台账号与统一登录（tenant_admin_accounts / admin_sessions / app_configs auth.cid、mail.smtp）
 
-设计：`docs/design/tenant-console-accounts-and-sso-2026-09-25.md`（§3.2 账号表、§3.3 会话、§4 接入统一认证、§4.9 自建认证中心）；决策：ADR-0021；接口 JSON 见 `contracts/openapi.json`。
+设计：`docs/design/tenant-console-accounts-and-sso-2026-09-25.md`（§3.2 账号表、§3.3 会话、§4 接入统一认证、§4.9 自建认证中心）、
+`docs/design/platform-accounts-and-console-login-2026-09-27.md`（平台管理员也进这张表，迁移 63）；决策：ADR-0021；接口 JSON 见 `contracts/openapi.json`。
 
 ## 复用映射
 
@@ -15,7 +16,8 @@
 | 发信账号 | 复用 `app_configs`，`tenant_id=0`、键 `mail.smtp` | 平台级一份；口令用 `secretbox` 加密（ADR-0022） |
 | 统一认证的客户端配置 | 复用 `app_configs`，`tenant_id=0`、键 `auth.cid` | 平台级一份；客户端密钥用 `secretbox` 加密 |
 | 会话 | 复用 `admin_sessions`，加三列（迁移 61） | 见下 |
-| 审计 | 复用 `audit_events` | 租户账号的 actor 是 `tenant:<租户 id>:<账号 id>` |
+| 审计 | 复用 `audit_events` | 租户账号的 actor 是 `tenant:<租户 id>:<账号 id>`；平台管理员账号是 `platform:<账号 id>`，审计记在平台（`tenant_id=0`），动作前缀 `platform_account_` |
+| 平台管理员账号 | 复用 `tenant_admin_accounts`，加 `scope` 列（迁移 63） | 与租户成员同一套生命周期（初始口令 → 待绑定 → 统一认证）；`tenant_id` 为 NULL，租户查询天然查不到它们 |
 
 应急账号（不绑定、只用本地口令）与 TOTP 暂不做（用户 2026-09-26：TOTP 要先把设计说定再实施），到时候再加列。
 
@@ -24,9 +26,11 @@
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | BIGINT UNSIGNED 自增 | 账号主键；会话与审计 actor 用它 |
-| `tenant_id` | BIGINT UNSIGNED | 所属租户；只能在这个租户的域名上登录 |
+| `scope`（迁移 63） | VARCHAR(16) | `tenant`=租户成员；`platform`=平台管理员 |
+| `tenant_id` | BIGINT UNSIGNED NULL | 所属租户；租户成员只能在这个租户的域名上登录。平台管理员为 NULL（任何控制台域名都能登录）；CHECK `ck_tenant_admin_scope` 保证与 `scope` 一致 |
+| `tenant_key`（迁移 63） | BIGINT UNSIGNED 生成列 | `IFNULL(tenant_id, 0)`，只给唯一键用（MySQL 唯一索引不比较 NULL） |
 | `display_name` | VARCHAR(120) | 显示名 |
-| `login_name` | VARCHAR(64) | 本地登录名，租户内唯一，小写；绑定之后不再能用来登录 |
+| `login_name` | VARCHAR(64) | 本地登录名，租户内唯一，小写；绑定之后不再能用来登录。平台管理员的登录名全局唯一，且不与任何租户成员重名（初始口令登录先找平台账号） |
 | `email` | VARCHAR(255) | 建号时填的邮箱，只用于界面与通知；不唯一、不作身份依据 |
 | `idp` | VARCHAR(32) NULL | `chainup-cid`；NULL=还没绑定 |
 | `idp_subject` | VARCHAR(120) NULL | 统一认证 userinfo 的 `username`（账号 uuid，小写）；NULL=还没绑定 |
@@ -38,7 +42,7 @@
 | `bound_at` | DATETIME(3) NULL | 最近一次完成绑定的时刻 |
 | `last_login_at` | DATETIME(3) NULL | 最近一次登录成功的时刻 |
 
-唯一键：`(tenant_id, login_name)`、`(tenant_id, idp, idp_subject)`。同一个统一认证账号可以分别是多个租户的成员，各算一个账号；同一租户里一个统一认证账号只能绑一个账号。
+唯一键：`(tenant_key, login_name)`、`(tenant_key, idp, idp_subject)`（迁移 63 之前建在 `tenant_id` 上）。同一个统一认证账号可以分别是多个租户的成员，各算一个账号；同一租户里一个统一认证账号只能绑一个账号；**不能同时是平台管理员与租户成员**（绑定确认时按 `ix_tenant_admin_subject (idp, idp_subject)` 加锁检查）。另有 `ix_tenant_admin_login_name (login_name)`：建号时查登录名冲突并加锁。
 
 状态：
 
@@ -48,18 +52,18 @@
 | `active` | 只能统一登录（口令登录 409 `ACCOUNT_BOUND_USE_CID`） | 本租户范围内都能操作（先不分角色） | 本人确认绑定 |
 | `disabled` | 不能 | 会话立即失效 | 平台管理员停用 |
 
-谁写：平台管理员（控制台成员页：建号、停用、解绑重置）；本人（确认绑定）；登录时更新 `last_login_at`。谁读：登录、每个请求的鉴权（回表查状态）、成员页。
+谁写：平台管理员（控制台成员页：建号、停用、解绑重置；平台管理员账号不能对自己做，也不能让最后一个可用的失效）；amos 上的建号命令 `rn-server admin platform-account create|reset`（控制台里没有可用的平台管理员时）；本人（确认绑定）；登录时更新 `last_login_at`。谁读：登录、每个请求的鉴权（回表查状态）、成员页。
 
 ## admin_sessions 新增的列（迁移 61、62）
 
 | 列 | 说明 |
 | --- | --- |
-| `tenant_id` | 租户会话的租户；NULL=平台会话（环境变量里的管理员账号） |
-| `account_id` | 租户会话的账号；NULL=平台会话。索引 `ix_session_account`：停用、重置时删掉这个账号的全部会话 |
+| `tenant_id` | 租户会话的租户；NULL=平台会话（平台管理员账号，或环境变量里的管理员账号） |
+| `account_id` | 会话的账号（租户成员或平台管理员）；NULL=环境变量里的管理员账号。索引 `ix_session_account`：停用、重置时删掉这个账号的全部会话 |
 | `login_method` | `password` / `cid`；NULL=迁移之前的会话，按 `password` 处理 |
-| `second_factor_at`（迁移 62） | 租户会话最近一次通过邮箱二次验证的时间；敏感操作与发起绑定要在 15 分钟内（ADR-0023）。NULL=这个会话还没验过；平台会话不用 |
+| `second_factor_at`（迁移 62） | 账号会话最近一次通过邮箱二次验证的时间；敏感操作与发起绑定要在 15 分钟内（ADR-0023），平台管理员账号的平台维护与成员管理写操作也要。NULL=这个会话还没验过；环境变量账号不用 |
 
-鉴权：租户会话只在请求域名属于同一个租户时有效（否则当没登录）；每个请求回表查账号状态；租户会话永远不是平台管理员。
+鉴权：租户会话只在请求域名属于同一个租户时有效（否则当没登录）；平台管理员账号的会话在任何控制台域名上有效；每个请求回表查账号状态；租户会话永远不是平台管理员。
 
 ## app_configs：auth.cid（平台级，tenant_id=0）
 

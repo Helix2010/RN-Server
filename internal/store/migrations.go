@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -91,6 +92,8 @@ var migrations = []migration{
 	// 租户会话的二次验证（邮箱验证码）：记在会话上，敏感操作要 15 分钟内验过
 	// （设计 tenant-console-accounts-and-sso §4.5，2026-09-27 定为邮箱验证码）
 	{version: 62, name: "admin_session_second_factor", apply: adminSessionSecondFactorMigration},
+	// 平台管理员也进账号表、走统一登录（设计 platform-accounts-and-console-login-2026-09-27 §3.1）
+	{version: 63, name: "platform_admin_accounts", apply: platformAdminAccountsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2215,6 +2218,85 @@ func adminSessionSecondFactorMigration(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE admin_sessions ADD COLUMN second_factor_at DATETIME(3) NULL
 			COMMENT '租户会话最近一次通过邮箱二次验证的时间；敏感操作要在 15 分钟内。NULL=这个会话还没验过。平台会话不用' AFTER login_method`); err != nil {
 		return fmt.Errorf("admin session second factor migration: %w", err)
+	}
+	return nil
+}
+
+// platformAdminAccountsMigration 让 tenant_admin_accounts 也能放平台管理员（设计 platform-accounts-and-console-login §3.1）。
+//
+// 平台账号 scope='platform'、tenant_id 为 NULL：所有租户查询都带 tenant_id=?，天然查不到它们。MySQL 唯一索引
+// 不比较 NULL，所以两条唯一键改建在生成列 tenant_key（平台账号记作 0）上。已有的行都是租户成员，行为不变。
+// 每一步都能重复执行。
+func platformAdminAccountsMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "tenant_admin_accounts", "scope",
+		`ALTER TABLE tenant_admin_accounts ADD COLUMN scope VARCHAR(16) NOT NULL DEFAULT 'tenant'
+			COMMENT 'tenant=租户成员（tenant_id 必填，只能在这个租户的控制台域名上登录）；platform=平台管理员（tenant_id 为 NULL，任何控制台域名都能登录）' AFTER id`); err != nil {
+		return fmt.Errorf("platform accounts migration scope: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE tenant_admin_accounts MODIFY tenant_id BIGINT UNSIGNED NULL
+		COMMENT '所属租户 tenants.id；租户成员只属于一个租户，只能在这个租户的控制台域名上登录。平台管理员为 NULL'`); err != nil {
+		return fmt.Errorf("platform accounts migration tenant_id: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "tenant_admin_accounts", "tenant_key",
+		`ALTER TABLE tenant_admin_accounts ADD COLUMN tenant_key BIGINT UNSIGNED AS (IFNULL(tenant_id, 0)) STORED
+			COMMENT '唯一键用：租户成员等于 tenant_id，平台管理员记作 0（MySQL 唯一索引不比较 NULL）。由数据库生成，无人写入' AFTER tenant_id`); err != nil {
+		return fmt.Errorf("platform accounts migration tenant_key: %w", err)
+	}
+	for _, key := range []struct{ name, columns string }{
+		{"uq_tenant_admin_login", "tenant_key, login_name"},
+		{"uq_tenant_admin_idp", "tenant_key, idp, idp_subject"},
+	} {
+		var first string
+		if err := db.QueryRowContext(ctx, `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tenant_admin_accounts' AND INDEX_NAME=? AND SEQ_IN_INDEX=1`,
+			key.name).Scan(&first); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("platform accounts migration inspect %s: %w", key.name, err)
+		}
+		switch first {
+		case "tenant_key":
+			continue
+		case "":
+			_, err := db.ExecContext(ctx, `ALTER TABLE tenant_admin_accounts ADD UNIQUE KEY `+key.name+` (`+key.columns+`)`)
+			if err != nil {
+				return fmt.Errorf("platform accounts migration %s: %w", key.name, err)
+			}
+		default:
+			// 一条语句里先删后建：中间没有「没有唯一键」的窗口
+			_, err := db.ExecContext(ctx, `ALTER TABLE tenant_admin_accounts DROP INDEX `+key.name+`, ADD UNIQUE KEY `+key.name+` (`+key.columns+`)`)
+			if err != nil {
+				return fmt.Errorf("platform accounts migration %s: %w", key.name, err)
+			}
+		}
+	}
+	if err := addIndexIfMissing(ctx, db, "tenant_admin_accounts", "ix_tenant_admin_subject",
+		`ALTER TABLE tenant_admin_accounts ADD KEY ix_tenant_admin_subject (idp, idp_subject) COMMENT '绑定时按统一认证账号跨租户、跨平台查重并加锁（同一个统一账号不能既是平台管理员又是租户成员）'`); err != nil {
+		return fmt.Errorf("platform accounts migration subject index: %w", err)
+	}
+	if err := addIndexIfMissing(ctx, db, "tenant_admin_accounts", "ix_tenant_admin_login_name",
+		`ALTER TABLE tenant_admin_accounts ADD KEY ix_tenant_admin_login_name (login_name) COMMENT '建号时查登录名是否与平台管理员冲突并加锁（初始口令登录先找平台账号，登录名不能有歧义）'`); err != nil {
+		return fmt.Errorf("platform accounts migration login name index: %w", err)
+	}
+	var checks int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tenant_admin_accounts' AND CONSTRAINT_NAME='ck_tenant_admin_scope'`).Scan(&checks); err != nil {
+		return fmt.Errorf("platform accounts migration inspect check: %w", err)
+	}
+	if checks == 0 {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE tenant_admin_accounts ADD CONSTRAINT ck_tenant_admin_scope CHECK (
+			(scope = 'platform' AND tenant_id IS NULL) OR (scope = 'tenant' AND tenant_id IS NOT NULL))`); err != nil {
+			return fmt.Errorf("platform accounts migration check: %w", err)
+		}
+	}
+	for _, statement := range []string{
+		`ALTER TABLE tenant_admin_accounts COMMENT='控制台账号：租户成员（scope=tenant）与平台管理员（scope=platform）。平台管理员在控制台或 amos 上的建号命令添加，发初始口令，本人登录后绑定统一认证，之后只走统一认证；同一个统一认证账号可以分别是多个租户的成员，但不能同时是平台管理员'`,
+		`ALTER TABLE admin_sessions MODIFY tenant_id BIGINT UNSIGNED NULL
+			COMMENT '租户会话所属的租户 tenants.id；只在这个租户的域名上有效。NULL=平台会话（平台管理员账号，或环境变量里的管理员账号）'`,
+		`ALTER TABLE admin_sessions MODIFY account_id BIGINT UNSIGNED NULL
+			COMMENT '会话对应的 tenant_admin_accounts.id（租户成员或平台管理员）；鉴权时每次回表查状态。NULL=环境变量里的管理员账号'`,
+		`ALTER TABLE admin_sessions MODIFY second_factor_at DATETIME(3) NULL
+			COMMENT '账号会话（租户成员与平台管理员）最近一次通过邮箱二次验证的时间；敏感操作要在 15 分钟内。NULL=这个会话还没验过。环境变量账号不用'`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("platform accounts migration comments: %w", err)
+		}
 	}
 	return nil
 }
