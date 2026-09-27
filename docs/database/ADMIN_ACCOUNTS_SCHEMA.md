@@ -27,7 +27,7 @@
 | --- | --- | --- | --- |
 | `id` | BIGINT UNSIGNED 自增 | 数据库 | 账号主键；会话与审计 actor 用它 |
 | `scope` | VARCHAR(16) | 外部系统 | `tenant`=租户成员；`platform`=平台管理员 |
-| `tenant_id` | BIGINT UNSIGNED NULL | 外部系统 | 租户成员的租户，只能在这个租户的域名上登录；平台管理员为 NULL（任何控制台域名都能登录）。CHECK `ck_tenant_admin_scope` 保证与 `scope` 一致 |
+| `tenant_id` | BIGINT UNSIGNED NULL | 外部系统 | 租户成员的租户，只能在这个租户的域名上登录；平台管理员为 NULL（只能在平台控制台 `PLATFORM_CONSOLE_HOST` 上登录，设计 `docs/design/service-and-console-split-2026-09-27.md`）。CHECK `ck_tenant_admin_scope` 保证与 `scope` 一致 |
 | `tenant_key` | BIGINT UNSIGNED 生成列 | 数据库 | `IFNULL(tenant_id, 0)`，只给唯一键用（MySQL 唯一索引不比较 NULL） |
 | `display_name` | VARCHAR(120)，默认 `''` | 外部系统 | 显示名，也用在二次验证邮件里（空串时用邮箱） |
 | `email` | VARCHAR(255) | 外部系统 | **二次验证码发到这里**，必须是本人能收信的邮箱；不唯一、不作身份依据。CHECK `ck_tenant_admin_email`（`LIKE '_%@_%._%'`） |
@@ -40,8 +40,9 @@
 唯一键：`uq_tenant_admin_subject (idp_subject, tenant_key)`——同一个统一认证账号在一个租户里最多一条，平台管理员里最多一条；可以分别是多个租户的成员。账号 id 在前，回调按它查出全部记录也走这个索引。
 索引：`ix_tenant_admin_tenant (tenant_id, status)`（成员列表）。迁移 64 删掉了 RN 不再读的列：`login_name`、`password_hash`、`password_expires_at`、`idp_email`、`bound_at`、`idp`（恒为 `chainup-cid`）、`updated_at`。
 
-登录规则（`cid_login.go` `accountForLogin`）：同时有平台记录与任何租户记录 → 拒绝（`cidError=identity_conflict`，记日志）；只有平台记录 → 平台会话；
-有当前域名租户的记录 → 租户会话；其余 → `no_access`；选中的记录不是 `active` → `disabled`。不自动开户。
+登录规则（`cid_login.go` `accountForLogin`）：同时有平台记录与任何租户记录 → 拒绝（`cidError=identity_conflict`，记日志）；
+平台控制台只认平台记录（→ 平台会话），租户控制台只认当前域名租户的记录（→ 租户会话），其余 → `no_access`；选中的记录不是
+`active` → `disabled`。不自动开户。
 
 谁写：外部系统（建议给它一个只能读写这张表、只读 `tenants` 与 `tenant_domain` 几列的数据库账号，见设计 §3）；RN 只写 `last_login_at`。
 谁读：统一登录回调、每个请求的鉴权（回表查状态、`scope`、租户与 `idp_subject`）、控制台的只读列表（`GET /v1/admin/tenant-accounts`、`GET /v1/admin/platform/accounts`，只给平台管理员）。
@@ -57,7 +58,7 @@
 
 迁移 64 删掉了 `login_method` 列与索引 `ix_session_account`（只给已删掉的停用、重置接口用）。迁移 65 删掉环境变量管理员账号留下的会话（`account_id` 为 NULL），会话从此只有统一登录一个来源。
 
-鉴权：租户会话只在请求域名属于同一个租户时有效（否则当没登录）；平台管理员账号的会话在任何控制台域名上有效；每个请求回表，账号要是 `active`、按会话类型查得到、`idp_subject` 不变；租户会话永远不是平台管理员。
+鉴权：租户会话只在请求域名属于同一个租户时有效（否则当没登录）；平台管理员账号的会话只在平台控制台有效，拿到租户控制台上当没登录；每个请求回表，账号要是 `active`、按会话类型查得到、`idp_subject` 不变；租户会话永远不是平台管理员。
 
 ## app_configs：auth.cid（平台级，tenant_id=0）
 

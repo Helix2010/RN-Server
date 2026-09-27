@@ -29,6 +29,8 @@ func TestDBPlatformAccounts(t *testing.T) {
 	tenantA := accountsTestTenantRow(t, db, "pa")
 	tenantB := accountsTestTenantRow(t, db, "pb")
 	automationKey := "platform-accounts-test-key-" + uniqueSuffix()
+	// 平台管理员在平台控制台（不属于任何租户的域名）上登录（设计 service-and-console-split-2026-09-27 §4.2）
+	platformHost := "platform-" + uniqueSuffix() + ".test"
 	router := New(config.Config{
 		Environment:            "test",
 		StorageMasterKey:       base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
@@ -37,6 +39,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 		AdminAPIActor:          "automation@test",
 		PlatformAdminUsernames: []string{"automation@test"},
 		AdminSessionTTL:        3600,
+		PlatformConsoleHost:    platformHost,
 	}, &store.Store{DB: db})
 	cidServer := newFakeCIDServer(t)
 	smtpServer := startTestSMTP(t)
@@ -62,13 +65,17 @@ func TestDBPlatformAccounts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// cidLogin 在某个租户的控制台上统一登录，返回浏览器与回调之后跳去哪
-	cidLogin := func(tenant accountsTestTenant, subject string) (*browser, string) {
+	// cidLogin 在某个控制台上统一登录（tenant 为 nil 是平台控制台），返回浏览器与回调之后跳去哪
+	cidLogin := func(tenant *accountsTestTenant, subject string) (*browser, string) {
 		t.Helper()
-		b := newBrowser(tenant)
+		b, console := newBrowser(tenantA), platformHost
+		b.host = platformHost
+		if tenant != nil {
+			b, console = newBrowser(*tenant), tenant.console
+		}
 		authorize := location(t, b.do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil))
 		// 控制台登录页：授权地址里的 {baseHost} 换成了浏览器所在的控制台域名
-		if !strings.HasPrefix(authorize, "https://"+tenant.console+"/auth/v1/oauth/authorize?") {
+		if !strings.HasPrefix(authorize, "https://"+console+"/auth/v1/oauth/authorize?") {
 			t.Fatalf("authorize url = %s", authorize)
 		}
 		code, state := cidServer.approve(t, authorize, subject, "someone@chainup.test")
@@ -77,9 +84,9 @@ func TestDBPlatformAccounts(t *testing.T) {
 
 	rootID := externalAccount(t, db, "", rootSubject, rootEmail)
 	var root *browser
-	t.Run("平台记录：统一登录回来是平台会话，任何控制台域名都认", func(t *testing.T) {
+	t.Run("平台记录：在平台控制台登录是平台会话；租户控制台上进不来", func(t *testing.T) {
 		var got string
-		root, got = cidLogin(tenantB, rootSubject)
+		root, got = cidLogin(nil, rootSubject)
 		if got != "/" {
 			t.Fatalf("login callback redirected to %s", got)
 		}
@@ -88,9 +95,13 @@ func TestDBPlatformAccounts(t *testing.T) {
 			object(view["account"])["id"] != rootID || object(view["account"])["email"] != rootEmail {
 			t.Fatalf("platform cid session = %v", view)
 		}
+		// 平台管理员不操作租户：租户控制台上登录是 no_access，已有的平台会话拿过去也当没登录
+		if _, got := cidLogin(&tenantB, rootSubject); got != "/?cidError=no_access" {
+			t.Fatalf("a platform record on a tenant console redirected to %s", got)
+		}
 		elsewhere := newBrowser(tenantA)
 		elsewhere.cookies[adminSessionCookie] = root.cookies[adminSessionCookie]
-		elsewhere.mustCode(t, elsewhere.do("GET", "/v1/admin/tenant", nil, nil), 200)
+		wantProblem(t, elsewhere.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
 	})
 
 	t.Run("写操作要 15 分钟内的二次验证，验证码发到记录里的邮箱", func(t *testing.T) {
@@ -129,11 +140,11 @@ func TestDBPlatformAccounts(t *testing.T) {
 		wantProblem(t, automation.do("DELETE", "/v1/admin/platform/mail?reason="+url.QueryEscape("删发信"), nil, nil), 409, "MAIL_REQUIRED_FOR_SECOND_FACTOR")
 	})
 
-	t.Run("同一个统一账号既有平台记录又有租户记录：拒绝登录，哪个域名都一样", func(t *testing.T) {
+	t.Run("同一个统一账号既有平台记录又有租户记录：拒绝登录，哪个控制台都一样", func(t *testing.T) {
 		externalAccount(t, db, tenantA.id, rootSubject, "root-member@example.com")
-		for _, tenant := range []accountsTestTenant{tenantA, tenantB} {
+		for _, tenant := range []*accountsTestTenant{nil, &tenantA, &tenantB} {
 			if _, got := cidLogin(tenant, rootSubject); got != "/?cidError=identity_conflict" {
-				t.Fatalf("conflicting records on %s redirected to %s", tenant.console, got)
+				t.Fatalf("conflicting records on %v redirected to %s", tenant, got)
 			}
 		}
 		// 冲突只在登录时查：已经登录的平台会话不受影响，要立刻踢人就把记录停用（下一条）
@@ -141,7 +152,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 		if _, err := db.Exec(`DELETE FROM tenant_admin_accounts WHERE scope=? AND tenant_id=? AND idp_subject=?`, scopeTenant, tenantA.id, rootSubject); err != nil {
 			t.Fatal(err)
 		}
-		if _, got := cidLogin(tenantA, rootSubject); got != "/" {
+		if _, got := cidLogin(nil, rootSubject); got != "/" {
 			t.Fatalf("after the conflict is fixed, login redirected to %s", got)
 		}
 	})
@@ -151,7 +162,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 			t.Fatal(err)
 		}
 		wantProblem(t, root.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
-		if _, got := cidLogin(tenantA, rootSubject); got != "/?cidError=disabled" {
+		if _, got := cidLogin(nil, rootSubject); got != "/?cidError=disabled" {
 			t.Fatalf("disabled platform account redirected to %s", got)
 		}
 		// 没有可用的平台管理员了，发信配置可以删
@@ -161,7 +172,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 	t.Run("租户会话进不了平台管理员账号的接口", func(t *testing.T) {
 		memberSubject := testSubject()
 		externalAccount(t, db, tenantA.id, memberSubject, "member@example.com")
-		member, got := cidLogin(tenantA, memberSubject)
+		member, got := cidLogin(&tenantA, memberSubject)
 		if got != "/" {
 			t.Fatalf("member login redirected to %s", got)
 		}

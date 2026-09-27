@@ -148,7 +148,7 @@ func TestDBAPNsPlatformRowSkipsProbe(t *testing.T) {
 		t.Fatalf("平台行保存后的视图：%v", view)
 	}
 	// 租户没有自己那一行时继承平台的
-	tenantView, err := s.pushCredentialsView(context.Background(), tenant, false)
+	tenantView, err := s.pushCredentialsView(context.Background(), tenant)
 	if err != nil || tenantView["apns"].(gin.H)["inherited"] != true {
 		t.Fatalf("租户应当显示为继承：%v %v", tenantView, err)
 	}

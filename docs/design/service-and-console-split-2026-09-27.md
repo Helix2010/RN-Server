@@ -174,6 +174,15 @@ systemd 三个 unit：`rn-foundation-app`、`rn-foundation-tenant`、`rn-foundat
 - 租户端不再认平台会话，第 5 节的特权分支删掉。
 - 租户控制台去掉平台维护的插件，打包仓库目录、预测平台关联改成只读。
 - nginx 删掉 `console.*` 上转给平台端的那一段。
+- 实现要点：
+  - **平台会话**：拿到租户控制台上当没登录；统一登录回调在租户控制台只认本租户记录，只有平台记录是 `no_access`；平台控制台的改动请求只认它自己这个来源。
+  - **租户接口一律租户视角**：第 5 节的分支都删了，按「是不是平台会话」切换的参数也一并删掉。自动化通道（`x-admin-key`）在租户接口上同样是租户视角：发 OTA 这类租户操作照旧，平台级的事走 `/v1/admin/platform/*`。
+  - **删掉的租户端接口**：`/v1/admin/predict/probe`、`/v1/admin/tenant-accounts`。它们挪到了平台端（第 8 节）。
+  - **发布记录**：`fileMetadata` 里的 `builderId`、`signerMachineId` 不再给租户控制台（库里照记），发布详情附带的审计与审计列表一样脱敏。
+  - **机器手上的任务**：「打包机与签名闸」的机器列表每台带上 `currentJobs`。租户控制台看不到是哪台机器领的，平台在这里看（第 5 节第一行）。
+  - **删掉的字段**：任务视图不再给 `claimedBy`、`claimedMachineId`、`signingMachineId`、`signingMachineName`、`signOutcome.machineId`；iOS 交付不再给 `teamSharedWithTestFlightTenants`。RN-Admin 的 2b 已不再读它们，所以**RN-Admin 的 2b 要先上**，否则旧的租户控制台解析这两个接口会失败。
+  - **顺带修正**：统一登录回调原来直接用 `tenantID(c)`，平台控制台上它是 `"<nil>"`，不是空串。2a 里靠「只有平台记录就认」那条过渡分支碰巧通过；现在改用 `loginTenant`，平台控制台明确为空。
+  - **部署**：重跑 `platform-console-enable.sh` 装上新的 nginx 片段。
 
 **顺序**：平台控制台先上线并验收（平台管理员能在 platform.anyfun.win 登录、做平台维护），再上线「租户端不认平台会话」。反过来的话，中间有一段平台管理员哪里都进不去。
 

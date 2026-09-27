@@ -18,7 +18,7 @@
 #   4. 停旧进程，起三个新进程，等三个端口都就绪；
 #   5. 换 nginx 配置，nginx -t 通过才 reload；
 #   6. 经 nginx 核对分流：api.* 的管理接口 404（App 端没有）、机器接口到平台端；控制台的
-#      /v1/admin 到租户端、/v1/admin/platform 到平台端；有平台控制台的片段时，platform.* 的管理接口到平台端；
+#      /v1/admin 到租户端（没有平台接口）；有平台控制台的片段时，platform.* 的管理接口到平台端；
 #   7. 都通过之后才停用、删除旧 unit（备份里留着）。
 set -euo pipefail
 
@@ -187,7 +187,7 @@ expect 401 "$API_HOST"     POST /v1/build-agent/claim        "打包机接口在
 expect 401 "$API_HOST"     POST /v1/signer/claim             "签名闸接口在平台端，没带令牌"
 expect 200 "$CONSOLE_HOST" GET  /v1/admin/auth/methods       "租户端"
 expect 401 "$CONSOLE_HOST" GET  /v1/admin/auth/session       "租户端，没登录"
-expect 401 "$CONSOLE_HOST" GET  /v1/admin/platform/accounts  "平台端（租户端没有这条路由，会是 404）"
+expect 404 "$CONSOLE_HOST" GET  /v1/admin/platform/accounts  "租户控制台上没有平台接口（在平台控制台）"
 if [ -n "${NGINX_FILES[rn-foundation-snippet-platform.inc]:-}" ]; then
   expect 200 "$PLATFORM_HOST" GET  /v1/admin/auth/methods     "平台控制台 → 平台端"
   expect 404 "$PLATFORM_HOST" POST /v1/build-agent/claim      "平台控制台上不开机器接口"

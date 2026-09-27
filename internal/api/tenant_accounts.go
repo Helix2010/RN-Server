@@ -65,14 +65,6 @@ func (a *tenantAccount) actor() string {
 	return tenantActor(a.TenantID, a.ID)
 }
 
-// auditTenant 是这个账号的审计记在哪个租户下：平台管理员记在平台（0）。
-func (a *tenantAccount) auditTenant() string {
-	if a.platform() {
-		return platformTenantID
-	}
-	return a.TenantID
-}
-
 // auditAction 给账号相关的审计动作加前缀：platform_account_* 或 tenant_account_*。
 func (a *tenantAccount) auditAction(verb string) string {
 	if a.platform() {
@@ -202,11 +194,6 @@ func (s *server) listAccounts(c *gin.Context, codePrefix, where string, args ...
 	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(200, gin.H{"items": items})
-}
-
-// listTenantAccounts 列当前域名所属租户的成员（current 组）。
-func (s *server) listTenantAccounts(c *gin.Context) {
-	s.listAccounts(c, "TENANT_ACCOUNT", `scope=? AND tenant_id=?`, scopeTenant, tenantID(c))
 }
 
 // listPlatformAccounts 列平台管理员（platform 组）。

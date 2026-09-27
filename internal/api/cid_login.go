@@ -398,6 +398,15 @@ func (s *server) consoleScope() gin.HandlerFunc {
 	}
 }
 
+// loginTenant 是这次登录所在的租户：租户控制台是按域名认出的租户，平台控制台为空（accountForLogin 据此只认平台记录）。
+// 不能直接用 tenantID(c)：没认租户时它是 "<nil>"，不是空串。
+func (s *server) loginTenant(c *gin.Context) string {
+	if s.platformConsole(c) {
+		return ""
+	}
+	return tenantID(c)
+}
+
 // flowAAD 是流程 Cookie 的加密附加数据：租户控制台绑租户 id，平台控制台是固定的 platform（租户 id 是数字，撞不上）。
 // 在一个控制台发起的流程拿到另一个控制台的回调上解不开。
 func (s *server) flowAAD(c *gin.Context) string {
@@ -489,7 +498,7 @@ func (s *server) cidCallback(c *gin.Context) {
 	// 令牌只在这里用一次；认证中心同时发的 refresh_token 直接丢掉，我们不代表用户长期访问认证中心
 	exchanged, err := client.Exchange(ctx, code, flow.RedirectURI, flow.Verifier)
 	if err != nil {
-		slog.Warn("unified login code exchange failed", "error", err, "tenant", tenantID(c))
+		slog.Warn("unified login code exchange failed", "error", err, "tenant", s.loginTenant(c))
 		cidFail(c, "exchange")
 		return
 	}
@@ -499,7 +508,7 @@ func (s *server) cidCallback(c *gin.Context) {
 		subject, err = cidSubject(info)
 	}
 	if err != nil {
-		slog.Warn("unified login userinfo failed", "error", err, "tenant", tenantID(c))
+		slog.Warn("unified login userinfo failed", "error", err, "tenant", s.loginTenant(c))
 		cidFail(c, "userinfo")
 		return
 	}
@@ -508,20 +517,19 @@ func (s *server) cidCallback(c *gin.Context) {
 		cidFail(c, "internal")
 		return
 	}
-	// 平台控制台不属于任何租户：tenantID 为空，只认平台记录
-	acc, refused := accountForLogin(accounts, tenantID(c))
+	acc, refused := accountForLogin(accounts, s.loginTenant(c))
 	if refused == "identity_conflict" {
 		ids := make([]string, 0, len(accounts))
 		for _, a := range accounts {
 			ids = append(ids, a.Scope+":"+a.ID)
 		}
-		slog.Warn("unified login refused: the account is both a platform administrator and a tenant member", "subject", subject, "accounts", ids, "tenant", tenantID(c))
+		slog.Warn("unified login refused: the account is both a platform administrator and a tenant member", "subject", subject, "accounts", ids, "tenant", s.loginTenant(c))
 	}
 	if refused != "" {
 		cidFail(c, refused)
 		return
 	}
-	// 平台管理员的会话不属于任何租户（tenant_id 为 NULL），在任何控制台域名上都有效
+	// 平台管理员的会话不属于任何租户（tenant_id 为 NULL），只在平台控制台有效
 	_, token, err := s.createAdminSession(ctx, acc.actor(), acc.TenantID, acc.ID, acc.IDPSubject)
 	if err != nil {
 		cidFail(c, "internal")
@@ -535,10 +543,9 @@ func (s *server) cidCallback(c *gin.Context) {
 
 // accountForLogin 按统一认证账号的全部记录决定这次登录用哪个身份（设计 console-accounts-external-maintenance §4.1）：
 //   - 既有平台记录又有任何一条租户记录 → identity_conflict（外部系统写错了，不猜）；
-//   - 平台控制台（tenant 为空）：只认平台记录，没有就 no_access（设计 service-and-console-split-2026-09-27 §4.2）；
-//   - 只有平台记录 → 平台管理员（过渡期：平台管理员还能在租户控制台登录，拆分第二步的后半段去掉）；
-//   - 有当前域名所属租户的记录 → 这个租户的成员；
-//   - 其余 → no_access。
+//   - 平台控制台（tenant 为空）：只认平台记录，没有就 no_access；
+//   - 租户控制台：只认当前域名所属租户的记录，只有平台记录也是 no_access——平台管理员不操作租户
+//     （设计 service-and-console-split-2026-09-27 §4.1、§4.2）。
 //
 // 选中的账号不是 active → disabled。
 func accountForLogin(accounts []*tenantAccount, tenant string) (*tenantAccount, string) {
@@ -558,9 +565,10 @@ func accountForLogin(accounts []*tenantAccount, tenant string) (*tenantAccount, 
 	switch {
 	case platform != nil && members > 0:
 		return nil, "identity_conflict"
-	case tenant == "" && platform == nil:
-		return nil, "no_access"
-	case platform != nil:
+	case tenant == "":
+		if platform == nil {
+			return nil, "no_access"
+		}
 		acc = platform
 	case here == nil:
 		return nil, "no_access"

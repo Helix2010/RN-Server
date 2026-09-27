@@ -17,8 +17,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 租户会话开放之前要审的现有租户接口（设计 tenant-console-accounts-and-sso-2026-09-25 §3.4）：同一个接口，
-// 租户会话看不到别的租户与平台的基础设施、改不了平台级的设置；平台会话照旧。
+// 租户接口的租户视角（设计 tenant-console-accounts-and-sso-2026-09-25 §3.4）：看不到别的租户与平台的基础设施、
+// 改不了平台级的设置。拆分之后租户控制台只收租户会话，平台会话在这里当没登录（service-and-console-split-2026-09-27
+// §4.4、§5）；平台级的那一半在平台控制台（platform_tenant_settings_test.go）。
 
 // activeTenantSession 在库里直接放一个成员（外部系统写的那种）和它的统一登录会话，返回会话令牌。
 // 会话记为刚通过邮箱二次验证：这里测的是租户隔离，不是二次验证（那在 second_factor_test.go）。
@@ -108,10 +109,12 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		AdminSessionTTL:   3600,
 	}, &store.Store{DB: db})
 	member := &browser{router: router, tenant: tenantA, cookies: map[string]string{adminSessionCookie: activeTenantSession(t, db, tenantA)}}
+	member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
+	// 平台管理员不操作租户：平台会话拿到租户控制台上当没登录
 	platformToken, _, _ := activePlatformSession(t, db)
 	platform := &browser{router: router, tenant: tenantA, cookies: map[string]string{adminSessionCookie: platformToken}}
-	platform.mustCode(t, platform.do("GET", "/v1/admin/tenant", nil, nil), 200)
-	member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
+	wantProblem(t, platform.do("GET", "/v1/admin/tenant", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
+	wantProblem(t, platform.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
 
 	sfx := uniqueSuffix()
 	teamID := fmt.Sprintf("Z%09d", time.Now().UnixNano()%1_000_000_000)
@@ -122,14 +125,8 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 	t.Run("iOS 交付方式：租户只知道这个 Team 还有别人在用，不知道是谁", func(t *testing.T) {
 		mine := member.do("GET", "/v1/admin/ios/delivery", nil, nil)
 		view := member.mustCode(t, mine, 200)
-		if view["teamSharedWithOtherTenants"] != true || len(view["teamSharedWithTestFlightTenants"].([]any)) != 0 || strings.Contains(mine.Body.String(), slugB) {
+		if _, named := view["teamSharedWithTestFlightTenants"]; view["teamSharedWithOtherTenants"] != true || named || strings.Contains(mine.Body.String(), slugB) {
 			t.Fatalf("tenant view = %s", mine.Body.String())
-		}
-		if !strings.Contains(platform.do("GET", "/v1/admin/ios/delivery", nil, nil).Body.String(), slugB) {
-			t.Fatal("the platform session must still see which tenants share the team")
-		}
-		if strings.Contains(iosSharedTeamWarning([]string{slugB}, false), slugB) || !strings.Contains(iosSharedTeamWarning([]string{slugB}, true), slugB) {
-			t.Fatal("the warning names other tenants only for the platform")
 		}
 	})
 
@@ -148,7 +145,7 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		}, nil), 200)
 	})
 
-	t.Run("仓库目录只有平台管理员能改", func(t *testing.T) {
+	t.Run("仓库目录只能原样带回（平台在平台控制台改）", func(t *testing.T) {
 		save := func(b *browser, directory string, version int) map[string]any {
 			return map[string]any{
 				"repoDirectory": directory, "expectedVersion": version, "reason": "改打包配置", "confirm": true, "acknowledgeIdentityChange": true,
@@ -158,12 +155,10 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		wantProblem(t, member.do("PUT", "/v1/admin/build-config", save(member, "someone-else", 0), nil), 403, "REPO_DIRECTORY_PLATFORM_ONLY")
 		// 留空 = slug，与没存过时的默认值相同：租户照常能存别的字段
 		member.mustCode(t, member.do("PUT", "/v1/admin/build-config", save(member, "", 0), nil), 200)
-		platform.mustCode(t, platform.do("PUT", "/v1/admin/build-config", save(platform, "iso-dir-"+sfx, 1), nil), 200)
-		wantProblem(t, member.do("PUT", "/v1/admin/build-config", save(member, "", 2), nil), 403, "REPO_DIRECTORY_PLATFORM_ONLY")
-		member.mustCode(t, member.do("PUT", "/v1/admin/build-config", save(member, "iso-dir-"+sfx, 2), nil), 200)
+		wantProblem(t, member.do("PUT", "/v1/admin/build-config", save(member, "iso-dir-"+sfx, 1), nil), 403, "REPO_DIRECTORY_PLATFORM_ONLY")
 	})
 
-	t.Run("预测平台的关联只有平台管理员能改；测试连接也只给平台", func(t *testing.T) {
+	t.Run("预测平台的关联只能原样带回；测试连接不在租户端", func(t *testing.T) {
 		scope := "0x" + strings.Repeat("1", 64)
 		// validConfig 要的最小形状
 		base := func() map[string]any {
@@ -189,7 +184,9 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		wantProblem(t, member.do("PATCH", "/v1/admin/app-config", patch("0x"+strings.Repeat("2", 64)), nil), 403, "SERVICES_CONFIG_PLATFORM_ONLY")
 		// 原样带回（大小写不同也算同一个，归一化之后比）
 		member.mustCode(t, member.do("PATCH", "/v1/admin/app-config", patch(strings.ToUpper(scope[:2])+scope[2:]), nil), 200)
-		wantProblem(t, member.do("POST", "/v1/admin/predict/probe", map[string]any{"domain": "127.0.0.1"}, nil), 403, "PLATFORM_ADMIN_REQUIRED")
+		if got := member.do("POST", "/v1/admin/predict/probe", map[string]any{"domain": "127.0.0.1"}, nil).Code; got != 404 {
+			t.Fatalf("the probe must be gone from the tenant side, got %d", got)
+		}
 	})
 
 	t.Run("推送凭据：继承平台那一行时，租户看不到平台的账号，也不能测它", func(t *testing.T) {
@@ -201,9 +198,6 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 			t.Fatalf("tenant sees the platform row: %s", mine.Body.String())
 		}
 		wantProblem(t, member.do("POST", "/v1/admin/push/credentials/fcm/test", map[string]any{}, nil), 403, "PUSH_CREDENTIALS_INHERITED")
-		if !strings.Contains(platform.do("GET", "/v1/admin/push/credentials", nil, nil).Body.String(), "iam.gserviceaccount.com") {
-			t.Fatal("the platform session still sees the platform row")
-		}
 	})
 
 	t.Run("对象存储：继承平台存储时不回显平台的桶，也不能借平台的密钥换成自己的地址", func(t *testing.T) {
@@ -222,9 +216,6 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		if cors.Code != 200 || strings.Contains(cors.Body.String(), tenantB.console) || !strings.Contains(cors.Body.String(), tenantA.console) {
 			t.Fatalf("tenant CORS origins = %d %s", cors.Code, cors.Body.String())
 		}
-		if !strings.Contains(platform.do("GET", "/v1/admin/release-storage/cors", nil, nil).Body.String(), tenantB.console) {
-			t.Fatal("the platform session gets the union of all tenants")
-		}
 	})
 
 	t.Run("租户读自己的审计时看不到机器与别的租户", func(t *testing.T) {
@@ -240,9 +231,6 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 		if mine.Code != 200 || strings.Contains(body, "signer-hk-1") || strings.Contains(body, "mch_iso") || strings.Contains(body, slugB) || !strings.Contains(body, `"decrypt":"ok"`) {
 			t.Fatalf("tenant audit view = %d %s", mine.Code, body)
 		}
-		if !strings.Contains(platform.do("GET", "/v1/admin/audit-events?q="+target, nil, nil).Body.String(), "signer-hk-1") {
-			t.Fatal("the platform session still sees the machine in the audit")
-		}
 	})
 
 	t.Run("原来不写审计的租户写接口现在写，操作者是成员", func(t *testing.T) {
@@ -255,15 +243,14 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 	})
 }
 
-// 构建任务视图：租户会话里构建机、签名闸的名称与 id 都清掉；按机器搜也只给平台。
+// 构建任务视图：构建机、签名闸的名称与 id 都清掉；也不能按机器搜。
 func TestBuildJobViewHidesMachinesFromTenants(t *testing.T) {
-	view := buildJobViewWithMachines(buildJob{
+	view := tenantJobView(buildJob{
 		ClaimedBy:        sql.NullString{String: "mac-mini-3", Valid: true},
 		ClaimedMachineID: sql.NullString{String: "mch_builder", Valid: true},
 		SigningMachineID: sql.NullString{String: "mch_signer", Valid: true},
 		SignOutcome:      []byte(`{"kind":"failed","code":"X","detail":"d","machineId":"mch_signer","at":"2026-09-27T00:00:00Z"}`),
-	}, map[string]string{"mch_signer": "signer-hk-1"})
-	redactMachinesForTenant(view)
+	})
 	for _, key := range []string{"claimedBy", "claimedMachineId", "signingMachineId", "signingMachineName"} {
 		if view[key] != nil {
 			t.Fatalf("%s = %v", key, view[key])
@@ -272,14 +259,12 @@ func TestBuildJobViewHidesMachinesFromTenants(t *testing.T) {
 	if view["signOutcome"].(gin.H)["machineId"] != nil {
 		t.Fatalf("signOutcome = %v", view["signOutcome"])
 	}
-	tenantWhere, _ := buildJobListFilter{query: "mac-mini"}.where("7")
-	platformWhere, _ := buildJobListFilter{query: "mac-mini", machineSearch: true}.where("7")
-	if strings.Contains(tenantWhere, "claimed_by") || !strings.Contains(platformWhere, "claimed_by") {
-		t.Fatalf("tenant where %q / platform where %q", tenantWhere, platformWhere)
+	if where, _ := (buildJobListFilter{query: "mac-mini"}).where("7"); strings.Contains(where, "claimed_by") || strings.Contains(where, "machine_id") {
+		t.Fatalf("tenant where %q", where)
 	}
 }
 
-// keystore 视图：租户会话里签名闸的名称换成角色，机器 id 留着对行。
+// keystore 视图：签名闸的名称换成角色，机器 id 留着对行。
 func TestAnonymizeSigners(t *testing.T) {
 	view := gin.H{
 		"signers":        []gin.H{{"machineId": "mch_a", "name": "signer-hk-1", "signerRole": string(signerRolePrimary)}},

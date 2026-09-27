@@ -14,6 +14,9 @@
 #   3. 装 nginx 配置（含 platform.* 的 server 块），nginx -t 通过才 reload；
 #   4. 重启平台端，经 nginx 核对：平台控制台的统一登录开着，发起时的回调地址是平台控制台的域名。
 #
+# 租户端不再认平台会话那一版（第二步后半段）合并之后再跑一次：它会装上不再把 console.* 的
+# /v1/admin/platform/ 转给平台端的 nginx 片段（env 已有的两行不会重复加）。
+#
 # 平台控制台的静态产物由 RN-Admin 的 CI 放到 /opt/rn-foundation/admin/platform；公网能不能到还要
 # 网关按 SNI 放行、认证中心登记回调域名，这两件不在这里。
 set -euo pipefail
@@ -141,6 +144,11 @@ case "$start" in
 esac
 code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$PLATFORM_HOST:443:127.0.0.1" -X POST "https://$PLATFORM_HOST/v1/build-agent/claim" || true)"
 [ "$code" = 404 ] || die "平台控制台上不该开机器接口：POST /v1/build-agent/claim -> $code"
+# 租户控制台上的平台接口：过渡期的片段转给平台端（没登录 401），租户端不认平台会话之后的片段不转（租户端 404）
+want=404
+if grep -q 'location ^~ /v1/admin/platform/' "$SRC/nginx-snippet-console.inc"; then want=401; fi
+code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "console.anyfun.win:443:127.0.0.1" "https://console.anyfun.win/v1/admin/platform/accounts" || true)"
+[ "$code" = "$want" ] || die "租户控制台上的 /v1/admin/platform/accounts -> $code，应为 $want"
 done_ok=yes
 
 cat <<DONE

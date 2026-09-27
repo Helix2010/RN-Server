@@ -23,6 +23,7 @@ func TestDBSecondFactor(t *testing.T) {
 	}
 	clearMail()
 	t.Cleanup(clearMail)
+	platformHost := "platform-" + uniqueSuffix() + ".test"
 	router := New(config.Config{
 		Environment:            "test",
 		StorageMasterKey:       base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
@@ -31,6 +32,7 @@ func TestDBSecondFactor(t *testing.T) {
 		AdminAPIActor:          "automation@test",
 		PlatformAdminUsernames: []string{"automation@test"},
 		AdminSessionTTL:        3600,
+		PlatformConsoleHost:    platformHost,
 	}, &store.Store{DB: db})
 	smtpServer := startTestSMTP(t)
 	memberToken := activeTenantSession(t, db, tenant)
@@ -78,19 +80,13 @@ func TestDBSecondFactor(t *testing.T) {
 	seedTenantConfig(t, db, tenant.id, "mobile-bootstrap", string(seed))
 	wantProblem(t, member.do("PATCH", "/v1/admin/app-config", appConfig("attackerproject00000"), nil), 403, "SECOND_FACTOR_REQUIRED")
 	member.mustCode(t, member.do("PATCH", "/v1/admin/app-config", appConfig("sfproject0000000"+sfx), nil), 200)
-	// 平台管理员账号的会话：改钱包段同样要二次验证（自动化通道不用）
+	// 平台管理员账号的会话（在平台控制台上）：平台级写操作同样要二次验证（自动化通道不用）
 	adminToken, _, _ := activePlatformSession(t, db)
 	if _, err := db.Exec(`UPDATE admin_sessions SET second_factor_at=NULL WHERE token_hash=?`, sha256Hex(adminToken)); err != nil {
 		t.Fatal(err)
 	}
-	platformAccount := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: adminToken}}
-	var bootstrapVersion int
-	if err := db.QueryRow(`SELECT version FROM app_configs WHERE tenant_id=? AND config_key='mobile-bootstrap'`, tenant.id).Scan(&bootstrapVersion); err != nil {
-		t.Fatal(err)
-	}
-	changed := appConfig("platformproject00000")
-	changed["expectedVersion"] = bootstrapVersion
-	wantProblem(t, platformAccount.do("PATCH", "/v1/admin/app-config", changed, nil), 403, "SECOND_FACTOR_REQUIRED")
+	platformAccount := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: adminToken}, host: platformHost}
+	wantProblem(t, platformAccount.do("POST", "/v1/admin/platform/recovery-keys", map[string]any{}, nil), 403, "SECOND_FACTOR_REQUIRED")
 
 	// 没配发信就发不了码，也就做不了敏感操作（不退回不校验）
 	wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")

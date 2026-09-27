@@ -18,14 +18,15 @@ import (
 // 会话只有统一登录一个来源，每个会话都属于 tenant_admin_accounts 里的一个账号（设计 §10 删掉了环境变量账号）。
 //
 //   - 平台会话：平台管理员账号（scope=platform）登出来的，admin_sessions.tenant_id 为 NULL，actor 是 platform:<id>，
-//     在任何租户的控制台域名上都有效。
+//     只在平台控制台有效（service-and-console-split-2026-09-27 §4.4），拿到租户控制台上当没登录。
 //   - 租户会话：租户成员登出来的，记下租户与账号。
 //     **只在这个租户的域名上有效**：请求域名的租户与会话租户不一致，一律当没登录；
 //     永远不是平台管理员，不管它的 actor 长什么样。
 //   - 账号会话每个请求都回表：账号要是 active，统一认证账号 id 要等于登录时记下的那个。账号由外部系统维护，
 //     停用、删除、换人、改 scope 都在下一个请求生效。
 //
-// 自动化通道（x-admin-key）不落会话，身份来自配置（ADMIN_API_ACTOR），按平台会话处理。
+// 自动化通道（x-admin-key）不落会话，身份来自配置（ADMIN_API_ACTOR）。平台接口看它的 actor 在不在
+// PLATFORM_ADMIN_USERNAMES 里；租户接口上它和租户会话一样只看得到租户视角。
 
 const adminSessionCookie = "rn_admin_session"
 
@@ -51,22 +52,6 @@ func (a *adminSession) auditTenant() string {
 		return a.TenantID
 	}
 	return platformTenantID
-}
-
-// isPlatformSession：平台会话（平台管理员账号、管理密钥）看得到平台的基础设施与别的租户；租户会话
-// 只看自己租户的东西（设计 tenant-console-accounts-and-sso §3.4）。
-func isPlatformSession(c *gin.Context) bool { return !currentAdminSession(c).tenantScoped() }
-
-// requirePlatformSession 挂在只给平台会话的租户路由上（判据同 isPlatformSession）。
-func requirePlatformSession() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if isPlatformSession(c) {
-			c.Next()
-			return
-		}
-		problem(c, http.StatusForbidden, "PLATFORM_ADMIN_REQUIRED", "Only the platform administrator can do this")
-		c.Abort()
-	}
 }
 
 // tenantActor 是租户账号在审计里的 actor。带冒号，与 ADMIN_API_ACTOR 的取值空间分开。
@@ -99,7 +84,11 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 		session.SecondFactorAt = secondFactor.Time.UTC()
 	}
 	if !tenant.Valid || tenant.String == "" {
-		// 平台管理员账号：任何控制台域名都有效，但每个请求都回表
+		// 平台管理员账号：只在平台控制台有效（设计 service-and-console-split-2026-09-27 §4.4），每个请求都回表。
+		// 拿到租户控制台上当没登录——平台管理员不操作租户
+		if !s.platformConsole(c) {
+			return nil, nil
+		}
 		acc, err := platformAccountByID(ctx, s.db, session.AccountID)
 		if err != nil {
 			return nil, err
@@ -223,8 +212,8 @@ func (s *server) adminOriginAllowed(c *gin.Context) bool {
 		}
 	}
 	// 平台控制台不在任何租户域名上：来源必须正是它自己（设计 service-and-console-split-2026-09-27 §4.3）
-	if s.platformConsole(c) && s.cfg.PlatformConsoleHost != "" && origin == "https://"+s.cfg.PlatformConsoleHost {
-		return true
+	if s.platformConsole(c) {
+		return s.cfg.PlatformConsoleHost != "" && origin == "https://"+s.cfg.PlatformConsoleHost
 	}
 	originTenant, ok := s.originTenant(origin)
 	if !ok {
@@ -286,7 +275,7 @@ func (s *server) sessionView(c *gin.Context, session *adminSession, method strin
 		"expiresAt":     nil,
 		"actorId":       actor(c),
 		"platformAdmin": false,
-		// 租户会话的租户；平台会话为 null。控制台据此把平台级设置做成只读（use-platform-session.ts）
+		// 租户会话的租户；平台会话为 null
 		"tenantId": nil,
 		"account":  nil,
 		// 邮箱二次验证在这个时间之前有效；null = 没验过或已过期（自动化通道不用）

@@ -43,12 +43,13 @@ func TestAccountForLogin(t *testing.T) {
 		{"只有别的租户的记录", []*tenantAccount{inB}, "7", nil, "no_access"},
 		{"本租户的记录", []*tenantAccount{inA, inB}, "7", inA, ""},
 		{"多个租户，按域名选", []*tenantAccount{inA, inB}, "8", inB, ""},
-		{"平台记录在任何域名上都认", []*tenantAccount{platform}, "8", platform, ""},
+		// 平台管理员不操作租户：只有平台记录，在租户控制台上进不来（设计 service-and-console-split-2026-09-27 §4.1）
+		{"平台记录在租户控制台上不认", []*tenantAccount{platform}, "8", nil, "no_access"},
+		{"停用的平台记录在租户控制台上也是 no_access", []*tenantAccount{disabledPlatform}, "7", nil, "no_access"},
 		{"平台记录加本租户记录", []*tenantAccount{platform, inA}, "7", nil, "identity_conflict"},
 		{"平台记录加别的租户的记录也算冲突", []*tenantAccount{platform, inB}, "7", nil, "identity_conflict"},
 		{"停用的平台记录加租户记录仍是冲突", []*tenantAccount{disabledPlatform, inA}, "7", nil, "identity_conflict"},
 		{"本租户的记录停用了", []*tenantAccount{disabledInA}, "7", nil, "disabled"},
-		{"平台记录停用了", []*tenantAccount{disabledPlatform}, "7", nil, "disabled"},
 		// 平台控制台（tenant 为空，设计 service-and-console-split-2026-09-27 §4.2）：只认平台记录
 		{"平台控制台：平台记录", []*tenantAccount{platform}, "", platform, ""},
 		{"平台控制台：只有租户记录", []*tenantAccount{inA, inB}, "", nil, "no_access"},

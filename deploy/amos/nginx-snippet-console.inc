@@ -22,21 +22,6 @@ location ^~ /v1/ {
     proxy_hide_header Referrer-Policy;
 }
 
-# 过渡期：平台管理员还在租户控制台上做平台维护，这些页面调的 /v1/admin/platform/ 归平台端。会话在库里，
-# 两个进程都认。平台控制台（platform.anyfun.win）上线、租户端不再认平台会话之后，这一段删掉
-# （RN-Server 设计 service-and-console-split-2026-09-27 §6）。其余与上面的 /v1/ 一样
-location ^~ /v1/admin/platform/ {
-    if ($rn_upstream_host = $host) {
-        return 500;
-    }
-    set $rn_service rn_platform;
-    include /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc;
-    gzip off;
-    proxy_hide_header X-Frame-Options;
-    proxy_hide_header X-Content-Type-Options;
-    proxy_hide_header Referrer-Policy;
-}
-
 # 统一登录的回调：认证中心固定把浏览器送回 <控制台域名>/client/v1/oauth/login，不能自定义
 # （RN-Server 设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。与 /v1/ 一样转给租户端。
 # 用 = 精确匹配：/client/ 下别的路径仍然落到下面的 SPA。

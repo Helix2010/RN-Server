@@ -245,10 +245,11 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	tenantA := accountsTestTenantRow(t, db, "a")
 	tenantB := accountsTestTenantRow(t, db, "b")
 	cfg := config.Config{
-		Environment:       "test",
-		StorageMasterKey:  base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
-		MySQLQueryTimeout: 10,
-		AdminSessionTTL:   3600,
+		Environment:         "test",
+		StorageMasterKey:    base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
+		MySQLQueryTimeout:   10,
+		AdminSessionTTL:     3600,
+		PlatformConsoleHost: "platform-" + uniqueSuffix() + ".test",
 	}
 	// auth.cid 是平台级的一份，测试库又是持久的：上一次运行留下的配置指向早已关掉的假认证中心。
 	// 这个键只有本测试写，开始前与结束后都清掉
@@ -275,8 +276,10 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	}
 	subject := testSubject()
 
+	// 平台管理员在平台控制台上（设计 service-and-console-split-2026-09-27 §4.2）
 	platformToken, platformID, _ := activePlatformSession(t, db)
 	platform := newBrowser(tenantA)
+	platform.host = cfg.PlatformConsoleHost
 	platform.cookies[adminSessionCookie] = platformToken
 	view := platform.mustCode(t, platform.do("GET", "/v1/admin/auth/session", nil, nil), 200)
 	if view["platformAdmin"] != true || view["tenantId"] != nil || object(view["account"])["id"] != platformID {
@@ -395,17 +398,22 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
 	})
 
-	t.Run("租户会话永远不是平台管理员，只读列表只给平台管理员", func(t *testing.T) {
+	t.Run("租户会话永远不是平台管理员，成员列表只在平台控制台", func(t *testing.T) {
 		wantProblem(t, member.do("GET", "/v1/admin/platform/auth/cid", nil, nil), 403, "PLATFORM_ADMIN_REQUIRED")
-		wantProblem(t, member.do("GET", "/v1/admin/tenant-accounts", nil, nil), 403, "PLATFORM_ADMIN_REQUIRED")
-		list := platform.mustCode(t, platform.do("GET", "/v1/admin/tenant-accounts", nil, nil), 200)
-		items, _ := list["items"].([]any)
-		if len(items) != 1 {
-			t.Fatalf("list = %v", list)
+		wantProblem(t, member.do("GET", "/v1/admin/platform/tenant-accounts", nil, nil), 403, "PLATFORM_ADMIN_REQUIRED")
+		// 租户控制台上没有成员列表了：在平台控制台跨租户看
+		if got := member.do("GET", "/v1/admin/tenant-accounts", nil, nil).Code; got != http.StatusNotFound {
+			t.Fatalf("the tenant-side member list must be gone, got %d", got)
 		}
-		item := object(items[0])
-		if item["id"] != memberID || item["subject"] != subject || item["status"] != accountActive || item["createdBy"] != "ext-ops" || item["lastLoginAt"] == nil {
-			t.Fatalf("list item = %v", item)
+		list := platform.mustCode(t, platform.do("GET", "/v1/admin/platform/tenant-accounts", nil, nil), 200)
+		var item map[string]any
+		for _, raw := range list["items"].([]any) {
+			if object(raw)["id"] == memberID {
+				item = object(raw)
+			}
+		}
+		if item == nil || item["tenantId"] != tenantA.id || item["subject"] != subject || item["status"] != accountActive || item["createdBy"] != "ext-ops" || item["lastLoginAt"] == nil {
+			t.Fatalf("list item = %v (list %v)", item, list)
 		}
 	})
 
