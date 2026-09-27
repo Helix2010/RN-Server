@@ -116,7 +116,7 @@ func TestAndroidKeystoreCiphertextIsNotOpenable(t *testing.T) {
 			t.Fatal(err)
 		}
 		box := Box{
-			Version: Version, Algorithm: Algorithm, Purpose: PurposeBuilder, Kind: KindCertificate,
+			Version: VersionLegacy, Algorithm: Algorithm, Purpose: PurposeBuilder, Kind: KindCertificate,
 			TeamID: "J4JDFC8LCC", RecipientSHA256: sealed.RecipientSHA256,
 			EphemeralPublicKey: sealed.EphemeralPublicKey, Nonce: sealed.Nonce, Ciphertext: sealed.Ciphertext,
 			CreatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -238,5 +238,83 @@ func TestParseBoxRejectsJunk(t *testing.T) {
 		if _, err := ParseBox(raw); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+// v2：带租户的材料封成第 2 版，外层与明文各一份租户，解开之后原样回来。
+func TestTenantMaterialSealsAsVersionTwo(t *testing.T) {
+	priv, pub := newRecipient(t)
+	material := profile()
+	material.TenantID = "1000000001"
+	box, err := Seal(material, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if box.Version != VersionTenant || box.TenantID != "1000000001" {
+		t.Fatalf("a tenant's material must seal as v2 with the tenant outside: v=%d tenant=%q", box.Version, box.TenantID)
+	}
+	got, err := Open(box, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TenantID != "1000000001" {
+		t.Errorf("tenant came back as %q", got.TenantID)
+	}
+	legacy, err := Seal(profile(), pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Version != VersionLegacy || legacy.TenantID != "" {
+		t.Errorf("material without a tenant must stay v1: v=%d tenant=%q", legacy.Version, legacy.TenantID)
+	}
+}
+
+// 外层的租户改得动，明文里的改不动：两者不符当场停住。一份 v2 也不能被换成 v1 的壳，
+// 冒充「没有租户的旧材料」。
+func TestOpenRejectsATenantThatDoesNotMatch(t *testing.T) {
+	priv, pub := newRecipient(t)
+	material := certificate()
+	material.TenantID = "1000000001"
+	box, err := Seal(material, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := box
+	moved.TenantID = "1000000002"
+	if _, err := Open(moved, priv); !errors.Is(err, ErrInvalidMaterial) || !strings.Contains(err.Error(), "tenantId") {
+		t.Errorf("a box relabelled to another tenant must not open: %v", err)
+	}
+	downgraded := box
+	downgraded.Version, downgraded.TenantID = VersionLegacy, ""
+	if _, err := Open(downgraded, priv); !errors.Is(err, ErrInvalidMaterial) {
+		t.Errorf("a v2 record in a v1 box must not open: %v", err)
+	}
+}
+
+func TestParseBoxChecksTheTenantAgainstTheVersion(t *testing.T) {
+	_, pub := newRecipient(t)
+	material := certificate()
+	material.TenantID = "1000000001"
+	box, err := Seal(material, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*Box){
+		"v2 without a tenant":  func(b *Box) { b.TenantID = "" },
+		"v2 with a path":       func(b *Box) { b.TenantID = "../1" },
+		"v2 with a leading 0":  func(b *Box) { b.TenantID = "01" },
+		"v1 carrying a tenant": func(b *Box) { b.Version = VersionLegacy },
+		"an unknown version":   func(b *Box) { b.Version = 3 },
+	} {
+		changed := box
+		mutate(&changed)
+		raw, _ := json.Marshal(changed)
+		if _, err := ParseBox(raw); err == nil {
+			t.Errorf("%s: ParseBox accepted it", name)
+		}
+	}
+	if _, err := Seal(Material{Kind: KindCertificate, TenantID: "tenant-a", TeamID: "J4JDFC8LCC",
+		P12Base64: certificate().P12Base64, P12Password: "x"}, pub); err == nil {
+		t.Error("Seal accepted a tenant id that is not a number")
 	}
 }
