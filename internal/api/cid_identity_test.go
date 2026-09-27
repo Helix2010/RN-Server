@@ -29,3 +29,35 @@ func TestCIDIdentity(t *testing.T) {
 		t.Fatalf("long email: user = %+v, err = %v", user, err)
 	}
 }
+
+// 回调按统一账号的全部记录认人（设计 console-accounts-external-maintenance §4.1）。
+func TestAccountForLogin(t *testing.T) {
+	platform := &tenantAccount{ID: "1", Scope: scopePlatform, Status: accountActive}
+	inA := &tenantAccount{ID: "2", Scope: scopeTenant, TenantID: "7", Status: accountActive}
+	inB := &tenantAccount{ID: "3", Scope: scopeTenant, TenantID: "8", Status: accountActive}
+	disabledInA := &tenantAccount{ID: "4", Scope: scopeTenant, TenantID: "7", Status: accountDisabled}
+	disabledPlatform := &tenantAccount{ID: "5", Scope: scopePlatform, Status: accountDisabled}
+	for _, tc := range []struct {
+		name     string
+		accounts []*tenantAccount
+		tenant   string
+		want     *tenantAccount
+		refused  string
+	}{
+		{"没有记录", nil, "7", nil, "no_access"},
+		{"只有别的租户的记录", []*tenantAccount{inB}, "7", nil, "no_access"},
+		{"本租户的记录", []*tenantAccount{inA, inB}, "7", inA, ""},
+		{"多个租户，按域名选", []*tenantAccount{inA, inB}, "8", inB, ""},
+		{"平台记录在任何域名上都认", []*tenantAccount{platform}, "8", platform, ""},
+		{"平台记录加本租户记录", []*tenantAccount{platform, inA}, "7", nil, "identity_conflict"},
+		{"平台记录加别的租户的记录也算冲突", []*tenantAccount{platform, inB}, "7", nil, "identity_conflict"},
+		{"停用的平台记录加租户记录仍是冲突", []*tenantAccount{disabledPlatform, inA}, "7", nil, "identity_conflict"},
+		{"本租户的记录停用了", []*tenantAccount{disabledInA}, "7", nil, "disabled"},
+		{"平台记录停用了", []*tenantAccount{disabledPlatform}, "7", nil, "disabled"},
+	} {
+		got, refused := accountForLogin(tc.accounts, tc.tenant)
+		if got != tc.want || refused != tc.refused {
+			t.Fatalf("%s: got %v %q, want %v %q", tc.name, got, refused, tc.want, tc.refused)
+		}
+	}
+}

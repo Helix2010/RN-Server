@@ -66,7 +66,7 @@ func (s *server) generateAdminPasswordHash(c *gin.Context) {
 	})
 }
 
-// hashPassword 算 verifyPassword 认的 scrypt 哈希（scrypt$N$r$p$salt$key）。平台管理员口令与租户账号的初始口令共用。
+// hashPassword 算 verifyPassword 认的 scrypt 哈希（scrypt$N$r$p$salt$key）。环境变量账号的口令（ADMIN_PASSWORD_HASH）用。
 func hashPassword(password string) (string, error) {
 	salt := make([]byte, passwordSaltLen)
 	if _, err := rand.Read(salt); err != nil {

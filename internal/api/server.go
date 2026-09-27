@@ -71,10 +71,8 @@ type server struct {
 	clock func() time.Time
 	// mailTests 是「发测试邮件」按操作人的小时窗口计数，零值可用
 	mailTests windowCounter
-	// bindCodes 是统一登录绑定验证码（进程内存，单实例），零值可用
-	bindCodes bindCodeStore
-	// secondFactorCodes：租户会话的邮箱二次验证码（second_factor.go），存法与限流同绑定验证码
-	secondFactorCodes bindCodeStore
+	// secondFactorCodes：账号会话的邮箱二次验证码（second_factor.go，进程内存，单实例），零值可用
+	secondFactorCodes emailCodeStore
 }
 
 type attempt struct {
@@ -221,28 +219,21 @@ func (s *server) routes() *gin.Engine {
 	admin.POST("/auth/login", s.login)
 	// 登录页要知道统一登录开没开；免登录
 	admin.GET("/auth/methods", s.authMethods)
-	// 发起统一登录（mode=login 免登录；mode=bind 要一个待绑定账号的会话，处理函数自己查）
+	// 发起统一登录（免登录）
 	admin.GET("/auth/cid/start", s.domainTenantScope(), s.startCIDLogin)
 	protected := admin.Group("")
 	protected.Use(s.authenticate())
 	protected.GET("/auth/session", s.session)
 	protected.POST("/auth/logout", s.logout)
-	// 绑定统一认证账号：回调之后本人在控制台确认，确认了才落库
-	protected.GET("/auth/cid/bind", s.getPendingCIDBind)
-	protected.POST("/auth/cid/bind/code", s.sendCIDBindCode)
-	protected.POST("/auth/cid/bind/confirm", s.confirmCIDBind)
-	// 租户会话的邮箱二次验证：敏感操作与发起绑定前要 15 分钟内验过（second_factor.go）
+	// 账号会话的邮箱二次验证：敏感操作前要 15 分钟内验过（second_factor.go）
 	protected.POST("/auth/second-factor/code", s.sendSecondFactorCode)
 	protected.POST("/auth/second-factor/verify", s.verifySecondFactor)
-	// 平台级路由：不按租户过滤，只对平台管理员开放（已绑定的平台管理员账号，或 PLATFORM_ADMIN_USERNAMES 里的
+	// 平台级路由：不按租户过滤，只对平台管理员开放（可用的平台管理员账号，或 PLATFORM_ADMIN_USERNAMES 里的
 	// 环境变量账号 / 自动化 actor）；租户账号的会话一律进不来。平台管理员账号做写操作要 15 分钟内过二次验证
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin(), s.requireSecondFactorOnWrite())
-	// 平台管理员账号（设计 platform-accounts-and-console-login §3.6）：不能停用、重置自己，不能让最后一个失效
+	// 平台管理员账号的只读列表：账号由外部系统维护（设计 console-accounts-external-maintenance-2026-09-27）
 	platform.GET("/accounts", s.listPlatformAccounts)
-	platform.POST("/accounts", s.createPlatformAccount)
-	platform.POST("/accounts/:id/disable", s.disablePlatformAccount)
-	platform.POST("/accounts/:id/reset", s.resetPlatformAccount)
 	// 统一登录的客户端配置（app_configs 平台级 auth.cid，客户端密钥加密存）
 	platform.GET("/auth/cid", s.getCIDConfig)
 	platform.PUT("/auth/cid", s.updateCIDConfig)
@@ -372,13 +363,9 @@ func (s *server) routes() *gin.Engine {
 	current := protected.Group("")
 	current.Use(s.domainTenantScope(), requireAdminSessionTenant())
 	current.GET("/tenant", s.currentTenant)
-	// 控制台成员（租户账号）：只有平台管理员能管，管的是当前域名的租户（用户 2026-09-25 定）
-	members := current.Group("/tenant-accounts")
-	members.Use(s.requirePlatformAdmin(), s.requireSecondFactorOnWrite())
-	members.GET("", s.listTenantAccounts)
-	members.POST("", s.createTenantAccount)
-	members.POST("/:id/disable", s.disableTenantAccount)
-	members.POST("/:id/reset", s.resetTenantAccount)
+	// 控制台成员（当前域名的租户）的只读列表，只给平台管理员：账号由外部系统维护
+	// （设计 console-accounts-external-maintenance-2026-09-27）
+	current.GET("/tenant-accounts", s.requirePlatformAdmin(), s.listTenantAccounts)
 	s.registerTenantRoutes(current)
 	return r
 }
@@ -1329,9 +1316,9 @@ func (s *server) updateAppConfig(c *gin.Context) {
 			return
 		}
 		// 钱包段（链的 RPC 地址、WalletConnect、转出是否真的上链）下发给这个租户的所有用户：
-		// 租户会话改它要 15 分钟内过邮箱二次验证（ADR-0023）。原样带回不算改
+		// 账号会话（租户成员、平台管理员账号）改它要 15 分钟内过邮箱二次验证（ADR-0023）。原样带回不算改
 		walletChanged := !sameJSON(normalizeWallet(object(incoming)), normalizeWallet(object(storedWalletSection(stored))))
-		if walletChanged && !isPlatformSession(c) && !secondFactorFresh(currentAdminSession(c), s.now()) {
+		if walletChanged && !s.secondFactorSatisfied(c) {
 			problem(c, http.StatusForbidden, "SECOND_FACTOR_REQUIRED",
 				"Changing the wallet section needs email verification within the last 15 minutes; request a code and verify it first")
 			return

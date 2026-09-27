@@ -16,7 +16,7 @@ import (
 )
 
 // 平台发信（ADR-0022）：发件的 SMTP 账号是 app_configs 平台级 mail.smtp，口令用 secretbox 加密。
-// 目前只有统一登录的绑定验证码用它；没配就不能绑定（不为「没配」退回不校验，见 AGENTS.md「不写回退」）。
+// 目前只有控制台账号的邮箱二次验证码用它；没配就过不了二次验证（不为「没配」退回不校验，见 AGENTS.md「不写回退」）。
 //
 //	GET    /v1/admin/platform/mail          配置；口令永不返回，只说有没有
 //	PUT    /v1/admin/platform/mail          host、port（空 = 587）、username、password（留空沿用）、fromAddress、fromName、expectedVersion、reason
@@ -266,7 +266,7 @@ func (s *server) updateMailConfig(c *gin.Context) {
 	c.JSON(200, mailConfigView(&mailRecord{Value: value, Version: currentVersion + 1, UpdatedBy: actor(c), UpdatedAt: now}))
 }
 
-// deleteMailConfig 删掉发件账号：之后统一登录的成员绑定不了，直到重新配置。
+// deleteMailConfig 删掉发件账号：之后控制台账号过不了二次验证，直到重新配置。
 func (s *server) deleteMailConfig(c *gin.Context) {
 	reason := strings.TrimSpace(c.Query("reason"))
 	if len(reason) < 3 {
@@ -277,7 +277,7 @@ func (s *server) deleteMailConfig(c *gin.Context) {
 	// 平台管理员账号做写操作都要过邮箱二次验证，验证码靠这份配置发出去：删了就再没人能改回来
 	// （只剩服务器上的管理密钥）。要换发信账号直接改，不用先删
 	var platformAccounts int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_admin_accounts WHERE scope=? AND status<>?`, scopePlatform, accountDisabled).Scan(&platformAccounts); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenant_admin_accounts WHERE scope=? AND status=?`, scopePlatform, accountActive).Scan(&platformAccounts); err != nil {
 		problem(c, 500, "MAIL_CONFIG_DELETE_FAILED", "Unable to delete the email settings")
 		return
 	}

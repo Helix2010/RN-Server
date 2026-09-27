@@ -22,7 +22,7 @@ import (
 
 var scanProbeHTTP = &http.Client{Timeout: 45 * time.Second}
 
-// requirePlatformAdmin 在 authenticate() 之后：已绑定、可用的平台管理员账号；或者没有账号的会话
+// requirePlatformAdmin 在 authenticate() 之后：可用的平台管理员账号；或者没有账号的会话
 // （环境变量账号、自动化通道）且 actor 在配置文件声明的列表里。租户账号的会话永远进不来
 // （它的 actor 与列表里的名字撞上也不行，见 platformAdminRequest）。
 func (s *server) requirePlatformAdmin() gin.HandlerFunc {

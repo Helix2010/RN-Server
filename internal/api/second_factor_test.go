@@ -44,9 +44,9 @@ func TestDBSecondFactor(t *testing.T) {
 	if _, err := db.Exec(`UPDATE admin_sessions SET second_factor_at=NULL WHERE token_hash=?`, sha256Hex(memberToken)); err != nil {
 		t.Fatal(err)
 	}
-	var memberEmail, loginName string
-	if err := db.QueryRow(`SELECT a.email, a.login_name FROM admin_sessions s JOIN tenant_admin_accounts a ON a.id=s.account_id WHERE s.token_hash=?`,
-		sha256Hex(memberToken)).Scan(&memberEmail, &loginName); err != nil {
+	var memberEmail, displayName string
+	if err := db.QueryRow(`SELECT a.email, a.display_name FROM admin_sessions s JOIN tenant_admin_accounts a ON a.id=s.account_id WHERE s.token_hash=?`,
+		sha256Hex(memberToken)).Scan(&memberEmail, &displayName); err != nil {
 		t.Fatal(err)
 	}
 	member := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: memberToken}}
@@ -63,7 +63,7 @@ func TestDBSecondFactor(t *testing.T) {
 	if view := member.mustCode(t, member.do("GET", "/v1/admin/auth/session", nil, nil), 200); view["secondFactorUntil"] != nil {
 		t.Fatalf("session = %v", view)
 	}
-	// 平台会话不用二次验证
+	// 环境变量账号（没有账号的平台会话）不用二次验证
 	platform.mustCode(t, platform.do("PUT", "/v1/admin/release-identity/ios", identity("com.sf.p"+sfx, 0), nil), 200)
 	wantProblem(t, platform.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 400, "SECOND_FACTOR_NOT_APPLICABLE")
 
@@ -84,6 +84,27 @@ func TestDBSecondFactor(t *testing.T) {
 	seedTenantConfig(t, db, tenant.id, "mobile-bootstrap", string(seed))
 	wantProblem(t, member.do("PATCH", "/v1/admin/app-config", appConfig("attackerproject00000"), nil), 403, "SECOND_FACTOR_REQUIRED")
 	member.mustCode(t, member.do("PATCH", "/v1/admin/app-config", appConfig("sfproject0000000"+sfx), nil), 200)
+	// 平台管理员账号也是账号会话：改钱包段同样要二次验证（环境变量账号不用）。平台记录会挡住删发信配置，用完就删
+	adminSubject := testSubject()
+	adminID := externalAccount(t, db, "", adminSubject, "sf-admin-"+sfx+"@example.com")
+	t.Cleanup(func() {
+		_, _ = db.Exec(`DELETE FROM admin_sessions WHERE account_id=?`, adminID)
+		_, _ = db.Exec(`DELETE FROM tenant_admin_accounts WHERE id=?`, adminID)
+	})
+	adminToken := randomID(32)
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,account_id,idp_subject,login_method,expires_at,created_at) VALUES (?,?,?,?,?,?,?)`,
+		sha256Hex(adminToken), platformActor(adminID), adminID, adminSubject, loginMethodCID, now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+	platformAccount := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: adminToken}}
+	var bootstrapVersion int
+	if err := db.QueryRow(`SELECT version FROM app_configs WHERE tenant_id=? AND config_key='mobile-bootstrap'`, tenant.id).Scan(&bootstrapVersion); err != nil {
+		t.Fatal(err)
+	}
+	changed := appConfig("platformproject00000")
+	changed["expectedVersion"] = bootstrapVersion
+	wantProblem(t, platformAccount.do("PATCH", "/v1/admin/app-config", changed, nil), 403, "SECOND_FACTOR_REQUIRED")
 
 	// 没配发信就发不了码，也就做不了敏感操作（不退回不校验）
 	wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 503, "MAIL_NOT_CONFIGURED")
@@ -95,7 +116,7 @@ func TestDBSecondFactor(t *testing.T) {
 		t.Fatalf("code response = %v", sent)
 	}
 	body := smtpServer.last(t, memberEmail)
-	if !strings.Contains(body, loginName) || !strings.Contains(body, tenant.console) {
+	if !strings.Contains(body, displayName) || !strings.Contains(body, tenant.console) {
 		t.Fatalf("second factor mail:\n%s", body)
 	}
 	wantProblem(t, member.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 429, "SECOND_FACTOR_CODE_RATE_LIMITED")

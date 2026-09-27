@@ -1,6 +1,6 @@
 # 平台管理员也进账号表、走统一登录；登录页放进控制台（2026-09-27）
 
-> 状态：发布 1 已实施（本地提交，待推送与合并），发布 2 待发布 1 验收后再做。前置文档：[tenant-console-accounts-and-sso-2026-09-25.md](tenant-console-accounts-and-sso-2026-09-25.md)（下称「账号设计」）。
+> 状态：发布 1 已上线（2026-09-27）。其中建号、初始口令、绑定、建号命令、控制台里平台管理员的增删改，已被 [console-accounts-external-maintenance-2026-09-27.md](console-accounts-external-maintenance-2026-09-27.md) 取代：账号改由外部系统写入，RN 只鉴别。发布 2（删环境变量账号）在外部系统写好第一条平台管理员记录并验收之后做。前置文档：[tenant-console-accounts-and-sso-2026-09-25.md](tenant-console-accounts-and-sso-2026-09-25.md)（下称「账号设计」）。
 
 ## 1. 用户的决定（2026-09-27）
 

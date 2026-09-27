@@ -32,7 +32,7 @@ rn-server config
 |---|---|
 | `MYSQL_DSN` | 数据库连接，见 §3。生产不配拒绝启动；开发不配用本地默认 |
 | `STORAGE_MASTER_KEY` | 32 字节随机值的 Base64。库里所有敏感配置都用它封：对象存储凭据、OTA 签名私钥、推送服务账号、签名密钥外层、扫链端点。**换掉它 = 那些配置全部解不开**。生产必填 |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 管理端登录。哈希用 `POST /v1/admin/platform/password-hash` 生成，明文不进仓库和日志。生产必填 |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 管理端的口令登录，过渡期保留：控制台账号只走统一登录，外部系统写好第一条平台管理员记录并验收后删掉（设计 `console-accounts-external-maintenance-2026-09-27.md` §7）。哈希用 `POST /v1/admin/platform/password-hash` 生成，明文不进仓库和日志。生产必填 |
 | `APP_ENV` | `development`（默认）/ `test` / `production`。生产会额外强制上面几项；`test` 会给库名加 `_test` 后缀 |
 
 生产环境额外拒绝的：`CORS_ORIGINS` 显式写 `*`（见 §4）。
@@ -117,7 +117,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BIND_ADDRESS` | 空（所有网卡） | 裸机部署**要显式填 `127.0.0.1`**，否则应用端口会绕过反向代理直接对外，TLS 和它上面的一切都白设。Docker 部署靠端口映射兜底 |
 | `PORT` | `3000` | |
 | `TRUSTED_PROXIES` | 空 | 允许设置 `X-Forwarded-For` 的上跳。**空 = 谁都不信**，`ClientIP` 取直连对端。不填时 `ADMIN_API_ALLOWED_IPS` 只是摆设（安全评审 N17） |
-| `PLATFORM_ADMIN_USERNAMES` | 空 | 能进平台级页面（扫链管理、打包机与签名闸、平台推送默认）的管理员，逗号分隔。**空 = 平台路由一律 403** |
+| `PLATFORM_ADMIN_USERNAMES` | 空 | 没有账号的会话（`ADMIN_USERNAME`、`ADMIN_API_ACTOR`）里，哪些能进平台级页面（扫链管理、打包机与签名闸、平台推送默认），逗号分隔。**空 = 这些会话进不了平台路由**。平台管理员账号不看这个列表，看 `tenant_admin_accounts`（`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`） |
 | `CORS_ORIGINS` | 开发 `*`，生产空 | **额外**放行的来源。租户自己的域名由 `tenant_domain` 表推导（见 `originAllowed`），通常不需要写。生产显式写 `*` 会拒绝启动 |
 | `HTTP_READ_TIMEOUT_SECONDS` | `3600` | 大产物上传要靠它，别调小 |
 | `HTTP_WRITE_TIMEOUT_SECONDS` | `3600` | |
