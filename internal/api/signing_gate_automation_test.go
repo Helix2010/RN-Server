@@ -253,7 +253,7 @@ func (f *gateFixture) auditCount(tenant, action string) int {
 
 func readinessCodes(t *testing.T, f *gateFixture) []string {
 	t.Helper()
-	r, err := f.s.signerReadinessFor(t.Context(), f.tenant)
+	r, err := f.s.signerReadinessFor(t.Context(), f.tenant, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1460,7 +1460,7 @@ func TestDBKeystoreGenerationTimesOut(t *testing.T) {
 		t.Fatalf("readiness of a fresh first generation: %v", codes)
 	}
 	now = now.Add(generationTimeout + time.Second)
-	readiness, err := f.s.signerReadinessFor(t.Context(), f.tenant)
+	readiness, err := f.s.signerReadinessFor(t.Context(), f.tenant, true)
 	if err != nil {
 		t.Fatal(err)
 	}

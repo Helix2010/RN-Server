@@ -208,7 +208,9 @@ type signerReadiness struct {
 // signerReadinessFor：该租户存在 v3 记录、与发布身份一致；主签名闸 active 且有发给它的密文；
 // 信任根算得出来；主签名闸对当前密钥版本 decrypt=ok、confirmed、确认的信任根摘要等于当前摘要、
 // trialSign=ok。任何一项不满足就不就绪，Problems 逐条说清缺什么。
-func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerReadiness, error) {
+//
+// showMachineNames=false（租户会话）时文案里只说「主签名闸」，不点名是哪一台（设计 §3.4）。
+func (s *server) signerReadinessFor(ctx context.Context, tenant string, showMachineNames bool) (signerReadiness, error) {
 	var r signerReadiness
 	keystore, err := s.buildKeystoreStateFor(ctx, s.db, tenant)
 	if err != nil {
@@ -244,6 +246,10 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		return r, err
 	}
 	primary, hasPrimary := registry.activePrimary()
+	primaryLabel := "主签名闸"
+	if hasPrimary && showMachineNames {
+		primaryLabel += " " + primary.Name
+	}
 	if hasPrimary {
 		r.Primary = &primary
 	} else {
@@ -255,7 +261,7 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 			if box, ok := boxFor(*keystore.Upload, string(primary.PublicKeySHA256)); ok {
 				r.Box = &box
 			} else {
-				add(readinessPrimarySignerNoBox, "签名密钥没有加密给主签名闸 "+primary.Name+"：把它加进离线 pin 文件，用离线工具重新 seal 并上传")
+				add(readinessPrimarySignerNoBox, "签名密钥没有加密给"+primaryLabel+"：把它加进离线 pin 文件，用离线工具重新 seal 并上传")
 			}
 		}
 	}
@@ -266,7 +272,7 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		if primary.ReportedLocalRole != "" {
 			reported = "本机记录仍是 " + string(primary.ReportedLocalRole)
 		}
-		add(readinessPrimaryLocalRole, "控制台上的主签名闸 "+primary.Name+" "+reported+"：在那台签名闸上执行 signer promote，或者把控制台的主备切回本机是主的那一台")
+		add(readinessPrimaryLocalRole, "控制台上的"+primaryLabel+" "+reported+"：在那台签名闸上执行 signer promote，或者把控制台的主备切回本机是主的那一台")
 	}
 	roots, digest, rootProblems, err := s.trustRootsFor(ctx, tenant)
 	if err != nil {
@@ -282,23 +288,23 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string) (signerR
 		check, ok := checks[primary.ID]
 		switch {
 		case !ok || check.KeystoreVersion != keystore.Version:
-			add(readinessPrimaryCheckMissing, "主签名闸 "+primary.Name+" 还没有检查当前这一版签名密钥")
+			add(readinessPrimaryCheckMissing, primaryLabel+" 还没有检查当前这一版签名密钥")
 		default:
 			r.Check = &check
 			if check.Decrypt != "ok" {
-				add(readinessPrimaryDecryptFailed, "主签名闸 "+primary.Name+" 解不开当前这一版签名密钥"+errorSuffix(string(check.Error)))
+				add(readinessPrimaryDecryptFailed, primaryLabel+" 解不开当前这一版签名密钥"+errorSuffix(string(check.Error)))
 			}
 			if !check.Confirmed {
-				add(readinessPrimaryNotConfirmed, "主签名闸 "+primary.Name+" 还没有在本机确认这个租户（signer confirm）")
+				add(readinessPrimaryNotConfirmed, primaryLabel+" 还没有在本机确认这个租户（signer confirm）")
 			} else if digest != "" && string(check.ConfirmedTrustRootsDigest) != digest {
-				add(readinessTrustRootsChanged, "包内信任根变了（apiBaseUrl、OTA 证书、bootstrap 签名地址、scheme 等），需要在主签名闸 "+primary.Name+" 上重新确认")
+				add(readinessTrustRootsChanged, "包内信任根变了（apiBaseUrl、OTA 证书、bootstrap 签名地址、scheme 等），需要在"+primaryLabel+"上重新确认")
 			}
 			switch check.TrialSign {
 			case "ok":
 			case "failed":
-				add(readinessPrimaryTrialSignFailed, "主签名闸 "+primary.Name+" 试签失败"+errorSuffix(string(check.Error)))
+				add(readinessPrimaryTrialSignFailed, primaryLabel+" 试签失败"+errorSuffix(string(check.Error)))
 			default:
-				add(readinessPrimaryTrialSignPending, "主签名闸 "+primary.Name+" 还没有试签通过")
+				add(readinessPrimaryTrialSignPending, primaryLabel+" 还没有试签通过")
 			}
 		}
 	}

@@ -60,14 +60,14 @@ type releaseStorageRecord struct {
 func (s *server) getReleaseStorage(c *gin.Context) {
 	record, err := s.releaseStorageRecord(c.Request.Context(), tenantID(c))
 	if errors.Is(err, sql.ErrNoRows) {
-		c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{}, tenantID(c)))
+		c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{}, tenantID(c), isPlatformSession(c)))
 		return
 	}
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_QUERY_FAILED", "Unable to load release storage configuration")
 		return
 	}
-	c.JSON(http.StatusOK, releaseStorageView(record, tenantID(c)))
+	c.JSON(http.StatusOK, releaseStorageView(record, tenantID(c), isPlatformSession(c)))
 }
 
 func (s *server) updateReleaseStorage(c *gin.Context) {
@@ -110,7 +110,16 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 		Provider: body.Provider, Endpoint: body.Endpoint, Region: body.Region, Bucket: body.Bucket,
 		ObjectPrefix: body.ObjectPrefix, PublicBaseURL: body.PublicBaseURL, ForcePathStyle: body.ForcePathStyle,
 	}
-	if !body.ClearCredentials && body.AccessKeyID == "" && body.SecretAccessKey == "" && body.SessionToken == "" && err == nil {
+	// 继承平台存储时不带凭据保存，原来会把平台的 AK/SK 解出来、按本租户重新加密写进租户行，而 endpoint、bucket、
+	// 前缀是租户填的——平台的密钥就被用在了租户指定的地方（设计 tenant-console-accounts-and-sso §3.4 复查）。
+	// 租户会话要换成自己的存储，就带自己的凭据
+	noCredentials := !body.ClearCredentials && body.AccessKeyID == "" && body.SecretAccessKey == "" && body.SessionToken == ""
+	if noCredentials && err == nil && current.SourceTenant != tenantID(c) && !isPlatformSession(c) {
+		problem(c, http.StatusUnprocessableEntity, "STORAGE_CREDENTIALS_REQUIRED",
+			"This tenant uses the platform's storage; to switch to its own storage, provide its own access key")
+		return
+	}
+	if noCredentials && err == nil {
 		accessKeyID, secretAccessKey, sessionToken, decryptErr := s.decryptReleaseStorage(current)
 		if decryptErr != nil {
 			problem(c, http.StatusInternalServerError, "STORAGE_SECRET_UNAVAILABLE", "Stored release storage credentials cannot be decrypted")
@@ -164,7 +173,7 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_SAVE_FAILED", "Unable to save release storage configuration")
 		return
 	}
-	c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{Value: value, SourceTenant: tenantID(c), Version: newVersion, UpdatedBy: actor(c), UpdatedAt: now}, tenantID(c)))
+	c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{Value: value, SourceTenant: tenantID(c), Version: newVersion, UpdatedBy: actor(c), UpdatedAt: now}, tenantID(c), isPlatformSession(c)))
 }
 
 func (s *server) testReleaseStorage(c *gin.Context) {
@@ -185,7 +194,12 @@ func (s *server) testReleaseStorage(c *gin.Context) {
 		problem(c, http.StatusFailedDependency, "STORAGE_TEST_FAILED", "Unable to access the configured release storage bucket")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": record.Value.Bucket, "checkedAt": iso(time.Now())})
+	// 继承平台存储时，租户会话拿不到平台的桶名（与 GET 一致，设计 tenant-console-accounts-and-sso §3.4）
+	var bucket any = record.Value.Bucket
+	if record.SourceTenant != tenantID(c) && !isPlatformSession(c) {
+		bucket = nil
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": bucket, "inherited": record.SourceTenant != tenantID(c), "checkedAt": iso(time.Now())})
 }
 
 func (s *server) releaseStorageRecord(ctx context.Context, tenant string) (releaseStorageRecord, error) {
@@ -271,8 +285,19 @@ func storageAssociatedData(tenant, field string) string {
 	return tenant + ":" + releaseStorageConfigKey + ":" + field
 }
 
-func releaseStorageView(record releaseStorageRecord, tenant string) gin.H {
+// releaseStorageView：showPlatformRow=false（租户会话）且继承的是平台那一行时，只说「用的是平台存储」，
+// 不给平台的 endpoint、bucket、前缀、密钥提示与修改人（设计 tenant-console-accounts-and-sso §3.4）。
+func releaseStorageView(record releaseStorageRecord, tenant string, showPlatformRow bool) gin.H {
 	value := record.Value
+	inherited := record.SourceTenant != "" && record.SourceTenant != tenant
+	if inherited && !showPlatformRow {
+		return gin.H{
+			"configured": value.Region != "" && value.Bucket != "", "version": record.Version,
+			"provider": nullableString(value.Provider), "endpoint": nil, "region": "", "bucket": "", "objectPrefix": "",
+			"publicBaseUrl": nil, "forcePathStyle": false, "credentialsConfigured": value.AccessKeyIDEncrypted != "" && value.SecretAccessKeyEncrypted != "",
+			"sessionTokenConfigured": false, "accessKeyHint": nil, "inherited": true, "updatedBy": "", "updatedAt": nil,
+		}
+	}
 	return gin.H{
 		"configured": value.Region != "" && value.Bucket != "", "version": record.Version,
 		"provider": nullableString(value.Provider), "endpoint": nullableString(value.Endpoint), "region": value.Region,
@@ -352,13 +377,21 @@ func nullableTime(value time.Time) any {
 //
 // **写入的是全平台所有活跃租户域名的并集**。CORS 是桶级配置而不是前缀级的，同一个
 // 桶被多个租户共用时，只写当前租户的来源会把其他租户踢掉。
-func (s *server) tenantConsoleOrigins(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
+//
+// onlyTenant 非空时只列这个租户的：租户会话不该拿到全平台的域名（设计 tenant-console-accounts-and-sso §3.4）。
+func (s *server) tenantConsoleOrigins(ctx context.Context, onlyTenant string) ([]string, error) {
+	query := `
 		SELECT DISTINCT LOWER(TRIM(TRAILING '.' FROM d.domain))
 		FROM tenant_domain d
 		JOIN tenants t ON t.id = d.tenant_id
 		WHERE d.status='active' AND d.deleted=0
-		  AND (CAST(t.status AS UNSIGNED)=1 OR t.status='active') AND t.deleted=0`)
+		  AND (CAST(t.status AS UNSIGNED)=1 OR t.status='active') AND t.deleted=0`
+	args := []any{}
+	if onlyTenant != "" {
+		query += ` AND d.tenant_id=?`
+		args = append(args, onlyTenant)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +426,12 @@ func (s *server) tenantConsoleOrigins(ctx context.Context) ([]string, error) {
 // 留下的这半边仍然有用：要配哪些来源是从 tenant_domain 算出来的，加了租户之后调
 // 一次就知道该补什么，不用去翻配置文件，也不会漏。
 func (s *server) bucketCORSRequirements(c *gin.Context) {
-	origins, err := s.tenantConsoleOrigins(c.Request.Context())
+	// 平台会话拿全平台的并集（共用的桶要放行所有租户）；租户会话只拿自己的
+	onlyTenant := ""
+	if !isPlatformSession(c) {
+		onlyTenant = tenantID(c)
+	}
+	origins, err := s.tenantConsoleOrigins(c.Request.Context(), onlyTenant)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "TENANT_DOMAIN_QUERY_FAILED", "Unable to list tenant domains")
 		return

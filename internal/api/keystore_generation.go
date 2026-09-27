@@ -411,8 +411,13 @@ func (s *server) generateBuildKeystore(c *gin.Context) {
 			return
 		}
 		if len(unsynced) > 0 {
+			// 签名闸叫什么是平台的事：租户会话只说有几台（设计 tenant-console-accounts-and-sso §3.4）
+			which := strings.Join(unsynced, ", ")
+			if !isPlatformSession(c) {
+				which = fmt.Sprintf("%d signing gate(s) of the platform", len(unsynced))
+			}
 			problem(c, http.StatusConflict, "KEYSTORE_SIGNERS_NOT_IN_SYNC",
-				"These signing gates hold the current key but have not confirmed this version yet: "+strings.Join(unsynced, ", ")+
+				"These signing gates hold the current key but have not confirmed this version yet: "+which+
 					". Wait for them to confirm (or run signer confirm there), or revoke them, or resend with allowUnconfirmedSigners=true "+
 					"— they will then need a manual signer confirm before they can use the new key")
 			return

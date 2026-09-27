@@ -351,6 +351,9 @@
           },
           "409": {
             "description": "STALE_APP_CONFIG, IOS_MIN_VERSION_NOT_INSTALLABLE (self-upload iOS tenant: the iOS minimum supported version was raised past the highest build marked installable)"
+          },
+          "403": {
+            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：SERVICES_CONFIG_PLATFORM_ONLY：services.predict 只能原样带回，只有平台管理员能改; SECOND_FACTOR_REQUIRED：租户会话改 wallet 段（RPC、WalletConnect、onchainSends）要 15 分钟内通过邮箱二次验证"
           }
         }
       }
@@ -453,7 +456,7 @@
         },
         "responses": {
           "200": {
-            "description": "Authenticated"
+            "description": "Authenticated。用户名等于 ADMIN_USERNAME 走平台账号；否则按请求域名的租户找待绑定的租户账号用初始口令登录。已绑定的账号 409 ACCOUNT_BOUND_USE_CID；初始口令过期 401 INITIAL_PASSWORD_EXPIRED"
           }
         }
       }
@@ -462,7 +465,7 @@
       "post": {
         "responses": {
           "200": {
-            "description": "Logged out"
+            "description": "已登出；租户会话且配了统一登录时带 cidLogoutUrl，控制台跳过去把认证中心也退掉"
           }
         }
       }
@@ -471,7 +474,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session 含 platformAdmin：账号是否在 PLATFORM_ADMIN_USERNAMES 里"
+            "description": "Session：platformAdmin（平台会话且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、loginMethod（password|cid）、tenantId（租户会话的租户，平台会话为 null）、account（租户账号：id、displayName、loginName、email、status、boundEmail）、bindRequired 租户会话另有 secondFactorUntil（邮箱二次验证的有效期，null=没验过或已过期）。"
           }
         }
       }
@@ -930,6 +933,9 @@
         "responses": {
           "201": {
             "description": "OTA state transition, canary audience change or rollback directive"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -1141,7 +1147,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Masked release storage config"
+            "description": "Masked release storage config 租户会话（tenant-console-accounts-and-sso §3.4）：继承平台存储时只给 inherited、configured、version、provider，不给平台的 endpoint、bucket、前缀、密钥提示与修改人。"
           }
         }
       },
@@ -1157,7 +1163,10 @@
             "description": "STALE_STORAGE_CONFIG"
           },
           "422": {
-            "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint)"
+            "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint); 租户会话（tenant-console-accounts-and-sso §3.4）：STORAGE_CREDENTIALS_REQUIRED：继承平台存储时不带凭据保存会被拒（不能借平台的密钥换成自己的地址）"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -1168,7 +1177,7 @@
         "description": "The bucket CORS rule a `direct` upload deployment would need, with the origins derived from the tenant_domain table so that adding a tenant does not mean editing a config file. Only relevant when ARTIFACT_UPLOAD_MODE=direct, where the browser PUTs straight to object storage and the bucket must allow the console origins itself. Under `proxy` (the default for deployments whose storage key has no bucket-configuration permission) uploads are streamed through the server and the bucket needs no CORS rule at all. The server never writes the rule.",
         "responses": {
           "200": {
-            "description": "The rule to configure on the bucket"
+            "description": "The rule to configure on the bucket 平台会话给全平台租户域名的并集；租户会话只给本租户的域名。"
           }
         }
       }
@@ -1265,6 +1274,9 @@
           },
           "503": {
             "description": "STORAGE_UNAVAILABLE (release storage not configured, or an http endpoint in production)"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -1317,6 +1329,9 @@
           },
           "422": {
             "description": "CANARY_AUDIENCE_REQUIRED, CANARY_AUDIENCE_INVALID, CANARY_AUDIENCE_TOO_LARGE, CANARY_INSTALLATION_UNKNOWN or CANARY_AUDIENCE_LOOKUP_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2257,6 +2272,9 @@
           },
           "424": {
             "description": "PREDICT_PROBE_FAILED: gamma-api.{domain} unreachable, non-200 or not JSON"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_REQUIRED：只给平台会话"
           }
         }
       }
@@ -2852,13 +2870,16 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version. RELEASE_IDENTITY_KEYSTORE_MISMATCH: the tenant has a v3 signing keystore and packageName/signerSha256 differ from its package name and certificate; the identity can only change together with the keystore (PUT /v1/admin/build-keystore writes both). BUILD_KEYSTORE_RECORD_INVALID: the stored v3 signing keystore record cannot be used (malformed, cannot be unwrapped, or its index fields differ from the uploaded file - readiness problem KEYSTORE_RECORD_INVALID); the identity cannot be changed until the keystore is uploaded again"
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version. RELEASE_IDENTITY_KEYSTORE_MISMATCH: the tenant has a v3 signing keystore and packageName/signerSha256 differ from its package name and certificate; the identity can only change together with the keystore (PUT /v1/admin/build-keystore writes both). BUILD_KEYSTORE_RECORD_INVALID: the stored v3 signing keystore record cannot be used (malformed, cannot be unwrapped, or its index fields differ from the uploaded file - readiness problem KEYSTORE_RECORD_INVALID); the identity cannot be changed until the keystore is uploaded again; ANDROID_PACKAGE_IN_USE：改成的包名别的租户已在用（不说是哪个租户）"
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
           },
           "422": {
             "description": "RELEASE_SIGNER_RETIRED: signerSha256 is a retired tenant signing certificate and can never be registered again"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2899,10 +2920,13 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version"
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version; IOS_BUNDLE_ID_IN_USE：改成的 bundle id 别的租户已在用（不区分大小写，不说是哪个租户）"
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2951,6 +2975,9 @@
           },
           "500": {
             "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -2984,6 +3011,9 @@
           },
           "500": {
             "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -3067,7 +3097,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore"
+            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore 租户会话（tenant-console-accounts-and-sso §3.4）：claimedBy、claimedMachineId、signingMachineId、signingMachineName、signOutcome.machineId 为 null；q 不按机器名与机器 id 搜。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -3115,7 +3145,7 @@
         "description": "Includes the bounded log tail for failure triage.",
         "responses": {
           "200": {
-            "description": "BuildJob"
+            "description": "BuildJob 租户会话（tenant-console-accounts-and-sso §3.4）：机器名称与 id 同列表一样清空。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -3303,6 +3333,9 @@
           },
           "409": {
             "description": "STALE_BUILD_CONFIG or APP_IDENTITY_CHANGE"
+          },
+          "403": {
+            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：REPO_DIRECTORY_PLATFORM_ONLY：repoDirectory 只能原样带回，只有平台管理员能改"
           }
         }
       }
@@ -3313,7 +3346,7 @@
         "description": "Keystore status for this tenant (BuildKeystoreView). Never returns ciphertext. Lists which registered signers the keystore is sealed to, active signers it is missing, each signer's check (decrypt, local confirmation with trust roots digest, trial signing) for the current keystore version, whether the primary signer is ready, and the trust roots the server composed. legacy=true means the stored row is a retired passphrase or build-agent box: it is not usable and must be replaced by a v3 upload. Also carries the latest key generation request, the generator of the current key (null when imported) and which recipients are recovery keys.",
         "responses": {
           "200": {
-            "description": "BuildKeystoreView",
+            "description": "BuildKeystoreView 租户会话（tenant-console-accounts-and-sso §3.4）：签名闸名称换成角色（主签名闸 / 备签名闸 / 签名闸），readinessProblems 不点名机器。",
             "content": {
               "application/json": {
                 "schema": {
@@ -3371,6 +3404,9 @@
           },
           "503": {
             "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -3425,6 +3461,9 @@
           },
           "503": {
             "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -3458,6 +3497,9 @@
           },
           "503": {
             "description": "RECOVERY_KEYS_UNAVAILABLE"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -7060,6 +7102,9 @@
           },
           "503": {
             "description": "STORAGE_MASTER_KEY_REQUIRED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       },
@@ -7088,6 +7133,9 @@
           },
           "404": {
             "description": "IOS_ASC_NOT_FOUND"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -7098,7 +7146,7 @@
         "description": "Fully managed (testflight: the platform uploads to TestFlight with the tenant's upload key) or self-upload (ipa: the platform hands over the App Store-signed .ipa and the tenant uploads it). Also returns what a switch has to look at: whether each mode can be queued right now, unfinished iOS builds (a switch is refused while any exist), whether the platform still stores an App Manager key, and other tenants on the same Apple team that stay fully managed (the team's upload key then remains on the build machines). Design ios-tenant-delivery-tiers-2026-09-24.",
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered"
+            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered 租户会话（tenant-console-accounts-and-sso §3.4）：多一个 teamSharedWithOtherTenants 布尔值；teamSharedWithTestFlightTenants 只给平台会话，租户会话是空数组。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -7156,7 +7204,7 @@
         },
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, uploadKeyWithdrawn, reminder?}"
+            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, uploadKeyWithdrawn, reminder?} 租户会话（tenant-console-accounts-and-sso §3.4）：reminder 与 409 详情里不点名别的租户。"
           },
           "400": {
             "description": "INVALID_IOS_DELIVERY"
@@ -7169,6 +7217,9 @@
           },
           "500": {
             "description": "IOS_DELIVERY_CONFIG_INVALID, IOS_DELIVERY_QUERY_FAILED, IOS_DELIVERY_SAVE_FAILED"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
           }
         }
       }
@@ -7264,6 +7315,402 @@
           },
           "409": {
             "description": "MACHINE_NOT_A_BUILDER, MACHINE_REVOKED, STALE_MACHINE_REGISTRY"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/methods": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "登录页用：{password:true, cid:<统一登录是否已配置>}；免登录"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/cid/start": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "302 去认证中心授权（出错时 302 回 /?cidError=<码>）"
+          }
+        },
+        "parameters": [
+          {
+            "name": "mode",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "login=统一登录；bind=待绑定账号绑定统一认证账号（要已登录会话）"
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "登录后回到的控制台相对路径，不合规时回 /"
+          }
+        ]
+      }
+    },
+    "/client/v1/oauth/login": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "认证中心的回调（路径固定）：login 设会话后 302 回 target；bind 302 到控制台 /cid/bind-confirm；出错 302 /?cidError=<码>"
+          }
+        },
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "授权码"
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "发起时的 state"
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "认证中心拒绝时的错误"
+          }
+        ]
+      }
+    },
+    "/v1/admin/auth/cid/bind": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "待确认的绑定：{account, cid:{email}, expiresAt}；没有 404 CID_BIND_NOT_PENDING"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/cid/bind/code": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "给待绑定的统一认证账号邮箱发验证码：{codeToken, expiresAt, resendAfter}。平台没配发信 503 MAIL_NOT_CONFIGURED；1 分钟 1 次、每账号每小时 5 次 429 CID_BIND_CODE_RATE_LIMITED；发送失败 502 MAIL_SEND_FAILED"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/cid/bind/confirm": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "本人确认绑定：body {codeToken, code}（发到统一认证账号邮箱的验证码，10 分钟，输错 5 次作废；不对 400 CID_BIND_CODE_INVALID）；账号变 active、本地口令作废，返回新的 Session；随后给账号登记的邮箱发绑定通知（同步，最多 10 秒；发不出去只写审计 tenant_account_bind_notice，不影响结果）；统一认证账号已绑本租户别的账号 409 CID_ACCOUNT_ALREADY_BOUND"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/platform/auth/cid": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "统一登录客户端配置（app_configs 平台级 auth.cid）：{configured, config:{authorizeUrl, logoutUrl, tokenUrl, userinfoUrl, clientId, hasClientSecret}, callbackPath, version}；密钥永不返回"
+          }
+        }
+      },
+      "put": {
+        "responses": {
+          "200": {
+            "description": "保存：authorizeUrl、logoutUrl（https，可带 {baseHost}）、tokenUrl、userinfoUrl（https 或本机 / 内网 http）、clientId、clientSecret（留空沿用）、expectedVersion、reason"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "关掉统一登录"
+          }
+        },
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "原因"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/mail": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "平台发信配置（app_configs 平台级 mail.smtp）：{configured, defaultPort, config:{host, port, username, hasPassword, fromAddress, fromName}, version}；口令永不返回"
+          }
+        }
+      },
+      "put": {
+        "responses": {
+          "200": {
+            "description": "保存：host（不带端口）、port（空 = 587；465 隐式 TLS，其它必须 STARTTLS，本机地址除外）、username、password（留空沿用，但 host、port、username 任一项变了就必须重填，否则 422 MAIL_PASSWORD_REQUIRED；无 username 不存口令）、fromAddress、fromName、expectedVersion、reason；不合法 422 INVALID_MAIL_CONFIG，版本不对 409 STALE_MAIL_CONFIG"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "删掉发信配置；之后成员无法完成统一登录绑定"
+          }
+        },
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "原因"
+          }
+        ]
+      }
+    },
+    "/v1/admin/platform/mail/test": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "用已保存的配置发一封测试邮件：body {to, reason} → {sent:true}；失败 502，code 为 MAIL_CONNECT_FAILED / MAIL_TLS_FAILED / MAIL_AUTH_FAILED / MAIL_REJECTED / MAIL_SEND_FAILED；每人每小时 10 次"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/tenant-accounts": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "当前域名租户的控制台成员（只有平台管理员）：{items:[{id, displayName, loginName, email, status, bound, boundSubject, boundEmail, boundAt, passwordExpiresAt, lastLoginAt, createdBy, createdAt, updatedAt}]}"
+          }
+        }
+      },
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/tenant-accounts/{id}/disable": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "停用：会话立即失效"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/tenant-accounts/{id}/reset": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "解绑并重置初始口令：回到待绑定，返回 {account, initialPassword, passwordExpiresAt}；会话立即失效"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/second-factor/code": {
+      "post": {
+        "summary": "租户会话的邮箱二次验证：给成员登记的邮箱发验证码（设计 tenant-console-accounts-and-sso §4.5）",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{codeToken, expiresAt, resendAfter, email（掩码）}；码 10 分钟、用一次、错 5 次作废，只属于这个会话"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "400": {
+            "description": "SECOND_FACTOR_NOT_APPLICABLE：平台会话不用"
+          },
+          "409": {
+            "description": "SECOND_FACTOR_NO_EMAIL"
+          },
+          "429": {
+            "description": "SECOND_FACTOR_CODE_RATE_LIMITED：每账号 1 分钟 1 次、1 小时 5 次，每 IP 1 小时 20 次"
+          },
+          "502": {
+            "description": "MAIL_SEND_FAILED"
+          },
+          "503": {
+            "description": "MAIL_NOT_CONFIGURED：平台没配发信（不退回不校验）"
+          }
+        }
+      }
+    },
+    "/v1/admin/auth/second-factor/verify": {
+      "post": {
+        "summary": "租户会话的邮箱二次验证：提交验证码",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{secondFactorUntil}：这个会话 15 分钟内可以做敏感操作"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "400": {
+            "description": "INVALID_SECOND_FACTOR、SECOND_FACTOR_CODE_INVALID、SECOND_FACTOR_NOT_APPLICABLE"
           }
         }
       }

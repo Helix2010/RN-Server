@@ -34,6 +34,19 @@ location ^~ /v1/ {
     proxy_hide_header Referrer-Policy;
 }
 
+# 统一登录的回调：认证中心固定把浏览器送回 <控制台域名>/client/v1/oauth/login，不能自定义
+# （RN-Server 设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。与 /v1/ 一样转给 rn-server。
+# 用 = 精确匹配：/client/ 下别的路径仍然落到下面的 SPA。
+location = /client/v1/oauth/login {
+    if ($rn_upstream_host = $host) {
+        return 500;
+    }
+    include /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+}
+
 location = /healthz {
     access_log off;
     add_header Content-Type text/plain;

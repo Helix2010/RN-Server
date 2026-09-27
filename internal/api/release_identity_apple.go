@@ -255,6 +255,20 @@ func (s *server) updateIOSReleaseIdentity(c *gin.Context) {
 		problem(c, http.StatusConflict, "STALE_RELEASE_IDENTITY", "Release identity changed; refresh and retry")
 		return
 	}
+	// bundle id 跨租户唯一（设计 tenant-console-accounts-and-sso §3.4）：两个租户用同一个 bundle id 会共用、
+	// 互相覆盖同一份描述文件。只拦「改成别人在用的」：已经重复的历史数据不因为改别的字段被卡住
+	if current == nil || !strings.EqualFold(current.Value.BundleID, value.BundleID) {
+		inUse, err := iosBundleIDUsedByAnotherTenant(c.Request.Context(), s.db, tenantID(c), value.BundleID)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_SAVE_FAILED", "Unable to check whether the bundle id is in use")
+			return
+		}
+		if inUse {
+			// 不说是哪个租户：租户管理员不该从这里知道别的租户的身份
+			problem(c, http.StatusConflict, "IOS_BUNDLE_ID_IN_USE", "Another tenant already uses this bundle id; every tenant's app needs its own bundle id")
+			return
+		}
+	}
 	previous := map[string]any{}
 	if current != nil {
 		previous = map[string]any{"appleTeamId": current.Value.AppleTeamID, "bundleId": current.Value.BundleID, "installUrl": current.Value.InstallURL}
@@ -268,6 +282,18 @@ func (s *server) updateIOSReleaseIdentity(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, iosReleaseIdentityView(record))
+}
+
+// iosBundleIDUsedByAnotherTenant：别的租户的 release.ios 已经用着这个 bundle id（不区分大小写，与 Apple 一致）。
+func iosBundleIDUsedByAnotherTenant(ctx context.Context, q rowQuerier, tenant, bundleID string) (bool, error) {
+	var one int
+	err := q.QueryRowContext(ctx,
+		`SELECT 1 FROM app_configs WHERE config_key=? AND tenant_id<>? AND tenant_id<>? AND LOWER(JSON_UNQUOTE(JSON_EXTRACT(config_value,'$.bundleId')))=LOWER(?) LIMIT 1`,
+		releaseIOSIdentityConfigKey, tenant, platformTenantID, bundleID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // writeIOSReleaseIdentity 把一份完整的身份写回去，并落一条审计。

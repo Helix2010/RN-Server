@@ -242,6 +242,19 @@ func (s *server) updateAndroidReleaseIdentity(c *gin.Context) {
 		problem(c, http.StatusConflict, "STALE_RELEASE_IDENTITY", "Release identity changed; refresh and retry")
 		return
 	}
+	// 包名跨租户唯一（设计 tenant-console-accounts-and-sso §3.4）。导入、生成签名密钥早就这样查；发布身份原来漏了。
+	// 只拦「改成别人在用的」：已经重复的历史数据不因为改签名指纹被卡住
+	if current == nil || current.Value.PackageName != value.PackageName {
+		inUse, err := androidPackageUsedByAnotherTenant(c.Request.Context(), s.db, tenantID(c), value.PackageName)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_SAVE_FAILED", "Unable to check whether the package name is in use")
+			return
+		}
+		if inUse {
+			androidPackageInUse(c)
+			return
+		}
+	}
 	raw, _ := json.Marshal(value)
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)

@@ -83,6 +83,14 @@ var migrations = []migration{
 	{version: 58, name: "ios_delivery", apply: iosDeliveryMigration},
 	// 签名材料的版本号改成毫秒时间戳（删掉再传不再从 1 重来），只改列注释
 	{version: 59, name: "ios_material_version_comment", apply: iosMaterialVersionCommentMigration},
+	// 租户控制台账号：平台管理员建号发初始口令，本人登录后绑定统一认证，之后只走统一认证
+	// （设计 tenant-console-accounts-and-sso-2026-09-25 §3.2、§4.3）
+	{version: 60, name: "tenant_admin_accounts", apply: tenantAdminAccountsMigration},
+	// 管理端会话分平台 / 租户：租户会话记下租户与账号，平台权限不再只看用户名
+	{version: 61, name: "admin_session_tenant", apply: adminSessionTenantMigration},
+	// 租户会话的二次验证（邮箱验证码）：记在会话上，敏感操作要 15 分钟内验过
+	// （设计 tenant-console-accounts-and-sso §4.5，2026-09-27 定为邮箱验证码）
+	{version: 62, name: "admin_session_second_factor", apply: adminSessionSecondFactorMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2139,4 +2147,87 @@ func iosDeliveryMigration(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("ios delivery migration build_machine_liveness.capabilities: %w", err)
 	}
 	return nil
+}
+
+// tenantAdminAccountsMigration 建租户控制台账号表（设计 tenant-console-accounts-and-sso-2026-09-25 §3.2）。
+//
+// 这是新实体：一个租户多个人，登录时按 (租户, 登录名) 或 (租户, 统一认证身份) 查人，要唯一约束和状态，
+// app_configs 一键一行的 JSON 承载不了。平台管理员照旧是环境变量里那一个，不进这张表。
+// 应急账号（不绑定、只用本地口令）与 TOTP 这次不做，等设计定了再加列。
+func tenantAdminAccountsMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS tenant_admin_accounts (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '账号主键；会话、审计 actor（tenant:<租户>:<账号>）都用它，不用显示名',
+		tenant_id BIGINT UNSIGNED NOT NULL COMMENT '所属租户 tenants.id；一个账号只属于一个租户，只能在这个租户的控制台域名上登录',
+		display_name VARCHAR(120) NOT NULL COMMENT '显示名，建号时填写，只用于界面',
+		login_name VARCHAR(64) NOT NULL COMMENT '本地登录名，建号时填写，租户内唯一；绑定统一认证之后不再能用来登录',
+		email VARCHAR(255) NOT NULL COMMENT '建号时填写的邮箱，用于界面与通知；不作登录依据、不唯一（统一认证那边的邮箱可改，拿它当身份会接错人）',
+		idp VARCHAR(32) NULL COMMENT '外部身份源：chainup-cid=统一认证；NULL=还没绑定',
+		idp_subject VARCHAR(120) NULL COMMENT '统一认证 userinfo 的 username（账号 uuid）；绑定后不变，换绑只能由平台管理员解绑重置。NULL=还没绑定',
+		idp_email VARCHAR(255) NULL COMMENT '绑定时统一认证返回的邮箱，只用于界面显示「绑的是哪个账号」；不作身份依据。NULL=还没绑定或对方没返回',
+		status VARCHAR(16) NOT NULL COMMENT 'pending_bind=只能用初始口令登录，登录后只能去绑定；active=已绑定，只能走统一认证登录；disabled=已停用，会话立即失效',
+		password_hash VARCHAR(255) NULL COMMENT '初始口令的 scrypt 哈希（scrypt$N$r$p$salt$key）；绑定成功后置 NULL。NULL=已绑定或已停用',
+		password_expires_at DATETIME(3) NULL COMMENT '初始口令过期时刻 UTC（建号或重置后 72 小时）；过期后要平台管理员重置。NULL=没有有效的初始口令',
+		created_by VARCHAR(120) NOT NULL COMMENT '建号人 actor',
+		created_at DATETIME(3) NOT NULL COMMENT '建号时刻 UTC',
+		updated_at DATETIME(3) NOT NULL COMMENT '本行最近一次被改动的时刻 UTC',
+		bound_at DATETIME(3) NULL COMMENT '最近一次完成绑定的时刻 UTC；NULL=还没绑定',
+		last_login_at DATETIME(3) NULL COMMENT '最近一次登录成功的时刻 UTC（本地口令或统一认证）；NULL=从未登录',
+		PRIMARY KEY (id),
+		UNIQUE KEY uq_tenant_admin_login (tenant_id, login_name),
+		UNIQUE KEY uq_tenant_admin_idp (tenant_id, idp, idp_subject),
+		KEY ix_tenant_admin_tenant (tenant_id, status)
+	) ENGINE=InnoDB COMMENT='租户控制台账号：平台管理员在控制台添加，RN-Server 登录与鉴权时读；同一个统一认证账号可以分别是多个租户的成员，各算一个账号'`); err != nil {
+		return fmt.Errorf("tenant admin accounts migration: %w", err)
+	}
+	return nil
+}
+
+// adminSessionTenantMigration 给管理端会话加租户与账号（设计 §3.3）。
+//
+// 平台会话（环境变量那个账号、自动化通道不落会话）两列都是 NULL；租户会话记下租户与账号，
+// 鉴权时每次都回表查账号状态，停用立即生效；请求域名的租户与会话租户不一致一律当没登录。
+// 老会话没有这两列的值，按平台会话处理——它们本来就只可能是环境变量那个账号登出来的。
+func adminSessionTenantMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "admin_sessions", "tenant_id",
+		`ALTER TABLE admin_sessions ADD COLUMN tenant_id BIGINT UNSIGNED NULL
+			COMMENT '租户会话所属的租户 tenants.id；只在这个租户的域名上有效。NULL=平台会话（环境变量里的管理员账号）' AFTER actor_id`); err != nil {
+		return fmt.Errorf("admin session tenant migration tenant_id: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "admin_sessions", "account_id",
+		`ALTER TABLE admin_sessions ADD COLUMN account_id BIGINT UNSIGNED NULL
+			COMMENT '租户会话对应的 tenant_admin_accounts.id；鉴权时每次回表查状态。NULL=平台会话' AFTER tenant_id`); err != nil {
+		return fmt.Errorf("admin session tenant migration account_id: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "admin_sessions", "login_method",
+		`ALTER TABLE admin_sessions ADD COLUMN login_method VARCHAR(16) NULL
+			COMMENT '这次会话怎么登录的：password=本地口令（平台账号，或租户账号的初始口令）；cid=统一认证。NULL=迁移之前的会话，按 password 处理' AFTER account_id`); err != nil {
+		return fmt.Errorf("admin session tenant migration login_method: %w", err)
+	}
+	if err := addIndexIfMissing(ctx, db, "admin_sessions", "ix_session_account",
+		`ALTER TABLE admin_sessions ADD KEY ix_session_account (account_id) COMMENT '停用、重置账号时删掉它的全部会话'`); err != nil {
+		return fmt.Errorf("admin session tenant migration index: %w", err)
+	}
+	return nil
+}
+
+func adminSessionSecondFactorMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "admin_sessions", "second_factor_at",
+		`ALTER TABLE admin_sessions ADD COLUMN second_factor_at DATETIME(3) NULL
+			COMMENT '租户会话最近一次通过邮箱二次验证的时间；敏感操作要在 15 分钟内。NULL=这个会话还没验过。平台会话不用' AFTER login_method`); err != nil {
+		return fmt.Errorf("admin session second factor migration: %w", err)
+	}
+	return nil
+}
+
+// addIndexIfMissing 让加索引的迁移可以重复执行：MySQL 没有 ADD INDEX IF NOT EXISTS。
+func addIndexIfMissing(ctx context.Context, db *sql.DB, table, index, statement string) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?`, table, index).Scan(&count); err != nil {
+		return fmt.Errorf("inspect: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, statement)
+	return err
 }

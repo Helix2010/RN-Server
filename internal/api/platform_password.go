@@ -46,19 +46,11 @@ func (s *server) generateAdminPasswordHash(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "WEAK_PASSWORD", err.Error())
 		return
 	}
-	salt := make([]byte, passwordSaltLen)
-	if _, err := rand.Read(salt); err != nil {
-		problem(c, http.StatusInternalServerError, "PASSWORD_HASH_FAILED", "Unable to generate a hash")
-		return
-	}
-	sum, err := scrypt.Key([]byte(password), salt, passwordHashN, passwordHashR, passwordHashP, passwordKeyLen)
+	encoded, err := hashPassword(password)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "PASSWORD_HASH_FAILED", "Unable to generate a hash")
 		return
 	}
-	encoded := fmt.Sprintf("scrypt$%d$%d$%d$%s$%s", passwordHashN, passwordHashR, passwordHashP,
-		base64.RawURLEncoding.EncodeToString(salt),
-		base64.RawURLEncoding.EncodeToString(sum))
 
 	// 审计只记"谁在什么时候生成过一个哈希"。口令和哈希都不进审计：审计表比配置文件
 	// 好读得多，把哈希写进去等于给它多开一个离线爆破的入口
@@ -72,6 +64,21 @@ func (s *server) generateAdminPasswordHash(c *gin.Context) {
 		// 把 $32768 当变量吃掉，留下一个登不进去的哈希。这个坑踩过
 		"envLine": "ADMIN_PASSWORD_HASH='" + encoded + "'",
 	})
+}
+
+// hashPassword 算 verifyPassword 认的 scrypt 哈希（scrypt$N$r$p$salt$key）。平台管理员口令与租户账号的初始口令共用。
+func hashPassword(password string) (string, error) {
+	salt := make([]byte, passwordSaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	sum, err := scrypt.Key([]byte(password), salt, passwordHashN, passwordHashR, passwordHashP, passwordKeyLen)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("scrypt$%d$%d$%d$%s$%s", passwordHashN, passwordHashR, passwordHashP,
+		base64.RawURLEncoding.EncodeToString(salt),
+		base64.RawURLEncoding.EncodeToString(sum)), nil
 }
 
 func checkAdminPasswordStrength(password string) error {

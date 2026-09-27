@@ -69,6 +69,12 @@ type server struct {
 	machineBundleDir string
 	// clock 是 s.now() 的时间源；nil = time.Now。只有测试会设
 	clock func() time.Time
+	// mailTests 是「发测试邮件」按操作人的小时窗口计数，零值可用
+	mailTests windowCounter
+	// bindCodes 是统一登录绑定验证码（进程内存，单实例），零值可用
+	bindCodes bindCodeStore
+	// secondFactorCodes：租户会话的邮箱二次验证码（second_factor.go），存法与限流同绑定验证码
+	secondFactorCodes bindCodeStore
 }
 
 type attempt struct {
@@ -208,15 +214,38 @@ func (s *server) routes() *gin.Engine {
 	// 这条路由内部按同一套可见性挑出"现在该给你的那一版"再 302 过去。
 	r.GET("/v1/public/releases/latest/download", s.domainTenantScope(), s.publicLatestReleaseDownload)
 	r.GET("/v1/public/releases/:id/download", s.domainTenantScope(), s.publicReleaseDownload)
+	// 统一登录的回调：认证中心固定回到 <控制台域名>/client/v1/oauth/login，不能自定义
+	// （设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。nginx 把控制台域名的这条路径转过来
+	r.GET(cidCallbackPath, s.domainTenantScope(), s.cidCallback)
 	admin := r.Group("/v1/admin")
 	admin.POST("/auth/login", s.login)
+	// 登录页要知道统一登录开没开；免登录
+	admin.GET("/auth/methods", s.authMethods)
+	// 发起统一登录（mode=login 免登录；mode=bind 要一个待绑定账号的会话，处理函数自己查）
+	admin.GET("/auth/cid/start", s.domainTenantScope(), s.startCIDLogin)
 	protected := admin.Group("")
 	protected.Use(s.authenticate())
 	protected.GET("/auth/session", s.session)
 	protected.POST("/auth/logout", s.logout)
-	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放
+	// 绑定统一认证账号：回调之后本人在控制台确认，确认了才落库
+	protected.GET("/auth/cid/bind", s.getPendingCIDBind)
+	protected.POST("/auth/cid/bind/code", s.sendCIDBindCode)
+	protected.POST("/auth/cid/bind/confirm", s.confirmCIDBind)
+	// 租户会话的邮箱二次验证：敏感操作与发起绑定前要 15 分钟内验过（second_factor.go）
+	protected.POST("/auth/second-factor/code", s.sendSecondFactorCode)
+	protected.POST("/auth/second-factor/verify", s.verifySecondFactor)
+	// 平台级路由：不按租户过滤，只对 PLATFORM_ADMIN_USERNAMES 里的账号开放；租户账号的会话一律进不来
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin())
+	// 统一登录的客户端配置（app_configs 平台级 auth.cid，客户端密钥加密存）
+	platform.GET("/auth/cid", s.getCIDConfig)
+	platform.PUT("/auth/cid", s.updateCIDConfig)
+	platform.DELETE("/auth/cid", s.deleteCIDConfig)
+	// 平台发信（app_configs 平台级 mail.smtp，口令加密存；ADR-0022）
+	platform.GET("/mail", s.getMailConfig)
+	platform.PUT("/mail", s.updateMailConfig)
+	platform.DELETE("/mail", s.deleteMailConfig)
+	platform.POST("/mail/test", s.sendTestMail)
 	// 构建机与签名闸的登记（build.machines）：新建发令牌、吊销、接受公钥、切换主备路由。
 	// 控制台接受只影响路由；签名闸与离线工具以本机记录和离线 pin 文件为准
 	platform.GET("/machines", s.listMachines)
@@ -335,8 +364,15 @@ func (s *server) routes() *gin.Engine {
 	gate.POST("/jobs/:id/release", s.releaseSigningJob)
 	gate.POST("/jobs/:id/reject", s.rejectSigningJob)
 	current := protected.Group("")
-	current.Use(s.domainTenantScope())
+	current.Use(s.domainTenantScope(), requireAdminSessionTenant())
 	current.GET("/tenant", s.currentTenant)
+	// 控制台成员（租户账号）：只有平台管理员能管，管的是当前域名的租户（用户 2026-09-25 定）
+	members := current.Group("/tenant-accounts")
+	members.Use(s.requirePlatformAdmin())
+	members.GET("", s.listTenantAccounts)
+	members.POST("", s.createTenantAccount)
+	members.POST("/:id/disable", s.disableTenantAccount)
+	members.POST("/:id/reset", s.resetTenantAccount)
 	s.registerTenantRoutes(current)
 	return r
 }
@@ -356,6 +392,10 @@ func (s *server) currentTenant(c *gin.Context) {
 }
 
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
+	// sf：敏感操作，租户会话要 15 分钟内通过邮箱二次验证（设计 tenant-console-accounts-and-sso §4.5）。
+	// 范围：签名密钥与签名材料、推送凭据、App Manager Key、发布身份、存储凭据、切换交付方式、
+	// 发版与热更新的放量 / 回滚 / 删除。平台会话不受影响
+	sf := s.requireSecondFactor()
 	group.GET("/overview", s.overview)
 	group.GET("/installations/overview", s.installationOverview)
 	group.GET("/installations", s.listInstallations)
@@ -381,17 +421,19 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/push/outbox", s.listPushOutbox)
 	group.GET("/push/deliveries", s.listPushDeliveries)
 	group.GET("/releases", s.listReleases)
-	group.POST("/releases", s.createReleaseFromArtifact)
+	group.POST("/releases", sf, s.createReleaseFromArtifact)
 	group.GET("/releases/:id", s.releaseDetail)
-	group.POST("/releases/:id/:action", s.releaseAction)
+	group.POST("/releases/:id/:action", sf, s.releaseAction)
 	// 清理历史产物。不是状态迁移：发布记录一旦删掉就不在升级决策里了，所以正在下发的
 	// 版本删不掉，且必须先清掉建在它上面的 OTA。见 release_purge.go
-	group.DELETE("/releases/:id", s.purgeRelease)
+	group.DELETE("/releases/:id", sf, s.purgeRelease)
 	group.GET("/audit-events", s.listAudits)
 	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
-	group.POST("/predict/probe", s.probePredictService)
+	// 只给平台会话：预测平台的配置归平台（§3.4），而且探测会去连任意 https 地址。
+	// 与保存 services.predict 同一个判据（isPlatformSession），能存的就能测
+	group.POST("/predict/probe", requirePlatformSession(), s.probePredictService)
 	group.GET("/branding", s.getBranding)
 	group.PATCH("/branding", s.updateBranding)
 	group.GET("/tokens", s.listTokens)
@@ -405,31 +447,31 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.PUT("/localization/documents", s.updateLocalizationDocuments)
 	group.POST("/localization/publish", s.publishLocalization)
 	group.GET("/release-storage", s.getReleaseStorage)
-	group.PUT("/release-storage", s.updateReleaseStorage)
+	group.PUT("/release-storage", sf, s.updateReleaseStorage)
 	group.GET("/release-storage/cors", s.bucketCORSRequirements)
 	group.POST("/release-storage/test", s.testReleaseStorage)
 	group.GET("/release-identity/android", s.getAndroidReleaseIdentity)
-	group.PUT("/release-identity/android", s.updateAndroidReleaseIdentity)
+	group.PUT("/release-identity/android", sf, s.updateAndroidReleaseIdentity)
 	group.GET("/release-identity/ios", s.getIOSReleaseIdentity)
-	group.PUT("/release-identity/ios", s.updateIOSReleaseIdentity)
+	group.PUT("/release-identity/ios", sf, s.updateIOSReleaseIdentity)
 	// App Store Connect 接入（模式 A）。没装密钥的租户走模式 B，只填分发入口——
 	// 扫码分发与 App 内更新入口只需要那一个字符串（设计 ios-testflight §4.6）
 	group.GET("/ios/asc-credentials", s.getIOSASCCredentials)
-	group.PUT("/ios/asc-credentials", s.updateIOSASCCredentials)
-	group.DELETE("/ios/asc-credentials", s.deleteIOSASCCredentials)
+	group.PUT("/ios/asc-credentials", sf, s.updateIOSASCCredentials)
+	group.DELETE("/ios/asc-credentials", sf, s.deleteIOSASCCredentials)
 	// 只读同步：拉 build 与测试组，回写公开链接与过期日。提审、开关公开链接、
 	// 增删测试员永远由人在 ASC 上点（§4.6.6）
 	group.POST("/ios/testflight/sync", s.syncIOSTestFlight)
 	// 交付方式：全托管（平台传 TestFlight）/ 自助上传（平台交 .ipa、租户自己传）。
 	// 有没跑完的 iOS 任务时不许切换（ios_delivery.go）
 	group.GET("/ios/delivery", s.getIOSDelivery)
-	group.PUT("/ios/delivery", s.updateIOSDelivery)
+	group.PUT("/ios/delivery", sf, s.updateIOSDelivery)
 	group.GET("/ota/signing-key", s.getOTASigningKey)
-	group.PUT("/ota/signing-key", s.updateOTASigningKey)
-	group.POST("/ota/signing-key/generate", s.generateOTASigningKey)
+	group.PUT("/ota/signing-key", sf, s.updateOTASigningKey)
+	group.POST("/ota/signing-key/generate", sf, s.generateOTASigningKey)
 	// bootstrap 响应签名（N3）。与 OTA 那把分开：共用一把等于把两个信任域焊在一起。
 	group.GET("/bootstrap/signing-key", s.getBootstrapSigningKey)
-	group.POST("/bootstrap/signing-key/generate", s.generateBootstrapSigningKey)
+	group.POST("/bootstrap/signing-key/generate", sf, s.generateBootstrapSigningKey)
 	group.GET("/builds", s.listBuildJobs)
 	group.POST("/builds", s.createBuildJob)
 	group.GET("/builds/:id", s.buildJobDetail)
@@ -455,20 +497,20 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 推送凭据：google-services.json 的服务端另一半，所以挨着 build-config 放。
 	// 两者必须属于同一个 Firebase 项目，视图里直接给出比对结果。
 	group.GET("/push/credentials", s.getPushCredentials)
-	group.PUT("/push/credentials/fcm", s.updatePushCredentialsFCM)
-	group.DELETE("/push/credentials/fcm", s.deletePushCredentialsFCM)
+	group.PUT("/push/credentials/fcm", sf, s.updatePushCredentialsFCM)
+	group.DELETE("/push/credentials/fcm", sf, s.deletePushCredentialsFCM)
 	group.POST("/push/credentials/fcm/test", s.testPushCredentialsFCM)
 	// APNs 的 topic 取自 release.ios 的 bundleId，所以这三条隐含依赖 iOS 发布身份
-	group.PUT("/push/credentials/apns", s.updatePushCredentialsAPNs)
-	group.DELETE("/push/credentials/apns", s.deletePushCredentialsAPNs)
+	group.PUT("/push/credentials/apns", sf, s.updatePushCredentialsAPNs)
+	group.DELETE("/push/credentials/apns", sf, s.deletePushCredentialsAPNs)
 	group.POST("/push/credentials/apns/test", s.testPushCredentialsAPNs)
 	group.GET("/build-keystore", s.getBuildKeystore)
 	// 导入已有密钥（离线工具产出的 v3 文件，高级）
-	group.PUT("/build-keystore", s.saveBuildKeystore)
+	group.PUT("/build-keystore", sf, s.saveBuildKeystore)
 	// 一键生成：记一条生成请求，由主签名闸在本机生成后交回
-	group.POST("/build-keystore/generate", s.generateBuildKeystore)
+	group.POST("/build-keystore/generate", sf, s.generateBuildKeystore)
 	// 导出当前密钥的密文文件（离线恢复用）
-	group.GET("/build-keystore/export", s.exportBuildKeystore)
+	group.GET("/build-keystore/export", sf, s.exportBuildKeystore)
 	group.POST("/release-artifacts/uploads", s.createReleaseArtifactUpload)
 	group.PUT("/release-artifacts/upload", s.uploadReleaseArtifact)
 	group.DELETE("/release-artifacts/upload", s.deleteReleaseArtifact)
@@ -478,8 +520,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 热更新修订只能由 kind=ota 的构建任务产出：管理端不再能直接上传热更新包
 	// （设计 android-signing-gate-2026-09-16「热更新」），票据、回传与落修订只在
 	// /v1/build-agent/jobs/:id/ota-* 上
-	group.POST("/ota/releases/:id/:action", s.otaAction)
-	group.DELETE("/ota/releases/:id", s.purgeOTARelease)
+	group.POST("/ota/releases/:id/:action", sf, s.otaAction)
+	group.DELETE("/ota/releases/:id", sf, s.purgeOTARelease)
 	group.POST("/upload-sessions", s.createUploadSession)
 	group.POST("/upload-sessions/cleanup-expired", s.cleanupExpiredUploadSessions)
 	group.GET("/upload-sessions/:id", s.getUploadSession)
@@ -645,99 +687,6 @@ func (s *server) ready(c *gin.Context) {
 func (s *server) docs(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(200, `<!doctype html><html><head><title>RN Foundation API</title></head><body><h1>RN Foundation API</h1><p><a href="/openapi.json">OpenAPI contract</a></p></body></html>`)
-}
-
-func (s *server) authenticate() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if cookie, err := c.Cookie("rn_admin_session"); err == nil && cookie != "" {
-			hash := sha256Hex(cookie)
-			var actor string
-			var expires time.Time
-			err := s.db.QueryRowContext(c.Request.Context(), `SELECT actor_id, expires_at FROM admin_sessions WHERE token_hash=? AND expires_at>? LIMIT 1`, hash, time.Now().UTC()).Scan(&actor, &expires)
-			if err == nil {
-				if !safeMethod(c.Request.Method) && !s.originAllowed(c.GetHeader("Origin")) {
-					problem(c, 403, "UNTRUSTED_ORIGIN", "Untrusted admin request origin")
-					c.Abort()
-					return
-				}
-				c.Set("actorId", actor)
-				c.Set("authMethod", "session")
-				c.Set("expiresAt", iso(expires))
-				c.Next()
-				return
-			}
-		}
-		// x-admin-key 自动化通道：身份来自配置里绑定的 actor，不是请求自报的 x-admin-id。
-		// 自报身份任何持钥者都能随便写，写进 audit_events 的 actor 就成了攻击者可控的字段，
-		// 事后追责等于没有依据（安全评审 N17）。请求仍然可以带那个头，只是不再被采纳。
-		if key := c.GetHeader("x-admin-key"); s.cfg.AdminAPIKey != "" && constantEqual(key, s.cfg.AdminAPIKey) {
-			// 密钥对了还要看来源：这把密钥长期有效、没有账号绑定，泄露之后
-			// 唯一还能拦住它的就是"不是从我们的机器发出来的"（安全评审 N17）
-			if !s.adminIPs.allows(c.ClientIP()) {
-				slog.Warn("admin api key used from an address outside the allowlist", "clientIp", c.ClientIP(), "path", c.Request.URL.Path)
-				problem(c, http.StatusForbidden, "ADMIN_SOURCE_NOT_ALLOWED", "This automation credential is not accepted from this address")
-				c.Abort()
-				return
-			}
-			if claimed := strings.TrimSpace(c.GetHeader("x-admin-id")); claimed != "" && claimed != s.cfg.AdminAPIActor {
-				slog.Warn("ignoring self-declared admin identity on api-key request", "claimed", claimed, "actor", s.cfg.AdminAPIActor, "path", c.Request.URL.Path)
-			}
-			c.Set("actorId", s.cfg.AdminAPIActor)
-			c.Set("authMethod", "api-key")
-			c.Set("expiresAt", nil)
-			c.Next()
-			return
-		}
-		problem(c, 401, "ADMIN_AUTH_REQUIRED", "Admin authentication required")
-		c.Abort()
-	}
-}
-
-func (s *server) login(c *gin.Context) {
-	var input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := decode(c, &input); err != nil || input.Username == "" || input.Password == "" || len(input.Password) > 1024 {
-		problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
-		return
-	}
-	if s.rateLimited(c.ClientIP()) {
-		problem(c, 429, "LOGIN_RATE_LIMITED", "Too many login attempts")
-		return
-	}
-	valid := constantEqual(strings.TrimSpace(input.Username), s.cfg.AdminUsername) && verifyPassword(input.Password, s.cfg.AdminPasswordHash)
-	if !valid {
-		s.failedLogin(c.ClientIP())
-		problem(c, 401, "INVALID_CREDENTIALS", "Invalid username or password")
-		return
-	}
-	s.mu.Lock()
-	delete(s.attempts, c.ClientIP())
-	s.mu.Unlock()
-	token := randomID(32)
-	now := time.Now().UTC()
-	expires := now.Add(time.Duration(s.cfg.AdminSessionTTL) * time.Second)
-	if _, err := s.db.ExecContext(c.Request.Context(), `INSERT INTO admin_sessions (token_hash,actor_id,expires_at,created_at) VALUES (?,?,?,?)`, sha256Hex(token), s.cfg.AdminUsername, expires, now); err != nil {
-		problem(c, 500, "SESSION_CREATE_FAILED", "Unable to create admin session")
-		return
-	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: "rn_admin_session", Value: token, Path: "/v1/admin", MaxAge: s.cfg.AdminSessionTTL, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
-	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"authenticated": true, "platformAdmin": s.isPlatformAdmin(s.cfg.AdminUsername), "actorId": s.cfg.AdminUsername, "expiresAt": iso(expires), "method": "session"})
-}
-
-func (s *server) session(c *gin.Context) {
-	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"authenticated": true, "actorId": actor(c), "expiresAt": valueFrom(c, "expiresAt"), "method": valueFrom(c, "authMethod"), "platformAdmin": s.isPlatformAdmin(actor(c))})
-}
-
-func (s *server) logout(c *gin.Context) {
-	if token, err := c.Cookie("rn_admin_session"); err == nil {
-		_, _ = s.db.ExecContext(c.Request.Context(), `DELETE FROM admin_sessions WHERE token_hash=?`, sha256Hex(token))
-	}
-	http.SetCookie(c.Writer, &http.Cookie{Name: "rn_admin_session", Value: "", Path: "/v1/admin", MaxAge: -1, HttpOnly: true, Secure: s.cfg.AdminCookieSecure, SameSite: http.SameSiteStrictMode})
-	c.JSON(200, gin.H{"authenticated": false})
 }
 
 func (s *server) rateLimited(ip string) bool {
@@ -1191,11 +1140,15 @@ func (s *server) listAudits(c *gin.Context) {
 	}
 	defer rows.Close()
 	items, cursors := []auditEvent{}, []string{}
+	platformView := isPlatformSession(c)
 	for rows.Next() {
 		item, created, err := scanAudit(rows, tenant)
 		if err != nil {
 			problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to read audit events")
 			return
+		}
+		if !platformView {
+			redactAuditForTenant(&item)
 		}
 		items, cursors = append(items, item), append(cursors, encodeListCursor(created, item.ID))
 	}
@@ -1205,6 +1158,27 @@ func (s *server) listAudits(c *gin.Context) {
 	}
 	items, next := finishListPage(items, cursors, page.limit)
 	c.JSON(200, listResponse(items, total, next, page.limit))
+}
+
+// tenantHiddenAuditKeys 是审计摘要里指向平台基础设施与别的租户的字段。审计按租户存、租户会话能读，
+// 读的时候拿掉（设计 tenant-console-accounts-and-sso §3.4）；平台会话照旧看全。
+var tenantHiddenAuditKeys = map[string]bool{
+	"machineId": true, "machineName": true, "claimedBy": true, "signingMachineId": true,
+	"generatorMachineId": true, "generatorName": true, "signerMachineId": true, "signerName": true,
+	// 旧版 ios_delivery_update 记的是同 Team 其它租户的 slug（现在只记个数）
+	"teamSharedWith": true,
+}
+
+func redactAuditForTenant(item *auditEvent) {
+	for key := range item.Summary {
+		if tenantHiddenAuditKeys[key] {
+			delete(item.Summary, key)
+		}
+	}
+	// 签名闸报检查结果的那条把机器名记在 name 里
+	if item.Action == "build_keystore_check_update" {
+		delete(item.Summary, "name")
+	}
 }
 
 func parseAuditListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, string) {
@@ -1348,6 +1322,14 @@ func (s *server) updateAppConfig(c *gin.Context) {
 			problem(c, 400, "INVALID_WALLET_CONFIG", err.Error())
 			return
 		}
+		// 钱包段（链的 RPC 地址、WalletConnect、转出是否真的上链）下发给这个租户的所有用户：
+		// 租户会话改它要 15 分钟内过邮箱二次验证（ADR-0023）。原样带回不算改
+		walletChanged := !sameJSON(normalizeWallet(object(incoming)), normalizeWallet(object(storedWalletSection(stored))))
+		if walletChanged && !isPlatformSession(c) && !secondFactorFresh(currentAdminSession(c), s.now()) {
+			problem(c, http.StatusForbidden, "SECOND_FACTOR_REQUIRED",
+				"Changing the wallet section needs email verification within the last 15 minutes; request a code and verify it first")
+			return
+		}
 	} else if carried := storedWalletSection(stored); carried != nil {
 		// 客户端不带 wallet 段时保留库里已有的：否则一次改颜色就会把租户的
 		// projectId 和链端点顺手清空。沿用的值不再校验——它已经在库里，
@@ -1367,6 +1349,12 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		section, err := parseServicesSection(incoming)
 		if err != nil {
 			problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
+			return
+		}
+		// 预测平台的关联（域名、scopeId、链、端点）由平台管理员配（设计 tenant-console-accounts-and-sso §3.4）：
+		// scopeId 指向别的租户，App 里显示的就是别人的市场。租户会话只能原样带回
+		if !isPlatformSession(c) && !sameJSON(section, normalizeServices(storedServicesSection(stored))) {
+			problem(c, http.StatusForbidden, "SERVICES_CONFIG_PLATFORM_ONLY", "Only the platform administrator can change services.predict")
 			return
 		}
 		body.Config["services"] = section
@@ -2256,10 +2244,9 @@ func problem(c *gin.Context, status int, code, detail string) {
 	c.Header("Content-Type", "application/problem+json")
 	c.JSON(status, gin.H{"type": "about:blank", "title": http.StatusText(status), "status": status, "code": code, "detail": detail, "requestId": requestID(c)})
 }
-func requestID(c *gin.Context) string          { v, _ := c.Get("requestId"); return fmt.Sprint(v) }
-func actor(c *gin.Context) string              { v, _ := c.Get("actorId"); return fmt.Sprint(v) }
-func tenantID(c *gin.Context) string           { v, _ := c.Get("tenantId"); return fmt.Sprint(v) }
-func valueFrom(c *gin.Context, key string) any { v, _ := c.Get(key); return v }
+func requestID(c *gin.Context) string { v, _ := c.Get("requestId"); return fmt.Sprint(v) }
+func actor(c *gin.Context) string     { v, _ := c.Get("actorId"); return fmt.Sprint(v) }
+func tenantID(c *gin.Context) string  { v, _ := c.Get("tenantId"); return fmt.Sprint(v) }
 
 func randomID(n int) string {
 	b := make([]byte, n)

@@ -195,7 +195,7 @@ func (s *server) writePushAPNs(c *gin.Context, tenant string) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIAL_SAVE_FAILED", "Unable to save push credentials")
 		return
 	}
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c))
+	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
 	c.JSON(http.StatusOK, view)
 }
 
@@ -243,7 +243,7 @@ func (s *server) removePushAPNs(c *gin.Context, tenant string) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIAL_DELETE_FAILED", "Unable to delete push credentials")
 		return
 	}
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c))
+	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
 	view["inheritorsAffected"] = inheritors
 	c.JSON(http.StatusOK, view)
 }
@@ -276,6 +276,11 @@ func (s *server) testPushCredentialsAPNs(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIALS_QUERY_FAILED", "Unable to load push credentials")
 		return
 	}
+	// 继承来的是平台那一行：由平台管理员来测（见 testPushCredentialsFCM）
+	if record.Inherited(tenant) && !isPlatformSession(c) {
+		pushCredentialsInherited(c)
+		return
+	}
 	authKey, err := record.AuthKey(s.secrets)
 	if err != nil {
 		problem(c, http.StatusServiceUnavailable, "APNS_CREDENTIAL_UNREADABLE", "已保存的 .p8 解不开："+err.Error())
@@ -296,9 +301,11 @@ func (s *server) testPushCredentialsAPNs(c *gin.Context) {
 		if errors.Is(err, pushcreds.ErrAPNsTopicDisallowed) {
 			code = "APNS_TOPIC_DISALLOWED"
 		}
+		s.auditPushCredentialTest(c, "apns", record.Inherited(tenant), code)
 		problem(c, http.StatusFailedDependency, code, err.Error())
 		return
 	}
+	s.auditPushCredentialTest(c, "apns", record.Inherited(tenant), "")
 	now := time.Now().UTC()
 	record.Value.VerifiedAt = &now
 	if stored, marshalErr := json.Marshal(record.Value); marshalErr == nil {

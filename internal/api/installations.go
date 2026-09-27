@@ -182,6 +182,8 @@ func (s *server) revokeInstallation(c *gin.Context) {
 		problem(c, 404, "INSTALLATION_NOT_FOUND", "Installation not found")
 		return
 	}
+	// 吊销已经落库：先写审计，后面结束会话失败也不会留下「状态变了、没有审计」
+	s.auditNow(newAudit(tenantID(c), actor(c), "installation_revoke", "installation", installationID, body.Reason, requestID(c), map[string]any{}))
 	_, _ = s.db.ExecContext(c.Request.Context(), `UPDATE app_push_tokens SET invalid_at=?,updated_at=? WHERE tenant_id=? AND installation_id=? AND invalid_at IS NULL`, now, now, tenantID(c), installationID)
 	// 撤销安装实例同时结束它上面的会话（设计 §4.2），App 下次校验会话得到 401 回到未登录态
 	if _, err := s.db.ExecContext(c.Request.Context(), endSessionsSQL+`tenant_id=? AND installation_id=?`, now, "admin", tenantID(c), installationID); err != nil {

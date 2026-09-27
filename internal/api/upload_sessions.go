@@ -149,6 +149,8 @@ func (s *server) createUploadSession(c *gin.Context) {
 		problem(c, 503, "UPLOAD_SESSION_TOKEN_UNAVAILABLE", "Upload session signing is not configured")
 		return
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "upload_session_create", "upload-session", id, "开始分片上传", requestID(c),
+		map[string]any{"uploadType": body.UploadType, "fileName": body.FileName, "size": body.Size}))
 	c.JSON(http.StatusCreated, gin.H{"session": s.uploadSessionJSON(uploadSessionView{ID: id, UploadType: body.UploadType, FileName: body.FileName, ContentType: body.ContentType, ExpectedSize: body.Size, PartSize: body.PartSize, TotalParts: total, Status: "active", ExpiresAt: expires, Parts: parts}), "token": tok, "uploadMode": s.cfg.ArtifactUploadMode})
 }
 
@@ -352,6 +354,8 @@ func (s *server) emitCompletedUpload(c *gin.Context, session uploadSessionView) 
 		problem(c, 503, "UPLOAD_ARTIFACT_TOKEN_UNAVAILABLE", "Unable to create artifact token")
 		return
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "upload_session_complete", "upload-session", session.ID, "完成分片上传", requestID(c),
+		map[string]any{"objectKey": session.ObjectKey, "fileName": session.FileName, "size": session.ExpectedSize}))
 	c.JSON(200, gin.H{"artifact": gin.H{"id": session.ID, "token": artifactToken, "objectKey": session.ObjectKey, "fileName": session.FileName, "contentType": session.ContentType, "size": session.ExpectedSize, "expiresAt": iso(expiresAt)}})
 }
 
@@ -365,6 +369,8 @@ func (s *server) cancelUploadSession(c *gin.Context) {
 		_ = client.AbortMultipartUpload(c.Request.Context(), session.ObjectKey, tok.UploadID)
 		_, _ = s.db.ExecContext(c.Request.Context(), `UPDATE upload_sessions SET status='aborted',updated_at=? WHERE tenant_id=? AND id=? AND status='active'`, time.Now().UTC(), tenantID(c), session.ID)
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "upload_session_cancel", "upload-session", session.ID, "取消分片上传", requestID(c),
+		map[string]any{"fileName": session.FileName, "wasActive": session.Status == "active"}))
 	c.JSON(200, gin.H{"cancelled": true})
 }
 
@@ -448,6 +454,8 @@ func (s *server) cleanupExpiredUploadSessions(c *gin.Context) {
 		_, _ = s.db.ExecContext(c.Request.Context(), `UPDATE upload_sessions SET status='expired',updated_at=? WHERE tenant_id=? AND id=? AND status='active'`, time.Now().UTC(), tenant, id)
 		count++
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "upload_session_cleanup", "upload-session", "expired", "清理过期的分片上传", requestID(c),
+		map[string]any{"expired": count}))
 	c.JSON(200, gin.H{"expired": count})
 }
 

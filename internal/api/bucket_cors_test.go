@@ -11,7 +11,7 @@ import (
 func TestDBBucketCORSCoversEveryActiveTenantDomain(t *testing.T) {
 	db := openTestDB(t)
 	s := &server{db: db}
-	origins, err := s.tenantConsoleOrigins(context.Background())
+	origins, err := s.tenantConsoleOrigins(context.Background(), "")
 	if err != nil {
 		t.Fatalf("取租户域名失败: %v", err)
 	}
