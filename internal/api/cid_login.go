@@ -267,8 +267,13 @@ func (s *server) updateCIDConfig(c *gin.Context) {
 	c.JSON(200, cidConfigView(&cidRecord{Value: value, Version: currentVersion + 1, UpdatedBy: actor(c), UpdatedAt: now}))
 }
 
-// deleteCIDConfig 关掉统一登录。控制台账号之后都登不进来，直到重新配置；环境变量账号（过渡期）不受影响。
+// deleteCIDConfig 关掉统一登录。控制台只有统一登录，删了之后所有账号都登不进来（包括删的人自己），
+// 只能靠自动化通道重新配置——所以只许自动化通道删，控制台会话一律 409；要换认证中心直接改（PUT）。
 func (s *server) deleteCIDConfig(c *gin.Context) {
+	if currentAdminSession(c) != nil {
+		problem(c, 409, "CID_REQUIRED_FOR_CONSOLE_LOGIN", "Deleting the unified login configuration would lock every console account out, including yours; change it instead")
+		return
+	}
 	reason := strings.TrimSpace(c.Query("reason"))
 	if len(reason) < 3 {
 		problem(c, 400, "INVALID_CID_CONFIG", "reason is required")

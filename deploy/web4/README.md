@@ -24,7 +24,9 @@ Nginx.
    `MYSQL_*` keys — the driver does not know about those. The configured
    database must already exist; RN-Server never runs `CREATE DATABASE` during
    application startup.
-2. Set `ADMIN_USERNAME` and a scrypt `ADMIN_PASSWORD_HASH`. The browser never receives `ADMIN_API_KEY`;
+2. The console has no password account any more: console users sign in through unified login, and their
+   accounts are written into `tenant_admin_accounts` by the external system (RN-Server design
+   `console-accounts-external-maintenance-2026-09-27`). The browser never receives `ADMIN_API_KEY`;
    that optional value is only for controlled automation.
 3. Set `PUBLIC_BASE_DOMAIN` and `PUBLIC_CONSOLE_DOMAIN`, point `PUBLIC_SERVER_URL` and
    `CORS_ORIGINS` to their HTTPS origins, set `PUBLIC_API_DOMAIN`, and keep

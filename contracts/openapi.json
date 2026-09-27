@@ -442,25 +442,6 @@
         }
       }
     },
-    "/v1/admin/auth/login": {
-      "post": {
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LoginRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Authenticated。只剩环境变量里的管理员账号（ADMIN_USERNAME）能用口令登录（过渡期保留）；控制台账号没有本地口令，只走统一登录。用户名或口令不对一律 401 INVALID_CREDENTIALS"
-          }
-        }
-      }
-    },
     "/v1/admin/auth/logout": {
       "post": {
         "responses": {
@@ -474,7 +455,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Session：platformAdmin（可用的平台管理员账号，或没有账号且在 PLATFORM_ADMIN_USERNAMES 里；租户会话恒为 false）、tenantId（租户会话的租户，平台会话为 null）、account（账号会话：id、displayName、email；环境变量账号与自动化通道为 null）、secondFactorUntil（账号会话邮箱二次验证的有效期，null=没验过或已过期）。"
+            "description": "Session：platformAdmin（平台管理员账号的会话；自动化通道看 PLATFORM_ADMIN_USERNAMES；租户会话恒为 false）、tenantId（租户会话的租户，平台会话为 null）、account（id、displayName、email；自动化通道为 null）、secondFactorUntil（邮箱二次验证的有效期，null=没验过或已过期）。"
           }
         }
       }
@@ -2287,7 +2268,7 @@
             "description": "{items:[{chain,name,chainId,testnet,config|null（端点只给 urlMasked/urlHash/hasSecret）,configError,state|null（chain_scan_state 含 endpointHealth/jobs/openAlerts）,stats{rows24h,unattributedOpen,watched,tenants}}],allowPlainHttp,defaults}；每项另带 readiness{minBuild{android,ios},lowBuildInstalls(近 30 天活跃且低于门槛的安装数),tokens(平台目录条目数),hasConfig,enabled}（新链接入向导）"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         }
       }
@@ -2300,7 +2281,7 @@
             "description": "{chain,config,savedAt,actorId,requestId}；启用时逐端点核对 eth_chainId；乐观锁 409 SCAN_CONFIG_VERSION_CONFLICT；校验失败 400 INVALID_SCAN_CONFIG"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         },
         "requestBody": {
@@ -2402,7 +2383,7 @@
             "description": "{chain,results:[{label,ok,error,chainId,headBlock,latencyMs,blockTimeMs,multicall3,maxLogSpan,fullBlockMs,fullBlockTxs,spanTried,suggestedMode,suggestedSpan,suggestedConfirmations}],suggestion{maxLogSpan,nativeMode,confirmations}}"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         },
         "requestBody": {
@@ -2462,7 +2443,7 @@
             "description": "{chain,config}"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         },
         "requestBody": {
@@ -2504,7 +2485,7 @@
             "description": "{chain,config}"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         },
         "requestBody": {
@@ -2546,7 +2527,7 @@
             "description": "{chain,job}；kind = rescan | attribute；409 SCAN_STATE_NOT_FOUND 表示索引器尚未初始化该链"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         },
         "requestBody": {
@@ -2598,7 +2579,7 @@
             "description": "{chain,cancelled}；404 SCAN_JOB_NOT_FOUND"
           },
           "403": {
-            "description": "PLATFORM_ADMIN_NOT_CONFIGURED（PLATFORM_ADMIN_USERNAMES 为空）或 PLATFORM_ADMIN_REQUIRED（账号不在列表）"
+            "description": "PLATFORM_ADMIN_REQUIRED（不是平台管理员账号的会话；自动化通道的 actor 不在 PLATFORM_ADMIN_USERNAMES 里）或 PLATFORM_ADMIN_NOT_CONFIGURED（自动化通道且 PLATFORM_ADMIN_USERNAMES 为空）"
           }
         },
         "requestBody": {
@@ -7323,7 +7304,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "登录页用：{password:<配了环境变量账号>, cid:<统一登录是否已配置>}；免登录"
+            "description": "登录页用：{cid:<统一登录是否已配置>}；免登录。控制台只有统一登录，开着登录页就直接跳过去"
           }
         }
       }
@@ -7424,6 +7405,9 @@
         "responses": {
           "200": {
             "description": "关掉统一登录"
+          },
+          "409": {
+            "description": "CID_REQUIRED_FOR_CONSOLE_LOGIN：控制台会话不能删（删了所有账号都登不进来），只有自动化通道能删；要换认证中心用 PUT"
           }
         },
         "parameters": [
@@ -7532,7 +7516,7 @@
             "description": "Admin authentication required"
           },
           "400": {
-            "description": "SECOND_FACTOR_NOT_APPLICABLE：没有账号的会话（环境变量账号、自动化）不用"
+            "description": "SECOND_FACTOR_NOT_APPLICABLE：自动化通道（管理密钥）没有会话，不用二次验证"
           },
           "409": {
             "description": "SECOND_FACTOR_NO_EMAIL"

@@ -18,21 +18,20 @@ import (
 )
 
 // 平台级"扫链管理"接口（设计 RN-App docs/design/wallet-receive-index-2026-09-06.md §4.11-4.12）。
-// 只对 PLATFORM_ADMIN_USERNAMES 里的账号开放，不按租户过滤：扫链配置与状态是平台级的。
+// 只对平台管理员开放（requirePlatformAdmin），不按租户过滤：扫链配置与状态是平台级的。
 
 var scanProbeHTTP = &http.Client{Timeout: 45 * time.Second}
 
-// requirePlatformAdmin 在 authenticate() 之后：可用的平台管理员账号；或者没有账号的会话
-// （环境变量账号、自动化通道）且 actor 在配置文件声明的列表里。租户账号的会话永远进不来
-// （它的 actor 与列表里的名字撞上也不行，见 platformAdminRequest）。
+// requirePlatformAdmin 在 authenticate() 之后：可用的平台管理员账号的会话；或者自动化通道且 actor 在
+// PLATFORM_ADMIN_USERNAMES 里。租户账号的会话永远进不来（它的 actor 与列表里的名字撞上也不行，见 platformAdminRequest）。
 func (s *server) requirePlatformAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s.platformAdminRequest(c) {
 			c.Next()
 			return
 		}
-		if len(s.cfg.PlatformAdminUsernames) == 0 && !currentAdminSession(c).hasAccount() {
-			problem(c, 403, "PLATFORM_ADMIN_NOT_CONFIGURED", "PLATFORM_ADMIN_USERNAMES is empty and this session has no platform account")
+		if len(s.cfg.PlatformAdminUsernames) == 0 && currentAdminSession(c) == nil {
+			problem(c, 403, "PLATFORM_ADMIN_NOT_CONFIGURED", "PLATFORM_ADMIN_USERNAMES is empty, so the automation channel cannot use platform routes")
 			c.Abort()
 			return
 		}

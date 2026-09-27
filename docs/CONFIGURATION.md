@@ -14,7 +14,7 @@ rn-server config
 
 机密与这台机器的拓扑。有默认值的不写，能从库里推导的不填，按租户变化的进租户配置。
 
-写一行等于默认值的配置，代价不是磁盘，是**以后没人能一眼看出哪些是特意设成这样的**。amos 上这份文件曾经有 61 行，其中 24 行复述默认值、7 行是空的或代码从不读取的；真正承载信息的不到 30 行。收缩之后是 18 行（见 §7）。
+写一行等于默认值的配置，代价不是磁盘，是**以后没人能一眼看出哪些是特意设成这样的**。amos 上这份文件曾经有 61 行，其中 24 行复述默认值、7 行是空的或代码从不读取的；真正承载信息的不到 30 行。收缩之后是 18 行，2026-09-27 删掉环境变量管理员账号之后是 15 行（见 §7）。
 
 按"这个值由什么决定"分，51 个键落在五类里，只有前三类真的属于 .env：
 
@@ -32,7 +32,6 @@ rn-server config
 |---|---|
 | `MYSQL_DSN` | 数据库连接，见 §3。生产不配拒绝启动；开发不配用本地默认 |
 | `STORAGE_MASTER_KEY` | 32 字节随机值的 Base64。库里所有敏感配置都用它封：对象存储凭据、OTA 签名私钥、推送服务账号、签名密钥外层、扫链端点。**换掉它 = 那些配置全部解不开**。生产必填 |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD_HASH` | 管理端的口令登录，过渡期保留：控制台账号只走统一登录，外部系统写好第一条平台管理员记录并验收后删掉（设计 `console-accounts-external-maintenance-2026-09-27.md` §7）。哈希用 `POST /v1/admin/platform/password-hash` 生成，明文不进仓库和日志。生产必填 |
 | `APP_ENV` | `development`（默认）/ `test` / `production`。生产会额外强制上面几项；`test` 会给库名加 `_test` 后缀 |
 
 生产环境额外拒绝的：`CORS_ORIGINS` 显式写 `*`（见 §4）。
@@ -117,7 +116,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `BIND_ADDRESS` | 空（所有网卡） | 裸机部署**要显式填 `127.0.0.1`**，否则应用端口会绕过反向代理直接对外，TLS 和它上面的一切都白设。Docker 部署靠端口映射兜底 |
 | `PORT` | `3000` | |
 | `TRUSTED_PROXIES` | 空 | 允许设置 `X-Forwarded-For` 的上跳。**空 = 谁都不信**，`ClientIP` 取直连对端。不填时 `ADMIN_API_ALLOWED_IPS` 只是摆设（安全评审 N17） |
-| `PLATFORM_ADMIN_USERNAMES` | 空 | 没有账号的会话（`ADMIN_USERNAME`、`ADMIN_API_ACTOR`）里，哪些能进平台级页面（扫链管理、打包机与签名闸、平台推送默认），逗号分隔。**空 = 这些会话进不了平台路由**。平台管理员账号不看这个列表，看 `tenant_admin_accounts`（`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`） |
+| `PLATFORM_ADMIN_USERNAMES` | 空 | 自动化通道里哪些 actor（`ADMIN_API_ACTOR`）能进平台级接口（扫链管理、打包机与签名闸、平台推送默认、发 OTA 的脚本），逗号分隔。**空 = 自动化通道进不了平台路由**。控制台账号是不是平台管理员看 `tenant_admin_accounts`（`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`），不看这个列表 |
 | `CORS_ORIGINS` | 开发 `*`，生产空 | **额外**放行的来源。租户自己的域名由 `tenant_domain` 表推导（见 `originAllowed`），通常不需要写。生产显式写 `*` 会拒绝启动 |
 | `HTTP_READ_TIMEOUT_SECONDS` | `3600` | 大产物上传要靠它，别调小 |
 | `HTTP_WRITE_TIMEOUT_SECONDS` | `3600` | |
@@ -131,8 +130,6 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | `ADMIN_API_ALLOWED_IPS` | 空 | 限制该通道的来源（CIDR 或裸 IP）。空 = 不限制。要它生效必须先配 `TRUSTED_PROXIES` |
 | `ADMIN_SESSION_TTL_SECONDS` | `28800` | 最小 300 |
 | `ADMIN_COOKIE_SECURE` | `true` | 会话 cookie 只走 TLS。本地用 http 调管理端才关掉 |
-| `ADMIN_LOGIN_MAX_ATTEMPTS` | `5` | 最小 3 |
-| `ADMIN_LOGIN_WINDOW_SECONDS` | `900` | 最小 60 |
 
 ### 4.3 打包与产物
 
@@ -214,14 +211,12 @@ DSN 的口令打码走结构体复制而不是字符串正则：口令里可以�
 
 ## 7. 一份真实的生产配置
 
-amos 上 `/etc/rn-foundation.env` 的全部内容（值已抹去），**18 行**：
+amos 上 `/etc/rn-foundation.env` 的全部内容（值已抹去），**15 行**（2026-09-27 删掉环境变量管理员账号的两行之后）：
 
 ```ini
 # ---- 机密 ----
 STORAGE_MASTER_KEY=
 MYSQL_DSN=user:password@tcp(host:13306)/db?parseTime=true&loc=UTC&charset=utf8mb4&timeout=15s&readTimeout=15s&writeTimeout=15s
-ADMIN_USERNAME=
-ADMIN_PASSWORD_HASH=
 ADMIN_API_KEY=
 
 # ---- 这台机器 ----

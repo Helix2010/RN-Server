@@ -52,7 +52,7 @@
 
 请求依次经过：凭证验证 -> audience/scope -> route permission -> resource ownership -> domain invariant。任一层失败即拒绝。管理 API 与 mobile API 分开 scope 和网络/风控策略。
 
-当前管理端最小门禁通过 `POST /v1/admin/auth/login` 建立服务端可撤销的 HttpOnly 会话；浏览器不得持有共享管理密钥。登录接口必须限流，基于会话的写操作必须校验可信 Origin。`x-admin-key` 仅用于受控自动化兼容，不作为 Web 登录方案。
+管理端只走统一登录（ChainUp 认证中心）：回调之后建立服务端可撤销的 HttpOnly 会话，会话属于 `tenant_admin_accounts` 里由外部系统分配的账号；浏览器不得持有共享管理密钥。基于会话的写操作必须校验可信 Origin，敏感操作要邮箱二次验证。`x-admin-key` 仅用于受控自动化，不作为 Web 登录方案。
 
 - 密码采用当前批准的强哈希参数，验证码有过期、次数和防枚举策略。
 - refresh rotation 检测 token family 重放并撤销会话。

@@ -22,7 +22,7 @@ go run ./cmd/server
 - 多语言资源对象 Key：发布文件按 `localization/{tenantId}/{languageCode}/{version}.json` 存储，租户和语言已由目录表达，文件名只保留版本号。
 - RN-App 正式文案：迁移 8 会重置 `type=14` 为 AnyFun 基座实际使用的 zh-CN/en-US 文案，并清空旧语言资源引用；迁移后需由管理端重新发布语言包。
 - RN-App 文案持续同步：迁移 29 从 RN-App 的 `i18n/seed` 补齐当前完整 UI 文案到全局 `language_document`（现为 748 个 key × 2 种语言），只补缺失记录，不覆盖已有全局内容或租户自定义覆盖；变更 App 内置文案后先在 RN-App 执行 `pnpm i18n:seed`，再在本仓库执行 `node scripts/sync-rn-app-i18n-seed.mjs`。
-- Admin 登录：`POST /v1/admin/auth/login` 创建 HttpOnly 会话；管理 API 默认拒绝未认证请求。`x-admin-key` 仅保留给受控自动化，不再进入 Web 构建。
+- Admin 登录：只走统一登录（`GET /v1/admin/auth/cid/start` → 认证中心 → `/client/v1/oauth/login` 回调）创建 HttpOnly 会话；账号由外部系统写进 `tenant_admin_accounts`，RN 只鉴别（见 `docs/design/console-accounts-external-maintenance-2026-09-27.md`）。管理 API 默认拒绝未认证请求。`x-admin-key` 仅保留给受控自动化，不再进入 Web 构建。
 - 配置：所有环境变量、默认值、必填项和排查办法见 **[配置参考](docs/CONFIGURATION.md)**。数据库是一行 `MYSQL_DSN`（go-sql-driver 标准写法）；`rn-server config` 打印这台机器上**实际生效**的配置并标出每一项来自 env 还是默认值，机密只显示长度。
 - 推送凭据：按租户存在 `app_configs` 的 `push.fcm`（用 `STORAGE_MASTER_KEY` 加密），管理接口 `GET /v1/admin/push/credentials`、`PUT|DELETE /v1/admin/push/credentials/fcm`、`POST /v1/admin/push/credentials/fcm/test`，平台默认走 `/v1/admin/platform/push/credentials/fcm`。保存时会真去 Google 换一次访问令牌，换不到就不保存。它必须和该租户 `google-services.json` 的 `project_info.project_id` 是同一个 Firebase 项目，两边保存时互相校验。见 `docs/decisions/0017-per-tenant-push-credentials.md`。
 - OTA（实验性）：迁移 10 增加租户级 `ota_releases`，基线 APK、Runtime、Channel、Manifest 和资产由 RN-Server/华为 OBS 管理；`/v1/ota/manifest` 实现 Expo Updates v1 基础协议。当前尚未接入 Manifest 签名密钥和客户端公钥验签，生产启用前必须完成签名链路与真机回退验证。

@@ -97,6 +97,9 @@ var migrations = []migration{
 	// 控制台账号改由外部系统写入，RN 只读：去掉登录名、初始口令、绑定与 RN 不再读的列，会话记下登录时的统一账号
 	// （设计 console-accounts-external-maintenance-2026-09-27 §6）
 	{version: 64, name: "external_console_accounts", apply: externalConsoleAccountsMigration},
+	// 删掉环境变量里的管理员账号：会话只剩统一登录一个来源，每个会话都属于一个账号
+	// （设计 console-accounts-external-maintenance-2026-09-27 §10）
+	{version: 65, name: "admin_sessions_account_only", apply: adminSessionsAccountOnlyMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2399,6 +2402,25 @@ func externalConsoleAccountsMigration(ctx context.Context, db *sql.DB) error {
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("external console accounts migration comments: %w", err)
+		}
+	}
+	return nil
+}
+
+// adminSessionsAccountOnlyMigration：环境变量账号（ADMIN_USERNAME）删掉之后，会话只剩统一登录一个来源。
+// 它留下的会话（account_id 为 NULL）连同来路不明的都删掉，account_id 与 idp_subject 改成必填。能重复执行。
+func adminSessionsAccountOnlyMigration(ctx context.Context, db *sql.DB) error {
+	for _, statement := range []string{
+		`DELETE FROM admin_sessions WHERE account_id IS NULL OR idp_subject IS NULL`,
+		`ALTER TABLE admin_sessions
+			MODIFY tenant_id BIGINT UNSIGNED NULL COMMENT '租户会话所属的租户 tenants.id；只在这个租户的域名上有效。NULL=平台会话（平台管理员账号）',
+			MODIFY account_id BIGINT UNSIGNED NOT NULL COMMENT '会话对应的 tenant_admin_accounts.id（租户成员或平台管理员）；鉴权时每次回表查状态与统一认证账号',
+			MODIFY idp_subject VARCHAR(120) NOT NULL COMMENT '登录时账号的统一认证账号 id；每个请求核对账号当前的 idp_subject，对不上（外部系统换了人）就当没登录',
+			MODIFY second_factor_at DATETIME(3) NULL COMMENT '这个会话最近一次通过邮箱二次验证的时间；敏感操作与平台维护的写操作要在 15 分钟内。NULL=还没验过'`,
+		`ALTER TABLE admin_sessions COMMENT='管理端登录会话：统一登录之后落一条，属于 tenant_admin_accounts 里的一个账号'`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("admin sessions account only migration: %w", err)
 		}
 	}
 	return nil

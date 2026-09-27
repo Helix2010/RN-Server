@@ -42,6 +42,27 @@ func activeTenantSession(t *testing.T, db *sql.DB, tenant accountsTestTenant) st
 	return token
 }
 
+// activePlatformSession 在库里直接放一个平台管理员账号（外部系统写的那种）和它的统一登录会话，返回会话令牌、
+// 账号 id 与邮箱。会话记为刚通过邮箱二次验证：平台维护的写操作都要验，这里测的不是它。
+// 平台记录会挡住删发信配置（MAIL_REQUIRED_FOR_SECOND_FACTOR），测试结束连同会话一起删掉。
+func activePlatformSession(t *testing.T, db *sql.DB) (token, accountID, email string) {
+	t.Helper()
+	now := time.Now().UTC()
+	subject := testSubject()
+	email = "platform-" + uniqueSuffix() + "@example.com"
+	accountID = externalAccount(t, db, "", subject, email)
+	t.Cleanup(func() {
+		_, _ = db.Exec(`DELETE FROM admin_sessions WHERE account_id=?`, accountID)
+		_, _ = db.Exec(`DELETE FROM tenant_admin_accounts WHERE id=?`, accountID)
+	})
+	token = randomID(32)
+	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,account_id,idp_subject,expires_at,created_at,second_factor_at) VALUES (?,?,?,?,?,?,?)`,
+		sha256Hex(token), platformActor(accountID), accountID, subject, now.Add(time.Hour), now, now); err != nil {
+		t.Fatalf("insert platform session: %v", err)
+	}
+	return token, accountID, email
+}
+
 // seedPlatformRow 放一行平台级（tenant 0）配置，库里原来就有就沿用、不动它；只删自己放的那一行。
 func seedPlatformRow(t *testing.T, db *sql.DB, key, value string) {
 	t.Helper()
@@ -80,25 +101,16 @@ func TestDBTenantSessionIsolation(t *testing.T) {
 	if err := db.QueryRow(`SELECT slug FROM tenants WHERE id=?`, tenantB.id).Scan(&slugB); err != nil {
 		t.Fatal(err)
 	}
-	platformUser := "platform-iso-" + uniqueSuffix()
-	platformHash, err := hashPassword("Platform-Pass-2026!")
-	if err != nil {
-		t.Fatal(err)
-	}
 	router := New(config.Config{
-		Environment:            "test",
-		StorageMasterKey:       base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
-		MySQLQueryTimeout:      10,
-		AdminUsername:          platformUser,
-		AdminPasswordHash:      platformHash,
-		PlatformAdminUsernames: []string{platformUser},
-		AdminSessionTTL:        3600,
-		AdminLoginMax:          1000,
-		AdminLoginWindow:       900,
+		Environment:       "test",
+		StorageMasterKey:  base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
+		MySQLQueryTimeout: 10,
+		AdminSessionTTL:   3600,
 	}, &store.Store{DB: db})
 	member := &browser{router: router, tenant: tenantA, cookies: map[string]string{adminSessionCookie: activeTenantSession(t, db, tenantA)}}
-	platform := &browser{router: router, tenant: tenantA, cookies: map[string]string{}}
-	platform.mustCode(t, platform.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
+	platformToken, _, _ := activePlatformSession(t, db)
+	platform := &browser{router: router, tenant: tenantA, cookies: map[string]string{adminSessionCookie: platformToken}}
+	platform.mustCode(t, platform.do("GET", "/v1/admin/tenant", nil, nil), 200)
 	member.mustCode(t, member.do("GET", "/v1/admin/tenant", nil, nil), 200)
 
 	sfx := uniqueSuffix()

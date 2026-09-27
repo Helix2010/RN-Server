@@ -16,11 +16,7 @@ import (
 func TestDBSecondFactor(t *testing.T) {
 	db := openTestDB(t)
 	tenant := accountsTestTenantRow(t, db, "sf")
-	platformUser := "platform-sf-" + uniqueSuffix()
-	platformHash, err := hashPassword("Platform-Pass-2026!")
-	if err != nil {
-		t.Fatal(err)
-	}
+	automationKey := "second-factor-test-key-" + uniqueSuffix()
 	// mail.smtp 是平台级的一份，测试库又是持久的：开始前与结束后都清掉
 	clearMail := func() {
 		_, _ = db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, platformTenantID, mailConfigKey)
@@ -31,12 +27,10 @@ func TestDBSecondFactor(t *testing.T) {
 		Environment:            "test",
 		StorageMasterKey:       base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
 		MySQLQueryTimeout:      10,
-		AdminUsername:          platformUser,
-		AdminPasswordHash:      platformHash,
-		PlatformAdminUsernames: []string{platformUser},
+		AdminAPIKey:            automationKey,
+		AdminAPIActor:          "automation@test",
+		PlatformAdminUsernames: []string{"automation@test"},
 		AdminSessionTTL:        3600,
-		AdminLoginMax:          1000,
-		AdminLoginWindow:       900,
 	}, &store.Store{DB: db})
 	smtpServer := startTestSMTP(t)
 	memberToken := activeTenantSession(t, db, tenant)
@@ -50,8 +44,8 @@ func TestDBSecondFactor(t *testing.T) {
 		t.Fatal(err)
 	}
 	member := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: memberToken}}
-	platform := &browser{router: router, tenant: tenant, cookies: map[string]string{}}
-	platform.mustCode(t, platform.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
+	// 自动化通道（管理密钥）：没有会话、没有邮箱，不做二次验证；这里也用它配发信
+	platform := &browser{router: router, tenant: tenant, cookies: map[string]string{}, headers: map[string]string{"x-admin-key": automationKey}}
 	sfx := uniqueSuffix()
 	identity := func(bundle string, version any) map[string]any {
 		return map[string]any{"appleTeamId": "SF" + strings.ToUpper(sfx + "00000000")[:8], "bundleId": bundle, "expectedVersion": version, "reason": "改 iOS 身份", "confirm": true}
@@ -63,7 +57,7 @@ func TestDBSecondFactor(t *testing.T) {
 	if view := member.mustCode(t, member.do("GET", "/v1/admin/auth/session", nil, nil), 200); view["secondFactorUntil"] != nil {
 		t.Fatalf("session = %v", view)
 	}
-	// 环境变量账号（没有账号的平台会话）不用二次验证
+	// 自动化通道不用二次验证
 	platform.mustCode(t, platform.do("PUT", "/v1/admin/release-identity/ios", identity("com.sf.p"+sfx, 0), nil), 200)
 	wantProblem(t, platform.do("POST", "/v1/admin/auth/second-factor/code", map[string]any{}, nil), 400, "SECOND_FACTOR_NOT_APPLICABLE")
 
@@ -84,17 +78,9 @@ func TestDBSecondFactor(t *testing.T) {
 	seedTenantConfig(t, db, tenant.id, "mobile-bootstrap", string(seed))
 	wantProblem(t, member.do("PATCH", "/v1/admin/app-config", appConfig("attackerproject00000"), nil), 403, "SECOND_FACTOR_REQUIRED")
 	member.mustCode(t, member.do("PATCH", "/v1/admin/app-config", appConfig("sfproject0000000"+sfx), nil), 200)
-	// 平台管理员账号也是账号会话：改钱包段同样要二次验证（环境变量账号不用）。平台记录会挡住删发信配置，用完就删
-	adminSubject := testSubject()
-	adminID := externalAccount(t, db, "", adminSubject, "sf-admin-"+sfx+"@example.com")
-	t.Cleanup(func() {
-		_, _ = db.Exec(`DELETE FROM admin_sessions WHERE account_id=?`, adminID)
-		_, _ = db.Exec(`DELETE FROM tenant_admin_accounts WHERE id=?`, adminID)
-	})
-	adminToken := randomID(32)
-	now := time.Now().UTC()
-	if _, err := db.Exec(`INSERT INTO admin_sessions (token_hash,actor_id,account_id,idp_subject,expires_at,created_at) VALUES (?,?,?,?,?,?)`,
-		sha256Hex(adminToken), platformActor(adminID), adminID, adminSubject, now.Add(time.Hour), now); err != nil {
+	// 平台管理员账号的会话：改钱包段同样要二次验证（自动化通道不用）
+	adminToken, _, _ := activePlatformSession(t, db)
+	if _, err := db.Exec(`UPDATE admin_sessions SET second_factor_at=NULL WHERE token_hash=?`, sha256Hex(adminToken)); err != nil {
 		t.Fatal(err)
 	}
 	platformAccount := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: adminToken}}
@@ -140,7 +126,7 @@ func TestDBSecondFactor(t *testing.T) {
 		t.Fatalf("session after verify = %v", view)
 	}
 
-	// 验过之后敏感操作放行（平台会话刚改过一版，按当前版本提交）
+	// 验过之后敏感操作放行（自动化通道刚改过一版，按当前版本提交）
 	current := member.mustCode(t, member.do("GET", "/v1/admin/release-identity/ios", nil, nil), 200)
 	member.mustCode(t, member.do("PUT", "/v1/admin/release-identity/ios", identity("com.sf.a"+sfx, current["version"]), nil), 200)
 
