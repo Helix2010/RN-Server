@@ -449,6 +449,7 @@ runner 的任务说明里加 `TenantID`。
 ```
 
 - 每个 (租户, Team) 一项，最多 64 项；`problems` 最多 8 条，每条最多 300 字。
+- `problems` 每条以 `<kind>: ` 开头（`certificate: ` / `profile: ` / `upload-key: `），控制台按种类归到对应那一格。
 - `certificateReady`：本机索引里这个 (租户, Team) 的 SHA-1 出现在签名钥匙串 `find-identity -v -p codesigning` 的结果里。
 - `bundleIds`：只列核对通过、没过期的描述文件。
 - `uploadProbe` 的取值同 `appleTeams`：`ok` / `forbidden` / `error` / `missing` / 空（这台机器没开上传）。
@@ -488,6 +489,48 @@ runner 的任务说明里加 `TenantID`。
   - `POST /v1/admin/platform/ios-material/remove` 要带 `tenantId`（`"0"` 表示旧的按 Team 的行），审计记在那个租户名下；
   - 总览与按租户总览改读按租户的行。
 - 切到自助上传：无条件删本租户的上传 Key 行；`iosKeysToRevokeFor` 按租户查。
+- 接口形状（控制台按这个写）：
+
+  ```jsonc
+  // GET /v1/admin/ios/material
+  {
+    "tenantId": "1000000001",
+    "identity": {"teamId": "J4JDFC8LCC", "bundleId": "win.anyfun.app"},   // 没配 release.ios 时为 null
+    "delivery": "testflight",                                             // 或 "ipa"
+    "recipients": {"builder": {"publicKey": "…", "sha256": "…"}, "uploader": null},
+    "items": [{"kind": "certificate", "teamId": "…", "scope": "", "version": 1759000000000,
+               "uploadedBy": "…", "uploadedAt": "RFC3339", "legacy": false, "stale": false}],
+    "requirements": [
+      // 固定三项，顺序 certificate、profile、upload-key
+      // need：required | rejected（自助上传时的上传 Key）
+      // status：ok（至少一台 Mac 就绪）| pending（已交、还没有 Mac 就绪）| failed（有 Mac 报了这一类的问题）
+      //       | missing | stale（加密给了旧公钥）| unexpected（不该有却有）| not-needed
+      {"kind": "certificate", "need": "required", "status": "ok", "item": {"kind": "certificate", "…": "…"},
+       "problems": ["Mac 报的原因，已去掉 kind 前缀、去重，最多 5 条"]}
+    ],
+    "machines": {"total": 2, "ready": 1},   // 只给数目，不给机器 id 与名字
+    "removals": [{"kind": "profile", "teamId": "…", "scope": "…", "reason": "…", "at": "RFC3339"}]
+  }
+  ```
+
+  - 其中 `machines.ready` 指本租户证书、描述文件都就绪的 iOS 打包机台数。
+  - `removals` 是最近 5 条平台紧急删除，不带操作人。
+  - `POST /v1/admin/ios/material` 成功回 `{"kind","teamId","scope","version","uploadedAt"}`，错误码：
+
+    | 状态码 | 错误码 |
+    | --- | --- |
+    | 400 | `INVALID_IOS_MATERIAL`、`IOS_MATERIAL_VERSION_UNSUPPORTED`（v1） |
+    | 403 | `IOS_MATERIAL_TENANT_MISMATCH` |
+    | 409 | `IOS_IDENTITY_REQUIRED`、`IOS_MATERIAL_TEAM_MISMATCH`、`IOS_MATERIAL_BUNDLE_MISMATCH`、`IOS_DELIVERY_SELF_UPLOAD`、`IOS_MATERIAL_RECIPIENT_NOT_REGISTERED`、`IOS_MATERIAL_RECIPIENT_UNKNOWN` |
+    | 429 | `IOS_MATERIAL_RATE_LIMITED` |
+
+  - `POST /v1/admin/ios/material/remove` 成功回 `{"removed":true}`；找不到 404 `IOS_MATERIAL_NOT_FOUND`，版本变了 409 `STALE_IOS_MATERIAL`。
+  - 平台 `GET /platform/ios-material`：每项加 `tenantId`、`tenantSlug`（旧行是 `"0"` 与 `""`）、`legacy`。
+  - 平台 `GET /platform/ios-material/tenants`：
+    - 每个租户的视图加 `tenantId`，三格按这个租户的行取；
+    - 机器「装没装上」按租户算；
+    - `orphans` 每项加 `tenantId`、`tenantSlug`、`legacy`，包括 `tenant_id=0` 的旧行，以及 Team / bundle 已经和租户当前配置对不上的行。
+  - 平台删除的请求体加 `tenantId`。
 - 认领响应加 `tenantId`。排队判据、平台页的「装没装上」都按租户算（报了 `tenantMaterial` 的机器按租户对，旧机器按 Team 对）。
 
 ### 12.5 Mac（阶段 2）
@@ -530,8 +573,10 @@ runner 的任务说明里加 `TenantID`。
   - `--profiles-dir`：在 `P/<TEAM>/` 下找描述文件，不给时是 `D/profiles`；
   - `--signing-certificate`：40 位十六进制，写进 pbxproj 的 `CODE_SIGN_IDENTITY`，并在导出选项里加 `signingCertificate`；不给时照旧用 `Apple Distribution`；
   - 两个新参数的值都不能被当成租户位置参数。
-- release 构建给 `expo-notifications` 传 `mode: "production"`。
 - 提交由用户签名。
+- 第 8 节阶段 3 里「release 构建给 `expo-notifications` 传 `mode: "production"`」挪到推送那一轮：
+  - 它改的是 expo 配置，而原生指纹把整份 expo 配置算进去，要先确认 Android 的指纹不受影响；
+  - 还要先在真机上确认导出时 `aps-environment` 会不会被描述文件替换（§5.2）。
 
 ### 12.7 控制台（阶段 5）
 
