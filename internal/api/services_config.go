@@ -178,6 +178,13 @@ func parseServicesSection(raw any) (map[string]any, error) {
 	return out, nil
 }
 
+// sameJSON 按 JSON 比较两份归一化后的配置（json.Marshal 对 map 的键排序，结果确定）。
+func sameJSON(a, b any) bool {
+	left, errA := json.Marshal(a)
+	right, errB := json.Marshal(b)
+	return errA == nil && errB == nil && string(left) == string(right)
+}
+
 // storedServicesSection 取库里已有的 services 段：PATCH 不带这一段时沿用，同 wallet。
 func storedServicesSection(stored []byte) map[string]any {
 	var current map[string]any

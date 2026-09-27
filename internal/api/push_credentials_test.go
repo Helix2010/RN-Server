@@ -148,7 +148,7 @@ func TestDBTenantInheritsThePlatformCredential(t *testing.T) {
 	putFCM(t, s, pushcreds.PlatformTenant, fcmServiceAccount("anyfun"), 0, http.StatusOK)
 	defer s.db.Exec(`DELETE FROM app_configs WHERE tenant_id=? AND config_key=?`, pushcreds.PlatformTenant, pushcreds.FCMConfigKey)
 
-	view, err := s.pushCredentialsView(context.Background(), tenant)
+	view, err := s.pushCredentialsView(context.Background(), tenant, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestDBTenantInheritsThePlatformCredential(t *testing.T) {
 	}
 
 	seedGoogleServices(t, s, tenant, "anyfun", "com.anyfun.foundation")
-	view, _ = s.pushCredentialsView(context.Background(), tenant)
+	view, _ = s.pushCredentialsView(context.Background(), tenant, true)
 	fcm, _ = view["fcm"].(gin.H)
 	if fcm["projectMatches"] != true {
 		t.Fatalf("两边同项目时应当为 true：%#v", fcm)
@@ -180,7 +180,7 @@ func TestDBPushCredentialViewNeverReturnsThePrivateKey(t *testing.T) {
 	seedGoogleServices(t, s, tenant, "anyfun", "com.anyfun.foundation")
 	putFCM(t, s, tenant, fcmServiceAccount("anyfun"), 0, http.StatusOK)
 
-	view, err := s.pushCredentialsView(context.Background(), tenant)
+	view, err := s.pushCredentialsView(context.Background(), tenant, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestDBCredentialRejectedByGoogleIsNotSaved(t *testing.T) {
 	tenant := testTenant(66)
 	putFCM(t, s, tenant, fcmServiceAccount("anyfun"), 0, http.StatusFailedDependency)
 
-	view, err := s.pushCredentialsView(context.Background(), tenant)
+	view, err := s.pushCredentialsView(context.Background(), tenant, true)
 	if err != nil {
 		t.Fatal(err)
 	}

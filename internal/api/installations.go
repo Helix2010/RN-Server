@@ -188,6 +188,7 @@ func (s *server) revokeInstallation(c *gin.Context) {
 		problem(c, 500, "INSTALLATION_REVOKE_FAILED", "Installation revoked but its sessions could not be ended")
 		return
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "installation_revoke", "installation", installationID, body.Reason, requestID(c), map[string]any{}))
 	c.JSON(http.StatusOK, gin.H{"revoked": true, "installationId": installationID, "revokedAt": iso(now)})
 }
 

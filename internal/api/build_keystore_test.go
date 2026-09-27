@@ -199,7 +199,7 @@ func TestDBSignerReadinessExplainsEachGap(t *testing.T) {
 	seen := map[string]bool{}
 	readiness := func() signerReadiness {
 		t.Helper()
-		r, err := f.s.signerReadinessFor(t.Context(), f.tenant)
+		r, err := f.s.signerReadinessFor(t.Context(), f.tenant, true)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -511,6 +511,8 @@ func (s *server) uploadBrandingAsset(c *gin.Context) {
 		problem(c, http.StatusFailedDependency, "BRANDING_UPLOAD_FAILED", "Unable to store branding asset")
 		return
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "branding_asset_upload", "branding-asset", v.ID, "上传品牌素材", requestID(c),
+		map[string]any{"objectKey": v.ObjectKey, "fileName": v.FileName, "contentType": v.ContentType, "size": size}))
 	c.JSON(200, gin.H{"asset": gin.H{"id": v.ID, "token": brandingTokenFromRequest(c), "objectKey": v.ObjectKey, "fileName": v.FileName, "contentType": v.ContentType, "size": size}})
 }
 
@@ -523,6 +525,8 @@ func (s *server) deleteBrandingAsset(c *gin.Context) {
 	if client, _, e := s.storageClientForTenant(c.Request.Context(), tenantID(c)); e == nil {
 		_ = client.Delete(c.Request.Context(), v.ObjectKey)
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "branding_asset_delete", "branding-asset", v.ID, "删除品牌素材", requestID(c),
+		map[string]any{"objectKey": v.ObjectKey, "fileName": v.FileName}))
 	c.JSON(200, gin.H{"deleted": true})
 }
 

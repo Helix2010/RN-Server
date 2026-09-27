@@ -263,7 +263,7 @@ func boxFor(upload keystorebox.Upload, recipient string) (keystorebox.Box, bool)
 
 func (s *server) getBuildKeystore(c *gin.Context) {
 	ctx := c.Request.Context()
-	view, err := s.buildKeystoreView(ctx, tenantID(c))
+	view, err := s.buildKeystoreView(ctx, tenantID(c), isPlatformSession(c))
 	if err != nil {
 		slog.Error("cannot compose the build keystore view", "tenant", tenantID(c), "error", err)
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "Stored build.keystore configuration cannot be read")
@@ -273,9 +273,10 @@ func (s *server) getBuildKeystore(c *gin.Context) {
 }
 
 // buildKeystoreView 是 GET 与 PUT 共用的视图（约定 5.4）。收件人、签名闸、确认状态都是公开值，
-// 租户管理员也看得到：没有它们，租户不知道自己的密钥卡在哪一步。
-func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, error) {
-	readiness, err := s.signerReadinessFor(ctx, tenant)
+// 租户管理员也看得到：没有它们，租户不知道自己的密钥卡在哪一步。但签名闸叫什么是平台的事：
+// showMachineNames=false（租户会话）时名称一律换成角色（设计 tenant-console-accounts-and-sso §3.4）。
+func (s *server) buildKeystoreView(ctx context.Context, tenant string, showMachineNames bool) (gin.H, error) {
+	readiness, err := s.signerReadinessFor(ctx, tenant, showMachineNames)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +359,34 @@ func (s *server) buildKeystoreView(ctx context.Context, tenant string) (gin.H, e
 		signers = append(signers, entry)
 	}
 	view["missingSigners"], view["signers"] = missing, signers
+	if !showMachineNames {
+		anonymizeSigners(view)
+	}
 	return view, nil
+}
+
+// anonymizeSigners 把视图里的签名闸名称换成角色。机器 id 是不透明的登记号，留着给界面对行。
+func anonymizeSigners(view gin.H) {
+	label := func(role any) string {
+		switch role {
+		case string(signerRolePrimary):
+			return "主签名闸"
+		case string(signerRoleStandby):
+			return "备签名闸"
+		}
+		return "签名闸"
+	}
+	for _, key := range []string{"recipients", "missingSigners", "signers"} {
+		items, _ := view[key].([]gin.H)
+		for _, item := range items {
+			if item["name"] != nil {
+				item["name"] = label(item["signerRole"])
+			}
+		}
+	}
+	if generator, ok := view["generator"].(gin.H); ok {
+		generator["name"] = "签名闸"
+	}
 }
 
 // saveBuildKeystoreRequest 是 PUT /v1/admin/build-keystore 的请求体（约定 5.4）。
@@ -533,7 +561,7 @@ func (s *server) saveBuildKeystore(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_SAVE_FAILED", "Unable to save the keystore")
 		return
 	}
-	view, err := s.buildKeystoreView(ctx, tenantID(c))
+	view, err := s.buildKeystoreView(ctx, tenantID(c), isPlatformSession(c))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_KEYSTORE_CONFIG_INVALID", "The keystore was saved but cannot be read back")
 		return

@@ -199,6 +199,25 @@ func buildJobViewWithMachines(j buildJob, machineNames map[string]string) map[st
 	}
 }
 
+// jobViewFor 是给控制台的任务视图。构建机、签名闸是平台的基础设施：租户会话只看得到「领取了、在签名」
+// （claimedAt、signingClaimedAt 还在），看不到是哪一台（设计 tenant-console-accounts-and-sso §3.4）。
+func (s *server) jobViewFor(c *gin.Context, j buildJob, machineNames map[string]string) map[string]any {
+	view := buildJobViewWithMachines(j, machineNames)
+	if !isPlatformSession(c) {
+		redactMachinesForTenant(view)
+	}
+	return view
+}
+
+func redactMachinesForTenant(view map[string]any) {
+	for _, key := range []string{"claimedBy", "claimedMachineId", "signingMachineId", "signingMachineName"} {
+		view[key] = nil
+	}
+	if outcome, ok := view["signOutcome"].(gin.H); ok {
+		outcome["machineId"] = nil
+	}
+}
+
 // withIPASupersession 用这个租户最高的成功 iOS build 号重算列表里每一行的 ipaDelivery。
 func withIPASupersession(items []map[string]any, jobs []buildJob, latest int) {
 	for i, job := range jobs {
@@ -525,7 +544,7 @@ func (s *server) createBuildJob(c *gin.Context) {
 	// 排进去的任务会永远等不到签名闸。租户改了 apiBaseUrl 或 OTA 密钥之后，在主签名闸
 	// 重新确认之前这里同样挡住。
 	if platform == "android" {
-		readiness, err := s.signerReadinessFor(c.Request.Context(), tenantID(c))
+		readiness, err := s.signerReadinessFor(c.Request.Context(), tenantID(c), isPlatformSession(c))
 		if err != nil {
 			problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to check whether the primary signer is ready")
 			return
@@ -623,7 +642,7 @@ func (s *server) listBuildJobs(c *gin.Context) {
 	names := s.machineNamesForView(c.Request.Context())
 	items := make([]map[string]any, 0, len(jobs))
 	for _, job := range jobs {
-		items = append(items, buildJobViewWithMachines(job, names))
+		items = append(items, s.jobViewFor(c, job, names))
 	}
 	latest, err := s.iosLatestBuildNumber(c.Request.Context(), tenantID(c))
 	if err != nil {
@@ -658,10 +677,12 @@ const buildJobListMaxLimit = 100
 
 type buildJobListFilter struct {
 	kind, platform, status, version, query string
-	limit                                  int
-	cursorAt                               time.Time
-	cursorID                               string
-	hasCursor                              bool
+	// machineSearch：q 也按构建机名称与机器 id 搜。只给平台会话——租户看不到机器，也不该能拿搜索去试出机器名
+	machineSearch bool
+	limit         int
+	cursorAt      time.Time
+	cursorID      string
+	hasCursor     bool
 }
 
 func parseBuildJobListFilter(c *gin.Context) (buildJobListFilter, string) {
@@ -672,6 +693,8 @@ func parseBuildJobListFilter(c *gin.Context) (buildJobListFilter, string) {
 		version:  strings.TrimSpace(c.Query("version")),
 		query:    strings.TrimSpace(c.Query("q")),
 		limit:    20,
+		// 平台会话才按机器搜
+		machineSearch: isPlatformSession(c),
 	}
 	if f.kind != "" && f.kind != "apk" && f.kind != "ota" {
 		return f, "kind must be apk or ota"
@@ -743,9 +766,14 @@ func (f buildJobListFilter) where(tenant string) (string, []any) {
 	}
 	if f.query != "" {
 		pattern := "%" + f.query + "%"
-		// claimed_by 是构建机名称，两个 *_machine_id 是登记 id：按哪一个搜都要搜得到
-		clauses = append(clauses, "(id LIKE ? OR version LIKE ? OR git_ref LIKE ? OR commit_sha LIKE ? OR claimed_by LIKE ? OR claimed_machine_id LIKE ? OR signing_machine_id LIKE ?)")
-		args = append(args, pattern, pattern, pattern, pattern, pattern, pattern, pattern)
+		if f.machineSearch {
+			// claimed_by 是构建机名称，两个 *_machine_id 是登记 id：按哪一个搜都要搜得到
+			clauses = append(clauses, "(id LIKE ? OR version LIKE ? OR git_ref LIKE ? OR commit_sha LIKE ? OR claimed_by LIKE ? OR claimed_machine_id LIKE ? OR signing_machine_id LIKE ?)")
+			args = append(args, pattern, pattern, pattern, pattern, pattern, pattern, pattern)
+		} else {
+			clauses = append(clauses, "(id LIKE ? OR version LIKE ? OR git_ref LIKE ? OR commit_sha LIKE ?)")
+			args = append(args, pattern, pattern, pattern, pattern)
+		}
 	}
 	return strings.Join(clauses, " AND "), args
 }
@@ -755,7 +783,7 @@ func (s *server) buildJobDetail(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	view := buildJobViewWithMachines(job, s.machineNamesForView(c.Request.Context()))
+	view := s.jobViewFor(c, job, s.machineNamesForView(c.Request.Context()))
 	if jobDelivery(job) == iosDeliveryIPA {
 		latest, err := s.iosLatestBuildNumber(c.Request.Context(), tenantID(c))
 		if err != nil {
@@ -842,7 +870,7 @@ func (s *server) cancelBuildJob(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	c.JSON(http.StatusOK, buildJobViewWithMachines(job, s.machineNamesForView(ctx)))
+	c.JSON(http.StatusOK, s.jobViewFor(c, job, s.machineNamesForView(ctx)))
 }
 
 // forceFailBuildJob 放弃一条卡在「签名中」的任务（设计「机器挂了怎么办」最后一行）。
@@ -885,7 +913,7 @@ func (s *server) forceFailBuildJob(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	c.JSON(http.StatusOK, buildJobViewWithMachines(job, s.machineNamesForView(ctx)))
+	c.JSON(http.StatusOK, s.jobViewFor(c, job, s.machineNamesForView(ctx)))
 }
 
 func isHex(value string, min, max int) bool {

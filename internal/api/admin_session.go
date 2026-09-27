@@ -45,6 +45,10 @@ type adminSession struct {
 
 func (a *adminSession) tenantScoped() bool { return a != nil && a.TenantID != "" }
 
+// isPlatformSession：平台会话（ADMIN_USERNAME、管理密钥）看得到平台的基础设施与别的租户；租户会话
+// 只看自己租户的东西（设计 tenant-console-accounts-and-sso §3.4）。
+func isPlatformSession(c *gin.Context) bool { return !currentAdminSession(c).tenantScoped() }
+
 // tenantActor 是租户账号在审计里的 actor。带冒号，与 ADMIN_USERNAME 的取值空间分开。
 func tenantActor(tenant, account string) string { return "tenant:" + tenant + ":" + account }
 

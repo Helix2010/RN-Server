@@ -43,7 +43,7 @@ func (s *server) verify(ctx context.Context, account pushcreds.ServiceAccount) e
 }
 
 func (s *server) getPushCredentials(c *gin.Context) {
-	view, err := s.pushCredentialsView(c.Request.Context(), tenantID(c))
+	view, err := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIALS_QUERY_FAILED", "Unable to load push credentials")
 		return
@@ -170,7 +170,7 @@ func (s *server) writePushFCM(c *gin.Context, tenant string) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIAL_SAVE_FAILED", "Unable to save push credentials")
 		return
 	}
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c))
+	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
 	c.JSON(http.StatusOK, view)
 }
 
@@ -222,7 +222,7 @@ func (s *server) removePushFCM(c *gin.Context, tenant string) {
 	}
 	// 删完之后生效的是哪一个项目，要在响应里说清楚——租户那一层删掉会回落到
 	// 平台默认，那通常不是"推送关掉了"的意思。
-	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c))
+	view, _ := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
 	view["inheritorsAffected"] = inheritors
 	c.JSON(http.StatusOK, view)
 }
@@ -255,15 +255,22 @@ func (s *server) testPushCredentialsFCM(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIALS_QUERY_FAILED", "Unable to load push credentials")
 		return
 	}
+	// 继承来的是平台那一行：测试会改写它的 verifiedAt，由平台管理员来测（设计 tenant-console-accounts-and-sso §3.4）
+	if record.Inherited(tenantID(c)) && !isPlatformSession(c) {
+		pushCredentialsInherited(c)
+		return
+	}
 	account, err := record.ServiceAccount(s.secrets)
 	if err != nil {
 		problem(c, http.StatusServiceUnavailable, "FCM_CREDENTIAL_UNREADABLE", "已保存的服务账号解不开："+err.Error())
 		return
 	}
 	if err := s.verify(c.Request.Context(), account); err != nil {
+		s.auditPushCredentialTest(c, "fcm", record.Inherited(tenantID(c)), "FCM_CREDENTIAL_REJECTED")
 		problem(c, http.StatusFailedDependency, "FCM_CREDENTIAL_REJECTED", err.Error())
 		return
 	}
+	s.auditPushCredentialTest(c, "fcm", record.Inherited(tenantID(c)), "")
 	// 验过就刷一下 verifiedAt：界面上"上次验证于"是这条链路唯一的活性证据
 	now := time.Now().UTC()
 	record.Value.VerifiedAt = &now
@@ -276,11 +283,34 @@ func (s *server) testPushCredentialsFCM(c *gin.Context) {
 		"inherited": record.Inherited(tenantID(c)), "checkedAt": iso(now)})
 }
 
+// pushCredentialsInherited：租户会话不能测平台默认那一行。
+func pushCredentialsInherited(c *gin.Context) {
+	problem(c, http.StatusForbidden, "PUSH_CREDENTIALS_INHERITED",
+		"这个租户用的是平台默认的推送凭据，由平台管理员维护与测试；要自己测，先给本租户单独配一份")
+}
+
+// auditPushCredentialTest 记一次推送凭据测试（原来不记，测试又会改写 verifiedAt）。problemCode 空 = 通过。
+func (s *server) auditPushCredentialTest(c *gin.Context, provider string, inherited bool, problemCode string) {
+	s.auditNow(newAudit(tenantID(c), actor(c), "push_credentials_test", "push-credentials", provider, "测试推送凭据", requestID(c),
+		map[string]any{"provider": provider, "inherited": inherited, "ok": problemCode == "", "problem": nullableString(problemCode)}))
+}
+
+// hidePlatformPushRow：租户会话看继承来的平台那一行时，不给平台的服务账号、密钥提示与修改人
+// （设计 tenant-console-accounts-and-sso §3.4）。项目 id、Team 留着：租户要拿它对自己的 google-services.json、bundle id。
+func hidePlatformPushRow(view gin.H, keys ...string) {
+	if view["inherited"] != true {
+		return
+	}
+	for _, key := range append([]string{"sourceTenant", "updatedBy", "updatedAt"}, keys...) {
+		delete(view, key)
+	}
+}
+
 // pushCredentialsView 是三个 provider 的一次性视图。
 //
 // FCM 那一段额外带上 google-services.json 的项目与匹配结果：控制台不该自己再去
 // 比一次，两处各比一次迟早会得出不同的答案。
-func (s *server) pushCredentialsView(ctx context.Context, tenant string) (gin.H, error) {
+func (s *server) pushCredentialsView(ctx context.Context, tenant string, showPlatformRow bool) (gin.H, error) {
 	fcm := gin.H{"configured": false, "inherited": false, "version": 0}
 	record, err := pushcreds.LoadFCM(ctx, s.db, tenant)
 	switch {
@@ -312,8 +342,13 @@ func (s *server) pushCredentialsView(ctx context.Context, tenant string) (gin.H,
 
 	// HMS 仍不进库：没有租户在用，而它的字段形状和前两家都不同，现在设计等于凭空猜。
 	// 位置先占住，界面上画出来标"未接入"。
+	apns := s.apnsCredentialView(ctx, tenant)
+	if !showPlatformRow {
+		hidePlatformPushRow(fcm, "clientEmail", "privateKeyIdHint")
+		hidePlatformPushRow(apns, "keyIdHint")
+	}
 	return gin.H{"fcm": fcm,
-		"apns": s.apnsCredentialView(ctx, tenant),
+		"apns": apns,
 		"hms":  gin.H{"configured": false, "inherited": false, "version": 0}}, nil
 }
 

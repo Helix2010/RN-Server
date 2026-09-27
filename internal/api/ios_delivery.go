@@ -272,7 +272,13 @@ func iosKeysNames(keys iosKeysToRevoke) string {
 	return strings.Join(names, "与")
 }
 
-func iosSharedTeamWarning(sharedWith []string) string {
+// iosSharedTeamWarning 只对平台会话点名：别的租户的 slug 不给租户看（设计
+// tenant-console-accounts-and-sso §3.4），租户只需要知道「这个 Team 还有别人在用」。
+func iosSharedTeamWarning(sharedWith []string, showNames bool) string {
+	if !showNames {
+		return "同一个 Apple Team 下还有别的租户是「全托管」，这个 Team 的上传 Key 留在平台与打包机上给它们用——" +
+			"不要在 App Store Connect 吊销它，否则它们的构建传不上去。"
+	}
 	shown := sharedWith
 	if len(shown) > 5 {
 		shown = append(append([]string{}, shown[:5]...), fmt.Sprintf("等 %d 个", len(sharedWith)))
@@ -282,7 +288,7 @@ func iosSharedTeamWarning(sharedWith []string) string {
 }
 
 // iosSwitchedToIPAReminder 按这次实际删了、撤了什么来写，不按"应该有什么"写。
-func iosSwitchedToIPAReminder(ascDeleted, uploadKeyWithdrawn bool, sharedWith []string) string {
+func iosSwitchedToIPAReminder(ascDeleted, uploadKeyWithdrawn bool, sharedWith []string, showNames bool) string {
 	reminder := "已切到「自助上传」。"
 	switch {
 	case ascDeleted && uploadKeyWithdrawn:
@@ -296,7 +302,7 @@ func iosSwitchedToIPAReminder(ascDeleted, uploadKeyWithdrawn bool, sharedWith []
 		reminder += "平台删掉副本不等于 Key 作废：请确认已在 App Store Connect 吊销。"
 	}
 	if len(sharedWith) > 0 {
-		reminder += iosSharedTeamWarning(sharedWith)
+		reminder += iosSharedTeamWarning(sharedWith, showNames)
 	}
 	if !ascDeleted && !uploadKeyWithdrawn && len(sharedWith) == 0 {
 		reminder += "平台没有存这个租户能上传的 Key，不用去吊销什么。"
@@ -351,7 +357,13 @@ func (s *server) getIOSDelivery(c *gin.Context) {
 			return
 		}
 	}
-	view["teamSharedWithTestFlightTenants"] = shared
+	// 租户会话只拿布尔值；名单只给平台会话（租户会话拿到空名单，旧控制台照样能解析）
+	view["teamSharedWithOtherTenants"] = len(shared) > 0
+	if isPlatformSession(c) {
+		view["teamSharedWithTestFlightTenants"] = shared
+	} else {
+		view["teamSharedWithTestFlightTenants"] = []string{}
+	}
 	keys, err := iosKeysToRevokeFor(ctx, s.db, tenantID(c), identity, shared)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_DELIVERY_QUERY_FAILED", "Unable to read which keys the platform holds")
@@ -502,7 +514,7 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 			}
 			detail += "。"
 			if len(sharedWith) > 0 {
-				detail += iosSharedTeamWarning(sharedWith)
+				detail += iosSharedTeamWarning(sharedWith, isPlatformSession(c))
 			}
 			problem(c, http.StatusConflict, "IOS_DELIVERY_KEYS_NOT_REVOKED", detail)
 			return
@@ -548,7 +560,8 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 	}
 	event := newAudit(tenantID(c), actor(c), "ios_delivery_update", "app-config", iosDeliveryConfigKey, reason, requestID(c),
 		map[string]any{"from": previous, "to": body.Mode, "ascKeyDeleted": ascDeleted, "uploadKeyWithdrawn": uploadKeyWithdrawn,
-			"teamSharedWith": sharedWith, "keysToRevoke": keys, "acknowledgeKeysRevoked": body.AcknowledgeKeysRevoked})
+			// 租户能读自己的审计（GET /audit-events）：只记个数，不记别的租户是谁
+			"teamSharedWithCount": len(sharedWith), "keysToRevoke": keys, "acknowledgeKeysRevoked": body.AcknowledgeKeysRevoked})
 	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "IOS_DELIVERY_SAVE_FAILED", "Unable to save the delivery mode")
 		return
@@ -557,7 +570,7 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 	view["ascKeyDeleted"] = ascDeleted
 	view["uploadKeyWithdrawn"] = uploadKeyWithdrawn
 	if body.Mode == iosDeliveryIPA {
-		view["reminder"] = iosSwitchedToIPAReminder(ascDeleted, uploadKeyWithdrawn, sharedWith)
+		view["reminder"] = iosSwitchedToIPAReminder(ascDeleted, uploadKeyWithdrawn, sharedWith, isPlatformSession(c))
 	}
 	c.JSON(http.StatusOK, view)
 }

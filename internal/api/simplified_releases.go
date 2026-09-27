@@ -137,6 +137,8 @@ func (s *server) uploadReleaseArtifact(c *gin.Context) {
 		problem(c, http.StatusFailedDependency, "RELEASE_UPLOAD_FAILED", err.Error())
 		return
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "release_artifact_upload", "release-artifact", value.ID, "上传发布产物", requestID(c),
+		map[string]any{"objectKey": value.ObjectKey, "fileName": value.FileName, "size": storedSize}))
 	c.JSON(http.StatusOK, gin.H{"artifact": gin.H{"id": value.ID, "fileSize": storedSize, "objectKey": value.ObjectKey}})
 }
 
@@ -194,6 +196,8 @@ func (s *server) deleteReleaseArtifact(c *gin.Context) {
 	if err == nil {
 		_ = client.Delete(c.Request.Context(), value.ObjectKey)
 	}
+	s.auditNow(newAudit(tenantID(c), actor(c), "release_artifact_delete", "release-artifact", value.ID, "删除发布产物", requestID(c),
+		map[string]any{"objectKey": value.ObjectKey, "fileName": value.FileName}))
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 

@@ -669,7 +669,7 @@ func (s *server) claimForSigning(ctx context.Context, c *gin.Context, job buildJ
 // signingDispatch 判断一条候选任务能不能派给这台签名闸，能的话把响应拼好（认领之前拼，
 // 拼不出来就不认领，不留下一条没人在签的 signing）。
 func (s *server) signingDispatch(ctx context.Context, job buildJob, machine buildMachine, ready map[string]bool) (gin.H, bool) {
-	readiness, err := s.signerReadinessFor(ctx, job.TenantID)
+	readiness, err := s.signerReadinessFor(ctx, job.TenantID, true)
 	if err != nil {
 		slog.Error("cannot evaluate signer readiness for a build to sign", "job", job.ID, "tenant", job.TenantID, "error", err)
 		return nil, false

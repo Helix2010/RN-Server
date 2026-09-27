@@ -351,6 +351,9 @@
           },
           "409": {
             "description": "STALE_APP_CONFIG, IOS_MIN_VERSION_NOT_INSTALLABLE (self-upload iOS tenant: the iOS minimum supported version was raised past the highest build marked installable)"
+          },
+          "403": {
+            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：SERVICES_CONFIG_PLATFORM_ONLY：services.predict 只能原样带回，只有平台管理员能改"
           }
         }
       }
@@ -1141,7 +1144,7 @@
       "get": {
         "responses": {
           "200": {
-            "description": "Masked release storage config"
+            "description": "Masked release storage config 租户会话（tenant-console-accounts-and-sso §3.4）：继承平台存储时只给 inherited、configured、version、provider，不给平台的 endpoint、bucket、前缀、密钥提示与修改人。"
           }
         }
       },
@@ -1157,7 +1160,7 @@
             "description": "STALE_STORAGE_CONFIG"
           },
           "422": {
-            "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint)"
+            "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint); 租户会话（tenant-console-accounts-and-sso §3.4）：STORAGE_CREDENTIALS_REQUIRED：继承平台存储时不带凭据保存会被拒（不能借平台的密钥换成自己的地址）"
           }
         }
       }
@@ -1168,7 +1171,7 @@
         "description": "The bucket CORS rule a `direct` upload deployment would need, with the origins derived from the tenant_domain table so that adding a tenant does not mean editing a config file. Only relevant when ARTIFACT_UPLOAD_MODE=direct, where the browser PUTs straight to object storage and the bucket must allow the console origins itself. Under `proxy` (the default for deployments whose storage key has no bucket-configuration permission) uploads are streamed through the server and the bucket needs no CORS rule at all. The server never writes the rule.",
         "responses": {
           "200": {
-            "description": "The rule to configure on the bucket"
+            "description": "The rule to configure on the bucket 平台会话给全平台租户域名的并集；租户会话只给本租户的域名。"
           }
         }
       }
@@ -2257,6 +2260,9 @@
           },
           "424": {
             "description": "PREDICT_PROBE_FAILED: gamma-api.{domain} unreachable, non-200 or not JSON"
+          },
+          "403": {
+            "description": "PLATFORM_ADMIN_REQUIRED：只给平台会话"
           }
         }
       }
@@ -2852,7 +2858,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version. RELEASE_IDENTITY_KEYSTORE_MISMATCH: the tenant has a v3 signing keystore and packageName/signerSha256 differ from its package name and certificate; the identity can only change together with the keystore (PUT /v1/admin/build-keystore writes both). BUILD_KEYSTORE_RECORD_INVALID: the stored v3 signing keystore record cannot be used (malformed, cannot be unwrapped, or its index fields differ from the uploaded file - readiness problem KEYSTORE_RECORD_INVALID); the identity cannot be changed until the keystore is uploaded again"
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version. RELEASE_IDENTITY_KEYSTORE_MISMATCH: the tenant has a v3 signing keystore and packageName/signerSha256 differ from its package name and certificate; the identity can only change together with the keystore (PUT /v1/admin/build-keystore writes both). BUILD_KEYSTORE_RECORD_INVALID: the stored v3 signing keystore record cannot be used (malformed, cannot be unwrapped, or its index fields differ from the uploaded file - readiness problem KEYSTORE_RECORD_INVALID); the identity cannot be changed until the keystore is uploaded again; ANDROID_PACKAGE_IN_USE：改成的包名别的租户已在用（不说是哪个租户）"
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
@@ -2899,7 +2905,7 @@
             "description": "Admin authentication required"
           },
           "409": {
-            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version"
+            "description": "STALE_RELEASE_IDENTITY: expectedVersion does not match the stored version; IOS_BUNDLE_ID_IN_USE：改成的 bundle id 别的租户已在用（不区分大小写，不说是哪个租户）"
           },
           "500": {
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
@@ -3067,7 +3073,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore"
+            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore 租户会话（tenant-console-accounts-and-sso §3.4）：claimedBy、claimedMachineId、signingMachineId、signingMachineName、signOutcome.machineId 为 null；q 不按机器名与机器 id 搜。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -3115,7 +3121,7 @@
         "description": "Includes the bounded log tail for failure triage.",
         "responses": {
           "200": {
-            "description": "BuildJob"
+            "description": "BuildJob 租户会话（tenant-console-accounts-and-sso §3.4）：机器名称与 id 同列表一样清空。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -3303,6 +3309,9 @@
           },
           "409": {
             "description": "STALE_BUILD_CONFIG or APP_IDENTITY_CHANGE"
+          },
+          "403": {
+            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：REPO_DIRECTORY_PLATFORM_ONLY：repoDirectory 只能原样带回，只有平台管理员能改"
           }
         }
       }
@@ -3313,7 +3322,7 @@
         "description": "Keystore status for this tenant (BuildKeystoreView). Never returns ciphertext. Lists which registered signers the keystore is sealed to, active signers it is missing, each signer's check (decrypt, local confirmation with trust roots digest, trial signing) for the current keystore version, whether the primary signer is ready, and the trust roots the server composed. legacy=true means the stored row is a retired passphrase or build-agent box: it is not usable and must be replaced by a v3 upload. Also carries the latest key generation request, the generator of the current key (null when imported) and which recipients are recovery keys.",
         "responses": {
           "200": {
-            "description": "BuildKeystoreView",
+            "description": "BuildKeystoreView 租户会话（tenant-console-accounts-and-sso §3.4）：签名闸名称换成角色（主签名闸 / 备签名闸 / 签名闸），readinessProblems 不点名机器。",
             "content": {
               "application/json": {
                 "schema": {
@@ -7098,7 +7107,7 @@
         "description": "Fully managed (testflight: the platform uploads to TestFlight with the tenant's upload key) or self-upload (ipa: the platform hands over the App Store-signed .ipa and the tenant uploads it). Also returns what a switch has to look at: whether each mode can be queued right now, unfinished iOS builds (a switch is refused while any exist), whether the platform still stores an App Manager key, and other tenants on the same Apple team that stay fully managed (the team's upload key then remains on the build machines). Design ios-tenant-delivery-tiers-2026-09-24.",
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered"
+            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered 租户会话（tenant-console-accounts-and-sso §3.4）：多一个 teamSharedWithOtherTenants 布尔值；teamSharedWithTestFlightTenants 只给平台会话，租户会话是空数组。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -7156,7 +7165,7 @@
         },
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, uploadKeyWithdrawn, reminder?}"
+            "description": "{mode, configured, version, updatedBy, updatedAt, ascKeyDeleted, uploadKeyWithdrawn, reminder?} 租户会话（tenant-console-accounts-and-sso §3.4）：reminder 与 409 详情里不点名别的租户。"
           },
           "400": {
             "description": "INVALID_IOS_DELIVERY"

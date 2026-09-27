@@ -422,7 +422,8 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
-	group.POST("/predict/probe", s.probePredictService)
+	// 只给平台会话：预测平台的配置归平台管理员（§3.4），而且探测会去连任意 https 地址
+	group.POST("/predict/probe", s.requirePlatformAdmin(), s.probePredictService)
 	group.GET("/branding", s.getBranding)
 	group.PATCH("/branding", s.updateBranding)
 	group.GET("/tokens", s.listTokens)
@@ -1305,6 +1306,12 @@ func (s *server) updateAppConfig(c *gin.Context) {
 		section, err := parseServicesSection(incoming)
 		if err != nil {
 			problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
+			return
+		}
+		// 预测平台的关联（域名、scopeId、链、端点）由平台管理员配（设计 tenant-console-accounts-and-sso §3.4）：
+		// scopeId 指向别的租户，App 里显示的就是别人的市场。租户会话只能原样带回
+		if !isPlatformSession(c) && !sameJSON(section, normalizeServices(storedServicesSection(stored))) {
+			problem(c, http.StatusForbidden, "SERVICES_CONFIG_PLATFORM_ONLY", "Only the platform administrator can change services.predict")
 			return
 		}
 		body.Config["services"] = section
