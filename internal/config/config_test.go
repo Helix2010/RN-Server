@@ -166,8 +166,6 @@ func TestLegacyMySQLKeysAreRefusedWithDirections(t *testing.T) {
 // 生产上不给默认连接：默默连本机 3306 不是一个可接受的猜测。
 func TestProductionRefusesToGuessTheDatabase(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
-	t.Setenv("ADMIN_USERNAME", "admin")
-	t.Setenv("ADMIN_PASSWORD_HASH", "$2a$10$abcdefghijklmnopqrstuv")
 	t.Setenv("STORAGE_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "MYSQL_DSN is required in production") {
@@ -225,8 +223,6 @@ func TestBadNumbersAndBooleansNameTheKeyAndTheValue(t *testing.T) {
 // （见 originAllowed），env 只剩额外放行。但显式写 "*" 仍然不行——那放行所有人。
 func TestProductionAllowsEmptyOriginsButNeverWildcard(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
-	t.Setenv("ADMIN_USERNAME", "admin")
-	t.Setenv("ADMIN_PASSWORD_HASH", "$2a$10$abcdefghijklmnopqrstuv")
 	t.Setenv("STORAGE_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 	t.Setenv("MYSQL_DSN", "app:x@tcp(db:3306)/foundation")
 
@@ -245,17 +241,18 @@ func TestProductionAllowsEmptyOriginsButNeverWildcard(t *testing.T) {
 	}
 }
 
-func TestProductionRequiresLoginAndMasterKey(t *testing.T) {
+// 生产必须有 STORAGE_MASTER_KEY。管理端不再有口令账号（ADMIN_USERNAME 已删），不再要求它；
+// 旧的 env 里还留着那两行也不影响启动（不认识的键不读）。
+func TestProductionRequiresMasterKey(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("MYSQL_DSN", "app:x@tcp(db:3306)/foundation")
+	t.Setenv("ADMIN_USERNAME", "leftover")
 	err := func() error { _, err := Load(); return err }()
-	if err == nil {
-		t.Fatal("expected production validation error")
+	if err == nil || !strings.Contains(err.Error(), "STORAGE_MASTER_KEY") {
+		t.Fatalf("the error must name STORAGE_MASTER_KEY, got: %v", err)
 	}
-	for _, want := range []string{"ADMIN_USERNAME", "STORAGE_MASTER_KEY"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("the error must name %q, got: %v", want, err)
-		}
+	if strings.Contains(err.Error(), "ADMIN_USERNAME") {
+		t.Fatalf("ADMIN_USERNAME is no longer required: %v", err)
 	}
 }
 

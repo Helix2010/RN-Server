@@ -29,18 +29,15 @@ import (
 	"github.com/Helix2010/RN-Server/internal/secretbox"
 	"github.com/Helix2010/RN-Server/internal/store"
 	"github.com/gin-gonic/gin"
-	"golang.org/x/crypto/scrypt"
 	"golang.org/x/mod/semver"
 )
 
 type server struct {
-	cfg      config.Config
-	db       *sql.DB
-	mu       sync.Mutex
-	attempts map[string]attempt
-	objects  objectstore.Factory
-	tenant   *tenantResolver
-	secrets  *secretbox.Box
+	cfg     config.Config
+	db      *sql.DB
+	objects objectstore.Factory
+	tenant  *tenantResolver
+	secrets *secretbox.Box
 	// tokens 只从平台默认端点读代币元数据；测试用假实现替换
 	tokens tokenMetadataReader
 	// verifyFCM 真去 Google 换一次访问令牌。做成字段是因为保存推送凭据这条路
@@ -73,11 +70,6 @@ type server struct {
 	mailTests windowCounter
 	// secondFactorCodes：账号会话的邮箱二次验证码（second_factor.go，进程内存，单实例），零值可用
 	secondFactorCodes emailCodeStore
-}
-
-type attempt struct {
-	Failures int
-	ResetsAt time.Time
 }
 
 type release struct {
@@ -149,7 +141,7 @@ func New(cfg config.Config, storage *store.Store) http.Handler {
 	if err != nil {
 		panic(err)
 	}
-	s := &server{cfg: cfg, db: storage.DB, attempts: map[string]attempt{}, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify, verifyAPNs: pushcreds.VerifyAPNs}
+	s := &server{cfg: cfg, db: storage.DB, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify, verifyAPNs: pushcreds.VerifyAPNs}
 	return s.routes()
 }
 
@@ -216,7 +208,6 @@ func (s *server) routes() *gin.Engine {
 	// （设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。nginx 把控制台域名的这条路径转过来
 	r.GET(cidCallbackPath, s.domainTenantScope(), s.cidCallback)
 	admin := r.Group("/v1/admin")
-	admin.POST("/auth/login", s.login)
 	// 登录页要知道统一登录开没开；免登录
 	admin.GET("/auth/methods", s.authMethods)
 	// 发起统一登录（免登录）
@@ -229,7 +220,7 @@ func (s *server) routes() *gin.Engine {
 	protected.POST("/auth/second-factor/code", s.sendSecondFactorCode)
 	protected.POST("/auth/second-factor/verify", s.verifySecondFactor)
 	// 平台级路由：不按租户过滤，只对平台管理员开放（可用的平台管理员账号，或 PLATFORM_ADMIN_USERNAMES 里的
-	// 环境变量账号 / 自动化 actor）；租户账号的会话一律进不来。平台管理员账号做写操作要 15 分钟内过二次验证
+	// 自动化 actor）；租户账号的会话一律进不来。平台管理员账号做写操作要 15 分钟内过二次验证
 	platform := protected.Group("/platform")
 	platform.Use(s.requirePlatformAdmin(), s.requireSecondFactorOnWrite())
 	// 平台管理员账号的只读列表：账号由外部系统维护（设计 console-accounts-external-maintenance-2026-09-27）
@@ -275,7 +266,6 @@ func (s *server) routes() *gin.Engine {
 	platform.GET("/recovery-keys", s.listRecoveryKeys)
 	platform.POST("/recovery-keys", s.createRecoveryKey)
 	platform.POST("/recovery-keys/:id/revoke", s.revokeRecoveryKey)
-	platform.POST("/password-hash", s.generateAdminPasswordHash)
 	// 平台默认的推送凭据：所有没单独配的租户都继承它，所以改它和删它是平台级动作
 	platform.PUT("/push/credentials/fcm", s.updatePlatformPushCredentialsFCM)
 	platform.DELETE("/push/credentials/fcm", s.deletePlatformPushCredentialsFCM)
@@ -680,27 +670,6 @@ func (s *server) ready(c *gin.Context) {
 func (s *server) docs(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(200, `<!doctype html><html><head><title>RN Foundation API</title></head><body><h1>RN Foundation API</h1><p><a href="/openapi.json">OpenAPI contract</a></p></body></html>`)
-}
-
-func (s *server) rateLimited(ip string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a, ok := s.attempts[ip]
-	if !ok || time.Now().After(a.ResetsAt) {
-		delete(s.attempts, ip)
-		return false
-	}
-	return a.Failures >= s.cfg.AdminLoginMax
-}
-func (s *server) failedLogin(ip string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a := s.attempts[ip]
-	if time.Now().After(a.ResetsAt) {
-		a = attempt{ResetsAt: time.Now().Add(time.Duration(s.cfg.AdminLoginWindow) * time.Second)}
-	}
-	a.Failures++
-	s.attempts[ip] = a
 }
 
 // listReleases GET /v1/admin/releases（设计 admin-list-pagination-2026-09-14 §4.2）。
@@ -2263,25 +2232,6 @@ func constantEqual(a, b string) bool {
 	ah := sha256.Sum256([]byte(a))
 	bh := sha256.Sum256([]byte(b))
 	return subtle.ConstantTimeCompare(ah[:], bh[:]) == 1
-}
-func verifyPassword(password, encoded string) bool {
-	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[0] != "scrypt" {
-		return false
-	}
-	n, e1 := strconv.Atoi(parts[1])
-	r, e2 := strconv.Atoi(parts[2])
-	p, e3 := strconv.Atoi(parts[3])
-	if e1 != nil || e2 != nil || e3 != nil || n < 16384 || n > 32768 || r < 8 || r > 16 || p < 1 || p > 4 {
-		return false
-	}
-	salt, e4 := base64.RawURLEncoding.DecodeString(parts[4])
-	expected, e5 := base64.RawURLEncoding.DecodeString(parts[5])
-	if e4 != nil || e5 != nil {
-		return false
-	}
-	actual, e6 := scrypt.Key([]byte(password), salt, n, r, p, len(expected))
-	return e6 == nil && subtle.ConstantTimeCompare(actual, expected) == 1
 }
 func safeMethod(m string) bool { return m == "GET" || m == "HEAD" || m == "OPTIONS" }
 func iso(t time.Time) string   { return t.UTC().Format("2006-01-02T15:04:05.000Z") }

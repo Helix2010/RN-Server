@@ -53,15 +53,11 @@ func printConfig(cfg config.Config) {
 	})
 
 	section("管理端", []entry{
-		text("ADMIN_USERNAME", cfg.AdminUsername),
-		secret("ADMIN_PASSWORD_HASH", cfg.AdminPasswordHash),
 		secret("ADMIN_API_KEY", cfg.AdminAPIKey),
 		text("ADMIN_API_ACTOR", cfg.AdminAPIActor),
 		list("ADMIN_API_ALLOWED_IPS", cfg.AdminAPIAllowedIPs),
 		num("ADMIN_SESSION_TTL_SECONDS", cfg.AdminSessionTTL),
 		yesNo("ADMIN_COOKIE_SECURE", cfg.AdminCookieSecure),
-		num("ADMIN_LOGIN_MAX_ATTEMPTS", cfg.AdminLoginMax),
-		num("ADMIN_LOGIN_WINDOW_SECONDS", cfg.AdminLoginWindow),
 	})
 
 	section("机密", []entry{

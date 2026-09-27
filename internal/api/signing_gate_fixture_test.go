@@ -119,7 +119,6 @@ func newGateFixture(t *testing.T, seed int) *gateFixture {
 	store := newFakeObjectStore()
 	s := &server{
 		db: db, secrets: box, objects: fixedObjectFactory{client: store}, tenant: newTenantResolver(db),
-		attempts: map[string]attempt{},
 		cfg: config.Config{
 			Environment: "development", ArtifactMaxSizeBytes: 8 << 20, ArtifactVerifyTimeout: 30, ArtifactUploadTTL: 900,
 			ArtifactUploadMode: "proxy", MySQLQueryTimeout: 10, AdminAPIKey: gateAdminKey, AdminAPIActor: "tester@example.com",

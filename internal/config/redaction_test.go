@@ -21,7 +21,6 @@ import (
 var secretEnv = map[string]string{
 	"MYSQL_DSN":                "app:SENTINEL-dsn-password@tcp(db.internal:3306)/foundation",
 	"STORAGE_MASTER_KEY":       "U0VOVElORUwtbWFzdGVyLWtleS0zMi1ieXRlcyEhISE=", // 32 字节的合法 base64，解出来是 SENTINEL-master-key-…
-	"ADMIN_PASSWORD_HASH":      "SENTINEL-password-hash",
 	"ADMIN_API_KEY":            "SENTINEL-admin-api-key",
 	"DEVICE_IDENTITY_HMAC_KEY": "SENTINEL-device-hmac-key",
 	"FCM_SERVICE_ACCOUNT_JSON": "SENTINEL-fcm-service-account",

@@ -15,7 +15,7 @@ import (
 
 // 平台管理员也在账号表里、走统一登录（设计 platform-accounts-and-console-login-2026-09-27），
 // 记录由外部系统写（设计 console-accounts-external-maintenance-2026-09-27）。
-// 过渡期：环境变量账号还在，用它配统一登录与发信。
+// 统一登录与发信用自动化通道（管理密钥）配：第一个平台管理员登进来之前，只有它能改平台配置。
 func TestDBPlatformAccounts(t *testing.T) {
 	db := openTestDB(t)
 	// 平台账号、auth.cid、mail.smtp 都是平台级的，测试库又是持久的：只有本测试写平台账号，开始前与结束后都清掉
@@ -28,21 +28,15 @@ func TestDBPlatformAccounts(t *testing.T) {
 	t.Cleanup(clear)
 	tenantA := accountsTestTenantRow(t, db, "pa")
 	tenantB := accountsTestTenantRow(t, db, "pb")
-	envUser := "platform-env-" + uniqueSuffix()
-	envHash, err := hashPassword("Platform-Pass-2026!")
-	if err != nil {
-		t.Fatal(err)
-	}
+	automationKey := "platform-accounts-test-key-" + uniqueSuffix()
 	router := New(config.Config{
 		Environment:            "test",
 		StorageMasterKey:       base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
 		MySQLQueryTimeout:      10,
-		AdminUsername:          envUser,
-		AdminPasswordHash:      envHash,
-		PlatformAdminUsernames: []string{envUser},
+		AdminAPIKey:            automationKey,
+		AdminAPIActor:          "automation@test",
+		PlatformAdminUsernames: []string{"automation@test"},
 		AdminSessionTTL:        3600,
-		AdminLoginMax:          1000,
-		AdminLoginWindow:       900,
 	}, &store.Store{DB: db})
 	cidServer := newFakeCIDServer(t)
 	smtpServer := startTestSMTP(t)
@@ -52,14 +46,14 @@ func TestDBPlatformAccounts(t *testing.T) {
 	rootSubject := testSubject()
 	rootEmail := "root-" + uniqueSuffix() + "@example.com"
 
-	env := newBrowser(tenantA)
-	env.mustCode(t, env.do("POST", "/v1/admin/auth/login", map[string]string{"username": envUser, "password": "Platform-Pass-2026!"}, nil), 200)
-	env.mustCode(t, env.do("PUT", "/v1/admin/platform/auth/cid", map[string]any{
+	automation := newBrowser(tenantA)
+	automation.headers = map[string]string{"x-admin-key": automationKey}
+	automation.mustCode(t, automation.do("PUT", "/v1/admin/platform/auth/cid", map[string]any{
 		"authorizeUrl": "https://{baseHost}/auth/v1/oauth/authorize", "logoutUrl": "https://{baseHost}/auth/v1/logout",
 		"tokenUrl": cidServer.URL + "/auth/v1/oauth/token", "userinfoUrl": cidServer.URL + "/internal/v1/userinfo",
 		"clientId": "rn-client", "clientSecret": "rn-secret", "expectedVersion": 0, "reason": "接统一登录",
 	}, nil), 200)
-	env.mustCode(t, env.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("二次验证要发信", 0), nil), 200)
+	automation.mustCode(t, automation.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("二次验证要发信", 0), nil), 200)
 
 	// markVerified 把会话记成刚过了二次验证：同一个账号 1 分钟只能发一次码，测试里不等
 	markVerified := func(b *browser) {
@@ -109,8 +103,8 @@ func TestDBPlatformAccounts(t *testing.T) {
 			t.Fatalf("second factor audit = %d %v", verified, err)
 		}
 		root.mustCode(t, root.do("PUT", "/v1/admin/platform/mail", smtpServer.settings("改发信", 1), nil), 200)
-		// 环境变量账号没有邮箱，不做二次验证
-		env.mustCode(t, env.do("GET", "/v1/admin/platform/accounts", nil, nil), 200)
+		// 自动化通道没有会话、没有邮箱，不做二次验证
+		automation.mustCode(t, automation.do("GET", "/v1/admin/platform/accounts", nil, nil), 200)
 	})
 
 	t.Run("平台管理员只有只读列表", func(t *testing.T) {
@@ -125,8 +119,14 @@ func TestDBPlatformAccounts(t *testing.T) {
 		}
 	})
 
+	t.Run("控制台会话不能删统一登录配置（删了谁都登不进来），只有自动化通道能删", func(t *testing.T) {
+		markVerified(root)
+		wantProblem(t, root.do("DELETE", "/v1/admin/platform/auth/cid?reason="+url.QueryEscape("删统一登录"), nil, nil), 409, "CID_REQUIRED_FOR_CONSOLE_LOGIN")
+		root.mustCode(t, root.do("GET", "/v1/admin/platform/auth/cid", nil, nil), 200)
+	})
+
 	t.Run("有可用的平台管理员时不能删发信配置", func(t *testing.T) {
-		wantProblem(t, env.do("DELETE", "/v1/admin/platform/mail?reason="+url.QueryEscape("删发信"), nil, nil), 409, "MAIL_REQUIRED_FOR_SECOND_FACTOR")
+		wantProblem(t, automation.do("DELETE", "/v1/admin/platform/mail?reason="+url.QueryEscape("删发信"), nil, nil), 409, "MAIL_REQUIRED_FOR_SECOND_FACTOR")
 	})
 
 	t.Run("同一个统一账号既有平台记录又有租户记录：拒绝登录，哪个域名都一样", func(t *testing.T) {
@@ -155,7 +155,7 @@ func TestDBPlatformAccounts(t *testing.T) {
 			t.Fatalf("disabled platform account redirected to %s", got)
 		}
 		// 没有可用的平台管理员了，发信配置可以删
-		env.mustCode(t, env.do("DELETE", "/v1/admin/platform/mail?reason="+url.QueryEscape("删发信"), nil, nil), 200)
+		automation.mustCode(t, automation.do("DELETE", "/v1/admin/platform/mail?reason="+url.QueryEscape("删发信"), nil, nil), 200)
 	})
 
 	t.Run("租户会话进不了平台管理员账号的接口", func(t *testing.T) {

@@ -148,11 +148,13 @@ func (f *fakeCIDServer) approve(t *testing.T, authorizeURL, subject, email strin
 	return code, q.Get("state")
 }
 
-// browser 是一个 cookie jar：只按名字存（服务端按名字读），Max-Age<0 删除。
+// browser 是一个 cookie jar：只按名字存（服务端按名字读），Max-Age<0 删除。headers 每个请求都带
+// （自动化通道的 x-admin-key）。
 type browser struct {
 	router  http.Handler
 	tenant  accountsTestTenant
 	cookies map[string]string
+	headers map[string]string
 }
 
 func (b *browser) do(method, target string, body any, headers map[string]string) *httptest.ResponseRecorder {
@@ -170,6 +172,9 @@ func (b *browser) do(method, target string, body any, headers map[string]string)
 	request.Header.Set("content-type", "application/json")
 	if !safeMethod(method) {
 		request.Header.Set("Origin", "https://"+b.tenant.console)
+	}
+	for k, v := range b.headers {
+		request.Header.Set(k, v)
 	}
 	for k, v := range headers {
 		request.Header.Set(k, v)
@@ -231,21 +236,11 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	db := openTestDB(t)
 	tenantA := accountsTestTenantRow(t, db, "a")
 	tenantB := accountsTestTenantRow(t, db, "b")
-	platformUser := "platform-root-" + uniqueSuffix()
-	platformHash, err := hashPassword("Platform-Pass-2026!")
-	if err != nil {
-		t.Fatal(err)
-	}
 	cfg := config.Config{
-		Environment:            "test",
-		StorageMasterKey:       base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
-		MySQLQueryTimeout:      10,
-		AdminUsername:          platformUser,
-		AdminPasswordHash:      platformHash,
-		PlatformAdminUsernames: []string{platformUser},
-		AdminSessionTTL:        3600,
-		AdminLoginMax:          1000,
-		AdminLoginWindow:       900,
+		Environment:       "test",
+		StorageMasterKey:  base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
+		MySQLQueryTimeout: 10,
+		AdminSessionTTL:   3600,
 	}
 	// auth.cid 是平台级的一份，测试库又是持久的：上一次运行留下的配置指向早已关掉的假认证中心。
 	// 这个键只有本测试写，开始前与结束后都清掉
@@ -272,16 +267,22 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 	}
 	subject := testSubject()
 
+	platformToken, platformID, _ := activePlatformSession(t, db)
 	platform := newBrowser(tenantA)
-	view := platform.mustCode(t, platform.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
-	if view["platformAdmin"] != true || view["tenantId"] != nil || view["account"] != nil {
+	platform.cookies[adminSessionCookie] = platformToken
+	view := platform.mustCode(t, platform.do("GET", "/v1/admin/auth/session", nil, nil), 200)
+	if view["platformAdmin"] != true || view["tenantId"] != nil || object(view["account"])["id"] != platformID {
 		t.Fatalf("platform session view = %v", view)
+	}
+	// 口令登录已经删掉（环境变量账号没了）
+	if got := newBrowser(tenantA).do("POST", "/v1/admin/auth/login", map[string]string{"username": "admin", "password": "anything-at-all"}, nil).Code; got != http.StatusNotFound {
+		t.Fatalf("password login must be gone, got %d", got)
 	}
 
 	t.Run("平台管理员配置统一登录，密钥不回显", func(t *testing.T) {
-		// 没配之前：登录页看到统一登录没开，发起直接回首页报原因。口令登录只剩环境变量账号，配了才显示
+		// 没配之前：登录页看到统一登录没开，发起直接回首页报原因。没有口令登录了
 		methods := platform.mustCode(t, newBrowser(tenantA).do("GET", "/v1/admin/auth/methods", nil, nil), 200)
-		if methods["cid"] != false || methods["password"] != true {
+		if _, hasPassword := methods["password"]; methods["cid"] != false || hasPassword {
 			t.Fatalf("methods = %v", methods)
 		}
 		if got := location(t, newBrowser(tenantA).do("GET", "/v1/admin/auth/cid/start?mode=login", nil, nil)); got != "/?cidError=not_configured" {
@@ -365,8 +366,6 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 		if got := location(t, newBrowser(tenantA).do("GET", cidCallbackPath+"?code="+code+"&state="+url.QueryEscape(state), nil, nil)); got != "/?cidError=state" {
 			t.Fatalf("replayed callback without the flow cookie redirected to %s", got)
 		}
-		// 控制台账号没有本地口令：拿显示名、邮箱当用户名都登不进
-		wantProblem(t, newBrowser(tenantA).do("POST", "/v1/admin/auth/login", map[string]string{"username": "zs@example.com", "password": "anything-at-all"}, nil), 401, "INVALID_CREDENTIALS")
 	})
 
 	t.Run("同一个统一账号在别的租户要另有记录，会话不跨租户", func(t *testing.T) {
@@ -413,12 +412,6 @@ func TestDBTenantAccountsAndUnifiedLogin(t *testing.T) {
 			t.Fatalf("cidLogoutUrl = %v, want %s", body["cidLogoutUrl"], want)
 		}
 		wantProblem(t, out.do("GET", "/v1/admin/auth/session", nil, nil), 401, "ADMIN_AUTH_REQUIRED")
-		// 环境变量账号不走统一登录，不给退出地址
-		p := newBrowser(tenantA)
-		p.mustCode(t, p.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
-		if p.mustCode(t, p.do("POST", "/v1/admin/auth/logout", map[string]any{}, nil), 200)["cidLogoutUrl"] != nil {
-			t.Fatal("env admin logout must not bounce through unified login")
-		}
 	})
 
 	t.Run("外部系统换人：旧会话下一个请求就失效，新的人能登", func(t *testing.T) {

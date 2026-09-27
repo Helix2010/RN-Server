@@ -33,12 +33,8 @@ type Config struct {
 	// TrustedProxies are the hops allowed to set X-Forwarded-For. Empty means
 	// gin trusts nobody, so the client IP is the direct peer.
 	TrustedProxies    []string
-	AdminUsername     string
-	AdminPasswordHash string
 	AdminSessionTTL   int
 	AdminCookieSecure bool
-	AdminLoginMax     int
-	AdminLoginWindow  int
 	// MySQL 是驱动级连接配置，由 MYSQL_DSN 解析而来（缺的参数按 mysqlDefaults 补齐）。
 	// 连接池、启动重试和查询超时不在这里：它们是 database/sql 和我们自己的事，
 	// 驱动不认。
@@ -89,7 +85,8 @@ type Config struct {
 	IndexerAllowPlainHTTP bool
 	// IndexerAlertWebhook 告警 webhook（企业微信 / Slack 通用 JSON）；空表示不发。
 	IndexerAlertWebhook string
-	// PlatformAdminUsernames 能进"扫链管理"等平台级页面的管理员用户名；空表示平台路由一律 403。
+	// PlatformAdminUsernames 是自动化通道（ADMIN_API_ACTOR）里哪些 actor 算平台管理员；空表示自动化通道进不了
+	// 平台路由。控制台账号是不是平台管理员看 tenant_admin_accounts，不看这个列表。
 	PlatformAdminUsernames []string
 }
 
@@ -119,12 +116,8 @@ func Load() (Config, error) {
 		AdminAPIActor:              l.value("ADMIN_API_ACTOR", "api-key-automation"),
 		AdminAPIAllowedIPs:         splitList(os.Getenv("ADMIN_API_ALLOWED_IPS")),
 		TrustedProxies:             splitList(os.Getenv("TRUSTED_PROXIES")),
-		AdminUsername:              os.Getenv("ADMIN_USERNAME"),
-		AdminPasswordHash:          os.Getenv("ADMIN_PASSWORD_HASH"),
 		AdminSessionTTL:            l.integer("ADMIN_SESSION_TTL_SECONDS", 28800),
 		AdminCookieSecure:          l.boolean("ADMIN_COOKIE_SECURE", true),
-		AdminLoginMax:              l.integer("ADMIN_LOGIN_MAX_ATTEMPTS", 5),
-		AdminLoginWindow:           l.integer("ADMIN_LOGIN_WINDOW_SECONDS", 900),
 		MySQLConnectionLimit:       l.integer("MYSQL_CONNECTION_LIMIT", 10),
 		MySQLMaxIdleConnections:    l.integer("MYSQL_MAX_IDLE_CONNECTIONS", 2),
 		MySQLConnectionMaxLifetime: l.integer("MYSQL_CONNECTION_MAX_LIFETIME_SECONDS", 1800),
@@ -175,9 +168,6 @@ func Load() (Config, error) {
 	}
 
 	if cfg.Environment == "production" {
-		if cfg.AdminUsername == "" || cfg.AdminPasswordHash == "" {
-			l.fail("ADMIN_USERNAME and ADMIN_PASSWORD_HASH are required in production")
-		}
 		// 空是允许的（租户域名从表里推导）；显式写 "*" 不是——那放行的是所有人。
 		for _, origin := range cfg.CORSOrigins {
 			if origin == "*" {
@@ -203,8 +193,6 @@ func Load() (Config, error) {
 	l.between("MYSQL_INIT_MAX_ATTEMPTS", cfg.MySQLInitMaxAttempts, 1, 10)
 	l.atLeast("MYSQL_INIT_RETRY_DELAY_SECONDS", cfg.MySQLInitRetryDelay, 0)
 	l.atLeast("ADMIN_SESSION_TTL_SECONDS", cfg.AdminSessionTTL, 300)
-	l.atLeast("ADMIN_LOGIN_MAX_ATTEMPTS", cfg.AdminLoginMax, 3)
-	l.atLeast("ADMIN_LOGIN_WINDOW_SECONDS", cfg.AdminLoginWindow, 60)
 	if cfg.StorageMasterKey != "" && !validMasterKey(cfg.StorageMasterKey) {
 		l.fail("STORAGE_MASTER_KEY must be a base64-encoded 32-byte key")
 	}
@@ -530,7 +518,6 @@ func (c Config) safeSummary() string {
 		value string
 	}{
 		{"STORAGE_MASTER_KEY", c.StorageMasterKey},
-		{"ADMIN_PASSWORD_HASH", c.AdminPasswordHash},
 		{"ADMIN_API_KEY", c.AdminAPIKey},
 		{"DEVICE_IDENTITY_HMAC_KEY", c.DeviceIdentityKey},
 		{"FCM_SERVICE_ACCOUNT_JSON", c.FCMServiceAccountJSON},

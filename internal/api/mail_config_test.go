@@ -159,15 +159,11 @@ func (f *testSMTP) settings(reason string, version int) map[string]any {
 func TestDBPlatformMailConfig(t *testing.T) {
 	db := openTestDB(t)
 	tenant := accountsTestTenantRow(t, db, "mail")
-	platformUser := "platform-mail-" + uniqueSuffix()
-	platformHash, err := hashPassword("Platform-Pass-2026!")
-	if err != nil {
-		t.Fatal(err)
-	}
+	automationKey := "mail-test-key-" + uniqueSuffix()
 	cfg := config.Config{
 		Environment: "test", StorageMasterKey: base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
-		MySQLQueryTimeout: 10, AdminUsername: platformUser, AdminPasswordHash: platformHash, PlatformAdminUsernames: []string{platformUser},
-		AdminSessionTTL: 3600, AdminLoginMax: 1000, AdminLoginWindow: 900,
+		MySQLQueryTimeout: 10, AdminAPIKey: automationKey, AdminAPIActor: "automation@test", PlatformAdminUsernames: []string{"automation@test"},
+		AdminSessionTTL: 3600,
 	}
 	// mail.smtp 是平台级的一份，测试库又是持久的：开始前与结束后都清掉
 	clearMail := func() {
@@ -176,8 +172,8 @@ func TestDBPlatformMailConfig(t *testing.T) {
 	clearMail()
 	t.Cleanup(clearMail)
 	router := New(cfg, &store.Store{DB: db})
-	platform := &browser{router: router, tenant: tenant, cookies: map[string]string{}}
-	platform.mustCode(t, platform.do("POST", "/v1/admin/auth/login", map[string]string{"username": platformUser, "password": "Platform-Pass-2026!"}, nil), 200)
+	platformToken, platformID, _ := activePlatformSession(t, db)
+	platform := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: platformToken}}
 	smtpServer := startTestSMTP(t)
 
 	// 没存过时管理端用服务端声明的默认端口预填
@@ -245,13 +241,19 @@ func TestDBPlatformMailConfig(t *testing.T) {
 	var audits int
 	var summaries string
 	_ = db.QueryRow(`SELECT COUNT(*), COALESCE(GROUP_CONCAT(summary SEPARATOR ' '), '') FROM audit_events
-		WHERE tenant_id=? AND action IN ('mail_config_update','mail_test_sent') AND actor_id LIKE ?`, platformTenantID, "%"+platformUser+"%").Scan(&audits, &summaries)
+		WHERE tenant_id=? AND action IN ('mail_config_update','mail_test_sent') AND actor_id=?`, platformTenantID, platformActor(platformID)).Scan(&audits, &summaries)
 	if audits < 6 || strings.Contains(summaries, "Smtp-Pass-2026") || strings.Contains(summaries, "ops@rn.test") {
 		t.Fatalf("audits = %d: %s", audits, summaries)
 	}
 
-	platform.mustCode(t, platform.do("DELETE", "/v1/admin/platform/mail?reason=撤掉发信", nil, nil), 200)
-	wantProblem(t, platform.do("DELETE", "/v1/admin/platform/mail?reason=撤掉发信", nil, nil), 404, "MAIL_NOT_CONFIGURED")
+	// 还有可用的平台管理员就不能删（它们做写操作都要靠发信收验证码）；没有了才能删，只剩自动化通道能做
+	wantProblem(t, platform.do("DELETE", "/v1/admin/platform/mail?reason=撤掉发信", nil, nil), 409, "MAIL_REQUIRED_FOR_SECOND_FACTOR")
+	if _, err := db.Exec(`UPDATE tenant_admin_accounts SET status='disabled' WHERE id=?`, platformID); err != nil {
+		t.Fatal(err)
+	}
+	automation := &browser{router: router, tenant: tenant, cookies: map[string]string{}, headers: map[string]string{"x-admin-key": automationKey}}
+	automation.mustCode(t, automation.do("DELETE", "/v1/admin/platform/mail?reason=撤掉发信", nil, nil), 200)
+	wantProblem(t, automation.do("DELETE", "/v1/admin/platform/mail?reason=撤掉发信", nil, nil), 404, "MAIL_NOT_CONFIGURED")
 }
 
 func TestEmailCodeStore(t *testing.T) {

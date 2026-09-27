@@ -322,9 +322,9 @@ ClientHello，一定被丢，会得出「443 完全不通」的错误结论。�
 了暴露面，裸机没有这层，不写的话 13080 绕过 nginx 直接对外，TLS 和它上面的一切
 都白设。
 
-**`.env` 里含 `$` 的值要加单引号。** `ADMIN_PASSWORD_HASH` 是 scrypt 格式，带
-`$`。systemd 读 EnvironmentFile 不做展开，但任何 `source` 这个文件的脚本都会把
-`$3` 当变量吃掉。加了引号两边都对。
+**`.env` 里含 `$` 的值要加单引号。** 口令、DSN 里都可能带 `$`。systemd 读
+EnvironmentFile 不做展开，但任何 `source` 这个文件的脚本都会把 `$3` 当变量吃掉。
+加了引号两边都对。
 
 **证书路径写软链接，不写具体目录。** 签发脚本只改链接指向，nginx 配置本身不动。
 这样重跑 `install.sh` 不会把 TLS 退回占位证书——那种退化 `nginx -t` 照样通过，

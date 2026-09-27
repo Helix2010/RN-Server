@@ -34,6 +34,11 @@ LEGACY_MYSQL = [
 # 代码从不读取，或键本身已经删掉的
 DEAD = {
     "INDEXER_MYSQL_CONNECTION_LIMIT": "代码从来没读过这个键",
+    # 2026-09-27 删掉环境变量里的管理员账号：控制台只走统一登录（设计 console-accounts-external-maintenance §10）
+    "ADMIN_USERNAME": "环境变量管理员账号已删，控制台只走统一登录",
+    "ADMIN_PASSWORD_HASH": "同上",
+    "ADMIN_LOGIN_MAX_ATTEMPTS": "口令登录已删，限流跟着删了",
+    "ADMIN_LOGIN_WINDOW_SECONDS": "同上",
     "ARTIFACT_DOWNLOAD_TTL_SECONDS": "读进 Config 之后没有任何地方用",
     "OTA_CHANNEL": "只在 updatePolicy.otaChannel 缺失时兜底，而模板里那个键有值",
     "ANDROID_STORE_URL": "下载地址按租户生成，全局值不可能同时对四个租户都对",
@@ -49,8 +54,6 @@ DEFAULTS = {
     "ADMIN_API_ACTOR": "api-key-automation",
     "ADMIN_SESSION_TTL_SECONDS": "28800",
     "ADMIN_COOKIE_SECURE": "true",
-    "ADMIN_LOGIN_MAX_ATTEMPTS": "5",
-    "ADMIN_LOGIN_WINDOW_SECONDS": "900",
     "MYSQL_QUERY_TIMEOUT_SECONDS": "10",
     "MYSQL_INIT_TIMEOUT_SECONDS": "30",
     "MYSQL_INIT_MAX_ATTEMPTS": "3",

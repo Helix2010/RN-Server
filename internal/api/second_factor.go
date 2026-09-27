@@ -24,7 +24,7 @@ import (
 //
 // 平台管理员账号也要验，而且范围更大（设计 platform-accounts-and-console-login §3.5）：统一账号口令泄露，
 // 拿到的就是整个平台。平台维护的写操作一律要求（requireSecondFactorOnWrite）。
-// 没有账号的会话（环境变量里的 ADMIN_USERNAME、管理密钥）不用：它们没有邮箱。
+// 自动化通道（管理密钥）不用：它没有会话，也没有邮箱。
 //
 //	POST /v1/admin/auth/second-factor/code    {} → {codeToken, expiresAt, resendAfter, email（掩码）}；没配发信 503 MAIL_NOT_CONFIGURED
 //	POST /v1/admin/auth/second-factor/verify  {codeToken, code} → {secondFactorUntil}；不对 400 SECOND_FACTOR_CODE_INVALID
@@ -129,7 +129,7 @@ func secondFactorFresh(session *adminSession, now time.Time) bool {
 	return !session.SecondFactorAt.IsZero() && now.Before(session.SecondFactorAt.Add(secondFactorWindow))
 }
 
-// requireSecondFactor 挂在敏感路由上：账号会话要 15 分钟内验过，没有账号的会话直接放行。
+// requireSecondFactor 挂在敏感路由上：会话要 15 分钟内验过，自动化通道（没有会话）直接放行。
 // 不为「没配发信」放行：那样二次验证就只剩名字（AGENTS.md「不写回退」）。
 func (s *server) requireSecondFactor() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -154,7 +154,7 @@ func (s *server) requireSecondFactorOnWrite() gin.HandlerFunc {
 
 func (s *server) secondFactorSatisfied(c *gin.Context) bool {
 	session := currentAdminSession(c)
-	return !session.hasAccount() || secondFactorFresh(session, s.now())
+	return session == nil || secondFactorFresh(session, s.now())
 }
 
 func secondFactorRequired(c *gin.Context) {
@@ -188,8 +188,8 @@ Valid for %d minutes. If this is not you, your unified login account may be in s
 
 func (s *server) sendSecondFactorCode(c *gin.Context) {
 	session := currentAdminSession(c)
-	if !session.hasAccount() {
-		problem(c, http.StatusBadRequest, "SECOND_FACTOR_NOT_APPLICABLE", "Sessions without an account do not use the email second factor")
+	if session == nil {
+		problem(c, http.StatusBadRequest, "SECOND_FACTOR_NOT_APPLICABLE", "The automation channel does not use the email second factor")
 		return
 	}
 	to := strings.TrimSpace(session.Account.Email)
@@ -241,8 +241,8 @@ func (s *server) verifySecondFactor(c *gin.Context) {
 		return
 	}
 	session := currentAdminSession(c)
-	if !session.hasAccount() {
-		problem(c, http.StatusBadRequest, "SECOND_FACTOR_NOT_APPLICABLE", "Sessions without an account do not use the email second factor")
+	if session == nil {
+		problem(c, http.StatusBadRequest, "SECOND_FACTOR_NOT_APPLICABLE", "The automation channel does not use the email second factor")
 		return
 	}
 	now := s.now()
