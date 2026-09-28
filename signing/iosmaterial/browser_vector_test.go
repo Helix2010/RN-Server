@@ -28,6 +28,23 @@ const browserSealedBox = `{
   "createdAt": "2026-09-19T00:00:00Z"
 }`
 
+// browserSealedTenantBox 是控制台封的 v2（带租户）描述文件，与上面那份同一把收件人公钥、另一个 nonce
+// （RN-Admin src/core/ios-material-box.spec.ts 的「v2」用例产出）。租户自己交材料只走这一版。
+const browserSealedTenantBox = `{
+  "v": 2,
+  "alg": "x25519-hkdf-sha256-aes256gcm",
+  "purpose": "ios-builder-material",
+  "kind": "profile",
+  "tenantId": "1000000001",
+  "teamId": "J4JDFC8LCC",
+  "bundleId": "win.anyfun.app",
+  "recipientSha256": "7538c5cdf61259c8e5f2a622a2e0dec8567baf6b3d898a3572036793375ae7b0",
+  "epk": "iha45EIqzdIdQEURiJmE15a4+NtrUsZvGSGju5KX2CI=",
+  "nonce": "DA0ODxAREhMUFRYX",
+  "ct": "cCc38EZEzSaZGZPu/4bx6ci4g97K+VSs/5WZkTi9BhSVsAumeHc4f4TwmZW/b0GFy9EkWL8OaaEpw6pnqv6E9B9WcDEnZZnpiUekyjneu2ixhlIai4LQv8p0LLeAFduMsPZxU7I9le7QJR9aAcitXub2I+XN3FKKZNlsR6wyCIVKttD9jArJXhccOgODlFBdQMptpcU4J+sv48PJSKlRth1+tSi3N/6+NGmoshLcvHcljPe4aAyCKNOSs+NU1nVRohZLAQm8L1vYt+6O9OX6tcodS7eZq/sj4XSM77NE8fjC7Ln1W318YBiI5pAIiYEFdl/jG8ARueG09EP95qRL7ekt3gGOE1jZYefeS4LZPORnHH0KSIU2+qTI2Pk5t07l",
+  "createdAt": "2026-09-27T00:00:00Z"
+}`
+
 // 收件人私钥。它只为这条用例存在，不是任何一台机器上的密钥。
 const browserVectorPrivateKey = "9QQKT1KEQKIn3tcW+032RRV20bmhaRlzxsif3HubmGk="
 
@@ -56,5 +73,32 @@ func TestOpensABoxSealedInTheBrowser(t *testing.T) {
 	p12, err := base64.StdEncoding.DecodeString(material.P12Base64)
 	if err != nil || len(p12) != 5 || p12[0] != 1 || p12[4] != 5 {
 		t.Errorf("the .p12 bytes came back changed: %v %v", p12, err)
+	}
+}
+
+func TestOpensATenantBoxSealedInTheBrowser(t *testing.T) {
+	private, err := base64.StdEncoding.DecodeString(browserVectorPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	box, err := ParseBox([]byte(browserSealedTenantBox))
+	if err != nil {
+		t.Fatalf("the browser's v2 box does not even parse: %v", err)
+	}
+	if box.Version != VersionTenant || box.TenantID != "1000000001" {
+		t.Fatalf("the browser must seal a tenant's material as v2: v=%d tenant=%q", box.Version, box.TenantID)
+	}
+	material, err := Open(box, private)
+	if err != nil {
+		t.Fatalf("Go cannot open the v2 box the console sealed: %v\n"+
+			"Check the tenantId field in both the box and the sealed record in RN-Admin src/core/ios-material-box.ts.", err)
+	}
+	if material.Kind != KindProfile || material.TenantID != "1000000001" || material.TeamID != "J4JDFC8LCC" ||
+		material.BundleID != "win.anyfun.app" {
+		t.Fatalf("decrypted the wrong thing: %s", material)
+	}
+	profile, err := base64.StdEncoding.DecodeString(material.ProfileBase64)
+	if err != nil || len(profile) != 6 || profile[0] != 1 || profile[5] != 6 {
+		t.Errorf("the profile bytes came back changed: %v %v", profile, err)
 	}
 }
