@@ -509,7 +509,7 @@ func (s *server) createBuildJob(c *gin.Context) {
 		}
 		delivery = mode
 		if identity != nil {
-			coverage, err := s.iosSigningCoverage(c.Request.Context(), registry,
+			coverage, err := s.iosSigningCoverage(c.Request.Context(), registry, tenantID(c),
 				identity.Value.AppleTeamID, identity.Value.BundleID, s.now())
 			if err != nil {
 				problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to read build machine liveness")

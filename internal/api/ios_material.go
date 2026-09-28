@@ -2,13 +2,17 @@ package api
 
 // iOS 签名材料的密文分发（设计 docs/design/ios-signing-material-distribution-2026-09-19.md）。
 //
-// 材料在管理员的浏览器或离线机器上加密给平台公钥，服务端**只存、只转发密文**：它没有任何
+// 材料在租户成员的浏览器里加密给平台公钥，服务端**只存、只转发密文**：它没有任何
 // 一把私钥，读不懂自己存的每一份。这是整套打包机设计的前提——服务端被攻破也变不出能用的
 // 签名材料。明文存服务端、机器来取的做法在设计第 2 节被明确排除。
 //
-// 这里做的检查**全部是帮运维当场发现拿错了文件**，不是安全控制：形状对不对、用途与种类
+// 材料按租户存（设计 ios-tenant-owned-signing-material-2026-09-25 §3.1）：同一个 Team 的租户各交各的，
+// 一个租户换、删自己的材料碰不到别人。租户怎么交在 ios_material_tenant.go；这里是存储、平台公钥、
+// 平台的紧急删除与打包机取材料。
+//
+// 这里做的检查**全部是帮人当场发现拿错了文件**，不是安全控制：形状对不对、用途与种类
 // 配不配、加密给的是不是一把登记过的公钥。传错了当场报错，好过等一台 Mac 取回去解不开。
-// 真正的判据在 Mac 上：私钥只在那里，解不开就是解不开。
+// 真正的判据在 Mac 上：私钥只在那里，解不开就是解不开；解开之后还要核对内容（§4.2）。
 
 import (
 	"context"
@@ -32,6 +36,8 @@ const buildIOSMaterialConfigKey = "build.ios.material"
 
 const (
 	iosMaterialAuditTarget = "ios-signing-material"
+	// iosMaterialEmergencyRemoveAction 是平台紧急删除的审计动作：租户页按它列出「平台管理员删了什么」
+	iosMaterialEmergencyRemoveAction = "ios_material_emergency_remove"
 	// iosMaterialMaxBody 是一份密文的大小上限，比 iosmaterial 自己的上限略宽，
 	// 好让"超了"这件事由那一侧报出具体原因
 	iosMaterialMaxBody = int64(iosmaterial.MaxBoxSize + 4096)
@@ -125,6 +131,8 @@ type rowsQuerier interface {
 
 // storedIOSMaterial 是表里的一行，不含密文。
 type storedIOSMaterial struct {
+	// TenantID 是这份材料属于的租户；"0" 是按 Team 存的旧行（只下发给还没升级的打包机）
+	TenantID        string `json:"tenantId"`
 	Kind            string `json:"kind"`
 	TeamID          string `json:"teamId"`
 	Scope           string `json:"scope"`
@@ -133,6 +141,8 @@ type storedIOSMaterial struct {
 	Version         int64  `json:"version"`
 	UploadedBy      string `json:"uploadedBy"`
 	UploadedAt      string `json:"uploadedAt"`
+	// Legacy：从旧行复制来的 v1 密文，里面没有租户。打包机只对这种项接受 v1
+	Legacy bool `json:"legacy"`
 }
 
 // scopeFor 回这一份材料在 (kind, team) 下的那一维：描述文件按 bundle id 分，证书与上传 Key
@@ -151,12 +161,12 @@ func scopeFor(box iosmaterial.Box) string {
 }
 
 func listIOSMaterial(ctx context.Context, q rowsQuerier, where string, args ...any) ([]storedIOSMaterial, error) {
-	query := `SELECT kind,team_id,scope,purpose,recipient_sha256,version,uploaded_by,uploaded_at
+	query := `SELECT tenant_id,kind,team_id,scope,purpose,recipient_sha256,version,uploaded_by,uploaded_at,legacy
 		FROM ios_signing_material`
 	if where != "" {
 		query += " WHERE " + where
 	}
-	query += fmt.Sprintf(" ORDER BY team_id,kind,scope LIMIT %d", iosMaterialMaxRows)
+	query += fmt.Sprintf(" ORDER BY tenant_id,team_id,kind,scope LIMIT %d", iosMaterialMaxRows)
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -166,8 +176,8 @@ func listIOSMaterial(ctx context.Context, q rowsQuerier, where string, args ...a
 	for rows.Next() {
 		var item storedIOSMaterial
 		var uploadedAt time.Time
-		if err := rows.Scan(&item.Kind, &item.TeamID, &item.Scope, &item.Purpose,
-			&item.RecipientSHA256, &item.Version, &item.UploadedBy, &uploadedAt); err != nil {
+		if err := rows.Scan(&item.TenantID, &item.Kind, &item.TeamID, &item.Scope, &item.Purpose,
+			&item.RecipientSHA256, &item.Version, &item.UploadedBy, &uploadedAt, &item.Legacy); err != nil {
 			return nil, err
 		}
 		item.UploadedAt = uploadedAt.UTC().Format(time.RFC3339)
@@ -178,7 +188,7 @@ func listIOSMaterial(ctx context.Context, q rowsQuerier, where string, args ...a
 
 // ---- 管理端 ----
 
-// iosMaterialOverview GET /v1/admin/platform/ios-material：两把公钥与已经存着的材料。
+// iosMaterialOverview GET /v1/admin/platform/ios-material：两把公钥与已经存着的材料（每项带租户 slug）。
 // **不下发密文**：控制台不需要它，而少一个出口就少一处要想清楚的地方。
 func (s *server) iosMaterialOverview(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -195,11 +205,43 @@ func (s *server) iosMaterialOverview(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
 		return
 	}
+	slugs, err := s.tenantSlugsByID(ctx)
+	if err != nil {
+		slog.Error("cannot read the tenant slugs", "error", err)
+		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
+		return
+	}
+	views := make([]gin.H, 0, len(items))
+	for _, item := range items {
+		views = append(views, gin.H{
+			"tenantId": item.TenantID, "tenantSlug": slugs[item.TenantID], "kind": item.Kind, "teamId": item.TeamID,
+			"scope": item.Scope, "purpose": item.Purpose, "recipientSha256": item.RecipientSHA256, "version": item.Version,
+			"uploadedBy": item.UploadedBy, "uploadedAt": item.UploadedAt, "legacy": item.Legacy,
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"version":    snapshot.Version,
 		"recipients": gin.H{"builder": snapshot.Doc.Builder, "uploader": snapshot.Doc.Uploader},
-		"items":      items,
+		"items":      views,
 	})
+}
+
+// tenantSlugsByID 是租户 id → slug，删掉的租户也在里面（材料行可能还留着）。
+func (s *server) tenantSlugsByID(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,slug FROM tenants`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, slug string
+		if err := rows.Scan(&id, &slug); err != nil {
+			return nil, err
+		}
+		out[id] = slug
+	}
+	return out, rows.Err()
 }
 
 // registerIOSMaterialRecipients PUT /v1/admin/platform/ios-material/recipients：登记两把平台公钥。
@@ -304,83 +346,30 @@ func (s *server) registerIOSMaterialRecipients(c *gin.Context) {
 	})
 }
 
-// uploadIOSMaterial POST /v1/admin/platform/ios-material：收一份密文。
-func (s *server) uploadIOSMaterial(c *gin.Context) {
-	ctx := c.Request.Context()
-	recipients, err := readIOSMaterialRecipients(ctx, s.db, false)
-	if err != nil {
-		slog.Error("cannot read the iOS material recipients", "error", err)
-		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_RECIPIENTS_INVALID",
-			"Stored "+buildIOSMaterialConfigKey+" configuration cannot be read")
-		return
-	}
-	raw, err := readLimitedBody(c, iosMaterialMaxBody)
-	if err != nil {
-		problem(c, http.StatusBadRequest, "INVALID_IOS_MATERIAL", "The ciphertext could not be read: "+err.Error())
-		return
-	}
-	box, err := iosmaterial.ParseBox(raw)
-	if err != nil {
-		problem(c, http.StatusBadRequest, "INVALID_IOS_MATERIAL", err.Error())
-		return
-	}
-	recipient, ok := recipients.Doc.forPurpose(box.Purpose)
-	switch {
-	case !ok:
-		problem(c, http.StatusConflict, "IOS_MATERIAL_RECIPIENT_NOT_REGISTERED",
-			"No platform key is registered for "+box.Purpose+"; register the two public keys from `ios-material keygen` first")
-		return
-	case recipient.SHA256 != box.RecipientSHA256:
-		problem(c, http.StatusConflict, "IOS_MATERIAL_RECIPIENT_UNKNOWN",
-			"This material is encrypted to "+box.RecipientSHA256+", but the registered "+box.Purpose+" key is "+recipient.SHA256+
-				". No machine holds the private key for that fingerprint, so nothing could ever decrypt it.")
-		return
-	}
+// storeIOSMaterial 把一份核对过的密文存进这个租户的那一格，返回新版本号。调用方负责提交事务。
+//
+// 读旧版本要在事务里加锁：同一格被同时传两次时，不加锁会算出同一个版本号，后传的那份在装过前一份的
+// 机器上被当成"已经装了"。一格只留当前这一版：旧密文直接被替换，换过什么在审计里查；租户重传之后
+// 是 v2，legacy 回到 0。
+func storeIOSMaterial(ctx context.Context, tx *sql.Tx, tenant string, box iosmaterial.Box, raw []byte, by string, now time.Time) (int64, error) {
 	scope := scopeFor(box)
-
-	now := time.Now().UTC()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to store the material")
-		return
-	}
-	defer tx.Rollback()
-	// 读旧版本要在事务里加锁：两个人同时传同一格时，不加锁会算出同一个版本号，后传的那份
-	// 在装过前一份的机器上被当成"已经装了"
 	var previous int64
-	err = tx.QueryRowContext(ctx,
-		`SELECT version FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=? FOR UPDATE`,
-		box.Kind, box.TeamID, scope).Scan(&previous)
+	err := tx.QueryRowContext(ctx,
+		`SELECT version FROM ios_signing_material WHERE tenant_id=? AND kind=? AND team_id=? AND scope=? FOR UPDATE`,
+		tenant, box.Kind, box.TeamID, scope).Scan(&previous)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
-		return
+		return 0, err
 	}
 	version := nextIOSMaterialVersion(previous, now)
-	// 一格只留当前这一版：旧密文直接被替换，换过什么在审计里查
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO ios_signing_material(kind,team_id,scope,purpose,recipient_sha256,version,ciphertext,uploaded_by,uploaded_at)
-		 VALUES(?,?,?,?,?,?,?,?,?)
+		`INSERT INTO ios_signing_material(tenant_id,kind,team_id,scope,purpose,recipient_sha256,version,ciphertext,uploaded_by,uploaded_at,legacy)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,0)
 		 ON DUPLICATE KEY UPDATE purpose=VALUES(purpose),recipient_sha256=VALUES(recipient_sha256),
-		   version=VALUES(version),ciphertext=VALUES(ciphertext),uploaded_by=VALUES(uploaded_by),uploaded_at=VALUES(uploaded_at)`,
-		box.Kind, box.TeamID, scope, box.Purpose, box.RecipientSHA256, version, raw, actor(c), now); err != nil {
-		slog.Error("cannot store the iOS signing material", "error", err)
-		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to store the material")
-		return
+		   version=VALUES(version),ciphertext=VALUES(ciphertext),uploaded_by=VALUES(uploaded_by),uploaded_at=VALUES(uploaded_at),legacy=0`,
+		tenant, box.Kind, box.TeamID, scope, box.Purpose, box.RecipientSHA256, version, raw, by, now); err != nil {
+		return 0, err
 	}
-	event := newAudit(platformTenantID, actor(c), "ios_material_upload", iosMaterialAuditTarget,
-		box.Kind+":"+box.TeamID+":"+scope, "", requestID(c), map[string]any{
-			"kind": box.Kind, "teamId": box.TeamID, "scope": scope,
-			"recipientSha256": box.RecipientSHA256, "version": version,
-		})
-	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
-		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to store the material")
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"kind": box.Kind, "teamId": box.TeamID, "scope": scope,
-		"version": version, "recipientSha256": box.RecipientSHA256,
-		"uploadedAt": now.Format(time.RFC3339),
-	})
+	return version, nil
 }
 
 // nextIOSMaterialVersion 给一格材料的新版本号：当前的毫秒时间戳，但至少比旧版本大 1。
@@ -396,90 +385,139 @@ func nextIOSMaterialVersion(previous int64, now time.Time) int64 {
 	return previous + 1
 }
 
-// removeIOSMaterial POST /v1/admin/platform/ios-material/remove：删一格。
+// removeIOSMaterial POST /v1/admin/platform/ios-material/remove：平台管理员的**紧急删除**（设计
+// ios-tenant-owned-signing-material-2026-09-25 §3.4），用于证书泄露、账号被盗。平台不代交材料，只能删。
+//
+// 审计记在那个租户名下：租户页上要显示「平台管理员于某时删除了某材料：原因」。删掉之后 Mac 下一轮同步
+// 发现清单里没有这一格，就把本机那一份撤掉（墓碑，cmd/build-agent/ios_material.go）——不撤等于没删。
+// tenantId="0" 是按 Team 存的旧行，只有还没升级的打包机取它。
 func (s *server) removeIOSMaterial(c *gin.Context) {
 	var body struct {
-		Kind   string `json:"kind"`
-		TeamID string `json:"teamId"`
-		Scope  string `json:"scope"`
-		// ExpectedVersion 可选：大于 0 时只删这一版。确认框开着的那几十秒里有人传了新版，
+		TenantID string `json:"tenantId"`
+		Kind     string `json:"kind"`
+		TeamID   string `json:"teamId"`
+		Scope    string `json:"scope"`
+		// ExpectedVersion 可选：大于 0 时只删这一版。确认框开着的那几十秒里租户传了新版，
 		// 删掉的就不该是那份新的
 		ExpectedVersion int64  `json:"expectedVersion"`
 		Reason          string `json:"reason"`
 		Confirm         bool   `json:"confirm"`
 	}
-	if decode(c, &body) != nil || !body.Confirm || body.ExpectedVersion < 0 || len([]rune(strings.TrimSpace(body.Reason))) < 3 {
-		problem(c, http.StatusBadRequest, "INVALID_IOS_MATERIAL", "kind, teamId, reason (at least 3 characters) and confirm=true are required")
+	if decode(c, &body) != nil || !body.Confirm || body.ExpectedVersion < 0 || len([]rune(strings.TrimSpace(body.Reason))) < 3 ||
+		(body.TenantID != platformTenantID && !iosmaterial.ValidTenantID(body.TenantID)) {
+		problem(c, http.StatusBadRequest, "INVALID_IOS_MATERIAL", "tenantId, kind, teamId, reason (at least 3 characters) and confirm=true are required")
 		return
 	}
+	reason := clipRunes(strings.TrimSpace(body.Reason), 500)
+	if !s.deleteIOSMaterial(c, body.TenantID, body.Kind, body.TeamID, body.Scope, body.ExpectedVersion,
+		iosMaterialEmergencyRemoveAction, reason) {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"removed": true})
+}
+
+// deleteIOSMaterial 删一个租户的一格并记审计（记在这个租户名下）。出错时已经写好了响应，返回 false。
+func (s *server) deleteIOSMaterial(c *gin.Context, tenant, kind, team, scope string, expected int64, action, reason string) bool {
 	ctx := c.Request.Context()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
-		return
+		return false
 	}
 	defer tx.Rollback()
 	var current int64
-	err = tx.QueryRowContext(ctx, `SELECT version FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=? FOR UPDATE`,
-		body.Kind, body.TeamID, body.Scope).Scan(&current)
+	err = tx.QueryRowContext(ctx, `SELECT version FROM ios_signing_material WHERE tenant_id=? AND kind=? AND team_id=? AND scope=? FOR UPDATE`,
+		tenant, kind, team, scope).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
 		problem(c, http.StatusNotFound, "IOS_MATERIAL_NOT_FOUND", "No material is stored for that kind, team and scope")
-		return
+		return false
 	}
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
-		return
+		return false
 	}
-	if body.ExpectedVersion > 0 && current != body.ExpectedVersion {
+	if expected > 0 && current != expected {
 		problem(c, http.StatusConflict, "STALE_IOS_MATERIAL", "This material was replaced by a newer version; refresh and decide again")
-		return
+		return false
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=?`,
-		body.Kind, body.TeamID, body.Scope); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE tenant_id=? AND kind=? AND team_id=? AND scope=?`,
+		tenant, kind, team, scope); err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
-		return
+		return false
 	}
-	event := newAudit(platformTenantID, actor(c), "ios_material_remove", iosMaterialAuditTarget,
-		body.Kind+":"+body.TeamID+":"+body.Scope, strings.TrimSpace(body.Reason), requestID(c),
-		map[string]any{"kind": body.Kind, "teamId": body.TeamID, "scope": body.Scope, "version": current})
+	event := newAudit(tenant, actor(c), action, iosMaterialAuditTarget, kind+":"+team+":"+scope, reason, requestID(c),
+		map[string]any{"kind": kind, "teamId": team, "scope": scope, "version": current})
 	if insertAudit(ctx, tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_SAVE_FAILED", "Unable to remove the material")
-		return
+		return false
 	}
-	// 删掉之后机器下次盘点就不再看见它。上传 Key 会被打包机当作墓碑处理：下一轮同步发现清单里
-	// 这个 Team 没有上传 Key 了，就请上传账户删掉本机那一份（cmd/build-agent/ios_material.go，
-	// 只删从清单装上的）。证书与描述文件**已经装到机器上的那一份不会消失**——那要人去那台
-	// 机器上清（运维手册 §5 退役清单），或者吊销机器
-	c.JSON(http.StatusOK, gin.H{"removed": true})
+	return true
 }
 
 // ---- 构建机 ----
 
+// machineCapabilityTenantMaterial：打包机认得按租户的清单（设计 ios-tenant-owned-signing-material-2026-09-25 §4.5、
+// §12.2）。它在**取清单的请求里**带上，因为材料同步发生在认领之前。
+const machineCapabilityTenantMaterial = "tenant-signing-material"
+
 // listIOSMaterialForMachine GET /v1/build-agent/ios-material：这台机器该装哪些材料。
 // 只回清单，不回密文——密文一份一份取，每份都是几 KB 到几十 KB。
+//
+// 带了 tenant-signing-material 能力的请求拿按租户的清单；不带的（还没升级的打包机）拿按 Team 的旧行。
+// 旧版打包机永远不能拿到按租户的清单：它会把两个租户落进同一格互相覆盖，取密文时也不带租户。
 func (s *server) listIOSMaterialForMachine(c *gin.Context) {
-	// 三样材料都是这个 Team 一份、所有 Mac 共用：不再按机器筛（scopeFor 那段注释说了为什么）
-	items, err := listIOSMaterial(c.Request.Context(), s.db, "")
+	tenantLayout := c.Query("capability") == machineCapabilityTenantMaterial
+	where := "tenant_id=0"
+	if tenantLayout {
+		where = "tenant_id<>0"
+	}
+	items, err := listIOSMaterial(c.Request.Context(), s.db, where)
 	if err != nil {
 		slog.Error("cannot list the iOS signing material", "error", err)
 		problem(c, http.StatusInternalServerError, "IOS_MATERIAL_UNAVAILABLE", "Stored iOS signing material cannot be read")
 		return
 	}
 	// complete：清单没被 LIMIT 截断。打包机只在清单完整时才把"清单里没有"当成"已撤下"去删本机
-	// 的上传 Key（墓碑，cmd/build-agent/ios_material.go）——截断时删，就会把排在后面的 Team 的 Key
-	// 从每台 Mac 上删掉
-	c.JSON(http.StatusOK, gin.H{"items": items, "complete": len(items) < iosMaterialMaxRows})
+	// 的那一份（墓碑，cmd/build-agent/ios_material.go）——截断时删，就会把排在后面的材料从每台 Mac 上删掉
+	complete := len(items) < iosMaterialMaxRows
+	if !tenantLayout {
+		// 旧打包机按 Team 记本机装到第几版，旧清单里不带租户与 legacy
+		legacy := make([]gin.H, 0, len(items))
+		for _, item := range items {
+			legacy = append(legacy, gin.H{
+				"kind": item.Kind, "teamId": item.TeamID, "scope": item.Scope, "purpose": item.Purpose,
+				"recipientSha256": item.RecipientSHA256, "version": item.Version,
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"items": legacy, "complete": complete})
+		return
+	}
+	out := make([]gin.H, 0, len(items))
+	for _, item := range items {
+		out = append(out, gin.H{
+			"tenantId": item.TenantID, "kind": item.Kind, "teamId": item.TeamID, "scope": item.Scope, "purpose": item.Purpose,
+			"recipientSha256": item.RecipientSHA256, "version": item.Version, "legacy": item.Legacy,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"layout": "tenant", "items": out, "complete": complete})
 }
 
-// getIOSMaterialBox GET /v1/build-agent/ios-material/box：取一份密文，原样下发。
+// getIOSMaterialBox GET /v1/build-agent/ios-material/box：取一份密文，原样下发。不带 tenantId 取按 Team 的旧行。
 func (s *server) getIOSMaterialBox(c *gin.Context) {
+	tenant := strings.TrimSpace(c.Query("tenantId"))
+	if tenant == "" {
+		tenant = platformTenantID
+	} else if !iosmaterial.ValidTenantID(tenant) {
+		problem(c, http.StatusBadRequest, "INVALID_IOS_MATERIAL", "tenantId must be a tenant id")
+		return
+	}
 	kind := strings.TrimSpace(c.Query("kind"))
 	team := strings.TrimSpace(c.Query("teamId"))
 	scope := strings.TrimSpace(c.Query("scope"))
 	var ciphertext []byte
 	err := s.db.QueryRowContext(c.Request.Context(),
-		`SELECT ciphertext FROM ios_signing_material WHERE kind=? AND team_id=? AND scope=?`,
-		kind, team, scope).Scan(&ciphertext)
+		`SELECT ciphertext FROM ios_signing_material WHERE tenant_id=? AND kind=? AND team_id=? AND scope=?`,
+		tenant, kind, team, scope).Scan(&ciphertext)
 	if errors.Is(err, sql.ErrNoRows) {
 		problem(c, http.StatusNotFound, "IOS_MATERIAL_NOT_FOUND", "No material is stored for that kind, team and scope")
 		return

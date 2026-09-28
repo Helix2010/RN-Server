@@ -523,8 +523,8 @@ func TestDBMachineListCarriesLivenessAndTheSigningGap(t *testing.T) {
 	}
 
 	// 那个租户的证书与描述文件传上来了（下发了），这台没装上：算一个
-	uploadSealed(t, f, teamCertificate(poolTeamB), builder)
-	uploadSealed(t, f, profileMaterial(poolTeamB, "com.other.app"), builder)
+	uploadSealed(t, f, other, teamCertificate(poolTeamB), builder)
+	uploadSealed(t, f, other, profileMaterial(poolTeamB, "com.other.app"), builder)
 	_, items = list()
 	if pending, _ := liveOf(items, macs[0].ID)["pendingInstall"].(float64); pending < 1 {
 		t.Fatalf("delivered material the machine does not report must be pending: %v", pending)

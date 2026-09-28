@@ -151,7 +151,7 @@ func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result 
 		case err != nil || identity == nil:
 			detail = "这个租户的 iOS 发布身份读不出来或已被删除，这条任务不会有人认领。"
 		default:
-			coverage, err := s.iosSigningCoverage(ctx, registry, identity.Value.AppleTeamID, identity.Value.BundleID, now)
+			coverage, err := s.iosSigningCoverage(ctx, registry, item.tenant, identity.Value.AppleTeamID, identity.Value.BundleID, now)
 			if err != nil {
 				break
 			}
@@ -160,11 +160,11 @@ func (s *server) warnStalledIOSQueue(ctx context.Context, now time.Time, result 
 			if code, _ := (iosDeliveryReadiness{coverage: coverage}).problem(item.delivery, identity.Value.AppleTeamID, identity.Value.BundleID); code != "" {
 				switch code {
 				case "NO_BUILDER_FOR_TEAM":
-					detail = "没有任何一台打包机报告过它手上有 Team " + identity.Value.AppleTeamID + "、bundle id " +
-						identity.Value.BundleID + " 的签名材料——排队之后这个租户的 iOS 身份被改过，或者材料从那台 Mac 上没了。" +
-						"这条任务不会有人认领，改回去或者取消它。"
+					detail = "没有任何一台打包机报告过它手上有这个租户 Team " + identity.Value.AppleTeamID + "、bundle id " +
+						identity.Value.BundleID + " 的签名材料——排队之后这个租户的 iOS 身份被改过、材料被删掉，或者 Mac 核对材料没通过。" +
+						"这条任务不会有人认领，改回去、补上材料或者取消它。"
 				case "NO_UPLOADER_FOR_TEAM":
-					detail = "这条任务是「全托管」，但没有任何一台打包机报告过 Team " + identity.Value.AppleTeamID +
+					detail = "这条任务是「全托管」，但没有任何一台打包机报告过这个租户 Team " + identity.Value.AppleTeamID +
 						" 的上传 Key 可用（Key 被删、被吊销，或者探测一直失败）。这条任务不会有人认领，补上 Key 或者取消它。"
 				case "NO_IPA_BUILDER_FOR_TEAM":
 					detail = "这条任务是「自助上传」，但手上有这个 Team 材料的打包机都不支持把 .ipa 交回平台。" +

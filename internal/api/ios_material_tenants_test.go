@@ -9,18 +9,20 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Helix2010/RN-Server/signing/iosmaterial"
 )
 
-// 「Apple 证书与密钥」页的按租户总览（设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md）。
-// 这一组钉住：
+// 「Apple 证书与密钥」页的按租户总览（设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md、
+// RN-Server ios-tenant-owned-signing-material-2026-09-25 §3.4）。这一组钉住：
 //
-//   - 匹配：证书、上传 Key 按 Team，描述文件按 Team + bundle id；材料的 bundle id 不分大小写，
-//     机器装没装按原样（与认领同一个判据）；
-//   - 共用 Team、bundle id 重复都标出来；上传 Key 的四种用途由服务端算；
-//   - 打包机的分母只算 active 的 iOS 构建机；
-//   - 没有租户在用的材料，只有清单完整、每个租户都读得出身份时才许删；删除带版本检查。
+//   - 材料按租户匹配：每个租户只看自己那几格，描述文件再按 bundle id（不分大小写）；机器装没装与认领
+//     同一个判据；
+//   - 共用 Team、bundle id 重复都标出来；上传 Key 的三种用途由服务端算；
+//   - 打包机的分母只算 active 的 iOS 构建机；Mac 核对不过的原因列出来；
+//   - 没有租户在用的材料（含按 Team 存的旧行），只有清单完整、每个租户都读得出身份时才许删；
+//     紧急删除带租户与版本检查。
 //
 // 需要真实 MySQL（RN_TEST_MYSQL_DSN），否则整组跳过。
 
@@ -43,8 +45,8 @@ func teamUploadKey(team string) iosmaterial.Material {
 	return m
 }
 
-// seedIOSTenant 另建一个配了 iOS 身份的租户；delivery 为空表示没配过（按全托管）。
-func seedIOSTenant(t *testing.T, f *gateFixture, seed int, team, bundle, delivery string) string {
+// seedIOSTenant 另建一个配了 iOS 身份的租户，返回 id 与 slug；delivery 为空表示没配过（按全托管）。
+func seedIOSTenant(t *testing.T, f *gateFixture, seed int, team, bundle, delivery string) (string, string) {
 	t.Helper()
 	tenant := testTenant(seed)
 	slug := seedBuildTenant(t, f.s, tenant)
@@ -56,7 +58,7 @@ func seedIOSTenant(t *testing.T, f *gateFixture, seed int, team, bundle, deliver
 	if delivery != "" {
 		setIOSDelivery(t, f, tenant, delivery)
 	}
-	return slug
+	return tenant, slug
 }
 
 func setIOSDelivery(t *testing.T, f *gateFixture, tenant, mode string) {
@@ -68,10 +70,28 @@ func setIOSDelivery(t *testing.T, f *gateFixture, tenant, mode string) {
 	}
 }
 
-func uploadSealed(t *testing.T, f *gateFixture, m iosmaterial.Material, key *sealedboxKey) {
+// uploadSealed 直接把一份这个租户的材料存进库，不走租户接口的核对：这一组要摆出「bundle id 大小写不同」
+// 「Team 已经改了」这类租户接口本来会拒的局面。tenant 为 "0" 时存成按 Team 的旧行（v1）。
+func uploadSealed(t *testing.T, f *gateFixture, tenant string, m iosmaterial.Material, key *sealedboxKey) {
 	t.Helper()
-	if code, body := uploadMaterialBox(t, f, sealMaterial(t, m, key)); code != http.StatusOK {
-		t.Fatalf("upload %s: %d %v", m.Kind, code, body)
+	if tenant != platformTenantID {
+		m.TenantID = tenant
+	}
+	raw := sealMaterial(t, m, key)
+	box, err := iosmaterial.ParseBox(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := storeIOSMaterial(t.Context(), tx, tenant, box, raw, "tester@example.com", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -167,14 +187,19 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 同 Team 的两个自助上传租户，bundle id 只差大小写——bundle id 目前不查重
-	beta := seedIOSTenant(t, f, 151, team, "com.pool.beta", iosDeliveryIPA)
-	gamma := seedIOSTenant(t, f, 152, team, "com.pool.BETA", iosDeliveryIPA)
+	betaID, beta := seedIOSTenant(t, f, 151, team, "com.pool.beta", iosDeliveryIPA)
+	gammaID, gamma := seedIOSTenant(t, f, 152, team, "com.pool.BETA", iosDeliveryIPA)
 
-	uploadSealed(t, f, teamCertificate(team), builder)
-	uploadSealed(t, f, teamUploadKey(team), uploader)
+	uploadSealed(t, f, f.tenant, teamCertificate(team), builder)
+	uploadSealed(t, f, f.tenant, teamUploadKey(team), uploader)
 	// 描述文件的 bundle id 与 alpha 的身份只差大小写：照样算 alpha 的
-	uploadSealed(t, f, profileMaterial(team, "COM.POOL.ALPHA"), builder)
-	uploadSealed(t, f, profileMaterial(team, "com.pool.gone"), builder)
+	uploadSealed(t, f, f.tenant, profileMaterial(team, "COM.POOL.ALPHA"), builder)
+	// alpha 名下一份别的 App 的描述文件：没人在用
+	uploadSealed(t, f, f.tenant, profileMaterial(team, "com.pool.gone"), builder)
+	// beta 交了自己的证书；gamma 什么都没交。alpha 的证书与 beta 无关
+	uploadSealed(t, f, betaID, teamCertificate(team), builder)
+	// 按 Team 存的旧行：不属于任何租户，只给还没升级的打包机
+	uploadSealed(t, f, platformTenantID, teamCertificate(team), builder)
 
 	// 分母只算 active 的 iOS 构建机：另登记一台吊销的 iOS 构建机与一台只打 Android 的
 	mac := macs[0].record("")
@@ -184,8 +209,20 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 	android := newGateMachine(t, machineRoleBuilder, "linux-"+uniqueSuffix()).record("")
 	android.Platforms = []string{buildPlatformAndroid}
 	f.writeMachines(f.primary.record(signerRolePrimary), f.standby.record(signerRoleStandby), mac, revoked, android)
-	if r := iosClaim(f, macs[0], []appleTeamReport{{TeamID: team, BundleIDs: []string{"com.pool.alpha", "com.pool.beta"},
-		ExpiresAt: "2027-03-01T00:00:00Z", UploadProbe: uploadProbeOK}}); r.Code != http.StatusNoContent {
+	// 按租户自报：alpha 就绪；beta 的描述文件还没交，证书在；gamma 的 Mac 核对不过
+	reports := []tenantMaterialReport{
+		{TenantID: f.tenant, TeamID: team, BundleIDs: []string{"com.pool.alpha"}, CertificateSHA1: testCertificateSHA1,
+			CertificateReady: true, ExpiresAt: "2027-03-01T00:00:00Z", UploadProbe: uploadProbeOK},
+		{TenantID: betaID, TeamID: team, BundleIDs: []string{}, CertificateSHA1: testCertificateSHA1, CertificateReady: true,
+			ExpiresAt: "2027-02-01T00:00:00Z", UploadProbe: uploadProbeMissing},
+		{TenantID: gammaID, TeamID: team, BundleIDs: []string{}, UploadProbe: uploadProbeMissing,
+			Problems: []string{"certificate: the certificate belongs to team ZZZZZZZZZZ"}},
+	}
+	if r := f.do(http.MethodPost, "/v1/build-agent/claim", macs[0].Token, nil, map[string]any{
+		"platforms": []string{buildPlatformIOS}, "kinds": []string{jobKindAPK},
+		"agentCommit": "1111111111111111111111111111111111111111", "os": machineOSDarwin,
+		"appleTeams": teamReport(team, "com.pool.alpha", "com.pool.beta"), "tenantMaterial": reports, "freeGb": 120,
+	}); r.Code != http.StatusNoContent {
 		t.Fatalf("claim: %d %s", r.Code, r.Body.String())
 	}
 
@@ -196,13 +233,14 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 	}
 
 	row := materialTenantRow(t, body, alpha)
-	if row["current"] != true || row["delivery"] != iosDeliveryTestFlight || row["uploadKeyUse"] != iosUploadKeyRequired {
+	if row["tenantId"] != f.tenant || row["current"] != true || row["delivery"] != iosDeliveryTestFlight || row["uploadKeyUse"] != iosUploadKeyRequired {
 		t.Fatalf("alpha is the current, fully managed tenant: %v", row)
 	}
 	if row["certificate"] == nil || row["uploadKey"] == nil || row["profile"] == nil {
 		t.Fatalf("alpha's certificate, upload key and profile (bundle id in another case) are all stored: %v", row)
 	}
-	if certificate := row["certificate"].(map[string]any); certificate["stale"] != false || certificate["version"].(float64) < float64(materialVersionFloor) {
+	if certificate := row["certificate"].(map[string]any); certificate["stale"] != false || certificate["legacy"] != false ||
+		certificate["version"].(float64) < float64(materialVersionFloor) {
 		t.Fatalf("certificate slot: %v", certificate)
 	}
 	// 删除按表里存的原样精确匹配，所以 slot 要交回存的 scope，而不是租户身份里的写法
@@ -220,9 +258,11 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 		t.Fatalf("alpha can be queued: %v", readiness)
 	}
 
+	// beta 有自己的证书，没有描述文件；alpha 的材料不算它的
 	row = materialTenantRow(t, body, beta)
-	if row["current"] != false || row["profile"] != nil || row["uploadKeyUse"] != iosUploadKeyKeptForOthers {
-		t.Fatalf("beta has no profile and the team's upload key is kept for alpha: %v", row)
+	if row["current"] != false || row["certificate"] == nil || row["profile"] != nil || row["uploadKey"] != nil ||
+		row["uploadKeyUse"] != iosUploadKeyNotNeeded {
+		t.Fatalf("beta holds its own certificate only: %v", row)
 	}
 	if got := slugList(row["teamTestFlightTenants"]); len(got) != 1 || got[0] != alpha {
 		t.Fatalf("alpha is the fully managed tenant on beta's team: %v", got)
@@ -230,30 +270,46 @@ func TestDBIOSMaterialByTenant(t *testing.T) {
 	if got := slugList(row["bundleTenants"]); len(got) != 1 || got[0] != gamma {
 		t.Fatalf("gamma registered the same bundle id: %v", got)
 	}
-	if readiness := row["readiness"].(map[string]any); readiness["ready"] != false || readiness["code"] != "NO_IPA_BUILDER_FOR_TEAM" {
-		t.Fatalf("no builder can hand an .ipa back yet: %v", readiness)
+	if onMac := row["machines"].([]any)[0].(map[string]any); onMac["installed"] != false || row["earliestExpiry"] != "2027-02-01T00:00:00Z" {
+		t.Fatalf("beta has no profile on the Mac: %v", row)
 	}
-	// gamma 的 bundle id 大小写与 Mac 报的不一样：认领按原样比，任务派不出去，这里就该显示没装
+	// gamma：Mac 核对不过，原因原样列出来
 	row = materialTenantRow(t, body, gamma)
-	if row["machines"].([]any)[0].(map[string]any)["installed"] != false {
-		t.Fatalf("a bundle id in another case is not what the Mac reported: %v", row)
+	if onMac := row["machines"].([]any)[0].(map[string]any); onMac["installed"] != false || len(onMac["problems"].([]any)) != 1 {
+		t.Fatalf("gamma on the Mac: %v", row)
+	}
+	rejected := false
+	for _, raw := range row["problems"].([]any) {
+		problem := raw.(map[string]any)
+		rejected = rejected || (problem["code"] == "mac-rejected" && problem["count"] == float64(1) &&
+			strings.HasPrefix(problem["detail"].(string), "certificate: "))
+	}
+	if !rejected {
+		t.Fatalf("gamma's Mac rejection must be a problem: %v", row["problems"])
 	}
 
 	orphans, _ := body["orphans"].([]any)
-	if len(orphans) != 1 || orphans[0].(map[string]any)["scope"] != "com.pool.gone" {
-		t.Fatalf("only the profile nobody uses is an orphan: %v", orphans)
+	var scopes []string
+	for _, raw := range orphans {
+		orphan := raw.(map[string]any)
+		scopes = append(scopes, orphan["tenantId"].(string)+"/"+orphan["kind"].(string)+"/"+orphan["scope"].(string))
+	}
+	sort.Strings(scopes)
+	if len(scopes) != 2 || scopes[0] != "0/certificate/" || scopes[1] != f.tenant+"/profile/com.pool.gone" {
+		t.Fatalf("the legacy row and alpha's unused profile are the orphans: %v", orphans)
 	}
 	invalid, _ := body["invalidTenants"].([]any)
 	if body["orphansDeletable"] != (body["complete"] == true && len(invalid) == 0) {
 		t.Fatalf("orphans are deletable only with a complete list and no unreadable tenant: %v", body)
 	}
 
-	// alpha 也切到自助上传：同 Team 没有全托管租户了，这把上传 Key 按设计就该撤下
+	// alpha 切到自助上传：它自己的上传 Key 该撤下，与同 Team 的别人无关
 	setIOSDelivery(t, f, f.tenant, iosDeliveryIPA)
-	if row := materialTenantRow(t, materialTenants(t, f, team), beta); row["uploadKeyUse"] != iosUploadKeyWithdraw {
-		t.Fatalf("an upload key nobody on the team needs should be withdrawn: %v", row)
+	if row := materialTenantRow(t, materialTenants(t, f, team), alpha); row["uploadKeyUse"] != iosUploadKeyWithdraw {
+		t.Fatalf("a self-upload tenant still holding an upload key should withdraw it: %v", row)
 	}
-	remove := map[string]any{"kind": iosmaterial.KindUploadKey, "teamId": team, "scope": "", "reason": "withdrawn by hand", "confirm": true}
+	remove := map[string]any{"tenantId": f.tenant, "kind": iosmaterial.KindUploadKey, "teamId": team, "scope": "",
+		"reason": "withdrawn by hand", "confirm": true}
 	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", remove); r.Code != http.StatusOK {
 		t.Fatalf("remove the upload key: %d %s", r.Code, r.Body.String())
 	}
@@ -274,7 +330,7 @@ func TestDBIOSMaterialOrphansAreNotDeletableWithAnUnreadableTenant(t *testing.T)
 	clearStoredMaterial(t, f)
 	builder, _ := materialKeys(t, f)
 	team := "Z" + strings.ToUpper(uniqueSuffix() + "000000000")[:9]
-	uploadSealed(t, f, profileMaterial(team, "com.nobody.app"), builder)
+	uploadSealed(t, f, f.tenant, profileMaterial(team, "com.nobody.app"), builder)
 
 	broken := testTenant(154)
 	slug := seedBuildTenant(t, f.s, broken)
@@ -306,17 +362,10 @@ func TestDBIOSMaterialRemovalChecksTheVersion(t *testing.T) {
 	f, _ := newIOSPool(t, 155, 1)
 	clearStoredMaterial(t, f)
 	builder, _ := materialKeys(t, f)
-	version := func() int64 {
-		code, body := uploadMaterialBox(t, f, sealMaterial(t, certificateMaterial(), builder))
-		v, _ := body["version"].(float64)
-		if code != http.StatusOK || v <= 0 {
-			t.Fatalf("upload: %d %v", code, body)
-		}
-		return int64(v)
-	}
+	version := func() int64 { return int64(uploadOwn(t, f, certificateMaterial(), builder)) }
 	older, current := version(), version()
 	body := func(version int64) map[string]any {
-		return map[string]any{"kind": iosmaterial.KindCertificate, "teamId": materialTeam, "scope": "",
+		return map[string]any{"tenantId": f.tenant, "kind": iosmaterial.KindCertificate, "teamId": materialTeam, "scope": "",
 			"expectedVersion": version, "reason": "the certificate was revoked at Apple", "confirm": true}
 	}
 	if r := f.adminDo(http.MethodPost, "/v1/admin/platform/ios-material/remove", body(older)); r.Code != http.StatusConflict || problemCode(t, r) != "STALE_IOS_MATERIAL" {
@@ -357,15 +406,18 @@ func TestDBIOSMaterialByTenantStatusFiltersAndPages(t *testing.T) {
 	if err := f.db.QueryRow(`SELECT slug FROM tenants WHERE id=?`, f.tenant).Scan(&alpha); err != nil {
 		t.Fatal(err)
 	}
-	beta := seedIOSTenant(t, f, 159, team, "com.s.beta", iosDeliveryIPA)
-	gamma := seedIOSTenant(t, f, 160, team, "com.s.gamma", iosDeliveryIPA)
+	betaID, beta := seedIOSTenant(t, f, 159, team, "com.s.beta", iosDeliveryIPA)
+	gammaID, gamma := seedIOSTenant(t, f, 160, team, "com.s.gamma", iosDeliveryIPA)
 	// delta 没传描述文件、Mac 也没报它：缺材料，而且不算"这台机器没装上"
-	delta := seedIOSTenant(t, f, 161, team, "com.s.delta", iosDeliveryIPA)
-	uploadSealed(t, f, teamCertificate(team), builder)
-	uploadSealed(t, f, teamUploadKey(team), uploader)
-	uploadSealed(t, f, profileMaterial(team, "com.s.alpha"), builder)
-	uploadSealed(t, f, profileMaterial(team, "com.s.gamma"), builder)
-	// Mac 报了 alpha 与 beta，没报 gamma
+	deltaID, delta := seedIOSTenant(t, f, 161, team, "com.s.delta", iosDeliveryIPA)
+	uploadSealed(t, f, f.tenant, teamCertificate(team), builder)
+	uploadSealed(t, f, f.tenant, teamUploadKey(team), uploader)
+	uploadSealed(t, f, f.tenant, profileMaterial(team, "com.s.alpha"), builder)
+	for _, tenant := range []string{betaID, gammaID, deltaID} {
+		uploadSealed(t, f, tenant, teamCertificate(team), builder)
+	}
+	uploadSealed(t, f, gammaID, profileMaterial(team, "com.s.gamma"), builder)
+	// Mac 这一轮还是旧版代理，按 Team 报了 alpha 与 beta 的 bundle，没报 gamma：旧机器照旧按 Team 算
 	if r := iosClaim(f, macs[0], []appleTeamReport{{TeamID: team, BundleIDs: []string{"com.s.alpha", "com.s.beta"},
 		ExpiresAt: "2027-03-01T00:00:00Z", UploadProbe: uploadProbeOK}}); r.Code != http.StatusNoContent {
 		t.Fatalf("claim: %d %s", r.Code, r.Body.String())
