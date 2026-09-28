@@ -21,7 +21,7 @@ import (
 //   - 控制台成员：跨租户只读，按租户分组（§7 第 3 条）；
 //   - 租户打包目录（repoDirectory）：只有这里能改，值仍存在各租户的 build.android（§7 第 1 条）；
 //   - 外部系统关联（services.predict）：只有这里能改，值仍存在各租户的 mobile-bootstrap（§7 第 2 条）；
-//   - 平台推送默认、平台发布存储默认与 CORS 汇总：原来是平台会话在租户页面上的特权，挪到这里（§5）。
+//   - 平台推送默认、平台发布存储默认与 CORS 汇总：原来是平台会话在租户接口上的特权，挪到这里（§5）。
 
 // platformTenant 是租户列表的一行。
 type platformTenant struct {
@@ -460,7 +460,7 @@ func (s *server) getPlatformPushCredentials(c *gin.Context) {
 
 // platformPushView 是平台控制台上的推送凭据视图（GET 与写、删之后的响应共用）。
 func (s *server) platformPushView(ctx context.Context) (gin.H, error) {
-	view, err := s.pushCredentialsView(ctx, pushcreds.PlatformTenant, true)
+	view, err := s.pushCredentialsView(ctx, pushcreds.PlatformTenant)
 	if err != nil {
 		return nil, err
 	}
@@ -496,19 +496,19 @@ func (s *server) getPlatformReleaseStorage(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_QUERY_FAILED", "Unable to load release storage configuration")
 		return
 	}
-	view := releaseStorageView(record, platformTenantID, true)
+	view := releaseStorageView(record, platformTenantID)
 	view["inheritors"] = inheritors
 	c.JSON(http.StatusOK, view)
 }
 
 // updatePlatformReleaseStorage PUT /v1/admin/platform/release-storage：改平台默认那一行，所有没单独配的租户都继承它。
 func (s *server) updatePlatformReleaseStorage(c *gin.Context) {
-	s.writeReleaseStorage(c, platformTenantID, true)
+	s.writeReleaseStorage(c, platformTenantID)
 }
 
 // testPlatformReleaseStorage POST /v1/admin/platform/release-storage/test
 func (s *server) testPlatformReleaseStorage(c *gin.Context) {
-	s.checkReleaseStorage(c, platformTenantID, true)
+	s.checkReleaseStorage(c, platformTenantID)
 }
 
 // platformBucketCORS GET /v1/admin/platform/release-storage/cors：全平台所有租户域名的并集（共用的桶要放行所有租户）。

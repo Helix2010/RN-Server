@@ -426,14 +426,24 @@ func TestBuildJobViewCarriesSigningFields(t *testing.T) {
 		Provenance:        []byte(`{"statement":"c2VjcmV0","signature":"x"}`),
 		SignOutcome:       []byte(`{"kind":"deferred","code":"NOT_CONFIRMED","detail":"not yet","machineId":"mch_signer","at":"2026-09-16T00:00:00.000Z"}`),
 	}
-	view := buildJobViewWithMachines(job, map[string]string{"mch_signer": "amos-signer-a"})
+	view := buildJobView(job)
 	for key, want := range map[string]any{
 		"attempt": 2, "signAttempt": 3, "signFailures": 1, "claimedMachineId": "mch_builder", "signingMachineId": "mch_signer",
-		"signingMachineName": "amos-signer-a", "unsignedSha256": strings.Repeat("a", 64), "commitSelfReported": true,
+		"unsignedSha256": strings.Repeat("a", 64), "commitSelfReported": true,
 	} {
 		if view[key] != want {
 			t.Fatalf("view[%s] = %#v, want %#v", key, view[key], want)
 		}
+	}
+	// 给租户控制台的视图看不到是哪台机器
+	tenantView := tenantJobView(job)
+	for _, key := range []string{"claimedBy", "claimedMachineId", "signingMachineId", "signingMachineName"} {
+		if value, present := tenantView[key]; present {
+			t.Fatalf("tenant view[%s] = %#v, want absent", key, value)
+		}
+	}
+	if _, present := tenantView["signOutcome"].(gin.H)["machineId"]; present {
+		t.Fatalf("tenant view signOutcome = %#v", tenantView["signOutcome"])
 	}
 	outcome, ok := view["signOutcome"].(gin.H)
 	if !ok || outcome["kind"] != "deferred" || outcome["code"] != "NOT_CONFIRMED" {

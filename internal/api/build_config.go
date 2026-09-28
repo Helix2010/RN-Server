@@ -202,18 +202,16 @@ func (s *server) saveBuildConfig(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CONFIG", detail)
 		return
 	}
-	// 仓库目录决定打包机从 App 仓库的哪个目录取租户文件，是平台的部署结构，不归租户管
-	// （设计 tenant-console-accounts-and-sso §3.4）：租户会话只能原样带回现在的值
-	if !isPlatformSession(c) {
-		stored, _, err := s.buildConfigFor(c.Request.Context(), tenantID(c), strings.TrimSpace(slug))
-		if err != nil {
-			problem(c, http.StatusInternalServerError, "BUILD_CONFIG_INVALID", "Stored build.android configuration is invalid")
-			return
-		}
-		if directory != stored.RepoDirectory {
-			problem(c, http.StatusForbidden, "REPO_DIRECTORY_PLATFORM_ONLY", "Only the platform administrator can change repoDirectory")
-			return
-		}
+	// 仓库目录决定打包机从 App 仓库的哪个目录取租户文件，是平台的部署结构，不归租户管：在平台控制台
+	// 「租户打包目录」里改（设计 service-and-console-split-2026-09-27 §7 第 1 条），这里只能原样带回现在的值
+	stored, _, err := s.buildConfigFor(c.Request.Context(), tenantID(c), strings.TrimSpace(slug))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_CONFIG_INVALID", "Stored build.android configuration is invalid")
+		return
+	}
+	if directory != stored.RepoDirectory {
+		problem(c, http.StatusForbidden, "REPO_DIRECTORY_PLATFORM_ONLY", "Only the platform administrator can change repoDirectory")
+		return
 	}
 	// 存规范写法：读的人（控制台、合成 tenant.json、信任根）看到的都是同一个字符串
 	body.Identity.APIBaseURL = canonicalAPIBaseURL(body.Identity.APIBaseURL)

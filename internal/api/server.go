@@ -414,9 +414,6 @@ func (s *server) registerTenantAdminRoutes(protected *gin.RouterGroup) {
 	current := protected.Group("")
 	current.Use(s.domainTenantScope(), requireAdminSessionTenant())
 	current.GET("/tenant", s.currentTenant)
-	// 控制台成员（当前域名的租户）的只读列表，只给平台管理员：账号由外部系统维护
-	// （设计 console-accounts-external-maintenance-2026-09-27）
-	current.GET("/tenant-accounts", s.requirePlatformAdmin(), s.listTenantAccounts)
 	s.registerTenantRoutes(current)
 }
 
@@ -435,9 +432,9 @@ func (s *server) currentTenant(c *gin.Context) {
 }
 
 func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
-	// sf：敏感操作，租户会话要 15 分钟内通过邮箱二次验证（设计 tenant-console-accounts-and-sso §4.5）。
+	// sf：敏感操作，控制台会话要 15 分钟内通过邮箱二次验证（设计 tenant-console-accounts-and-sso §4.5）。
 	// 范围：签名密钥与签名材料、推送凭据、App Manager Key、发布身份、存储凭据、切换交付方式、
-	// 发版与热更新的放量 / 回滚 / 删除。平台会话不受影响
+	// 发版与热更新的放量 / 回滚 / 删除。自动化通道不受影响
 	sf := s.requireSecondFactor()
 	group.GET("/overview", s.overview)
 	group.GET("/installations/overview", s.installationOverview)
@@ -474,9 +471,6 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	group.GET("/wallet/index-status", s.tenantIndexStatus)
 	group.GET("/app-config", s.getAppConfig)
 	group.PATCH("/app-config", s.updateAppConfig)
-	// 只给平台会话：预测平台的配置归平台（§3.4），而且探测会去连任意 https 地址。
-	// 与保存 services.predict 同一个判据（isPlatformSession），能存的就能测
-	group.POST("/predict/probe", requirePlatformSession(), s.probePredictService)
 	group.GET("/branding", s.getBranding)
 	group.PATCH("/branding", s.updateBranding)
 	group.GET("/tokens", s.listTokens)
@@ -827,6 +821,10 @@ func scanRelease(row scanner) (release, error) {
 	}
 	_ = json.Unmarshal(notes, &r.ReleaseNotes)
 	_ = json.Unmarshal(metadata, &r.FileMetadata)
+	// 库里记全链路（哪台构建机、哪台签名闸，signer.go / ios_build_release.go），但发布记录只给租户控制台看：
+	// 机器是平台的基础设施，与任务视图一样不给（设计 service-and-console-split-2026-09-27 §5）
+	delete(r.FileMetadata, "builderId")
+	delete(r.FileMetadata, "signerMachineId")
 	if fileName.Valid {
 		r.FileName = &fileName.String
 	}
@@ -1162,16 +1160,13 @@ func (s *server) listAudits(c *gin.Context) {
 	}
 	defer rows.Close()
 	items, cursors := []auditEvent{}, []string{}
-	platformView := isPlatformSession(c)
 	for rows.Next() {
 		item, created, err := scanAudit(rows, tenant)
 		if err != nil {
 			problem(c, 500, "AUDIT_QUERY_FAILED", "Unable to read audit events")
 			return
 		}
-		if !platformView {
-			redactAuditForTenant(&item)
-		}
+		redactAuditForTenant(&item)
 		items, cursors = append(items, item), append(cursors, encodeListCursor(created, item.ID))
 	}
 	if err := rows.Err(); err != nil {
@@ -1182,8 +1177,8 @@ func (s *server) listAudits(c *gin.Context) {
 	c.JSON(200, listResponse(items, total, next, page.limit))
 }
 
-// tenantHiddenAuditKeys 是审计摘要里指向平台基础设施与别的租户的字段。审计按租户存、租户会话能读，
-// 读的时候拿掉（设计 tenant-console-accounts-and-sso §3.4）；平台会话照旧看全。
+// tenantHiddenAuditKeys 是审计摘要里指向平台基础设施与别的租户的字段。审计按租户存、租户控制台能读，
+// 读的时候拿掉（设计 tenant-console-accounts-and-sso §3.4）。
 var tenantHiddenAuditKeys = map[string]bool{
 	"machineId": true, "machineName": true, "claimedBy": true, "signingMachineId": true,
 	"generatorMachineId": true, "generatorName": true, "signerMachineId": true, "signerName": true,
@@ -1222,7 +1217,7 @@ func parseAuditListFilter(c *gin.Context, tenant string) (sqlWhere, listPage, st
 
 const auditColumns = `id,actor_id,action,target_type,target_id,reason,request_id,summary,created_at`
 
-// queryAudits 某一个目标的审计记录（发布详情里用）。
+// queryAudits 某一个目标的审计记录（发布详情里用）。给租户控制台看，与审计列表一样拿掉机器与别的租户。
 func (s *server) queryAudits(ctx context.Context, tenant, target string) ([]auditEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+auditColumns+` FROM audit_events WHERE tenant_id=? AND target_id=? ORDER BY created_at DESC LIMIT 1000`, tenant, target)
 	if err != nil {
@@ -1235,6 +1230,7 @@ func (s *server) queryAudits(ctx context.Context, tenant, target string) ([]audi
 		if err != nil {
 			return nil, err
 		}
+		redactAuditForTenant(&item)
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -1373,9 +1369,10 @@ func (s *server) updateAppConfig(c *gin.Context) {
 			problem(c, 400, "INVALID_SERVICES_CONFIG", err.Error())
 			return
 		}
-		// 预测平台的关联（域名、scopeId、链、端点）由平台管理员配（设计 tenant-console-accounts-and-sso §3.4）：
-		// scopeId 指向别的租户，App 里显示的就是别人的市场。租户会话只能原样带回
-		if !isPlatformSession(c) && !sameJSON(section, normalizeServices(storedServicesSection(stored))) {
+		// 预测平台的关联（域名、scopeId、链、端点）由平台在平台控制台「外部系统关联」里配（设计
+		// service-and-console-split-2026-09-27 §7 第 2 条）：scopeId 指向别的租户，App 里显示的就是别人的市场。
+		// 租户只能原样带回
+		if !sameJSON(section, normalizeServices(storedServicesSection(stored))) {
 			problem(c, http.StatusForbidden, "SERVICES_CONFIG_PLATFORM_ONLY", "Only the platform administrator can change services.predict")
 			return
 		}

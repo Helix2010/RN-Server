@@ -164,13 +164,14 @@ func TestDBStatusDrivenQueriesKnowTheSigningStates(t *testing.T) {
 	c, recorder := testContext(t, f.tenant, http.MethodGet, "/v1/admin/builds?status=signing", nil)
 	f.s.listBuildJobs(c)
 	items := decodeBody(t, recorder)["items"].([]any)
-	if len(items) != 1 || items[0].(map[string]any)["signingMachineName"] != f.primary.Name {
+	if len(items) != 1 || items[0].(map[string]any)["status"] != jobSigning {
 		t.Fatalf("signing filter: %v", items)
 	}
+	// 租户控制台看不到机器，也不能按机器 id 搜出任务（试探机器名）
 	for _, query := range []string{f.primary.ID, f.builder.ID} {
 		c, recorder = testContext(t, f.tenant, http.MethodGet, "/v1/admin/builds?q="+query, nil)
 		f.s.listBuildJobs(c)
-		if got := decodeBody(t, recorder)["items"].([]any); len(got) != 1 {
+		if got := decodeBody(t, recorder)["items"].([]any); len(got) != 0 {
 			t.Fatalf("searching by machine id %s: %v", query, got)
 		}
 	}
@@ -218,5 +219,37 @@ func TestDBCancelingARunningBuildStopsTheBuilderAtItsNextHeartbeat(t *testing.T)
 	}
 	if status := f.jobStatus(jobID).Status; status != jobCanceled {
 		t.Fatalf("status changed after cancel: %s", status)
+	}
+}
+
+// 平台控制台「打包机与签名闸」看机器手上的任务：租户控制台看不到是哪台机器领的
+// （设计 service-and-console-split-2026-09-27 §5）。签名中的算签名闸的，认领、构建中的算构建机的。
+func TestDBMachineListShowsCurrentJobs(t *testing.T) {
+	f := newGateFixture(t, 73)
+	jobID := f.queueBuild("8.1.0", 810)
+	currentJobs := func(machineID string) []any {
+		t.Helper()
+		r := f.adminDo(http.MethodGet, "/v1/admin/platform/machines", nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("machines: %d %s", r.Code, r.Body.String())
+		}
+		for _, raw := range decodeBody(t, r)["items"].([]any) {
+			if item := raw.(map[string]any); item["id"] == machineID {
+				return item["currentJobs"].([]any)
+			}
+		}
+		t.Fatalf("machine %s is missing", machineID)
+		return nil
+	}
+	f.setJob(jobID, "status='claimed',claimed_machine_id=?", f.builder.ID)
+	if jobs := currentJobs(f.builder.ID); len(jobs) != 1 || jobs[0].(map[string]any)["id"] != jobID || jobs[0].(map[string]any)["tenantId"] != f.tenant {
+		t.Fatalf("builder jobs = %v", jobs)
+	}
+	f.setJob(jobID, "status='signing',signing_machine_id=?,signing_heartbeat_at=?", f.primary.ID, time.Now().UTC())
+	if jobs := currentJobs(f.primary.ID); len(jobs) != 1 || jobs[0].(map[string]any)["status"] != jobSigning {
+		t.Fatalf("signer jobs = %v", jobs)
+	}
+	if jobs := currentJobs(f.builder.ID); len(jobs) != 0 {
+		t.Fatalf("the builder no longer holds a job being signed: %v", jobs)
 	}
 }

@@ -329,14 +329,6 @@ func (d buildMachinesDoc) signerByRecipient(recipient string) (buildMachine, boo
 	return buildMachine{}, false
 }
 
-func (d buildMachinesDoc) names() map[string]string {
-	out := make(map[string]string, len(d.Machines))
-	for _, m := range d.Machines {
-		out[m.ID] = m.Name
-	}
-	return out
-}
-
 // validate 是登记的不变量。库里出现不满足的值就是事故：鉴权直接失败，不猜。
 func (d buildMachinesDoc) validate() error {
 	ids := map[string]bool{}
@@ -692,16 +684,53 @@ func (s *server) listMachines(c *gin.Context) {
 	} else {
 		delivered = index.deliveredTargets(wanted)
 	}
+	// 机器手上的任务：租户控制台看不到是哪台机器领的，平台在这里看（设计 service-and-console-split-2026-09-27 §5）。
+	// 读不出来同样不挡整份登记
+	current, err := s.machineCurrentJobs(ctx)
+	if err != nil {
+		slog.Error("cannot read the jobs held by build machines; currentJobs is left empty", "error", err)
+	}
 	now := s.now()
 	for _, item := range items {
 		id, _ := item["id"].(string)
 		item["liveness"] = machineLivenessView(liveness[id], item, delivered, now)
+		jobs := current[id]
+		if jobs == nil {
+			jobs = []gin.H{}
+		}
+		item["currentJobs"] = jobs
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"version":             snapshot.Version,
 		"approvedAgentCommit": nullableString(string(snapshot.Doc.ApprovedAgentCommit)),
 		"items":               items,
 	})
+}
+
+// machineCurrentJobs 按机器列出手上的任务：构建机是它认领、还在构建的，签名闸是它在签的。
+func (s *server) machineCurrentJobs(ctx context.Context) (map[string][]gin.H, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT CASE WHEN j.status IN (`+sqlSignerActive+`) THEN j.signing_machine_id ELSE j.claimed_machine_id END,
+		       j.id, CAST(j.tenant_id AS CHAR), t.slug, j.platform, j.kind, j.version, j.build_number, j.status
+		FROM build_jobs j JOIN tenants t ON t.id=j.tenant_id
+		WHERE (j.status IN (`+sqlBuilderActive+`) AND j.claimed_machine_id IS NOT NULL)
+		   OR (j.status IN (`+sqlSignerActive+`) AND j.signing_machine_id IS NOT NULL)
+		ORDER BY j.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]gin.H{}
+	for rows.Next() {
+		var machine, id, tenant, slug, platform, kind, version, status string
+		var buildNumber int
+		if err := rows.Scan(&machine, &id, &tenant, &slug, &platform, &kind, &version, &buildNumber, &status); err != nil {
+			return nil, err
+		}
+		out[machine] = append(out[machine], gin.H{"id": id, "tenantId": tenant, "tenantSlug": slug, "platform": platform,
+			"kind": kind, "version": version, "buildNumber": buildNumber, "status": status})
+	}
+	return out, rows.Err()
 }
 
 type machineWriteCommon struct {

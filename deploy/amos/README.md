@@ -90,8 +90,8 @@ Docker 的端口映射兜底，这几个端口就绕过 nginx 直接对外了）
 
 nginx 按路径分给三个进程（`nginx-rn-foundation.conf` 顶上的三个 `upstream`，各 location 用
 `set $rn_service` 选）：`api.*` 上机器接口到平台端、其余到 App 端，所以 App 端碰不到管理接口；`console.*`
-的 `/v1/` 与统一登录回调到租户端。过渡期平台管理员还在租户控制台上做平台维护，`console.*` 的
-`/v1/admin/platform/` 到平台端——平台控制台（platform.anyfun.win）上线后这一段删掉。
+的 `/v1/` 与统一登录回调到租户端（租户控制台上没有平台接口）；`platform.anyfun.win` 的 `/v1/admin/` 与统一登录
+回调到平台端。
 
 **租户是按 Host 头认的**（`tenant_domain` 表）。所以反代必须原样传 `$host`；
 amos 上原有那份 `console.any123.top` 写的是 `proxy_set_header Host 127.0.0.1:13080`，

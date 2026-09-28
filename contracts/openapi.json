@@ -353,7 +353,7 @@
             "description": "STALE_APP_CONFIG, IOS_MIN_VERSION_NOT_INSTALLABLE (self-upload iOS tenant: the iOS minimum supported version was raised past the highest build marked installable)"
           },
           "403": {
-            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：SERVICES_CONFIG_PLATFORM_ONLY：services.predict 只能原样带回，只有平台管理员能改; SECOND_FACTOR_REQUIRED：租户会话改 wallet 段（RPC、WalletConnect、onchainSends）要 15 分钟内通过邮箱二次验证"
+            "description": "SERVICES_CONFIG_PLATFORM_ONLY：services.predict 只能原样带回，由平台在平台控制台「外部系统关联」（PUT /v1/admin/platform/predict-links/{tenantId}）改; SECOND_FACTOR_REQUIRED：改 wallet 段（RPC、WalletConnect、onchainSends）要 15 分钟内通过邮箱二次验证"
           }
         }
       }
@@ -916,7 +916,7 @@
             "description": "OTA state transition, canary audience change or rollback directive"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -1147,7 +1147,7 @@
             "description": "STORAGE_ENDPOINT_INSECURE: in production, endpoint and publicBaseUrl must use https (direct-upload presigned URLs are derived from the endpoint); 租户会话（tenant-console-accounts-and-sso §3.4）：STORAGE_CREDENTIALS_REQUIRED：继承平台存储时不带凭据保存会被拒（不能借平台的密钥换成自己的地址）"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -1158,7 +1158,7 @@
         "description": "The bucket CORS rule a `direct` upload deployment would need, with the origins derived from the tenant_domain table so that adding a tenant does not mean editing a config file. Only relevant when ARTIFACT_UPLOAD_MODE=direct, where the browser PUTs straight to object storage and the bucket must allow the console origins itself. Under `proxy` (the default for deployments whose storage key has no bucket-configuration permission) uploads are streamed through the server and the bucket needs no CORS rule at all. The server never writes the rule.",
         "responses": {
           "200": {
-            "description": "The rule to configure on the bucket 平台会话给全平台租户域名的并集；租户会话只给本租户的域名。"
+            "description": "The rule to configure on the bucket 只给本租户的域名；全平台的并集见 GET /v1/admin/platform/release-storage/cors。"
           }
         }
       }
@@ -1257,7 +1257,7 @@
             "description": "STORAGE_UNAVAILABLE (release storage not configured, or an http endpoint in production)"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -1312,7 +1312,7 @@
             "description": "CANARY_AUDIENCE_REQUIRED, CANARY_AUDIENCE_INVALID, CANARY_AUDIENCE_TOO_LARGE, CANARY_INSTALLATION_UNKNOWN or CANARY_AUDIENCE_LOOKUP_FAILED"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -2213,53 +2213,6 @@
         }
       }
     },
-    "/v1/admin/predict/probe": {
-      "post": {
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "domain",
-                  "scopeId",
-                  "chain"
-                ],
-                "properties": {
-                  "domain": {
-                    "type": "string",
-                    "description": "Bare hostname of the tenant on the prediction platform"
-                  },
-                  "scopeId": {
-                    "type": "string",
-                    "description": "0x + 64 hex, the platform tenant scope"
-                  },
-                  "chain": {
-                    "type": "string",
-                    "description": "Chain id from the platform chain catalog (e.g. op-sepolia)"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Probe result: ok, brand, chainId, chainName, scopeId and problems[] (scope or chain mismatch against gamma-api.{domain}/public-info)"
-          },
-          "400": {
-            "description": "INVALID_SERVICES_CONFIG"
-          },
-          "424": {
-            "description": "PREDICT_PROBE_FAILED: gamma-api.{domain} unreachable, non-200 or not JSON"
-          },
-          "403": {
-            "description": "PLATFORM_ADMIN_REQUIRED：只给平台会话"
-          }
-        }
-      }
-    },
     "/v1/admin/platform/scan/chains": {
       "get": {
         "summary": "扫链管理：目录 × 配置 × 状态 × 统计一览",
@@ -2860,7 +2813,7 @@
             "description": "RELEASE_SIGNER_RETIRED: signerSha256 is a retired tenant signing certificate and can never be registered again"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -2907,7 +2860,7 @@
             "description": "RELEASE_IDENTITY_CONFIG_INVALID (stored pin is invalid and must be repaired by migration), RELEASE_IDENTITY_SAVE_FAILED"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -2958,7 +2911,7 @@
             "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -2994,7 +2947,7 @@
             "description": "OTA_SIGNING_CONFIG_INVALID, OTA_SIGNING_SAVE_FAILED"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -3078,7 +3031,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore 租户会话（tenant-console-accounts-and-sso §3.4）：claimedBy、claimedMachineId、signingMachineId、signingMachineName、signOutcome.machineId 为 null；q 不按机器名与机器 id 搜。"
+            "description": "Build jobs (items are BuildJob), next defaults, gitRef, total, limit, nextCursor, hasMore 看不到是哪台机器领的、哪台在签：不给 claimedBy、claimedMachineId、signingMachineId 与 signOutcome.machineId，q 也不按机器搜（机器手上的任务在 GET /v1/admin/platform/machines 的 currentJobs）。"
           },
           "401": {
             "description": "Admin authentication required"
@@ -3316,7 +3269,7 @@
             "description": "STALE_BUILD_CONFIG or APP_IDENTITY_CHANGE"
           },
           "403": {
-            "description": "租户会话（tenant-console-accounts-and-sso §3.4）：REPO_DIRECTORY_PLATFORM_ONLY：repoDirectory 只能原样带回，只有平台管理员能改"
+            "description": "REPO_DIRECTORY_PLATFORM_ONLY：repoDirectory 只能原样带回，由平台在平台控制台「租户打包目录」（PUT /v1/admin/platform/build-directories/{tenantId}）改"
           }
         }
       }
@@ -3387,7 +3340,7 @@
             "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -3444,7 +3397,7 @@
             "description": "MACHINE_REGISTRY_UNAVAILABLE, RECOVERY_KEYS_UNAVAILABLE"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -3480,7 +3433,7 @@
             "description": "RECOVERY_KEYS_UNAVAILABLE"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -4301,7 +4254,7 @@
         "description": "The build.machines registry. Console acceptance only affects routing: signers and the offline tool trust their local records and the offline pin file. The response also carries approvedAgentCommit (the build-agent version machines must run) and, per machine, a liveness block.",
         "responses": {
           "200": {
-            "description": "Registry",
+            "description": "Registry 每台机器另带 currentJobs：它手上的任务 [{id, tenantId, tenantSlug, platform, kind, version, buildNumber, status}]（构建机是认领、构建中的，签名闸是签名中的；租户控制台看不到是哪台机器领的）。",
             "content": {
               "application/json": {
                 "schema": {
@@ -7085,7 +7038,7 @@
             "description": "STORAGE_MASTER_KEY_REQUIRED"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       },
@@ -7116,7 +7069,7 @@
             "description": "IOS_ASC_NOT_FOUND"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -7127,7 +7080,7 @@
         "description": "Fully managed (testflight: the platform uploads to TestFlight with the tenant's upload key) or self-upload (ipa: the platform hands over the App Store-signed .ipa and the tenant uploads it). Also returns what a switch has to look at: whether each mode can be queued right now, unfinished iOS builds (a switch is refused while any exist), whether the platform still stores an App Manager key, and other tenants on the same Apple team that stay fully managed (the team's upload key then remains on the build machines). Design ios-tenant-delivery-tiers-2026-09-24.",
         "responses": {
           "200": {
-            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithTestFlightTenants[slug], readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered 租户会话（tenant-console-accounts-and-sso §3.4）：多一个 teamSharedWithOtherTenants 布尔值；teamSharedWithTestFlightTenants 只给平台会话，租户会话是空数组。"
+            "description": "{mode, configured, version, updatedBy, updatedAt, unfinishedJobs[{id,status,buildNumber,delivery}], ascKeyStored, keysToRevoke{appManagerKey, uploadKey}, teamSharedWithOtherTenants（这个 Apple Team 还有别的全托管租户，不点名）, readiness{testflight|ipa: {ready, code, detail, online}}}. readiness is empty until release.ios is registered"
           },
           "401": {
             "description": "Admin authentication required"
@@ -7200,7 +7153,7 @@
             "description": "IOS_DELIVERY_CONFIG_INVALID, IOS_DELIVERY_QUERY_FAILED, IOS_DELIVERY_SAVE_FAILED"
           },
           "403": {
-            "description": "SECOND_FACTOR_REQUIRED：租户会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），平台会话不受影响"
+            "description": "SECOND_FACTOR_REQUIRED：控制台会话要 15 分钟内通过邮箱二次验证（POST /v1/admin/auth/second-factor/*），自动化通道不受影响"
           }
         }
       }
@@ -7482,15 +7435,6 @@
                 "type": "object"
               }
             }
-          }
-        }
-      }
-    },
-    "/v1/admin/tenant-accounts": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "当前域名租户的控制台成员，只读（只有平台管理员能看）：{items:[{id, displayName, email, subject（统一认证账号 id）, status（active|disabled）, lastLoginAt, createdBy, createdAt}]}。账号由外部系统写进 tenant_admin_accounts，RN 不建号、不改（设计 console-accounts-external-maintenance-2026-09-27）"
           }
         }
       }
@@ -9544,10 +9488,6 @@
             "type": "integer"
           },
           "signingMachineId": {
-            "type": "string",
-            "nullable": true
-          },
-          "signingMachineName": {
             "type": "string",
             "nullable": true
           },

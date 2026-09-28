@@ -11,6 +11,7 @@ import (
 
 	"github.com/Helix2010/RN-Server/signing/keystorebox"
 	"github.com/Helix2010/RN-Server/signing/provenance"
+	"github.com/gin-gonic/gin"
 )
 
 // 一次安装包发布走完全程：排队 → 构建机领取、交付未签名包与出处 → 主签名闸领取（只拿到发给
@@ -109,6 +110,14 @@ func TestDBSigningGateEndToEnd(t *testing.T) {
 	}
 	if sbom, _ := metadata["sbom"].(map[string]any); sbom["sha256"] != sha256HexBytes(delivered.sbom) {
 		t.Fatalf("file_metadata.sbom = %v", metadata["sbom"])
+	}
+	// 库里记着哪台构建机、哪台签名闸；租户控制台的发布记录里不给（设计 service-and-console-split-2026-09-27 §5）
+	c, detail := testContext(t, f.tenant, http.MethodGet, "/v1/admin/releases/"+releaseID, nil)
+	c.Params = gin.Params{{Key: "id", Value: releaseID}}
+	f.s.releaseDetail(c)
+	if detail.Code != http.StatusOK || strings.Contains(detail.Body.String(), f.builder.ID) || strings.Contains(detail.Body.String(), f.primary.ID) ||
+		!strings.Contains(detail.Body.String(), jobID) {
+		t.Fatalf("tenant release view: %d %s", detail.Code, detail.Body.String())
 	}
 
 	// 签名闸没收到响应重试：同一个包，同一个 releaseId，不多落一条

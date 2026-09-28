@@ -1142,7 +1142,8 @@ func TestDBKeystoreGenerationHappyPathAndStateMachine(t *testing.T) {
 	}
 	keystore := f.keystoreView()
 	recoveryRecipients := keystore["recoveryRecipients"].([]any)
-	if keystore["generator"].(map[string]any)["name"] != f.primary.Name || len(recoveryRecipients) != 1 || recoveryRecipients[0] != recoveryKey.SHA256 ||
+	// 租户控制台上签名闸不点名，换成角色（机器 id 留着对行）
+	if keystore["generator"].(map[string]any)["name"] != "签名闸" || keystore["generator"].(map[string]any)["machineId"] != f.primary.ID || len(recoveryRecipients) != 1 || recoveryRecipients[0] != recoveryKey.SHA256 ||
 		keystore["generationRequest"].(map[string]any)["status"] != generationDone {
 		t.Fatalf("keystore view after delivery: %v", keystore)
 	}
@@ -1822,8 +1823,9 @@ func TestDBGenerationWaitsForSignersToConfirmTheCurrentKey(t *testing.T) {
 	if r.Code != http.StatusConflict || problemCode(t, r) != "KEYSTORE_SIGNERS_NOT_IN_SYNC" {
 		t.Fatalf("generate while the standby has not confirmed: %d %s", r.Code, r.Body.String())
 	}
-	if !strings.Contains(r.Body.String(), f.standby.Name) {
-		t.Fatalf("the problem must name the signing gate: %s", r.Body.String())
+	// 签名闸叫什么是平台的事：只说有几台
+	if strings.Contains(r.Body.String(), f.standby.Name) || !strings.Contains(r.Body.String(), "1 signing gate(s) of the platform") {
+		t.Fatalf("the problem must count the signing gates without naming them: %s", r.Body.String())
 	}
 	// 明确要求仍然生成：放行
 	body := f.generateBody(f.packageName)

@@ -209,7 +209,7 @@ type signerReadiness struct {
 // 信任根算得出来；主签名闸对当前密钥版本 decrypt=ok、confirmed、确认的信任根摘要等于当前摘要、
 // trialSign=ok。任何一项不满足就不就绪，Problems 逐条说清缺什么。
 //
-// showMachineNames=false（租户会话）时文案里只说「主签名闸」，不点名是哪一台（设计 §3.4）。
+// showMachineNames=false（给租户控制台）时文案里只说「主签名闸」，不点名是哪一台（设计 §3.4）。
 func (s *server) signerReadinessFor(ctx context.Context, tenant string, showMachineNames bool) (signerReadiness, error) {
 	var r signerReadiness
 	keystore, err := s.buildKeystoreStateFor(ctx, s.db, tenant)

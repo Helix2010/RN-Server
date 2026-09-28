@@ -163,7 +163,7 @@ func TestDBPlatformMailConfig(t *testing.T) {
 	cfg := config.Config{
 		Environment: "test", StorageMasterKey: base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32)),
 		MySQLQueryTimeout: 10, AdminAPIKey: automationKey, AdminAPIActor: "automation@test", PlatformAdminUsernames: []string{"automation@test"},
-		AdminSessionTTL: 3600,
+		AdminSessionTTL: 3600, PlatformConsoleHost: "platform-" + uniqueSuffix() + ".test",
 	}
 	// mail.smtp 是平台级的一份，测试库又是持久的：开始前与结束后都清掉
 	clearMail := func() {
@@ -173,7 +173,8 @@ func TestDBPlatformMailConfig(t *testing.T) {
 	t.Cleanup(clearMail)
 	router := New(cfg, &store.Store{DB: db})
 	platformToken, platformID, _ := activePlatformSession(t, db)
-	platform := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: platformToken}}
+	// 平台管理员在平台控制台上（设计 service-and-console-split-2026-09-27 §4.2）
+	platform := &browser{router: router, tenant: tenant, cookies: map[string]string{adminSessionCookie: platformToken}, host: cfg.PlatformConsoleHost}
 	smtpServer := startTestSMTP(t)
 
 	// 没存过时管理端用服务端声明的默认端口预填

@@ -183,7 +183,7 @@ func (s *server) markIOSIPAStatus(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to read later builds")
 		return
 	}
-	view := s.jobViewFor(c, job, s.machineNamesForView(ctx))
+	view := tenantJobView(job)
 	view["ipaDelivery"] = ipaDeliveryView(job, latest)
 	c.JSON(http.StatusOK, view)
 }

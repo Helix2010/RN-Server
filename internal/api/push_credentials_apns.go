@@ -276,7 +276,7 @@ func (s *server) testPushCredentialsAPNs(c *gin.Context) {
 		return
 	}
 	// 继承来的是平台那一行：由平台管理员来测（见 testPushCredentialsFCM）
-	if record.Inherited(tenant) && !isPlatformSession(c) {
+	if record.Inherited(tenant) {
 		pushCredentialsInherited(c)
 		return
 	}

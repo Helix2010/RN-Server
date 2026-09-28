@@ -43,7 +43,7 @@ func (s *server) verify(ctx context.Context, account pushcreds.ServiceAccount) e
 }
 
 func (s *server) getPushCredentials(c *gin.Context) {
-	view, err := s.pushCredentialsView(c.Request.Context(), tenantID(c), isPlatformSession(c))
+	view, err := s.pushCredentialsView(c.Request.Context(), tenantID(c))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "PUSH_CREDENTIALS_QUERY_FAILED", "Unable to load push credentials")
 		return
@@ -182,7 +182,7 @@ func (s *server) pushCredentialsAfterWrite(c *gin.Context, tenant string) gin.H 
 	if tenant == pushcreds.PlatformTenant {
 		view, err = s.platformPushView(c.Request.Context())
 	} else {
-		view, err = s.pushCredentialsView(c.Request.Context(), tenant, isPlatformSession(c))
+		view, err = s.pushCredentialsView(c.Request.Context(), tenant)
 	}
 	if err != nil || view == nil {
 		return gin.H{}
@@ -272,7 +272,7 @@ func (s *server) testPushCredentialsFCM(c *gin.Context) {
 		return
 	}
 	// 继承来的是平台那一行：测试会改写它的 verifiedAt，由平台管理员来测（设计 tenant-console-accounts-and-sso §3.4）
-	if record.Inherited(tenantID(c)) && !isPlatformSession(c) {
+	if record.Inherited(tenantID(c)) {
 		pushCredentialsInherited(c)
 		return
 	}
@@ -311,8 +311,8 @@ func (s *server) auditPushCredentialTest(c *gin.Context, provider string, inheri
 		map[string]any{"provider": provider, "inherited": inherited, "ok": problemCode == "", "problem": nullableString(problemCode)}))
 }
 
-// hidePlatformPushRow：租户会话看继承来的平台那一行时，不给平台的服务账号、密钥提示与修改人
-// （设计 tenant-console-accounts-and-sso §3.4）。项目 id、Team 留着：租户要拿它对自己的 google-services.json、bundle id。
+// hidePlatformPushRow：看继承来的平台那一行时，不给平台的服务账号、密钥提示与修改人
+// （设计 tenant-console-accounts-and-sso §3.4）。平台控制台读的是平台自己那一行，不算继承。项目 id、Team 留着：租户要拿它对自己的 google-services.json、bundle id。
 func hidePlatformPushRow(view gin.H, keys ...string) {
 	if view["inherited"] != true {
 		return
@@ -326,7 +326,7 @@ func hidePlatformPushRow(view gin.H, keys ...string) {
 //
 // FCM 那一段额外带上 google-services.json 的项目与匹配结果：控制台不该自己再去
 // 比一次，两处各比一次迟早会得出不同的答案。
-func (s *server) pushCredentialsView(ctx context.Context, tenant string, showPlatformRow bool) (gin.H, error) {
+func (s *server) pushCredentialsView(ctx context.Context, tenant string) (gin.H, error) {
 	fcm := gin.H{"configured": false, "inherited": false, "version": 0}
 	record, err := pushcreds.LoadFCM(ctx, s.db, tenant)
 	switch {
@@ -359,10 +359,8 @@ func (s *server) pushCredentialsView(ctx context.Context, tenant string, showPla
 	// HMS 仍不进库：没有租户在用，而它的字段形状和前两家都不同，现在设计等于凭空猜。
 	// 位置先占住，界面上画出来标"未接入"。
 	apns := s.apnsCredentialView(ctx, tenant)
-	if !showPlatformRow {
-		hidePlatformPushRow(fcm, "clientEmail", "privateKeyIdHint")
-		hidePlatformPushRow(apns, "keyIdHint")
-	}
+	hidePlatformPushRow(fcm, "clientEmail", "privateKeyIdHint")
+	hidePlatformPushRow(apns, "keyIdHint")
 	return gin.H{"fcm": fcm,
 		"apns": apns,
 		"hms":  gin.H{"configured": false, "inherited": false, "version": 0}}, nil
