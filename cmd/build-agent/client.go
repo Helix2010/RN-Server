@@ -126,7 +126,9 @@ type claimedJob struct {
 	ID               string `json:"id"`
 	Attempt          int    `json:"attempt"`
 	ClaimedMachineID string `json:"claimedMachineId"`
-	TenantSlug       string `json:"tenantSlug"`
+	// TenantID 是服务端的租户 id。按租户落盘的机器拿它取这个租户自己的材料；旧版服务端不带
+	TenantID   string `json:"tenantId"`
+	TenantSlug string `json:"tenantSlug"`
 	// TenantDirectory 是仓库里 tenants/ 下的目录名，与 TenantSlug 是两套命名，只用它拼路径。
 	TenantDirectory string `json:"tenantDirectory"`
 	Platform        string `json:"platform"`
@@ -358,10 +360,29 @@ type claimRequest struct {
 	// Capabilities：这一版程序会做的"新"事情。ios-ipa-delivery = 能把 .ipa 交回服务端（自助上传的
 	// iOS 租户）；服务端据此决定能不能排、能不能派那种任务（设计 ios-tenant-delivery-tiers-2026-09-24）
 	Capabilities []string `json:"capabilities,omitempty"`
+	// TenantMaterial 是按租户的盘点（设计 ios-tenant-owned-signing-material-2026-09-25 §12.3）。
+	// **只在按租户落盘、而且服务端回过按租户的清单时才带**：旧版服务端的请求体是 DisallowUnknownFields，
+	// 多这个字段整条认领就 400。指针是为了让"按租户、但一项都没有"也能报成 []——服务端据有没有这个
+	// 字段决定按租户还是按 Team 派活
+	TenantMaterial *[]tenantMaterialSelfReport `json:"tenantMaterial,omitempty"`
 }
 
-// agentCapabilities 是这一版程序的能力。与服务端的 machineCapabilityIPADelivery 同名
-var agentCapabilities = []string{"ios-ipa-delivery"}
+// agentCapabilities 是这一版程序的能力。ios-ipa-delivery 与服务端的 machineCapabilityIPADelivery 同名；
+// tenant-signing-material = 会按租户落盘与核对签名材料（取清单时也带，见 ios_material.go）
+var agentCapabilities = []string{"ios-ipa-delivery", capabilityTenantMaterial}
+
+// tenantMaterialSelfReport 是自报盘点里的一个 (租户, Team)。字段与服务端的严格解析一一对应。
+type tenantMaterialSelfReport struct {
+	TenantID         string   `json:"tenantId"`
+	TeamID           string   `json:"teamId"`
+	BundleIDs        []string `json:"bundleIds"`
+	CertificateSHA1  string   `json:"certificateSha1,omitempty"`
+	CertificateReady bool     `json:"certificateReady"`
+	ExpiresAt        string   `json:"expiresAt,omitempty"`
+	UploadProbe      string   `json:"uploadProbe,omitempty"`
+	APSEnvironment   string   `json:"apsEnvironment,omitempty"`
+	Problems         []string `json:"problems,omitempty"`
+}
 
 // appleTeamSelfReport 是自报盘点里的一个 Team。字段名与服务端的严格解析一一对应：
 // 服务端的请求体是 DisallowUnknownFields，多一个字段整条认领就 400。
