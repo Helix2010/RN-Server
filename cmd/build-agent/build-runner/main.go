@@ -15,7 +15,8 @@
 //	build-runner cleanup    --jobs-root <abs> --job <id>
 //	build-runner self-check    --protocol <n> [--jobs-root <abs>] [--expect-separated]
 //	build-runner ios-inventory        --signing-dir <abs>
-//	build-runner install-ios-material     --signing-dir <abs>   （密文走标准输入）
+//	build-runner install-ios-material     --signing-dir <abs> [--tenant <id> [--legacy]]   （密文走标准输入）
+//	build-runner remove-ios-material      --signing-dir <abs> [--tenant <id>] --kind certificate|profile --team <TEAMID> [--scope <bundle id>]
 //	build-runner material-key-fingerprint --signing-dir <abs>
 //
 // 退出码：0 成功；1 构建失败；2 参数、身份或任务目录不合规。失败原因最后一行以
@@ -113,15 +114,39 @@ func dispatch(ctx context.Context, args []string, in io.Reader, out io.Writer, g
 	case "install-ios-material":
 		set := flag.NewFlagSet("install-ios-material", flag.ContinueOnError)
 		set.SetOutput(io.Discard)
-		var dir onceValue
+		var dir, tenant onceValue
 		set.Var(&dir, "signing-dir", "")
+		set.Var(&tenant, "tenant", "")
+		legacy := set.Bool("legacy", false, "")
 		if err := set.Parse(args[1:]); err != nil {
 			return usagef("bad arguments: %v", err)
 		}
 		if set.NArg() != 0 {
 			return usagef("unexpected positional arguments")
 		}
-		return installIOSMaterial(ctx, out, in, who, dir.value)
+		if tenant.set && tenant.value == "" {
+			return usagef("--tenant must not be empty")
+		}
+		return installIOSMaterial(ctx, out, in, who, dir.value, tenant.value, *legacy)
+	case "remove-ios-material":
+		set := flag.NewFlagSet("remove-ios-material", flag.ContinueOnError)
+		set.SetOutput(io.Discard)
+		var dir, tenant, kind, team, scope onceValue
+		set.Var(&dir, "signing-dir", "")
+		set.Var(&tenant, "tenant", "")
+		set.Var(&kind, "kind", "")
+		set.Var(&team, "team", "")
+		set.Var(&scope, "scope", "")
+		if err := set.Parse(args[1:]); err != nil {
+			return usagef("bad arguments: %v", err)
+		}
+		if set.NArg() != 0 {
+			return usagef("unexpected positional arguments")
+		}
+		if tenant.set && tenant.value == "" {
+			return usagef("--tenant must not be empty")
+		}
+		return removeIOSMaterial(ctx, out, who, dir.value, tenant.value, kind.value, team.value, scope.value)
 	case "ios-inventory":
 		set := flag.NewFlagSet("ios-inventory", flag.ContinueOnError)
 		set.SetOutput(io.Discard)

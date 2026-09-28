@@ -197,7 +197,7 @@ func TestListKeysNamesTheTeamsAndNothingElse(t *testing.T) {
 	if err := listKeys(&out, dir); err != nil {
 		t.Fatalf("--list-keys failed: %v", err)
 	}
-	if got := strings.TrimSpace(out.String()); got != `{"teams":["J4JDFC8LCC"]}` {
+	if got := strings.TrimSpace(out.String()); got != `{"teams":["J4JDFC8LCC"],"tenants":{}}` {
 		t.Errorf("--list-keys said %s", got)
 	}
 	for _, leak := range []string{"secret", "8WQNTAY7MP", "3223da1d"} {
@@ -253,5 +253,72 @@ func TestRemoveKeyDeletesOnlyThatTeam(t *testing.T) {
 	// Team ID 形状不对：拼路径之前就拒
 	if code := run([]string{"--remove-key", "--team", "../etc", "--keys", keys}, nil, &stdout, &stderr); code != 2 {
 		t.Fatalf("a malformed team was accepted: exit %d", code)
+	}
+}
+
+func tenantUploadKey(t *testing.T, tenant string) iosmaterial.Material {
+	t.Helper()
+	return iosmaterial.Material{
+		Kind: iosmaterial.KindUploadKey, TenantID: tenant, TeamID: "J4JDFC8LCC",
+		IssuerID: "3223da1d-14c5-46fc-80a1-41ecfb6e3c67", KeyID: "8WQNTAY7MP",
+		P8Base64: base64.StdEncoding.EncodeToString(testPrivateKeyPEM(t)),
+	}
+}
+
+// 按租户落盘：Key 放进 tenants/<租户>/<TEAM>/；材料里写的租户必须与清单给的一致；迁移过来的 v1 要
+// 带 --legacy；带租户的 Key 不能落进旧布局（设计 ios-tenant-owned-signing-material-2026-09-25 §4.3）。
+func TestInstallKeyForATenant(t *testing.T) {
+	dir, pub := uploadFixture(t)
+	install := func(box string, args ...string) (int, string) {
+		var out, errBuf bytes.Buffer
+		code := run(append([]string{"--install-key", "--keys", dir}, args...), strings.NewReader(box), &out, &errBuf)
+		return code, out.String() + errBuf.String()
+	}
+	if code, out := install(sealedKey(t, tenantUploadKey(t, "1000000001"), pub), "--tenant", "1000000001"); code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	teamDir := filepath.Join(dir, tenantsDirName, "1000000001", "J4JDFC8LCC")
+	if _, err := readKey(teamDir); err != nil {
+		t.Fatalf("the tenant's key is not where the uploader looks: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "J4JDFC8LCC")); !os.IsNotExist(err) {
+		t.Fatal("a tenant's key also landed in the per-team layout")
+	}
+	for name, c := range map[string]struct {
+		box  string
+		args []string
+		want string
+	}{
+		"another tenant's key":    {sealedKey(t, tenantUploadKey(t, "1000000002"), pub), []string{"--tenant", "1000000001"}, rejectedPrefix},
+		"v1 without --legacy":     {sealedKey(t, tenantUploadKey(t, ""), pub), []string{"--tenant", "1000000001"}, rejectedPrefix},
+		"tenant key, no tenant":   {sealedKey(t, tenantUploadKey(t, "1000000001"), pub), nil, "--tenant"},
+		"tenant that is a path":   {sealedKey(t, tenantUploadKey(t, "1000000001"), pub), []string{"--tenant", "../1"}, "digits only"},
+		"--legacy without tenant": {sealedKey(t, tenantUploadKey(t, ""), pub), []string{"--legacy"}, "--legacy"},
+	} {
+		if code, out := install(c.box, c.args...); code == 0 || !strings.Contains(out, c.want) {
+			t.Errorf("%s: exit %d: %s", name, code, out)
+		}
+	}
+	if code, out := install(sealedKey(t, tenantUploadKey(t, ""), pub), "--tenant", "1000000002", "--legacy"); code != 0 {
+		t.Fatalf("a legacy slot's v1 key was refused: %s", out)
+	}
+
+	var out bytes.Buffer
+	if err := listKeys(&out, dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(out.String()); got != `{"teams":[],"tenants":{"1000000001":["J4JDFC8LCC"],"1000000002":["J4JDFC8LCC"]}}` {
+		t.Fatalf("--list-keys said %s", got)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--remove-key", "--tenant", "1000000001", "--team", "J4JDFC8LCC", "--keys", dir}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if _, err := os.Stat(teamDir); !os.IsNotExist(err) {
+		t.Fatal("the tenant's key is still there")
+	}
+	if _, err := readKey(filepath.Join(dir, tenantsDirName, "1000000002", "J4JDFC8LCC")); err != nil {
+		t.Fatalf("another tenant's key on the same team was touched: %v", err)
 	}
 }

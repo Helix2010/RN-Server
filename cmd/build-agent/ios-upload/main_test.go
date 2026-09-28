@@ -251,3 +251,35 @@ func TestUploadRefusesAnEmptyPackage(t *testing.T) {
 		t.Fatalf("stderr does not say why: %s", stderr.String())
 	}
 }
+
+// 按租户落盘之后，探测与上传都从 tenants/<租户>/<TEAM>/ 读 Key。
+func TestProbeReadsTheTenantsKey(t *testing.T) {
+	asc := newFakeASC(t)
+	root := t.TempDir()
+	perTeam := writeKeyDir(t, "AB12CD34EF")
+	if err := os.MkdirAll(filepath.Join(root, tenantsDirName, "1000000001"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(perTeam, "AB12CD34EF"), filepath.Join(root, tenantsDirName, "1000000001", "AB12CD34EF")); err != nil {
+		t.Fatal(err)
+	}
+	probe := func(extra ...string) outcome {
+		var stdout, stderr bytes.Buffer
+		args := append([]string{"--probe", "--team", "AB12CD34EF", "--keys", root, "--base-url", asc.server.URL,
+			"--expect-bundle-id", "com.anyfun.foundation"}, extra...)
+		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("exit %d: %s", code, stderr.String())
+		}
+		return decodeOutcome(t, &stdout)
+	}
+	if result := probe("--tenant", "1000000001"); result.Probe != probeOK {
+		t.Fatalf("the tenant's key was not used: %+v", result)
+	}
+	// 旧布局下没有这把 Key；另一个租户也没有
+	if result := probe(); result.Probe != probeError {
+		t.Fatalf("the per-team layout found a key that only the tenant has: %+v", result)
+	}
+	if result := probe("--tenant", "1000000002"); result.Probe != probeError {
+		t.Fatalf("another tenant's key was used: %+v", result)
+	}
+}

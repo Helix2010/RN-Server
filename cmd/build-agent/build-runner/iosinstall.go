@@ -6,6 +6,8 @@ package main
 //
 //	sudo -n -u _rnbuilder /opt/rn-build-agent/build-runner install-ios-material --signing-dir /var/rn-build-signing
 //
+// 按租户的格再带 `--tenant <租户 id>`（迁移过来的 v1 再带 `--legacy`），装之前核对内容，见 iostenant.go。
+//
 // 密文走标准输入而不是路径：控制进程手里那份副本在它的状态目录下（0700，同一棵树里放着
 // 出处私钥），给另一个账户开一条能读到那里的路，等于为了传一份不是机密的密文放宽一个装着
 // 机密的目录——与 ios-upload 收 .ipa 同一个理由。
@@ -21,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,9 +48,18 @@ var securityCommand = func(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 // installIOSMaterial 读密文、解开、按种类落地。回一行 JSON 给控制进程。
-func installIOSMaterial(ctx context.Context, out io.Writer, in io.Reader, who identity, dir string) error {
+//
+// tenant 为空是旧布局（材料按 Team 存、同 Team 的租户共用），照旧只查格式就装——那时材料只来自
+// 平台管理员。tenant 非空是按租户的布局，材料由租户自己交，装之前要核对内容（iostenant.go）。
+func installIOSMaterial(ctx context.Context, out io.Writer, in io.Reader, who identity, dir, tenant string, legacy bool) error {
 	if err := checkSigningDir(who, dir); err != nil {
 		return usageError{err}
+	}
+	if tenant != "" && !jobspec.ValidTenantID(tenant) {
+		return usagef("--tenant must be the tenant id the server gave (digits only), got %q", tenant)
+	}
+	if legacy && tenant == "" {
+		return usagef("--legacy only applies to a tenant's slot (--tenant)")
 	}
 	raw, err := io.ReadAll(io.LimitReader(in, iosmaterial.MaxBoxSize+1))
 	if err != nil {
@@ -66,11 +78,18 @@ func installIOSMaterial(ctx context.Context, out io.Writer, in io.Reader, who id
 	if err != nil {
 		return fmt.Errorf("cannot open this material: %w", err)
 	}
+	if tenant != "" {
+		return installTenantMaterial(ctx, out, dir, tenant, legacy, box.Version, material)
+	}
+	if box.Version != iosmaterial.VersionLegacy {
+		// 带租户的材料只能落进那个租户的格：放进旧布局就等于交给同 Team 的所有租户
+		return usagef("this material belongs to tenant %s; install it with --tenant", material.TenantID)
+	}
 	switch material.Kind {
 	case iosmaterial.KindCertificate:
 		err = importCertificate(ctx, dir, material)
 	case iosmaterial.KindProfile:
-		err = writeProfile(dir, material)
+		err = writeProfile(filepath.Join(dir, jobspec.IOSProfilesDirName, material.TeamID), material)
 	default:
 		// 上传 Key 是另一个账户的事（ios-upload install-key）
 		err = fmt.Errorf("%s is not installed by the build user", material.Kind)
@@ -134,22 +153,11 @@ func importCertificate(ctx context.Context, dir string, material iosmaterial.Mat
 	}
 
 	// .p12 要落一次盘：security import 只收路径。0600、这个账户自己的目录、用完就删
-	file, err := os.CreateTemp(dir, ".import-*.p12")
+	p12Path, err := writeScratch(dir, ".import-*.p12", p12)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(file.Name())
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		return err
-	}
-	if _, err := file.Write(p12); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
+	defer os.Remove(p12Path)
 
 	// 钥匙串口令的两条命令走 `security -i` 的标准输入，而不是命令行参数：口令出现在
 	// 命令行里，这台机器上任何一个用户 `ps` 一下就看得到（AGENTS.md「机密的操作纪律」，
@@ -168,10 +176,9 @@ func importCertificate(ctx context.Context, dir string, material iosmaterial.Mat
 	// 归档里那份 .p12 的口令是每张证书现场随机生成的（运维手册 §1.2），不与别处共用。
 	// 它也**不能**跟着上面两条走标准输入：`security -i` 按空白切词，而这个口令是人定的，
 	// 带空格就会被切成别的参数。
-	importCmd := securityCommand(ctx, "import", file.Name(), "-k", keychain,
-		"-T", "/usr/bin/codesign", "-f", "pkcs12", "-P", material.P12Password)
-	if out, err := importCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("security import: %w: %s", err, firstLine(out))
+	if _, err := securityRun(ctx, "", "import", p12Path, "-k", keychain,
+		"-T", "/usr/bin/codesign", "-f", "pkcs12", "-P", material.P12Password); err != nil {
+		return fmt.Errorf("security import: %w", scrubbed(err, material.P12Password))
 	}
 	if err := runSecurityScript(ctx, keychainPassword,
 		"set-key-partition-list -S apple-tool:,apple: -s -k "+keychainPassword+" "+keychain,
@@ -184,23 +191,52 @@ func importCertificate(ctx context.Context, dir string, material iosmaterial.Mat
 // runSecurityScript 把几条 security 子命令经标准输入喂给 `security -i`，失败时把钥匙串
 // 口令从输出里抹掉再往上报——失败路径上的输出是最容易漏掉的一条泄漏路径。
 func runSecurityScript(ctx context.Context, keychainPassword string, lines ...string) error {
-	cmd := securityCommand(ctx, "-i")
-	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n") + "\n")
-	out, err := cmd.CombinedOutput()
+	_, err := securityRun(ctx, strings.Join(lines, "\n")+"\n", "-i")
+	return scrubbed(err, keychainPassword)
+}
+
+// securityRun 跑一次 `security`（stdin 非空就喂给它），回标准输出。失败时错误里带上它说的第一行
+// （先看标准错误，空的再看标准输出）。钥匙串相关的调用都走它：测试换掉它，就能在没有 Mac 的
+// 机器上模拟一个钥匙串，把核对逻辑测全。
+var securityRun = func(ctx context.Context, stdin string, args ...string) (string, error) {
+	cmd := securityCommand(ctx, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		detail := firstLine(stderr.Bytes())
+		if detail == "" {
+			detail = firstLine(stdout.Bytes())
+		}
+		return stdout.String(), fmt.Errorf("%w: %s", err, detail)
+	}
+	return stdout.String(), nil
+}
+
+// scrubbed 把几个机密从错误文字里抹掉。security 不回显口令，但失败路径上的输出是最容易漏掉的
+// 一条泄漏路径，所以一律先抹再往上报。
+func scrubbed(err error, secrets ...string) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: %s", err,
-		firstLine([]byte(strings.ReplaceAll(string(out), keychainPassword, "<keychain password>"))))
+	text := err.Error()
+	for _, secret := range secrets {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "<redacted>")
+		}
+	}
+	return errors.New(text)
 }
 
-// writeProfile 把描述文件放到 profiles/<TEAMID>/<bundle id>.mobileprovision。
-func writeProfile(dir string, material iosmaterial.Material) error {
+// writeProfile 把描述文件放到 teamDir/<bundle id>.mobileprovision。旧布局的 teamDir 是
+// profiles/<TEAMID>，按租户的是 profiles/tenants/<租户>/<TEAMID>。
+func writeProfile(teamDir string, material iosmaterial.Material) error {
 	body, err := base64.StdEncoding.Strict().DecodeString(material.ProfileBase64)
 	if err != nil {
 		return fmt.Errorf("the profile in this material is not base64: %w", err)
 	}
-	teamDir := filepath.Join(dir, jobspec.IOSProfilesDirName, material.TeamID)
 	if err := os.MkdirAll(teamDir, 0o700); err != nil {
 		return err
 	}
@@ -256,6 +292,29 @@ func readMaterialKey(path string) ([]byte, error) {
 		return nil, fmt.Errorf("%s is not a base64 X25519 private key", path)
 	}
 	return key, nil
+}
+
+// writeScratch 在签名目录下写一个 0600 的临时文件（security 只收路径），回它的路径。用完由调用方删。
+func writeScratch(dir, pattern string, body []byte) (string, error) {
+	file, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		os.Remove(file.Name())
+		return "", err
+	}
+	if _, err := file.Write(body); err != nil {
+		file.Close()
+		os.Remove(file.Name())
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		os.Remove(file.Name())
+		return "", err
+	}
+	return file.Name(), nil
 }
 
 func firstLine(out []byte) string {

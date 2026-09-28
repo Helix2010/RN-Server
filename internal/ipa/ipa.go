@@ -12,6 +12,9 @@ package ipa
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -166,6 +169,12 @@ type Profile struct {
 	HasDevices bool
 	// ProvisionsAllDevices：企业分发描述文件
 	ProvisionsAllDevices bool
+	// DeveloperCertificateSHA1s 是描述文件里 DeveloperCertificates 每张证书 DER 的 SHA-1（40 位大写
+	// 十六进制，与 `security find-identity` 打印的同一个形状）。Mac 装描述文件前拿它核对「这份描述文件
+	// 包含本租户那张证书」（设计 ios-tenant-owned-signing-material-2026-09-25 §4.2）
+	DeveloperCertificateSHA1s []string
+	// APSEnvironment 是 Entitlements 里的 aps-environment（development / production），没有就空
+	APSEnvironment string
 }
 
 // ParseProfile 从一份 .mobileprovision 的原文里读出核对要用的几项。
@@ -203,6 +212,20 @@ func ParseProfile(raw []byte) (Profile, error) {
 			if text, ok := value.(string); ok {
 				profile.TeamIdentifiers = append(profile.TeamIdentifiers, text)
 			}
+		}
+	}
+	profile.APSEnvironment = plist.String(entitlements, "aps-environment")
+	// data 在 plist 里是一段 base64（带换行与缩进）。解不开的一项直接报错，而不是跳过：少算一张
+	// 证书的后果是把一份其实合格的描述文件判成「不含本租户的证书」，而人看到的原因会是错的
+	if certificates, ok := dict["DeveloperCertificates"].([]any); ok {
+		for index, value := range certificates {
+			text, _ := value.(string)
+			der, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(text), ""))
+			if err != nil || len(der) == 0 {
+				return Profile{}, fmt.Errorf("DeveloperCertificates[%d] is not base64 certificate data", index)
+			}
+			digest := sha1.Sum(der)
+			profile.DeveloperCertificateSHA1s = append(profile.DeveloperCertificateSHA1s, strings.ToUpper(hex.EncodeToString(digest[:])))
 		}
 	}
 	return profile, nil

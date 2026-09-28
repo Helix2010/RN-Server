@@ -3,6 +3,9 @@ package ipa
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,4 +241,40 @@ func withDuplicate(t *testing.T, entries map[string]string, name string) string 
 		t.Fatal(err)
 	}
 	return filePath
+}
+
+// DeveloperCertificates 按证书 DER 算 SHA-1，与 `security find-identity` 打印的是同一个值：Mac 装
+// 描述文件前拿它核对「这份描述文件包含本租户那张证书」。plist 里的 data 带换行与缩进。
+func TestParseProfileHashesTheDeveloperCertificates(t *testing.T) {
+	first, second := []byte("first certificate der"), []byte("second certificate der")
+	encoded := base64.StdEncoding.EncodeToString(second)
+	extra := `<key>DeveloperCertificates</key><array>
+		<data>` + base64.StdEncoding.EncodeToString(first) + `</data>
+		<data>
+		` + encoded[:8] + `
+		` + encoded[8:] + `
+		</data>
+	</array>`
+	parsed, err := ParseProfile([]byte(profile("J4JDFC8LCC", "com.anyfun.foundation", extra,
+		`<key>aps-environment</key><string>production</string>`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{sha1Hex(first), sha1Hex(second)}
+	if strings.Join(parsed.DeveloperCertificateSHA1s, ",") != strings.Join(want, ",") {
+		t.Fatalf("certificate hashes %v, want %v", parsed.DeveloperCertificateSHA1s, want)
+	}
+	if parsed.APSEnvironment != "production" {
+		t.Errorf("aps-environment %q", parsed.APSEnvironment)
+	}
+
+	broken := `<key>DeveloperCertificates</key><array><data>not base64!</data></array>`
+	if _, err := ParseProfile([]byte(profile("J4JDFC8LCC", "com.anyfun.foundation", broken, ""))); err == nil {
+		t.Fatal("a certificate that is not base64 was skipped instead of refused")
+	}
+}
+
+func sha1Hex(b []byte) string {
+	digest := sha1.Sum(b)
+	return strings.ToUpper(hex.EncodeToString(digest[:]))
 }

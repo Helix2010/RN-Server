@@ -147,7 +147,7 @@ func (j job) buildIPA(ctx context.Context) error {
 	app := j.layout.App()
 	// 先让这次任务的 HOME 能签名，再跑任何第三方代码：缺证书或缺描述文件的话，
 	// pnpm install 那十几分钟是白花的
-	signingDir, err := j.prepareIOSSigning(ctx)
+	signing, err := j.prepareIOSSigning(ctx)
 	if err != nil {
 		return err
 	}
@@ -159,8 +159,9 @@ func (j job) buildIPA(ctx context.Context) error {
 		return err
 	}
 	// **不传 --upload**：执行进程不上传，也没有任何一把 App Store Connect Key（§4.3）。
-	// --signing-dir 让构建脚本读得到描述文件的名字（手工签名要 PROVISIONING_PROFILE_SPECIFIER）
-	if err := j.run(ctx, "pnpm", "ios:release", j.spec.TenantDirectory, "--signing-dir", signingDir); err != nil {
+	// --signing-dir 让构建脚本读得到描述文件的名字（手工签名要 PROVISIONING_PROFILE_SPECIFIER）；
+	// 按租户落盘时再加 --profiles-dir 与 --signing-certificate（iosSigning.scriptArgs）
+	if err := j.run(ctx, "pnpm", append([]string{"ios:release", j.spec.TenantDirectory}, signing.scriptArgs()...)...); err != nil {
 		return err
 	}
 	name := jobspec.IPAArtifactName(j.spec.TenantDirectory, j.spec.AppVersion, j.spec.BuildNumber)

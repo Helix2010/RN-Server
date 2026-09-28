@@ -94,6 +94,7 @@ var (
 	applicationIDPattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{0,63}$`)
 	apiBaseURLPattern      = regexp.MustCompile(`^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$`)
 	langPattern            = regexp.MustCompile(`^[A-Za-z0-9_.@-]{1,64}$`)
+	appleTeamIDPattern     = regexp.MustCompile(`^[A-Z0-9]{10}$`)
 	nativeFingerprintRe    = regexp.MustCompile(`^[0-9a-f]{32,128}$`)
 )
 
@@ -394,6 +395,11 @@ type Spec struct {
 	// Key 正是钥匙串里那些签名材料唯一缺的出口。
 	OTA *OTAArgs `json:"ota"`
 	Env []string `json:"env"`
+	// TenantID / AppleTeamID 只在 iOS 任务、而且这台机器已经按租户落盘时才有（设计
+	// ios-tenant-owned-signing-material-2026-09-25 §4.3）：执行进程据它只复制这个租户的描述文件，
+	// 并从本机证书索引取出这个租户那张证书的 SHA-1 钉死签名身份。两个都来自服务端，不来自仓库
+	TenantID    string `json:"tenantId,omitempty"`
+	AppleTeamID string `json:"appleTeamId,omitempty"`
 }
 
 // SpecVersion 是 Spec.Version 唯一允许的值。
@@ -419,6 +425,11 @@ func (s Spec) Validate(l Layout) error {
 		return errors.New("spec buildNumber is out of range")
 	case !ValidCommit(s.CommitSHA):
 		return errors.New("spec commitSha is malformed")
+	case (s.TenantID != "" || s.AppleTeamID != "") && s.Platform != PlatformIOS:
+		return errors.New("spec tenantId / appleTeamId only belong to ios jobs")
+	case (s.TenantID != "" || s.AppleTeamID != "") && (!ValidTenantID(s.TenantID) || !appleTeamIDPattern.MatchString(s.AppleTeamID)):
+		// 两个一起给或都不给：只有一个的话，执行进程既不能按租户取材料，也不该退回旧布局
+		return errors.New("spec tenantId and appleTeamId must both be given and well formed")
 	}
 	if _, err := ParseKind(string(s.Kind)); err != nil {
 		return err

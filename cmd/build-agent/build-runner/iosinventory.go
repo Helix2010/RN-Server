@@ -59,7 +59,21 @@ func iosInventory(ctx context.Context, out io.Writer, who identity, dir string) 
 	} else {
 		material.Certificates = text
 	}
-	material.Problems = readProfiles(filepath.Join(dir, jobspec.IOSProfilesDirName), material.Profiles)
+	count := 0
+	material.Problems = readProfiles(filepath.Join(dir, jobspec.IOSProfilesDirName), material.Profiles, &count)
+	// 按租户落盘的那一份（设计 ios-tenant-owned-signing-material-2026-09-25 §4.1）：描述文件与证书索引
+	// 都是原文，判断仍在控制进程那一侧
+	tenantProfiles := map[string][]byte{}
+	material.Problems = append(material.Problems, readTenantProfiles(
+		filepath.Join(dir, jobspec.IOSProfilesDirName, jobspec.IOSTenantsDirName), tenantProfiles, &count)...)
+	if len(tenantProfiles) > 0 {
+		material.TenantProfiles = tenantProfiles
+	}
+	if index, err := readTenantCertificates(dir); err != nil {
+		material.Problems = append(material.Problems, oneLine(err.Error()))
+	} else if len(index) > 0 {
+		material.TenantCertificates = index
+	}
 	return json.NewEncoder(out).Encode(material)
 }
 
@@ -88,8 +102,9 @@ func checkSigningDir(who identity, dir string) error {
 	return nil
 }
 
-// readProfiles 读 profiles/<TEAMID>/*.mobileprovision 的原文，回"看见了但读不了"的那些。
-func readProfiles(root string, into map[string][]byte) []string {
+// readProfiles 读 profiles/<TEAMID>/*.mobileprovision 的原文（旧布局），回"看见了但读不了"的那些。
+// count 是两种布局合计读了几份，与上限比。
+func readProfiles(root string, into map[string][]byte, count *int) []string {
 	var problems []string
 	teams, err := os.ReadDir(root)
 	if err != nil {
@@ -99,9 +114,9 @@ func readProfiles(root string, into map[string][]byte) []string {
 		return problems
 	}
 	sort.Slice(teams, func(i, j int) bool { return teams[i].Name() < teams[j].Name() })
-	count := 0
 	for _, team := range teams {
-		if !team.IsDir() {
+		// tenants/ 是按租户的那一层，另读
+		if !team.IsDir() || team.Name() == jobspec.IOSTenantsDirName {
 			continue
 		}
 		dir := filepath.Join(root, team.Name())
@@ -114,7 +129,7 @@ func readProfiles(root string, into map[string][]byte) []string {
 			if file.IsDir() || !strings.HasSuffix(file.Name(), jobspec.IOSProfileSuffix) {
 				continue
 			}
-			if count >= jobspec.IOSProfileMaxCount {
+			if *count >= jobspec.IOSProfileMaxCount {
 				problems = append(problems, root+" holds more than "+fmt.Sprint(jobspec.IOSProfileMaxCount)+" profiles; the rest were not read")
 				return problems
 			}
@@ -125,7 +140,7 @@ func readProfiles(root string, into map[string][]byte) []string {
 				continue
 			}
 			into[team.Name()+"/"+file.Name()] = raw
-			count++
+			*count++
 		}
 	}
 	return problems
