@@ -30,9 +30,11 @@ require_apply() {
   }
 }
 
-# 控制台只有一份产物：请求 API 走同源 /v1/，由各 console.* 的 nginx 转给 rn-server，包里不编 API 地址
-# （RN-Admin 设计 console-single-build-same-origin-2026-09-25）。apply 的 admin 子命令收的是目录名
-ADMIN_DIR=console
+# 控制台两份产物（设计 service-and-console-split-2026-09-27 §4.2），都走同源 /v1/、包里不编 API 地址
+# （RN-Admin 设计 console-single-build-same-origin-2026-09-25）：RN-Admin 的 dist/ 是租户控制台（三个 console.*
+# 共用，装到 admin/console），dist-platform/ 是平台控制台（platform.anyfun.win，装到 admin/platform）。
+# 「构建目录:装到哪」，apply 的 admin 子命令收的是后者
+ADMIN_BUILDS="dist:console dist-platform:platform"
 
 build_server() {
   echo "== 编译服务端 =="
@@ -59,24 +61,32 @@ build_admin() {
   echo "== 构建控制台 =="
   (cd "$ADMIN_REPO" && pnpm install --frozen-lockfile >/dev/null)
   # 生产包不认 VITE_API_BASE_URL（只给 pnpm dev 用），开发机 .env 里的本地地址编不进去
-  (cd "$ADMIN_REPO" && rm -rf dist && pnpm build >/dev/null)
-  [ -s "$ADMIN_REPO/dist/index.html" ] || { echo "   构建产物里没有 index.html" >&2; exit 1; }
-  mkdir -p "$STAGING_LOCAL/admin/$ADMIN_DIR"
-  cp -r "$ADMIN_REPO/dist/." "$STAGING_LOCAL/admin/$ADMIN_DIR/"
+  (cd "$ADMIN_REPO" && rm -rf dist dist-platform && pnpm build >/dev/null)
+  local pair out dir
+  for pair in $ADMIN_BUILDS; do
+    out="${pair%%:*}" dir="${pair##*:}"
+    [ -s "$ADMIN_REPO/$out/index.html" ] || { echo "   $out 里没有 index.html" >&2; exit 1; }
+    mkdir -p "$STAGING_LOCAL/admin/$dir"
+    cp -r "$ADMIN_REPO/$out/." "$STAGING_LOCAL/admin/$dir/"
+  done
 }
 
 ship_admin() {
   echo "== 上传控制台 =="
   # 用 tar 走管道，不用 rsync：amos 上没有 rsync，为了发几个静态文件去装一个工具
   # 不值得。整目录换过去，顺带拿到 --delete 的效果
-  # shellcheck disable=SC2029
-  tar -C "$STAGING_LOCAL/admin/$ADMIN_DIR" -czf - . | ssh "$HOST" "
-    set -eu
-    sudo mkdir -p '$STAGE/admin'
-    sudo rm -rf '$STAGE/admin/$ADMIN_DIR'
-    sudo mkdir -p '$STAGE/admin/$ADMIN_DIR'
-    sudo tar -C '$STAGE/admin/$ADMIN_DIR' -xzf -
-    sudo $APPLY admin '$ADMIN_DIR'"
+  local pair dir
+  for pair in $ADMIN_BUILDS; do
+    dir="${pair##*:}"
+    # shellcheck disable=SC2029
+    tar -C "$STAGING_LOCAL/admin/$dir" -czf - . | ssh "$HOST" "
+      set -eu
+      sudo mkdir -p '$STAGE/admin'
+      sudo rm -rf '$STAGE/admin/$dir'
+      sudo mkdir -p '$STAGE/admin/$dir'
+      sudo tar -C '$STAGE/admin/$dir' -xzf -
+      sudo $APPLY admin '$dir'"
+  done
 }
 
 require_apply

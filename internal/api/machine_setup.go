@@ -120,7 +120,7 @@ func enrollmentCodeInvalid(c *gin.Context) {
 
 // enrollmentView 是新建与重发响应里的 enrollment：注册码原文、有效期、服务端拼好的安装命令。
 func (s *server) enrollmentView(c *gin.Context, m buildMachine, code string) gin.H {
-	origin := s.externalOrigin(c)
+	origin := s.machineAPIOrigin(c)
 	if m.osOf() == machineOSDarwin {
 		return gin.H{"code": code, "expiresAt": m.Enrollment.ExpiresAt, "installCommand": macOSInstallCommand(origin, code)}
 	}
@@ -148,6 +148,15 @@ func macOSInstallCommand(origin, code string) string {
 		"sudo bash install-macos.sh --server " + origin + " --code " + code + " \\",
 		"     --release-key-sha256 <从密码管理器粘贴发布公钥指纹>",
 	}, "\n")
+}
+
+// machineAPIOrigin 是装机命令里写的服务端地址：配了 MACHINE_API_ORIGIN 就用它（平台控制台不在任何租户域名上，
+// 请求的源是 platform.*，机器不能绑到那里）；没配沿用请求的源（租户控制台转过来的请求是这个租户的 api.*）。
+func (s *server) machineAPIOrigin(c *gin.Context) string {
+	if s.cfg.MachineAPIOrigin != "" {
+		return s.cfg.MachineAPIOrigin
+	}
+	return s.externalOrigin(c)
 }
 
 // externalOrigin 是这次请求的外部源（scheme://host）。https 的判据：TLS 直连；或直连对端是

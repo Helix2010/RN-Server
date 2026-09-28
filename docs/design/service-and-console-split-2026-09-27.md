@@ -72,7 +72,7 @@
 | `console.<租户域名>` | `/v1/`、`/client/v1/oauth/login` | 租户端（Host 改写照旧） |
 | `console.<租户域名>` | `/auth/v1/` | 认证中心（不变） |
 | `platform.anyfun.win` | 静态文件 | 平台控制台的构建产物 |
-| `platform.anyfun.win` | `/v1/`、`/client/v1/oauth/login` | 平台端 |
+| `platform.anyfun.win` | `/v1/admin/`、`/client/v1/oauth/login` | 平台端（其余 `/v1/` 一律 404：机器接口只走 `api.*`，这里不给第二个入口） |
 | `platform.anyfun.win` | `/auth/v1/` | 认证中心（与租户控制台同一套转发和限流） |
 
 systemd 三个 unit：`rn-foundation-app`、`rn-foundation-tenant`、`rn-foundation-platform`，同一个 EnvironmentFile，各自覆盖端口。部署脚本 `rn-foundation-apply` 要改成重启三个服务。按 `deploy/amos/README.md` 的约定，CI 只比对这个脚本的 sha256，不能自己更新它，要用户在 amos 上重跑 `setup-ci-deploy.sh`。
@@ -100,6 +100,13 @@ systemd 三个 unit：`rn-foundation-app`、`rn-foundation-tenant`、`rn-foundat
 ### 4.3 平台端的统一登录不依赖租户
 
 现在统一登录的发起与回调挂着 `domainTenantScope`：先按域名认出租户，再把租户 id 放进流程 Cookie 的加密附加数据。platform.anyfun.win 不是任何租户的域名。所以平台端的发起与回调改用固定的附加数据（`auth-cid:flow:platform`），回调地址和退出地址直接用 platform.anyfun.win。认证中心的 `{baseHost}` 方式不用改，但要在认证中心给 RN 应用登记 `platform.anyfun.win` 这个回调域名。那是写 `auth_server` 库，写之前先问。
+
+实现（`roles.go` 的 `platformConsole`、`cid_login.go` 的 `consoleScope`/`flowAAD`）：
+- **哪些请求算平台控制台的**：平台端进程收到的都算，租户端进程收到的都不算；不带角色的全量进程（本地开发、库测）按 Host 是不是 `PLATFORM_CONSOLE_HOST` 分。
+- **两个新配置**：
+  - `PLATFORM_CONSOLE_HOST`：回调与退出地址用它，平台控制台的改动请求只认 `https://` 加这个域名作为来源。没配时平台端不发起统一登录，登录方式接口报统一登录没开。
+  - `MACHINE_API_ORIGIN`：新机器装机命令里的服务端地址。原来用请求的源拼，平台控制台上拼出来会是 `platform.*`，机器就被绑到平台控制台的域名上；配成 `https://api.anyfun.win`，机器地址和原来一样。没配时沿用请求的源。
+- **回调认人**：平台控制台只认平台记录，只有租户记录的是 `no_access`；平台记录加租户记录照旧是 `identity_conflict`。
 
 ### 4.4 会话
 
@@ -146,18 +153,29 @@ systemd 三个 unit：`rn-foundation-app`、`rn-foundation-tenant`、`rn-foundat
 
 ### 第二步：平台控制台独立
 
-- **上线前要准备好的**：
-  - Cloudflare 上 platform.anyfun.win 的 DNS；
-  - 宿主机网关加这个 SNI（网关在宿主机上，要管网关的人做）；
-  - 源站证书覆盖到这个域名；
-  - amos nginx 加 server 块；
-  - 认证中心登记回调域名（写 `auth_server`，先问）。
-- **控制台**：两份构建；平台控制台的插件与页面按第 4.2 节，部署到 `/opt/rn-foundation/admin/platform`。
+按「顺序」拆成两段，各自一次合并与部署：
+
+**2a：平台控制台上线（只加不减）**
 - **服务端**：
-  - 租户端不再认平台会话，第 5 节的特权分支删掉；
-  - 平台端的统一登录按第 4.3 节改；
-  - 平台默认的推送与存储、CORS 并集挪到平台端。
-- **顺序**：平台控制台先上线并验收（平台管理员能在 platform.anyfun.win 登录、做平台维护），再上线「租户端不认平台会话」。反过来的话，中间有一段平台管理员哪里都进不去。
+  - 平台端的统一登录按第 4.3 节；
+  - 平台控制台只认平台会话；
+  - 第 8 节的平台端新接口。
+
+  租户控制台一切照旧，平台管理员在两边都能用。
+- **控制台**：两份构建。平台控制台的插件与页面按第 4.2 节，部署到 `/opt/rn-foundation/admin/platform`。
+- **部署**：用户以 root 跑 `deploy/amos/platform-console-enable.sh`。它往 env 补两个配置，装 platform.* 的 nginx server 块，重启平台端，再经 nginx 核对统一登录会回到平台控制台；失败自动退回。
+- **上线前要准备好的**（2026-09-27 在 amos 上查过）：
+  - DNS：Cloudflare 上已经解析了（代理模式）。
+  - 证书：anyfun 那张源站证书是 `*.anyfun.win`，已经覆盖。
+  - **宿主机网关**：要加这个 SNI。现在公网请求到的是网关自己的 `404 page not found`，要管网关的人做。
+  - **认证中心**：要登记回调域名，也就是写 `auth_server`，写之前先问。
+
+**2b：租户端不再认平台会话**（2a 验收之后）
+- 租户端不再认平台会话，第 5 节的特权分支删掉。
+- 租户控制台去掉平台维护的插件，打包仓库目录、预测平台关联改成只读。
+- nginx 删掉 `console.*` 上转给平台端的那一段。
+
+**顺序**：平台控制台先上线并验收（平台管理员能在 platform.anyfun.win 登录、做平台维护），再上线「租户端不认平台会话」。反过来的话，中间有一段平台管理员哪里都进不去。
 
 两步都不改 `go.mod`，也不碰打包机的构建输入（`cmd/build-agent`、`signing/*`），打包机不用重签。
 
@@ -166,3 +184,19 @@ systemd 三个 unit：`rn-foundation-app`、`rn-foundation-tenant`、`rn-foundat
 1. **打包仓库目录（`repoDirectory`）**：平台控制台加一张「租户打包目录」平台级配置表（租户 → 目录），不进入任何租户。值仍存在各租户的 `build.android` 里（复用现有存储，打包任务读取的地方不变），只有平台端的这张表能改；租户端一律只能原样带回。
 2. **预测平台关联（`services.predict`：接口域名、scopeId、链、端点）**：平台控制台加一张「外部系统关联」平台级登记表（租户 → 预测平台的 scopeId 等），租户只能看、不能改。理由：scopeId 写错就会让 App 显示别人的市场，而 RN 没有办法验证某个 scopeId 属于哪个租户。值仍存在各租户 `mobile-bootstrap` 的 `services` 段（下发给 App 的地方不变）；探测接口（`/predict/probe`）挪到平台端。
 3. **跨租户、只读的视图保留**：控制台成员列表（按租户分组）、Apple 证书与密钥的按租户总览。钱包与设备的跨租户查询和封禁也保留，属于平台风控。
+
+## 8. 平台端新接口（2a）
+
+都在 `/v1/admin/platform/` 下，走平台会话与写操作的二次验证（`platform_tenant_settings.go`）。按租户的设置路径里带租户 id，改动记在那个租户名下的审计里，让租户看得到是平台改的。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /tenants` | 租户列表：id、slug、启用状态、App 名、生效中的域名。给各页分组、选租户用 |
+| `GET /tenant-accounts` | 全部租户的控制台成员，只读，每行带 `tenantId`（第 7 节第 3 条） |
+| `GET /build-directories`，`PUT /build-directories/:tenantId` | 租户打包目录（第 7 节第 1 条）。只改 `build.android` 的 `repoDirectory`，其余原样。租户还没保存过构建配置时新建一行，只带目录 |
+| `GET /predict-links`，`PUT /predict-links/:tenantId` | 外部系统关联（第 7 节第 2 条）。只改 `mobile-bootstrap` 的 `services.predict`。版本判断、预测市场模块开着就必须有合法关联、从平台默认复制一行、通知 App 配置变了，这几条都与租户页保存相同。`predict: null` 表示取消关联 |
+| `POST /predict/probe` | 测试预测平台连接（从租户端挪过来） |
+| `GET /push/credentials` | 平台默认推送凭据，加上继承它的租户数。改、删沿用原来的 `PUT`、`DELETE /push/credentials/{fcm,apns}` |
+| `GET`、`PUT /release-storage`，`POST /release-storage/test`，`GET /release-storage/cors` | 平台默认发布存储（tenant 0 那一行），加上继承它的租户数；CORS 是全平台域名的并集。原来平台默认那一行没有接口能改 |
+
+平台级审计（`tenant_id=0`）的查看页这次不做：原来也没有地方能看，不算退步，另排。

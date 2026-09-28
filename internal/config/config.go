@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -88,6 +89,13 @@ type Config struct {
 	// PlatformAdminUsernames 是自动化通道（ADMIN_API_ACTOR）里哪些 actor 算平台管理员；空表示自动化通道进不了
 	// 平台路由。控制台账号是不是平台管理员看 tenant_admin_accounts，不看这个列表。
 	PlatformAdminUsernames []string
+	// PlatformConsoleHost 是平台控制台的域名（例如 platform.anyfun.win，不带协议与端口）。平台端的统一登录
+	// 拿它拼回调与退出地址，平台控制台的改动请求只认这个来源（设计 service-and-console-split-2026-09-27 §4.3）。
+	// 空 = 没有平台控制台，平台端不发起统一登录
+	PlatformConsoleHost string
+	// MachineAPIOrigin 是新机器装机命令里写的服务端地址（例如 https://api.anyfun.win）。平台控制台不在任何
+	// 租户域名上，不能拿请求的 Host 拼；空 = 沿用请求的源（租户控制台转过来的请求是这个租户的 api.*）
+	MachineAPIOrigin string
 }
 
 // mysqlDefaults 是 DSN 里没写时服务端补上的值。
@@ -152,6 +160,8 @@ func Load() (Config, error) {
 		IndexerAllowPlainHTTP:      l.boolean("INDEXER_ALLOW_PLAIN_HTTP", false),
 		IndexerAlertWebhook:        strings.TrimSpace(os.Getenv("INDEXER_ALERT_WEBHOOK")),
 		PlatformAdminUsernames:     split(strings.TrimSpace(os.Getenv("PLATFORM_ADMIN_USERNAMES"))),
+		PlatformConsoleHost:        strings.ToLower(strings.TrimSpace(os.Getenv("PLATFORM_CONSOLE_HOST"))),
+		MachineAPIOrigin:           strings.TrimRight(strings.TrimSpace(os.Getenv("MACHINE_API_ORIGIN")), "/"),
 	}
 	// CORS_ORIGINS 是额外放行项，不是"允许列表的全部"：租户域名由 tenant_domain
 	// 表推导。开发环境默认放开，生产环境默认**空**——生产上继续默认 "*" 等于
@@ -193,6 +203,12 @@ func Load() (Config, error) {
 	l.between("MYSQL_INIT_MAX_ATTEMPTS", cfg.MySQLInitMaxAttempts, 1, 10)
 	l.atLeast("MYSQL_INIT_RETRY_DELAY_SECONDS", cfg.MySQLInitRetryDelay, 0)
 	l.atLeast("ADMIN_SESSION_TTL_SECONDS", cfg.AdminSessionTTL, 300)
+	if cfg.PlatformConsoleHost != "" && !bareHostPattern.MatchString(cfg.PlatformConsoleHost) {
+		l.fail("PLATFORM_CONSOLE_HOST must be a bare hostname such as platform.example.com (no scheme, port or path)")
+	}
+	if cfg.MachineAPIOrigin != "" && !validMachineAPIOrigin(cfg.MachineAPIOrigin, cfg.Environment == "production") {
+		l.fail("MACHINE_API_ORIGIN must be an origin such as https://api.example.com (https in production, no path)")
+	}
 	if cfg.StorageMasterKey != "" && !validMasterKey(cfg.StorageMasterKey) {
 		l.fail("STORAGE_MASTER_KEY must be a base64-encoded 32-byte key")
 	}
@@ -485,6 +501,18 @@ func split(raw string) []string {
 		}
 	}
 	return result
+}
+
+// bareHostPattern：小写域名，至少两段，不带协议、端口与路径。
+var bareHostPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
+
+// validMachineAPIOrigin：scheme://host[:port]，不带路径、查询与凭据；生产环境只收 https。
+func validMachineAPIOrigin(raw string, production bool) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	return parsed.Scheme == "https" || (!production && parsed.Scheme == "http")
 }
 
 // splitList 解析逗号分隔的列表，去掉空白与空项。

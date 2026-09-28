@@ -70,6 +70,8 @@ type server struct {
 	mailTests windowCounter
 	// secondFactorCodes：账号会话的邮箱二次验证码（second_factor.go，进程内存，单实例），零值可用
 	secondFactorCodes emailCodeStore
+	// role 是这个进程承担的角色（roles.go）；零值 RoleAll。平台控制台的请求按它认（platformConsole）
+	role Role
 }
 
 type release struct {
@@ -147,7 +149,7 @@ func NewForRole(cfg config.Config, storage *store.Store, role Role) http.Handler
 	if err != nil {
 		panic(err)
 	}
-	s := &server{cfg: cfg, db: storage.DB, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify, verifyAPNs: pushcreds.VerifyAPNs}
+	s := &server{cfg: cfg, db: storage.DB, objects: objectstore.AWSFactory{}, tenant: newTenantResolver(storage.DB), secrets: box, tokens: chain.NewReader(nil), adminIPs: allowlist, verifyFCM: pushcreds.Verify, verifyAPNs: pushcreds.VerifyAPNs, role: role}
 	return s.routesFor(role)
 }
 
@@ -238,12 +240,12 @@ func (s *server) registerAppRoutes(r *gin.Engine) {
 func (s *server) registerAdminAuthRoutes(r *gin.Engine) *gin.RouterGroup {
 	// 统一登录的回调：认证中心固定回到 <控制台域名>/client/v1/oauth/login，不能自定义
 	// （设计 tenant-console-accounts-and-sso-2026-09-25 §4.9）。nginx 把控制台域名的这条路径转过来
-	r.GET(cidCallbackPath, s.domainTenantScope(), s.cidCallback)
+	r.GET(cidCallbackPath, s.consoleScope(), s.cidCallback)
 	admin := r.Group("/v1/admin")
 	// 登录页要知道统一登录开没开；免登录
 	admin.GET("/auth/methods", s.authMethods)
 	// 发起统一登录（免登录）
-	admin.GET("/auth/cid/start", s.domainTenantScope(), s.startCIDLogin)
+	admin.GET("/auth/cid/start", s.consoleScope(), s.startCIDLogin)
 	protected := admin.Group("")
 	protected.Use(s.authenticate())
 	protected.GET("/auth/session", s.session)
@@ -321,6 +323,20 @@ func (s *server) registerPlatformRoutes(protected *gin.RouterGroup) {
 	platform.GET("/wallet/blocks", s.listPlatformWalletBlocks)
 	platform.POST("/wallet/blocks", s.createPlatformWalletBlock)
 	platform.POST("/wallet/blocks/:id/revoke", s.revokePlatformWalletBlock)
+	// 平台控制台不进入任何租户：按租户的平台级设置以「租户 → 值」的表出现（platform_tenant_settings.go，
+	// 设计 service-and-console-split-2026-09-27 §4.2、§7）
+	platform.GET("/tenants", s.listPlatformTenants)
+	platform.GET("/tenant-accounts", s.listAllTenantAccounts)
+	platform.GET("/build-directories", s.listBuildDirectories)
+	platform.PUT("/build-directories/:tenantId", s.updateBuildDirectory)
+	platform.GET("/predict-links", s.listPredictLinks)
+	platform.PUT("/predict-links/:tenantId", s.updatePredictLink)
+	platform.POST("/predict/probe", s.probePredictService)
+	platform.GET("/push/credentials", s.getPlatformPushCredentials)
+	platform.GET("/release-storage", s.getPlatformReleaseStorage)
+	platform.PUT("/release-storage", s.updatePlatformReleaseStorage)
+	platform.POST("/release-storage/test", s.testPlatformReleaseStorage)
+	platform.GET("/release-storage/cors", s.platformBucketCORS)
 }
 
 // registerMachineRoutes：打包机、签名闸与新机器注册（平台端）。机器配置的地址是 api.*，nginx 按路径转过来。
@@ -1377,25 +1393,13 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	// 不落库：读路径按行的版本派生，存一份手填的字符串就是第二个事实源
 	delete(body.Config, "configVersion")
 	raw, _ := json.Marshal(body.Config)
-	result, err := tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key='mobile-bootstrap' AND version=?`, raw, actor(c), now, tenantID(c), body.ExpectedVersion)
-	if err != nil {
-		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
+	newVersion, err := writeMobileBootstrapRow(c.Request.Context(), tx, tenantID(c), raw, actor(c), now, body.ExpectedVersion)
+	if errors.Is(err, errStaleAppConfig) {
+		problem(c, 409, "STALE_APP_CONFIG", "App config changed since it was loaded; refresh and retry")
 		return
 	}
-	affected, _ := result.RowsAffected()
-	newVersion := body.ExpectedVersion + 1
-	if affected == 0 {
-		result, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
-			SELECT ?, 'mobile-bootstrap', ?, 1, ?, ? FROM app_configs global_config
-			WHERE global_config.tenant_id=0 AND global_config.config_key='mobile-bootstrap' AND global_config.version=?
-			AND NOT EXISTS (SELECT 1 FROM app_configs tenant_config WHERE tenant_config.tenant_id=? AND tenant_config.config_key='mobile-bootstrap')`, tenantID(c), raw, actor(c), now, body.ExpectedVersion, tenantID(c))
-		if err == nil {
-			affected, _ = result.RowsAffected()
-			newVersion = 1
-		}
-	}
-	if affected != 1 {
-		problem(c, 409, "STALE_APP_CONFIG", "App config changed since it was loaded; refresh and retry")
+	if err != nil {
+		problem(c, 500, "CONFIG_SAVE_FAILED", "Unable to save app config")
 		return
 	}
 	savedConfigVersion := derivedConfigVersion(now, newVersion)
@@ -1418,6 +1422,33 @@ func (s *server) updateAppConfig(c *gin.Context) {
 	view["actorId"] = actor(c)
 	view["requestId"] = requestID(c)
 	c.JSON(200, view)
+}
+
+// errStaleAppConfig：写 mobile-bootstrap 时版本对不上（期间别人改过）。
+var errStaleAppConfig = errors.New("app config changed since it was loaded")
+
+// writeMobileBootstrapRow 按版本写租户的 mobile-bootstrap：有自己的那一行就按 expectedVersion 更新；还在继承
+// 平台默认（tenant 0）就从那一行的 expectedVersion 起新建一行，版本 1。返回写入后的版本。
+// 租户页保存（updateAppConfig）与平台控制台改预测平台关联（updatePredictLink）共用。
+func writeMobileBootstrapRow(ctx context.Context, tx *sql.Tx, tenant string, raw []byte, actorID string, now time.Time, expectedVersion int) (int, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key='mobile-bootstrap' AND version=?`, raw, actorID, now, tenant, expectedVersion)
+	if err != nil {
+		return 0, err
+	}
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		return expectedVersion + 1, nil
+	}
+	result, err = tx.ExecContext(ctx, `INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at)
+		SELECT ?, 'mobile-bootstrap', ?, 1, ?, ? FROM app_configs global_config
+		WHERE global_config.tenant_id=0 AND global_config.config_key='mobile-bootstrap' AND global_config.version=?
+		AND NOT EXISTS (SELECT 1 FROM app_configs tenant_config WHERE tenant_config.tenant_id=? AND tenant_config.config_key='mobile-bootstrap')`, tenant, raw, actorID, now, expectedVersion, tenant)
+	if err != nil {
+		return 0, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return 0, errStaleAppConfig
+	}
+	return 1, nil
 }
 
 // supportedNetworks is the EVM chain catalog this platform can talk to. The

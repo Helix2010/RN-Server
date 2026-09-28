@@ -49,6 +49,12 @@ func TestAccountForLogin(t *testing.T) {
 		{"停用的平台记录加租户记录仍是冲突", []*tenantAccount{disabledPlatform, inA}, "7", nil, "identity_conflict"},
 		{"本租户的记录停用了", []*tenantAccount{disabledInA}, "7", nil, "disabled"},
 		{"平台记录停用了", []*tenantAccount{disabledPlatform}, "7", nil, "disabled"},
+		// 平台控制台（tenant 为空，设计 service-and-console-split-2026-09-27 §4.2）：只认平台记录
+		{"平台控制台：平台记录", []*tenantAccount{platform}, "", platform, ""},
+		{"平台控制台：只有租户记录", []*tenantAccount{inA, inB}, "", nil, "no_access"},
+		{"平台控制台：没有记录", nil, "", nil, "no_access"},
+		{"平台控制台：平台记录加租户记录仍是冲突", []*tenantAccount{platform, inA}, "", nil, "identity_conflict"},
+		{"平台控制台：平台记录停用了", []*tenantAccount{disabledPlatform}, "", nil, "disabled"},
 	} {
 		got, refused := accountForLogin(tc.accounts, tc.tenant)
 		if got != tc.want || refused != tc.refused {

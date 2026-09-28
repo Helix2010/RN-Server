@@ -71,6 +71,12 @@ func (s *server) getReleaseStorage(c *gin.Context) {
 }
 
 func (s *server) updateReleaseStorage(c *gin.Context) {
+	s.writeReleaseStorage(c, tenantID(c), isPlatformSession(c))
+}
+
+// writeReleaseStorage 写 tenant 这一行（平台默认是 tenant 0，由平台端的接口写）。showPlatformRow=false（租户会话）
+// 时不许把继承来的平台凭据搬进租户行，响应里也不给平台那一行的细节。
+func (s *server) writeReleaseStorage(c *gin.Context, tenant string, showPlatformRow bool) {
 	var body releaseStorageWrite
 	if decode(c, &body) != nil || !body.Confirm || len(strings.TrimSpace(body.Reason)) < 3 || body.ExpectedVersion < 0 {
 		problem(c, http.StatusBadRequest, "INVALID_STORAGE_CONFIG", "Storage config, expectedVersion, reason and confirm=true are required")
@@ -92,7 +98,7 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 		return
 	}
 
-	current, err := s.releaseStorageRecord(c.Request.Context(), tenantID(c))
+	current, err := s.releaseStorageRecord(c.Request.Context(), tenant)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_QUERY_FAILED", "Unable to load release storage configuration")
 		return
@@ -114,7 +120,7 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 	// 前缀是租户填的——平台的密钥就被用在了租户指定的地方（设计 tenant-console-accounts-and-sso §3.4 复查）。
 	// 租户会话要换成自己的存储，就带自己的凭据
 	noCredentials := !body.ClearCredentials && body.AccessKeyID == "" && body.SecretAccessKey == "" && body.SessionToken == ""
-	if noCredentials && err == nil && current.SourceTenant != tenantID(c) && !isPlatformSession(c) {
+	if noCredentials && err == nil && current.SourceTenant != tenant && !showPlatformRow {
 		problem(c, http.StatusUnprocessableEntity, "STORAGE_CREDENTIALS_REQUIRED",
 			"This tenant uses the platform's storage; to switch to its own storage, provide its own access key")
 		return
@@ -132,12 +138,12 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 			problem(c, http.StatusServiceUnavailable, "STORAGE_MASTER_KEY_REQUIRED", "STORAGE_MASTER_KEY is required before saving storage credentials")
 			return
 		}
-		value.AccessKeyIDEncrypted, err = s.encryptStorageSecret(body.AccessKeyID, tenantID(c), "accessKeyId")
+		value.AccessKeyIDEncrypted, err = s.encryptStorageSecret(body.AccessKeyID, tenant, "accessKeyId")
 		if err == nil {
-			value.SecretAccessKeyEncrypted, err = s.encryptStorageSecret(body.SecretAccessKey, tenantID(c), "secretAccessKey")
+			value.SecretAccessKeyEncrypted, err = s.encryptStorageSecret(body.SecretAccessKey, tenant, "secretAccessKey")
 		}
 		if err == nil {
-			value.SessionTokenEncrypted, err = s.encryptStorageSecret(body.SessionToken, tenantID(c), "sessionToken")
+			value.SessionTokenEncrypted, err = s.encryptStorageSecret(body.SessionToken, tenant, "sessionToken")
 		}
 		if err != nil {
 			problem(c, http.StatusInternalServerError, "STORAGE_SECRET_SAVE_FAILED", "Unable to encrypt release storage credentials")
@@ -154,11 +160,11 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 	defer tx.Rollback()
 	var result sql.Result
 	newVersion := 1
-	if current.SourceTenant == tenantID(c) {
+	if current.SourceTenant == tenant {
 		newVersion = currentVersion + 1
-		result, err = tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key=? AND version=?`, raw, actor(c), now, tenantID(c), releaseStorageConfigKey, currentVersion)
+		result, err = tx.ExecContext(c.Request.Context(), `UPDATE app_configs SET config_value=?,version=version+1,updated_by=?,updated_at=? WHERE tenant_id=? AND config_key=? AND version=?`, raw, actor(c), now, tenant, releaseStorageConfigKey, currentVersion)
 	} else {
-		result, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) SELECT ?,?,?,1,?,? WHERE NOT EXISTS (SELECT 1 FROM app_configs WHERE tenant_id=? AND config_key=?)`, tenantID(c), releaseStorageConfigKey, raw, actor(c), now, tenantID(c), releaseStorageConfigKey)
+		result, err = tx.ExecContext(c.Request.Context(), `INSERT INTO app_configs(tenant_id,config_key,config_value,version,updated_by,updated_at) SELECT ?,?,?,1,?,? WHERE NOT EXISTS (SELECT 1 FROM app_configs WHERE tenant_id=? AND config_key=?)`, tenant, releaseStorageConfigKey, raw, actor(c), now, tenant, releaseStorageConfigKey)
 	}
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_SAVE_FAILED", "Unable to save release storage configuration")
@@ -168,16 +174,21 @@ func (s *server) updateReleaseStorage(c *gin.Context) {
 		problem(c, http.StatusConflict, "STALE_STORAGE_CONFIG", "Release storage configuration changed; refresh and retry")
 		return
 	}
-	event := newAudit(tenantID(c), actor(c), "release_storage_update", "app-config", releaseStorageConfigKey, body.Reason, requestID(c), map[string]any{"provider": body.Provider, "bucket": body.Bucket, "databaseVersion": newVersion})
+	event := newAudit(tenant, actor(c), "release_storage_update", "app-config", releaseStorageConfigKey, body.Reason, requestID(c), map[string]any{"provider": body.Provider, "bucket": body.Bucket, "databaseVersion": newVersion})
 	if insertAudit(c.Request.Context(), tx, event) != nil || tx.Commit() != nil {
 		problem(c, http.StatusInternalServerError, "STORAGE_CONFIG_SAVE_FAILED", "Unable to save release storage configuration")
 		return
 	}
-	c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{Value: value, SourceTenant: tenantID(c), Version: newVersion, UpdatedBy: actor(c), UpdatedAt: now}, tenantID(c), isPlatformSession(c)))
+	c.JSON(http.StatusOK, releaseStorageView(releaseStorageRecord{Value: value, SourceTenant: tenant, Version: newVersion, UpdatedBy: actor(c), UpdatedAt: now}, tenant, showPlatformRow))
 }
 
 func (s *server) testReleaseStorage(c *gin.Context) {
-	record, err := s.releaseStorageRecord(c.Request.Context(), tenantID(c))
+	s.checkReleaseStorage(c, tenantID(c), isPlatformSession(c))
+}
+
+// checkReleaseStorage 用 tenant 生效的那一行（自己的或继承的平台默认）真连一次桶。
+func (s *server) checkReleaseStorage(c *gin.Context, tenant string, showPlatformRow bool) {
+	record, err := s.releaseStorageRecord(c.Request.Context(), tenant)
 	if err != nil {
 		problem(c, http.StatusPreconditionFailed, "STORAGE_NOT_CONFIGURED", "Release storage is not configured for this tenant")
 		return
@@ -196,10 +207,10 @@ func (s *server) testReleaseStorage(c *gin.Context) {
 	}
 	// 继承平台存储时，租户会话拿不到平台的桶名（与 GET 一致，设计 tenant-console-accounts-and-sso §3.4）
 	var bucket any = record.Value.Bucket
-	if record.SourceTenant != tenantID(c) && !isPlatformSession(c) {
+	if record.SourceTenant != tenant && !showPlatformRow {
 		bucket = nil
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": bucket, "inherited": record.SourceTenant != tenantID(c), "checkedAt": iso(time.Now())})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "provider": record.Value.Provider, "bucket": bucket, "inherited": record.SourceTenant != tenant, "checkedAt": iso(time.Now())})
 }
 
 func (s *server) releaseStorageRecord(ctx context.Context, tenant string) (releaseStorageRecord, error) {
@@ -436,7 +447,12 @@ func (s *server) bucketCORSRequirements(c *gin.Context) {
 		problem(c, http.StatusInternalServerError, "TENANT_DOMAIN_QUERY_FAILED", "Unable to list tenant domains")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(http.StatusOK, bucketCORSView(origins))
+}
+
+// bucketCORSView 是桶级跨域规则的形状（租户页与平台控制台共用）。
+func bucketCORSView(origins []string) gin.H {
+	return gin.H{
 		"allowedOrigins": origins,
 		// 直传只用 PUT；GET/HEAD 留给浏览器按 ETag 做条件请求
 		"allowedMethods": []string{"PUT", "GET", "HEAD"},
@@ -446,5 +462,5 @@ func (s *server) bucketCORSRequirements(c *gin.Context) {
 		"note": "只在 ARTIFACT_UPLOAD_MODE=direct 时才需要这条规则——那种模式下浏览器" +
 			"直传对象存储，桶必须自己放行控制台来源。当前部署用的是 proxy，上传经服务端" +
 			"中转，桶上不需要任何跨域规则。",
-	})
+	}
 }

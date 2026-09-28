@@ -40,10 +40,11 @@
 | 路径 | 内容 |
 | --- | --- |
 | `/opt/rn-foundation/rn-server` | 程序本体，API、扫链、迁移共用 |
-| `/opt/rn-foundation/admin/<租户>/` | 控制台静态产物，一个租户一份 |
+| `/opt/rn-foundation/admin/console/` | 租户控制台静态产物，三个 `console.*` 共用一份 |
+| `/opt/rn-foundation/admin/platform/` | 平台控制台静态产物（`platform.anyfun.win`） |
 | `/etc/rn-foundation.env` | 配置，0600 root，含数据库口令 |
 | `/var/lib/rn-foundation/` | 状态目录 |
-| `/etc/nginx/conf.d/rn-foundation.conf` | 四个域名的站点配置 |
+| `/etc/nginx/conf.d/rn-foundation.conf` | 各域名的站点配置（片段在同目录的 `rn-foundation-snippet-*.inc`） |
 | `/usr/local/sbin/rn-foundation-apply` | 特权收口脚本，换二进制／换控制台／换打包机都走它（`server` / `admin <slug>` / `build-agent`） |
 | `/var/lib/rn-foundation-deploy/incoming/` | 部署暂存目录，属 `rndeploy` |
 
@@ -196,6 +197,12 @@ nginx 配置里的证书路径指向软链接 `/etc/nginx/ssl/rn-foundation`：�
    先核对二进制：旧二进制不认角色子命令，会在 13080 上起全量进程，三个 unit 抢同一个端口。
 3. 出问题要退回：`sudo bash service-split-switch.sh --rollback <备份目录>`。
 4. 稳定之后把这个脚本从仓库删掉。
+
+平台控制台（`platform.anyfun.win`，第二步）要在上面这步之后、服务端带上平台控制台之后再打开：
+以 root 跑 `platform-console-enable.sh`。它往 env 补 `PLATFORM_CONSOLE_HOST`、`MACHINE_API_ORIGIN`（已有的不改），
+装 nginx（含 `platform.*` 的 server 块，只开 `/v1/admin/` 与统一登录回调，机器接口仍只在 `api.*`），重启平台端，
+经 nginx 核对统一登录回到平台控制台；失败自动退回，`--rollback <备份目录>` 手动退回。公网能到还要网关按 SNI
+放行这个域名、认证中心登记回调域名；证书用 anyfun 那张 `*.anyfun.win`。
 
 ```bash
 scp -r deploy/amos amos:~/rn-foundation-split

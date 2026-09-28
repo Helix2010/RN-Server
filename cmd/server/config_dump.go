@@ -47,6 +47,8 @@ func printConfig(cfg config.Config) {
 		text("PORT", cfg.Port),
 		list("TRUSTED_PROXIES", cfg.TrustedProxies),
 		list("PLATFORM_ADMIN_USERNAMES", cfg.PlatformAdminUsernames),
+		text("PLATFORM_CONSOLE_HOST", cfg.PlatformConsoleHost),
+		text("MACHINE_API_ORIGIN", cfg.MachineAPIOrigin),
 		list("CORS_ORIGINS", cfg.CORSOrigins),
 		num("HTTP_READ_TIMEOUT_SECONDS", cfg.HTTPReadTimeout),
 		num("HTTP_WRITE_TIMEOUT_SECONDS", cfg.HTTPWriteTimeout),

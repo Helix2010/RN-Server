@@ -18,7 +18,7 @@
 #   4. 停旧进程，起三个新进程，等三个端口都就绪；
 #   5. 换 nginx 配置，nginx -t 通过才 reload；
 #   6. 经 nginx 核对分流：api.* 的管理接口 404（App 端没有）、机器接口到平台端；控制台的
-#      /v1/admin 到租户端、/v1/admin/platform 到平台端；
+#      /v1/admin 到租户端、/v1/admin/platform 到平台端；有平台控制台的片段时，platform.* 的管理接口到平台端；
 #   7. 都通过之后才停用、删除旧 unit（备份里留着）。
 set -euo pipefail
 
@@ -28,10 +28,18 @@ NGINX_DIR=/etc/nginx/conf.d
 APPLY=/usr/local/sbin/rn-foundation-apply
 BINARY=/opt/rn-foundation/rn-server
 NEW_UNITS=(rn-foundation-platform rn-foundation-tenant rn-foundation-app)
-NGINX_FILES=(rn-foundation.conf rn-foundation-snippet-api.inc rn-foundation-snippet-api-proxy.inc rn-foundation-snippet-console.inc)
-# 经 nginx 核对用的域名：anyfun 的 api 与控制台（本机 443，--resolve 到回环，不出网）
+# nginx：站点配置加上同目录下全部 nginx-snippet-<名字>.inc（装成 conf.d/rn-foundation-snippet-<名字>.inc）。
+# 键是装上去的文件名，值是本目录里的源文件
+declare -A NGINX_FILES=([rn-foundation.conf]=nginx-rn-foundation.conf)
+for f in "$SRC"/nginx-snippet-*.inc; do
+  [ -e "$f" ] || continue
+  f="${f##*/}"
+  NGINX_FILES["rn-foundation-snippet-${f#nginx-snippet-}"]="$f"
+done
+# 经 nginx 核对用的域名：anyfun 的 api 与控制台、平台控制台（本机 443，--resolve 到回环，不出网）
 API_HOST=api.anyfun.win
 CONSOLE_HOST=console.anyfun.win
+PLATFORM_HOST=platform.anyfun.win
 
 log() { printf '== %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
@@ -60,8 +68,13 @@ restore() { # $1 = 备份目录
   systemctl enable rn-foundation-server >/dev/null 2>&1 || true
   systemctl start rn-foundation-server
   systemctl start rn-foundation-indexer || true
-  for f in "${NGINX_FILES[@]}"; do
-    install -m 0644 -o root -g root "$backup/$f" "$NGINX_DIR/$f"
+  # 切换前没有的片段（这次新加的）删掉，有的装回去
+  for f in "${!NGINX_FILES[@]}"; do
+    if [ -f "$backup/nginx/$f" ]; then
+      install -m 0644 -o root -g root "$backup/nginx/$f" "$NGINX_DIR/$f"
+    else
+      rm -f "$NGINX_DIR/$f"
+    fi
   done
   if nginx -t 2>/dev/null; then
     systemctl reload nginx
@@ -105,7 +118,10 @@ BACKUP="/root/rn-foundation-service-split-$(date -u +%Y%m%dT%H%M%SZ)"
 log "备份到 $BACKUP"
 install -d -m 0700 "$BACKUP"
 cp -a "$UNIT_DIR/rn-foundation-server.service" "$UNIT_DIR/rn-foundation-indexer.service" "$APPLY" "$BACKUP/"
-for f in "${NGINX_FILES[@]}"; do cp -a "$NGINX_DIR/$f" "$BACKUP/"; done
+install -d -m 0700 "$BACKUP/nginx"
+for f in "${!NGINX_FILES[@]}"; do
+  if [ -f "$NGINX_DIR/$f" ]; then cp -a "$NGINX_DIR/$f" "$BACKUP/nginx/"; fi
+done
 
 # 与 CI 的 rn-foundation-apply 同一把锁：切换期间 CI 部署排队，不会在半路换二进制
 exec 9>/var/lib/rn-foundation-deploy/.apply.lock
@@ -143,9 +159,8 @@ done
 systemctl start rn-foundation-indexer || printf '!! 扫链没起来，API 不受影响：journalctl -u rn-foundation-indexer\n' >&2
 
 log "换 nginx 配置"
-install -m 0644 -o root -g root "$SRC/nginx-rn-foundation.conf" "$NGINX_DIR/rn-foundation.conf"
-for f in api api-proxy console; do
-  install -m 0644 -o root -g root "$SRC/nginx-snippet-$f.inc" "$NGINX_DIR/rn-foundation-snippet-$f.inc"
+for f in "${!NGINX_FILES[@]}"; do
+  install -m 0644 -o root -g root "$SRC/${NGINX_FILES[$f]}" "$NGINX_DIR/$f"
 done
 nginx -t || die "新的 nginx 配置 nginx -t 不过"
 systemctl reload nginx
@@ -173,6 +188,10 @@ expect 401 "$API_HOST"     POST /v1/signer/claim             "签名闸接口在
 expect 200 "$CONSOLE_HOST" GET  /v1/admin/auth/methods       "租户端"
 expect 401 "$CONSOLE_HOST" GET  /v1/admin/auth/session       "租户端，没登录"
 expect 401 "$CONSOLE_HOST" GET  /v1/admin/platform/accounts  "平台端（租户端没有这条路由，会是 404）"
+if [ -n "${NGINX_FILES[rn-foundation-snippet-platform.inc]:-}" ]; then
+  expect 200 "$PLATFORM_HOST" GET  /v1/admin/auth/methods     "平台控制台 → 平台端"
+  expect 404 "$PLATFORM_HOST" POST /v1/build-agent/claim      "平台控制台上不开机器接口"
+fi
 [ "$failed" = 0 ] || die "分流核对没通过"
 
 log "停用并删除旧 unit"

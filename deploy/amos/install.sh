@@ -10,7 +10,8 @@ cd "$(dirname "$0")"
 for f in rn-foundation-app.service rn-foundation-tenant.service rn-foundation-platform.service \
          rn-foundation-indexer.service rn-foundation-migrate.service \
          rn-foundation.env.example nginx-rn-foundation.conf \
-         nginx-snippet-api.inc nginx-snippet-api-proxy.inc nginx-snippet-console.inc; do
+         nginx-snippet-api.inc nginx-snippet-api-proxy.inc nginx-snippet-console.inc \
+         nginx-snippet-console-static.inc nginx-snippet-platform.inc; do
   [ -f "$f" ] || { echo "缺少 $f" >&2; exit 1; }
 done
 
@@ -62,9 +63,9 @@ done
 echo "== nginx =="
 # 后缀必须是 .conf：nginx.conf 里 include 的是 conf.d/*.conf。片段不能用 .conf
 # 结尾，否则会被当成独立配置加载，里面的 location 不在 server 块里会直接报错
-sudo install -m 0644 nginx-snippet-api-proxy.inc /etc/nginx/conf.d/rn-foundation-snippet-api-proxy.inc
-sudo install -m 0644 nginx-snippet-api.inc     /etc/nginx/conf.d/rn-foundation-snippet-api.inc
-sudo install -m 0644 nginx-snippet-console.inc /etc/nginx/conf.d/rn-foundation-snippet-console.inc
+for f in nginx-snippet-*.inc; do
+  sudo install -m 0644 "$f" "/etc/nginx/conf.d/rn-foundation-snippet-${f#nginx-snippet-}"
+done
 sudo install -m 0644 nginx-rn-foundation.conf  /etc/nginx/conf.d/rn-foundation.conf
 sudo nginx -t
 sudo systemctl reload nginx

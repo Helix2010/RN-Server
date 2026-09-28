@@ -155,6 +155,9 @@ type browser struct {
 	tenant  accountsTestTenant
 	cookies map[string]string
 	headers map[string]string
+	// host 非空时这是平台控制台（设计 service-and-console-split-2026-09-27 §4.3）：Host 原样是它、
+	// 没有 X-RN-Console-Host，改动请求的 Origin 也是它
+	host string
 }
 
 func (b *browser) do(method, target string, body any, headers map[string]string) *httptest.ResponseRecorder {
@@ -166,12 +169,17 @@ func (b *browser) do(method, target string, body any, headers map[string]string)
 		reader = bytes.NewReader(nil)
 	}
 	request := httptest.NewRequest(method, target, reader)
-	// nginx 把 console.* 的 Host 改写成 api.*，并写下原来的控制台域名
-	request.Host = b.tenant.api
-	request.Header.Set(consoleHostHeader, b.tenant.console)
+	origin := b.tenant.console
+	if b.host != "" {
+		request.Host, origin = b.host, b.host
+	} else {
+		// nginx 把 console.* 的 Host 改写成 api.*，并写下原来的控制台域名
+		request.Host = b.tenant.api
+		request.Header.Set(consoleHostHeader, b.tenant.console)
+	}
 	request.Header.Set("content-type", "application/json")
 	if !safeMethod(method) {
-		request.Header.Set("Origin", "https://"+b.tenant.console)
+		request.Header.Set("Origin", "https://"+origin)
 	}
 	for k, v := range b.headers {
 		request.Header.Set(k, v)

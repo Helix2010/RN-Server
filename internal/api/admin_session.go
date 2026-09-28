@@ -111,6 +111,10 @@ func (s *server) loadAdminSession(c *gin.Context) (*adminSession, error) {
 		return &session, nil
 	}
 	session.TenantID = tenant.String
+	if s.platformConsole(c) {
+		// 平台控制台只认平台会话（设计 service-and-console-split-2026-09-27 §4.4）
+		return nil, nil
+	}
 	host, err := s.tenant.resolve(ctx, c.Request.Host)
 	if err != nil || host.ID != session.TenantID {
 		// 别的租户的会话拿到这个域名上来：当没登录，而不是 403——对这个域名来说它确实没登录
@@ -217,6 +221,10 @@ func (s *server) adminOriginAllowed(c *gin.Context) bool {
 		if allowed == "*" || allowed == origin {
 			return true
 		}
+	}
+	// 平台控制台不在任何租户域名上：来源必须正是它自己（设计 service-and-console-split-2026-09-27 §4.3）
+	if s.platformConsole(c) && s.cfg.PlatformConsoleHost != "" && origin == "https://"+s.cfg.PlatformConsoleHost {
+		return true
 	}
 	originTenant, ok := s.originTenant(origin)
 	if !ok {
@@ -334,8 +342,10 @@ func (s *server) logout(c *gin.Context) {
 // 免登录，不泄露任何配置细节。
 func (s *server) authMethods(c *gin.Context) {
 	client, _, err := s.cidClient(c.Request.Context())
+	// 平台控制台还要有 PLATFORM_CONSOLE_HOST 才拼得出回调地址
+	usable := err == nil && client != nil && (!s.platformConsole(c) || s.cfg.PlatformConsoleHost != "")
 	c.Header("Cache-Control", "no-store")
-	c.JSON(200, gin.H{"cid": err == nil && client != nil})
+	c.JSON(200, gin.H{"cid": usable})
 }
 
 // requireAdminSessionTenant 用在 current 组里：租户会话的租户必须等于请求域名的租户。
