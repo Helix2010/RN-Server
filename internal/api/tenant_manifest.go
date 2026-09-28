@@ -45,6 +45,10 @@ type tenantManifest struct {
 	IconBackgroundColor    string     `json:"iconBackgroundColor"`
 	Icon                   tenantIcon `json:"icon"`
 	SignerSHA256           string     `json:"signerSha256"`
+	// IOSUsesNonExemptEncryption 是租户声明过的出口合规（ios_export_compliance.go）：RN-App 打包 iOS 时写进
+	// Info.plist 的 ITSAppUsesNonExemptEncryption。没声明就省略，RN-App 不写这个键、每个 build 在 ASC 上人工回答。
+	// 指针：false 也是一个声明，不能被 omitempty 吞掉
+	IOSUsesNonExemptEncryption *bool `json:"iosUsesNonExemptEncryption,omitempty"`
 }
 
 // 图标文件名是约定，不是配置：图片本身仍然在仓库的 assets/tenants/<slug>/ 下，
@@ -176,25 +180,33 @@ func (s *server) composeTenantManifest(ctx context.Context, tenant string, cfg b
 		}
 		appleTeamID = strings.TrimSpace(ios.Value.AppleTeamID)
 	}
+	var usesNonExemptEncryption *bool
+	if declared, err := s.iosExportComplianceRecordFor(ctx, s.db, tenant); err != nil {
+		return tenantManifest{}, err
+	} else if declared != nil {
+		value := declared.Value.UsesNonExemptEncryption
+		usesNonExemptEncryption = &value
+	}
 
 	return tenantManifest{
-		Slug:                   cfg.RepoDirectory,
-		AppName:                strings.TrimSpace(identity.AppName),
-		Scheme:                 strings.TrimSpace(identity.Scheme),
-		AndroidPackage:         strings.TrimSpace(release.Value.PackageName),
-		IOSBundleID:            bundleID,
-		AppleTeamID:            appleTeamID,
-		APIBaseURL:             strings.TrimRight(strings.TrimSpace(identity.APIBaseURL), "/"),
-		BootstrapSignerAddress: signer.Value.Address,
-		ApplicationID:          tenantApplicationID,
-		DistributionChannel:    tenantDistributionChannel,
-		OTAChannel:             tenantOTAChannel,
-		Version:                version,
-		AndroidVersionCode:     buildNumber,
-		IOSBuildNumber:         strconv.Itoa(buildNumber),
-		IconBackgroundColor:    background,
-		Icon:                   defaultTenantIcon(),
-		SignerSHA256:           release.Value.SignerSHA256,
+		Slug:                       cfg.RepoDirectory,
+		AppName:                    strings.TrimSpace(identity.AppName),
+		Scheme:                     strings.TrimSpace(identity.Scheme),
+		AndroidPackage:             strings.TrimSpace(release.Value.PackageName),
+		IOSBundleID:                bundleID,
+		AppleTeamID:                appleTeamID,
+		APIBaseURL:                 strings.TrimRight(strings.TrimSpace(identity.APIBaseURL), "/"),
+		BootstrapSignerAddress:     signer.Value.Address,
+		ApplicationID:              tenantApplicationID,
+		DistributionChannel:        tenantDistributionChannel,
+		OTAChannel:                 tenantOTAChannel,
+		Version:                    version,
+		AndroidVersionCode:         buildNumber,
+		IOSBuildNumber:             strconv.Itoa(buildNumber),
+		IconBackgroundColor:        background,
+		Icon:                       defaultTenantIcon(),
+		SignerSHA256:               release.Value.SignerSHA256,
+		IOSUsesNonExemptEncryption: usesNonExemptEncryption,
 	}, nil
 }
 

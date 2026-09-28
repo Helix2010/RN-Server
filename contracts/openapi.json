@@ -7259,6 +7259,136 @@
         }
       }
     },
+    "/v1/admin/ios/export-compliance": {
+      "get": {
+        "summary": "Read the tenant's iOS export compliance declaration",
+        "description": "Export compliance is the tenant's own (legal) judgement; the platform never answers it on the tenant's behalf. Declared tenants get iosUsesNonExemptEncryption in the tenant.json handed to build machines, and RN-App writes ITSAppUsesNonExemptEncryption into Info.plist so App Store Connect stops asking per build. Stored as its own key release.ios.export-compliance (not inside release.ios). Design ios-platform-testflight-upload-2026-09-23 §9.",
+        "responses": {
+          "200": {
+            "description": "The declaration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "declared": {
+                      "type": "boolean",
+                      "description": "false = no declaration: builds leave ITSAppUsesNonExemptEncryption out and every build is answered by hand in App Store Connect"
+                    },
+                    "usesNonExemptEncryption": {
+                      "type": "boolean",
+                      "nullable": true
+                    },
+                    "version": {
+                      "type": "integer"
+                    },
+                    "updatedBy": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "updatedAt": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "500": {
+            "description": "IOS_EXPORT_COMPLIANCE_CONFIG_INVALID"
+          }
+        }
+      },
+      "put": {
+        "summary": "Declare or withdraw the tenant's iOS export compliance",
+        "description": "Second factor required. usesNonExemptEncryption true / false declares; null withdraws the declaration (back to answering every build by hand). Takes effect for builds claimed afterwards (tenant.json is composed when a build machine claims the job). Audited as ios_export_compliance_update with from / to.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "usesNonExemptEncryption",
+                  "expectedVersion",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "usesNonExemptEncryption": {
+                    "type": "boolean",
+                    "nullable": true
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3
+                  },
+                  "confirm": {
+                    "type": "boolean",
+                    "enum": [
+                      true
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The saved declaration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "declared": {
+                      "type": "boolean",
+                      "description": "false = no declaration: builds leave ITSAppUsesNonExemptEncryption out and every build is answered by hand in App Store Connect"
+                    },
+                    "usesNonExemptEncryption": {
+                      "type": "boolean",
+                      "nullable": true
+                    },
+                    "version": {
+                      "type": "integer"
+                    },
+                    "updatedBy": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "updatedAt": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_IOS_EXPORT_COMPLIANCE"
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "409": {
+            "description": "STALE_IOS_EXPORT_COMPLIANCE, IOS_EXPORT_COMPLIANCE_UNCHANGED"
+          },
+          "500": {
+            "description": "IOS_EXPORT_COMPLIANCE_SAVE_FAILED"
+          }
+        }
+      }
+    },
     "/v1/admin/ios/testflight/sync": {
       "post": {
         "description": "Read-only sync from App Store Connect: builds, tester groups, the external public link and the current build's expiry, written back into release.ios. Never creates groups, opens public links, submits for review or changes testers",
