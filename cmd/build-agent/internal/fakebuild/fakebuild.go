@@ -81,22 +81,28 @@ type Tools struct {
 	Sleep string
 	// Linger 存在时，假 pnpm install 留下一个握着标准输出的后台进程（睡 1800 秒），PID 写进 <Record>/linger.pid
 	Linger string
-	// APK、OTA 与 IPA 是假产物的内容
-	APK []byte
-	OTA []byte
-	IPA []byte
+	// NoAppStoreInfo 存在时，假 ios:release 不在 .ipa 旁边生成 AppStoreInfo.plist（模拟不生成它的 Xcode）
+	NoAppStoreInfo string
+	// APK、OTA、IPA 与 AppStoreInfo 是假产物的内容
+	APK          []byte
+	OTA          []byte
+	IPA          []byte
+	AppStoreInfo []byte
 }
 
 // Install 在 dir 下造出 bin/pnpm、bin/node 与记录目录。
 func Install(t *testing.T, dir string) Tools {
 	t.Helper()
 	tools := Tools{
-		Bin:    filepath.Join(dir, "bin"),
-		Record: filepath.Join(dir, "record"),
-		Sleep:  filepath.Join(dir, "sleep-on-install"),
-		Linger: filepath.Join(dir, "linger-on-install"),
-		APK:    APKWithCertificate(t, CertificatePEM),
-		OTA:    []byte("PK\x05\x06" + strings.Repeat("\x00", 18)),
+		Bin:            filepath.Join(dir, "bin"),
+		Record:         filepath.Join(dir, "record"),
+		Sleep:          filepath.Join(dir, "sleep-on-install"),
+		Linger:         filepath.Join(dir, "linger-on-install"),
+		NoAppStoreInfo: filepath.Join(dir, "no-appstore-info"),
+		AppStoreInfo: []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>bundle-identifier</key><string>` + IPABundleID + `</string></dict></plist>`),
+		APK: APKWithCertificate(t, CertificatePEM),
+		OTA: []byte("PK\x05\x06" + strings.Repeat("\x00", 18)),
 		// .ipa 是真的 zip：控制进程会打开它读 Info.plist，核对身份之后才交给上传账户
 		IPA: IPAWithIdentity(t, IPABundleID, IPAShortVersion, IPABuildNumber),
 	}
@@ -108,6 +114,7 @@ func Install(t *testing.T, dir string) Tools {
 	apkFixture := filepath.Join(dir, "fixture.apk")
 	otaFixture := filepath.Join(dir, "fixture-ota.zip")
 	ipaFixture := filepath.Join(dir, "fixture.ipa")
+	appStoreInfoFixture := filepath.Join(dir, "fixture-AppStoreInfo.plist")
 	if err := os.WriteFile(apkFixture, tools.APK, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +122,9 @@ func Install(t *testing.T, dir string) Tools {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(ipaFixture, tools.IPA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(appStoreInfoFixture, tools.AppStoreInfo, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	pnpm := fmt.Sprintf(`#!/bin/sh
@@ -162,6 +172,7 @@ ios:release)
   mkdir -p artifacts
   cp %[7]q "artifacts/$slug-$version-build$build.ipa"
   echo "iOS release IPA written"
+  if [ ! -e %[8]q ]; then cp %[9]q "artifacts/$slug-$version-build$build.AppStoreInfo.plist"; fi
   ;;
 ota:build)
   record ota-build
@@ -178,7 +189,7 @@ ota:build)
   exit 3
   ;;
 esac
-`, tools.Record, tools.Sleep, NativeFingerprint, apkFixture, otaFixture, tools.Linger, ipaFixture)
+`, tools.Record, tools.Sleep, NativeFingerprint, apkFixture, otaFixture, tools.Linger, ipaFixture, tools.NoAppStoreInfo, appStoreInfoFixture)
 	node := fmt.Sprintf(`#!/bin/sh
 set -eu
 env > %[1]q/sbom.env

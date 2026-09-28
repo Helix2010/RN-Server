@@ -39,6 +39,10 @@ func build(ctx context.Context, out io.Writer, who identity, flags runnerFlags) 
 	}
 	// 上一个任务留下的进程与临时文件先清掉，再开始执行任何第三方代码
 	reap(who)
+	// 执行账户跨任务可写的家目录（Xcode 认它不认 $HOME）也按白名单清空：上一个租户的描述文件不能留给这一个
+	if err := pruneRunnerHome(out, who); err != nil {
+		return err
+	}
 	if err := ensureEmpty(layout.Work(), "work/"); err != nil {
 		return usageError{err}
 	}
@@ -69,7 +73,8 @@ func build(ctx context.Context, out io.Writer, who identity, flags runnerFlags) 
 
 func cleanup(out io.Writer, who identity, layout jobspec.Layout) error {
 	reap(who)
-	var first error
+	// 做完就清：描述文件不在两次构建之间留在执行账户的家目录里
+	first := pruneRunnerHome(out, who)
 	for _, dir := range []string{layout.Work(), layout.Out()} {
 		if err := emptyDir(dir); err != nil && first == nil {
 			first = err
@@ -171,6 +176,13 @@ func (j job) buildIPA(ctx context.Context) error {
 	}
 	if err := copyFile(artifact, j.layout.OutFile(jobspec.IPAFileName), 0o640); err != nil {
 		return fmt.Errorf("cannot hand over the iOS package: %w", err)
+	}
+	// AppStoreInfo.plist 可有可无：Xcode 没生成时构建脚本只记一行，这里也不当失败。交不交给租户由控制进程按交付方式定
+	info := filepath.Join(app, "artifacts", jobspec.AppStoreInfoArtifactName(j.spec.TenantDirectory, j.spec.AppVersion, j.spec.BuildNumber))
+	if stat, err := os.Lstat(info); err == nil && stat.Mode().IsRegular() {
+		if err := copyFile(info, j.layout.OutFile(jobspec.AppStoreInfoFileName), 0o640); err != nil {
+			return fmt.Errorf("cannot hand over AppStoreInfo.plist: %w", err)
+		}
 	}
 	// 结果里没有"传上去了没有"：上传由控制进程交给另一个用户做，执行进程答不了这个问题
 	return j.writeResult(jobspec.Result{

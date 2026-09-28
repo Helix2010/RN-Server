@@ -155,6 +155,11 @@ sudo dscl . -create /Users/_rnbuilder NFSHomeDirectory /var/rn-build-home
 事（按 uid 清残留进程与临时目录），加一条「清空 `_rnbuilder` 的家目录」是自然的延伸；
 要小心的是别把 Xcode 自己的长期缓存一起清掉导致每次构建都重新索引——所以更可能是
 **白名单式保留**（比如只留 `Library/Caches/com.apple.dt.Xcode`）而不是整个删。这条没做。
+
+> **2026-09-28 已做**（`build-runner/runnerhome.go`）：执行进程在每个任务开始前（`reap` 之后、任何第三方代码之前）
+> 与结束后，把密码数据库里的家目录按白名单清空，只留 `Library/Caches/com.apple.dt.Xcode`。直接原因是 RN-App 把
+> **当前租户的**描述文件装进这里，不清就会留给下一个租户的构建。只在执行与控制是不同 uid、且目录属于执行账户时动手，
+> 符号链接只删链接不跟进去。发打包机新版本即可生效，不用重装。
 装机脚本 2026-09-23 起会建这个目录并改 `NFSHomeDirectory`（`RUNNER_HOME`），只动执行账户。
 
 ### 缓存全是每任务一份，于是每次构建都重掷一次网络的骰子（2026-09-21 记）
@@ -193,7 +198,16 @@ func (l Layout) GradleUserHome() string { return filepath.Join(l.Work(), "gradle
 - **另一条路是只读预热**：由一个受信任的进程（不是执行账户）把缓存灌好，任务侧只读挂载。
   代价是多一套预热机制，换来的是"共享但不可写"。
 
-选哪条是要人拍板的，先记在这里。顺带：`libyttrium` 那个 zip 走的是 `curl` 取 github
+选哪条是要人拍板的，先记在这里。
+
+> **2026-09-28 用户按建议定：pnpm 共享、CocoaPods 仍每任务一份。** 落地时发现"pnpm 共享"要安全，缓存必须由受信任的一方
+> 填，不能是执行账户（`deploy/build-agent/README.md`：store 的 index 把 tarball 完整性映射到文件哈希，没有原 tarball
+> 就验不了，执行账户填过的 store 一旦被下毒，之后每个任务都信它）；而控制账户手里有打包机密钥，让它跑 pnpm 处理
+> 第三方包会打穿"构建进程与 agent-key 不同 uid"这条隔离（记忆：打包机签名密钥暴露面）。所以做法定为：新建一个
+> 没有钥匙串、没有密钥的 `_rnbuildcache` 账户，只把 `pnpm-lock.yaml` 拷进空目录跑 `pnpm fetch --frozen-lockfile
+> --ignore-scripts` 填种子（不执行仓库代码，tarball 按 lockfile 的 sha512 校验），属主改成控制账户、组可读，执行进程
+> 每个任务用 APFS `cp -c` 克隆进自己的 store（可写、写不回种子、没有硬链接 TOCTOU）。新账户与 sudoers 要在 Mac 上
+> 重跑装机脚本，**等用户安排一次 Mac 维护时一起做**，先不写没法在真机上跑的代码。顺带：`libyttrium` 那个 zip 走的是 `curl` 取 github
 release 资产，**`url.insteadOf` 的镜像改写管不着它**（那只改 git clone），所以镜像解决不了
 这一条。
 

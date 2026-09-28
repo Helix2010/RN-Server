@@ -605,6 +605,29 @@ func (a *agent) deliverAPK(ctx context.Context, job claimedJob, prepared prepare
 //     但那是交给租户的交付件，不是分发产物（设计 ios-tenant-delivery-tiers-2026-09-24 §3.5）；
 //  2. **没有出处签名**。那套是给签名闸验货用的，iOS 没有签名闸这一环；
 //  3. **一步到 succeeded**，不经过 built / signing。
+//
+// handBackAppStoreInfo 把 AppStoreInfo.plist 交回服务端（自助上传的租户在 Windows / Linux 上用 iTMSTransporter
+// 上传要带它，设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）。它是可选的：Xcode 没生成就没有；交不回去也不让
+// 任务失败——.ipa 已经交回了，租户还能用 Mac 的 Transporter 传。只记进日志，人从构建日志里看得到。
+func (a *agent) handBackAppStoreInfo(ctx context.Context, job claimedJob, prepared preparedJob, buf *logBuffer) {
+	info, ok, err := spoolOptionalOutput(prepared.Layout, jobspec.AppStoreInfoFileName, a.spoolDir(job.ID), jobspec.MaxAppStoreInfoSize)
+	switch {
+	case err != nil:
+		buf.add("AppStoreInfo.plist from the build runner was refused, not handing it back: " + err.Error())
+		return
+	case !ok:
+		buf.add("this Xcode did not generate AppStoreInfo.plist; the tenant can still upload with Transporter on a Mac")
+		return
+	}
+	if err := withRetry(ctx, buf, "AppStoreInfo.plist hand-back", 3, func(ctx context.Context) error {
+		return a.api.uploadStream(ctx, job, "/ipa/appstore-info/upload", info.Path, info.SHA256, info.Size)
+	}); err != nil {
+		buf.add("AppStoreInfo.plist could not be handed back (the .ipa was): " + err.Error())
+		return
+	}
+	buf.add(fmt.Sprintf("handed AppStoreInfo.plist back (%d bytes)", info.Size))
+}
+
 func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared preparedJob, buf *logBuffer) error {
 	result, err := readResult(prepared.Layout, jobspec.KindAPK, jobspec.PlatformIOS)
 	if err != nil {
@@ -641,6 +664,7 @@ func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared prepare
 			return fmt.Errorf("the iOS package was built but could not be handed back to the server: %w", err)
 		}
 		buf.add("handed the .ipa back to the server for the tenant to upload")
+		a.handBackAppStoreInfo(backhaulCtx, job, prepared, buf)
 	case deliveryTestFlight, "":
 		if !a.cfg.IOSUpload {
 			// 服务端只把全托管的任务派给上传 Key 可用的机器，走到这里说明两边对不上

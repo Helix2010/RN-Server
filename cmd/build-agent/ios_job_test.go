@@ -82,6 +82,10 @@ func TestIOSJobReportsTheReleaseWithoutUploadingTheArtifact(t *testing.T) {
 	if handed := rig.server.uploads["ipa"]; string(handed) != string(rig.tools.IPA) {
 		t.Fatalf("the .ipa handed back is not the one the runner built (%d bytes)", len(handed))
 	}
+	// Windows / Linux 上的 iTMSTransporter 要带的 AppStoreInfo.plist 跟着交回
+	if handed := rig.server.uploads["appstore-info"]; string(handed) != string(rig.tools.AppStoreInfo) {
+		t.Fatalf("the AppStoreInfo.plist handed back is not the one Xcode generated: %q", handed)
+	}
 	// 几台 Mac 装同一个 Xcode 是人工维护的约定，版本漂移只有记下来才看得见
 	if report.Toolchain != fakebuild.XcodeVersion+" (16C5032a)" {
 		t.Fatalf("the toolchain was not reported: %q", report.Toolchain)
@@ -115,6 +119,56 @@ func TestIOSTestFlightJobFailsOnAMachineThatDoesNotUpload(t *testing.T) {
 	}
 	if calls := rig.server.callsTo("/ipa/upload"); len(calls) != 0 {
 		t.Fatal("a TestFlight job must not hand its .ipa back")
+	}
+	if calls := rig.server.callsTo("/appstore-info/upload"); len(calls) != 0 {
+		t.Fatal("a TestFlight job must not hand its AppStoreInfo.plist back")
+	}
+}
+
+// AppStoreInfo.plist 可有可无（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）：Xcode 没生成、或者服务端不收，
+// .ipa 已经交回了，任务照样完成，只在构建日志里说一句——租户还能用 Mac 的 Transporter 传。
+func TestIOSJobCompletesWithoutAnAppStoreInfo(t *testing.T) {
+	t.Setenv("BUILD_AGENT_MACHINE_TOKEN", testToken)
+	for _, tc := range []struct {
+		name      string
+		generated bool
+		wantLog   string
+	}{
+		{"not generated", false, "did not generate AppStoreInfo.plist"},
+		{"refused by the server", true, "AppStoreInfo.plist could not be handed back"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newRig(t)
+			rig.agent.cfg.Platforms = []string{"ios"}
+			rig.agent.iosScan = fakeIOSInventory
+			if !tc.generated {
+				if err := os.WriteFile(rig.tools.NoAppStoreInfo, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				rig.server.failOnce("/appstore-info/upload", http.StatusUnprocessableEntity, "IOS_APPSTORE_INFO_INVALID")
+			}
+			body := claimBody("bld_e2eIOSnoinfo", "apk")
+			body["platform"] = "ios"
+			body["delivery"] = "ipa"
+			rig.server.queueClaim(body)
+			if !rig.agent.pollOnce(context.Background()) {
+				t.Fatal("the agent did not work on the claimed job")
+			}
+			if fails := rig.server.callsTo("/fail"); len(fails) != 0 {
+				t.Fatalf("the job failed over an optional file: %s", fails[0].Body)
+			}
+			released := rig.server.callsTo("/ios-release")
+			if len(released) != 1 {
+				t.Fatalf("expected one /ios-release call, got %d", len(released))
+			}
+			if !strings.Contains(string(released[0].Body), tc.wantLog) {
+				t.Fatalf("the build log does not say what happened to AppStoreInfo.plist: %s", released[0].Body)
+			}
+			if calls := rig.server.callsTo("/appstore-info/upload"); tc.generated != (len(calls) > 0) {
+				t.Fatalf("AppStoreInfo.plist upload calls: %d (generated=%v)", len(calls), tc.generated)
+			}
+		})
 	}
 }
 
