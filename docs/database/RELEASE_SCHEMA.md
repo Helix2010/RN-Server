@@ -43,7 +43,7 @@
 
 写入只走状态机（`canary` / `set-canary-audience`）：名单不能为空，ID 必须在 `app_installations` 里存在，上限 200 条（超过这个规模改为关联表，查询形状不变）。离开灰度（`promote` / `cancel-canary`）时清空。
 
-## build_jobs（迁移 40、41、42、45、54）
+## build_jobs（迁移 40、41、42、45、54、58、67）
 
 打包任务。管理端写入；构建机认领、交付未签名包与出处签名；签名闸认领、签名、在一个事务里落发布记录并完成任务。设计见 `docs/design/build-service-2026-09-11.md`、`docs/design/android-signing-gate-2026-09-16.md`，决策见 ADR-0019。
 
@@ -108,6 +108,12 @@ ota：queued → claimed → running → succeeded
 | `delivery_state` | JSON NULL | 自助上传任务交出 .ipa 之后租户在控制台标记的进展：`{"uploadedAt","uploadedBy","installableAt","installableBy","rejection","rejectedAt","purgedAt"}`。平台看不到 Apple 那边，版本策略校验（iOS 最低支持版本不能高于标了 `installableAt` 的版本）与交付件清理都看它。清理只用 `JSON_SET` 补 `purgedAt`，不整段写回 |
 
 **iOS 复用 `unsigned_*` 这几列存自助上传的 .ipa**：iOS 不经过签名闸，这几列在 iOS 任务上本来空着；复用之后回收、取消、失败、重新认领与删除发布的对象清理自动覆盖。键形如 `…/build-jobs/<job>/a<attempt>/<随机段>/<bundleId>-<version>-build<n>.ipa`，只能经 `PUT /jobs/:id/ipa/upload` 写入（服务端先解包核对身份、内嵌描述文件与压缩包结构，对得上才存）；`/unsigned/upload` 对 iOS 任务回 409。交付件保留到出包 30 天或标记已上传 7 天，到期只删对象、置空键，任务行与发布记录保留。
+
+### 列（迁移 67 新增：AppStoreInfo.plist）
+
+| 列 | 类型 | 含义 |
+| --- | --- | --- |
+| `appstore_info_object_key` / `appstore_info_size` / `appstore_info_sha256` | VARCHAR(512) / BIGINT / CHAR(64) NULL | 自助上传任务和 .ipa 一起交回的 `AppStoreInfo.plist`（Xcode 导出时 `generateAppStoreInformation` 生成，Windows / Linux 上 iTMSTransporter 上传要带它）。键形如 `…/build-jobs/<job>/a<attempt>/<随机段>/<bundleId>-<version>-build<n>.AppStoreInfo.plist`，只能经 `PUT /jobs/:id/ipa/appstore-info/upload` 写入（不超过 1 MiB、顶层是非空字典的 plist）。写入规则同 `unsigned_object_key`；在 `jobObjectKeyColumns` 里，重新认领、回收、取消、失败、过保留期与删除发布都和 .ipa 一起清理。可选：旧版打包机不交、Xcode 没生成时为 NULL，任务照样完成 |
 
 **为什么每次上传一个新键**：键只由编号决定时，同一次认领里一个在反向代理那里超时、被客户端重传顶替的请求，会在任务已经往前走（`/built`、`complete`）之后才写完——覆盖已被引用的对象，又因为状态变了、改不到行而把它删掉，发布记录指向一个不存在的包。每次一个新键之后，迟到或过期的上传只能删掉自己写的那个对象。
 

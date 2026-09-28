@@ -352,14 +352,15 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	// 在认领提交之后删掉（回收时一般已经删过，这里兜住其它路径留下的）
 	var previous jobObjectKeys
 	if err := tx.QueryRowContext(ctx, `SELECT `+jobObjectKeyColumns+` FROM build_jobs WHERE id=? FOR UPDATE`, id).
-		Scan(&previous.Unsigned, &previous.SBOM, &previous.Signed); err != nil {
+		Scan(previous.scanTargets()...); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to claim a build")
 		return
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE build_jobs SET status='claimed',claimed_by=?,claimed_machine_id=?,claimed_at=?,heartbeat_at=?,attempt=attempt+1,
 		        commit_sha=NULL,unsigned_object_key=NULL,unsigned_size=NULL,unsigned_sha256=NULL,
-		        sbom_object_key=NULL,sbom_size=NULL,sbom_sha256=NULL,native_fingerprint=NULL,provenance=NULL,updated_at=?
+		        sbom_object_key=NULL,sbom_size=NULL,sbom_sha256=NULL,native_fingerprint=NULL,provenance=NULL,
+		        appstore_info_object_key=NULL,appstore_info_size=NULL,appstore_info_sha256=NULL,updated_at=?
 		  WHERE id=? AND status='queued'`,
 		machine.Name, machine.ID, now, now, now, id); err != nil {
 		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to claim a build")

@@ -135,6 +135,10 @@ sequenceDiagram
   探测其实是每次认领（约 10 秒一次）对每个 Team 都做（`ios_inventory.go:290-292`），和注释说的"启动时探一次"不一致，要改注释或降低频率。
 - **导出时生成 `AppStoreInfo.plist`**：Windows 和 Linux 上用 iTMSTransporter 上传必须带它，现在的导出选项没有打开 `generateAppStoreInformation`
   （RN-App `scripts/lib/ios-release-identity.js:58-75`）。这是 RN-App 的改动，两档都打开，② 把它和 `.ipa` 一起回传。键名与行为上线前在 mac-01 上用 `xcodebuild -help` 核对。
+  **2026-09-28 实现**：RN-App 已打开（5df2c6f，文件放在 .ipa 旁边，名为 `<目录>-<版本>-build<n>.AppStoreInfo.plist`，Xcode 没生成只记一行）。
+  服务端另开三列存它（迁移 67，`appstore_info_*`，没有复用别的列），回传 `PUT /jobs/:id/ipa/appstore-info/upload`、下载 `GET /builds/:id/ipa/appstore-info/download`，
+  都和 .ipa 同样守卫、同样清理；它是**可选的**：旧版打包机不交、Xcode 没生成，任务照样完成，构建列表上 `ipaDelivery.appStoreInfo` 为 null。
+  打包机在交回 .ipa 之后再交它（要发新版本）。
 
 ### 3.4 回传路径
 

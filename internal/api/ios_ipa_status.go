@@ -83,7 +83,9 @@ func ipaDeliveryView(j buildJob, latest int) any {
 		"rejection":     nullableString(state.Rejection),
 		"rejectedAt":    nullableString(state.RejectedAt),
 		"purgedAt":      nullableString(state.PurgedAt),
-		"superseded":    succeeded && latest > j.BuildNumber,
+		// Windows / Linux 上用 iTMSTransporter 上传要带的 AppStoreInfo.plist；旧版打包机不交，就是 null
+		"appStoreInfo": appStoreInfoView(j, succeeded),
+		"superseded":   succeeded && latest > j.BuildNumber,
 		// 最早可能的过期时刻：TestFlight 从上传起算 90 天，上传不会早于出包，所以按出包算只会
 		// 比真实的早——告警宁早勿晚。不用租户标的 uploadedAt：人往往是传完过几天才来标，
 		// 按它算会比真实的晚
@@ -102,6 +104,13 @@ func ipaDeliveryView(j buildJob, latest int) any {
 		}
 	}
 	return view
+}
+
+func appStoreInfoView(j buildJob, succeeded bool) any {
+	if !succeeded || !j.AppStoreInfoObjectKey.Valid || j.AppStoreInfoObjectKey.String == "" {
+		return nil
+	}
+	return gin.H{"sha256": nullableString(j.AppStoreInfoSHA256.String), "size": nullableInt64(j.AppStoreInfoSize)}
 }
 
 // markIOSIPAStatus 让租户标记一个自助上传构建的进展。
@@ -235,7 +244,7 @@ func (s *server) purgeExpiredIPADeliveries(ctx context.Context, now time.Time) [
 			WhereArgs: []any{item.id, item.key},
 			Set:       `delivery_state=JSON_SET(COALESCE(delivery_state,JSON_OBJECT()),'$.purgedAt',?),updated_at=?`,
 			SetArgs:   []any{iso(now), now},
-			Release:   releaseUnsigned,
+			Release:   releaseIOSPackage,
 		})
 		if err != nil {
 			slog.Error("cannot purge an expired self-upload package", "job", item.id, "error", err)

@@ -620,7 +620,7 @@ func (s *server) claimForSigning(ctx context.Context, c *gin.Context, job buildJ
 		var keys jobObjectKeys
 		switch err := tx.QueryRowContext(ctx,
 			`SELECT `+jobObjectKeyColumns+` FROM build_jobs WHERE id=? AND kind='apk' AND status IN (`+sqlStatusList(buildJobEventFrom(eventSignerClaim, jobKindAPK))+`) AND sign_attempt=? FOR UPDATE`,
-			job.ID, job.SignAttempt).Scan(&keys.Unsigned, &keys.SBOM, &keys.Signed); {
+			job.ID, job.SignAttempt).Scan(keys.scanTargets()...); {
 		case errors.Is(err, sql.ErrNoRows):
 			return nil, nil
 		case err != nil:
