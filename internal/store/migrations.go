@@ -108,6 +108,8 @@ var migrations = []migration{
 	// 全托管的 iOS 构建传进 App Store Connect 之后，服务端只读地查它在 Apple 那边的处理状态
 	// （设计 ios-platform-testflight-upload-2026-09-23 §3.3，2026-09-28 决定只读轮询、不写 Apple）
 	{version: 68, name: "build_jobs_testflight_state", apply: buildJobsTestFlightStateMigration},
+	// 第二次发布（ADR 0019「两次发布」）：签名闸 09-17 上线、稳定之后单独发（原编号 55 一直没发，55 已被 build_machine_liveness 占用，2026-09-28 改成 69）
+	{version: 69, name: "drop_platform_backups", apply: dropPlatformBackupsMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2546,4 +2548,33 @@ func buildJobsAppStoreInfoMigration(ctx context.Context, db *sql.DB) error {
 func buildJobsTestFlightStateMigration(ctx context.Context, db *sql.DB) error {
 	return addColumnIfMissing(ctx, db, "build_jobs", "testflight_state", `ALTER TABLE build_jobs ADD COLUMN testflight_state JSON NULL
 		COMMENT '全托管 iOS 构建在 App Store Connect 上的处理状态：{"buildId","processingState","expired","expirationDate","uploadedDate","checkedAt","nextCheckAt","checks","finalAt","lastError","unavailable"}。服务端平台进程的回收循环用租户交的只读 ASC 密钥查，只读、不写 Apple；processingState 到 VALID/INVALID/FAILED、或 24 小时查不到（NOT_FOUND）写 finalAt 后不再查。没交密钥的租户写 unavailable 并 6 小时后再看，密钥被拒整个租户 6 小时后再试。NULL=还没查过（自助上传、Android 与热更新任务恒为 NULL）'`)
+}
+
+// dropPlatformBackupsMigration 删掉已整体移除的平台备份方案（platform-backup-recovery-2026-09-15）
+// 留下的表与配置行，以及签名闸切换后不再有人读的两类记录：
+//
+//   - platform_backups 表；
+//   - app_configs 的 backup.bucket、backup.recipients、build.agent.backup-sign（备份）与
+//     build.agent.recipient（打包机单一公钥，被 build.machines 取代）；
+//   - 旧格式（不是 format 2）的 build.keystore.check：打包机时代的单机记录，新代码读到它
+//     本来就当作空，删掉只是清理。
+//
+// **这是第二次发布**（ADR 0019「两次发布」）。第一次发布删代码、不删表：那一次失败回滚到
+// 旧二进制时，旧代码面对的表和配置还在。新链路稳定之后才单独发布这一条迁移。
+//
+// 迁移 53 留在列表里不动：跑过 53 的库靠 schema_migrations 跳过它，新库先建后删，结果一致。
+// 每一步都能重复执行（DROP TABLE IF EXISTS、按键 DELETE），中途失败重跑就是从头再来。
+func dropPlatformBackupsMigration(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `DELETE FROM app_configs
+		WHERE config_key IN ('backup.bucket','backup.recipients','build.agent.backup-sign','build.agent.recipient')`); err != nil {
+		return fmt.Errorf("drop platform backups migration delete configs: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM app_configs
+		WHERE config_key='build.keystore.check' AND NOT COALESCE(JSON_TYPE(config_value)='OBJECT' AND JSON_EXTRACT(config_value,'$.format')=2, FALSE)`); err != nil {
+		return fmt.Errorf("drop platform backups migration delete legacy keystore checks: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `DROP TABLE IF EXISTS platform_backups`); err != nil {
+		return fmt.Errorf("drop platform backups migration drop table: %w", err)
+	}
+	return nil
 }
