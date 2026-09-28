@@ -3441,7 +3441,7 @@
     "/v1/build-agent/claim": {
       "post": {
         "summary": "Claim the next queued build",
-        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view (its claimedMachineId is this builder's id, the builderId of the provenance statement) plus attempt, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims. The body also carries the machine's self-report (agentCommit, os, appleTeams, freeGb): it is recorded as the machine's last-seen row before the empty-queue 204, so an idle pool still shows up as online in the console. iOS jobs are additionally filtered by that self-report - a Mac only gets a tenant's iOS job when it reports holding that tenant's Apple Team and bundle id - and only one iOS apk job per tenant is in flight at a time, because a second, lower build number would be rejected at /ios-release after its .ipa had already reached App Store Connect.",
+        "description": "Claims the oldest queued job for the requested platforms and kinds (FOR UPDATE SKIP LOCKED), increments attempt, records claimed_machine_id and returns the job view (its claimedMachineId is this builder's id, the builderId of the provenance statement) plus attempt, tenantId, tenantSlug, tenantDirectory, googleServicesJson, icons (file names), tenantFile (composed tenant.json), otaCertificatePem, otaCertificateSha256 and, for OTA jobs, runtimeVersion. It never returns any keystore material: apk jobs are delivered unsigned and signed by the primary signer. Each builder gets at most one job at a time: 409 BUILDER_HAS_ACTIVE_JOB carries jobId and attempt of the job it still holds. Reaping stale jobs is done by the server's own timer, not by claims. The body also carries the machine's self-report (agentCommit, os, appleTeams, freeGb): it is recorded as the machine's last-seen row before the empty-queue 204, so an idle pool still shows up as online in the console. iOS jobs are additionally filtered by that self-report - a Mac only gets a tenant's iOS job when it reports holding that tenant's Apple Team and bundle id (a Mac that sends tenantMaterial: only that tenant's own material, certificate in the keychain and profile checked) - and only one iOS apk job per tenant is in flight at a time, because a second, lower build number would be rejected at /ios-release after its .ipa had already reached App Store Connect.",
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineToken"
@@ -4822,7 +4822,7 @@
     "/v1/admin/platform/ios-material": {
       "get": {
         "summary": "平台登记的两把材料公钥，以及所有已存材料的总览",
-        "description": "app_configs 平台行 build.ios.material 存两把公钥；材料密文在 ios_signing_material 表。服务端没有任何一把私钥，存的每一份都解不开（设计 docs/design/ios-signing-material-distribution-2026-09-19.md）。",
+        "description": "app_configs 平台行 build.ios.material 存两把公钥；材料密文在 ios_signing_material 表。服务端没有任何一把私钥，存的每一份都解不开（设计 docs/design/ios-signing-material-distribution-2026-09-19.md）。 材料按租户存（设计 docs/design/ios-tenant-owned-signing-material-2026-09-25.md §3.1）；平台不代交，只有只读总览与紧急删除。",
         "responses": {
           "200": {
             "description": "两把公钥与材料总览",
@@ -4912,7 +4912,10 @@
                           "recipientSha256",
                           "version",
                           "uploadedBy",
-                          "uploadedAt"
+                          "uploadedAt",
+                          "tenantId",
+                          "tenantSlug",
+                          "legacy"
                         ],
                         "properties": {
                           "kind": {
@@ -4949,6 +4952,18 @@
                           "uploadedAt": {
                             "type": "string",
                             "format": "date-time"
+                          },
+                          "tenantId": {
+                            "type": "string",
+                            "description": "材料属于的租户；\"0\" 是按 Apple Team 存的旧行（只下发给还没升级的打包机）"
+                          },
+                          "tenantSlug": {
+                            "type": "string",
+                            "description": "租户 slug；旧行是空串"
+                          },
+                          "legacy": {
+                            "type": "boolean",
+                            "description": "迁移时从旧行复制来的 v1 密文，租户重传之后变成 v2"
                           }
                         }
                       }
@@ -4966,101 +4981,6 @@
           },
           "500": {
             "description": "IOS_MATERIAL_UNAVAILABLE"
-          }
-        }
-      },
-      "post": {
-        "summary": "上传一份材料密文（浏览器或离线工具封好的 box）",
-        "description": "请求体就是那份 box.json，原样入库、原样下发——服务端一个字节都不改，也读不懂。只检查形状与收件人：密文加密给的公钥必须是当前登记的那一把（按 purpose 选 builder 或 uploader），否则 409 IOS_MATERIAL_RECIPIENT_UNKNOWN——那种密文永远没有机器解得开。同一格（kind, teamId, scope）重复上传就是换一版，版本号加一，只留当前这一份。审计 ios_material_upload。",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "v",
-                  "alg",
-                  "purpose",
-                  "kind",
-                  "teamId",
-                  "recipientSha256",
-                  "epk",
-                  "nonce",
-                  "ct",
-                  "createdAt"
-                ],
-                "properties": {
-                  "v": {
-                    "type": "integer"
-                  },
-                  "alg": {
-                    "type": "string"
-                  },
-                  "purpose": {
-                    "type": "string"
-                  },
-                  "kind": {
-                    "type": "string"
-                  },
-                  "teamId": {
-                    "type": "string"
-                  },
-                  "bundleId": {
-                    "type": "string",
-                    "description": "只有描述文件有"
-                  },
-                  "recipientSha256": {
-                    "type": "string"
-                  },
-                  "epk": {
-                    "type": "string"
-                  },
-                  "nonce": {
-                    "type": "string"
-                  },
-                  "ct": {
-                    "type": "string"
-                  },
-                  "createdAt": {
-                    "type": "string",
-                    "format": "date-time"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "收下了",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "version"
-                  ],
-                  "properties": {
-                    "version": {
-                      "type": "integer"
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "IOS_MATERIAL_INVALID（不是一份合法的 box）"
-          },
-          "409": {
-            "description": "IOS_MATERIAL_RECIPIENT_UNKNOWN（加密给的不是当前登记的那把公钥）"
-          },
-          "401": {
-            "description": "Admin authentication required"
-          },
-          "403": {
-            "description": "Not a platform administrator"
           }
         }
       }
@@ -5153,7 +5073,7 @@
     "/v1/admin/platform/ios-material/tenants": {
       "get": {
         "summary": "按租户的 Apple 证书与密钥总览",
-        "description": "控制台「Apple 证书与密钥」页用。材料表按 Team 存，这里按 release.ios 拼成每个租户一行：证书、上传 Key 按 Team 匹配，描述文件按 Team + bundle id（不分大小写）匹配；打包机只算登记为 active、能打 iOS 的构建机，装没装按 (Team, bundle id) 原样比，与认领同一个判据；earliestExpiry 是报了这个 Team 的机器里最早的那个值（含钥匙串里过期的旧证书与同 Team 其它租户的描述文件）；readiness 与排队时的判断同一套。orphans 是没有租户在用的材料，只有 complete 且没有 invalidTenants 时 orphansDeletable 才为 true。设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md。 第二轮（设计 §10）：每行多 status（ready/missing/attention）、problems（code 按优先级：certificate-missing、profile-missing、upload-key-missing、material-stale、bundle-duplicated、upload-key-should-be-withdrawn、no-builders、not-installed、not-ready）与 delivered（证书与描述文件都在平台上、新装的 Mac 解得开）。筛选与分页在服务端：q（slug/应用名/Team/bundle id 子串）、status、machine（材料已下发但这台没装上）、cursor、limit；按 slug 升序。counts 按 q 与 machine 筛过、不按 status。",
+        "description": "控制台「Apple 证书与密钥」页用。材料按租户存（设计 ios-tenant-owned-signing-material-2026-09-25 §3.4，平台只读 + 紧急删除），每个租户一行只看它自己的那几格：证书、上传 Key 按 Team 匹配，描述文件按 Team + bundle id（不分大小写）匹配；打包机只算登记为 active、能打 iOS 的构建机，装没装与认领同一个判据（按租户自报的 Mac 看这个租户自己的材料，旧 Mac 按 (Team, bundle id) 原样比）；earliestExpiry 是这些机器报的最早到期时间；readiness 与排队时的判断同一套。orphans 是没有租户在用的材料（含 tenantId=\"0\" 的按 Team 存的旧行，以及 Team / bundle id 已经和租户当前配置对不上的行），只有 complete 且没有 invalidTenants 时 orphansDeletable 才为 true。设计 RN-Admin docs/design/ios-credentials-overview-2026-09-24.md。 第二轮（设计 §10）：每行多 status（ready/missing/attention）、problems（code 按优先级：certificate-missing、profile-missing、upload-key-missing、material-stale、bundle-duplicated、upload-key-should-be-withdrawn、mac-rejected（Mac 装前核对不过：count=台数，detail=第一条原因原话）、no-builders、not-installed、not-ready）与 delivered（证书与描述文件都在平台上、新装的 Mac 解得开）。筛选与分页在服务端：q（slug/应用名/Team/bundle id 子串）、status、machine（材料已下发但这台没装上）、cursor、limit；按 slug 升序。counts 按 q 与 machine 筛过、不按 status。",
         "parameters": [
           {
             "name": "q",
@@ -5288,6 +5208,7 @@
                       "items": {
                         "type": "object",
                         "required": [
+                          "tenantId",
                           "slug",
                           "current",
                           "appName",
@@ -5309,6 +5230,9 @@
                           "delivered"
                         ],
                         "properties": {
+                          "tenantId": {
+                            "type": "string"
+                          },
                           "slug": {
                             "type": "string"
                           },
@@ -5363,7 +5287,8 @@
                               "version",
                               "uploadedBy",
                               "uploadedAt",
-                              "stale"
+                              "stale",
+                              "legacy"
                             ],
                             "properties": {
                               "teamId": {
@@ -5386,6 +5311,10 @@
                               "stale": {
                                 "type": "boolean",
                                 "description": "加密给的公钥不是现在登记的那一把：新装的 Mac 解不开，已装好的照常能签"
+                              },
+                              "legacy": {
+                                "type": "boolean",
+                                "description": "迁移时从按 Team 存的旧行复制来的 v1 密文"
                               }
                             }
                           },
@@ -5398,7 +5327,8 @@
                               "version",
                               "uploadedBy",
                               "uploadedAt",
-                              "stale"
+                              "stale",
+                              "legacy"
                             ],
                             "properties": {
                               "teamId": {
@@ -5421,6 +5351,10 @@
                               "stale": {
                                 "type": "boolean",
                                 "description": "加密给的公钥不是现在登记的那一把：新装的 Mac 解不开，已装好的照常能签"
+                              },
+                              "legacy": {
+                                "type": "boolean",
+                                "description": "迁移时从按 Team 存的旧行复制来的 v1 密文"
                               }
                             }
                           },
@@ -5433,7 +5367,8 @@
                               "version",
                               "uploadedBy",
                               "uploadedAt",
-                              "stale"
+                              "stale",
+                              "legacy"
                             ],
                             "properties": {
                               "teamId": {
@@ -5456,6 +5391,10 @@
                               "stale": {
                                 "type": "boolean",
                                 "description": "加密给的公钥不是现在登记的那一把：新装的 Mac 解不开，已装好的照常能签"
+                              },
+                              "legacy": {
+                                "type": "boolean",
+                                "description": "迁移时从按 Team 存的旧行复制来的 v1 密文"
                               }
                             }
                           },
@@ -5463,7 +5402,6 @@
                             "type": "string",
                             "enum": [
                               "required",
-                              "kept-for-others",
                               "should-be-withdrawn",
                               "not-needed"
                             ]
@@ -5475,7 +5413,8 @@
                               "required": [
                                 "id",
                                 "installed",
-                                "uploadProbe"
+                                "uploadProbe",
+                                "problems"
                               ],
                               "properties": {
                                 "id": {
@@ -5487,6 +5426,13 @@
                                 "uploadProbe": {
                                   "type": "string",
                                   "nullable": true
+                                },
+                                "problems": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "description": "这台 Mac 核对这个租户的材料时报的原因（按租户自报的 Mac 才有），每条以 \"<kind>: \" 开头"
                                 }
                               }
                             }
@@ -5541,6 +5487,7 @@
                                     "material-stale",
                                     "bundle-duplicated",
                                     "upload-key-should-be-withdrawn",
+                                    "mac-rejected",
                                     "no-builders",
                                     "not-installed",
                                     "not-ready"
@@ -5574,15 +5521,26 @@
                       "items": {
                         "type": "object",
                         "required": [
+                          "tenantId",
+                          "tenantSlug",
                           "kind",
                           "teamId",
                           "scope",
                           "version",
                           "uploadedBy",
                           "uploadedAt",
-                          "stale"
+                          "stale",
+                          "legacy"
                         ],
                         "properties": {
+                          "tenantId": {
+                            "type": "string",
+                            "description": "\"0\" 是按 Team 存的旧行"
+                          },
+                          "tenantSlug": {
+                            "type": "string",
+                            "description": "旧行是空串"
+                          },
                           "kind": {
                             "type": "string"
                           },
@@ -5603,6 +5561,10 @@
                           },
                           "stale": {
                             "type": "boolean"
+                          },
+                          "legacy": {
+                            "type": "boolean",
+                            "description": "迁移时从按 Team 存的旧行复制来的 v1 密文"
                           }
                         }
                       }
@@ -5666,8 +5628,8 @@
     },
     "/v1/admin/platform/ios-material/remove": {
       "post": {
-        "summary": "删掉一份已存材料",
-        "description": "按种类后果不同：证书与描述文件只删服务端存的密文，**已经装到机器上的那一份不会消失**，照样能签，要清掉得去机器上清（运维手册 §5 退役清单）或者吊销机器；上传 Key 删掉之后，打包机下一轮同步（清单完整时）会把本机那份也删掉（墓碑），同 Team 的全托管租户在重新上传之前传不上去。expectedVersion 可选：大于 0 时只删这一版。审计 ios_material_remove。",
+        "summary": "平台紧急删除一个租户的一份材料",
+        "description": "用于证书泄露、账号被盗（设计 docs/design/ios-tenant-owned-signing-material-2026-09-25.md §3.4）。删完打包机下一轮同步（清单完整时）会把本机那一份撤掉（墓碑：描述文件删文件、证书按指纹计引用、上传 Key 删目录）。审计 ios_material_emergency_remove 记在那个租户名下，租户页上显示「平台管理员于某时删除了某材料：原因」。tenantId=\"0\" 删的是按 Team 存的旧行。expectedVersion 可选：大于 0 时只删这一版。",
         "requestBody": {
           "required": true,
           "content": {
@@ -5675,6 +5637,7 @@
               "schema": {
                 "type": "object",
                 "required": [
+                  "tenantId",
                   "kind",
                   "teamId",
                   "scope",
@@ -5682,6 +5645,10 @@
                   "confirm"
                 ],
                 "properties": {
+                  "tenantId": {
+                    "type": "string",
+                    "description": "租户 id；\"0\" 表示按 Team 存的旧行"
+                  },
                   "kind": {
                     "type": "string"
                   },
@@ -5747,10 +5714,10 @@
     "/v1/build-agent/ios-material": {
       "get": {
         "summary": "这台机器该装哪些 iOS 签名材料（只回清单，不回密文）",
-        "description": "三样材料都是按 (kind, teamId, scope) 一份、所有 macOS 打包机共用：清单不按机器筛。机器拿它与本机已装版本比对，只去取新的。鉴权 x-machine-token（构建机通道）。",
+        "description": "不带 capability 时回按 Apple Team 存的旧行（tenant_id=0），给还没升级的打包机；带 capability=tenant-signing-material 时回按租户的清单，body 多一个 layout=\"tenant\"，每项多 tenantId 与 legacy（legacy=迁移时复制来的 v1 密文，Mac 只对这种项接受 v1）。旧版打包机永远拿不到按租户的清单：它会把两个租户落进同一格。只回清单，不回密文。鉴权 x-machine-token（构建机通道）（设计 docs/design/ios-tenant-owned-signing-material-2026-09-25.md §12.2）。",
         "responses": {
           "200": {
-            "description": "清单 The body also carries complete (boolean): false when the list was cut at its row limit. Build machines only treat an upload key missing from a complete list as withdrawn and delete their local copy.",
+            "description": "清单",
             "content": {
               "application/json": {
                 "schema": {
@@ -5769,9 +5736,7 @@
                           "scope",
                           "purpose",
                           "recipientSha256",
-                          "version",
-                          "uploadedBy",
-                          "uploadedAt"
+                          "version"
                         ],
                         "properties": {
                           "kind": {
@@ -5802,15 +5767,27 @@
                           "version": {
                             "type": "integer"
                           },
-                          "uploadedBy": {
-                            "type": "string"
-                          },
-                          "uploadedAt": {
+                          "tenantId": {
                             "type": "string",
-                            "format": "date-time"
+                            "description": "按租户的清单才有"
+                          },
+                          "legacy": {
+                            "type": "boolean",
+                            "description": "按租户的清单才有"
                           }
                         }
                       }
+                    },
+                    "layout": {
+                      "type": "string",
+                      "enum": [
+                        "tenant"
+                      ],
+                      "description": "只有带了 capability 的请求才有"
+                    },
+                    "complete": {
+                      "type": "boolean",
+                      "description": "清单没被行数上限截断。打包机只在清单完整时才把「清单里没有」当成已撤下"
                     }
                   }
                 }
@@ -5823,7 +5800,21 @@
           "500": {
             "description": "IOS_MATERIAL_UNAVAILABLE"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "capability",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "tenant-signing-material"
+              ]
+            },
+            "description": "打包机认得按租户的清单时带上"
+          }
+        ]
       }
     },
     "/v1/build-agent/ios-material/box": {
@@ -5831,6 +5822,15 @@
         "summary": "取一份材料密文，原样下发",
         "description": "响应体就是入库时收到的那份 box.json，逐字节相同——服务端只是快递员。解开它要对应角色的私钥（构建账户或上传账户），那两把只在 Mac 上。",
         "parameters": [
+          {
+            "name": "tenantId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "按租户的那一格；不带取按 Team 存的旧行"
+          },
           {
             "name": "kind",
             "in": "query",
@@ -5874,6 +5874,9 @@
           },
           "500": {
             "description": "IOS_MATERIAL_UNAVAILABLE"
+          },
+          "400": {
+            "description": "INVALID_IOS_MATERIAL（tenantId 不是租户 id）"
           }
         }
       }
@@ -7676,6 +7679,369 @@
         "responses": {
           "200": {
             "description": "直传模式下桶要放行的来源：全平台所有生效租户域名的并集（共用的桶要放行所有租户），形状同租户的 GET /v1/admin/release-storage/cors"
+          }
+        }
+      }
+    },
+    "/v1/admin/ios/material": {
+      "get": {
+        "summary": "本租户的 iOS 签名材料、按交付方式的要求清单与 Mac 核对结果",
+        "description": "证书、描述文件、上传 Key 由租户自己交（设计 docs/design/ios-tenant-owned-signing-material-2026-09-25.md §3.2、§12.4）。两把平台公钥一起给（浏览器用它们加密，公钥不是机密）。requirements 固定三项（certificate、profile、upload-key）：need=required|rejected（自助上传时的上传 Key）；status=ok（至少一台 Mac 核对通过、装好了）|pending|failed（Mac 报了这一类的问题，problems 是原话）|missing|stale（加密给了旧公钥）|unexpected（不该有却有）|not-needed。machines 只给台数：打包机是平台的基础设施。removals 是最近 5 条平台紧急删除，不带操作人。",
+        "responses": {
+          "200": {
+            "description": "材料卡",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "tenantId",
+                    "identity",
+                    "delivery",
+                    "recipients",
+                    "items",
+                    "requirements",
+                    "machines",
+                    "removals"
+                  ],
+                  "properties": {
+                    "tenantId": {
+                      "type": "string",
+                      "description": "封 v2 材料时写进去的租户 id"
+                    },
+                    "identity": {
+                      "type": "object",
+                      "nullable": true,
+                      "required": [
+                        "teamId",
+                        "bundleId"
+                      ],
+                      "properties": {
+                        "teamId": {
+                          "type": "string"
+                        },
+                        "bundleId": {
+                          "type": "string"
+                        }
+                      },
+                      "description": "没配 release.ios 时为 null（此时 requirements 为空）"
+                    },
+                    "delivery": {
+                      "type": "string",
+                      "enum": [
+                        "testflight",
+                        "ipa"
+                      ]
+                    },
+                    "recipients": {
+                      "type": "object",
+                      "required": [
+                        "builder",
+                        "uploader"
+                      ],
+                      "properties": {
+                        "builder": {
+                          "type": "object",
+                          "nullable": true,
+                          "required": [
+                            "publicKey",
+                            "sha256"
+                          ],
+                          "properties": {
+                            "publicKey": {
+                              "type": "string"
+                            },
+                            "sha256": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "uploader": {
+                          "type": "object",
+                          "nullable": true,
+                          "required": [
+                            "publicKey",
+                            "sha256"
+                          ],
+                          "properties": {
+                            "publicKey": {
+                              "type": "string"
+                            },
+                            "sha256": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/TenantIOSMaterialItem"
+                      }
+                    },
+                    "requirements": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "need",
+                          "status",
+                          "item",
+                          "problems"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "certificate",
+                              "profile",
+                              "upload-key"
+                            ]
+                          },
+                          "need": {
+                            "type": "string",
+                            "enum": [
+                              "required",
+                              "rejected"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ok",
+                              "pending",
+                              "failed",
+                              "missing",
+                              "stale",
+                              "unexpected",
+                              "not-needed"
+                            ]
+                          },
+                          "item": {
+                            "allOf": [
+                              {
+                                "$ref": "#/components/schemas/TenantIOSMaterialItem"
+                              }
+                            ],
+                            "nullable": true
+                          },
+                          "problems": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "description": "Mac 报的原因，去掉种类前缀、去重，最多 5 条"
+                          }
+                        }
+                      }
+                    },
+                    "machines": {
+                      "type": "object",
+                      "required": [
+                        "total",
+                        "ready"
+                      ],
+                      "properties": {
+                        "total": {
+                          "type": "integer"
+                        },
+                        "ready": {
+                          "type": "integer",
+                          "description": "本租户证书、描述文件都就绪的 iOS 打包机台数"
+                        }
+                      }
+                    },
+                    "removals": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "kind",
+                          "teamId",
+                          "scope",
+                          "reason",
+                          "at"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "type": "string"
+                          },
+                          "teamId": {
+                            "type": "string"
+                          },
+                          "scope": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string"
+                          },
+                          "at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "IOS_MATERIAL_UNAVAILABLE"
+          }
+        }
+      },
+      "post": {
+        "summary": "上传本租户的一份材料密文（v2）",
+        "description": "请求体就是浏览器封好的 v2 Box（材料里带租户 id）。服务端只核对密文外层的明文提示：v2、tenantId=会话租户、Team=release.ios 的 Team、描述文件的 bundle id=release.ios 的 bundle id（原样比）、收件人是登记的那把公钥、自助上传时拒收上传 Key；按租户每小时 30 次。真正的核对在 Mac 上（解开之后按密文里那一份再核一遍）。要二次验证。审计 ios_material_upload。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "iosmaterial.Box v2（v、alg、purpose、kind、tenantId、teamId、bundleId、recipientSha256、epk、nonce、ct、createdAt）"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "存下了",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "teamId",
+                    "scope",
+                    "version",
+                    "uploadedAt"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string"
+                    },
+                    "teamId": {
+                      "type": "string"
+                    },
+                    "scope": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "uploadedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_IOS_MATERIAL / IOS_MATERIAL_VERSION_UNSUPPORTED（v1）"
+          },
+          "403": {
+            "description": "IOS_MATERIAL_TENANT_MISMATCH / SECOND_FACTOR_REQUIRED"
+          },
+          "409": {
+            "description": "IOS_IDENTITY_REQUIRED / IOS_MATERIAL_TEAM_MISMATCH / IOS_MATERIAL_BUNDLE_MISMATCH / IOS_DELIVERY_SELF_UPLOAD / IOS_MATERIAL_RECIPIENT_NOT_REGISTERED / IOS_MATERIAL_RECIPIENT_UNKNOWN"
+          },
+          "429": {
+            "description": "IOS_MATERIAL_RATE_LIMITED"
+          },
+          "500": {
+            "description": "IOS_MATERIAL_SAVE_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/admin/ios/material/remove": {
+      "post": {
+        "summary": "删本租户的一份材料",
+        "description": "Team 与 scope 由请求给：改过 Team 或 bundle id 之后旧的那几格也删得掉。打包机下一轮同步把本机那一份撤掉。要二次验证；按租户每小时 30 次（与上传共用）。审计 ios_material_remove。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "teamId",
+                  "scope",
+                  "reason",
+                  "confirm"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string"
+                  },
+                  "teamId": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "可选。大于 0 时必须与当前版本一致，否则 409 STALE_IOS_MATERIAL"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "confirm": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "删了",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "removed"
+                  ],
+                  "properties": {
+                    "removed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "INVALID_IOS_MATERIAL"
+          },
+          "403": {
+            "description": "SECOND_FACTOR_REQUIRED"
+          },
+          "404": {
+            "description": "IOS_MATERIAL_NOT_FOUND"
+          },
+          "409": {
+            "description": "STALE_IOS_MATERIAL"
+          },
+          "429": {
+            "description": "IOS_MATERIAL_RATE_LIMITED"
+          },
+          "500": {
+            "description": "IOS_MATERIAL_SAVE_FAILED"
           }
         }
       }
@@ -9642,6 +10008,74 @@
             },
             "maxItems": 16,
             "description": "What this agent build can do beyond the baseline, e.g. ios-ipa-delivery (hands the .ipa back to the server for self-upload tenants). Unknown names are accepted so an agent can ship before the server knows them. Omitted by older agents: self-upload iOS jobs are then neither queued nor dispatched."
+          },
+          "tenantMaterial": {
+            "type": "array",
+            "maxItems": 64,
+            "description": "按租户的签名材料自报（设计 ios-tenant-owned-signing-material-2026-09-25 §12.3）。只有收到过按租户清单的打包机才报；报了就只按 (租户, Team, bundle id) 派 iOS 任务，只算 certificateReady=true 的项。",
+            "items": {
+              "type": "object",
+              "required": [
+                "tenantId",
+                "teamId",
+                "bundleIds"
+              ],
+              "properties": {
+                "tenantId": {
+                  "type": "string"
+                },
+                "teamId": {
+                  "type": "string"
+                },
+                "bundleIds": {
+                  "type": "array",
+                  "maxItems": 64,
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Mac 核对通过、没过期的描述文件"
+                },
+                "certificateSha1": {
+                  "type": "string",
+                  "description": "40 位大写十六进制；本机索引里这个 (租户, Team) 的证书"
+                },
+                "certificateReady": {
+                  "type": "boolean",
+                  "description": "这张证书出现在签名钥匙串的 find-identity -v 里"
+                },
+                "expiresAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "uploadProbe": {
+                  "type": "string",
+                  "enum": [
+                    "",
+                    "ok",
+                    "forbidden",
+                    "error",
+                    "missing"
+                  ]
+                },
+                "apsEnvironment": {
+                  "type": "string",
+                  "enum": [
+                    "",
+                    "development",
+                    "production"
+                  ]
+                },
+                "problems": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 300
+                  },
+                  "description": "Mac 核对不过的原因，每条以 \"<kind>: \" 开头"
+                }
+              }
+            }
           }
         }
       },
@@ -11013,6 +11447,10 @@
                 "type": "integer",
                 "minimum": 1,
                 "description": "Send it as x-build-attempt on every /jobs/{id}/* request"
+              },
+              "tenantId": {
+                "type": "string",
+                "description": "按租户落签名材料的 Mac 用它找本租户的描述文件、证书与上传 Key"
               }
             }
           }
@@ -12086,6 +12524,55 @@
             "type": "string",
             "nullable": true,
             "description": "Why the last self-upgrade failed."
+          }
+        }
+      },
+      "TenantIOSMaterialItem": {
+        "type": "object",
+        "required": [
+          "kind",
+          "teamId",
+          "scope",
+          "version",
+          "uploadedBy",
+          "uploadedAt",
+          "legacy",
+          "stale"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "certificate",
+              "profile",
+              "upload-key"
+            ]
+          },
+          "teamId": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "description": "描述文件是 bundle id，证书与上传 Key 是空串"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "uploadedBy": {
+            "type": "string"
+          },
+          "uploadedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "legacy": {
+            "type": "boolean",
+            "description": "迁移时从按 Team 存的旧行复制来的 v1 密文"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "加密给的公钥已经不是现在登记的那一把"
           }
         }
       }

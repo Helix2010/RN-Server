@@ -17,19 +17,17 @@ import (
 // 控制台「Apple 证书与密钥」页的按租户总览（设计 RN-Admin
 // docs/design/ios-credentials-overview-2026-09-24.md）。
 //
-// 材料表按 Team 存（证书、上传 Key 每 Team 一份，描述文件每 Team + bundle id 一份），没有租户列；
-// 「按租户」是从 release.ios 拼出来的视图。匹配、上传 Key 需不需要、现在能不能排都在这里算——
-// 这些规则与排队、切换交付方式用的是同一套函数，控制台只负责画出来，不另写一份。
-//
-// 单独一个接口，不往 GET /ios-material 里加字段：租户页的上传卡也读那一个，而这里要读机器登记与
-// liveness，读失败不该连累上传卡。
+// 材料按租户存（设计 ios-tenant-owned-signing-material-2026-09-25 §3.1）：每个租户的证书、上传 Key 各一份，
+// 描述文件每 bundle id 一份。这一页是平台的**只读**总览加紧急删除（§3.4）：缺什么、哪台 Mac 没装上、
+// Mac 核对不过的原因。匹配、上传 Key 需不需要、现在能不能排都在这里算——这些规则与排队、切换交付方式
+// 用的是同一套函数，控制台只负责画出来，不另写一份。
 
-// iOS 上传 Key 对一个租户的用途。
+// iOS 上传 Key 对一个租户的用途。上传 Key 按租户存之后，一个租户的那一份与别人无关：自助上传却还存着，
+// 就是该撤下的（切换时本来会删，留着多半是迁移复制过来的）。
 const (
-	iosUploadKeyRequired      = "required"            // 全托管：要有
-	iosUploadKeyKeptForOthers = "kept-for-others"     // 自助上传，同 Team 的全托管租户还在用
-	iosUploadKeyWithdraw      = "should-be-withdrawn" // 自助上传，同 Team 没人用，按设计切换时就该撤下
-	iosUploadKeyNotNeeded     = "not-needed"          // 自助上传，平台上也没有
+	iosUploadKeyRequired  = "required"            // 全托管：要有
+	iosUploadKeyWithdraw  = "should-be-withdrawn" // 自助上传，却还存着这个租户的上传 Key
+	iosUploadKeyNotNeeded = "not-needed"          // 自助上传，也没有存
 )
 
 type iosMaterialSlotView struct {
@@ -41,10 +39,16 @@ type iosMaterialSlotView struct {
 	UploadedAt string `json:"uploadedAt"`
 	// Stale：加密给的公钥已经不是现在登记的那一把。新装的 Mac 解不开它，已经装好的照常能签
 	Stale bool `json:"stale"`
+	// Legacy：迁移时从按 Team 存的旧行复制来的 v1 密文，租户重传之后变成 v2
+	Legacy bool `json:"legacy"`
 }
 
+// iosMaterialOrphanView 是没有租户在用的一格：tenant_id=0 的旧行，或者 Team / bundle id 已经和租户当前
+// 配置对不上的行。删除按 (tenantId, kind, teamId, scope) 精确匹配。
 type iosMaterialOrphanView struct {
-	Kind string `json:"kind"`
+	TenantID   string `json:"tenantId"`
+	TenantSlug string `json:"tenantSlug"`
+	Kind       string `json:"kind"`
 	iosMaterialSlotView
 }
 
@@ -52,9 +56,12 @@ type iosMaterialMachineView struct {
 	ID          string `json:"id"`
 	Installed   bool   `json:"installed"`
 	UploadProbe any    `json:"uploadProbe"`
+	// Problems 是这台 Mac 核对这个租户的材料时报的原因（按租户自报的机器才有），每条以 "<kind>: " 开头
+	Problems []string `json:"problems"`
 }
 
 type iosMaterialTenantView struct {
+	TenantID              string                   `json:"tenantId"`
 	Slug                  string                   `json:"slug"`
 	Current               bool                     `json:"current"`
 	AppName               string                   `json:"appName"`
@@ -119,14 +126,16 @@ func (x iosMaterialIndex) complete() bool { return len(x.items) < iosMaterialMax
 func (x iosMaterialIndex) slot(item storedIOSMaterial) *iosMaterialSlotView {
 	recipient, ok := x.doc.forPurpose(item.Purpose)
 	return &iosMaterialSlotView{TeamID: item.TeamID, Scope: item.Scope, Version: item.Version,
-		UploadedBy: item.UploadedBy, UploadedAt: item.UploadedAt, Stale: !ok || recipient.SHA256 != item.RecipientSHA256}
+		UploadedBy: item.UploadedBy, UploadedAt: item.UploadedAt, Stale: !ok || recipient.SHA256 != item.RecipientSHA256,
+		Legacy: item.Legacy}
 }
 
-func (x iosMaterialIndex) find(kind, team, scope string) *iosMaterialSlotView {
+// find 找这个租户的一格。
+func (x iosMaterialIndex) find(tenant, kind, team, scope string) *iosMaterialSlotView {
 	for _, item := range x.items {
 		// bundle id 不分大小写比：表的主键多半不区分大小写，而重传时 scope 不更新，大小写不同的一次
 		// 重传会沿用旧 scope——按原样比，控制台会把传了的描述文件显示成"缺"
-		if item.Kind == kind && strings.EqualFold(item.TeamID, team) && strings.EqualFold(item.Scope, scope) {
+		if item.TenantID == tenant && item.Kind == kind && strings.EqualFold(item.TeamID, team) && strings.EqualFold(item.Scope, scope) {
 			return x.slot(item)
 		}
 	}
@@ -134,10 +143,10 @@ func (x iosMaterialIndex) find(kind, team, scope string) *iosMaterialSlotView {
 }
 
 // delivered：这个租户的证书与描述文件都在平台上、且加密给的是现在登记的公钥——新装的 Mac 解得开。
-// 上传 Key 不在其中：Mac 报不报这个 Team 与上传 Key 无关（没装报 missing），全托管缺 Key 另有问题码
+// 上传 Key 不在其中：Mac 报不报这个租户与上传 Key 无关（没装报 missing），全托管缺 Key 另有问题码
 func (x iosMaterialIndex) delivered(target iosSigningTarget) bool {
-	certificate := x.find(iosmaterial.KindCertificate, target.TeamID, "")
-	profile := x.find(iosmaterial.KindProfile, target.TeamID, target.BundleID)
+	certificate := x.find(target.TenantID, iosmaterial.KindCertificate, target.TeamID, "")
+	profile := x.find(target.TenantID, iosmaterial.KindProfile, target.TeamID, target.BundleID)
 	return certificate != nil && profile != nil && !certificate.Stale && !profile.Stale
 }
 
@@ -179,11 +188,22 @@ func iosMaterialStatus(view iosMaterialTenantView, builders int, readinessCode, 
 	if view.UploadKeyUse == iosUploadKeyWithdraw {
 		add("upload-key-should-be-withdrawn")
 	}
-	notInstalled := 0
+	notInstalled, rejected := 0, 0
+	detail := ""
 	for _, machine := range view.Machines {
 		if !machine.Installed {
 			notInstalled++
 		}
+		if len(machine.Problems) > 0 {
+			rejected++
+			if detail == "" {
+				detail = machine.Problems[0]
+			}
+		}
+	}
+	// Mac 装前核对不过（设计 §4.2）：租户交的东西不对，原因是 Mac 报的原话
+	if rejected > 0 {
+		problems = append(problems, iosMaterialProblem{Code: "mac-rejected", Count: rejected, Detail: detail})
 	}
 	switch {
 	case builders == 0:
@@ -287,13 +307,13 @@ func (s *server) iosMaterialTenants(c *gin.Context) {
 	for _, target := range targets {
 		team := strings.ToUpper(target.TeamID)
 		view := iosMaterialTenantView{
-			Slug: target.Slug, Current: target.TenantID == current, AppName: appNames[target.TenantID],
+			TenantID: target.TenantID, Slug: target.Slug, Current: target.TenantID == current, AppName: appNames[target.TenantID],
 			TeamID: team, BundleID: target.BundleID, Delivery: modeOf(target.TenantID),
 			TeamTenants: []string{}, BundleTenants: []string{},
 			TeamTestFlightTenants: testFlightTenantsOnTeam(targets, modeOf, target.TenantID, team),
-			Certificate:           index.find(iosmaterial.KindCertificate, team, ""),
-			Profile:               index.find(iosmaterial.KindProfile, team, target.BundleID),
-			UploadKey:             index.find(iosmaterial.KindUploadKey, team, ""),
+			Certificate:           index.find(target.TenantID, iosmaterial.KindCertificate, team, ""),
+			Profile:               index.find(target.TenantID, iosmaterial.KindProfile, team, target.BundleID),
+			UploadKey:             index.find(target.TenantID, iosmaterial.KindUploadKey, team, ""),
 			Delivered:             index.delivered(target),
 		}
 		for _, other := range targets {
@@ -310,13 +330,11 @@ func (s *server) iosMaterialTenants(c *gin.Context) {
 			view.UploadKeyUse = iosUploadKeyRequired
 		case view.UploadKey == nil:
 			view.UploadKeyUse = iosUploadKeyNotNeeded
-		case len(view.TeamTestFlightTenants) > 0:
-			view.UploadKeyUse = iosUploadKeyKeptForOthers
 		default:
 			view.UploadKeyUse = iosUploadKeyWithdraw
 		}
-		view.Machines, view.EarliestExpiry = iosTenantMachines(builders, liveness, team, target.BundleID)
-		code, detail := iosDeliveryReadiness{coverage: iosSigningCoverageFrom(registry, liveness, team, target.BundleID, now)}.
+		view.Machines, view.EarliestExpiry = iosTenantMachines(builders, liveness, target.TenantID, team, target.BundleID)
+		code, detail := iosDeliveryReadiness{coverage: iosSigningCoverageFrom(registry, liveness, target.TenantID, team, target.BundleID, now)}.
 			problem(view.Delivery, team, target.BundleID)
 		view.Readiness = gin.H{"ready": code == "", "code": nullableString(code), "detail": nullableString(detail)}
 		view.Status, view.Problems = iosMaterialStatus(view, len(builders), code, detail)
@@ -324,12 +342,18 @@ func (s *server) iosMaterialTenants(c *gin.Context) {
 	}
 	page, total, next, counts := filterIOSMaterialTenants(views, filter)
 
+	slugs, err := s.tenantSlugsByID(ctx)
+	if err != nil {
+		fail("the tenants", err)
+		return
+	}
 	orphans := []iosMaterialOrphanView{}
 	for _, item := range index.items {
 		if iosMaterialInUse(item, targets) {
 			continue
 		}
-		orphans = append(orphans, iosMaterialOrphanView{Kind: item.Kind, iosMaterialSlotView: *index.slot(item)})
+		orphans = append(orphans, iosMaterialOrphanView{TenantID: item.TenantID, TenantSlug: slugs[item.TenantID],
+			Kind: item.Kind, iosMaterialSlotView: *index.slot(item)})
 	}
 	invalidSlugs := make([]gin.H, 0, len(invalid))
 	for _, target := range invalid {
@@ -455,10 +479,11 @@ func (s *server) requestTenant(c *gin.Context) string {
 	return item.ID
 }
 
-// iosMaterialInUse：有没有租户在用这份材料。证书、上传 Key 按 Team，描述文件按 Team + bundle id。
+// iosMaterialInUse：这份材料的租户还在用它——租户当前的 Team 对得上，描述文件还要 bundle id 对得上。
+// tenant_id=0 的旧行不属于任何租户，永远算孤儿：它们只给还没升级的打包机用（设计 §3.5）。
 func iosMaterialInUse(item storedIOSMaterial, targets []iosSigningTarget) bool {
 	for _, target := range targets {
-		if !strings.EqualFold(item.TeamID, target.TeamID) {
+		if item.TenantID != target.TenantID || !strings.EqualFold(item.TeamID, target.TeamID) {
 			continue
 		}
 		if item.Kind != iosmaterial.KindProfile || strings.EqualFold(item.Scope, target.BundleID) {
@@ -468,28 +493,37 @@ func iosMaterialInUse(item storedIOSMaterial, targets []iosSigningTarget) bool {
 	return false
 }
 
-// iosTenantMachines 是一个租户在每台 iOS 构建机上的情况，以及这个 Team 最早的到期时间。
+// iosTenantMachines 是一个租户在每台 iOS 构建机上的情况，以及最早的到期时间。
 //
-// 装没装按 (Team, bundle id) **原样**比，与认领时同一个判据：大小写对不上的话任务确实派不出去，
-// 这里就该显示没装。到期时间是 Mac 按 Team 报的一个值——钥匙串里这个 Team 的全部证书（含过期、
-// 已轮换掉的旧证书）与同 Team 所有描述文件里最早的那个，不是这个租户独有的。
-func iosTenantMachines(builders []buildMachine, liveness map[string]machineLiveness, team, bundle string) ([]iosMaterialMachineView, any) {
-	want := team + "." + strings.TrimSpace(bundle)
+// 装没装与认领时同一个判据（machineLiveness.signs）：按租户自报的机器看这个租户自己的材料，旧机器按
+// (Team, bundle id) 原样比。到期时间：按租户自报的机器报的是这个租户的证书与描述文件；旧机器报的是
+// 这个 Team 在钥匙串里全部证书与所有描述文件里最早的那个，不是这个租户独有的。
+func iosTenantMachines(builders []buildMachine, liveness map[string]machineLiveness, tenant, team, bundle string) ([]iosMaterialMachineView, any) {
 	out := make([]iosMaterialMachineView, 0, len(builders))
 	var earliest *time.Time
+	note := func(expiresAt string) {
+		if at, err := time.Parse(time.RFC3339, expiresAt); err == nil && (earliest == nil || at.Before(*earliest)) {
+			earliest = &at
+		}
+	}
 	for _, m := range builders {
-		view := iosMaterialMachineView{ID: m.ID}
+		view := iosMaterialMachineView{ID: m.ID, Problems: []string{}}
 		live, ok := liveness[m.ID]
-		if ok {
-			view.Installed = containsString(signingPairs(live.AppleTeams), want)
+		if ok && live.TenantMaterial != nil {
+			view.Installed = live.signs(tenant, team, bundle)
+			if report := live.tenantReport(tenant, team); report != nil {
+				view.UploadProbe = nullableString(report.UploadProbe)
+				view.Problems = append(view.Problems, report.Problems...)
+				note(report.ExpiresAt)
+			}
+		} else if ok {
+			view.Installed = live.signs(tenant, team, bundle)
 			for _, report := range live.AppleTeams {
 				if !strings.EqualFold(report.TeamID, team) {
 					continue
 				}
 				view.UploadProbe = nullableString(report.UploadProbe)
-				if at, err := time.Parse(time.RFC3339, report.ExpiresAt); err == nil && (earliest == nil || at.Before(*earliest)) {
-					earliest = &at
-				}
+				note(report.ExpiresAt)
 			}
 		}
 		out = append(out, view)

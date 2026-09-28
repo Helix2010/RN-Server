@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Helix2010/RN-Server/signing/iosmaterial"
 	"github.com/gin-gonic/gin"
 )
 
@@ -82,6 +84,25 @@ type appleTeamReport struct {
 	UploadProbe string `json:"uploadProbe"`
 }
 
+// tenantMaterialReport 是一台 Mac 按租户自报的一个 (租户, Team) 的签名材料（设计
+// ios-tenant-owned-signing-material-2026-09-25 §12.3）。只有收到过按租户清单的打包机才报。
+type tenantMaterialReport struct {
+	TenantID string `json:"tenantId"`
+	TeamID   string `json:"teamId"`
+	// BundleIDs 只列 Mac 核对通过、没过期的描述文件
+	BundleIDs []string `json:"bundleIds"`
+	// CertificateSHA1 是本机索引里这个 (租户, Team) 的证书；CertificateReady=它出现在签名钥匙串的
+	// find-identity -v 里。不就绪的项照样报（控制台要显示原因），但不算可签
+	CertificateSHA1  string `json:"certificateSha1"`
+	CertificateReady bool   `json:"certificateReady"`
+	ExpiresAt        string `json:"expiresAt"`
+	UploadProbe      string `json:"uploadProbe"`
+	// APSEnvironment 是描述文件里的 aps-environment。现在只报不判，推送那一轮再用
+	APSEnvironment string `json:"apsEnvironment"`
+	// Problems 是 Mac 核对不过的原因，每条以 "<kind>: " 开头
+	Problems []string `json:"problems"`
+}
+
 // machineLiveness 是表里的一行。
 type machineLiveness struct {
 	MachineID   string
@@ -90,8 +111,11 @@ type machineLiveness struct {
 	OS          string
 	Platforms   []string
 	// Capabilities 是这次认领自报的能力（例如 ios-ipa-delivery）。旧版代理不报
-	Capabilities     []string
-	AppleTeams       []appleTeamReport
+	Capabilities []string
+	AppleTeams   []appleTeamReport
+	// TenantMaterial 非 nil = 这台 Mac 已经按租户落材料：派活、排队、控制台都按 (租户, Team, bundle) 算，
+	// 不再看 AppleTeams。nil = 旧版代理，或者还没收到过按租户的清单
+	TenantMaterial   []tenantMaterialReport
 	SigningExpiresAt sql.NullTime
 	FreeGB           sql.NullInt64
 	// PausedReason 是机器自己报的"我现在不领活"的原因（磁盘不够等）。空=没暂停。
@@ -105,6 +129,64 @@ type machineLiveness struct {
 
 func (l machineLiveness) online(now time.Time) bool {
 	return now.Sub(l.LastSeenAt) <= machineOfflineAfter
+}
+
+// signs：这台机器现在能不能签这个租户的包。按租户自报的机器只看这个租户自己的材料，旧机器看 Team。
+func (l machineLiveness) signs(tenant, team, bundle string) bool {
+	if l.TenantMaterial != nil {
+		return containsString(tenantSigningPairs(l.TenantMaterial), tenantSigningPair(tenant, team, bundle))
+	}
+	return containsString(signingPairs(l.AppleTeams), strings.ToUpper(strings.TrimSpace(team))+"."+strings.TrimSpace(bundle))
+}
+
+// uploads：这台机器能不能替这个租户上传（全托管）。判据同 uploadablePairs。
+func (l machineLiveness) uploads(tenant, team, bundle string) bool {
+	if l.TenantMaterial != nil {
+		return containsString(tenantUploadablePairs(l.TenantMaterial), tenantSigningPair(tenant, team, bundle))
+	}
+	return containsString(uploadablePairs(l.AppleTeams), strings.ToUpper(strings.TrimSpace(team))+"."+strings.TrimSpace(bundle))
+}
+
+// tenantReport 是这台机器对这个 (租户, Team) 的自报，没有就是 nil。
+func (l machineLiveness) tenantReport(tenant, team string) *tenantMaterialReport {
+	for i := range l.TenantMaterial {
+		report := &l.TenantMaterial[i]
+		if report.TenantID == tenant && strings.EqualFold(report.TeamID, team) {
+			return report
+		}
+	}
+	return nil
+}
+
+// tenantSigningPair 是按租户的可签对 "<租户>:<TEAM>.<bundle>"，与认领 SQL 里拼的一致。
+func tenantSigningPair(tenant, team, bundle string) string {
+	return tenant + ":" + strings.ToUpper(strings.TrimSpace(team)) + "." + strings.TrimSpace(bundle)
+}
+
+// tenantSigningPairs 把按租户的自报摊平成可签对。证书不就绪的项不算：身份不在钥匙串里，派过来也签不出来。
+func tenantSigningPairs(reports []tenantMaterialReport) []string {
+	out := []string{}
+	for _, report := range reports {
+		if !report.CertificateReady {
+			continue
+		}
+		for _, bundle := range report.BundleIDs {
+			out = append(out, tenantSigningPair(report.TenantID, report.TeamID, bundle))
+		}
+	}
+	return out
+}
+
+// tenantUploadablePairs 是按租户自报里上传 Key 装着、Apple 没拒的可签对（ok 或 error，理由见 uploadablePairs）。
+func tenantUploadablePairs(reports []tenantMaterialReport) []string {
+	out := []string{}
+	for _, report := range reports {
+		if report.UploadProbe != uploadProbeOK && report.UploadProbe != uploadProbeError {
+			continue
+		}
+		out = append(out, tenantSigningPairs([]tenantMaterialReport{report})...)
+	}
+	return out
 }
 
 // signingPairs 把自报盘点摊平成 "TEAMID.bundleid" 的集合：认领 SQL 拿它当 IN 列表，
@@ -163,6 +245,78 @@ func normalizeAppleTeamReports(reports []appleTeamReport) ([]appleTeamReport, bo
 	return out, true
 }
 
+// 按租户自报的规模上限：条目数同 appleTeams，每项的原因条数与长度只够把话说清
+const (
+	maxTenantMaterialProblems     = 8
+	maxTenantMaterialProblemRunes = 300
+)
+
+var certificateSHA1Pattern = regexp.MustCompile(`^[0-9A-F]{40}$`)
+
+// normalizeTenantMaterialReports 校验并归一按租户的自报。nil 原样返回 nil（没报）；返回 false 表示请求体不合法。
+func normalizeTenantMaterialReports(reports []tenantMaterialReport) ([]tenantMaterialReport, bool) {
+	if reports == nil {
+		return nil, true
+	}
+	if len(reports) > maxAppleTeamReports {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	out := make([]tenantMaterialReport, 0, len(reports))
+	for _, report := range reports {
+		team := strings.ToUpper(strings.TrimSpace(report.TeamID))
+		key := report.TenantID + "/" + team
+		if !iosmaterial.ValidTenantID(report.TenantID) || !appleTeamIDPattern.MatchString(team) || seen[key] {
+			return nil, false
+		}
+		seen[key] = true
+		if len(report.BundleIDs) > maxBundleIDsPerTeam || len(report.Problems) > maxTenantMaterialProblems {
+			return nil, false
+		}
+		bundles := make([]string, 0, len(report.BundleIDs))
+		for _, bundle := range report.BundleIDs {
+			bundle = strings.TrimSpace(bundle)
+			if !iosBundleIDPattern.MatchString(bundle) || containsString(bundles, bundle) {
+				return nil, false
+			}
+			bundles = append(bundles, bundle)
+		}
+		sha1 := strings.ToUpper(strings.TrimSpace(report.CertificateSHA1))
+		if sha1 != "" && !certificateSHA1Pattern.MatchString(sha1) {
+			return nil, false
+		}
+		expires := strings.TrimSpace(report.ExpiresAt)
+		if expires != appleSigningNeverEnds {
+			at, err := time.Parse(time.RFC3339, expires)
+			if err != nil {
+				return nil, false
+			}
+			expires = at.UTC().Format(time.RFC3339)
+		}
+		switch report.UploadProbe {
+		case uploadProbeUnknown, uploadProbeOK, uploadProbeForbidden, uploadProbeError, uploadProbeMissing:
+		default:
+			return nil, false
+		}
+		aps := strings.TrimSpace(report.APSEnvironment)
+		if aps != "" && aps != "development" && aps != "production" {
+			return nil, false
+		}
+		problems := make([]string, 0, len(report.Problems))
+		for _, problem := range report.Problems {
+			if problem = sanitizeSignerText(problem, maxTenantMaterialProblemRunes); problem != "" {
+				problems = append(problems, problem)
+			}
+		}
+		out = append(out, tenantMaterialReport{
+			TenantID: report.TenantID, TeamID: team, BundleIDs: bundles, CertificateSHA1: sha1,
+			CertificateReady: report.CertificateReady && sha1 != "", ExpiresAt: expires, UploadProbe: report.UploadProbe,
+			APSEnvironment: aps, Problems: problems,
+		})
+	}
+	return out, true
+}
+
 // earliestSigningExpiry 是自报盘点里最早的那个到期日：控制台在它进入 30 天内时标黄。
 func earliestSigningExpiry(reports []appleTeamReport) sql.NullTime {
 	var earliest sql.NullTime
@@ -197,25 +351,30 @@ func (s *server) recordMachineLiveness(ctx context.Context, live machineLiveness
 			capabilities = string(encoded)
 		}
 	}
-	var teams any
+	var teams, tenantMaterial any
 	if live.AppleTeams != nil {
 		encoded, err := json.Marshal(live.AppleTeams)
 		if err == nil {
 			teams = string(encoded)
 		}
 	}
+	if live.TenantMaterial != nil {
+		if encoded, err := json.Marshal(live.TenantMaterial); err == nil {
+			tenantMaterial = string(encoded)
+		}
+	}
 	now := live.LastSeenAt
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,capabilities,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason,updated_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		`INSERT INTO build_machine_liveness(machine_id,last_seen_at,agent_commit,os,platforms,capabilities,apple_teams,tenant_material,signing_expires_at,free_gb,upgrade_error,paused_reason,updated_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		 ON DUPLICATE KEY UPDATE
 		   last_seen_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(last_seen_at), last_seen_at),
 		   agent_commit=VALUES(agent_commit),os=VALUES(os),platforms=VALUES(platforms),capabilities=VALUES(capabilities),
-		   apple_teams=VALUES(apple_teams),signing_expires_at=VALUES(signing_expires_at),free_gb=VALUES(free_gb),
+		   apple_teams=VALUES(apple_teams),tenant_material=VALUES(tenant_material),signing_expires_at=VALUES(signing_expires_at),free_gb=VALUES(free_gb),
 		   upgrade_error=VALUES(upgrade_error),paused_reason=VALUES(paused_reason),
 		   updated_at=IF(last_seen_at < VALUES(last_seen_at) - INTERVAL `+machineLivenessThrottle+` SECOND, VALUES(updated_at), updated_at)`,
 		live.MachineID, now, nullableString(live.AgentCommit), nullableString(live.OS), string(platforms),
-		capabilities, teams, live.SigningExpiresAt, live.FreeGB, nullableString(live.UpgradeError), nullableString(live.PausedReason), now); err != nil {
+		capabilities, teams, tenantMaterial, live.SigningExpiresAt, live.FreeGB, nullableString(live.UpgradeError), nullableString(live.PausedReason), now); err != nil {
 		slog.Warn("unable to record build machine liveness", "machineId", live.MachineID, "error", err)
 	}
 }
@@ -241,7 +400,7 @@ func (s *server) touchMachineLiveness(ctx context.Context, machineID string, now
 // machineLivenessByID 读全表。行数等于登记过的机器数（上限 64），一次全取比按 id 查几十次便宜。
 func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiveness, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,capabilities,apple_teams,signing_expires_at,free_gb,upgrade_error,paused_reason FROM build_machine_liveness`)
+		`SELECT machine_id,last_seen_at,agent_commit,os,platforms,capabilities,apple_teams,tenant_material,signing_expires_at,free_gb,upgrade_error,paused_reason FROM build_machine_liveness`)
 	if err != nil {
 		return nil, err
 	}
@@ -250,8 +409,8 @@ func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiv
 	for rows.Next() {
 		var live machineLiveness
 		var agentCommit, os, upgradeError, paused sql.NullString
-		var platforms, capabilities, teams []byte
-		if err := rows.Scan(&live.MachineID, &live.LastSeenAt, &agentCommit, &os, &platforms, &capabilities, &teams,
+		var platforms, capabilities, teams, tenantMaterial []byte
+		if err := rows.Scan(&live.MachineID, &live.LastSeenAt, &agentCommit, &os, &platforms, &capabilities, &teams, &tenantMaterial,
 			&live.SigningExpiresAt, &live.FreeGB, &upgradeError, &paused); err != nil {
 			return nil, err
 		}
@@ -269,6 +428,12 @@ func (s *server) machineLivenessByID(ctx context.Context) (map[string]machineLiv
 		}
 		if len(teams) > 0 {
 			_ = json.Unmarshal(teams, &live.AppleTeams)
+		}
+		if len(tenantMaterial) > 0 {
+			// 坏 JSON 当作按租户报了、但什么都没有：这台机器已经在按租户落材料，退回按 Team 派活反而会错派
+			if json.Unmarshal(tenantMaterial, &live.TenantMaterial) != nil || live.TenantMaterial == nil {
+				live.TenantMaterial = []tenantMaterialReport{}
+			}
 		}
 		out[live.MachineID] = live
 	}
@@ -293,12 +458,12 @@ type iosSigningCoverage struct {
 	IPACapableOnline bool
 }
 
-func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesDoc, teamID, bundleID string, now time.Time) (iosSigningCoverage, error) {
+func (s *server) iosSigningCoverage(ctx context.Context, registry buildMachinesDoc, tenant, teamID, bundleID string, now time.Time) (iosSigningCoverage, error) {
 	rows, err := s.machineLivenessByID(ctx)
 	if err != nil {
 		return iosSigningCoverage{}, err
 	}
-	return iosSigningCoverageFrom(registry, rows, teamID, bundleID, now), nil
+	return iosSigningCoverageFrom(registry, rows, tenant, teamID, bundleID, now), nil
 }
 
 // iosBuilder 是池子里算数的那种机器：登记为 active、能打 iOS 的构建机。排队、认领与控制台的
@@ -309,22 +474,23 @@ func iosBuilder(m buildMachine) bool {
 
 // iosSigningCoverageFrom 是 iosSigningCoverage 的计算部分，登记与 liveness 由调用方读好——
 // 一次要算很多个租户时（控制台的「Apple 证书与密钥」页）不必每个租户重读一遍。
-func iosSigningCoverageFrom(registry buildMachinesDoc, rows map[string]machineLiveness, teamID, bundleID string, now time.Time) iosSigningCoverage {
+//
+// 按租户自报的机器只看这个租户自己的材料（machineLiveness.signs），与认领同一个判据。
+func iosSigningCoverageFrom(registry buildMachinesDoc, rows map[string]machineLiveness, tenant, teamID, bundleID string, now time.Time) iosSigningCoverage {
 	var coverage iosSigningCoverage
-	want := strings.ToUpper(strings.TrimSpace(teamID)) + "." + strings.TrimSpace(bundleID)
 	for _, m := range registry.Machines {
 		if !iosBuilder(m) {
 			continue
 		}
 		live, ok := rows[m.ID]
-		if !ok || !containsString(signingPairs(live.AppleTeams), want) {
+		if !ok || !live.signs(tenant, teamID, bundleID) {
 			continue
 		}
 		online := live.online(now)
 		coverage.Reported = true
 		coverage.Online = coverage.Online || online
 		// 按"登记语义"判：登记在用、最近一次上报里有，就算数；在不在线只影响提示
-		if containsString(uploadablePairs(live.AppleTeams), want) {
+		if live.uploads(tenant, teamID, bundleID) {
 			coverage.Uploadable = true
 			coverage.UploadableOnline = coverage.UploadableOnline || online
 		}
@@ -440,11 +606,10 @@ func machineLivenessView(live machineLiveness, machine gin.H, delivered []iosSig
 	if role != machineRoleBuilder || status != machineStatusActive || !containsString(platforms, buildPlatformIOS) {
 		return view
 	}
-	held := signingPairs(live.AppleTeams)
 	pending := 0
 	for _, target := range delivered {
-		// 与认领、与那一页的 machine 筛选同一个判据：(Team, bundle id) 原样比
-		if !containsString(held, strings.ToUpper(target.TeamID)+"."+strings.TrimSpace(target.BundleID)) {
+		// 与认领、与那一页的 machine 筛选同一个判据（machineLiveness.signs）
+		if !live.signs(target.TenantID, target.TeamID, target.BundleID) {
 			pending++
 		}
 	}

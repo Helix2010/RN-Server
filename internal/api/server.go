@@ -68,6 +68,8 @@ type server struct {
 	clock func() time.Time
 	// mailTests 是「发测试邮件」按操作人的小时窗口计数，零值可用
 	mailTests windowCounter
+	// iosMaterialWrites 是租户传、删 iOS 签名材料按租户的小时窗口计数，零值可用
+	iosMaterialWrites windowCounter
 	// secondFactorCodes：账号会话的邮箱二次验证码（second_factor.go，进程内存，单实例），零值可用
 	secondFactorCodes emailCodeStore
 	// role 是这个进程承担的角色（roles.go）；零值 RoleAll。平台控制台的请求按它认（platformConsole）
@@ -297,7 +299,7 @@ func (s *server) registerPlatformRoutes(protected *gin.RouterGroup) {
 	// 按租户的总览：控制台「Apple 证书与密钥」页（单独一个接口，读失败不连累租户页的上传卡）
 	platform.GET("/ios-material/tenants", s.iosMaterialTenants)
 	platform.PUT("/ios-material/recipients", s.registerIOSMaterialRecipients)
-	platform.POST("/ios-material", s.uploadIOSMaterial)
+	// 平台不代交材料（设计 ios-tenant-owned-signing-material-2026-09-25 §3.4）：只有只读总览与紧急删除
 	platform.POST("/ios-material/remove", s.removeIOSMaterial)
 	platform.GET("/build-agent-version/manifest", s.deployedManifest)
 	platform.POST("/build-agent-version/signature", s.uploadBundleSignature)
@@ -503,6 +505,10 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 有没跑完的 iOS 任务时不许切换（ios_delivery.go）
 	group.GET("/ios/delivery", s.getIOSDelivery)
 	group.PUT("/ios/delivery", sf, s.updateIOSDelivery)
+	// iOS 签名材料由租户自己交：证书、描述文件、上传 Key（ios_material_tenant.go）
+	group.GET("/ios/material", s.getTenantIOSMaterial)
+	group.POST("/ios/material", sf, s.uploadTenantIOSMaterial)
+	group.POST("/ios/material/remove", sf, s.removeTenantIOSMaterial)
 	group.GET("/ota/signing-key", s.getOTASigningKey)
 	group.PUT("/ota/signing-key", sf, s.updateOTASigningKey)
 	group.POST("/ota/signing-key/generate", sf, s.generateOTASigningKey)

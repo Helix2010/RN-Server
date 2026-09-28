@@ -56,6 +56,10 @@ func TestDBSecondFactor(t *testing.T) {
 	// 没验过：敏感操作 403，会话视图里没有有效期
 	wantProblem(t, member.do("PUT", "/v1/admin/release-identity/ios", identity("com.sf.a"+sfx, 0), nil), 403, "SECOND_FACTOR_REQUIRED")
 	wantProblem(t, member.do("PUT", "/v1/admin/ios/delivery", map[string]any{"mode": "ipa", "expectedVersion": 0, "reason": "切换", "confirm": true}, nil), 403, "SECOND_FACTOR_REQUIRED")
+	// 签名材料由租户自己交：读随意，传与删要二次验证（设计 ios-tenant-owned-signing-material-2026-09-25 §2）
+	member.mustCode(t, member.do("GET", "/v1/admin/ios/material", nil, nil), 200)
+	wantProblem(t, member.do("POST", "/v1/admin/ios/material", map[string]any{"v": 2}, nil), 403, "SECOND_FACTOR_REQUIRED")
+	wantProblem(t, member.do("POST", "/v1/admin/ios/material/remove", map[string]any{"kind": "certificate"}, nil), 403, "SECOND_FACTOR_REQUIRED")
 	if view := member.mustCode(t, member.do("GET", "/v1/admin/auth/session", nil, nil), 200); view["secondFactorUntil"] != nil {
 		t.Fatalf("session = %v", view)
 	}

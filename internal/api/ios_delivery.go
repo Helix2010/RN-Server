@@ -196,14 +196,14 @@ type iosDeliveryReadiness struct {
 func (r iosDeliveryReadiness) problem(mode, teamID, bundleID string) (string, string) {
 	switch {
 	case !r.coverage.Reported:
-		return "NO_BUILDER_FOR_TEAM", "没有任何一台 iOS 打包机报告过它手上有 Team " + teamID + "、bundle id " + bundleID +
-			" 的签名材料，排进去的任务不会有人认领。把这个 Team 的证书与描述文件下发到至少一台 Mac，" +
-			"到「平台维护 → 打包机与签名闸」确认它报上来之后再排。"
+		return "NO_BUILDER_FOR_TEAM", "没有任何一台 iOS 打包机报告过它手上有这个租户 Team " + teamID + "、bundle id " + bundleID +
+			" 的签名材料，排进去的任务不会有人认领。在「iOS 打包与分发」的签名材料卡上交齐证书与描述文件，" +
+			"等 Mac 核对通过（卡上显示就绪）之后再排。"
 	// 这两句既用在排队被拒时，也用在配置卡上说"切过去能不能排"：写成对交付方式本身的陈述，
 	// 不写"这个租户是……"——配置卡上看的往往是还没选的那一种
 	case mode == iosDeliveryTestFlight && !r.coverage.Uploadable:
-		return "NO_UPLOADER_FOR_TEAM", "「全托管」要由打包机用这个 Team 的上传 Key 上传，但没有任何一台打包机报告过 Team " + teamID +
-			" 的上传 Key 可用，排进去的任务不会有人认领。先把上传 Key 下发到打包机并确认探测结果，或者用「自助上传」。"
+		return "NO_UPLOADER_FOR_TEAM", "「全托管」要由打包机用这个租户的上传 Key 上传，但没有任何一台打包机报告过 Team " + teamID +
+			" 的这把上传 Key 可用，排进去的任务不会有人认领。先在签名材料卡上交上传 Key 并等 Mac 探测通过，或者用「自助上传」。"
 	case mode == iosDeliveryIPA && !r.coverage.IPACapable:
 		return "NO_IPA_BUILDER_FOR_TEAM", "「自助上传」要由打包机把 .ipa 交回平台，但手上有 Team " + teamID +
 			" 签名材料的打包机都还不支持（打包机程序版本太旧）。批准新版打包机、等它升级之后才能排。"
@@ -218,12 +218,12 @@ func (r iosDeliveryReadiness) online(mode string) bool {
 	return r.coverage.UploadableOnline
 }
 
-func (s *server) iosDeliveryReadinessFor(ctx context.Context, teamID, bundleID string) (iosDeliveryReadiness, error) {
+func (s *server) iosDeliveryReadinessFor(ctx context.Context, tenant, teamID, bundleID string) (iosDeliveryReadiness, error) {
 	registry, err := s.machineRegistry(ctx)
 	if err != nil {
 		return iosDeliveryReadiness{}, err
 	}
-	coverage, err := s.iosSigningCoverage(ctx, registry, teamID, bundleID, s.now())
+	coverage, err := s.iosSigningCoverage(ctx, registry, tenant, teamID, bundleID, s.now())
 	if err != nil {
 		return iosDeliveryReadiness{}, err
 	}
@@ -232,9 +232,10 @@ func (s *server) iosDeliveryReadinessFor(ctx context.Context, teamID, bundleID s
 
 // iosKeysToRevoke 是从全托管切到自助上传时，租户要去 App Store Connect 吊销的、交给过平台的 Key。
 //
-// 只算平台真拿着、切过去之后也不该再拿着的那些：同一个 Team 下还有别的全托管租户时，这个 Team 的
-// 上传 Key 它们还在用（Team Key 限不了 App，一个 Team 一把），让人去吊销就断了它们的上传；平台
-// 根本没存过的 Key 也不该要人勾"已吊销"——审计里记下的就成了一句不真实的确认。
+// 只算平台真拿着的：平台根本没存过的 Key 不该要人勾"已吊销"——审计里记下的就成了一句不真实的确认。
+// 上传 Key 按租户存（设计 ios-tenant-owned-signing-material-2026-09-25 §3.3），切过去时**无条件**删掉本租户
+// 那一份；同一个 Team 下别的租户交的是它们自己的副本，平台这边互不相干。Apple 那一侧隔离不了：别的租户
+// 交的要是同一把 Key，吊销会让它们也传不了——这件事只能提醒（iosSharedTeamWarning）。
 type iosKeysToRevoke struct {
 	AppManagerKey bool `json:"appManagerKey"`
 	UploadKey     bool `json:"uploadKey"`
@@ -244,20 +245,18 @@ func (k iosKeysToRevoke) any() bool { return k.AppManagerKey || k.UploadKey }
 
 func iosKeysToRevokeFor(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, tenant string, identity *iosReleaseIdentityRecord, sharedWith []string) (iosKeysToRevoke, error) {
+}, tenant string) (iosKeysToRevoke, error) {
 	var keys iosKeysToRevoke
 	var count int
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM app_configs WHERE tenant_id=? AND config_key=?`, tenant, iosASCConfigKey).Scan(&count); err != nil {
 		return keys, err
 	}
 	keys.AppManagerKey = count > 0
-	if identity != nil && len(sharedWith) == 0 {
-		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ios_signing_material WHERE kind=? AND team_id=?`,
-			iosmaterial.KindUploadKey, identity.Value.AppleTeamID).Scan(&count); err != nil {
-			return keys, err
-		}
-		keys.UploadKey = count > 0
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM ios_signing_material WHERE tenant_id=? AND kind=?`,
+		tenant, iosmaterial.KindUploadKey).Scan(&count); err != nil {
+		return keys, err
 	}
+	keys.UploadKey = count > 0
 	return keys, nil
 }
 
@@ -273,20 +272,20 @@ func iosKeysNames(keys iosKeysToRevoke) string {
 }
 
 // iosSharedTeamWarning 不点名：别的租户的 slug 不给租户看（设计 tenant-console-accounts-and-sso §3.4），
-// 租户只需要知道「这个 Team 还有别人在用」。
-const iosSharedTeamWarning = "同一个 Apple Team 下还有别的租户是「全托管」，这个 Team 的上传 Key 留在平台与打包机上给它们用——" +
-	"不要在 App Store Connect 吊销它，否则它们的构建传不上去。"
+// 租户只需要知道「这个 Team 还有别人在用」。Apple 的 Team Key 限定不到单个 App，平台隔离不了这件事。
+const iosSharedTeamWarning = "同一个 Apple Team 下还有别的 App 是「全托管」。如果它们交给平台的是同一把上传 Key，" +
+	"在 App Store Connect 吊销它会让它们也传不上去；它们用的是各自的 Key 就不受影响。"
 
 // iosSwitchedToIPAReminder 按这次实际删了、撤了什么来写，不按"应该有什么"写。
 func iosSwitchedToIPAReminder(ascDeleted, uploadKeyWithdrawn, teamShared bool) string {
 	reminder := "已切到「自助上传」。"
 	switch {
 	case ascDeleted && uploadKeyWithdrawn:
-		reminder += "平台存的 App Manager Key 已删除、这个 Team 的上传 Key 已从平台材料里撤下，打包机下一轮同步（几分钟内）会删掉本机那份。"
+		reminder += "平台存的 App Manager Key 已删除、这个 App 的上传 Key 已从平台撤下，打包机下一轮同步（几分钟内）会删掉本机那份。"
 	case ascDeleted:
 		reminder += "平台存的 App Manager Key 已删除。"
 	case uploadKeyWithdrawn:
-		reminder += "这个 Team 的上传 Key 已从平台材料里撤下，打包机下一轮同步（几分钟内）会删掉本机那份。"
+		reminder += "这个 App 的上传 Key 已从平台撤下，打包机下一轮同步（几分钟内）会删掉本机那份。"
 	}
 	if ascDeleted || uploadKeyWithdrawn {
 		reminder += "平台删掉副本不等于 Key 作废：请确认已在 App Store Connect 吊销。"
@@ -331,7 +330,7 @@ func (s *server) getIOSDelivery(c *gin.Context) {
 		return
 	}
 	if identity != nil {
-		ready, err := s.iosDeliveryReadinessFor(ctx, identity.Value.AppleTeamID, identity.Value.BundleID)
+		ready, err := s.iosDeliveryReadinessFor(ctx, tenantID(c), identity.Value.AppleTeamID, identity.Value.BundleID)
 		if err != nil {
 			problem(c, http.StatusInternalServerError, "IOS_DELIVERY_QUERY_FAILED", "Unable to read build machine liveness")
 			return
@@ -340,8 +339,7 @@ func (s *server) getIOSDelivery(c *gin.Context) {
 			code, detail := ready.problem(mode, identity.Value.AppleTeamID, identity.Value.BundleID)
 			readiness[mode] = gin.H{"ready": code == "", "code": nullableString(code), "detail": nullableString(detail), "online": ready.online(mode)}
 		}
-		// 同一个 Team 下还有别的租户是全托管：这个 Team 的上传 Key 会继续留在打包机上
-		// （Team Key 限不了 App，一个 Team 一把），切到自助上传也收不回这份授权
+		// 同一个 Team 下还有别的租户是全托管：它们交的要是同一把上传 Key，吊销会连带它们（Team Key 限不了 App）
 		if shared, err = s.iosTeamSharedWithTestFlightTenants(ctx, tenantID(c), identity.Value.AppleTeamID); err != nil {
 			problem(c, http.StatusInternalServerError, "IOS_DELIVERY_QUERY_FAILED", "Unable to read other tenants on this Apple team")
 			return
@@ -349,7 +347,7 @@ func (s *server) getIOSDelivery(c *gin.Context) {
 	}
 	// 只给布尔值，不点名是哪些租户
 	view["teamSharedWithOtherTenants"] = len(shared) > 0
-	keys, err := iosKeysToRevokeFor(ctx, s.db, tenantID(c), identity, shared)
+	keys, err := iosKeysToRevokeFor(ctx, s.db, tenantID(c))
 	if err != nil {
 		problem(c, http.StatusInternalServerError, "IOS_DELIVERY_QUERY_FAILED", "Unable to read which keys the platform holds")
 		return
@@ -487,7 +485,7 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 				return
 			}
 		}
-		if keys, err = iosKeysToRevokeFor(ctx, tx, tenantID(c), identity, sharedWith); err != nil {
+		if keys, err = iosKeysToRevokeFor(ctx, tx, tenantID(c)); err != nil {
 			problem(c, http.StatusInternalServerError, "IOS_DELIVERY_QUERY_FAILED", "Unable to read which keys the platform holds")
 			return
 		}
@@ -512,17 +510,22 @@ func (s *server) updateIOSDelivery(c *gin.Context) {
 		}
 		affected, _ := result.RowsAffected()
 		ascDeleted = affected > 0
-		// 这个 Team 的上传 Key 材料也撤下——除非同一个 Team 下还有别的租户是全托管（Team Key 限不了
-		// App，一个 Team 一把，撤了那些租户就传不了）。撤下之后，打包机下一轮同步发现清单里没有这个
-		// Team 的上传 Key，就请上传账户删掉本机那份（墓碑，cmd/build-agent/ios_material.go）
+		// 本租户的上传 Key 无条件撤下（按租户存，碰不到别人）。打包机下一轮同步发现清单里没有这一格，
+		// 就请上传账户删掉本机那份（墓碑，cmd/build-agent/ios_material.go）
+		result, err = tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE tenant_id=? AND kind=?`, tenantID(c), iosmaterial.KindUploadKey)
+		if err != nil {
+			problem(c, http.StatusInternalServerError, "IOS_DELIVERY_SAVE_FAILED", "Unable to withdraw the upload key of this app")
+			return
+		}
+		withdrawn, _ := result.RowsAffected()
+		uploadKeyWithdrawn = withdrawn > 0
+		// 按 Team 存的旧行（只下发给还没升级的打包机）照旧：同一个 Team 下没有别的全托管租户才撤
 		if identity != nil && len(sharedWith) == 0 {
-			result, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE kind=? AND team_id=?`, iosmaterial.KindUploadKey, identity.Value.AppleTeamID)
-			if err != nil {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM ios_signing_material WHERE tenant_id=0 AND kind=? AND team_id=?`,
+				iosmaterial.KindUploadKey, identity.Value.AppleTeamID); err != nil {
 				problem(c, http.StatusInternalServerError, "IOS_DELIVERY_SAVE_FAILED", "Unable to withdraw the upload key of this team")
 				return
 			}
-			withdrawn, _ := result.RowsAffected()
-			uploadKeyWithdrawn = withdrawn > 0
 		}
 	}
 	raw, _ := json.Marshal(iosDeliveryConfig{Mode: body.Mode})

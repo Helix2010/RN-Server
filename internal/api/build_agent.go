@@ -104,6 +104,9 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		// Capabilities：这台机器的构建机程序会做哪些"新"事情（例如 ios-ipa-delivery：能把 .ipa
 		// 交回服务端）。服务端据此决定派不派需要它的任务；旧版代理不报
 		Capabilities []string `json:"capabilities"`
+		// TenantMaterial：按租户的签名材料自报（设计 ios-tenant-owned-signing-material-2026-09-25 §12.3）。
+		// 只有收到过按租户清单的打包机才报；报了就只按 (租户, Team, bundle id) 派 iOS 任务
+		TenantMaterial []tenantMaterialReport `json:"tenantMaterial"`
 	}
 	if decode(c, &body) != nil || len(body.Platforms) == 0 || len(body.Kinds) == 0 {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "platforms (android, ios) and kinds (apk, ota) are required")
@@ -144,6 +147,12 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM", "capabilities must be a short list of lowercase names")
 		return
 	}
+	tenantMaterial, ok := normalizeTenantMaterialReports(body.TenantMaterial)
+	if !ok {
+		problem(c, http.StatusBadRequest, "INVALID_BUILD_CLAIM",
+			"tenantMaterial must carry tenant ids, 10-character Apple Team IDs, bundle ids, a 40-character certificate sha1 and at most 8 problems")
+		return
+	}
 	ctx := c.Request.Context()
 	// 在 GET_LOCK 与事务**之外**、在"队列空回 204"提前返回**之前**记一次在线与自报盘点。
 	// 认领这条路径上绝大多数请求都是空转（队列是空的），而"这台机器还活着、手上有这些
@@ -160,7 +169,7 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		MachineID: machine.ID, LastSeenAt: s.now(), AgentCommit: body.AgentCommit, OS: body.OS,
 		// 记自报的平台，不是下面收窄之后的：收窄掉的恰恰是"它想干但干不了"，
 		// 而那正是要在控制台上看见的东西
-		Platforms: body.Platforms, Capabilities: capabilities, AppleTeams: teams,
+		Platforms: body.Platforms, Capabilities: capabilities, AppleTeams: teams, TenantMaterial: tenantMaterial,
 		SigningExpiresAt: earliestSigningExpiry(teams), FreeGB: freeGB, PausedReason: pausedReason,
 		UpgradeError: sanitizeSignerText(body.UpgradeError, machineUpgradeErrorMaxRunes),
 	})
@@ -191,7 +200,14 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	capable := machine.buildPlatforms()
 	args := []any{}
 	claimed := []string{}
-	pairs := signingPairs(teams)
+	// 可签对：按租户自报的机器是 "<租户>:TEAM.bundle"，只算这个租户自己交、Mac 核对通过的材料；旧机器是
+	// "TEAM.bundle"（同 Team 的租户共用）。下面 SQL 里拼的那一列跟着换（signingKey）
+	pairs, uploadPairs := signingPairs(teams), uploadablePairs(teams)
+	signingKey := `CONCAT(UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId')))`
+	if tenantMaterial != nil {
+		pairs, uploadPairs = tenantSigningPairs(tenantMaterial), tenantUploadablePairs(tenantMaterial)
+		signingKey = `CONCAT(c.tenant_id,':',UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId')))`
+	}
 	for _, p := range body.Platforms {
 		if !containsString(capable, p) {
 			continue
@@ -231,9 +247,8 @@ func (s *server) claimBuildJob(c *gin.Context) {
 	for _, pair := range pairs {
 		args = append(args, pair)
 	}
-	// 全托管的任务只派给这个 Team 的上传 Key 可用的机器；自助上传的任务只派给能把 .ipa 交回
-	// 服务端的机器（ios_delivery.go）。同样的 IN () 占位
-	uploadPairs := uploadablePairs(teams)
+	// 全托管的任务只派给这个租户（旧机器：这个 Team）的上传 Key 可用的机器；自助上传的任务只派给能把
+	// .ipa 交回服务端的机器（ios_delivery.go）。同样的 IN () 占位
 	if len(uploadPairs) == 0 {
 		uploadPairs = []string{""}
 	}
@@ -317,12 +332,10 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		                         AND (e.created_at<j.created_at OR (e.created_at=j.created_at AND e.id<j.id))))
 		          AND EXISTS (SELECT 1 FROM app_configs c
 		                       WHERE c.tenant_id=j.tenant_id AND c.config_key='`+releaseIOSIdentityConfigKey+`'
-		                         AND CONCAT(UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',
-		                                    JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId'))) IN (`+pairPlaceholders+`)
+		                         AND `+signingKey+` IN (`+pairPlaceholders+`)
 		                         AND (j.kind<>'`+jobKindAPK+`'
 		                              OR (COALESCE(j.delivery,'`+iosDeliveryTestFlight+`')='`+iosDeliveryTestFlight+`'
-		                                  AND CONCAT(UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId'))),'.',
-		                                             JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId'))) IN (`+uploadPlaceholders+`))
+		                                  AND `+signingKey+` IN (`+uploadPlaceholders+`))
 		                              OR (j.delivery='`+iosDeliveryIPA+`' AND ?=1)))))
 		  ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, args...).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -417,6 +430,10 @@ func (s *server) claimBuildJob(c *gin.Context) {
 		return
 	}
 	view := buildJobView(job)
+	// tenantId：按租户落签名材料的 Mac 用它找本租户的描述文件、证书与上传 Key（设计
+	// ios-tenant-owned-signing-material-2026-09-25 §4.1）。目录用租户 id，不用 slug 或 tenantDirectory：
+	// 那两个要么租户自己能改，要么会与别的租户撞
+	view["tenantId"] = job.TenantID
 	view["tenantSlug"] = slug
 	view["tenantDirectory"] = buildCfg.RepoDirectory
 	view["googleServicesJson"] = nullableString(buildCfg.GoogleServicesJSON)

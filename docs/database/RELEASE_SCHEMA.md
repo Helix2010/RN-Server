@@ -124,6 +124,7 @@ ota：queued → claimed → running → succeeded
 - 认领是**跨租户**的，取最早那条。解析不出租户、`git_ref` 不是固定分支的任务当场判 failed 而不是报错留在队列里——否则一条脏数据会把整个队列堵死。
 - 回收是服务端独立的定时器（每分钟），条件更新，多实例并发安全。
 - iOS 认领还有两条（迁移 55、设计 `docs/design/ios-mac-builders-home-network-2026-09-18.md` §5.2、§5.3）：**同租户同时只有一条 iOS 安装包任务在途**（两条并行跑完，低号那条的 `/ios-release` 会被拒，而它的 `.ipa` 已经进了 App Store Connect，撤不回来）；任务租户 `release.ios` 的 `appleTeamId` + `bundleId` 必须在这台机器**本次认领自报**的盘点里（`build_machine_liveness.apple_teams`）。两条都写成子查询并用 `FOR UPDATE OF j SKIP LOCKED` 限定锁的范围——不限定的话每次认领都会锁住各租户 `app_configs` 的 `release.ios` 那几行。Android 不加第一条：那会把两台构建机同时打同一个租户的两条任务也串起来。
+- 迁移 66 起（设计 `docs/design/ios-tenant-owned-signing-material-2026-09-25.md` §4.4、§12.3）：本次认领报了 `tenantMaterial` 的机器，第二条改按 `"<租户>:TEAM.bundle"` 比，只算这个租户自己交、Mac 核对通过、证书在钥匙串里的材料；没报的旧机器照旧按 `TEAM.bundle`。
 - 迁移 58 又加两条（设计 `docs/design/ios-tenant-delivery-tiers-2026-09-24.md` §3.2）：**同租户的 iOS 安装包任务按排队顺序领**（有更早的排队中任务时这一条不能先领——交付方式按任务分路由之后，领取条件不再相同，"按顺序"不再碰巧成立）；**交付方式对得上这台机器**：`testflight` 要本次自报里这个 Team 的 `uploadProbe` 是 `ok` 或 `error`，`ipa` 要本次认领自报了 `ios-ipa-delivery` 能力。
 
 ## build_machine_liveness（迁移 55）
@@ -143,6 +144,7 @@ ota：queued → claimed → running → succeeded
 | `platforms` | JSON NULL | 本次认领自报的平台，如 `["ios"]`。记的是**自报的**、不是被登记收窄之后的：收窄掉的恰恰是"它想干但干不了"，而那正是要在控制台上看见的 |
 | `capabilities` | JSON NULL | 本次认领自报的能力（迁移 58），如 `["ios-ipa-delivery"]`=能把 .ipa 交回服务端。排队与认领据此决定自助上传的任务能不能排、派给谁。NULL=旧版代理没报 |
 | `apple_teams` | JSON NULL | 自报盘点：`[{"teamId":"ABCDE12345","bundleIds":["com.x.y"],"expiresAt":"2027-01-01T00:00:00Z","uploadProbe":"ok"}]`（`uploadProbe`：`ok`/`forbidden`/`error` 是对上传 Key 的只读探测——每次盘点（随认领，约 10 秒一次）都探，让"角色不够传不上去"在**第一次构建之前**就看得见；`missing`=开着上传但没装这个 Team 的 Key（迁移 58 起照样报这个 Team，自助上传的租户本来就不交 Key）；空=这台机器没开上传或问不到上传账户）。服务端据它路由 iOS 任务；控制台拿它与全部租户的 `release.ios` 求差集，标出"这台缺哪个租户的签名材料"。NULL=不是 iOS 打包机或旧版代理没报 |
+| `tenant_material` | JSON NULL | 按租户的自报（迁移 66，设计 `ios-tenant-owned-signing-material-2026-09-25.md` §12.3）：`[{"tenantId":"…","teamId":"…","bundleIds":[…],"certificateSha1":"…","certificateReady":true,"expiresAt":"…","uploadProbe":"ok","apsEnvironment":"production","problems":["profile: …"]}]`。非 NULL 的机器派活、排队、控制台都只按 (租户, Team, bundle id) 算；NULL=旧版代理或还没收到过按租户的清单，按 `apple_teams` 算。同样是运维仪表 |
 | `signing_expires_at` | DATETIME(3) NULL | 本机最早到期的证书或描述文件，30 天内控制台标黄 |
 | `free_gb` | INT UNSIGNED NULL | 构建盘剩余空间 GiB，认领时自报 |
 | `upgrade_error` | VARCHAR(300) NULL | 上一次自升级失败的原因（升级程序写 `state/upgrade-failed.json`，代理启动后读出来随认领报上来）。**为什么要报上来**：升级是 root 的那个程序做的，它失败时代理还在跑旧版，控制台上看到的只是"版本一直追不上审批值"，不说原因就只能上机器看日志 |
@@ -155,3 +157,19 @@ ota：queued → claimed → running → succeeded
 - 写失败只记日志，不影响认领与心跳：在线状态是仪表，认领是主路径。
 - **`hasLiveBuilderFor` 不看这张表**：任务能不能排进队列仍然只看登记里有没有 active 的构建机。家里的 Mac 掉线时 iOS 任务照常排队等它回来（已定的决策）；"一台都不在线"只进排队响应的 `warnings`（`no_ios_builder_online`）与控制台提示。挡住排队的只有"**从来没有**任何一台报过这个 Team"（409 `NO_BUILDER_FOR_TEAM`），那种情况排进去永远没人领。
 - 掉线判据 5 分钟（代理每 10 秒认领、每 30 秒心跳，写入 60 秒节流），控制台卡片超过 30 分钟标黄。
+
+## ios_signing_material（迁移 57、59、66）
+
+iOS 签名材料的密文，服务端只存、只转发，没有任何一把私钥。设计见 `docs/design/ios-signing-material-distribution-2026-09-19.md`、`docs/design/ios-tenant-owned-signing-material-2026-09-25.md`。
+
+- 主键 `(tenant_id, kind, team_id, scope)`（迁移 66 起）：材料由租户自己交，同一个 Team 的租户各交各的，一个租户换、删自己的材料碰不到别人。
+- `tenant_id=0` 是迁移前按 Apple Team 存的旧行，只下发给不带 `tenant-signing-material` 能力的清单请求（还没升级的打包机），所有 Mac 切到按租户的布局之后删除。
+- 迁移 66 把旧行复制给用这个 Team 的每个租户，复制的行 `legacy=1`（v1 密文，里面没有租户，Mac 只对这种项接受 v1）：
+  - 证书按 Team；
+  - 描述文件按 bundle id，不分大小写；
+  - 上传 Key 只复制给全托管的租户。
+- `version` 是上传时的毫秒时间戳，且至少比旧版本大 1：删掉再传也不会变小（迁移 59）。
+- 写入点：
+  - 租户接口 `POST /v1/admin/ios/material`（只收 v2，材料里带租户 id）；
+  - 删除：租户 `POST /v1/admin/ios/material/remove`、平台紧急删除 `POST /v1/admin/platform/ios-material/remove`（审计记在那个租户名下）；
+  - 租户切到自助上传时删本租户的上传 Key。

@@ -100,6 +100,9 @@ var migrations = []migration{
 	// 删掉环境变量里的管理员账号：会话只剩统一登录一个来源，每个会话都属于一个账号
 	// （设计 console-accounts-external-maintenance-2026-09-27 §10）
 	{version: 65, name: "admin_sessions_account_only", apply: adminSessionsAccountOnlyMigration},
+	// iOS 签名材料按租户存、租户自己交；打包机按租户自报盘点
+	// （设计 ios-tenant-owned-signing-material-2026-09-25 §3.1、§3.5、§12.3、§12.4）
+	{version: 66, name: "ios_signing_material_by_tenant", apply: iosSigningMaterialByTenantMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2422,6 +2425,55 @@ func adminSessionsAccountOnlyMigration(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("admin sessions account only migration: %w", err)
 		}
+	}
+	return nil
+}
+
+// iosSigningMaterialByTenantMigration 让 iOS 签名材料按租户存：主键加 tenant_id，同一个 Team 的租户各交各的，
+// 一个租户换、删自己的材料碰不到别人（设计 ios-tenant-owned-signing-material-2026-09-25 §3.1）。
+//
+// 原来按 Team 存的行留在 tenant_id=0 下，只下发给还没升级的打包机（不带 tenant-signing-material 能力的清单
+// 请求），所有 Mac 切到按租户的布局之后删掉（§3.5，阶段 6）。每一行再复制给 release.ios 用这个 Team 的每个租户：
+//   - 证书按 Team；
+//   - 描述文件按 (Team, bundle id)，bundle id 不分大小写，与控制台按租户总览的匹配同一个口径；
+//   - 上传 Key 只复制给全托管的租户：自助上传的租户不收上传 Key（§3.3）。交付方式读不出来按全托管，与
+//     api.iosDeliveryModes 同一个取向。
+//
+// 复制过来的是 v1 密文，里面没有租户，所以标 legacy=1：Mac 只对标了 legacy 的清单项接受 v1（§12.2）。
+// 版本号照抄——打包机按租户记「装到第几版」，新的一格本来就会装一遍。INSERT IGNORE 让它能重跑。
+//
+// 顺带补 build_machine_liveness.tenant_material：打包机按租户的自报盘点（§12.3）。
+func iosSigningMaterialByTenantMigration(ctx context.Context, db *sql.DB) error {
+	if err := addColumnIfMissing(ctx, db, "ios_signing_material", "tenant_id",
+		`ALTER TABLE ios_signing_material
+			ADD COLUMN tenant_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '这份材料属于哪个租户 tenants.id。0=按 Apple Team 存的旧行，只下发给还没升级的打包机，所有 Mac 切到按租户的布局之后删除' FIRST,
+			ADD COLUMN legacy TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=迁移时从 tenant_id=0 的旧行复制来的 v1 密文，里面没有租户：打包机只对这种行接受 v1。租户重传之后是 v2，这一列回到 0' AFTER uploaded_at,
+			MODIFY kind VARCHAR(20) NOT NULL COMMENT 'certificate=Apple Distribution 证书（每租户每 Team 一份）；profile=App Store 描述文件（每租户每 bundle id 一份）；upload-key=App Store Connect 上传 Key（每租户每 Team 一份，只有全托管的租户有）',
+			MODIFY scope VARCHAR(100) NOT NULL COMMENT '同一 (租户, kind, team) 下把材料分开的那一维：描述文件是 bundle id，证书与上传 Key 是空串。放进主键，免得两行打架',
+			MODIFY uploaded_by VARCHAR(100) NOT NULL COMMENT '传这份材料的人：租户成员，或者迁移之前传这份的平台管理员',
+			DROP PRIMARY KEY,
+			ADD PRIMARY KEY (tenant_id, kind, team_id, scope),
+			COMMENT='iOS 签名材料的密文，按租户存。服务端只是快递员：它没有任何一把私钥，存的每一份都解不开'`); err != nil {
+		return fmt.Errorf("ios signing material by tenant migration: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT IGNORE INTO ios_signing_material
+		(tenant_id,kind,team_id,scope,purpose,recipient_sha256,version,ciphertext,uploaded_by,uploaded_at,legacy)
+		SELECT c.tenant_id,m.kind,m.team_id,m.scope,m.purpose,m.recipient_sha256,m.version,m.ciphertext,m.uploaded_by,m.uploaded_at,1
+		  FROM ios_signing_material m
+		  JOIN app_configs c ON c.config_key='release.ios' AND c.tenant_id>0
+		  JOIN tenants t ON t.id=c.tenant_id AND t.deleted=0
+		 WHERE m.tenant_id=0
+		   AND UPPER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.appleTeamId')))=UPPER(m.team_id)
+		   AND (m.kind='certificate'
+		        OR (m.kind='profile' AND LOWER(JSON_UNQUOTE(JSON_EXTRACT(c.config_value,'$.bundleId')))=LOWER(m.scope))
+		        OR (m.kind='upload-key' AND COALESCE((SELECT JSON_UNQUOTE(JSON_EXTRACT(d.config_value,'$.mode')) FROM app_configs d
+		                                              WHERE d.tenant_id=c.tenant_id AND d.config_key='release.ios.delivery'),'testflight')<>'ipa'))`); err != nil {
+		return fmt.Errorf("ios signing material by tenant migration copy: %w", err)
+	}
+	if err := addColumnIfMissing(ctx, db, "build_machine_liveness", "tenant_material",
+		`ALTER TABLE build_machine_liveness ADD COLUMN tenant_material JSON NULL
+			COMMENT '按租户的签名材料自报：[{"tenantId":"…","teamId":"…","bundleIds":[…],"certificateSha1":"…","certificateReady":true,"uploadProbe":"ok","problems":[…]}]。报了这一列的 Mac 只按 (租户, Team, bundle id) 派 iOS 任务；NULL=旧版代理或还没收到按租户的清单，按 apple_teams 派。运维仪表，不是安全边界' AFTER apple_teams`); err != nil {
+		return fmt.Errorf("ios signing material by tenant migration tenant_material: %w", err)
 	}
 	return nil
 }
