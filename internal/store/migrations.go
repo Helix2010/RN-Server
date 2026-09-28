@@ -105,6 +105,9 @@ var migrations = []migration{
 	{version: 66, name: "ios_signing_material_by_tenant", apply: iosSigningMaterialByTenantMigration},
 	// 自助上传的 iOS 任务把 AppStoreInfo.plist 和 .ipa 一起交回（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3、§3.5）
 	{version: 67, name: "build_jobs_appstore_info", apply: buildJobsAppStoreInfoMigration},
+	// 全托管的 iOS 构建传进 App Store Connect 之后，服务端只读地查它在 Apple 那边的处理状态
+	// （设计 ios-platform-testflight-upload-2026-09-23 §3.3，2026-09-28 决定只读轮询、不写 Apple）
+	{version: 68, name: "build_jobs_testflight_state", apply: buildJobsTestFlightStateMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2536,4 +2539,11 @@ func buildJobsAppStoreInfoMigration(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// buildJobsTestFlightStateMigration：全托管 iOS 构建在 App Store Connect 上的处理状态，由服务端用租户交的
+// 只读 ASC 密钥定时查回来。放在任务行上而不是发布记录：构建列表只读 build_jobs，发布记录还可能被删。
+func buildJobsTestFlightStateMigration(ctx context.Context, db *sql.DB) error {
+	return addColumnIfMissing(ctx, db, "build_jobs", "testflight_state", `ALTER TABLE build_jobs ADD COLUMN testflight_state JSON NULL
+		COMMENT '全托管 iOS 构建在 App Store Connect 上的处理状态：{"buildId","processingState","expired","expirationDate","uploadedDate","checkedAt","nextCheckAt","checks","finalAt","lastError","unavailable"}。服务端平台进程的回收循环用租户交的只读 ASC 密钥查，只读、不写 Apple；processingState 到 VALID/INVALID/FAILED、或 24 小时查不到（NOT_FOUND）写 finalAt 后不再查。没交密钥的租户写 unavailable 并 6 小时后再看，密钥被拒整个租户 6 小时后再试。NULL=还没查过（自助上传、Android 与热更新任务恒为 NULL）'`)
 }

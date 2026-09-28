@@ -1,6 +1,7 @@
 # iOS：平台代传 TestFlight 与控制台提审（2026-09-23）
 
-> 状态：**草案，待拍板**。前置：`ios-testflight-distribution-2026-09-17.md`（分发模型、模式 A/B）、
+> 状态：**2026-09-28 部分拍板**（见 §9）：提审不做控制台按钮、服务端继续不写 Apple；处理状态改成服务端只读轮询；出口合规由租户在控制台声明。
+> 原状态：草案，待拍板。前置：`ios-testflight-distribution-2026-09-17.md`（分发模型、模式 A/B）、
 > `ios-mac-builders-home-network-2026-09-18.md`（Mac 打包机、§4.3 上传账户）、
 > `ios-mac-builders-implementation-2026-09-18.md`（实现与真机记录）。
 
@@ -199,3 +200,18 @@ sequenceDiagram
 | 2 | Mac → OBS 回传 + 服务端核验 + 发布记录带产物 + 「下载 .ipa」（模式 B） | §7 第 1 条实测通过 |
 | 3 | 服务端「上传到 TestFlight」按钮；Mac 上传账户退为备用 | 阶段 2 |
 | 4 | 图标改发预签名地址 | 阶段 2 的任务作用域签发接口 |
+
+## 9. 决定（2026-09-28）
+
+用户按建议定了四件事，其余（包回传走 OBS、服务端代传）仍按本稿的开放问题处理：
+
+1. **提审（§3.5）不做控制台按钮。** 外部测试的 Beta App Review、App Store 送审、测试组、公开链接继续由人在 App Store Connect 上操作。
+   §4「服务端开始写 Apple」不采纳：`TestServerSideNeverConstructsAnUploader` 继续守着，租户也不必交权限更大的 App Manager 密钥来换一个按钮。
+   控制台里「平台不做的事」那段说明（admin-i18n `iosNeverAutoDetail`）本来就是这么写的，不用改。
+2. **处理状态（§3.3）改成服务端只读轮询。** 全托管构建传进 Apple 之后，平台进程的回收循环用租户交的 ASC 密钥查 processingState，
+   写在 `build_jobs.testflight_state`（迁移 68），构建列表直接显示；只读、不写 Apple；没交密钥的租户一次请求都不发。
+   INVALID / FAILED / 一天查不到写审计 `ios_testflight_processing_problem`。节奏与退避见 `internal/api/ios_testflight_poll.go`。
+3. **出口合规（§3.4、§7 第 2 条）由租户在控制台声明。** 平台不替租户答：租户（它的法务）在「iOS 打包与分发」声明
+   「只用豁免的加密」与否；声明了，打包时写进 Info.plist 的 `ITSAppUsesNonExemptEncryption`，ASC 上不再每个 build 人工回答；
+   没声明保持现状（不写这个键，每个 build 人工回答）。实现见 `release.ios.export-compliance` 与 RN-App 的构建脚本。
+4. **Mac 构建缓存**不属于本稿，见 `ios-mac-builders-implementation-2026-09-18.md` 同日的记录。
