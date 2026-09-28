@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// 打包任务交付对象（未签名包、SBOM、已签名包）的清理。
+// 打包任务交付对象（未签名包、SBOM、已签名包，自助上传 iOS 任务的 AppStoreInfo.plist）的清理。
 //
 // 每次上传都是一个新键（deliveryObjectSegment），任务行只记最新那一个。任务被放弃（回收、取消、
 // 强制判失败、构建机或签名闸报失败）或者被重新认领时，行上的键不再有人引用，不删就成了桶里的
@@ -25,16 +25,26 @@ const (
 	releaseUnsigned objectSet = 1 << iota
 	releaseSBOM
 	releaseSigned
+	// releaseAppStoreInfo 是自助上传 iOS 任务和 .ipa（记在 unsigned 列上）一起交回的 AppStoreInfo.plist，
+	// 跟着 .ipa 走：属于构建机那一次认领，也和 .ipa 一起过保留期
+	releaseAppStoreInfo
 
-	releaseNothing        objectSet = 0
-	releaseBuildDelivery            = releaseUnsigned | releaseSBOM
-	releaseAllDeliveries            = releaseBuildDelivery | releaseSigned
-	jobObjectKeyColumns             = `unsigned_object_key,sbom_object_key,signed_object_key`
-	deliveryDeleteTimeout           = 30 * time.Second
+	releaseNothing       objectSet = 0
+	releaseBuildDelivery           = releaseUnsigned | releaseSBOM | releaseAppStoreInfo
+	releaseAllDeliveries           = releaseBuildDelivery | releaseSigned
+	// releaseIOSPackage 是自助上传的交付件：.ipa 与 AppStoreInfo.plist
+	releaseIOSPackage     = releaseUnsigned | releaseAppStoreInfo
+	jobObjectKeyColumns   = `unsigned_object_key,sbom_object_key,signed_object_key,appstore_info_object_key`
+	deliveryDeleteTimeout = 30 * time.Second
 )
 
 type jobObjectKeys struct {
-	Unsigned, SBOM, Signed sql.NullString
+	Unsigned, SBOM, Signed, AppStoreInfo sql.NullString
+}
+
+// scanTargets 与 jobObjectKeyColumns 一一对应：按那一串列 SELECT 之后用它 Scan，加列只改这两处
+func (k *jobObjectKeys) scanTargets() []any {
+	return []any{&k.Unsigned, &k.SBOM, &k.Signed, &k.AppStoreInfo}
 }
 
 // pick 返回集合里非空的键。
@@ -48,6 +58,7 @@ func (k jobObjectKeys) pick(set objectSet) []string {
 	add(releaseUnsigned, k.Unsigned)
 	add(releaseSBOM, k.SBOM)
 	add(releaseSigned, k.Signed)
+	add(releaseAppStoreInfo, k.AppStoreInfo)
 	return keys
 }
 
@@ -62,6 +73,9 @@ func (set objectSet) clearColumns() string {
 	}
 	if set&releaseSigned != 0 {
 		b.WriteString(",signed_object_key=NULL")
+	}
+	if set&releaseAppStoreInfo != 0 {
+		b.WriteString(",appstore_info_object_key=NULL,appstore_info_size=NULL,appstore_info_sha256=NULL")
 	}
 	return b.String()
 }
@@ -99,7 +113,7 @@ func (s *server) transitionBuildJob(ctx context.Context, jobID string, t jobTran
 	defer tx.Rollback()
 	switch err := tx.QueryRowContext(ctx,
 		`SELECT tenant_id,sign_attempt,sign_failures,signing_machine_id,`+jobObjectKeyColumns+` FROM build_jobs `+t.Where+` FOR UPDATE`, t.WhereArgs...).
-		Scan(&locked.TenantID, &locked.SignAttempt, &locked.SignFailures, &locked.SigningMachineID, &locked.Keys.Unsigned, &locked.Keys.SBOM, &locked.Keys.Signed); {
+		Scan(append([]any{&locked.TenantID, &locked.SignAttempt, &locked.SignFailures, &locked.SigningMachineID}, locked.Keys.scanTargets()...)...); {
 	case errors.Is(err, sql.ErrNoRows):
 		return lockedJob{}, false, nil
 	case err != nil:

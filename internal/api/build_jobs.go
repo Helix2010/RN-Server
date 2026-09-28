@@ -105,11 +105,16 @@ type buildJob struct {
 	SigningHeartbeatAt sql.NullTime
 	SignOutcome        []byte
 	SignedObjectKey    sql.NullString
+	// 自助上传的 iOS 任务和 .ipa 一起交回的 AppStoreInfo.plist（迁移 67，ios_ipa_delivery.go）
+	AppStoreInfoObjectKey sql.NullString
+	AppStoreInfoSize      sql.NullInt64
+	AppStoreInfoSHA256    sql.NullString
 }
 
 const buildJobColumns = `id,tenant_id,platform,kind,delivery,delivery_state,base_release_id,channel,apply_strategy,ota_release_id,git_ref,commit_sha,version,build_number,status,claimed_by,claimed_at,heartbeat_at,release_id,artifact_sha256,log_tail,failure_reason,reason,release_notes,created_by,created_at,updated_at,` +
 	`attempt,claimed_machine_id,unsigned_object_key,unsigned_size,unsigned_sha256,sbom_object_key,sbom_size,sbom_sha256,native_fingerprint,provenance,` +
-	`sign_attempt,sign_failures,signing_machine_id,signing_claimed_at,signing_heartbeat_at,sign_outcome,signed_object_key`
+	`sign_attempt,sign_failures,signing_machine_id,signing_claimed_at,signing_heartbeat_at,sign_outcome,signed_object_key,` +
+	`appstore_info_object_key,appstore_info_size,appstore_info_sha256`
 
 func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 	var j buildJob
@@ -119,7 +124,8 @@ func scanBuildJob(row interface{ Scan(...any) error }) (buildJob, error) {
 		&j.FailureReason, &j.Reason, &j.ReleaseNotes, &j.CreatedBy, &j.CreatedAt, &j.UpdatedAt,
 		&j.Attempt, &j.ClaimedMachineID, &j.UnsignedObjectKey, &j.UnsignedSize, &j.UnsignedSHA256,
 		&j.SBOMObjectKey, &j.SBOMSize, &j.SBOMSHA256, &j.NativeFingerprint, &j.Provenance,
-		&j.SignAttempt, &j.SignFailures, &j.SigningMachineID, &j.SigningClaimedAt, &j.SigningHeartbeatAt, &j.SignOutcome, &j.SignedObjectKey)
+		&j.SignAttempt, &j.SignFailures, &j.SigningMachineID, &j.SigningClaimedAt, &j.SigningHeartbeatAt, &j.SignOutcome, &j.SignedObjectKey,
+		&j.AppStoreInfoObjectKey, &j.AppStoreInfoSize, &j.AppStoreInfoSHA256)
 	return j, err
 }
 

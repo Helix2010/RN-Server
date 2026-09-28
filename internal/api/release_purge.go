@@ -191,7 +191,7 @@ func (s *server) purgeRelease(c *gin.Context) {
 	}
 	for deliveryRows.Next() {
 		var keys jobObjectKeys
-		if err := deliveryRows.Scan(&keys.Unsigned, &keys.SBOM, &keys.Signed); err != nil {
+		if err := deliveryRows.Scan(keys.scanTargets()...); err != nil {
 			deliveryRows.Close()
 			problem(c, http.StatusInternalServerError, "RELEASE_PURGE_FAILED", "Unable to read the build deliveries of this release")
 			return

@@ -7,11 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Helix2010/RN-Server/internal/ipa"
+	"github.com/Helix2010/RN-Server/internal/plist"
 	"github.com/gin-gonic/gin"
 )
 
@@ -26,6 +28,14 @@ import (
 func iosPackageObjectName(bundleID, version string, buildNumber int) string {
 	return safeDownloadName(bundleID + "-" + version + "-build" + strconv.Itoa(buildNumber) + ".ipa")
 }
+
+// iosAppStoreInfoObjectName 是 AppStoreInfo.plist 的文件名：和 .ipa 同名、换后缀，下载到同一个目录里一眼能配上对。
+func iosAppStoreInfoObjectName(bundleID, version string, buildNumber int) string {
+	return safeDownloadName(bundleID + "-" + version + "-build" + strconv.Itoa(buildNumber) + ".AppStoreInfo.plist")
+}
+
+// iosAppStoreInfoMaxSize：AppStoreInfo.plist 是几 KB 的元数据，给足余量，但不让它变成另一条交大文件的路。
+const iosAppStoreInfoMaxSize = 1 << 20
 
 // uploadIOSPackage 收下自助上传任务的 .ipa：先在临时文件上核对，对得上才写进存储、记到任务行。
 //
@@ -213,5 +223,146 @@ func (s *server) downloadIOSPackage(c *gin.Context) {
 	}
 	if _, err := io.Copy(c.Writer, body); err != nil {
 		slog.Warn("self-upload .ipa download stream ended early", "job", c.Param("id"), "error", err)
+	}
+}
+
+// uploadIOSAppStoreInfo 收下自助上传任务和 .ipa 一起交回的 AppStoreInfo.plist
+// （设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）。Windows / Linux 上用 iTMSTransporter 上传必须带它，
+// Mac 上的 Transporter 用不到，所以它是可选的：旧版打包机不交、Xcode 没生成，任务照样能完成。
+//
+// 只核对它是一份顶层为字典的 plist、不超过上限：内容由 Xcode 生成，服务端不解释，原样交给租户。
+func (s *server) uploadIOSAppStoreInfo(c *gin.Context) {
+	job, ok := builderJobFromContext(c)
+	if !ok {
+		return
+	}
+	if job.Kind != jobKindAPK || job.Platform != buildPlatformIOS || jobDelivery(job) != iosDeliveryIPA {
+		problem(c, http.StatusConflict, "BUILD_KIND_MISMATCH", "Only self-upload iOS builds hand an AppStoreInfo.plist back to the server")
+		return
+	}
+	machine, _ := machineFromContext(c)
+	identity, err := s.iosReleaseIdentityRecord(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.ios configuration is invalid")
+		return
+	}
+	if identity == nil {
+		problem(c, http.StatusConflict, "IOS_IDENTITY_INCOMPLETE", "这个租户的 iOS 发布身份在构建期间被删掉了，这份文件落不了库")
+		return
+	}
+	client, prefix, err := s.storageClientForTenant(c.Request.Context(), job.TenantID)
+	if err != nil {
+		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
+		return
+	}
+	received, status, code, detail := receiveStreamToTemp(c, iosAppStoreInfoMaxSize)
+	if status != 0 {
+		problem(c, status, code, detail)
+		return
+	}
+	defer received.cleanup()
+	raw, err := os.ReadFile(received.path)
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "UPLOAD_FAILED", "Unable to read the upload")
+		return
+	}
+	if fields, err := plist.Parse(raw); err != nil || len(fields) == 0 {
+		problem(c, http.StatusUnprocessableEntity, "IOS_APPSTORE_INFO_INVALID", "交回的 AppStoreInfo.plist 不是一份有内容的 plist 字典")
+		return
+	}
+	key := buildJobObjectKey(prefix, job.TenantID, job.ID, deliveryObjectSegment("a", job.Attempt),
+		iosAppStoreInfoObjectName(identity.Value.BundleID, job.Version, job.BuildNumber))
+	if status, code, detail := s.storeReceivedStream(client, key, received); status != 0 {
+		problem(c, status, code, detail)
+		return
+	}
+	// 请求可能已经断开，落库不跟着请求取消（与 uploadIOSPackage 同一个道理）
+	replaced, current, err := s.recordDeliveredObject(context.Background(),
+		`SELECT appstore_info_object_key FROM build_jobs
+		  WHERE id=? AND kind='apk' AND platform='`+buildPlatformIOS+`' AND delivery='`+iosDeliveryIPA+`'
+		    AND status IN (`+sqlStatusList(buildJobEventFrom(eventBuilderUpload, jobKindAPK))+`) AND attempt=? AND claimed_machine_id=?`,
+		[]any{job.ID, job.Attempt, machine.ID},
+		`UPDATE build_jobs SET appstore_info_object_key=?,appstore_info_size=?,appstore_info_sha256=?,updated_at=? WHERE id=?`,
+		[]any{key, received.size, received.sha256, time.Now().UTC(), job.ID})
+	if err != nil {
+		slog.Error("cannot record a delivered AppStoreInfo.plist", "job", job.ID, "error", err)
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_SAVE_FAILED", "Unable to record the delivered file")
+		return
+	}
+	if !current {
+		_ = client.Delete(context.Background(), key)
+		problem(c, http.StatusConflict, "BUILD_ATTEMPT_STALE", "This claim is no longer current for this machine; stop working on the job")
+		return
+	}
+	deleteReplacedObject(client, replaced, key, job.ID)
+	c.JSON(http.StatusOK, gin.H{"sha256": received.sha256, "size": received.size})
+}
+
+// downloadIOSAppStoreInfo 把自助上传任务的 AppStoreInfo.plist 交给控制台。和 .ipa 一样鉴权后由服务端转发、
+// 每次记审计；文件只有几 KB，不支持 Range。
+func (s *server) downloadIOSAppStoreInfo(c *gin.Context) {
+	ctx := c.Request.Context()
+	var platform, kind, status, version string
+	var delivery, key, digest sql.NullString
+	var size sql.NullInt64
+	var buildNumber int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT platform,kind,delivery,status,version,build_number,appstore_info_object_key,appstore_info_sha256,appstore_info_size FROM build_jobs WHERE tenant_id=? AND id=?`,
+		tenantID(c), c.Param("id")).Scan(&platform, &kind, &delivery, &status, &version, &buildNumber, &key, &digest, &size)
+	if errors.Is(err, sql.ErrNoRows) {
+		problem(c, http.StatusNotFound, "BUILD_JOB_NOT_FOUND", "Build job not found")
+		return
+	}
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "BUILD_JOB_QUERY_FAILED", "Unable to load the build")
+		return
+	}
+	if platform != buildPlatformIOS || kind != jobKindAPK || delivery.String != iosDeliveryIPA {
+		problem(c, http.StatusNotFound, "IOS_APPSTORE_INFO_NOT_AVAILABLE", "这条构建不是「自助上传」的 iOS 构建，没有 AppStoreInfo.plist")
+		return
+	}
+	if status != jobSucceeded || !key.Valid || key.String == "" || !size.Valid || !digest.Valid {
+		problem(c, http.StatusNotFound, "IOS_APPSTORE_INFO_NOT_AVAILABLE", "这条构建没有交回 AppStoreInfo.plist（打包机版本较旧或 Xcode 没生成），或者已经过了保留期被清理")
+		return
+	}
+	identity, err := s.iosReleaseIdentityRecord(ctx, tenantID(c))
+	if err != nil {
+		problem(c, http.StatusInternalServerError, "RELEASE_IDENTITY_CONFIG_INVALID", "Stored release.ios configuration is invalid")
+		return
+	}
+	bundleID := "app"
+	if identity != nil {
+		bundleID = identity.Value.BundleID
+	}
+	client, _, err := s.storageClientForTenant(ctx, tenantID(c))
+	if err != nil {
+		problem(c, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", "Release storage is not configured")
+		return
+	}
+	stored, err := client.Stat(ctx, key.String)
+	if err != nil {
+		problem(c, http.StatusFailedDependency, "IOS_APPSTORE_INFO_DOWNLOAD_FAILED", "Unable to read the AppStoreInfo.plist from release storage")
+		return
+	}
+	if stored.Size != size.Int64 {
+		slog.Error("a delivered AppStoreInfo.plist changed in storage", "job", c.Param("id"), "tenant", tenantID(c), "stored", stored.Size, "recorded", size.Int64)
+		problem(c, http.StatusFailedDependency, "IOS_APPSTORE_INFO_OBJECT_CHANGED", "The AppStoreInfo.plist in release storage no longer matches what the server received")
+		return
+	}
+	body, err := client.Get(ctx, key.String)
+	if err != nil {
+		problem(c, http.StatusFailedDependency, "IOS_APPSTORE_INFO_DOWNLOAD_FAILED", "Unable to read the AppStoreInfo.plist from release storage")
+		return
+	}
+	defer body.Close()
+	s.auditNow(newAudit(tenantID(c), actor(c), "ios_appstore_info_download", "build-job", c.Param("id"), "downloaded the AppStoreInfo.plist of a self-upload build", requestID(c),
+		map[string]any{"jobId": c.Param("id"), "sha256": digest.String, "size": size.Int64}))
+	c.Header("Content-Type", octetStream)
+	c.Header("Content-Disposition", `attachment; filename="`+iosAppStoreInfoObjectName(bundleID, version, buildNumber)+`"`)
+	c.Header("Content-Length", strconv.FormatInt(size.Int64, 10))
+	c.Header("ETag", `"`+digest.String+`"`)
+	c.Header("Cache-Control", "no-store")
+	if _, err := io.Copy(c.Writer, body); err != nil {
+		slog.Warn("AppStoreInfo.plist download stream ended early", "job", c.Param("id"), "error", err)
 	}
 }

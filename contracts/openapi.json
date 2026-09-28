@@ -3158,6 +3158,38 @@
         }
       }
     },
+    "/v1/admin/builds/{id}/ipa/appstore-info/download": {
+      "get": {
+        "summary": "Download the AppStoreInfo.plist of a self-upload iOS build",
+        "description": "Only for succeeded self-upload (delivery=ipa) iOS builds that handed one back and whose package is still retained. Streamed by the server after authentication, like the .ipa; no Range support (a few KB). The object's size is checked against what the server received before anything is sent. Every request is audited (ios_appstore_info_download). The path ends in /download so it is exempt from the database timeout.",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The plist (application/octet-stream), Content-Disposition attachment <bundle>-<version>-build<n>.AppStoreInfo.plist, ETag \"<sha256>\"",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin authentication required"
+          },
+          "404": {
+            "description": "BUILD_JOB_NOT_FOUND, IOS_APPSTORE_INFO_NOT_AVAILABLE (not a self-upload iOS build, not succeeded yet, no plist was handed back, or it was cleaned up)"
+          },
+          "424": {
+            "description": "IOS_APPSTORE_INFO_DOWNLOAD_FAILED, IOS_APPSTORE_INFO_OBJECT_CHANGED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          }
+        }
+      }
+    },
     "/v1/admin/builds/{id}/ipa/status": {
       "post": {
         "summary": "Mark the progress of a self-upload .ipa",
@@ -3990,6 +4022,72 @@
           },
           "422": {
             "description": "IOS_IPA_INVALID (not a readable App Store package: development, Ad Hoc or enterprise profile, missing profile, unexpected archive entries), IOS_ARTIFACT_MISMATCH (bundle id, version, build number or profile team does not match)"
+          },
+          "424": {
+            "description": "UPLOAD_STORAGE_FAILED"
+          },
+          "503": {
+            "description": "STORAGE_UNAVAILABLE"
+          },
+          "401": {
+            "description": "MACHINE_AUTH_REQUIRED: missing or unknown machine token. MACHINE_REVOKED: the token belongs to a machine revoked in the console - stop retrying and exit"
+          },
+          "403": {
+            "description": "MACHINE_ROLE_FORBIDDEN (token of the other role) or MACHINE_KEY_NOT_ACCEPTED (the machine public key has not been accepted in the console yet)"
+          },
+          "426": {
+            "description": "MACHINE_AUTH_UPGRADE_REQUIRED: only the retired x-build-agent-token was sent"
+          },
+          "500": {
+            "description": "RELEASE_IDENTITY_CONFIG_INVALID, BUILD_JOB_SAVE_FAILED"
+          }
+        }
+      }
+    },
+    "/v1/build-agent/jobs/{id}/ipa/appstore-info/upload": {
+      "put": {
+        "summary": "Hand back the AppStoreInfo.plist of a self-upload iOS build",
+        "description": "Self-upload (delivery=ipa) iOS jobs only; optional (older agents do not send it and the job completes without it). The AppStoreInfo.plist Xcode generated next to the .ipa, needed by iTMSTransporter on Windows / Linux. Limit 1 MiB; it must parse as a plist whose root is a non-empty dictionary (binary or XML); the server does not interpret its content. Written under tenants/<tenant>/build-jobs/<job>/a<attempt>/<random>/<bundle>-<version>-build<n>.AppStoreInfo.plist and recorded in the job's appstore_info_* columns in one transaction that locks the job row and checks the attempt; a re-upload replaces and deletes the previous object. Cleared and deleted with the .ipa on re-claim, reaping, cancel, failure and retention purge; deleted with the release. The path ends in /upload so it is exempt from the database timeout. Design ios-tenant-delivery-tiers-2026-09-24 §3.3.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineToken"
+          },
+          {
+            "$ref": "#/components/parameters/JobId"
+          },
+          {
+            "$ref": "#/components/parameters/BuildAttempt"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{sha256, size}"
+          },
+          "400": {
+            "description": "UPLOAD_EMPTY, UPLOAD_INTERRUPTED, INVALID_BUILD_ATTEMPT"
+          },
+          "409": {
+            "description": "BUILD_ATTEMPT_STALE, BUILD_KIND_MISMATCH (not a self-upload iOS job), IOS_IDENTITY_INCOMPLETE"
+          },
+          "413": {
+            "description": "UPLOAD_TOO_LARGE (over 1 MiB)"
+          },
+          "415": {
+            "description": "UPLOAD_CONTENT_TYPE_INVALID"
+          },
+          "422": {
+            "description": "IOS_APPSTORE_INFO_INVALID (not a plist dictionary, or empty)"
           },
           "424": {
             "description": "UPLOAD_STORAGE_FAILED"
@@ -9911,6 +10009,21 @@
                 "type": "string",
                 "nullable": true,
                 "description": "The .ipa passed its retention period and was deleted; the record stays"
+              },
+              "appStoreInfo": {
+                "type": "object",
+                "nullable": true,
+                "description": "The AppStoreInfo.plist Xcode generated next to the .ipa (generateAppStoreInformation), needed by iTMSTransporter on Windows / Linux (-assetDescription). Download it from /ipa/appstore-info/download. null when the build agent did not hand one back (older agent, or this Xcode did not generate it), the build has not succeeded, or it was purged with the .ipa",
+                "properties": {
+                  "sha256": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "size": {
+                    "type": "integer",
+                    "nullable": true
+                  }
+                }
               },
               "superseded": {
                 "type": "boolean",

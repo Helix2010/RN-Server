@@ -103,6 +103,8 @@ var migrations = []migration{
 	// iOS 签名材料按租户存、租户自己交；打包机按租户自报盘点
 	// （设计 ios-tenant-owned-signing-material-2026-09-25 §3.1、§3.5、§12.3、§12.4）
 	{version: 66, name: "ios_signing_material_by_tenant", apply: iosSigningMaterialByTenantMigration},
+	// 自助上传的 iOS 任务把 AppStoreInfo.plist 和 .ipa 一起交回（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3、§3.5）
+	{version: 67, name: "build_jobs_appstore_info", apply: buildJobsAppStoreInfoMigration},
 }
 
 // releaseCanaryMigration 给全量发布与 OTA 各加一个与 active 平行的 canary 状态和一列设备
@@ -2513,4 +2515,25 @@ func addIndexIfMissing(ctx context.Context, db *sql.DB, table, index, statement 
 	}
 	_, err := db.ExecContext(ctx, statement)
 	return err
+}
+
+// buildJobsAppStoreInfoMigration：自助上传的 iOS 任务在 .ipa 之外再交回一份 AppStoreInfo.plist
+// （Xcode 导出时 generateAppStoreInformation 生成）。Windows / Linux 上用 iTMSTransporter 上传必须带它，
+// 租户从控制台和 .ipa 一起下载。对象键和 .ipa 一样记在任务行上，回收、取消、失败、重新认领、
+// 过了保留期与删除发布都按这一列清理，不会在桶里留下孤儿。
+func buildJobsAppStoreInfoMigration(ctx context.Context, db *sql.DB) error {
+	columns := []struct{ name, ddl string }{
+		{"appstore_info_object_key", `ALTER TABLE build_jobs ADD COLUMN appstore_info_object_key VARCHAR(512) NULL
+			COMMENT '自助上传 iOS 任务交回的 AppStoreInfo.plist 对象键：前缀/tenants/租户/build-jobs/任务/a认领编号/每次上传的随机段/<bundle>-<版本>-build<号>.AppStoreInfo.plist。写入规则同 unsigned_object_key；重新认领、回收、取消、失败、过了保留期时置空并删除对象，删除发布时一并删除。NULL=没有交回（旧版打包机、Xcode 没生成，或者不是自助上传任务）'`},
+		{"appstore_info_size", `ALTER TABLE build_jobs ADD COLUMN appstore_info_size BIGINT NULL
+			COMMENT 'AppStoreInfo.plist 大小，单位字节，服务端收流时计数；NULL=没有交回'`},
+		{"appstore_info_sha256", `ALTER TABLE build_jobs ADD COLUMN appstore_info_sha256 CHAR(64) NULL
+			COMMENT 'AppStoreInfo.plist sha256（小写十六进制），服务端收流时自己算；NULL=没有交回'`},
+	}
+	for _, column := range columns {
+		if err := addColumnIfMissing(ctx, db, "build_jobs", column.name, column.ddl); err != nil {
+			return fmt.Errorf("build jobs appstore info migration %s: %w", column.name, err)
+		}
+	}
+	return nil
 }
