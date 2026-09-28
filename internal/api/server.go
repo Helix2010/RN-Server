@@ -506,6 +506,9 @@ func (s *server) registerTenantRoutes(group *gin.RouterGroup) {
 	// 有没跑完的 iOS 任务时不许切换（ios_delivery.go）
 	group.GET("/ios/delivery", s.getIOSDelivery)
 	group.PUT("/ios/delivery", sf, s.updateIOSDelivery)
+	// 出口合规：租户（它的法务）声明用没用非豁免的加密；声明了打包时写进 Info.plist，ASC 不再每个 build 问
+	group.GET("/ios/export-compliance", s.getIOSExportCompliance)
+	group.PUT("/ios/export-compliance", sf, s.updateIOSExportCompliance)
 	// iOS 签名材料由租户自己交：证书、描述文件、上传 Key（ios_material_tenant.go）
 	group.GET("/ios/material", s.getTenantIOSMaterial)
 	group.POST("/ios/material", sf, s.uploadTenantIOSMaterial)
