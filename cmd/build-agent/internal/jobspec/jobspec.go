@@ -46,6 +46,9 @@ const (
 	// 它不上传服务端——TestFlight 的包在 Apple 那边，而且不是这一份（Apple 会重签、瘦身）。
 	// 交到 out/ 只为让控制进程自己算一遍摘要记进审计，以及让人能在机器上找到它。
 	IPAFileName = "app-release.ipa"
+	// AppStoreInfoFileName 是导出时和 .ipa 一起生成的 AppStoreInfo.plist：Windows / Linux 上用 iTMSTransporter
+	// 上传必须带它（设计 ios-tenant-delivery-tiers-2026-09-24 §3.3）。可选：Xcode 没生成就没有这个文件
+	AppStoreInfoFileName = "AppStoreInfo.plist"
 
 	// 执行进程检出副本里的相对路径。它们会进 expo config，从而进原生指纹，所以只能是相对的。
 	OTACertificateRelPath = "./ota-certificate.pem"
@@ -57,6 +60,8 @@ const (
 	MaxSBOMSize     = 16 << 20
 	MaxOTASize      = 2 << 30
 	MaxIPASize      = 2 << 30
+	// AppStoreInfo.plist 是几 KB 的元数据；与服务端收件上限一致
+	MaxAppStoreInfoSize = 1 << 20
 )
 
 // 目标平台。与服务端 build_jobs.platform 同一套取值。
@@ -569,4 +574,9 @@ func ArtifactName(tenantDirectory, version string, buildNumber int) string {
 // 两边必须一致：执行进程按这个名字去找产物，找不到就判这次构建没出东西。
 func IPAArtifactName(tenantDirectory, version string, buildNumber int) string {
 	return fmt.Sprintf("%s-%s-build%d.ipa", tenantDirectory, version, buildNumber)
+}
+
+// AppStoreInfoArtifactName 是 RN-App 放在 .ipa 旁边的 AppStoreInfo.plist：同名、换后缀（build-ios-release.mjs）。
+func AppStoreInfoArtifactName(tenantDirectory, version string, buildNumber int) string {
+	return fmt.Sprintf("%s-%s-build%d.AppStoreInfo.plist", tenantDirectory, version, buildNumber)
 }

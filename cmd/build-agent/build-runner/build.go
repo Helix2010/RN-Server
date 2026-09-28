@@ -172,6 +172,13 @@ func (j job) buildIPA(ctx context.Context) error {
 	if err := copyFile(artifact, j.layout.OutFile(jobspec.IPAFileName), 0o640); err != nil {
 		return fmt.Errorf("cannot hand over the iOS package: %w", err)
 	}
+	// AppStoreInfo.plist 可有可无：Xcode 没生成时构建脚本只记一行，这里也不当失败。交不交给租户由控制进程按交付方式定
+	info := filepath.Join(app, "artifacts", jobspec.AppStoreInfoArtifactName(j.spec.TenantDirectory, j.spec.AppVersion, j.spec.BuildNumber))
+	if stat, err := os.Lstat(info); err == nil && stat.Mode().IsRegular() {
+		if err := copyFile(info, j.layout.OutFile(jobspec.AppStoreInfoFileName), 0o640); err != nil {
+			return fmt.Errorf("cannot hand over AppStoreInfo.plist: %w", err)
+		}
+	}
 	// 结果里没有"传上去了没有"：上传由控制进程交给另一个用户做，执行进程答不了这个问题
 	return j.writeResult(jobspec.Result{
 		Version: jobspec.ResultVersion, Kind: jobspec.KindAPK, Toolchain: toolchain,

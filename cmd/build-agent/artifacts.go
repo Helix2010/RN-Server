@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,15 @@ func (a *agent) spoolDir(jobID string) string {
 }
 
 // spoolOutput 从 out/ 取一个产物复制进 spool，边复制边算 sha256。
+// spoolOptionalOutput 同 spoolOutput，只是执行进程没交这个文件不算错（ok=false）。交了就按同样的规矩查。
+func spoolOptionalOutput(layout jobspec.Layout, name, spoolDir string, limit int64) (spooledFile, bool, error) {
+	if _, err := os.Lstat(layout.OutFile(name)); errors.Is(err, fs.ErrNotExist) {
+		return spooledFile{}, false, nil
+	}
+	file, err := spoolOutput(layout, name, spoolDir, limit)
+	return file, err == nil, err
+}
+
 func spoolOutput(layout jobspec.Layout, name, spoolDir string, limit int64) (spooledFile, error) {
 	src := layout.OutFile(name)
 	// O_NOFOLLOW：最后一段是符号链接就打不开；O_NONBLOCK：FIFO 不会把控制进程卡住
