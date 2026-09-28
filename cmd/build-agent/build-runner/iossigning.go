@@ -46,22 +46,54 @@ var (
 	iosKeychainPasswordPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 )
 
-// prepareIOSSigning 让这次任务的 HOME 能签名，返回签名材料目录。
-func (j job) prepareIOSSigning(ctx context.Context) (string, error) {
+// iosSigning 是这次构建签名要用的东西。profilesDir 与 certificateSHA1 只在按租户落盘时有：
+// 构建脚本据前者只在这个租户的目录里找描述文件，据后者把签名身份按指纹钉死。
+type iosSigning struct {
+	dir             string
+	profilesDir     string
+	certificateSHA1 string
+}
+
+// scriptArgs 是交给 `pnpm ios:release` 的签名参数。
+func (s iosSigning) scriptArgs() []string {
+	args := []string{"--signing-dir", s.dir}
+	if s.certificateSHA1 != "" {
+		args = append(args, "--profiles-dir", s.profilesDir, "--signing-certificate", s.certificateSHA1)
+	}
+	return args
+}
+
+// prepareIOSSigning 让这次任务的 HOME 能签名，返回签名要用的东西。
+func (j job) prepareIOSSigning(ctx context.Context) (iosSigning, error) {
 	dir := jobspec.EnvValue(j.spec.Env, jobspec.IOSSigningDirEnv)
 	if dir == "" {
-		return "", fmt.Errorf("%s is not set: an iOS build machine needs the directory that holds the keychain and the provisioning profiles", jobspec.IOSSigningDirEnv)
+		return iosSigning{}, fmt.Errorf("%s is not set: an iOS build machine needs the directory that holds the keychain and the provisioning profiles", jobspec.IOSSigningDirEnv)
 	}
 	if !iosSigningPathPattern.MatchString(dir) || filepath.Clean(dir) != dir {
-		return "", fmt.Errorf("%s must be a clean absolute path of letters, digits and ._-/ (got %q)", jobspec.IOSSigningDirEnv, dir)
+		return iosSigning{}, fmt.Errorf("%s must be a clean absolute path of letters, digits and ._-/ (got %q)", jobspec.IOSSigningDirEnv, dir)
+	}
+	signing := iosSigning{dir: dir}
+	// 按租户落盘：证书索引里必须有这个 (租户, Team)。没有就失败，不退回旧布局——退回去就是拿
+	// 同 Team 别的租户（或者平台管理员当初传的）那张证书与描述文件签这个租户的包（设计 §12.5）
+	if j.spec.TenantID != "" {
+		index, err := readTenantCertificates(dir)
+		if err != nil {
+			return iosSigning{}, err
+		}
+		signing.certificateSHA1 = index[jobspec.TenantCertificateKey(j.spec.TenantID, j.spec.AppleTeamID)]
+		if signing.certificateSHA1 == "" {
+			return iosSigning{}, fmt.Errorf("this machine has no certificate of tenant %s for Apple Team %s: the tenant uploads it in the console, "+
+				"and this machine installs it within a few minutes", j.spec.TenantID, j.spec.AppleTeamID)
+		}
+		signing.profilesDir = filepath.Join(dir, iosProfilesDirName, jobspec.IOSTenantsDirName, j.spec.TenantID)
 	}
 	keychain := filepath.Join(dir, iosKeychainName)
 	if info, err := os.Lstat(keychain); err != nil || !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file: import this machine's signing certificates into it first", keychain)
+		return iosSigning{}, fmt.Errorf("%s is not a regular file: import this machine's signing certificates into it first", keychain)
 	}
 	password, err := readKeychainPassword(filepath.Join(dir, iosKeychainPasswordName))
 	if err != nil {
-		return "", err
+		return iosSigning{}, err
 	}
 	// 三条命令走 `security -i` 的标准输入，而不是三次命令行调用：口令要是出现在
 	// 命令行参数里，这台机器上任何一个用户 `ps` 一下就看得到（AGENTS.md「机密的操作纪律」）。
@@ -77,7 +109,7 @@ func (j job) prepareIOSSigning(ctx context.Context) (string, error) {
 	}, "\n")
 	cmd, err := j.command(ctx, "security", "-i")
 	if err != nil {
-		return "", fmt.Errorf("cannot run security: %w", err)
+		return iosSigning{}, fmt.Errorf("cannot run security: %w", err)
 	}
 	var out bytes.Buffer
 	cmd.Stdin = strings.NewReader(script)
@@ -85,15 +117,24 @@ func (j job) prepareIOSSigning(ctx context.Context) (string, error) {
 	if err := cmd.Run(); err != nil {
 		// security 不回显口令，但失败路径上的输出是最容易漏掉的一条泄漏路径，
 		// 所以无论如何先把它从输出里抹掉再打
-		return "", fmt.Errorf("cannot make the signing keychain usable in this job's HOME: %w: %s",
+		return iosSigning{}, fmt.Errorf("cannot make the signing keychain usable in this job's HOME: %w: %s",
 			err, strings.ReplaceAll(strings.TrimSpace(out.String()), password, "<keychain password>"))
 	}
-	copied, err := j.copyProvisioningProfiles(dir)
-	if err != nil {
-		return "", err
+	root := filepath.Join(dir, iosProfilesDirName)
+	if signing.profilesDir != "" {
+		root = signing.profilesDir
 	}
-	logf(j.out, "signing keychain unlocked; %d provisioning profiles copied into this job's HOME", copied)
-	return dir, nil
+	copied, err := j.copyProvisioningProfiles(root)
+	if err != nil {
+		return iosSigning{}, err
+	}
+	if signing.certificateSHA1 != "" {
+		logf(j.out, "signing keychain unlocked; %d provisioning profiles of tenant %s copied into this job's HOME; signing identity %s",
+			copied, j.spec.TenantID, signing.certificateSHA1)
+	} else {
+		logf(j.out, "signing keychain unlocked; %d provisioning profiles copied into this job's HOME", copied)
+	}
+	return signing, nil
 }
 
 // readKeychainPassword 读钥匙串口令并校验字母表。
@@ -113,13 +154,13 @@ func readKeychainPassword(path string) (string, error) {
 	return password, nil
 }
 
-// copyProvisioningProfiles 把签名目录下**所有** Team 的描述文件复制进任务 HOME 的两个目录。
+// copyProvisioningProfiles 把 root/<TEAMID>/ 下的描述文件复制进任务 HOME 的两个目录。
 //
-// 全部复制而不是只挑这个租户的：描述文件不是机密（§4.4），而挑选需要执行进程知道
-// "这次要签哪个 bundle id"，那等于把一次判断搬到不可信的一侧。Xcode 按
-// PROVISIONING_PROFILE_SPECIFIER 的名字选，多放几份不会选错。
-func (j job) copyProvisioningProfiles(signingDir string) (int, error) {
-	root := filepath.Join(signingDir, iosProfilesDirName)
+// 旧布局的 root 是 profiles/，全部 Team 都复制：那时一个 (Team, bundle id) 只有一份。按租户落盘
+// 之后 root 是 profiles/tenants/<租户>/，**只复制这个租户的**：两个租户可能传同名的描述文件，
+// 而 Xcode 按名字选，混在一起会选错（设计 ios-tenant-owned-signing-material-2026-09-25 §4.3）。
+// 复制发生在构建代码运行之前，仍在可信的一侧；租户 id 来自服务端写的任务说明，不来自仓库。
+func (j job) copyProvisioningProfiles(root string) (int, error) {
 	targets := make([]string, 0, len(iosProfileHomeDirs))
 	for _, rel := range iosProfileHomeDirs {
 		target := filepath.Join(j.layout.Home(), rel)
@@ -134,7 +175,8 @@ func (j job) copyProvisioningProfiles(signingDir string) (int, error) {
 	}
 	copied := 0
 	for _, team := range teams {
-		if !team.IsDir() {
+		// 旧布局下 tenants/ 是按租户的那一层，不是一个 Team
+		if !team.IsDir() || team.Name() == jobspec.IOSTenantsDirName {
 			continue
 		}
 		files, err := os.ReadDir(filepath.Join(root, team.Name()))

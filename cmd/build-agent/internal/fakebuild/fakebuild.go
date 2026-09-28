@@ -146,13 +146,17 @@ ios:release)
   slug="$1"; shift
   # 执行进程不再传 --upload（它没有任何 App Store Connect Key）；--signing-dir 是手工签名
   # 要用的描述文件目录
-  signing=""
+  signing=""; profiles=""; certificate=""
   while [ $# -gt 0 ]; do
     if [ "$1" = "--signing-dir" ]; then signing="$2"; fi
+    if [ "$1" = "--profiles-dir" ]; then profiles="$2"; fi
+    if [ "$1" = "--signing-certificate" ]; then certificate="$2"; fi
     if [ "$1" = "--upload" ]; then echo "fake pnpm: ios:release must not be given --upload" >&2; exit 4; fi
     shift
   done
   echo "$signing" > %[1]q/ios-signing-dir.txt
+  echo "$profiles" > %[1]q/ios-profiles-dir.txt
+  echo "$certificate" > %[1]q/ios-signing-certificate.txt
   version=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "tenants/$slug/tenant.json")
   build=$(sed -n 's/.*"iosBuildNumber": *"\([^"]*\)".*/\1/p' "tenants/$slug/tenant.json")
   mkdir -p artifacts

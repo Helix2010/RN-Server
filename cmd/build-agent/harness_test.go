@@ -54,6 +54,7 @@ const testMachineID = "mch_builderTEST01"
 type recordedCall struct {
 	Method  string
 	Path    string
+	Query   string
 	Attempt string
 	Token   string
 	Body    []byte
@@ -85,6 +86,9 @@ type fakeServer struct {
 	materialBoxes map[string][]byte
 	// materialTruncated：清单被服务端的 LIMIT 截断了（响应里 complete=false）
 	materialTruncated bool
+	// materialLayout 非空时，带了能力 tenant-signing-material 的清单请求回这个 layout（按租户的服务端）；
+	// 租户格的密文按 "<租户>/kind/team/scope" 存在 materialBoxes 里
+	materialLayout string
 	// delays 让以某个后缀结尾的请求先睡这么久再回（不占着锁，心跳照常进来）
 	delays map[string]time.Duration
 }
@@ -205,7 +209,7 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, recordedCall{Method: r.Method, Path: r.URL.Path, Attempt: r.Header.Get(headerBuildAttempt),
+	f.calls = append(f.calls, recordedCall{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Attempt: r.Header.Get(headerBuildAttempt),
 		Token: r.Header.Get(headerMachineToken), Body: body})
 	if r.Header.Get(headerMachineToken) != testToken {
 		f.problem(w, http.StatusUnauthorized, "MACHINE_AUTH_REQUIRED")
@@ -233,10 +237,17 @@ func (f *fakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	case path == "/v1/build-agent/public-key":
 		f.publicKey(w, body)
 	case path == "/v1/build-agent/ios-material":
-		_ = json.NewEncoder(w).Encode(map[string]any{"items": f.material, "complete": !f.materialTruncated})
+		answer := map[string]any{"items": f.material, "complete": !f.materialTruncated}
+		if f.materialLayout != "" && r.URL.Query().Get("capability") == "tenant-signing-material" {
+			answer["layout"] = f.materialLayout
+		}
+		_ = json.NewEncoder(w).Encode(answer)
 	case path == "/v1/build-agent/ios-material/box":
-		box, ok := f.materialBoxes[r.URL.Query().Get("kind")+"/"+
-			r.URL.Query().Get("teamId")+"/"+r.URL.Query().Get("scope")]
+		key := r.URL.Query().Get("kind") + "/" + r.URL.Query().Get("teamId") + "/" + r.URL.Query().Get("scope")
+		if tenant := r.URL.Query().Get("tenantId"); tenant != "" {
+			key = tenant + "/" + key
+		}
+		box, ok := f.materialBoxes[key]
 		if !ok {
 			f.problem(w, http.StatusNotFound, "IOS_MATERIAL_NOT_FOUND")
 			return

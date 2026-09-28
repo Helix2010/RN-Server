@@ -35,8 +35,12 @@ const (
 	Label = "rn-ios-material/v1"
 	// Algorithm 是 Box.Algorithm 唯一允许的值。
 	Algorithm = "x25519-hkdf-sha256-aes256gcm"
-	// Version 是 Box.Version 唯一允许的值。
-	Version = 1
+	// VersionLegacy 是没有租户的旧格式：材料按 Apple Team 存、同 Team 的租户共用。
+	VersionLegacy = 1
+	// VersionTenant 在外层与明文里各带一个 tenantId（设计 ios-tenant-owned-signing-material-2026-09-25 §3.1）：
+	// Mac 只在「清单说这份属于哪个租户」与「材料自己说属于哪个租户」一致时才装。租户交一份声称属于
+	// 别人的材料会被拒，只见密文的服务端也没法把 A 的材料挪给 B。
+	VersionTenant = 2
 
 	// KindCertificate 是 Apple Distribution 证书（.p12 + 口令），每个 Team 一份、全机共用。
 	KindCertificate = "certificate"
@@ -75,7 +79,12 @@ var (
 	bundleIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$`)
 	keyIDPattern    = regexp.MustCompile(`^[A-Z0-9]{10}$`)
 	issuerIDPattern = regexp.MustCompile(`^[0-9a-f-]{16,64}$`)
+	// tenantIDPattern 是服务端租户表的自增主键。它会被拼进 Mac 上的目录名，所以只许数字
+	tenantIDPattern = regexp.MustCompile(`^[1-9][0-9]{0,19}$`)
 )
+
+// ValidTenantID 判断一个租户 id 能不能拿去拼路径、做比较。
+func ValidTenantID(s string) bool { return tenantIDPattern.MatchString(s) }
 
 // Material 是一份材料的明文。**它装着私钥与口令**：
 //
@@ -84,7 +93,9 @@ var (
 type Material struct {
 	Purpose string `json:"purpose"`
 	Kind    string `json:"kind"`
-	TeamID  string `json:"teamId"`
+	// TenantID 只有 v2 有：这份材料属于哪个租户。Seal 看它有没有值决定封成哪一版
+	TenantID string `json:"tenantId,omitempty"`
+	TeamID   string `json:"teamId"`
 	// BundleID 只有描述文件有
 	BundleID string `json:"bundleId,omitempty"`
 	// RecipientSHA256 是收件人公钥指纹。附加数据里已经绑了一次，明文里再写一份是为了
@@ -112,6 +123,7 @@ type Box struct {
 	Algorithm          string `json:"alg"`
 	Purpose            string `json:"purpose"`
 	Kind               string `json:"kind"`
+	TenantID           string `json:"tenantId,omitempty"`
 	TeamID             string `json:"teamId"`
 	BundleID           string `json:"bundleId,omitempty"`
 	RecipientSHA256    string `json:"recipientSha256"`
@@ -143,6 +155,8 @@ func (m Material) Validate() error {
 		return fmt.Errorf("purpose %q does not match kind %q", firstRunes(m.Purpose, 32), m.Kind)
 	case !teamIDPattern.MatchString(m.TeamID):
 		return fmt.Errorf("teamId %q is not a 10 character Apple Team ID", firstRunes(m.TeamID, 32))
+	case m.TenantID != "" && !tenantIDPattern.MatchString(m.TenantID):
+		return fmt.Errorf("tenantId %q is not a tenant id", firstRunes(m.TenantID, 32))
 	case !fingerprint.Valid(m.RecipientSHA256):
 		return errors.New("recipientSha256 is not a sha256")
 	case !validTime(m.CreatedAt):
@@ -261,9 +275,13 @@ func Seal(m Material, recipientPub []byte) (Box, error) {
 	if err != nil {
 		return Box{}, fmt.Errorf("iosmaterial: %w", err)
 	}
+	version := VersionLegacy
+	if m.TenantID != "" {
+		version = VersionTenant
+	}
 	box := Box{
-		Version: Version, Algorithm: Algorithm,
-		Purpose: m.Purpose, Kind: m.Kind, TeamID: m.TeamID,
+		Version: version, Algorithm: Algorithm,
+		Purpose: m.Purpose, Kind: m.Kind, TenantID: m.TenantID, TeamID: m.TeamID,
 		BundleID:           m.BundleID,
 		RecipientSHA256:    sealed.RecipientSHA256,
 		EphemeralPublicKey: sealed.EphemeralPublicKey,
@@ -320,8 +338,11 @@ func Open(b Box, x25519Private []byte) (Material, error) {
 	// 外层与内层必须一致。外层是服务端拿来路由与显示的，改得动；内层改不动。两者不符
 	// 只有两种可能：服务端的索引与内容对不上，或者有人动过手脚——都该当场停住，而不是
 	// "反正我只信内层"然后把一份与索引不符的材料装到机器上。
+	// 租户也在这里比：v1 的外层没有租户（ValidateShape 挡了），明文里有就不符；v2 的外层必有，明文里
+	// 必须是同一个。所以一份 v2 明文不可能被套进 v1 的壳里当成「没有租户的旧材料」装到机器上
 	for _, pair := range []struct{ name, outer, inner string }{
 		{"kind", b.Kind, out.Kind},
+		{"tenantId", b.TenantID, out.TenantID},
 		{"teamId", b.TeamID, out.TeamID},
 		{"bundleId", b.BundleID, out.BundleID},
 	} {
@@ -335,8 +356,13 @@ func Open(b Box, x25519Private []byte) (Material, error) {
 
 // ValidateShape 只查形状，不碰密码学。
 func (b Box) ValidateShape() error {
-	if b.Version != Version {
-		return fmt.Errorf("version %d is not %d", b.Version, Version)
+	switch {
+	case b.Version == VersionLegacy && b.TenantID != "":
+		return errors.New("a version 1 box has no tenantId")
+	case b.Version == VersionTenant && !tenantIDPattern.MatchString(b.TenantID):
+		return fmt.Errorf("tenantId %q is not a tenant id", firstRunes(b.TenantID, 32))
+	case b.Version != VersionLegacy && b.Version != VersionTenant:
+		return fmt.Errorf("version %d is neither %d nor %d", b.Version, VersionLegacy, VersionTenant)
 	}
 	if b.Algorithm != Algorithm {
 		return fmt.Errorf("algorithm %q is not %q", firstRunes(b.Algorithm, 64), Algorithm)
@@ -398,7 +424,11 @@ func ParseBox(raw []byte) (Box, error) {
 // ---- 机密结构体的格式化白名单 ----
 
 func (m Material) String() string {
-	parts := []string{"kind=" + m.Kind, "team=" + m.TeamID}
+	parts := []string{"kind=" + m.Kind}
+	if m.TenantID != "" {
+		parts = append(parts, "tenant="+m.TenantID)
+	}
+	parts = append(parts, "team="+m.TeamID)
 	if m.BundleID != "" {
 		parts = append(parts, "bundle="+m.BundleID)
 	}

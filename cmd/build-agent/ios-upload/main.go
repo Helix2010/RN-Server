@@ -8,6 +8,9 @@
 //	sudo -n -u _rnuploader /opt/rn-build-agent/ios-upload --probe --team <TEAMID> --keys … --expect-bundle-id …
 //	sudo -n -u _rnuploader /opt/rn-build-agent/ios-upload --install-key --keys /var/rn-build-upload   # 密文走标准输入
 //
+// 按租户落盘之后（设计 ios-tenant-owned-signing-material-2026-09-25 §4.3）每条都可以再带
+// `--tenant <租户 id>`，Key 读写在 <keys>/tenants/<租户>/<TEAMID>/ 下。
+//
 // 为什么是单独一个程序、单独一个账户（设计 ios-mac-builders-home-network-2026-09-18 §4.3）：
 // 这台 Mac 的钥匙串里有全部租户的 Distribution 私钥，而执行进程跑的是几千个第三方依赖。
 // 一把能上传 build 的 App Store Connect Key 正是那些签名材料唯一缺的出口，所以它既不在
@@ -39,6 +42,7 @@ import (
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/netproxy"
 	"github.com/Helix2010/RN-Server/internal/ascapi"
+	"github.com/Helix2010/RN-Server/signing/iosmaterial"
 )
 
 // outcome 是打给控制进程的那一行 JSON。字段与控制进程的严格解析一一对应。
@@ -75,6 +79,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	remove := set.Bool("remove-key", false, "delete the upload key of --team from this machine")
 	fingerprint := set.Bool("material-key-fingerprint", false, "print the sha256 of this account's material public key")
 	team := set.String("team", "", "Apple Developer Team ID")
+	tenant := set.String("tenant", "", "tenant id the server gave; the key lives under <keys>/tenants/<tenant>/<TEAMID>/")
+	legacy := set.Bool("legacy", false, "with --install-key --tenant: accept a version 1 key copied from the per-team store")
 	keys := set.String("keys", "/var/rn-build-upload", "directory that holds <TEAMID>/key.json and the .p8")
 	bundleID := set.String("expect-bundle-id", "", "bundle id of the app this package belongs to")
 	version := set.String("expect-version", "", "CFBundleShortVersionString of this package")
@@ -92,6 +98,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--proxy / --no-proxy:", err)
 		return 2
 	}
+	// 租户 id 会拼进路径：只收服务端给的那种纯数字
+	if *tenant != "" && !iosmaterial.ValidTenantID(*tenant) {
+		fmt.Fprintln(stderr, "--tenant must be the tenant id the server gave (digits only)")
+		return 2
+	}
+	if *legacy && (*tenant == "" || !*install) {
+		fmt.Fprintln(stderr, "--legacy only applies to --install-key --tenant")
+		return 2
+	}
 	// 装 Key 那条路不需要 --team / --expect-*：要装什么全写在密文里，而那一份是
 	// 平台在离线机器或浏览器里封的，比命令行上的值可信
 	if *fingerprint {
@@ -102,7 +117,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if *install {
-		if err := installKey(stdin, stdout, *keys); err != nil {
+		if err := installKey(stdin, stdout, *keys, *tenant, *legacy); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
@@ -115,7 +130,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "--team must be a 10-character Apple Developer Team ID")
 			return 2
 		}
-		if err := removeKey(stdout, *keys, *team); err != nil {
+		if err := removeKey(stdout, *keys, *tenant, *team); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
@@ -144,7 +159,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--expect-build must be the CFBundleVersion, a number")
 		return 2
 	}
-	key, err := readKey(filepath.Join(*keys, *team))
+	key, err := readKey(keyDir(*keys, *tenant, *team))
 	if err != nil {
 		if *probe {
 			return report(stdout, outcome{Probe: probeError, Detail: err.Error()})

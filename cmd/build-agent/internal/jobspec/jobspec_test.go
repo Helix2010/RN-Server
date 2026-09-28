@@ -177,6 +177,20 @@ func TestSpecValidateRefusesMismatches(t *testing.T) {
 			s.OTA = &OTAArgs{Channel: "--output-zip", ApplyStrategy: "next_launch", RuntimeVersion: "1.3.7",
 				APIBaseURL: "https://api.anyfun.win", ApplicationID: "dex-mobile"}
 		},
+		// 租户与 Team 只属于 iOS 任务，而且要一起给：只有一个时执行进程既不能按租户取材料，也不该退回旧布局
+		"tenant on android": func(s *Spec) { s.TenantID, s.AppleTeamID = "1000000001", "J4JDFC8LCC" },
+		"tenant without team": func(s *Spec) {
+			s.Platform, s.Env = PlatformIOS, testIOSEnv(t, layout)
+			s.TenantID = "1000000001"
+		},
+		"tenant that is a path": func(s *Spec) {
+			s.Platform, s.Env = PlatformIOS, testIOSEnv(t, layout)
+			s.TenantID, s.AppleTeamID = "../1", "J4JDFC8LCC"
+		},
+		"team in lower case": func(s *Spec) {
+			s.Platform, s.Env = PlatformIOS, testIOSEnv(t, layout)
+			s.TenantID, s.AppleTeamID = "1000000001", "j4jdfc8lcc"
+		},
 	} {
 		spec := validSpec(t, layout)
 		mutate(&spec)
@@ -184,6 +198,36 @@ func TestSpecValidateRefusesMismatches(t *testing.T) {
 			t.Errorf("%s was accepted", name)
 		}
 	}
+}
+
+// 按租户落盘的 iOS 任务带租户与 Team，照样过校验、照样能往返。
+func TestIOSSpecCarriesTheTenant(t *testing.T) {
+	layout := testLayout(t)
+	spec := validSpec(t, layout)
+	spec.Platform, spec.Env = PlatformIOS, testIOSEnv(t, layout)
+	spec.TenantID, spec.AppleTeamID = "1000000001", "J4JDFC8LCC"
+	if err := spec.Validate(layout); err != nil {
+		t.Fatalf("a tenant's ios spec was refused: %v", err)
+	}
+	raw, err := EncodeSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeSpec(bytes.NewReader(raw))
+	if err != nil || decoded.TenantID != "1000000001" || decoded.AppleTeamID != "J4JDFC8LCC" {
+		t.Fatalf("the tenant did not survive the round trip: %+v %v", decoded, err)
+	}
+}
+
+func testIOSEnv(t *testing.T, layout Layout) []string {
+	t.Helper()
+	env, err := BuildEnv(layout, map[string]string{"PATH": "/usr/bin:/bin"}, TaskEnv{
+		Platform: PlatformIOS, TenantDirectory: "anyfun", APIBaseURL: "https://api.anyfun.win",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
 }
 
 func TestResultIsCheckedPerKind(t *testing.T) {

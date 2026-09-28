@@ -72,7 +72,7 @@ func TestAgentInstallsMaterialItDoesNotHaveYet(t *testing.T) {
 		t.Fatalf("the upload key did not reach the upload user: %q %v", uploaderStdin, err)
 	}
 	// 记下来了：下一轮不该再装一遍
-	installed := readInstalledMaterial(a.cfg.StateDir)
+	installed := readMaterialRecord(a.cfg.StateDir).Installed
 	if installed["certificate/J4JDFC8LCC/"] != 3 || installed["upload-key/J4JDFC8LCC/mch_x"] != 1 {
 		t.Fatalf("versions were not recorded: %v", installed)
 	}
@@ -128,7 +128,7 @@ func TestAgentKeepsGoingWhenOneMaterialFails(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "ios-upload.stdin")); err != nil {
 		t.Fatalf("a failing certificate stopped the upload key from being installed: %v", err)
 	}
-	installed := readInstalledMaterial(a.cfg.StateDir)
+	installed := readMaterialRecord(a.cfg.StateDir).Installed
 	if _, recorded := installed["certificate/J4JDFC8LCC/"]; recorded {
 		t.Error("a material that failed to install was recorded as installed; it would never be retried")
 	}
@@ -156,7 +156,7 @@ func TestAgentTreatsABrokenRecordAsNothingInstalled(t *testing.T) {
 		[]byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := readInstalledMaterial(a.cfg.StateDir); len(got) != 0 {
+	if got := readMaterialRecord(a.cfg.StateDir).Installed; len(got) != 0 {
 		t.Fatalf("a broken record was trusted: %v", got)
 	}
 }
@@ -222,7 +222,7 @@ func TestAgentRemovesUploadKeysTheServerWithdrew(t *testing.T) {
 	if strings.Contains(string(calls), "--remove-key --team ZZ99YY88XX") {
 		t.Fatalf("a team still in the list lost its key: %s", calls)
 	}
-	installed := readInstalledMaterial(a.cfg.StateDir)
+	installed := readMaterialRecord(a.cfg.StateDir).Installed
 	if _, still := installed["upload-key/J4JDFC8LCC/"]; still {
 		t.Fatalf("the removed key is still recorded as installed: %v", installed)
 	}
@@ -243,7 +243,7 @@ func TestAgentKeepsUploadKeysWhenTheListIsTruncated(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "ios-upload.stdin")); err == nil {
 		t.Fatal("the uploader was called although nothing needed installing")
 	}
-	if readInstalledMaterial(a.cfg.StateDir)["upload-key/J4JDFC8LCC/"] != 2 {
+	if readMaterialRecord(a.cfg.StateDir).Installed["upload-key/J4JDFC8LCC/"] != 2 {
 		t.Fatal("a key was treated as withdrawn from a truncated list")
 	}
 }

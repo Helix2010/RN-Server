@@ -86,7 +86,9 @@ type uploadOutcome struct {
 // 在控制进程的 spool 里，而 spool 在状态目录下——那里还放着出处私钥，目录是 0700。
 // 给另一个账户开一条能读到那棵树的路，等于为了传一个不是机密的包，放宽了一个装着机密的
 // 目录。上传程序自己把标准输入落到它自己的临时文件里。
-func (a *agent) uploadIPA(ctx context.Context, job claimedJob, ipaPath string, identity ipaIdentity, buf *logBuffer) (uploadOutcome, error) {
+//
+// tenant 非空（按租户落盘的机器）时上传账户用这个租户自己的那把 Key：keys/tenants/<租户>/<TEAM>/。
+func (a *agent) uploadIPA(ctx context.Context, job claimedJob, tenant, ipaPath string, identity ipaIdentity, buf *logBuffer) (uploadOutcome, error) {
 	ctx, cancel := context.WithTimeout(ctx, iosUploadTimeout)
 	defer cancel()
 	file, err := os.Open(ipaPath)
@@ -100,6 +102,9 @@ func (a *agent) uploadIPA(ctx context.Context, job claimedJob, ipaPath string, i
 		"--expect-bundle-id", identity.BundleID,
 		"--expect-version", identity.ShortVersion,
 		"--expect-build", identity.BuildNumber,
+	}
+	if tenant != "" {
+		args = append(args, "--tenant", tenant)
 	}
 	cmd := a.uploaderCommand(ctx, args...)
 	cmd.Stdin = file
@@ -134,6 +139,15 @@ func (a *agent) uploadIPA(ctx context.Context, job claimedJob, ipaPath string, i
 // 启动时每个 Team 各跑一次，结果随认领自报上去——好让"角色不够传不上去"在**第一次构建
 // 之前**就看得见，而不是在一次构建的最后一步。
 func (a *agent) probeUploadKey(ctx context.Context, teamID string, bundleIDs []string) string {
+	return a.probe(ctx, "", teamID, bundleIDs)
+}
+
+// probeTenantUploadKey 是按租户目录的那一次探测：探的是这个租户自己交的那把 Key。
+func (a *agent) probeTenantUploadKey(ctx context.Context, tenantID, teamID string, bundleIDs []string) string {
+	return a.probe(ctx, tenantID, teamID, bundleIDs)
+}
+
+func (a *agent) probe(ctx context.Context, tenantID, teamID string, bundleIDs []string) string {
 	if !a.cfg.IOSUpload || len(bundleIDs) == 0 {
 		return ""
 	}
@@ -141,8 +155,11 @@ func (a *agent) probeUploadKey(ctx context.Context, teamID string, bundleIDs []s
 	defer cancel()
 	// 探一个 App 就够了：这把 Key 的角色对这个 Team 下的每个 App 都一样（团队密钥没有
 	// App 范围，§4.3a）
-	cmd := a.uploaderCommand(ctx, "--probe", "--team", teamID, "--keys", a.cfg.IOSUploadKeys,
-		"--expect-bundle-id", bundleIDs[0])
+	args := []string{"--probe", "--team", teamID, "--keys", a.cfg.IOSUploadKeys, "--expect-bundle-id", bundleIDs[0]}
+	if tenantID != "" {
+		args = append(args, "--tenant", tenantID)
+	}
+	cmd := a.uploaderCommand(ctx, args...)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
@@ -168,28 +185,56 @@ func (a *agent) probeUploadKey(ctx context.Context, teamID string, bundleIDs []s
 // 出来，控制台上永远"缺材料"（2026-09-20 真机）。与签名区那次同一个解法：由持有它的账户
 // 交出原文，判断仍留在这一侧。
 func (a *agent) uploadKeyTeams(ctx context.Context) (map[string]bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	cmd := a.uploaderCommand(ctx, "--list-keys", "--keys", a.cfg.IOSUploadKeys)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s --list-keys: %w: %s", a.cfg.IOSUploader, err,
-			truncate(strings.TrimSpace(stderr.String()), 200))
-	}
-	var answer struct {
-		Teams []string `json:"teams"`
-	}
-	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&answer); err != nil {
-		return nil, fmt.Errorf("the upload program did not answer with JSON: %w", err)
+	answer, err := a.listUploadKeys(ctx)
+	if err != nil {
+		return nil, err
 	}
 	teams := map[string]bool{}
 	for _, team := range answer.Teams {
 		teams[team] = true
 	}
 	return teams, nil
+}
+
+// uploadKeyTenants 问上传账户"每个租户哪些 Team 装好了上传 Key"（按租户落盘之后）。
+func (a *agent) uploadKeyTenants(ctx context.Context) (map[string]map[string]bool, error) {
+	answer, err := a.listUploadKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]map[string]bool{}
+	for tenant, teams := range answer.Tenants {
+		out[tenant] = map[string]bool{}
+		for _, team := range teams {
+			out[tenant][team] = true
+		}
+	}
+	return out, nil
+}
+
+// uploadKeyListing 是 ios-upload --list-keys 的回答：旧布局的 Team，与按租户的。
+type uploadKeyListing struct {
+	Teams   []string            `json:"teams"`
+	Tenants map[string][]string `json:"tenants"`
+}
+
+func (a *agent) listUploadKeys(ctx context.Context) (uploadKeyListing, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := a.uploaderCommand(ctx, "--list-keys", "--keys", a.cfg.IOSUploadKeys)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return uploadKeyListing{}, fmt.Errorf("%s --list-keys: %w: %s", a.cfg.IOSUploader, err,
+			truncate(strings.TrimSpace(stderr.String()), 200))
+	}
+	var answer uploadKeyListing
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&answer); err != nil {
+		return uploadKeyListing{}, fmt.Errorf("the upload program did not answer with JSON: %w", err)
+	}
+	return answer, nil
 }
 
 // uploaderCommand 构造上传程序的调用：经 sudo 切到上传账户，环境只给 PATH 与 LANG。

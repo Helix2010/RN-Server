@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Helix2010/RN-Server/cmd/build-agent/internal/jobspec"
+	"github.com/Helix2010/RN-Server/signing/iosmaterial"
 	"github.com/Helix2010/RN-Server/signing/machinekey"
 	"github.com/Helix2010/RN-Server/signing/provenance"
 )
@@ -52,6 +53,14 @@ type agent struct {
 	// lastMaterialSync 是上一次去问"该装哪些签名材料"的时刻。认领每 10 秒一次，而材料
 	// 几个月才动一次，不必每一轮都问
 	lastMaterialSync time.Time
+	// layout 是本机签名材料的布局（team / tenant），空=还没读本机记录（见 tenantMode）
+	layout string
+	// serverLayout 是服务端最近一次回的清单布局，空=这次启动还没问到。按租户落盘之后服务端却回了
+	// 按 Team 的清单（回滚），认领里就不报 iOS 材料：旧版服务端认不得 tenantMaterial，报了会 400
+	serverLayout string
+	// materialProblems 是按租户的格装不上的原因（slot -> 版本与原因），随盘点报上去。只在内存里：
+	// 进程重启后核对不过的那一版会再试一次
+	materialProblems map[string]materialProblem
 
 	keyActive      bool
 	keyCheckedAt   time.Time
@@ -204,6 +213,26 @@ func (a *agent) claimRequest(ctx context.Context) claimRequest {
 		return request
 	}
 	inventory := a.iosInventory(ctx)
+	if inventory.TenantLayout {
+		if a.serverLayout == materialLayoutTeam {
+			// 按租户落盘了，服务端却回了按 Team 的清单：它多半认不得 tenantMaterial（报了会 400），
+			// 按 Team 报又会被派来这台机器已经不按 Team 签的任务。什么 iOS 材料都不报，等它恢复
+			return request
+		}
+		reports := make([]tenantMaterialSelfReport, 0, len(inventory.Tenants))
+		for _, material := range inventory.Tenants {
+			report := tenantMaterialSelfReport{
+				TenantID: material.TenantID, TeamID: material.TeamID, BundleIDs: material.BundleIDs,
+				CertificateSHA1: material.CertificateSHA1, CertificateReady: material.CertificateReady,
+				UploadProbe: material.UploadProbe, APSEnvironment: material.APSEnvironment, Problems: material.Problems,
+			}
+			if !material.ExpiresAt.IsZero() {
+				report.ExpiresAt = material.ExpiresAt.UTC().Format(time.RFC3339)
+			}
+			reports = append(reports, report)
+		}
+		request.TenantMaterial = &reports
+	}
 	for _, team := range inventory.Teams {
 		report := appleTeamSelfReport{TeamID: team.TeamID, BundleIDs: team.BundleIDs, UploadProbe: team.UploadProbe}
 		if !team.ExpiresAt.IsZero() {
@@ -234,8 +263,17 @@ func (a *agent) iosInventory(ctx context.Context) iosInventory {
 	// 上传区归上传账户（0700 _rnuploader），控制进程连目录都 stat 不了——"哪些 Team 装了
 	// 上传 Key"同样得由那个账户交出来
 	scanner.UploadKeyTeams = a.uploadKeyTeams
+	// 按租户落盘之后按租户盘点（设计 ios-tenant-owned-signing-material-2026-09-25 §4.4）
+	scanner.TenantLayout = a.tenantMode()
+	scanner.UploadKeyTenants = a.uploadKeyTenants
+	scanner.ProbeTenant = a.probeTenantUploadKey
+	scanner.InstallProblems = a.tenantProblems()
 	inventory := scanner.scan(ctx)
-	a.sayOnce("iosTeams", "signing material for "+strings.Join(inventory.teamIDs(), ", "))
+	if inventory.TenantLayout {
+		a.sayOnce("iosTeams", "per-tenant signing material: "+inventory.tenantSummary())
+	} else {
+		a.sayOnce("iosTeams", "signing material for "+strings.Join(inventory.teamIDs(), ", "))
+	}
 	if len(inventory.Problems) > 0 {
 		a.sayOnce("iosProblems", strings.Join(inventory.Problems, "; "))
 	}
@@ -447,7 +485,18 @@ func (a *agent) buildAndDeliver(ctx, deliverCtx context.Context, stopBuildClock 
 	// 在检出仓库、装依赖、跑 archive 之前先核一次：缺材料的话那几十分钟一定白花，
 	// 而且失败会出现在 xcodebuild 的输出里，看起来像构建问题而不是材料问题
 	if job.Kind == string(jobspec.KindAPK) && job.Platform == string(jobspec.PlatformIOS) {
-		if team, bundle := job.AppleTeamID(), job.BundleID(); !a.iosInventory(ctx).covers(team, bundle) {
+		team, bundle := job.AppleTeamID(), job.BundleID()
+		inventory := a.iosInventory(ctx)
+		switch {
+		case a.tenantMode() && !iosmaterial.ValidTenantID(job.TenantID):
+			// 按租户落盘的机器只拿这个租户自己的材料签：不知道是哪个租户就签不了，也不能退回旧布局
+			return "", errors.New("the server did not say which tenant this iOS job belongs to (tenantId); " +
+				"this machine signs only with the material each tenant uploaded")
+		case a.tenantMode() && !inventory.coversTenant(job.TenantID, team, bundle):
+			return "", fmt.Errorf("this machine has no usable signing material of this tenant for Apple Team %s / bundle id %s: "+
+				"the tenant uploads the distribution certificate and the App Store profile in the console, and this machine "+
+				"installs and checks them within a few minutes", team, bundle)
+		case !a.tenantMode() && !inventory.covers(team, bundle):
 			return "", fmt.Errorf("this machine has no usable signing material for Apple Team %s / bundle id %s: "+
 				"import the distribution certificate into the keychain and put the provisioning profile under %s, then restart the agent",
 				team, bundle, a.cfg.MachineEnv[jobspec.IOSSigningDirEnv])
@@ -597,7 +646,7 @@ func (a *agent) deliverIPA(ctx context.Context, job claimedJob, prepared prepare
 			// 服务端只把全托管的任务派给上传 Key 可用的机器，走到这里说明两边对不上
 			return errors.New("this build is to be uploaded to App Store Connect, but this machine is not configured to upload (BUILD_AGENT_IOS_UPLOAD)")
 		}
-		if outcome, err = a.uploadIPA(ctx, job, ipa.Path, identity, buf); err != nil {
+		if outcome, err = a.uploadIPA(ctx, job, prepared.Spec.TenantID, ipa.Path, identity, buf); err != nil {
 			return err
 		}
 		if outcome.UploadedByEarlierAttempt {

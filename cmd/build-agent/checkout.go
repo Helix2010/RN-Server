@@ -189,6 +189,12 @@ func (a *agent) prepareWorktree(ctx context.Context, job claimedJob, buf *logBuf
 		CommitSHA:       commit,
 		Env:             env,
 	}
+	// 按租户落盘的机器：告诉执行进程这是哪个租户、哪个 Team，它据此只复制这个租户的描述文件、
+	// 按指纹钉死签名身份（设计 ios-tenant-owned-signing-material-2026-09-25 §4.3）。两个值都来自服务端
+	if spec.Platform == jobspec.PlatformIOS && a.tenantMode() {
+		spec.TenantID = job.TenantID
+		spec.AppleTeamID = strings.ToUpper(strings.TrimSpace(job.AppleTeamID()))
+	}
 	if spec.Kind == jobspec.KindOTA {
 		spec.OTA = &jobspec.OTAArgs{
 			Channel:        job.Channel,
