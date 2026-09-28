@@ -84,7 +84,7 @@ func (s *server) bundleSignatureFor(ctx context.Context, dir string, manifest []
 			" (" + stored.ManifestSHA256 + ", deployed is " + digest + "): re-sign the manifest that is deployed now")
 	}
 	return bundlesig.Signature{}, errors.New("the deployed bundles have no signature yet: a platform admin signs " +
-		machineBundleManifest + " offline and uploads it in the console (平台维护 → 打包机与签名闸 → 构建机 → 打包机程序版本)")
+		machineBundleManifest + " offline and uploads it in the platform console (打包与签名 → 打包机与签名闸 → 构建机 → 打包机程序版本)")
 }
 
 // deployedManifest GET /v1/admin/platform/build-agent-version/manifest：
