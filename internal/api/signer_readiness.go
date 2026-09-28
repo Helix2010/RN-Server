@@ -319,7 +319,7 @@ func (s *server) signerReadinessFor(ctx context.Context, tenant string, showMach
 			return r, err
 		}
 		if len(recoveryKeys.Doc.live()) == 0 {
-			add(readinessRecoveryKeyMissing, "平台还没有登记离线恢复公钥，不能在签名闸上生成签名密钥（平台管理员在「平台维护 → 签名闸恢复密钥」登记）")
+			add(readinessRecoveryKeyMissing, "平台还没有登记离线恢复公钥，不能在签名闸上生成签名密钥（平台管理员在平台控制台「打包与签名 → 签名闸恢复密钥」登记）")
 		}
 		switch {
 		case generation == nil:
