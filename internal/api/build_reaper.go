@@ -86,6 +86,8 @@ type reapResult struct {
 	QueueStalled []string
 	// IPAPurged 是这一轮清掉的、过了保留期的自助上传交付件（任务 id）
 	IPAPurged []string
+	// TestFlightChecked 是这一轮写了 App Store Connect 处理状态的全托管构建（任务 id）
+	TestFlightChecked []string
 }
 
 func (s *server) reapBuildJobs(ctx context.Context, now time.Time) reapResult {
@@ -94,6 +96,7 @@ func (s *server) reapBuildJobs(ctx context.Context, now time.Time) reapResult {
 	s.reapStaleSignings(ctx, now, &result)
 	s.warnStalledIOSQueue(ctx, now, &result)
 	result.IPAPurged = s.purgeExpiredIPADeliveries(ctx, now)
+	result.TestFlightChecked = s.pollTestFlightStates(ctx, now)
 	return result
 }
 

@@ -10040,6 +10040,44 @@
                 "description": "When the .ipa is deleted: 30 days after the build, or 7 days after the tenant marked it uploaded, whichever is earlier"
               }
             }
+          },
+          "testflight": {
+            "type": "object",
+            "nullable": true,
+            "description": "Fully managed (delivery=testflight) iOS builds only: the build's processing state in App Store Connect, read by the platform process every few minutes with the tenant's own ASC key (read-only; the server never writes to Apple — submission, test groups and public links stay manual in App Store Connect). Checked 2, 5, 15, 30, then every 60 minutes after completion, for builds completed in the last 7 days, until a final state. null until the first check, and for other jobs",
+            "properties": {
+              "processingState": {
+                "type": "string",
+                "nullable": true,
+                "description": "Apple's processingState (PROCESSING, VALID, INVALID, FAILED), or NOT_FOUND when Apple still did not show the build 24 hours after completion"
+              },
+              "expired": {
+                "type": "boolean"
+              },
+              "expirationDate": {
+                "type": "string",
+                "nullable": true,
+                "description": "When the build expires on TestFlight (from Apple)"
+              },
+              "checkedAt": {
+                "type": "string",
+                "nullable": true
+              },
+              "final": {
+                "type": "boolean",
+                "description": "The state will not change any more (VALID, INVALID, FAILED or NOT_FOUND); polling stopped"
+              },
+              "lastError": {
+                "type": "string",
+                "nullable": true,
+                "description": "Why the last check failed (key rejected, network, Apple errors); retried later"
+              },
+              "unavailable": {
+                "type": "string",
+                "nullable": true,
+                "description": "no-asc-key (the tenant has no App Store Connect key: nothing is requested from Apple) or no-ios-identity; looked at again after 6 hours"
+              }
+            }
           }
         }
       },
