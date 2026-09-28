@@ -47,6 +47,7 @@
 | `/etc/nginx/conf.d/rn-foundation.conf` | 各域名的站点配置（片段在同目录的 `rn-foundation-snippet-*.inc`） |
 | `/usr/local/sbin/rn-foundation-apply` | 特权收口脚本，换二进制／换控制台／换打包机都走它（`server` / `admin <slug>` / `build-agent`） |
 | `/var/lib/rn-foundation-deploy/incoming/` | 部署暂存目录，属 `rndeploy` |
+| `/opt/rn-foundation/build-deps/` | iOS 构建依赖的固定副本，`https://api.*/build-deps/…`（见「iOS 构建依赖的固定副本」） |
 
 API 是同一个二进制按角色起的三个进程，共用 `/etc/rn-foundation.env` 与同一个库
 （设计 `docs/design/service-and-console-split-2026-09-27.md`，2026-09-27 起）：
@@ -305,6 +306,30 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
    `/v1/` 一律 500；
 3. `tenant_domain` 里登记这两个域名；
 4. 链路上按 SNI 放行的那台设备的白名单里也要有这两个域名。
+
+### iOS 构建依赖的固定副本
+
+打包机装 CocoaPods 时，有的 pod 要从 github.com 的 release 下大文件（YttriumWrapper 的
+`libyttrium.xcframework.zip`，87 MB）。RN-App 把它们改成从 `https://api.anyfun.win/build-deps/<路径>` 下、
+按钉死的 sha256 校验（RN-App `scripts/lib/ios-pinned-pods.js`，版本与 sha256 以那边为准）。文件放在
+`/opt/rn-foundation/build-deps/`，由 nginx 的 `/build-deps/`（`nginx-snippet-api.inc`）直接出，不经过 rn-server。
+
+加一个或换版本（在 amos 上）：
+
+```bash
+sudo bash install-build-dep.sh <上游地址> <sha256> <路径>
+# 例：yttrium 0.10.54
+sudo bash install-build-dep.sh \
+  https://github.com/reown-com/yttrium/releases/download/0.10.54/libyttrium.xcframework.zip \
+  1d8555bdd7526ec984f43e227e7fcf30a83d090a0e7d481cd5dfb2d55f0fa32b \
+  yttrium/0.10.54/libyttrium.xcframework.zip
+```
+
+- **先放副本，再合并 RN-App 那边改版本的提交**：反过来的话，中间排上的 iOS 构建下不到文件。
+- 路径带版本，放进去就不再变：nginx 给一年缓存并标 immutable，Cloudflare 边缘也缓存。脚本遇到同一路径、
+  不同 sha256 会拒绝，要换内容就换路径。旧版本没有构建再用了可以删，删之前确认 RN-App 已经不钉它。
+- 地址不需要被信任，完整性靠 RN-App 那边的 sha256；这台机器挂了 iOS 构建本来也跑不了（打包机连的就是它），
+  所以不另设第二个下载地址。
 
 ## 注意事项
 

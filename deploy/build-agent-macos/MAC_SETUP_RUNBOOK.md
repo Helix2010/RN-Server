@@ -302,9 +302,12 @@ sudo -u _rnbuilder -H git ls-remote https://github.com/reown-com/yttrium.git ref
     rm -rf "$d"
   done
   ```
-- 只改写 **git clone**。`:http:` 拉 tarball 的那一类 pod（RN 的 `glog`、`folly`、`fmt` 等
-  第三方 podspec）是 curl 下载，这条配置管不着；它们通常已经在 `~/Library/Caches/CocoaPods`
-  里，真碰上再单独处理。
+- 只改写 **git clone**。`:http:` 拉 tarball 的 pod、在 prepare_command 里直接 curl 的 pod，这条配置都
+  管不着；而且任务的 HOME 每次是新的，`~/Library/Caches/CocoaPods` 随任务删掉，指望不上缓存。
+  最大的一个——YttriumWrapper 的 `libyttrium.xcframework.zip`（87 MB，原先直连 github.com 的 release、
+  不校验，三次挂两次）——2026-09-28 起改从 amos 上的固定副本下、按 sha256 校验（RN-App
+  `scripts/lib/ios-pinned-pods.js`；副本用 `deploy/amos/install-build-dep.sh` 放，见 `deploy/amos/README.md`
+  「iOS 构建依赖的固定副本」）。别的 pod 碰上同样的问题，照这个办法加。
 
 能在路由器上给 github.com 做分流、或者有可用代理的话，**都比这条干净**，优先用那两条。
 
