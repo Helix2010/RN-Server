@@ -114,7 +114,7 @@ MYSQL_DSN is required: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_DATABASE 已经
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `BIND_ADDRESS` | 空（所有网卡） | 裸机部署**要显式填 `127.0.0.1`**，否则应用端口会绕过反向代理直接对外，TLS 和它上面的一切都白设。Docker 部署靠端口映射兜底 |
-| `PORT` | `3000` | |
+| `PORT` | `3000` | 不带角色子命令（`rn-server`）时的监听端口。按角色起的进程用参数给端口：`rn-server app\|tenant\|platform --port N`，amos 上写在三个 unit 的 `ExecStart` 里（设计 `docs/design/service-and-console-split-2026-09-27.md`），不受这个键影响 |
 | `TRUSTED_PROXIES` | 空 | 允许设置 `X-Forwarded-For` 的上跳。**空 = 谁都不信**，`ClientIP` 取直连对端。不填时 `ADMIN_API_ALLOWED_IPS` 只是摆设（安全评审 N17） |
 | `PLATFORM_ADMIN_USERNAMES` | 空 | 自动化通道里哪些 actor（`ADMIN_API_ACTOR`）能进平台级接口（扫链管理、打包机与签名闸、平台推送默认、发 OTA 的脚本），逗号分隔。**空 = 自动化通道进不了平台路由**。控制台账号是不是平台管理员看 `tenant_admin_accounts`（`docs/database/ADMIN_ACCOUNTS_SCHEMA.md`），不看这个列表 |
 | `CORS_ORIGINS` | 开发 `*`，生产空 | **额外**放行的来源。租户自己的域名由 `tenant_domain` 表推导（见 `originAllowed`），通常不需要写。生产显式写 `*` 会拒绝启动 |
@@ -222,16 +222,16 @@ ADMIN_API_KEY=
 # ---- 这台机器 ----
 APP_ENV=production
 BIND_ADDRESS=127.0.0.1
-PORT=13080
+PORT=13080                          # 拆成三个进程之后没人读了（端口在 unit 的 --port 里），可以删
 TRUSTED_PROXIES=127.0.0.1
 PLATFORM_ADMIN_USERNAMES=
 
 # ---- 角色 ----
-PUSH_DISPATCH_ENABLED=true
+PUSH_DISPATCH_ENABLED=true          # 只在平台端进程里生效，App 端、租户端不派发
 MYSQL_AUTO_MIGRATE=false
 
 # ---- 与默认不同的调优，每一条都有理由 ----
-MYSQL_CONNECTION_LIMIT=3            # 和别的进程共用一个库
+MYSQL_CONNECTION_LIMIT=3            # 和别的进程共用一个库；每个进程各 3 条，API 三个进程加扫链最多 12 条
 MYSQL_MAX_IDLE_CONNECTIONS=1
 MYSQL_CONNECTION_MAX_LIFETIME_SECONDS=600
 MYSQL_CONNECTION_MAX_IDLE_TIME_SECONDS=60

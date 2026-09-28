@@ -8,7 +8,7 @@
 # 它不监听任何端口，所以不需要 nginx，也不该出现在 conf.d 里。
 [Unit]
 Description=RN Foundation chain indexer
-After=network-online.target rn-foundation-server.service
+After=network-online.target rn-foundation-platform.service
 Wants=network-online.target
 
 [Service]

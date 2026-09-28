@@ -1,4 +1,11 @@
-# RN-Foundation API（amos）。与打包机代理同一套部署规范：程序在 /opt，配置在
+# RN-Foundation API 的一个角色（设计 docs/design/service-and-console-split-2026-09-27.md）。
+# 同一个二进制按角色起三个进程：rn-foundation-app、rn-foundation-tenant、rn-foundation-platform，
+# 共用同一份配置与同一个库。端口写在 ExecStart 的 --port 里，不能用 Environment=PORT=：
+# EnvironmentFile 里的 PORT 会覆盖它，三个进程就会抢同一个端口。
+#
+# 租户端：租户控制台的 /v1/admin（平台部分除外）与它的统一登录。
+#
+# 与打包机代理同一套部署规范：程序在 /opt，配置在
 # /etc 下 0600，systemd 拉起，不引入 Docker。
 #
 #   /opt/rn-foundation/rn-server        程序本体
@@ -12,7 +19,7 @@
 # 提权就能把两半凑齐。下面的 InaccessiblePaths 挡住的是同机非 root 的那条路径，挡不住提权
 # ——真要恢复这条边界，上生产时得把签名闸与构建机挪到各自的机器上。
 [Unit]
-Description=RN Foundation API
+Description=RN Foundation API（租户端）
 After=network-online.target
 Wants=network-online.target
 
@@ -22,7 +29,7 @@ User=rnfoundation
 Group=rnfoundation
 EnvironmentFile=/etc/rn-foundation.env
 WorkingDirectory=/opt/rn-foundation
-ExecStart=/opt/rn-foundation/rn-server
+ExecStart=/opt/rn-foundation/rn-server tenant --port 13082
 Restart=always
 RestartSec=10
 PrivateTmp=true

@@ -17,7 +17,7 @@
 
 | 组件 | 跑在哪 | 谁部署 | 改了什么会重新部署 |
 | --- | --- | --- | --- |
-| API 服务端 `rn-foundation-server` | amos | **CI 自动**（push main） | RN-Server 代码、迁移 |
+| API 服务端，三个进程：`rn-foundation-platform`（13080）、`rn-foundation-app`（13081）、`rn-foundation-tenant`（13082） | amos | **CI 自动**（push main） | RN-Server 代码、迁移 |
 | 扫链 `rn-foundation-indexer` | amos | **CI 自动**（同一个二进制） | 同上 |
 | 控制台（两个租户域名） | amos 的 nginx 静态目录 | **CI 自动**（RN-Admin push main） | RN-Admin 代码 |
 | 构建机控制进程 `rn-build-agent` + 执行进程 | amos | **CI 自动**（开关 `AMOS_DEPLOY_BUILD_AGENT=true`，见下面的提醒） | `cmd/build-agent/**` |
@@ -65,7 +65,7 @@
 **回滚是怎么做的**：迁移失败或健康检查没过，`rn-foundation-apply` 会把二进制换回上一版再起。
 **迁移不会退回去**——所以迁移只能是加法、旧代码要能在新表结构上跑；哪天写了破坏性迁移，这条回滚就不成立了。
 
-**怎么确认成功**：`ls -l /opt/rn-foundation/rn-server` 的时间；`curl -s http://127.0.0.1:13080/health/ready`；
+**怎么确认成功**：`ls -l /opt/rn-foundation/rn-server` 的时间；13080、13081、13082 三个端口的 `/health/ready`；
 `readlink /opt/rn-foundation/machine-bundles/current` 等于本次提交。
 
 ## 2. 升级签名闸（人工，改了 `signing/**` 时）
@@ -289,7 +289,7 @@ curl -si "<API>/v1/ota/manifest?platform=android&runtimeVersion=<基线 runtimeV
 
 | 出了什么事 | 怎么退 |
 | --- | --- |
-| 服务端新版本起不来 | CI 已经自动把二进制换回上一版（**迁移不回退**）。看 `journalctl -u rn-foundation-server -n 50` 定位，前滚修复 |
+| 服务端新版本起不来 | CI 已经自动把二进制换回上一版（**迁移不回退**）。看 `journalctl -u rn-foundation-platform -u rn-foundation-tenant -u rn-foundation-app -n 50` 定位，前滚修复 |
 | 安装包发出去发现有问题 | 「发布管理 → 全量版本」对它 `pause`：新设备立刻拿不到它，**已经装上的不会被收回**。修好发新版本 |
 | 想回到上一版安装包 | 对上一条记录再点一次发布（`paused → active` 也走发布）。只有「已校验」「已暂停」的记录能发布；版本号只能往前，别改旧记录 |
 | 热更新推错了 | 「OTA 热更新」对它 `rollback`：会新写一条不可变的「回到内置 bundle」指令并置为 active，**连已经缓存了旧更新的设备也能退回来**。`pause` 只挡住还没拉到的设备 |

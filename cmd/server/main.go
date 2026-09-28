@@ -71,16 +71,28 @@ func main() {
 		runIndexer(cfg, database)
 		return
 	}
+	// 服务进程：不带参数承担全部接口；`rn-server app|tenant|platform [--port N]` 只承担一个角色
+	// （设计 service-and-console-split-2026-09-27）
+	role, port, err := parseServeArgs(os.Args[1:], cfg.Port)
+	if err != nil {
+		slog.Error("invalid command line", "error", err)
+		os.Exit(2)
+	}
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 	// 打包任务回收是服务端自己的定时器（每分钟），不挂在构建机认领上：签名闸挂了，
-	// signing 的任务要退回待签名，而这和有没有构建机在轮询无关（见 api/build_reaper.go）
+	// signing 的任务要退回待签名，而这和有没有构建机在轮询无关（见 api/build_reaper.go）。
+	// 它和推送派发各只能有一份：只在平台端（或不带参数的全量进程）里跑
 	reaperDone := make(chan struct{})
-	go func() {
-		defer close(reaperDone)
-		api.RunBuildJobReaper(workerCtx, cfg, database)
-	}()
-	if cfg.PushDispatchEnabled {
+	if role.RunsWorkers() {
+		go func() {
+			defer close(reaperDone)
+			api.RunBuildJobReaper(workerCtx, cfg, database)
+		}()
+	} else {
+		close(reaperDone)
+	}
+	if role.RunsWorkers() && cfg.PushDispatchEnabled {
 		// 推送凭据按租户存在库里，用主密钥封着；派发器要能解开它们才能发出去
 		box, boxErr := secretbox.New(cfg.StorageMasterKey)
 		if boxErr != nil {
@@ -96,15 +108,15 @@ func main() {
 	}
 
 	httpServer := &http.Server{
-		Addr:              cfg.BindAddress + ":" + cfg.Port,
-		Handler:           api.New(cfg, database),
+		Addr:              cfg.BindAddress + ":" + port,
+		Handler:           api.NewForRole(cfg, database, role),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Duration(cfg.HTTPReadTimeout) * time.Second,
 		WriteTimeout:      time.Duration(cfg.HTTPWriteTimeout) * time.Second,
 		IdleTimeout:       75 * time.Second,
 	}
 	go func() {
-		slog.Info("RN-Server listening", "address", cfg.BindAddress+":"+cfg.Port)
+		slog.Info("RN-Server listening", "address", cfg.BindAddress+":"+port, "role", role.Name())
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP server failed", "error", err)
 			os.Exit(1)
