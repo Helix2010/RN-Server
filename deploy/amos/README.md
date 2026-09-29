@@ -247,8 +247,8 @@ root 执行 CI 传来的二进制——构建机的冒烟降到权限更小的�
 
 但别把它说成"CI 密钥被偷最多发一版坏代码"：坏代码以 `rnfoundation` 跑，读得到服务端
 进程的全部配置机密；换上去的构建机控制进程以 `rn-build-agent` 跑，拿得到构建机的机器令牌与
-出处密钥，能以这台构建机的名义交付任意未签名包与出处声明。所以构建机那一路在签名闸同机
-期间必须关着，见下面「签名闸同机期间，打包机不走 CI」。
+出处密钥，能以这台构建机的名义交付任意未签名包与出处声明。构建机那一路原先要求签名闸同机
+期间关着，2026-09-29 定为有意开着，见下面「打包机随 CI 部署」。
 
 `sudoers` 里故意不限制参数——参数校验在脚本里。把 `install`/`mv`/`rm`/`systemctl`
 逐条写进 sudoers，任何一条带通配符的规则写松一点就等于给了 root。
@@ -280,21 +280,38 @@ ed25519 密钥，并打印要填进 GitHub 的四个 secret。私钥留在机器
 | `AMOS_DEPLOY_ENABLED` | Variable | `true`，否则只跑校验不部署 |
 | `AMOS_DEPLOY_BUILD_AGENT` | Variable | 只有 RN-Server 用。**签名闸与 amos 同机期间不建，或值不是 `true`**（见下一节） |
 
-### 签名闸同机期间，打包机不走 CI
+### 打包机随 CI 部署
 
 开发阶段签名闸和打包机、后端同在 amos 上（设计
 [`android-signing-gate-2026-09-16.md`](../../docs/design/android-signing-gate-2026-09-16.md)
-「开发阶段的部署」「部署与运维」）。**同机期间 `AMOS_DEPLOY_BUILD_AGENT` 必须关着**：
-在 RN-Server 仓库 Settings → Secrets and variables → Actions → Variables 里删掉它，或者
-把值改成 `true` 以外的任何东西。打包机改为手工部署（`deploy/build-agent/README.md`）。
+「开发阶段的部署」「部署与运维」）。原先的要求是同机期间关掉 `AMOS_DEPLOY_BUILD_AGENT`、打包机手工部署；
+**2026-09-29 定为有意开着**（仓库 Settings → Secrets and variables → Actions → Variables 里是 `true`），
+让 amos 上的打包机随 main 保持最新。新版本照旧要签名批准才接活（`deploy/setup/agent-commit.sh`）。
 
-原因：开着它，每次 push 到 main 工作流都会把新的 build-agent（构建机控制进程）送上来，由
+接受的风险：开着它，每次 push 到 main 工作流都会把新的打包机程序送上来，由
 `rn-foundation-apply build-agent` 换上并以 `rn-build-agent` 身份运行。于是能往 main 推代码、
 或者拿到 `AMOS_SSH_KEY` 的人，就能换掉持有机器令牌与出处密钥的那个进程：以受信构建机的
-名义给签名闸送包，并在签名闸所在的机器上执行任意代码，离签名闸只差一次本地提权。冒烟不再
-以 root 跑只去掉了"直接拿到 root"那一步，不改变这一条。
+名义给签名闸送包，并在签名闸所在的机器上执行任意代码，离签名闸只差一次本地提权。签名闸挪到独立机器之后这条自然消失。
 
-这个开关在 GitHub 上，仓库里的改动关不掉它，要有人去关。签名闸挪到独立机器之前不要再打开。
+**两个程序一起换。** `build-agent`（控制进程）与 `build-runner`（执行进程）之间靠任务说明（jobspec）通信，
+加字段时不一定提升协议号，启动自检（`--protocol`）拦不住版本不配套。2026-09-29 之前 CI 只换 `build-agent`，
+09-16 装的 `build-runner` 一直留着，Android 构建全部失败在 `spec.json refused: unknown field "platform"`
+（09-17 之后没人排 Android，直到这天才暴露）。现在工作流把两个都编出来、核对与安装包逐字节相同、一起送；
+`rn-foundation-apply build-agent` 缺一个就一个都不换，两个都冒烟，起不来两个一起回滚。
+
+手工补一次 runner（比如这台机器上的 `rn-foundation-apply` 还是旧版时）：从同一个提交的安装包里取，
+核对清单里的 sha256：
+
+```bash
+c=$(readlink /opt/rn-foundation/machine-bundles/current)
+d=$(mktemp -d); tar -xzf /opt/rn-foundation/machine-bundles/$c/builder.tar.gz -C "$d" ./bin/build-runner   # 成员名带 ./
+sha256sum "$d/bin/build-runner"; jq -r '.bundles.builder.files[]|select(.name=="bin/build-runner").sha256' /opt/rn-foundation/machine-bundles/$c/manifest.json
+sudo install -m 0755 -o root -g root "$d/bin/build-runner" /opt/rn-build-agent/build-runner
+# 自检要以控制进程的身份调（root 直接调会报 jobs root 不属于 uid 0）
+sudo -u rn-build-agent -- sudo -n -u builder -- /opt/rn-build-agent/build-runner self-check \
+  --jobs-root /var/lib/rn-build-jobs --protocol 1 --expect-separated
+sudo systemctl restart rn-build-agent
+```
 
 ### 加一个租户
 

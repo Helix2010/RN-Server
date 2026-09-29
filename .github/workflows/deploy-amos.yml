@@ -132,6 +132,16 @@ jobs:
             echo "::error::给 amos 编的 build-agent（$got）与安装包里的（$want）不是同一份字节：两处编译参数不一致"
             exit 1
           fi
+          # build-runner 跟着一起送：只换控制进程的话，任务说明加了字段旧 runner 就拒收（2026-09-29
+          # Android 全部失败在 unknown field "platform"）。参数同 build-bundles.sh，同样核对与安装包逐字节相同
+          GOTOOLCHAIN=local GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$RUNNER_TEMP/amos/build-runner" ./cmd/build-agent/build-runner
+          want="$(jq -r '.bundles.builder.files[] | select(.name == "bin/build-runner") | .sha256' "$RUNNER_TEMP/machine-bundles/manifest.json")"
+          got="$(sha256sum "$RUNNER_TEMP/amos/build-runner" | cut -d' ' -f1)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::给 amos 编的 build-runner（$got）与安装包里的（$want）不是同一份字节：两处编译参数不一致"
+            exit 1
+          fi
           ls -l "$RUNNER_TEMP/amos"
       - name: Hand the payload to deploy
         if: steps.changes.outputs.deploy-needed == 'true' && vars.AMOS_DEPLOY_ENABLED == 'true'
@@ -277,9 +287,9 @@ jobs:
         # upload-artifact 不保留可执行位，而下面是 `ssh amos "cat > …" < 文件`——
         # 只读文件内容，位不位其实无所谓；补上只是为了 ls 看着不吓人、也便于本地复跑
         run: |
-          chmod +x "$RUNNER_TEMP/amos/rn-server" "$RUNNER_TEMP/amos/build-agent"
-          mv "$RUNNER_TEMP/amos/rn-server" "$RUNNER_TEMP/amos/build-agent" .
-          ls -l rn-server build-agent "$RUNNER_TEMP/machine-bundles"
+          chmod +x "$RUNNER_TEMP/amos/rn-server" "$RUNNER_TEMP/amos/build-agent" "$RUNNER_TEMP/amos/build-runner"
+          mv "$RUNNER_TEMP/amos/rn-server" "$RUNNER_TEMP/amos/build-agent" "$RUNNER_TEMP/amos/build-runner" .
+          ls -l rn-server build-agent build-runner "$RUNNER_TEMP/machine-bundles"
 
       - name: Configure SSH
         env:
@@ -361,8 +371,9 @@ jobs:
           else
             echo "bundles-changed=true" >> "$GITHUB_OUTPUT"
           fi
-          new_agent="$(sha256sum build-agent | cut -d' ' -f1)"
-          old_agent="$(ssh amos 'sha256sum /opt/rn-build-agent/build-agent 2>/dev/null | cut -d" " -f1')"
+          # 两个二进制都比：任何一个与 amos 上的不同就一起换（runner 落后过一次，见 Build 那一步）
+          new_agent="$(cat build-agent build-runner | sha256sum | cut -d' ' -f1)"
+          old_agent="$(ssh amos 'cat /opt/rn-build-agent/build-agent /opt/rn-build-agent/build-runner 2>/dev/null | sha256sum | cut -d" " -f1')"
           if [ "$new_agent" = "$old_agent" ]; then
             echo "agent-changed=false" >> "$GITHUB_OUTPUT"
           else
@@ -409,15 +420,25 @@ jobs:
 
       # ---- 打包机 ----------------------------------------------------------
       #
-      # **签名闸与 amos 同机期间必须关着**（docs/design/android-signing-gate-2026-09-16.md
-      # 「开发阶段的部署」「部署与运维」）。这一步换掉的是构建机控制进程，它以 rn-build-agent
-      # 身份运行、持有机器令牌与出处密钥：开着它，能往 main 推代码或拿到 AMOS_SSH_KEY 的人，
-      # 就能以受信构建机的名义给签名闸送包，并在签名闸所在的机器上执行任意代码。开关是仓库 Variables 里的 AMOS_DEPLOY_BUILD_AGENT，
-      # 不建或不是 'true' 即关；关着时打包机手工部署，见 deploy/build-agent/README.md。
+      # 开关是仓库 Variables 里的 AMOS_DEPLOY_BUILD_AGENT，不建或不是 'true' 即关；关着时打包机手工部署，
+      # 见 deploy/build-agent/README.md。2026-09-29 定为有意开着，让打包机随 main 保持最新。风险照旧成立：
+      # 这一步换掉的是构建机控制进程，它以 rn-build-agent 身份运行、持有机器令牌与出处密钥，能往 main 推代码
+      # 或拿到 AMOS_SSH_KEY 的人，就能以受信构建机的名义给签名闸送包，并在签名闸所在的机器上执行任意代码
+      # （docs/design/android-signing-gate-2026-09-16.md「开发阶段的部署」；deploy/amos/README.md「打包机随 CI 部署」）。
+      #
+      # build-agent 与 build-runner 一起送、一起换（rn-foundation-apply build-agent 两个都要，缺一个都不换）
       - name: Upload the build agent
         if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true' && steps.compare.outputs.agent-changed == 'true'
         run: |
-          ssh amos "set -eu; cat > '$STAGE/build-agent.part'; mv '$STAGE/build-agent.part' '$STAGE/build-agent'" < build-agent
+          # 旧版特权脚本只换 build-agent、不认 build-runner：送上去也白送，runner 照样落后。先要有人
+          # 在 amos 上重跑 setup-ci-deploy.sh 换上新脚本
+          if ! ssh amos 'grep -q "^RUNNER_BINARY=" /usr/local/sbin/rn-foundation-apply'; then
+            echo "::error::amos 上的 rn-foundation-apply 还只换 build-agent、不换 build-runner：在那台机器上重跑 deploy/amos/setup-ci-deploy.sh 更新它"
+            exit 1
+          fi
+          for f in build-runner build-agent; do
+            ssh amos "set -eu; cat > '$STAGE/$f.part'; mv '$STAGE/$f.part' '$STAGE/$f'" < "$f"
+          done
 
       - name: Apply the build agent
         if: vars.AMOS_DEPLOY_BUILD_AGENT == 'true' && steps.compare.outputs.agent-changed == 'true'
