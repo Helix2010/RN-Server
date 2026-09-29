@@ -10,7 +10,7 @@
 # rn-build-agent（构建机控制进程）身份运行而不是 root，脚本自己也不以 root 执行 CI 传来的
 # 二进制。但 CI 密钥被偷不只是"发了一版坏代码"：坏代码以那两个身份跑，读得到各自进程的
 # 配置与状态，包括构建机的机器令牌与出处密钥。
-# 签名闸同机期间打包机那一路必须关着，见 README.md。
+# 打包机那一路（AMOS_DEPLOY_BUILD_AGENT）2026-09-29 定为有意开着，风险见 README.md「打包机随 CI 部署」。
 set -euo pipefail
 
 cd "$(dirname "$0")"

@@ -21,8 +21,13 @@
 # 身份运行，拿得到这台构建机的机器令牌与出处密钥，能以受信构建机的名义交付任意包。
 #
 # **build-agent 那条因此单独说清楚。** 这台机器开发阶段还和签名闸同机
-# （docs/design/android-signing-gate-2026-09-16.md「开发阶段的部署」），同机期间工作流里的
-# AMOS_DEPLOY_BUILD_AGENT 必须关着，打包机手工部署（见 deploy/amos/README.md）。
+# （docs/design/android-signing-gate-2026-09-16.md「开发阶段的部署」）。原先的要求是同机期间
+# 工作流里的 AMOS_DEPLOY_BUILD_AGENT 关着、打包机手工部署；2026-09-29 定为有意开着，让打包机随 main
+# 保持最新，上面这条风险照旧成立（见 deploy/amos/README.md「打包机随 CI 部署」）。
+#
+# build-agent 与 build-runner **一起换**：两者之间的任务说明（jobspec）加字段时不一定提升协议号，
+# 只换控制进程的话旧 runner 会拒收新的任务说明——2026-09-29 就是这样，09-16 的 runner 一直留着，
+# Android 构建全部失败在 `spec.json refused: unknown field "platform"`。
 set -euo pipefail
 
 STAGE_ROOT=/var/lib/rn-foundation-deploy/incoming
@@ -34,6 +39,8 @@ BUNDLE_ROOT=/opt/rn-foundation/machine-bundles
 BUNDLE_KEEP_PREVIOUS=2
 AGENT_BINARY=/opt/rn-build-agent/build-agent
 AGENT_PREVIOUS=/opt/rn-build-agent/build-agent.prev
+RUNNER_BINARY=/opt/rn-build-agent/build-runner
+RUNNER_PREVIOUS=/opt/rn-build-agent/build-runner.prev
 # 构建机冒烟用的身份：执行用户 builder，比正式运行控制进程的 rn-build-agent 权限更小
 # （读不到令牌与出处密钥），也不是 root。冒烟只验"跑得起来"，不需要控制进程的任何东西
 AGENT_USER=builder
@@ -189,16 +196,20 @@ apply_admin() {
 #  2. **没有健康检查可等。** 它不监听任何端口（只出不进），活着的判据只有
 #     systemd 的 ActiveState 和 MainPID 变没变。
 apply_build_agent() {
-  local src="$STAGE_ROOT/build-agent"
+  local src="$STAGE_ROOT/build-agent" runner_src="$STAGE_ROOT/build-runner" f
   [ -s "$src" ] || die "暂存目录里没有 build-agent：$src"
-  [ "$(head -c 4 "$src" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
-    || die "$src 不是 ELF 可执行文件"
+  # 两个一起换，缺一个就一个都不换（为什么见文件头）
+  [ -s "$runner_src" ] || die "暂存目录里没有 build-runner：$runner_src。build-agent 与 build-runner 必须同一个提交一起换"
+  for f in "$src" "$runner_src"; do
+    [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] \
+      || die "$f 不是 ELF 可执行文件"
+  done
   # 取数字 uid/gid：--regid 要的是组，账号的主组不一定和账号同名
   local agent_uid agent_gid
   agent_uid="$(id -u "$AGENT_USER" 2>/dev/null)" || die "没有 $AGENT_USER 账号，冒烟不能改用 root 跑"
   agent_gid="$(id -g "$AGENT_USER")"
 
-  # 冒烟：不带任何配置跑一下，它必须以 2 退出并抱怨配置不全。这不验业务，
+  # 冒烟：不带任何参数与配置各跑一下，两个都必须以 2 退出（配置不全 / 用法不对）。这不验业务，
   # 它验的是"这个二进制在这台机器上跑得起来"——架构不对、动态链接缺库都在这里露馅，
   # 而不是换上去之后由 systemd 反复重启。
   #
@@ -210,22 +221,26 @@ apply_build_agent() {
     || die "建不了冒烟用的临时目录"
   chmod 0711 "$SMOKE_DIR"
   install -m 0755 -o root -g root "$src" "$SMOKE_DIR/build-agent"
-  local code=0
-  setpriv --reuid="$agent_uid" --regid="$agent_gid" --clear-groups --no-new-privs \
-    env -i "$SMOKE_DIR/build-agent" >/dev/null 2>&1 || code=$?
-  [ "$code" = "2" ] || die "新的 build-agent 跑不起来（以 $AGENT_USER 身份，退出码 $code），不换"
+  install -m 0755 -o root -g root "$runner_src" "$SMOKE_DIR/build-runner"
+  local code name
+  for name in build-agent build-runner; do
+    code=0
+    setpriv --reuid="$agent_uid" --regid="$agent_gid" --clear-groups --no-new-privs \
+      env -i "$SMOKE_DIR/$name" >/dev/null 2>&1 || code=$?
+    [ "$code" = "2" ] || die "新的 $name 跑不起来（以 $AGENT_USER 身份，退出码 $code），两个都不换"
+  done
 
   local before_pid
   before_pid="$(systemctl show -p MainPID --value rn-build-agent 2>/dev/null || echo 0)"
 
-  if [ -f "$AGENT_BINARY" ]; then
-    cp -a "$AGENT_BINARY" "$AGENT_PREVIOUS"
-  else
-    rm -f "$AGENT_PREVIOUS"
-  fi
-  # 正在跑的进程握着旧 inode，install 不会打断它
+  rm -f "$AGENT_PREVIOUS" "$RUNNER_PREVIOUS"
+  if [ -f "$AGENT_BINARY" ]; then cp -a "$AGENT_BINARY" "$AGENT_PREVIOUS"; fi
+  if [ -f "$RUNNER_BINARY" ]; then cp -a "$RUNNER_BINARY" "$RUNNER_PREVIOUS"; fi
+  # 正在跑的进程握着旧 inode，install 不会打断它。先换 runner：控制进程在排空手上那条构建期间
+  # 还会调它（cleanup），那几个子命令的参数两版之间没变
+  install -m 0755 -o root -g root "$SMOKE_DIR/build-runner" "$RUNNER_BINARY"
   install -m 0755 -o root -g root "$SMOKE_DIR/build-agent" "$AGENT_BINARY"
-  rm -f "$src"
+  rm -f "$src" "$runner_src"
 
   log "请求重启（手上有构建的话会先把它做完）"
   systemctl --no-block restart rn-build-agent
@@ -235,26 +250,30 @@ apply_build_agent() {
     state="$(systemctl show -p ActiveState --value rn-build-agent 2>/dev/null || true)"
     pid="$(systemctl show -p MainPID --value rn-build-agent 2>/dev/null || echo 0)"
     if [ "$state" = "active" ] && [ "$pid" != "$before_pid" ] && [ "$pid" != "0" ]; then
-      rm -f "$AGENT_PREVIOUS"
+      rm -f "$AGENT_PREVIOUS" "$RUNNER_PREVIOUS"
       log "打包机已更新并起来了（pid $pid）"
       return 0
     fi
     if [ "$state" = "failed" ]; then
+      # 起不来多半是启动自检（控制进程调 runner self-check）没过：两个一起回滚
       log "回滚（新二进制起不来）"
+      if [ -f "$RUNNER_PREVIOUS" ]; then
+        install -m 0755 -o root -g root "$RUNNER_PREVIOUS" "$RUNNER_BINARY"
+      fi
       if [ -f "$AGENT_PREVIOUS" ]; then
         install -m 0755 -o root -g root "$AGENT_PREVIOUS" "$AGENT_BINARY"
-        rm -f "$AGENT_PREVIOUS"
         systemctl --no-block restart rn-build-agent
       fi
+      rm -f "$AGENT_PREVIOUS" "$RUNNER_PREVIOUS"
       journalctl -u rn-build-agent -n 30 --no-pager -o cat >&2
-      die "新的 build-agent 起不来，已回滚二进制"
+      die "新的 build-agent 起不来，已回滚两个二进制"
     fi
     sleep 3
   done
 
   # 90 秒还没换 pid：多半是在排空一条构建。这不是失败，但也不能说"已更新"——
   # 新二进制在磁盘上，生效时机是那条构建做完
-  rm -f "$AGENT_PREVIOUS"
+  rm -f "$AGENT_PREVIOUS" "$RUNNER_PREVIOUS"
   log "新二进制已就位；代理正在把手上那条构建做完，做完自动起新版（systemctl status rn-build-agent 看进度）"
 }
 
